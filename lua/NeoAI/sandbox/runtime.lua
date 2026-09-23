@@ -61,6 +61,9 @@ local DEFAULT_MASK_PATHS = {
   -- 宿主身份与凭据
   "/etc/shadow", "/etc/shadow-", "/etc/gshadow", "/etc/gshadow-",
   "/etc/sudoers", "/etc/sudoers.d", "/etc/machine-id", "/etc/hostid",
+  -- 宿主 fstab 泄露磁盘布局/根文件系统 UUID，且会让 `mount -o remount,rw /` 按宿主 UUID 解析
+  -- （沙箱根是 overlay/tmpfs，必然失败并暴露宿主身份）。以空文件遮蔽，得到无条目的容器语义。
+  "/etc/fstab",
   "/etc/ssh", "/etc/ssl/private", "/etc/ipa", "/etc/krb5.keytab",
   -- 日志、计划任务与审计
   "/var/log", "/var/spool/cron", "/etc/crontab", "/etc/cron.d",
@@ -604,7 +607,10 @@ local function _maintscript_stubs()
     "rm -f \"$req\" \"$dir/out.$id\" \"$dir/err.$id\" \"$dir/code.$id\" \"$dir/done.$id\"",
     "exit \"${code:-0}\"",
   }, "\n") .. "\n"
-  for _, name in ipairs({ "systemctl", "journalctl", "systemd-run", "systemd-analyze" }) do
+  for _, name in ipairs({
+    "systemctl", "journalctl", "systemd-run", "systemd-analyze",
+    "hostnamectl", "timedatectl", "dmesg",
+  }) do
     local f = io.open(dir .. "/" .. name, "w")
     if not f then return nil end
     f:write(client)
@@ -1884,6 +1890,63 @@ function M.stable_tmp_base()
   return (tostring(root):gsub("/+$", "")) .. "/tmp"
 end
 
+--- 沙箱内临时根（`/tmp`、`/var/tmp`、`/run`）在宿主侧的**会话私有目录**。这些根在沙箱内被
+--- 绑定到该目录（见 `_append_tmpfs_roots` host 模式 + 稳定 base），故宿主侧门面要读取沙箱内
+--- 写入的单元文件时，必须读这里，而不是宿主真实 `/run` 等（后者既看不到沙箱写入，又会泄漏
+--- 宿主运行时内容）。与 `_append_tmpfs_roots` 的计算保持一致。
+--- @param guest_root string 形如 "/run"
+--- @return string
+function M.host_tmp_dir(guest_root)
+  local base = M.stable_tmp_base():gsub("/+$", "")
+  local session = vim.fn.fnamemodify(base, ":t")
+  return base .. "/tmp" .. tostring(guest_root):gsub("[^%w]", "_") .. "/" .. session
+end
+
+-- 整机根 overlay 的 upper 目录注册表（宿主侧）：命令写入经 overlay upper 暂存，宿主真实路径
+-- 看不到；systemd 门面据此读取沙箱内写入的 /etc、/usr 等（与沙箱同一私有视图）。
+local _root_overlay_uppers = {}
+
+--- 注册整机根 overlay upper 目录（幂等）。
+--- @param dir string
+function M.register_root_overlay_upper(dir)
+  if type(dir) ~= "string" or dir == "" then return end
+  for _, u in ipairs(_root_overlay_uppers) do if u == dir then return end end
+  _root_overlay_uppers[#_root_overlay_uppers + 1] = dir
+end
+
+--- 现存的整机根 overlay upper 目录（供门面读取沙箱视图）。
+--- @return table
+function M.root_overlay_uppers()
+  local out = {}
+  for _, u in ipairs(_root_overlay_uppers) do
+    if vim.fn.isdirectory(u) == 1 then out[#out + 1] = u end
+  end
+  return out
+end
+
+--- 整机根 overlay 主位置不可用时（如在 overlayfs 之上的容器里嵌套 overlay 会 EINVAL）的
+--- 备选 upper/work 基目录：tmpfs（`/dev/shm`、`/run`）不是 overlay，可承载 overlay upper，
+--- 使沙箱根仍可写（避免 AI 察觉「文件系统只读」）。返回可写目录或 nil。
+--- @return string|nil
+function M.overlay_fallback_dir()
+  local id = tostring(vim.fn.getpid())
+  local ok, store = pcall(require, "NeoAI.sandbox.store")
+  if ok and store and store.root then
+    local r = store.root()
+    if type(r) == "string" and r ~= "" then id = vim.fn.fnamemodify(r, ":t") end
+  end
+  for _, base in ipairs({ "/dev/shm", "/run" }) do
+    if vim.fn.isdirectory(base) == 1 then
+      local dir = base .. "/.neoai-overlay-" .. id
+      pcall(vim.fn.mkdir, dir, "p")
+      if vim.fn.isdirectory(dir) == 1 and vim.fn.filewritable(dir) == 1 then
+        return dir
+      end
+    end
+  end
+  return nil
+end
+
 --- 追加宿主敏感路径遮蔽挂载（供 LSP 命名空间等复用，保持与 run_command 一致的遮蔽面）：
 --- 仅应用配置/内置 mask_paths 与沙箱自身存储，不含按 cwd 的遮蔽目录（避免遮蔽工作区兄弟）。
 --- @param argv table|nil
@@ -2055,9 +2118,63 @@ local function _self_scope_paths()
   return out
 end
 
+--- 默认越界留痕忽略路径（软件包/依赖缓存）：这些目录的读取是包管理/构建的正常行为，
+--- 不记为「越界访问」，避免 `~/.cache/uv`、`~/.npm` 等大量缓存读取在审批悬浮窗刷屏。
+local DEFAULT_TRACE_IGNORE_PATHS = {
+  "~/.cache/uv", "~/.cache/pip", "~/.cache/pypoetry", "~/.cache/pdm", "~/.cache/poetry",
+  "~/.cache/yarn", "~/.cache/go-build", "~/.cache/composer", "~/.cache/deno",
+  "~/.cache/node-gyp", "~/.cache/electron", "~/.cache/pre-commit", "~/.cache/bun",
+  "~/.npm", "~/.pnpm-store", "~/.bun", "~/.deno",
+  "~/.cargo", "~/.rustup", "~/go/pkg",
+  "~/.gradle", "~/.m2", "~/.nuget/packages", "~/.gem",
+  "~/.local/share/uv", "~/.local/share/pipx",
+}
+
+--- 越界留痕忽略匹配器：合并 `tools.sandbox.observe.trace_ignore_paths`（默认
+--- `DEFAULT_TRACE_IGNORE_PATHS`）与 `tools.sandbox.packages.volatile_paths`。
+--- 支持 `~` 展开与 glob（`*`）。按配置表引用缓存（观测热路径高频调用，避免逐事件展开/glob）。
+--- @return function(path) -> boolean
+local function _trace_ignore_matcher()
+  local ocfg = config_store.get("tools.sandbox.observe")
+  local list = (type(ocfg) == "table" and ocfg.trace_ignore_paths) or DEFAULT_TRACE_IGNORE_PATHS
+  local pcfg = config_store.get("tools.sandbox.packages")
+  local volatile = type(pcfg) == "table" and pcfg.volatile_paths or nil
+  local cache = state.trace_ignore_cache
+  if cache and cache.list == list and cache.volatile == volatile then return cache.fn end
+  local roots = {}
+  local function add(p)
+    if type(p) ~= "string" or p == "" or p == "/" then return end
+    p = vim.fn.expand(p):gsub("/+$", "")
+    if p == "" or p == "/" then return end
+    if p:find("[*?[]") then
+      local ok, matches = pcall(vim.fn.glob, p, false, true)
+      if ok and type(matches) == "table" then
+        for _, m in ipairs(matches) do
+          m = tostring(m):gsub("/+$", "")
+          if m ~= "" and m ~= "/" then roots[#roots + 1] = m end
+        end
+      end
+    else
+      roots[#roots + 1] = p
+    end
+  end
+  if type(list) == "table" then for _, p in ipairs(list) do add(p) end end
+  if type(volatile) == "table" then for _, p in ipairs(volatile) do add(p) end end
+  local fn = function(path)
+    if type(path) ~= "string" or path == "" then return false end
+    for _, r in ipairs(roots) do
+      if path == r or path:sub(1, #r + 1) == r .. "/" then return true end
+    end
+    return false
+  end
+  state.trace_ignore_cache = { list = list, volatile = volatile, fn = fn }
+  return fn
+end
+
 --- 判断路径是否属于「工作区之外的用户工作目录」：不在 cwd 子树内、但位于某个
 --- 遮蔽目录（home/root 等）之下。用于越界访问留痕（`read_all` 下这些目录可读，
---- 但会记录并在审批悬浮窗展示）。系统路径（/usr、/etc 等）不计入，避免噪声。
+--- 但会记录并在审批悬浮窗展示）。系统路径（/usr、/etc 等）不计入，避免噪声；
+--- 软件包/依赖缓存目录（`observe.trace_ignore_paths` + `packages.volatile_paths`）同样不计入。
 --- 沙箱自有路径（store 根/实例目录/overlay 基目录/runtime 私有目录）同样不计入，
 --- 否则每次外部命令的自观测（如重新打开 seccomp 过滤器）都会产生一条伪「越界」记录。
 --- @param path string|nil
@@ -2079,6 +2196,8 @@ function M.outside_workspace(path, cwd)
   local c = _canonical(cwd)
   if p == "" or p == "/" then return nil end
   if p == c or _under(p, c) then return nil end
+  -- 软件包/依赖缓存目录：正常的包管理/构建读取，不记为越界（避免审批悬浮窗刷屏）。
+  if _trace_ignore_matcher()(p) then return nil end
   -- 沙箱自有路径（store 根/实例目录/overlay 基目录/runtime 私有目录）：位于遮蔽目录之下
   -- 但不是用户工作目录。观测会捕获沙箱自身（包装器重开 seccomp 过滤器、overlay upper/work
   -- 等）的 openat，若不排除，每次外部命令都会留下一条伪「越界」记录。与 `is_masked_path`
@@ -2431,6 +2550,16 @@ function M.process_prefix(opts)
       local sdcfg = config_store.get("tools.sandbox.systemd") or {}
       if sdcfg.enabled ~= false then
         table.insert(argv, "--dir"); table.insert(argv, "/run/systemd/system")
+        table.insert(argv, "--dir"); table.insert(argv, "/run/systemd/user")
+        -- 单元写入视图：`/run/systemd` 被 mask 为空 tmpfs（隐藏宿主运行时），会把 AI 写入的
+        -- 单元落进临时 tmpfs、门面（宿主侧）读不到。把**会话私有**单元根绑定回来，使
+        -- `systemctl`/门面与沙箱内 `/run/systemd/{system,user}` 看到同一批单元。
+        local runbase = M.host_tmp_dir("/run")
+        for _, sub in ipairs({ "system", "user" }) do
+          local host = runbase .. "/systemd/" .. sub
+          pcall(vim.fn.mkdir, host, "p")
+          table.insert(argv, "--bind"); table.insert(argv, host); table.insert(argv, "/run/systemd/" .. sub)
+        end
         local spoof = _pid1_spoof_files()
         if spoof then
           for _, b in ipairs({
@@ -2469,7 +2598,7 @@ function M.process_prefix(opts)
             table.insert(argv, "--ro-bind"); table.insert(argv, stubs.dir .. "/journalctl"); table.insert(argv, bin)
           end
         end
-        for _, name in ipairs({ "systemd-run", "systemd-analyze" }) do
+        for _, name in ipairs({ "systemd-run", "systemd-analyze", "hostnamectl", "timedatectl", "dmesg" }) do
           for _, dir in ipairs({ "/usr/bin", "/bin", "/usr/local/bin", "/usr/sbin", "/sbin" }) do
             local bin = dir .. "/" .. name
             if vim.uv.fs_stat(bin) then

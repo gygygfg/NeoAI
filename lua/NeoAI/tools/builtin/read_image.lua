@@ -51,6 +51,28 @@ local function _is_url(path)
   return type(path) == "string" and (path:lower():match("^https?://") ~= nil)
 end
 
+--- 在「同一私有视图」下定位可读文件：真实盘 → 沙箱暂存副本 → 整机根 overlay 的 upper。
+--- 命令在沙箱内生成的文件（裁剪产物、下载文件）落在 overlay upper / 暂存副本，宿主真实路径
+--- 不可读；三个来源都查才能与沙箱视图一致。
+--- @param path string 绝对路径
+--- @return string|nil readable_path
+local function _view_readable_path(path)
+  if vim.fn.filereadable(path) == 1 then return path end
+  local okc, candidate = pcall(require, "NeoAI.sandbox.candidate")
+  if okc and candidate and type(candidate.read_path) == "function" then
+    local sp = candidate.read_path(path)
+    if sp and vim.fn.filereadable(sp) == 1 then return sp end
+  end
+  local okr, runtime = pcall(require, "NeoAI.sandbox.runtime")
+  if okr and type(runtime.root_overlay_uppers) == "function" then
+    for _, up in ipairs(runtime.root_overlay_uppers()) do
+      local cand = up .. path
+      if vim.fn.filereadable(cand) == 1 then return cand end
+    end
+  end
+  return nil
+end
+
 --- 生成临时图像文件路径（普通文件，无执行权限）。
 --- 位于宿主与沙箱同路径可见的共享目录，使沙箱内 curl 下载的文件宿主侧可直接读取。
 --- @return string
@@ -105,8 +127,8 @@ end
 --- @return Deferred resolve(ref)
 local function _ingest(target_path, declared_media, display_path)
   local limits = attachment.image_limits()
-  -- 读盘（线程池）：优先读取沙箱暂存副本（工具子进程的写入已冻结为候选，尚未落盘）。
-  local read_target = require("NeoAI.sandbox.candidate").read_path(target_path) or target_path
+  -- 读盘（线程池）：优先读取沙箱暂存副本 / 整机 overlay upper（工具子进程/命令的写入尚未落盘）。
+  local read_target = _view_readable_path(target_path) or target_path
   return work.run(_read_binary, read_target):then_(function(data)
     if not data or #data == 0 then
       error(("读取到空文件: %s"):format(target_path))
@@ -234,8 +256,11 @@ local read_image = helpers.define_tool(
       return
     end
 
-    local abs_path = vim.fn.fnamemodify(file_path, ":p")
-    if vim.fn.filereadable(abs_path) ~= 1 then
+    -- 规范化（`fnamemodify(":p")` 不会折叠 `/./`，需 simplify），并接受**沙箱暂存副本**：
+    -- 命令在沙箱内生成的图片（如裁剪产物）冻结为候选、尚未落真实盘，此时真实路径不可读，
+    -- 但 `candidate.read_path` 能映射到暂存副本（`_ingest` 会优先读它）。
+    local abs_path = vim.fn.simplify(vim.fn.fnamemodify(file_path, ":p"))
+    if not _view_readable_path(abs_path) then
       on_error("文件不可读: " .. abs_path)
       return
     end

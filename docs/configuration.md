@@ -296,6 +296,7 @@ sandbox = {
     "/home/*/.ssh", "/home/*/.gnupg", "/home/*/.netrc", "/home/*/.git-credentials",
     "/home/*/.config/git/credentials", "/home/*/.config/gh", "/home/*/.docker/config.json",
     "/etc/shadow", "/etc/gshadow", "/etc/sudoers", "/etc/machine-id", "/etc/ssh",
+    "/etc/fstab",                  -- 宿主磁盘布局/根 UUID（避免 mount -o remount 按宿主 UUID 解析）
     "/var/log", "/var/spool/cron", "/etc/crontab",
     "/root/.bash_history", "/root/.zsh_history", "/root/.python_history", "/root/.wget-hsts",
   },
@@ -358,8 +359,9 @@ sandbox = {
   -- /usr/bin/systemctl、/usr/bin/journalctl 为极薄入口（bash 文件 IPC 客户端），把 argv 转发
   -- 给宿主门面并按真实 stdout/stderr/退出码返回。独立调用由门禁直接路由，脚本/管道调用经入口
   -- 走同一门面；不调用宿主 systemd、也不修改宿主机。支持 simple/exec/oneshot 与
-  -- Requires/Wants/After/Before 依赖；Type=notify/forking/dbus、socket/timer 等语义明确报错；
-  -- 门面不处理的动词回退 T2/hostop 提案路径。
+  -- Requires/Wants/After/Before 依赖，展开 `%` 说明符与 `${VAR}`；notify/forking/dbus/idle
+  -- 类型与 User=/Group= 按 best-effort 兼容；socket/timer、模板单元、未知 Type 等明确报错
+  -- （透传清洗后的具体原因）；门面不处理的动词回退 T2/hostop 提案路径。
   systemd = {
     enabled = true,          -- 总开关
     mode = "facade",         -- facade（默认）：沙箱内处理
@@ -390,7 +392,7 @@ sandbox = {
     -- HTTP(S)_PROXY/ALL_PROXY 指向宿主侧 Lua 过滤代理，本机目标拦截、外部放行并记录。
     -- 应用层边界：不认代理的裸 TCP 可绕过（详见 docs/sandbox.md §6.1）。
     host_local_block = true,
-    block_proxy_evasion = true,      -- host_local_block 生效时拒绝显式清除/绕过代理的命令（unset *proxy、env -u、--noproxy、--proxy ""），防止过滤失效直达宿主本机
+    block_proxy_evasion = true,      -- 代理规避处理（host_local_block 生效时）：true（默认）= 暂停并弹窗询问（仅本次允许/本次会话始终允许/拒绝）；"deny" = 直接拒绝（旧硬拒绝）；false = 不拦截（允许绕过，过滤边界失效）。清除/绕过代理包括 unset *proxy、env -u、--noproxy、--proxy "" 等
     host_local_proxy_port = 0,       -- 宿主过滤代理端口（0 = 自动分配 loopback 随机端口）
     allow_localhost_ports = {},      -- 本机端口白名单（默认空=全拦）：仅放行「回环地址 + 这些端口」的本机访问（如沙箱内服务自测 5432/6379）；宿主网卡 IP/链路本地/云元数据永不放行。沙箱内命令启动的临时监听端口会按 cgroup 归属自动登记免权限，无需在此列出
     -- 沙箱网络访问策略：沙箱内部创建的进程/端口（回环 + allow_localhost_ports + 服务端口登记表）
@@ -399,6 +401,8 @@ sandbox = {
     --   "allow"       = 直接放行并记录（旧行为）；
     --   "deny"        = 直接拒绝。
     access = "ask",
+    auto_allow_sources = true,       -- 软件源自动放行（默认开）：pip/uv/npm/go/cargo/apt 等**外部**软件源（PyPI、npm、crates、清华/阿里/中科大等镜像）经代理访问时免弹窗直接放行，避免包安装被网络同意门禁拦截。仅对非本机目标生效（解析到本机或解析失败仍拒绝，SSRF 防护不削弱）；access="deny" 时仍拒绝
+    extra_package_sources = {},      -- 额外软件源域名后缀（私有源/自建镜像），如 { "pypi.mycorp.com" }；子域自动匹配
     -- 沙箱外部命令代理策略：strip（默认，不把宿主代理传入沙箱，如 mihomo 只代理 opencode 自身，
     -- 避免宿主 HTTPS_PROXY=127.0.0.1:7890 在沙箱内不可达导致 pip/npm 失败）| passthrough（沿用宿主）|
     -- table { http, https, all, no_proxy }（显式设置；未列出的代理变量清除）。

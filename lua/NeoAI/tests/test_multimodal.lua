@@ -178,6 +178,60 @@ tests.suite("multimodal", function(_, it, before_each)
     t.eq(1, img_count, "仅保留 1 张图像（其余 offload 为文本）")
   end)
 
+  it("materialize：工具结果图像不打断 tool_calls→tool 连续性", function(t)
+    local att = require("NeoAI.core.attachment.attachment")
+    local content = require("NeoAI.core.model.content")
+    local json = require("NeoAI.utils.json")
+    local ok = false
+    local ref
+    att.save_image({ data = PNG, mediaType = "image/png", name = "t.png" }):then_(function(r) ref = r ok = true end)
+    t.true_(wait_until(function() return ok end), "save")
+
+    -- assistant 一轮发起两个调用；第一个结果带图（会拆成独立 user 图像消息），
+    -- 第二个结果为纯文本。图像消息必须排在本轮全部 tool 消息之后。
+    local msgs = {
+      { role = "assistant", content = "", tool_calls = {
+        { id = "c1", type = "function", ["function"] = { name = "read_image", arguments = "{}" } },
+        { id = "c2", type = "function", ["function"] = { name = "read_file", arguments = "{}" } },
+      } },
+      { role = "tool", tool_call_id = "c1", content = json.encode({ path = "x.png", image = ref }) },
+      { role = "tool", tool_call_id = "c2", content = "plain text" },
+      { role = "assistant", content = "done" },
+    }
+    local ok2, wire
+    content.materialize(msgs, { vision = true }):then_(function(w) wire = w ok2 = true end)
+    t.true_(wait_until(function() return ok2 end), "materialize")
+
+    local idx_image, last_tool
+    for i, m in ipairs(wire) do
+      if m.role == "tool" then last_tool = i end
+      if m.role == "user" and type(m.content) == "table" then
+        for _, p in ipairs(m.content) do
+          if p.type == "image" then idx_image = i end
+        end
+      end
+    end
+    t.not_nil(idx_image, "图像已注入")
+    t.not_nil(last_tool, "存在 tool 结果消息")
+    t.true_(idx_image > last_tool, "图像 user 消息排在本轮全部 tool 消息之后")
+
+    -- 校验 tool_calls 后紧邻的 tool 消息覆盖全部 tool_call_id
+    for i, m in ipairs(wire) do
+      if m.role == "assistant" and m.tool_calls and #m.tool_calls > 0 then
+        local need = {}
+        for _, tc in ipairs(m.tool_calls) do need[tc.id] = true end
+        local j = i + 1
+        while wire[j] and wire[j].role == "tool" do
+          if wire[j].tool_call_id then need[wire[j].tool_call_id] = nil end
+          j = j + 1
+        end
+        for id, _ in pairs(need) do
+          error("tool_call " .. id .. " 后缺少紧随的 tool 结果")
+        end
+      end
+    end
+  end)
+
   it("read_image 工具：门禁 + 成功注入", function(t)
     local registry = require("NeoAI.tools.registry")
     local att = require("NeoAI.core.attachment.attachment")
@@ -301,5 +355,27 @@ tests.suite("multimodal", function(_, it, before_each)
     -- 清理：停服务器 + 删除静态目录
     pcall(vim.fn.jobstop, server_job)
     os.execute("rm -rf /tmp/opencode/neoai_www")
+  end)
+
+  it("read_image：相对路径 ./ 规范化为无 ./ 的绝对路径", function(t)
+    local registry = require("NeoAI.tools.registry")
+    if not registry.has("read_image") then require("NeoAI.tools").reload_tools() end
+    local tool = registry.get("read_image")
+    t.not_nil(tool, "read_image 已注册")
+    os.execute("mkdir -p /tmp/opencode/imsub/_crops")
+    local f = io.open("/tmp/opencode/imsub/_crops/ck.png", "wb")
+    f:write(PNG)
+    f:close()
+    local saved = vim.fn.getcwd()
+    vim.fn.chdir("/tmp/opencode/imsub")
+    local ok, res = false, nil
+    local err = nil
+    tool.func({ file_path = "./_crops/ck.png" }, function(r) res = r; ok = true end,
+      function(e) err = e end, { agent = { model = "deepseek-v4-flash-vision-exp" } })
+    t.true_(wait_until(function() return ok or err ~= nil end), "read_image 应返回")
+    vim.fn.chdir(saved)
+    os.execute("rm -rf /tmp/opencode/imsub")
+    t.eq(nil, err, "相对 ./ 路径应可读: " .. tostring(err))
+    t.eq("/tmp/opencode/imsub/_crops/ck.png", res.path, "应规范化为无 ./ 的绝对路径")
   end)
 end)

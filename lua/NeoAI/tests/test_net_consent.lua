@@ -172,4 +172,62 @@ tests.suite("net_consent", function(_, it)
     hp.reset()
     nc.reset()
   end)
+
+  it("软件源自动放行：镜像免弹窗，非软件源仍按策略，可关闭/扩展", function(t)
+    local hp = require("NeoAI.sandbox.host_proxy")
+    local nc = require("NeoAI.sandbox.net_consent")
+    hp.reset()
+    nc.reset()
+
+    -- 内置匹配（含子域）
+    t.true_(hp._is_package_source("pypi.org"), "pypi.org")
+    t.true_(hp._is_package_source("files.pythonhosted.org"), "pythonhosted 子域")
+    t.true_(hp._is_package_source("pypi.tuna.tsinghua.edu.cn"), "清华镜像子域")
+    t.true_(hp._is_package_source("mirrors.aliyun.com"), "阿里镜像")
+    t.true_(hp._is_package_source("registry.npmjs.org"), "npm")
+    t.true_(hp._is_package_source("cache.npmmirror.com"), "npmmirror 子域")
+    t.true_(hp._is_package_source("archive.ubuntu.com"), "apt")
+    -- 边界：后缀/域名内嵌欺骗不匹配
+    t.false_(hp._is_package_source("evilpypi.org"), "非子域后缀欺骗")
+    t.false_(hp._is_package_source("pypi.org.evil.com"), "域名内嵌欺骗")
+    t.false_(hp._is_package_source("example.com"), "普通外部")
+
+    -- 门禁：外部软件源免弹窗（无 UI）放行
+    local allowed, reason
+    hp._gate(false, "pypi.tuna.tsinghua.edu.cn", 443, {}, "http",
+      function(a, r) allowed, reason = a, r end)
+    t.true_(allowed, "外部软件源应放行")
+    t.eq("allow_source", reason)
+
+    -- 非软件源外部目标：默认 ask + 无 UI → 失败关闭
+    local allowed2, reason2, done = nil, nil, false
+    hp._gate(false, "example.com", 443, {}, "http",
+      function(a, r) allowed2, reason2 = a, r; done = true end)
+    vim.wait(1000, function() return done end, 10)
+    t.true_(done, "非软件源门禁应回调")
+    t.false_(allowed2, "非软件源外部目标应失败关闭")
+    t.eq("external_blocked", reason2)
+
+    -- 本机目标即便域名像软件源也不放行（SSRF 防护）
+    local allowed3, done3 = nil, false
+    hp._gate(true, "pypi.org", 443, {}, "http",
+      function(a) allowed3 = a; done3 = true end)
+    vim.wait(1000, function() return done3 end, 10)
+    t.false_(allowed3, "解析到本机不应放行")
+
+    -- 关闭开关：不自动放行
+    with_config({ tools = { sandbox = { network = { auto_allow_sources = false } } } }, function()
+      t.false_(hp._is_package_source("pypi.org"), "关闭后不匹配软件源")
+    end)
+
+    -- 用户扩展源（精确 + 子域）
+    with_config({ tools = { sandbox = { network = { extra_package_sources = { "pypi.mycorp.com" } } } } }, function()
+      t.true_(hp._is_package_source("pypi.mycorp.com"), "扩展源精确匹配")
+      t.true_(hp._is_package_source("sub.pypi.mycorp.com"), "扩展源子域匹配")
+    end)
+
+    hp.stop()
+    hp.reset()
+    nc.reset()
+  end)
 end)

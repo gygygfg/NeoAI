@@ -192,6 +192,15 @@ is only kept for other `approval.mode` values (`prompt`/`strict`).
     (including directories) to a worker; staged access waits via `_await_rotation` for the
     migration to finish (usually already done, so the wait is 0). At agentEnd, long sessions with
     many unpublished changes no longer copy file-by-file on the main thread.
+  - **Wait for in-flight postprocess before rotation / resident (re)creation**:
+    `merge_candidate_async` registers `state.workspace` entries first and writes the staged copies
+    asynchronously. If `rotate_session` migrates before those writes finish, the missing staged
+    copies are treated as deletions and materialized as whiteouts; if a resident instance is created
+    before materializing, its fresh overlay is missing files — both show up as "command products roll
+    back between tool calls" (an install reports many packages, the next command sees far fewer).
+    Therefore `rotate_session` and `resident.ensure` (create/rebuild only) first `await_postprocess`
+    (bounded by `shutdown_timeout_ms`), and rotation scheduling is deferred while
+    `postprocess_pending()` (bounded ~30s).
   - **Incremental pending index**: `review._pending_items` caches PENDING items (sorted by
     created_at); `supersede_by_paths` / package merging no longer filter + sort **all** change
     units (including terminal ones) on every call; any write invalidates the cache.
@@ -402,10 +411,20 @@ is only kept for other `approval.mode` values (`prompt`/`strict`).
      `apt update`.
   The dropped count is recorded on the candidate's `dropped` field and surfaced in the review UI;
   the publish-time masked hard reject remains as defense in depth.
-- **Same-file supersede**: when the same file is edited again (a new candidate is enqueued) or
-  published directly, older `PENDING` change sets covering that path are marked `SUPERSEDED` and
-  their candidates discarded, so the queue keeps only the latest version
-  (`review.supersede_by_paths`).
+- **Same-file supersede (per-file granularity + incremental)**: when the same file is edited again
+  (a new candidate is enqueued) or published directly, an older `PENDING` change set has **only the
+  covered paths recorded as a "superseded" delta**; its remaining files stay pending
+  (`review.supersede_by_paths`; the delta is persisted as one small file per change set under
+  `reviews_removed/` and applied/filtered on read). The unit/candidate is **not re-encoded**: a
+  package install puts thousands of files in one change set, and rebuilding the candidate plus
+  rewriting the whole unit on every subsequent command that touches any of them is O(N) deep-copy +
+  JSON encode + write per call, causing per-round stalls in long sessions; the delta is O(overlapped
+  paths). The whole unit must **not** be discarded: a later command touching just one file (e.g.
+  `python -c "import pkg"` writing `__pycache__/*.pyc`) would otherwise drop the whole package's
+  `*.py`/`dist-info`; after approval the directory exists but `__init__.py` is missing → `ImportError
+  ... (unknown location)`, `pkg.__file__ is None` (empty namespace package). A unit is marked
+  `SUPERSEDED` only when **all** its effective files are covered; `atomic_group="git"`
+  objects/pointers are kept as a whole and are **not** split by per-file supersede.
 
 ### Static scan of indirect script execution (`tools.sandbox.script_scan`, on by default)
 
@@ -817,7 +836,8 @@ on stop — the **host systemd is never called and the host is never modified**.
 **Architecture (all parsing/implementation in Lua, only a thin entry inside the sandbox)**: all
 parsing and implementation live in `sandbox/systemd.lua`'s `M.exec(argv)` (returning
 `{stdout, stderr, code}`). Inside the sandbox, `/usr/bin/systemctl`, `/usr/bin/journalctl`,
-`/usr/bin/systemd-run` and `/usr/bin/systemd-analyze` are overridden by a **thin entry** generated
+`/usr/bin/systemd-run`, `/usr/bin/systemd-analyze`, `hostnamectl`, `timedatectl` and `dmesg` are
+overridden by a **thin entry** generated
 in `runtime._maintscript_stubs` (`--ro-bind` over the real binary paths; no more PATH-prepending
 `/tmp/.dynbin`). The entry is a bash file-IPC client: it writes
 argv (NUL-separated) into the host-bound inbox `/run/systemd/units`, waits for the response, then
@@ -865,8 +885,11 @@ sandbox-identifying comments/strings.
     and `is-system-running=running` stay self-consistent.
   - Missing-unit errors match real text: `Unit X not found.`, `Failed to start X: Unit X not
     found.` (code 5), `Unit X could not be found.` (status, code 4), `Unknown command verb 'X'.`
-    (code 1), etc. Output contains no "sandbox" wording.
-  - Types: `Type=simple` (default)/`exec` as long-lived services; `oneshot` runs to completion.
+    (code 1), etc. When the unit exists but has an unparseable/unsupported setting, the **sanitized
+    real reason** is passed through (e.g. `单元缺少 ExecStart…`, `不支持 socket 单元`) instead of
+    always lying with `Operation not permitted`. Output contains no "sandbox" wording.
+  - Types: `Type=simple` (default)/`exec` as long-lived services; `oneshot` runs to completion
+    (see "Type/user compatibility" above).
   - Dependencies: `Requires`/`Wants` pulled recursively, `After`/`Before` topologically ordered
     (bounded by `max_deps`).
   - Unit files are read from the **sandbox staging copy first** (units created/edited by the AI via
@@ -882,9 +905,8 @@ sandbox-identifying comments/strings.
   supports `--unit`/`-u`, `--wait` (wait for completion and propagate the unit's exit code),
   `--user`, `--setenv`/`-E`, `--working-directory`, and
   `-p WorkingDirectory=/Environment=/Description=`; without `--unit` it auto-names
-  `run-r<hex>.service`. `--scope`/`-t`/`--pty`/`-P`/`--pipe` (foreground/interactive IO) cannot be
-  reliably implemented through the facade and return an explicit error (instead of hitting the host
-  binary and reporting "cannot connect to bus"). Transient units show up in `list-units`/`is-active`;
+  `run-r<hex>.service`. `--pipe`/`-P`/`--pty`/`-t`/`--scope` run with foreground semantics and
+  **return the command output and exit code** (no real tty, but no more "not supported" error). Transient units show up in `list-units`/`is-active`;
   `--collect` is effectively automatic when the service is destroyed.
 - **`systemd-analyze` (boot analysis, routed to the facade)**: the in-sandbox
   `/usr/bin/systemd-analyze` is likewise overridden by the thin entry and forwarded to the facade.
@@ -894,14 +916,48 @@ sandbox-identifying comments/strings.
   segments + `… reached after …s in userspace.`), `blame` (services sorted by duration),
   `critical-chain`, `unit-paths`, and `--version`; the verb defaults to `time`. Unknown verbs return
   the real-style `Unknown command verb`.
+- **`hostnamectl` / `timedatectl` / `dmesg` (also routed to the facade)**: these need system D-Bus in
+  a real environment (hostnamectl/timedatectl would always fail with `Failed to connect to system
+  scope bus`) or the kernel buffer (dmesg returns `Operation not permitted` in a restricted
+  container). The facade synthesizes real-style output: `hostnamectl` (Static hostname/Icon/Chassis/
+  Machine ID/Boot ID/OS/Kernel/Architecture; `set-hostname` returns a real-style `Access denied`
+  without touching the host), `timedatectl` (Local/Universal/RTC time, time zone, sync/NTP; `show`
+  Key=Value; `set-*` returns `Access denied`), and `dmesg` (a synthetic kernel ring buffer honoring
+  `-T`/`--ctime` and `-l`/`--level`) with no host kernel info.
+- **Transient-unit consistency**: units created by `systemd-run` (no unit file) are first-class across
+  `status`/`show`/`cat`/`is-enabled` (`generated`)/`start`/`stop`/`restart`.
+- **`reset-failed`**: the facade has no persistent failed units, so it succeeds idempotently (real
+  semantics; no more `Unknown command verb`). Also `get-default`/`set-default`/`show-environment`/
+  `list-timers`/`list-sockets`/`list-jobs` are synthesized (real-style output, exit 0).
+- **ExecStart semantics match real systemd**: systemd specifiers are expanded (`%n`/`%N`/`%p`/`%i`/
+  `%u`/`%h`/`%t` …, `%%`→literal `%`; unknown specifiers are left literal); only `${VAR}` is expanded
+  (`$$`→`$`), bare `$VAR` is left literal (`ExecStart=/bin/sh -c 'i=1; [ $i -lt 2 ]'` is no longer
+  mis-expanded); argv is single-quoted per argument before handing to the service, preserving
+  boundaries. `oneshot` allows multiple `ExecStart=` lines (run sequentially with `&&`, failing on the
+  first failure); other types use the last one (later assignment wins); an empty `ExecStart=` resets
+  the list. `oneshot` `start` waits for exit and returns its exit code (a failure yields
+  `Job for X failed because the control process exited with error code`).
+- **Type/user compatibility**: `simple`/`exec` are long-running, `oneshot` returns on completion;
+  `notify`/`notify-reload`/`oneshot-notify`/`forking`/`dbus`/`idle` run **best-effort** with simple
+  semantics inside the sandbox (no `sd_notify` READY / daemonize child tracking). `User=`/`Group=`
+  are accepted and run as the fixed sandbox identity (the facade cannot switch users; no error).
+  Only an unknown `Type=` is rejected.
+- **Same private view**: when resolving unit files the facade reads `/run/systemd/system` (and other
+  unit roots under `/run`) from the **host-side session-private directory** bound as the sandbox's
+  `/run`, so units the AI writes to `/run/systemd/system` inside the sandbox are visible to
+  `systemctl` (and host `/run` runtime units do not leak); `sandbox.service` now shares the same
+  stable temporary roots as `run_command`/`exec`, so a service can see scripts/units the AI writes
+  under `/run`. Other paths (`/etc/systemd/system`, `/usr/lib/systemd/system`, …) prefer the
+  **whole-root overlay upper** (where command writes land) and the staging copy, so units the AI
+  writes to `/etc/systemd/system` are also visible to the facade.
 - **`journalctl`**: synthesized by the facade (`-- Logs begin at …` header + per-unit service logs;
   generic system lines when there are no logs, bounded by `-n <N>`), never falling through to the
   host's real `journalctl` (which would print `No journal files were found.`). Each line's timestamp
   **increments**, with `Logs begin/end` spanning the first/last, instead of all lines sharing one
   instant.
-- **Explicitly rejected (no host fallback, no hostop)**: `Type=notify`/`notify-reload`/`forking`/
-  `dbus`/`idle`, `.socket`/`.timer` units, `User=`/`Group=`, systemd specifiers (`%n` …),
-  `Requisite`/`BindsTo`/`PartOf`; plus host power/kernel-state operations
+- **Explicitly rejected (no host fallback, no hostop)**: `.socket`/`.timer` units, template/instance
+  units, `Requisite`/`BindsTo`/`PartOf`/`OnFailure` dependencies, unknown `Type=`; plus host
+  power/kernel-state operations
   `poweroff`/`reboot`/`halt`/`kexec`/`suspend`. Returns real-systemctl-style errors (e.g.
   `Failed to poweroff system via logind: Access denied`) and emits `SANDBOX_SYSTEMD_UNSUPPORTED`.
 - **Hostop fallback**: verbs the facade does not handle (e.g. `isolate`) or options targeting
@@ -939,8 +995,9 @@ sandbox-identifying comments/strings.
   `systemctl --user enable/disable` is handled by the facade's **fake parser** and its symlinks are
   staged under the user unit root (see "Fake systemd --user parser").
 - **Known limits**: template/instance units (`foo@bar.service`) are unsupported; `[Install] Also=` is
-  not expanded yet; `Type=notify/forking/dbus` etc. are still explicitly rejected (a real systemd
-  would run them, so this is a known detectable difference).
+  not expanded yet; `notify`/`forking`/`dbus` etc. can start but do **no READY notification or
+  daemonize child tracking** (best-effort simple semantics), so their observable behavior differs
+  from a real systemd (a known detectable difference).
 
 ### Fake systemd --user parser (`tools.sandbox.systemd.user`)
 
@@ -956,7 +1013,8 @@ the facade (`sandbox/systemd.lua`) with a **fake parser** covering only simple
   units the AI just wrote are visible immediately). Override via
   `tools.sandbox.systemd.user_unit_roots`.
 - **Parsing**: reuses the same `.service` parser as the system-level facade (`[Unit]` deps,
-  `[Service]` `Type`/`ExecStart`/`Environment`/`WorkingDirectory`; only `simple`/`exec`/`oneshot`).
+  `[Service]` `Type`/`ExecStart` with specifier & env expansion/`Environment`/`WorkingDirectory`;
+  the same type set as the system-level facade).
   `start` hands `ExecStart` to `sandbox.service` to run in the sandbox; `is-active`/`status` are
   synthesized from service state.
 - **Namespace isolation**: user unit service keys are prefixed `user-unit:`, separate from system
@@ -971,7 +1029,8 @@ the facade (`sandbox/systemd.lua`) with a **fake parser** covering only simple
 - **Config**: `tools.sandbox.systemd.user = { enabled }` (on by default; with `enabled=false`,
   `systemctl --user` reports a clear error). `tools.sandbox.systemd.user_unit_roots` customizes the
   user unit roots.
-- **Limits**: this is **fake** semantics — `Type=notify/forking/dbus` etc. are unsupported; and
+- **Limits**: this is **fake** semantics — `notify`/`forking`/`dbus` etc. run best-effort with simple
+  semantics (no READY/daemonize tracking); and
   `systemctl --user` is handled by the facade whether it is standalone or inside a
   script/pipeline (the latter forwards over the in-sandbox entry IPC, see "systemctl facade").
 
@@ -1213,8 +1272,13 @@ defense-in-depth to the bwrap prefix by default (`--cap-drop ALL` plus the tier 
   `~/.git-credential-cache`, `~/.netrc`, `~/.ssh`, `~/.gnupg`, `~/.config/gh`, for both root and
   `/home/*` users), plus
   read-surface leaks such as `/etc/shadow`, `/etc/gshadow`, `/etc/sudoers`, `/etc/machine-id`,
-  `/etc/ssh`, `/var/log`, `/var/spool/cron` and root shell history.
-  Masks are mounted after the writable-root overlays so they take effect.
+  `/etc/ssh`, `/etc/fstab` (host disk layout / root filesystem UUID, which would also make
+  `mount -o remount,rw /` resolve by the host UUID and fail), `/var/log`, `/var/spool/cron` and
+  root shell history.
+  Masks are mounted after the writable-root overlays so they take effect. Hence `mount` /
+  `/proc/mounts` / `findmnt` consistently show an **overlay/tmpfs** root inside the sandbox, and
+  `mount -o remount,rw /` returns kernel `EPERM` (no more host-fstab-derived "ext4 root / host
+  UUID" contradiction).
   In-process `read`/`fs_write` tools do not go through a namespace, so mount masking does not apply;
   the executor additionally queries `runtime.is_masked_path` for path arguments and **hard-rejects**
   hits (`路径位于宿主敏感遮蔽路径`, no approval), covering `read_file`/`search_files`/`edit_file`
@@ -1226,8 +1290,12 @@ defense-in-depth to the bwrap prefix by default (`--cap-drop ALL` plus the tier 
   after the command, leaving the host disk untouched. Only the important config files/credentials in
   `mask_paths` (see above) plus the sandbox's own storage are masked — i.e. "everything is
   readable/writable except important config files", so `/opt`, `/srv`, other project dirs, … are
-  writable. `mask_dirs` (`/home`, `/root` sibling dirs) are no longer mount-masked. When the overlay
-  is unavailable it falls back to a read-only root (`overlay_fail_closed` decides whether to degrade).
+  writable. `mask_dirs` (`/home`, `/root` sibling dirs) are no longer mount-masked. The root
+  overlay's primary upper/work live under the sandbox store root; when nesting an overlay on top of
+  an overlay (common in containers) would fail with EINVAL, it automatically uses tmpfs
+  (`/dev/shm`, `/run`) for upper/work instead, so the root does not fall back to read-only (and the
+  AI is less likely to notice a read-only filesystem). When the overlay is unavailable it falls back
+  to a read-only root (`overlay_fail_closed` decides whether to degrade).
   > **"System dirs are writable" is by design, not a defect**: `/usr/bin`, `/etc`, etc. appear
   > writable because the whole root is exposed as a **writable overlay** — writes only land in the
   > session-private upper and are frozen as review candidates; **the host disk is untouched**.
@@ -1385,18 +1453,30 @@ commands (SSRF, e.g. host admin panels, internal ports, cloud metadata):
   `sandbox/net_consent`. Headless / no UI fails closed (deny). A `sandbox:net_consent_requested`
   event is emitted on each request. Long-lived services auto-register internal ports declared via
   `PORT`/`--port` etc. (`net_consent.register_from_command`).
+- **Software-source auto-allow (`network.auto_allow_sources`, on by default)**: so that package
+  installs are not intercepted by the consent gate, access to **external** software sources
+  (PyPI/pythonhosted, npm/npmmirror, crates/rust-lang, proxy.golang.org/goproxy, Maven,
+  Debian/Ubuntu/Alpine/Docker repos, and public mirrors such as `tuna.tsinghua.edu.cn`,
+  `mirrors.aliyun.com`, `mirrors.ustc.edu.cn`) through the proxy is **allowed without a prompt**
+  (recorded as `allow_source`). It only applies when the target is judged **non-host-local**:
+  resolving to the host, or failed DNS (fail-closed), is still denied as host-local, so SSRF
+  protection is unchanged; `access="deny"` still denies. Add private/self-hosted mirrors via
+  `network.extra_package_sources` (subdomains match automatically); set `auto_allow_sources=false`
+  to disable the carve-out.
 - **Boundary (important)**: this is **application-layer** filtering. **Raw TCP that ignores the
   proxy** (`nc`/`ssh`/database clients, tools ignoring proxy env) can connect directly to the host
   under a shared netns and is not covered. Hard-interception of raw TCP requires either root +
   iptables/nft (destination-based filtering) or rootless `slirp4netns`/`passt` (native userspace
   network stacks, not installed here) — this plugin does not add those dependencies. So this is a
   **non-hard boundary**; see the `sandbox/host_proxy.lua` module header.
-- **Proxy-evasion gate**: explicitly clearing/bypassing the proxy (`unset *proxy`, `env -u *proxy`,
-  `curl --noproxy`, `--proxy ""`/`-x ''`, `export *proxy=`) defeats the filter above; the gate rejects
-  it on the **folded effective command** before entering the sandbox (`PROXY_EVASION:*`,
-  `network.block_proxy_evasion`, default on). It normalizes shell quoting/ANSI-C/escapes and expands
-  same-command variables before matching (defeating `--noprox''y`/`$'--noproxy'`/`$c`), and treats
-  `-x` as `--proxy` only for curl (so `set -x` is not a false positive).
+- **Proxy-evasion confirmation**: explicitly clearing/bypassing the proxy (`unset *proxy`,
+  `env -u *proxy`, `curl --noproxy`, `--proxy ""`/`-x ''`, `export *proxy=`) defeats the filter above;
+  the gate detects it on the **folded effective command** before entering the sandbox
+  (`PROXY_EVASION:*`) and, by default, **pauses the agent and prompts** (`network.block_proxy_evasion=true`:
+  allow once / always this session / deny). `"deny"` rejects outright (old hard reject), `false` does
+  not intercept. It normalizes shell quoting/ANSI-C/escapes and expands same-command variables before
+  matching (defeating `--noprox''y`/`$'--noproxy'`/`$c`), and treats `-x` as `--proxy` only for curl
+  (so `set -x` is not a false positive). Headless (no attached UI) fails closed.
 - **Residual information leak (inherent to a shared netns)**: because T0 shares the host network
   namespace, `/proc/net/tcp`, `/proc/net/unix` (host connection/Unix-socket tables) and
   `ip addr`/`ip route` (netlink, host topology) are visible to the sandbox. `/proc/net` is a
@@ -1479,7 +1559,9 @@ require("NeoAI").setup({
         "/root/.config/herdr", "/etc/1panel", "/root/.ssh", "/root/.aws", "/root/.gnupg",
         "/root/.git-credentials", "/root/.config/git/credentials", "/root/.config/gh",
         "/home/*/.ssh", "/home/*/.gnupg", "/home/*/.git-credentials", "/home/*/.config/gh",
-        "/etc/shadow", "/etc/gshadow", "/etc/machine-id", "/etc/ssh", "/var/log",
+        "/etc/shadow", "/etc/gshadow", "/etc/machine-id", "/etc/ssh",
+        "/etc/fstab",                -- host disk layout / root UUID (mount -o remount would use it)
+        "/var/log",
         "/root/.bash_history", "/root/.zsh_history",
       },
       mask_dirs_enabled = true,      -- masked-directories master switch (on by default)
@@ -2125,6 +2207,16 @@ the **fake key that will be used for replacement**. Options:
 **Headless (no UI) is fail-closed** (stops immediately). Fake keys never stop the agent, only warn +
 escalate.
 
+**Sending a secret to a non-whitelisted address** (real value or a fake that will be restored in the
+sandbox) is handled by the egress guard (`secret_egress.lua`, whitelist
+`tools.sandbox.secrets.trusted_services` + auto-trusted model-provider hosts): the agent is **paused**
+and a confirm popup asks whether to allow that address (allow once / add to whitelist / stop). Only
+**explicit destinations** are extracted (URL, `host:port`, `user@host`, IP literal, or a bare
+public-host-shaped name), so code identifiers such as `os.getenv` / `os.environ.get` / attribute
+access are **not** mistaken for an address. When the dedicated popup UI is not registered but Neovim
+is **interactive**, it falls back to the built-in `confirm` prompt (still pausing); truly headless
+(no attached UI) remains fail-closed.
+
 > **Env-var names are not raw secrets**: the mapping registers **credential values** only, never a
 > sensitive env-var name itself. An assignment whose RHS is a name reference
 > (`api_key=DASHSCOPE_API_KEY`) is not registered; and even if a name-shaped value was registered by
@@ -2532,12 +2624,13 @@ mitigation can still be bypassed by more elaborate commands.
 - **Proxy evasion (mitigated)**: `host_local_block` relies on proxy env vars; explicitly clearing or
   bypassing them (`unset *proxy`, `env -u *proxy`, `curl --noproxy`, `--proxy ""`/`-x ''`,
   `export *proxy=`) defeats the filter and reaches the host directly. The gate detects this on the
-  **folded effective command** before entering the sandbox and rejects it (`PROXY_EVASION:*`),
-  controlled by `tools.sandbox.network.block_proxy_evasion` (default on). Detection first applies
-  shell normalization (quote concatenation `--noprox''y`, ANSI-C quoting `$'--noproxy'`, backslash
-  escapes) and expands simple same-command variables (`c=--noproxy; curl $c`) to defeat
-  concatenation/variable bypasses; `-x` is treated as `--proxy` only for curl, so `set -x` etc. are
-  not falsely rejected.
+  **folded effective command** before entering the sandbox (`PROXY_EVASION:*`) and by default
+  **pauses and prompts** (`tools.sandbox.network.block_proxy_evasion=true`: allow once / always this
+  session / deny); `"deny"` rejects outright and `false` allows without asking; headless with no UI
+  fails closed. Detection first applies shell normalization (quote concatenation `--noprox''y`,
+  ANSI-C quoting `$'--noproxy'`, backslash escapes) and expands simple same-command variables
+  (`c=--noproxy; curl $c`) to defeat concatenation/variable bypasses; `-x` is treated as `--proxy`
+  only for curl, so `set -x` etc. are not falsely rejected.
 - **Bare TCP (design boundary)**: tools that ignore the proxy (`nc`/`ssh`/DB clients/raw sockets) can
   connect to the host directly under a shared netns. Kernel-level destination filtering requires root
   + iptables/nft or `slirp4netns`/`passt` (not bundled). For a hard boundary enable `network.gateway`
@@ -2565,14 +2658,21 @@ mitigation can still be bypassed by more elaborate commands.
   Non-zero exits of query verbs (`is-active`/`is-enabled`/`is-failed`/`is-system-running`/`status`)
   are normal semantics and are not wrapped as `ok:false`.
 - **Entry consistency (fixed)**: parsing/implementation live in Lua; inside the sandbox
-  `systemctl`/`journalctl`/`systemd-run`/`systemd-analyze` are thin entries — standalone calls are
-  routed by the gate and script/pipeline calls forward over file IPC to the same facade, so **both
-  behave identically** and the "compound command hits the real binary and reports no bus"
-  contradiction no longer exists. `systemd-run` transient units run as in-sandbox background services
-  (`--wait` propagates the exit code); `systemd-analyze` `time`/`blame` etc. are synthesized;
-  start/stop/restart of baseline system units are idempotent successes (no more
-  `Operation not permitted`); verb-less `systemctl` is treated as `list-units` (so `--failed` etc.
-  work).
+  `systemctl`/`journalctl`/`systemd-run`/`systemd-analyze`/`hostnamectl`/`timedatectl`/`dmesg` are
+  thin entries — standalone calls are routed by the gate and script/pipeline calls forward over file
+  IPC to the same facade, so **both behave identically** and the "compound command hits the real
+  binary and reports no bus" contradiction no longer exists. `systemd-run` transient units are
+  first-class across status/show/cat/is-enabled/stop/restart (`--wait` propagates the exit code;
+  `--pipe`/`-P`/`--pty`/`--scope` return command output/exit code); `systemd-analyze` `time`/`blame`
+  and `hostnamectl`/`timedatectl`/`dmesg` are synthesized; `get-default`/`list-timers`/`list-sockets`/
+  `list-jobs`/`show-environment` are synthesized; start/stop/restart of baseline system units are
+  idempotent successes (no more `Operation not permitted`); verb-less `systemctl` is treated as
+  `list-units`; `reset-failed` succeeds; `ExecStart` uses real systemd `${VAR}` expansion plus `%`
+  specifiers, and `oneshot` start waits for the exit code; `notify`/`forking`/`dbus`/`idle` types and
+  `User=`/`Group=` are best-effort compatible; unparseable units pass through the sanitized real
+  reason (no more lying `Operation not permitted`); the facade reads `/run/systemd/system` (and
+  root-overlay upper for `/etc/systemd/system`) from the same session-private view; and host
+  `/etc/fstab` is masked (consistent overlay/tmpfs mount view).
 - **`service`/`invoke-rc.d` not routed (design boundary)**: the facade intercepts
   `systemctl`/`journalctl`/`systemd-run`/`systemd-analyze`; `service`/`invoke-rc.d` are only shimmed for **package installs**
   (policy-rc.d; services do not really start). For user-level services use `systemctl --user`

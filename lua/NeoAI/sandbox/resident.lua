@@ -438,6 +438,18 @@ function M.ensure(opts)
   end
 
   local specs = opts.specs or {}
+  -- 首次/重建常驻实例前，等待在途后台后处理（捕获/冻结/合并）完成：常驻实例是**新的 overlay
+  -- 视图**，需从最新的工作区暂存物化；若上一条命令的 merge 尚未写完暂存副本，常驻视图会缺文件
+  -- （表现为「命令产物在工具调用之间回退」）。仅在创建/重建时等待，不影响普通命令并发。
+  pcall(function()
+    local w = require("NeoAI.sandbox.wrapper")
+    if type(w.await_postprocess) == "function" then
+      local t = tonumber(require("NeoAI.kernel.config_store").get("tools.sandbox.shutdown_timeout_ms"))
+      if t == nil then t = 3000 end
+      if t < 0 then t = 0 end
+      w.await_postprocess(t)
+    end
+  end)
   -- 首次：挂载前把工作区暂存物化进 upper（宿主侧写入安全）。
   local conflicts = candidate.materialize_overlay(specs)
   if conflicts and #conflicts > 0 then

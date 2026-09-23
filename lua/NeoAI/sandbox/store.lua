@@ -58,6 +58,12 @@ local function _snapshots_dir()
   return state.root .. "/snapshots"
 end
 
+--- 变更单元「部分取代」增量目录：记录被更新候选覆盖的路径集合（每个 change_set 一个小文件）。
+--- 单独存放是为了让部分取代只需 O(重叠) 写入，而不必重编码含上万文件的整个变更单元/候选。
+local function _removed_dir()
+  return state.root .. "/reviews_removed"
+end
+
 --- 大文件内容 blob 目录：超过 `tools.sandbox.max_file_bytes` 的候选文件不再把内容嵌入候选
 --- JSON，而是把暂存副本复制到此处，候选条目仅记录 blob 路径（发布/物化时按文件复制）。
 local function _blobs_dir()
@@ -74,9 +80,10 @@ local function _ensure_dirs()
   fs.ensure_dir(_host_ops_dir())
   fs.ensure_dir(_snapshots_dir())
   fs.ensure_dir(_blobs_dir())
+  fs.ensure_dir(_removed_dir())
   -- 存储根与子目录收紧到 0700：候选/证据含未发布内容与命令详情，避免同机其他用户枚举/读取。
   -- （同 uid 的本地进程属信任边界之外，无法靠权限或摘要防住——见 docs/sandbox.md。）
-  for _, d in ipairs({ state.root, _candidates_dir(), _receipts_dir(), _reviews_dir(), _evidence_dir(), _host_ops_dir(), _snapshots_dir(), _blobs_dir() }) do
+  for _, d in ipairs({ state.root, _candidates_dir(), _receipts_dir(), _reviews_dir(), _evidence_dir(), _host_ops_dir(), _snapshots_dir(), _blobs_dir(), _removed_dir() }) do
     pcall(vim.uv.fs_chmod, d, 448) -- 0700
   end
   return true
@@ -530,6 +537,35 @@ function M.delete_review(change_set_id)
   return fs.delete_file(path)
 end
 
+--- 写入变更单元的「被取代路径」增量（部分取代：只记录被更新候选覆盖的路径，避免重编码整单元）。
+--- @param change_set_id string
+--- @param paths table<string, boolean>
+--- @return boolean ok
+function M.write_review_removed(change_set_id, paths)
+  if not _ensure_dirs() then return false end
+  local path = _removed_dir() .. "/" .. _safe_name(change_set_id) .. ".json"
+  _encode_and_write(path, { change_set_id = change_set_id, paths = paths or {} })
+  return true
+end
+
+--- 读取变更单元的被取代路径增量（无记录返回 nil）。
+--- @param change_set_id string
+--- @return table|nil { change_set_id, paths }
+function M.read_review_removed(change_set_id)
+  if not state.root then return nil end
+  return _read_json(_removed_dir() .. "/" .. _safe_name(change_set_id) .. ".json")
+end
+
+--- 删除变更单元的被取代路径增量。
+--- @param change_set_id string
+--- @return boolean
+function M.delete_review_removed(change_set_id)
+  if not state.root then return false end
+  local path = _removed_dir() .. "/" .. _safe_name(change_set_id) .. ".json"
+  _cancel_write(path)
+  return fs.delete_file(path)
+end
+
 --- 写入证据记录
 --- @param record table { evidence_id }
 --- @return boolean ok
@@ -742,6 +778,7 @@ function M.reset()
     pcall(vim.fn.delete, _host_ops_dir(), "rf")
     pcall(vim.fn.delete, _snapshots_dir(), "rf")
     pcall(vim.fn.delete, _blobs_dir(), "rf")
+    pcall(vim.fn.delete, _removed_dir(), "rf")
     -- 常驻实例的稳定 overlay/shell 目录（<root>/resident）：实例已由 resident.reset 停止，
     -- 此处清理其磁盘残留，避免跨 reset/跨套件复用过期 overlay 视图。
     pcall(vim.fn.delete, state.root:gsub("/+$", "") .. "/resident", "rf")

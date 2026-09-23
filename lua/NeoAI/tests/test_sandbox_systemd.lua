@@ -80,11 +80,11 @@ tests.suite("sandbox_systemd", function(_, it)
     t.not_nil(sd.parse_command("journalctl -n 3"))
   end)
 
-  it("unit 解析：Environment 展开与不支持语义报错", function(t)
+  it("unit 解析：Environment/说明符展开、User 兼容、未知类型报错", function(t)
     local sd = require("NeoAI.sandbox.systemd")
     local u, err = sd.parse_unit(
       "[Unit]\nDescription=Demo\nAfter=network.target\n[Service]\nType=simple\n"
-      .. "Environment=PORT=8080\nWorkingDirectory=/srv/app\nExecStart=/usr/bin/foo --port $PORT\n",
+      .. "Environment=PORT=8080\nWorkingDirectory=/srv/app\nExecStart=/usr/bin/foo --port ${PORT} $PORT\n",
       "demo.service")
     t.not_nil(u, tostring(err))
     t.eq("simple", u.type)
@@ -92,17 +92,51 @@ tests.suite("sandbox_systemd", function(_, it)
     t.eq("/srv/app", u.workdir)
     t.eq("/usr/bin/foo", u.argv[1])
     t.eq("8080", u.argv[3])
+    t.eq("$PORT", u.argv[4], "systemd 只展开 ${VAR}；裸 $PORT 原样保留")
 
-    local _, e1 = sd.parse_unit("[Service]\nType=notify\nExecStart=/bin/x\n", "n.service")
-    t.matches("不支持", e1 or "")
-    local _, e2 = sd.parse_unit("[Service]\nType=forking\nExecStart=/bin/x\n", "f.service")
-    t.matches("forking", e2 or "")
-    local _, e3 = sd.parse_unit("[Service]\nUser=nobody\nExecStart=/bin/x\n", "u.service")
-    t.matches("User", e3 or "")
-    local _, e4 = sd.parse_unit("[Service]\nExecStart=/bin/x %n\n", "s.service")
-    t.matches("说明符", e4 or "")
+    -- 说明符展开：%%→%，%n→全名、%N→去后缀、%p→前缀、%i→实例（非模板为空）。
+    local us = sd.parse_unit(
+      "[Service]\nExecStart=/usr/bin/foo %n %N %p 100%%\n", "demo.service")
+    t.not_nil(us, tostring(us and us.err))
+    t.eq("/usr/bin/foo", us.argv[1])
+    t.eq("demo.service", us.argv[2])
+    t.eq("demo", us.argv[3])
+    t.eq("demo", us.argv[4])
+    t.eq("100%", us.argv[5])
+    local ui = sd.parse_unit("[Service]\nExecStart=/bin/x@%i/\n", "tpl@inst.service")
+    t.not_nil(ui)
+    t.eq("/bin/x@inst/", ui.argv[1])
+
+    -- User=/Group= 兼容（沙箱以固定身份运行，不再拒绝）。
+    local uu, uerr = sd.parse_unit("[Service]\nUser=nobody\nGroup=nogroup\nExecStart=/bin/x\n", "u.service")
+    t.not_nil(uu, tostring(uerr))
+
+    -- notify/forking/dbus/idle 以 simple 语义 best-effort 执行（不再明确拒绝）。
+    for _, typ in ipairs({ "notify", "notify-reload", "forking", "dbus", "idle", "oneshot-notify" }) do
+      local ut = sd.parse_unit("[Service]\nType=" .. typ .. "\nExecStart=/bin/x\n", typ .. ".service")
+      t.not_nil(ut, typ .. " 应可解析")
+    end
+
+    -- 非 oneshot 多条 ExecStart：后写覆盖（取最后一条）。
+    local um = sd.parse_unit("[Service]\nExecStart=/bin/a\nExecStart=/bin/b\n", "m.service")
+    t.not_nil(um)
+    t.eq("/bin/b", um.argv[1])
+
+    -- oneshot 多条 ExecStart：顺序保留。
+    local uo = sd.parse_unit(
+      "[Service]\nType=oneshot\nExecStart=/bin/a\nExecStart=/bin/b\n", "o.service")
+    t.not_nil(uo)
+    t.eq(2, #uo.argv_list)
+    t.eq("/bin/a", uo.argv_list[1][1])
+    t.eq("/bin/b", uo.argv_list[2][1])
+    -- 空 `ExecStart=` 重置列表。
+    local _, ue = sd.parse_unit("[Service]\nExecStart=/bin/a\nExecStart=\n", "e.service")
+    t.matches("ExecStart", ue or "")
+
     local _, e5 = sd.parse_unit("[Service]\nType=simple\n", "m.service")
     t.matches("ExecStart", e5 or "")
+    local _, e6 = sd.parse_unit("[Service]\nType=banana\nExecStart=/bin/x\n", "b.service")
+    t.matches("Type", e6 or "")
   end)
 
   it("依赖闭包：Requires/Wants + After 排序、缺失依赖报错", function(t)
@@ -150,7 +184,7 @@ tests.suite("sandbox_systemd", function(_, it)
     write_unit(dir, "demo.service",
       "[Unit]\nDescription=Demo\n[Service]\nType=simple\nWorkingDirectory=" .. dir
       .. "\nExecStart=/bin/sleep 30\n")
-    write_unit(dir, "bad.service", "[Service]\nType=notify\nExecStart=/bin/true\n")
+    write_unit(dir, "bad.service", "[Service]\nType=simple\n")
 
     with_config({ tools = { sandbox = systemd_config({ dir }) } }, function()
       require("NeoAI.sandbox").reset()
@@ -171,7 +205,8 @@ tests.suite("sandbox_systemd", function(_, it)
       t.eq(0, atext.code)
 
       local bres = run_plan(sd, sd.parse_command("systemctl start bad.service"))
-      t.true_((bres.code or 0) ~= 0, "不支持类型应非零退出")
+      t.true_((bres.code or 0) ~= 0, "无效单元应非零退出")
+      t.matches("ExecStart", tostring(bres.stderr or ""), "应透传真实原因（而非笼统权限错误）")
       t.true_(not tostring(bres.stderr or ""):find("沙箱", 1, true), "错误不应暴露沙箱")
 
       local sdone
@@ -438,6 +473,183 @@ tests.suite("sandbox_systemd", function(_, it)
       t.eq(nil, err, tostring(err and err.message))
       t.matches("Startup finished in", tostring(text))
       t.true_(not tostring(text):find("connect to", 1, true), "不应报总线连接失败")
+    end)
+  end)
+
+  it("systemd-run 瞬态单元：status/cat/show/is-enabled/stop/restart 一致", function(t)
+    with_config({ tools = { sandbox = systemd_config({}) } }, function()
+      require("NeoAI.sandbox").reset()
+      local sd = require("NeoAI.sandbox.systemd")
+      local r1 = run_plan(sd, sd.parse_command("systemd-run --unit=__probe_tx.service /bin/sleep 30"), 10000)
+      t.eq(0, r1.code, tostring(r1.stderr))
+      local st = run_plan(sd, sd.parse_command("systemctl status __probe_tx.service"), 2000)
+      t.eq(0, st.code, tostring(st.stderr))
+      t.matches("active", st.stdout or "")
+      t.true_(not tostring(st.stderr):find("could not be found", 1, true))
+      local cat = run_plan(sd, sd.parse_command("systemctl cat __probe_tx.service"), 2000)
+      t.eq(0, cat.code, tostring(cat.stderr))
+      t.matches("transient", cat.stdout or "")
+      local show = run_plan(sd, sd.parse_command("systemctl show __probe_tx.service"), 2000)
+      t.matches("ActiveState=active", show.stdout or "")
+      t.matches("Transient=yes", show.stdout or "")
+      local en = run_plan(sd, sd.parse_command("systemctl is-enabled __probe_tx.service"), 2000)
+      t.eq("generated", (en.stdout or ""):gsub("%s+$", ""))
+      local re = run_plan(sd, sd.parse_command("systemctl restart __probe_tx.service"), 8000)
+      t.eq(0, re.code, tostring(re.stderr))
+      local on = run_plan(sd, sd.parse_command("systemctl is-active __probe_tx.service"), 2000)
+      t.eq("active", (on.stdout or ""):gsub("%s+$", ""))
+      local stop = run_plan(sd, sd.parse_command("systemctl stop __probe_tx.service"), 8000)
+      t.eq(0, stop.code, tostring(stop.stderr))
+      local off = run_plan(sd, sd.parse_command("systemctl is-active __probe_tx.service"), 2000)
+      t.eq("inactive", (off.stdout or ""):gsub("%s+$", ""))
+      require("NeoAI.sandbox.service").stop_all({ timeout_ms = 5000 })
+    end)
+  end)
+
+  it("systemctl reset-failed：幂等成功（不再 Unknown command verb）", function(t)
+    local sd = require("NeoAI.sandbox.systemd")
+    local p = sd.parse_command("systemctl reset-failed")
+    t.eq("facade", p.route)
+    local r = run_plan(sd, p, 2000)
+    t.eq(0, r.code)
+    t.eq("", r.stdout or "")
+    local r2 = run_plan(sd, sd.parse_command("systemctl reset-failed foo.service"), 2000)
+    t.eq(0, r2.code)
+  end)
+
+  it("hostnamectl/timedatectl/dmesg：门面合成（不再连 bus/EPERM）", function(t)
+    local sd = require("NeoAI.sandbox.systemd")
+    local h = run_plan(sd, sd.parse_command("hostnamectl"), 2000)
+    t.eq(0, h.code)
+    t.matches("Static hostname:", h.stdout or "")
+    t.matches("Machine ID:", h.stdout or "")
+    local td = run_plan(sd, sd.parse_command("timedatectl"), 2000)
+    t.eq(0, td.code)
+    t.matches("Time zone:", td.stdout or "")
+    local d = run_plan(sd, sd.parse_command("dmesg"), 2000)
+    t.eq(0, d.code)
+    t.matches("Linux version", d.stdout or "")
+    local dt = run_plan(sd, sd.parse_command("dmesg -T"), 2000)
+    t.eq(0, dt.code)
+    t.matches("%[%a%a%a ", dt.stdout or "")
+    local sh = run_plan(sd, sd.parse_command("hostnamectl set-hostname x"), 2000)
+    t.true_((sh.code or 0) ~= 0, "set-hostname 应拒绝（不修改宿主）")
+    t.matches("Access denied", sh.stderr or "")
+  end)
+
+  it("门面读取沙箱私有视图：/run/systemd/system 会话目录中的单元可见", function(t)
+    local runtime = require("NeoAI.sandbox.runtime")
+    local host = runtime.host_tmp_dir("/run") .. "/systemd/system/__probe_view.service"
+    vim.fn.mkdir(vim.fn.fnamemodify(host, ":h"), "p")
+    local f = assert(io.open(host, "w"))
+    f:write("[Unit]\nDescription=View Probe\n[Service]\nType=oneshot\nExecStart=/bin/true\n")
+    f:close()
+    local ok, err = pcall(function()
+      local sd = require("NeoAI.sandbox.systemd")
+      local cat = run_plan(sd, sd.parse_command("systemctl cat __probe_view.service"), 2000)
+      t.eq(0, cat.code, tostring(cat.stderr))
+      t.matches("View Probe", cat.stdout or "")
+      t.eq("facade", sd.parse_command("systemctl start __probe_view.service").route)
+    end)
+    os.remove(host)
+    if not ok then error(err, 0) end
+  end)
+
+  it("门禁：沙箱内写入 /run/systemd/system 的单元对 systemctl 可见", function(t)
+    with_config({
+      tools = { approval = { mode = "auto_allow" }, sandbox = systemd_config({}) },
+    }, function()
+      require("NeoAI.sandbox").reset()
+      local tools = require("NeoAI.tools")
+      local function run(cmd)
+        local out, done = nil, false
+        tools.execute("run_command", { command = cmd, description = "t", timeout_ms = 20000 }, {}):then_(
+          function(v) out = tostring(v); done = true end,
+          function(e) out = "ERR:" .. tostring(e and e.message or e); done = true end)
+        vim.wait(25000, function() return done end, 50)
+        return out
+      end
+      run("printf '[Unit]\\nDescription=Run Unit View\\n[Service]\\nType=oneshot\\nExecStart=/bin/true\\n'"
+        .. " > /run/systemd/system/__probe_run_unit.service")
+      t.matches("Run Unit View", run("systemctl cat __probe_run_unit.service"))
+      t.matches("rc=0", run("systemctl start __probe_run_unit.service; echo rc=$?"))
+    end)
+  end)
+
+  it("systemctl：get-default/list-timers/list-sockets/list-jobs/show-environment 可识别", function(t)
+    local sd = require("NeoAI.sandbox.systemd")
+    local function txt(cmd)
+      local p = sd.parse_command(cmd)
+      t.not_nil(p, cmd)
+      t.eq("facade", p.route, cmd)
+      local r = run_plan(sd, p, 2000)
+      t.true_((r.code or 0) == 0, cmd .. " rc=" .. tostring(r.code) .. " " .. tostring(r.stderr))
+      return tostring(r.stdout or "")
+    end
+    t.matches("target", txt("systemctl get-default"))
+    t.matches("timers listed", txt("systemctl list-timers"))
+    t.matches("sockets listed", txt("systemctl list-sockets"))
+    t.matches("No jobs", txt("systemctl list-jobs"))
+    t.eq("", txt("systemctl show-environment"):gsub("%s+$", ""))
+    local p = sd.parse_command("systemctl set-default multi-user.target")
+    t.eq(0, run_plan(sd, p, 2000).code)
+  end)
+
+  it("systemd-run --pipe/-P：回传输出与退出码（不再报不支持）", function(t)
+    with_config({ tools = { sandbox = systemd_config({}) } }, function()
+      require("NeoAI.sandbox").reset()
+      local sd = require("NeoAI.sandbox.systemd")
+      local p = sd.parse_command("systemd-run --pipe /bin/echo PIPED")
+      t.not_nil(p)
+      t.true_(p.pipe == true, "应识别 --pipe")
+      local r = run_plan(sd, p, 15000)
+      t.eq(0, r.code, tostring(r.stderr))
+      t.matches("PIPED", r.stdout or "")
+      t.true_(not tostring(r.stdout):find("Running as unit", 1, true), "pipe 不应打印 Running as unit")
+      local q = sd.parse_command("systemd-run -P /bin/sh -c 'exit 4'")
+      t.true_(q.pipe == true)
+      local r2 = run_plan(sd, q, 15000)
+      t.eq(4, r2.code, "应透传退出码")
+      require("NeoAI.sandbox.service").stop_all({ timeout_ms = 5000 })
+    end)
+  end)
+
+  it("oneshot：start 等待结束并按退出码返回", function(t)
+    local dir = vim.fn.tempname()
+    vim.fn.mkdir(dir, "p")
+    write_unit(dir, "ok.service", "[Service]\nType=oneshot\nExecStart=/bin/true\n")
+    write_unit(dir, "bad.service", "[Service]\nType=oneshot\nExecStart=/bin/sh -c 'exit 3'\n")
+    with_config({ tools = { sandbox = systemd_config({ dir }) } }, function()
+      require("NeoAI.sandbox").reset()
+      local sd = require("NeoAI.sandbox.systemd")
+      local ok = run_plan(sd, sd.parse_command("systemctl start ok.service"), 15000)
+      t.eq(0, ok.code, tostring(ok.stderr))
+      local bad = run_plan(sd, sd.parse_command("systemctl start bad.service"), 15000)
+      t.true_((bad.code or 0) ~= 0, "失败的 oneshot 应非零退出")
+      t.matches("failed", tostring(bad.stderr or "") .. tostring(bad.stdout or ""))
+      require("NeoAI.sandbox.service").stop_all({ timeout_ms = 5000 })
+    end)
+    vim.fn.delete(dir, "rf")
+  end)
+
+  it("门禁：沙箱内写入 /etc/systemd/system 的单元对 systemctl 可见", function(t)
+    with_config({
+      tools = { approval = { mode = "auto_allow" }, sandbox = systemd_config({}) },
+    }, function()
+      require("NeoAI.sandbox").reset()
+      local tools = require("NeoAI.tools")
+      local function run(cmd)
+        local out, done = nil, false
+        tools.execute("run_command", { command = cmd, description = "t", timeout_ms = 20000 }, {}):then_(
+          function(v) out = tostring(v); done = true end,
+          function(e) out = "ERR:" .. tostring(e and e.message or e); done = true end)
+        vim.wait(25000, function() return done end, 50)
+        return out
+      end
+      local w = run("printf '[Unit]\\nDescription=Etc Unit\\n[Service]\\nType=oneshot\\nExecStart=/bin/true\\n'"
+        .. " > /etc/systemd/system/__probe_etc_unit.service 2>&1 && echo WROTE")
+      if not tostring(w):find("WROTE", 1, true) then return end -- 环境无整机可写 overlay：跳过
+      t.matches("Etc Unit", run("systemctl cat __probe_etc_unit.service"))
     end)
   end)
 end)

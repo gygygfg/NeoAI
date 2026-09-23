@@ -27,6 +27,31 @@ local state = {
 
 local MAX_RECORDS = 4096
 
+--- 内置软件源域名后缀（包管理器索引/镜像）。这些是**外部**包源，非本机 SSRF 目标，免弹窗
+--- 放行不削弱本机防护；解析到本机或解析失败仍按本机拒绝（见 `_gate` 的 `not local_` 前置条件）。
+local PACKAGE_SOURCE_SUFFIXES = {
+  -- Python / PyPI
+  "pypi.org", "pythonhosted.org", "pypi.python.org",
+  -- npm / Node
+  "registry.npmjs.org", "registry.yarnpkg.com", "npmmirror.com", "npm.taobao.org",
+  -- Go
+  "proxy.golang.org", "sum.golang.org", "goproxy.cn", "goproxy.io",
+  -- Rust / Cargo
+  "crates.io", "static.crates.io", "index.crates.io", "static.rust-lang.org",
+  -- Maven / Java
+  "repo.maven.apache.org", "repo1.maven.org", "maven.aliyun.com",
+  -- 系统包源（Debian/Ubuntu/Alpine/Docker/nodesource）
+  "deb.debian.org", "security.debian.org", "archive.ubuntu.com", "security.ubuntu.com",
+  "ports.ubuntu.com", "mirrors.ubuntu.com", "dl-cdn.alpinelinux.org",
+  "download.docker.com", "deb.nodesource.com",
+  -- 国内公共镜像（覆盖其下全部子域/路径）
+  "tuna.tsinghua.edu.cn", "mirrors.aliyun.com", "mirrors.ustc.edu.cn",
+  "mirror.sjtu.edu.cn", "mirrors.zju.edu.cn", "mirrors.huaweicloud.com",
+  "mirrors.cloud.tencent.com", "mirrors.bfsu.edu.cn",
+  -- Conda / Ruby / PHP
+  "repo.anaconda.com", "conda.anaconda.org", "rubygems.org", "repo.packagist.org",
+}
+
 -- ========== 地址判定 ==========
 
 local function _strip_zone(ip)
@@ -171,6 +196,43 @@ local function _access_policy()
   return p
 end
 
+--- 软件源自动放行配置：`state.opts` 优先（测试/内部注入），否则读 config。
+--- @return boolean enabled
+--- @return table|nil extra 额外域名后缀数组
+local function _sources_config()
+  if state.opts.auto_allow_sources ~= nil or state.opts.package_sources ~= nil then
+    return state.opts.auto_allow_sources ~= false, state.opts.package_sources
+  end
+  local ok, cfg = pcall(function()
+    return require("NeoAI.kernel.config_store").get("tools.sandbox.network")
+  end)
+  cfg = (ok and type(cfg) == "table") and cfg or {}
+  return cfg.auto_allow_sources ~= false, cfg.extra_package_sources
+end
+
+--- 主机名是否属于已知软件源（内置后缀 + 用户扩展；子域自动匹配）。
+--- @param host string
+--- @return boolean
+local function _is_package_source(host)
+  if type(host) ~= "string" or host == "" then return false end
+  local enabled, extra = _sources_config()
+  if not enabled then return false end
+  local h = host:lower():gsub("%.$", "")
+  local function matches(pat)
+    pat = tostring(pat):lower()
+    return pat ~= "" and (h == pat or h:sub(-(#pat + 1)) == "." .. pat)
+  end
+  for _, pat in ipairs(PACKAGE_SOURCE_SUFFIXES) do
+    if matches(pat) then return true end
+  end
+  if type(extra) == "table" then
+    for _, pat in ipairs(extra) do
+      if type(pat) == "string" and matches(pat) then return true end
+    end
+  end
+  return false
+end
+
 --- 端口是否为已登记的沙箱内部服务端口
 --- @param port number
 --- @return boolean
@@ -213,6 +275,11 @@ local function _gate(local_, host, port, ips, proto, cb)
     end
   end
   local policy = _access_policy()
+  -- 软件源自动放行：外部包源（非本机）免弹窗，避免 pip/uv/npm/apt 安装被同意门禁拦截。
+  -- 本机目标（含 DNS 解析到本机）不走此分支，SSRF 防护不削弱；access="deny" 时仍拒绝。
+  if not local_ and policy ~= "deny" and _is_package_source(host) then
+    return cb(true, "allow_source")
+  end
   if policy == "allow" then return cb(true, local_ and "allow_local" or "allow") end
   if policy == "deny" then return cb(false, block_reason) end
   local ok, nc = pcall(require, "NeoAI.sandbox.net_consent")
@@ -707,6 +774,16 @@ end
 --- 测试/内部：异步本机判定（不阻塞主线程）
 function M._classify_async(host, cb)
   return _classify_async(host, cb)
+end
+
+--- 测试/内部：软件源判定
+function M._is_package_source(host)
+  return _is_package_source(host)
+end
+
+--- 测试/内部：访问门禁（异步回调 allow/reason）
+function M._gate(local_, host, port, ips, proto, cb)
+  return _gate(local_, host, port, ips, proto, cb)
 end
 
 --- 重置（测试用）

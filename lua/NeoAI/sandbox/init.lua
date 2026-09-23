@@ -84,7 +84,21 @@ local function _rehydrate_pending()
       or (st == review.REVIEW.APPROVED and ap == review.APPLY.NOT_REQUESTED)
     if keep then
       local cand = store.read_candidate(item.candidate_digest)
-      if cand then pcall(candidate.merge_candidate, cand) end
+      if cand then
+        -- 部分取代增量：被更新候选覆盖的路径不再物化（由新单元持有）。
+        local sup = item.superseded_paths
+        if type(sup) == "table" and next(sup) then
+          local filtered = {}
+          for _, f in ipairs(cand.files or {}) do
+            if not sup[f.path] then filtered[#filtered + 1] = f end
+          end
+          local copy = {}
+          for k, v in pairs(cand) do copy[k] = v end
+          copy.files = filtered
+          cand = copy
+        end
+        pcall(candidate.merge_candidate, cand)
+      end
     end
   end
 end
@@ -206,13 +220,21 @@ function M.watch_sessions()
     end
     local function rotate_when_idle(tries)
       local resident = require("NeoAI.sandbox.resident")
-      if resident.busy() and tries > 0 then
+      -- 同时在途命令与后台后处理（捕获/冻结/合并）时延迟轮换：合并的暂存写入是异步的，
+      -- 若在写完前轮换，缺失的暂存副本会被误判为删除并物化成 whiteout（命令产物回退）。
+      local busy = resident.busy()
+      if not busy then
+        local ok, wrapper = pcall(require, "NeoAI.sandbox.wrapper")
+        busy = ok and type(wrapper.postprocess_pending) == "function" and wrapper.postprocess_pending()
+      end
+      if busy and tries > 0 then
         vim.defer_fn(function() rotate_when_idle(tries - 1) end, 500)
         return
       end
       do_rotate()
     end
-    rotate_when_idle(20)
+    -- 上限约 30s：后处理异常卡住时不永久推迟轮换（rotate_session 内仍有有界等待兜底）。
+    rotate_when_idle(60)
   end
   for _, ev in ipairs({
     events.GENERATION_COMPLETED,

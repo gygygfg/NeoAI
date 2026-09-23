@@ -1100,6 +1100,26 @@ tests.suite("sandbox", function(_, it)
     end)
   end)
 
+  it("沙箱会话：轮换前等待在途后台后处理（避免 merge 暂存未写完被误判删除）", function(t)
+    local sandbox = require("NeoAI.sandbox")
+    local candidate = require("NeoAI.sandbox.candidate")
+    local wrapper = require("NeoAI.sandbox.wrapper")
+    local async = require("NeoAI.utils.async")
+    with_config({ tools = { sandbox = { workspace_root = vim.fn.tempname() .. "/sb" } } }, function()
+      sandbox.reset()
+      candidate.begin_session()
+      -- 模拟在途后处理（merge 暂存写入未完成）：注册一个待 resolve 的 Deferred。
+      local def = async.Deferred.new()
+      wrapper._set_postprocess_pending(def)
+      local resolved = false
+      vim.defer_fn(function() resolved = true; def:resolve(true) end, 60)
+      candidate.rotate_session()
+      t.true_(resolved, "轮换应等待在途后处理完成（否则暂存副本会被误判删除并物化成 whiteout）")
+      wrapper._reset_postprocess()
+      sandbox.reset()
+    end)
+  end)
+
   it("沙箱会话：目录暂存跨轮换保留为目录（不被误判删除）", function(t)
     local fs = require("NeoAI.utils.fs")
     local sandbox = require("NeoAI.sandbox")
@@ -1876,6 +1896,38 @@ tests.suite("sandbox", function(_, it)
     -- 恢复默认配置：缓存应按配置表引用失效，/root 重新命中
     t.eq("/root/other/x", runtime.outside_workspace("/root/other/x", "/root/proj"),
       "恢复默认后 /root 应重新命中")
+  end)
+
+  it("越界访问判定：软件包/依赖缓存目录不计入（避免审批悬浮窗刷屏）", function(t)
+    local runtime = require("NeoAI.sandbox.runtime")
+    local home = vim.fn.expand("~")
+    t.nil_(runtime.outside_workspace(home .. "/.cache/uv/archive-v0/x.py", "/root/proj"),
+      "~/.cache/uv 应忽略")
+    t.nil_(runtime.outside_workspace(home .. "/.npm/_cacache/x", "/root/proj"),
+      "~/.npm 应忽略")
+    t.nil_(runtime.outside_workspace(home .. "/.cargo/registry/cache/x", "/root/proj"),
+      "~/.cargo 应忽略")
+    t.eq(home .. "/other/x", runtime.outside_workspace(home .. "/other/x", "/root/proj"),
+      "非缓存 home 路径仍应命中")
+  end)
+
+  it("越界访问判定：trace_ignore_paths 可配置且变更后缓存失效", function(t)
+    local runtime = require("NeoAI.sandbox.runtime")
+    local home = vim.fn.expand("~")
+    with_config({ tools = { sandbox = { observe = { trace_ignore_paths = { "~/work/cache" } } } } }, function()
+      t.nil_(runtime.outside_workspace(home .. "/work/cache/a", "/root/proj"),
+        "自定义忽略目录应命中")
+      -- volatile_paths 始终合并：~/.cache/uv 仍忽略
+      t.nil_(runtime.outside_workspace(home .. "/.cache/uv/x", "/root/proj"),
+        "volatile_paths 合并后仍忽略")
+      t.eq(home .. "/other/x", runtime.outside_workspace(home .. "/other/x", "/root/proj"),
+        "其它 home 路径仍命中")
+    end)
+    -- 恢复默认：默认缓存目录重新忽略、自定义目录不再忽略
+    t.nil_(runtime.outside_workspace(home .. "/.cache/uv/x", "/root/proj"),
+      "恢复默认后缓存目录仍忽略")
+    t.eq(home .. "/work/cache/a", runtime.outside_workspace(home .. "/work/cache/a", "/root/proj"),
+      "恢复默认后自定义目录重新命中")
   end)
 
   it("证据：异步写入可 flush 落盘（观测留痕非阻塞）", function(t)

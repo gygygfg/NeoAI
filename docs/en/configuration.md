@@ -315,6 +315,7 @@ sandbox = {
     "/home/*/.ssh", "/home/*/.gnupg", "/home/*/.netrc", "/home/*/.git-credentials",
     "/home/*/.config/git/credentials", "/home/*/.config/gh", "/home/*/.docker/config.json",
     "/etc/shadow", "/etc/gshadow", "/etc/sudoers", "/etc/machine-id", "/etc/ssh",
+    "/etc/fstab",                  -- host disk layout / root UUID (mount -o remount uses it)
     "/var/log", "/var/spool/cron", "/etc/crontab",
     "/root/.bash_history", "/root/.zsh_history", "/root/.python_history", "/root/.wget-hsts",
   },
@@ -388,8 +389,10 @@ sandbox = {
   -- forward argv to the host facade and return the real stdout/stderr/exit code. Standalone calls are
   -- routed by the gate; script/pipeline calls go through the entry to the same facade; the host
   -- systemd is never called and the host is never modified. Supports simple/exec/oneshot and
-  -- Requires/Wants/After/Before dependencies; Type=notify/forking/dbus and socket/timer units fail
-  -- explicitly; verbs the facade does not handle fall back to the existing T2/hostop proposal path.
+  -- Requires/Wants/After/Before dependencies, expanding `%` specifiers and `${VAR}`;
+  -- notify/forking/dbus/idle types and User=/Group= are best-effort compatible; socket/timer units,
+  -- template units and unknown Type fail explicitly (passing through the sanitized real reason);
+  -- verbs the facade does not handle fall back to the existing T2/hostop proposal path.
   systemd = {
     enabled = true,          -- master switch
     mode = "facade",         -- facade (default): handled inside the sandbox
@@ -423,7 +426,7 @@ sandbox = {
     -- host-local targets are blocked, external targets allowed and recorded. Application-layer
     -- boundary: raw TCP that ignores the proxy can bypass it (see docs/en/sandbox.md §6.1).
     host_local_block = true,
-    block_proxy_evasion = true,      -- when host_local_block is active, reject commands that explicitly clear/bypass proxies (unset *proxy, env -u, --noproxy, --proxy ""), preventing the filter from being defeated to reach the host directly
+    block_proxy_evasion = true,      -- proxy-evasion handling (when host_local_block is active): true (default) = pause and prompt (allow once / always this session / deny); "deny" = reject outright (old hard reject); false = do not intercept (bypass allowed, filter boundary defeated). Clearing/bypassing includes unset *proxy, env -u, --noproxy, --proxy "", etc.
     host_local_proxy_port = 0,       -- host filtering proxy port (0 = random loopback port)
     allow_localhost_ports = {},      -- localhost port allowlist (empty = block all): only loopback + these ports are allowed (e.g. self-testing a service inside the sandbox on 5432/6379); host NIC IPs / link-local / cloud metadata are never allowed. Temporary listeners started by sandbox commands are auto-registered by cgroup membership and need not be listed here
     -- Sandbox network access policy: processes/ports created inside the sandbox (loopback +
@@ -434,6 +437,8 @@ sandbox = {
     --   "allow"         = allow directly and record (previous behaviour);
     --   "deny"          = deny directly.
     access = "ask",
+    auto_allow_sources = true,       -- auto-allow software sources (default on): external package sources (PyPI, npm, crates, Tsinghua/Aliyun/USTC mirrors, …) used by pip/uv/npm/go/cargo/apt are allowed through the proxy without a prompt, so package installs are not intercepted by the consent gate. Only non-host-local targets qualify (resolve-to-host/failed DNS is still denied; SSRF protection unchanged); still denied when access="deny"
+    extra_package_sources = {},      -- extra software-source domain suffixes (private/self-hosted mirrors), e.g. { "pypi.mycorp.com" }; subdomains match automatically
     -- Proxy policy for sandbox external commands: strip (default: do not pass host proxies into the
     -- sandbox; e.g. mihomo only proxies opencode itself, avoiding an unreachable host
     -- HTTPS_PROXY=127.0.0.1:7890 breaking pip/npm) | passthrough (keep host proxies) |

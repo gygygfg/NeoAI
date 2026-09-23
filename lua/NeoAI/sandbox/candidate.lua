@@ -513,6 +513,20 @@ end
 --- @return string session_id 新会话 id
 function M.rotate_session()
   _await_rotation()
+  -- 轮换前等待在途后台后处理（捕获/冻结/合并）完成：`merge_candidate_async` 登记 `state.workspace`
+  -- 条目后，暂存副本的写入是异步的。若此时轮换，尚未写出的副本会被下方 `staged_exists` 判定为
+  -- 「缺失」而标记 `deleted=true`，随后物化为 whiteout（隐藏真实文件），表现为「命令产物在工具
+  -- 调用之间回退」（安装报大量包、下一条命令又变回少量）。等待有上限（`shutdown_timeout_ms`），
+  -- 避免后处理卡住时永久阻塞轮换。
+  do
+    local ok, wrapper = pcall(require, "NeoAI.sandbox.wrapper")
+    if ok and type(wrapper.await_postprocess) == "function" then
+      local timeout = tonumber(require("NeoAI.kernel.config_store").get("tools.sandbox.shutdown_timeout_ms"))
+      if timeout == nil then timeout = 3000 end
+      if timeout < 0 then timeout = 0 end
+      pcall(wrapper.await_postprocess, timeout)
+    end
+  end
   local old_dir = state.session_id and _workspace_dir() or nil
   local old_proc = state.process_dir_cache
   local old = state.workspace

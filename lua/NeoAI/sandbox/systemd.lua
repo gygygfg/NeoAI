@@ -54,20 +54,32 @@ local function _baseline(name, scope)
   return BASELINE_ACTIVE[name]
 end
 
--- 单元类型支持：simple/exec 长驻，oneshot 跑完即返回；其余明确不支持。
-local SUPPORTED_TYPES = { simple = true, exec = true, oneshot = true }
-local UNSUPPORTED_TYPES = {
-  notify = true, ["notify-reload"] = true, forking = true, dbus = true, idle = true,
-  ["oneshot-notify"] = true,
+-- 单元类型支持：simple/exec 长驻、oneshot 跑完即返回。notify/forking/dbus/idle 等按 **best-effort**
+-- 以 simple 语义在沙箱内执行（不做 sd_notify READY / daemonize 子进程跟踪）；仅未知类型明确报错。
+local SUPPORTED_TYPES = {
+  simple = true, exec = true, oneshot = true,
+  notify = true, ["notify-reload"] = true, ["oneshot-notify"] = true,
+  forking = true, dbus = true, idle = true,
 }
+
+--- oneshot 语义（start 阻塞到进程退出并按退出码返回）。
+--- @param typ string
+--- @return boolean
+local function _is_oneshot(typ)
+  return typ == "oneshot" or typ == "oneshot-notify"
+end
 
 -- 门面处理的动词。
 local SUPPORTED_VERBS = {
   start = true, stop = true, restart = true, status = true, ["is-active"] = true,
   ["is-enabled"] = true, show = true, cat = true, ["daemon-reload"] = true,
   ["list-units"] = true, ["list-unit-files"] = true,
+  ["list-timers"] = true, ["list-sockets"] = true, ["list-jobs"] = true,
+  ["get-default"] = true, ["set-default"] = true, ["show-environment"] = true,
   -- 环境探测类：合成「已启动/无失败」输出，避免暴露「非 systemd 环境」。
   ["is-system-running"] = true, ["is-failed"] = true,
+  -- 清除失败状态：门面无持久失败单元，幂等成功（真实 systemd 支持该动词）。
+  ["reset-failed"] = true,
 }
 
 -- 使「无动词的 systemctl」等价于 `list-units` 的选项（真实 systemctl 默认动词即 list-units）。
@@ -82,7 +94,7 @@ local LIST_OPTS = {
 local REJECT_VERBS = {
   enable = true, disable = true, reenable = true, mask = true, unmask = true,
   reload = true, ["reload-or-restart"] = true, ["try-reload-or-restart"] = true,
-  kill = true, ["reset-failed"] = true, edit = true, link = true, revert = true,
+  kill = true, edit = true, link = true, revert = true,
   isolate = true, ["switch-root"] = true, ["set-property"] = true,
   -- 宿主电源/内核状态：明确拒绝（绝不回退 hostop 在宿主执行）。
   poweroff = true, reboot = true, halt = true, kexec = true, suspend = true,
@@ -240,6 +252,15 @@ function M._plan_tokens(toks, raw)
   if bin == "systemd-analyze" then
     return M._parse_systemd_analyze(toks, i + 1, raw)
   end
+  if bin == "hostnamectl" then
+    return M._parse_simple_tool(toks, i + 1, raw, "hostnamectl", "status")
+  end
+  if bin == "timedatectl" then
+    return M._parse_simple_tool(toks, i + 1, raw, "timedatectl", "status")
+  end
+  if bin == "dmesg" then
+    return M._parse_simple_tool(toks, i + 1, raw, "dmesg", nil)
+  end
   if bin ~= "systemctl" and bin ~= "journalctl" then return nil end
   local kind = bin
   local argv = {}
@@ -353,15 +374,15 @@ local RUN_OPT_VALUE = {
 }
 
 --- 解析 `systemd-run`：临时单元（后台服务），支持 `--unit`/`--wait`/`--user`/
---- `--setenv`(`-E`)/`--working-directory`/`-p WorkingDirectory=`。`--scope`/`-t`/`-P` 等
---- 交互/前台 IO 语义无法经门面可靠实现，标记为不支持（由分发返回真实风格错误）。
+--- `--setenv`(`-E`)/`--working-directory`/`-p WorkingDirectory=`；`--pipe`/`-P`/`--pty`/`-t`/
+--- `--scope`（前台/管道 IO）按后台服务执行并回传输出与退出码（真实无 tty，但不再报不支持）。
 --- @param toks table
 --- @param i number 指向 `systemd-run` 之后的第一个 token
 --- @param raw string
 --- @return table|nil
 function M._parse_systemd_run(toks, i, raw)
   local unit, scope, wait = nil, "system", false
-  local workdir, env, unsupported = nil, {}, nil
+  local workdir, env, pipe = nil, {}, false
   local rest = {}
   while i <= #toks do
     local t = toks[i]
@@ -381,7 +402,9 @@ function M._parse_systemd_run(toks, i, raw)
         scope = "user"
       elseif name == "--scope" or name == "-t" or name == "--pty" or name == "-P"
         or name == "--pipe" or name == "--shell" then
-        unsupported = name
+        -- 前台/管道/交互 IO：以后台服务执行并等待，回传其输出与退出码（`--pipe` 语义）。
+        pipe = true
+        wait = true
       elseif name == "--property" or name == "-p" then
         local p = val
         if not p and toks[i + 1] then p = toks[i + 1]; i = i + 1 end
@@ -418,8 +441,8 @@ function M._parse_systemd_run(toks, i, raw)
   if #rest == 0 and not unit then return nil end
   return {
     kind = "systemd-run", verb = "run", route = "facade", scope = scope,
-    units = unit and { unit } or {}, argv = rest, wait = wait,
-    workdir = workdir, env = env, unsupported = unsupported, raw = raw,
+    units = unit and { unit } or {}, argv = rest, wait = wait, pipe = pipe,
+    workdir = workdir, env = env, raw = raw,
   }
 end
 
@@ -450,6 +473,36 @@ function M._parse_systemd_analyze(toks, i, raw)
   }
 end
 
+--- 通用解析：选项 + 可选动词 + 参数（hostnamectl/timedatectl/dmesg 共用）。
+--- @param toks table
+--- @param i number
+--- @param raw string
+--- @param kind string
+--- @param default_verb string|nil
+--- @return table
+function M._parse_simple_tool(toks, i, raw, kind, default_verb)
+  local opts, args, verb = {}, {}, nil
+  while i <= #toks do
+    local t = toks[i]
+    if t == "--" then
+      i = i + 1
+      while i <= #toks do args[#args + 1] = toks[i]; i = i + 1 end
+      break
+    elseif t:sub(1, 1) == "-" and t ~= "-" then
+      opts[#opts + 1] = t
+    elseif default_verb ~= nil and not verb then
+      verb = t
+    else
+      args[#args + 1] = t
+    end
+    i = i + 1
+  end
+  return {
+    kind = kind, verb = verb or default_verb, opts = opts, args = args,
+    units = {}, route = "facade", raw = raw,
+  }
+end
+
 --- 单元名归一化：无已知后缀则补 `.service`。
 --- @param name string
 --- @return string
@@ -460,11 +513,39 @@ local function _normalize_unit_name(name)
   return name .. ".service"
 end
 
---- 读取文件内容（优先沙箱暂存副本）。
+-- 会话私有临时根：仅 `/run`（/run/systemd/system、/run/systemd/user 是标准单元根）。沙箱内
+-- `/run` 绑定到宿主侧会话私有目录，门面必须读该目录（否则看不到沙箱写入，且会泄漏宿主运行时
+-- 单元）。`/tmp`、`/var/tmp` 非标准单元根，且自定义 unit_roots 可能位于其下，故不映射。
+local VIEW_TMP_ROOTS = { "/run" }
+
+--- 沙箱内路径若属于映射的临时根，映射到宿主侧会话私有目录；否则返回 nil。
+--- @param path string
+--- @return string|nil
+local function _guest_tmp_host(path)
+  local ok, runtime = pcall(require, "NeoAI.sandbox.runtime")
+  if not ok or type(runtime.host_tmp_dir) ~= "function" then return nil end
+  for _, root in ipairs(VIEW_TMP_ROOTS) do
+    if path == root or path:sub(1, #root + 1) == root .. "/" then
+      return runtime.host_tmp_dir(root) .. path:sub(#root + 1)
+    end
+  end
+  return nil
+end
+
+--- 读取文件内容（同一私有视图）：
+---   1. 临时根（`/tmp`、`/var/tmp`、`/run`）→ 宿主侧会话私有目录（**不回退**宿主真实目录）；
+---   2. 其余路径 → 优先沙箱暂存副本（overlay 上的 AI 编辑），否则宿主真实文件。
 --- @param path string
 --- @return string|nil content
 --- @return string|nil staged_path
 local function _read_view(path)
+  local mapped = _guest_tmp_host(path)
+  if mapped then
+    if not fs.exists(mapped) then return nil, nil end
+    local okc, c = pcall(fs.read_file, mapped)
+    if okc and type(c) == "string" then return c, mapped end
+    return nil, nil
+  end
   local staged = nil
   local ok, candidate = pcall(require, "NeoAI.sandbox.candidate")
   if ok and candidate and type(candidate.read_path) == "function" then
@@ -472,6 +553,17 @@ local function _read_view(path)
     if sp and fs.exists(sp) then staged = sp end
   end
   local read = staged or path
+  if not staged then
+    -- 整机根 overlay：命令写入 /etc、/usr 等落在 overlay upper（宿主真实路径看不到），
+    -- 门面须读 upper 才能与沙箱同一视图（否则 AI 写的单元 systemctl 看不到）。
+    local okr, runtime = pcall(require, "NeoAI.sandbox.runtime")
+    if okr and type(runtime.root_overlay_uppers) == "function" then
+      for _, up in ipairs(runtime.root_overlay_uppers()) do
+        local cand = up .. path
+        if fs.exists(cand) then read = cand; break end
+      end
+    end
+  end
   if not fs.exists(read) then return nil, staged end
   local ok2, content = pcall(fs.read_file, read)
   if not ok2 or type(content) ~= "string" then return nil, staged end
@@ -528,15 +620,53 @@ local function _get(sections, sec, key)
   return s[key][1], s[key]
 end
 
---- 展开 `$VAR` / `${VAR}`（`$$` → 字面 `$`）。未定义变量展开为空（systemd 语义）。
+--- 展开 `${VAR}`（`$$` → 字面 `$`）。未定义变量展开为空（systemd 语义）。
+--- **不**展开裸 `$VAR`：真实 systemd 只支持 `${VAR}`，裸 `$i` 原样传给进程（避免把
+--- `ExecStart=/bin/sh -c 'i=1; [ $i -lt 2 ]'` 里的 `$i` 误展开为空导致 `[: -lt:` 报错）。
 --- @param value string
 --- @param env table
 --- @return string
 local function _expand_env(value, env)
   local out = value:gsub("%$%$", "\1")
   out = out:gsub("%${([%w_]+)}", function(k) return env[k] or "" end)
-  out = out:gsub("%$([%w_]+)", function(k) return env[k] or "" end)
   return (out:gsub("\1", "$"))
+end
+
+--- 展开 systemd 说明符（`%n`/`%N`/`%p`/`%i`/`%u`/`%h`/`%t`…，`%%` → 字面 `%`）。
+--- 与真实 systemd 对齐：`%n` 单元全名、`%N` 去类型后缀、`%p` 前缀、`%i` 实例（非模板为空）、
+--- `%j` 前缀末段、`%u`/`%h`/`%s` 运行用户/家目录/shell、`%t`/`%T` 运行时/临时目录。
+--- 未知说明符保留原文（真实 systemd 会拒绝，这里 best-effort，避免把非说明符的 `%` 误删）。
+--- @param value string
+--- @param name string 单元全名（如 demo@inst.service）
+--- @return string
+local function _expand_specifiers(value, name)
+  local base = name:match("^(.*)%.[%w]+$") or name
+  local prefix, instance = base:match("^([^@]*)@(.*)$")
+  if not prefix then prefix, instance = base, "" end
+  local home = vim.fn.expand("~")
+  if home == "" or home == "~" then home = "/root" end
+  local uid = 0
+  pcall(function()
+    local pw = vim.uv.os_get_passwd()
+    if pw and pw.uid then uid = pw.uid end
+  end)
+  local map = {
+    ["%"] = "%",
+    n = name,
+    N = base,
+    p = prefix,
+    P = prefix,
+    i = instance,
+    I = instance,
+    j = prefix:match("([^/]+)$") or prefix,
+    u = os.getenv("USER") or os.getenv("LOGNAME") or "root",
+    U = tostring(uid),
+    h = home,
+    s = os.getenv("SHELL") or "/bin/sh",
+    t = "/run",
+    T = "/tmp",
+  }
+  return (value:gsub("%%(.)", function(c) return map[c] or ("%" .. c) end))
 end
 
 --- 按 shell 规则切分 ExecStart 参数（支持引号与反斜杠）。
@@ -612,43 +742,54 @@ function M.parse_unit(content, name)
   local svc = sections["Service"] or {}
   local typ = svc.Type and svc.Type[1] or "simple"
   typ = tostring(typ):gsub("%s+$", "")
-  if UNSUPPORTED_TYPES[typ] then
-    return nil, "沙箱环境不支持 Type=" .. typ .. "（仅支持 simple/exec/oneshot）"
-  end
   if not SUPPORTED_TYPES[typ] then
-    return nil, "沙箱环境不支持 Type=" .. typ
+    return nil, "Unit has an unsupported Type= setting: " .. typ
   end
 
   local env, eerr = _parse_environment(sections)
   if eerr then return nil, eerr end
 
+  -- ExecStart 列表：先展开说明符与环境变量，再切分 argv。空值 `ExecStart=` 表示重置列表
+  -- （systemd 语义）。oneshot 允许多条（顺序执行）；其余类型取最后一条（后写覆盖）。
   local exec_vals = svc.ExecStart or {}
-  if #exec_vals == 0 then
+  local exec_raws = {}
+  for _, raw in ipairs(exec_vals) do
+    local r = raw:match("^[%-@:+!]*(.*)$") or raw
+    r = _expand_specifiers(r, name)
+    r = _expand_env(r, env)
+    if r:match("^%s*$") then
+      exec_raws = {}
+    else
+      exec_raws[#exec_raws + 1] = r
+    end
+  end
+  if #exec_raws == 0 then
     return nil, "单元缺少 ExecStart（沙箱门面不支持无 ExecStart 的单元）"
   end
-  if #exec_vals > 1 and typ ~= "oneshot" then
-    return nil, "沙箱门面仅支持单个 ExecStart"
+  if not _is_oneshot(typ) and #exec_raws > 1 then
+    exec_raws = { exec_raws[#exec_raws] }
   end
-  local exec_raw = exec_vals[1]
-  if exec_raw:find("%%%a") then
-    return nil, "沙箱门面不支持 systemd 说明符（%" .. exec_raw:match("%%%a") .. "）"
+  local argv_list = {}
+  for _, r in ipairs(exec_raws) do
+    local argv, aerr = _split_args(r)
+    if aerr then return nil, "ExecStart 解析失败：" .. aerr end
+    if #argv == 0 then return nil, "ExecStart 为空" end
+    argv_list[#argv_list + 1] = argv
   end
-  exec_raw = exec_raw:match("^[%-@:+!]*(.*)$") or exec_raw
-  exec_raw = _expand_env(exec_raw, env)
-  local argv, aerr = _split_args(exec_raw)
-  if aerr then return nil, "ExecStart 解析失败：" .. aerr end
-  if #argv == 0 then return nil, "ExecStart 为空" end
+  local argv = argv_list[1]
+  local exec_raw = exec_raws[1]
 
   local workdir = nil
   local wd = _get(sections, "Service", "WorkingDirectory")
   if wd and wd ~= "" and wd ~= "-" then
     wd = wd:gsub("^%-", "")
-    workdir = _expand_env(wd, env)
+    workdir = _expand_env(_expand_specifiers(wd, name), env)
   end
 
-  if _get(sections, "Service", "User") or _get(sections, "Service", "Group") then
-    return nil, "沙箱门面不支持 User=/Group=（沙箱载荷统一以沙箱身份运行）"
-  end
+  -- User=/Group=：沙箱载荷以固定沙箱身份运行，无法在门面内切换用户；接受该设置并按当前
+  -- 沙箱身份执行（best-effort，不报错），使 `User=root` 等常见单元可正常启动。
+  local run_user = _get(sections, "Service", "User")
+  local run_group = _get(sections, "Service", "Group")
   if _get(sections, "Socket") then
     return nil, "沙箱环境不支持 socket 单元"
   end
@@ -683,9 +824,12 @@ function M.parse_unit(content, name)
     description = desc or name,
     type = typ,
     argv = argv,
+    argv_list = argv_list,
     exec = exec_raw,
     env = env,
     workdir = workdir,
+    user = run_user,
+    group = run_group,
     requires = requires,
     wants = wants,
     after = after,
@@ -720,6 +864,19 @@ local function _load_unit(name, scope)
       unit.path = path
       return unit, nil, path
     end
+  end
+  -- systemd-run 创建的瞬态单元没有单元文件，但在 sandbox.service 中有运行态：返回伪 unit
+  -- （含 command）使 start/stop/restart/status/show/cat 与文件单元一致处理。
+  local svc = _svc()
+  local key = (scope == "user" and "user-unit:" or "unit:") .. norm
+  local info = svc and svc.status(key) or nil
+  if info then
+    return {
+      name = norm, transient = true, command = info.command,
+      description = info.command or norm, type = "simple",
+      argv = {}, env = {}, workdir = info.cwd,
+      requires = {}, wants = {}, after = {}, before = {},
+    }, nil, nil
   end
   return nil, "Unit " .. norm .. " not found（沙箱内未找到该 unit 文件）"
 end
@@ -836,6 +993,16 @@ local function _unit_key(unit, scope)
   return (scope == "user" and "user-unit:" or "unit:") .. unit.name
 end
 
+--- 沙箱服务运行态（门面启动的单元 / systemd-run 瞬态单元）；无则 nil。
+--- @param name string
+--- @param scope string
+--- @return table|nil
+local function _runtime_info(name, scope)
+  local svc = _svc()
+  if not svc then return nil end
+  return svc.status(_unit_key({ name = name }, scope))
+end
+
 --- @param text string
 --- @return string
 local function _redact(text)
@@ -858,10 +1025,23 @@ local function _start_one(unit, scope)
   if not svc then return nil, "长驻服务模块不可用" end
   local key = _unit_key(unit, scope)
   local existing = svc.status(key)
-  if existing and existing.status == "running" then
+  if existing and (existing.status == "running" or existing.status == "exited") then
+    -- 已在运行，或 oneshot 已结束（真实 systemctl start 幂等）。
     return existing, nil
   end
-  local command = table.concat(unit.argv, " ")
+  local command
+  if unit.transient then
+    command = unit.command
+    if not command or command == "" then return nil, "瞬态单元缺少命令" end
+  else
+    -- 单元 ExecStart 是 argv（execvp 语义），交给服务的 shell 前逐参数单引号转义，
+    -- 保留参数边界（如 `sh -c 'exit 3'` 不能被拆成 `sh -c exit 3`）。oneshot 多条按序以
+    -- `&&` 串联（任一条失败即停止，与真实 systemd 的 oneshot 顺序执行语义一致）。
+    local list = unit.argv_list or { unit.argv }
+    local parts = {}
+    for _, a in ipairs(list) do parts[#parts + 1] = _quote_argv(a) end
+    command = table.concat(parts, " && ")
+  end
   local started, err = svc.start(key, command, {
     workdir = unit.workdir,
     cwd = unit.workdir,
@@ -870,6 +1050,61 @@ local function _start_one(unit, scope)
   })
   if not started then return nil, err or ("启动失败：" .. unit.name) end
   return started, nil
+end
+
+--- 等待单元进程结束（用于 oneshot：真实 `systemctl start` 会阻塞到单元退出）。
+--- @param name string
+--- @param scope string
+--- @return Deferred resolve(exit_code)
+local function _wait_service(name, scope)
+  local d = async.Deferred.new()
+  local deadline = vim.uv.now() + (tonumber(_cfg().start_timeout_ms) or 30000)
+  local function poll()
+    local info = _runtime_info(name, scope)
+    if not info or info.status == "exited" then
+      d:resolve(tonumber(info and info.exit_code) or 0)
+      return
+    end
+    if vim.uv.now() >= deadline then d:resolve(0); return end
+    vim.defer_fn(poll, 30)
+  end
+  poll()
+  return d
+end
+
+--- 按序启动单元；`oneshot` 启动后等待其结束（真实 `systemctl start` 会阻塞到单元退出），
+--- 退出码非零则返回真实风格错误。resolve `{ok=true}` 或 `{err=string}`。
+--- @param ordered table
+--- @param unitmap table
+--- @param scope string
+--- @return Deferred
+local function _start_ordered(ordered, unitmap, scope)
+  local d = async.Deferred.new()
+  local function step(i)
+    if i > #ordered then d:resolve({ ok = true }); return end
+    local name = ordered[i]
+    local unit = unitmap[name]
+    local svc, serr = _start_one(unit, scope)
+    if not svc then
+      d:resolve({ err = string.format("Failed to start %s: %s.", name, tostring(serr)) })
+      return
+    end
+    if _is_oneshot(unit.type) then
+      _wait_service(name, scope):then_(function(rc)
+        if rc ~= 0 then
+          d:resolve({ err = string.format(
+            "Job for %s failed because the control process exited with error code %d.\n"
+            .. 'See "systemctl status %s" and "journalctl -xe" for details.', name, rc, name) })
+        else
+          step(i + 1)
+        end
+      end, function() step(i + 1) end)
+    else
+      step(i + 1)
+    end
+  end
+  step(1)
+  return d
 end
 
 --- 停止一个单元（异步）。
@@ -1230,17 +1465,30 @@ end
 --- @return table names
 local function _enum_units(scope)
   local seen, names = {}, {}
-  for _, root in ipairs(_unit_roots(scope)) do
-    if fs.is_dir(root) then
-      for _, entry in ipairs(fs.list_dir(root) or {}) do
-        local n = type(entry) == "table" and entry.name or tostring(entry)
-        if n and not seen[n] then
-          local suf = n:match("(%.[%w]+)$")
-          if suf and vim.tbl_contains(KNOWN_SUFFIXES, suf) then
-            seen[n] = true
-            names[#names + 1] = n
-          end
+  local function scan(dir)
+    if not fs.is_dir(dir) then return end
+    for _, entry in ipairs(fs.list_dir(dir) or {}) do
+      local n = type(entry) == "table" and entry.name or tostring(entry)
+      if n and not seen[n] then
+        local suf = n:match("(%.[%w]+)$")
+        if suf and vim.tbl_contains(KNOWN_SUFFIXES, suf) then
+          seen[n] = true
+          names[#names + 1] = n
         end
+      end
+    end
+  end
+  for _, root in ipairs(_unit_roots(scope)) do
+    -- 临时根（/run/systemd/system 等）只扫宿主侧会话私有目录，不扫宿主真实目录。
+    local mapped = _guest_tmp_host(root)
+    if mapped then
+      scan(mapped)
+    else
+      scan(root)
+      -- 整机根 overlay upper：命令写入的单元（/etc/systemd/system 等）。
+      local okr, runtime = pcall(require, "NeoAI.sandbox.runtime")
+      if okr and type(runtime.root_overlay_uppers) == "function" then
+        for _, up in ipairs(runtime.root_overlay_uppers()) do scan(up .. root) end
       end
     end
   end
@@ -1257,7 +1505,33 @@ local function _status_block(name, scope)
   local norm, path = _unit_find(name, scope)
   local base = _baseline(norm, scope)
   if not path and not base then
-    return nil, "Unit " .. norm .. " could not be found.", 4
+    -- 瞬态单元（systemd-run）：无单元文件但有运行态，合成真实风格 status。
+    local rinfo = _runtime_info(norm, scope)
+    if not rinfo then return nil, "Unit " .. norm .. " could not be found.", 4 end
+    local active = "inactive"
+    if rinfo.status == "running" then active = "active"
+    elseif rinfo.status == "exited" and (tonumber(rinfo.exit_code) or 0) ~= 0 then active = "failed" end
+    local sub = (active == "active" and "running")
+      or (active == "failed" and "failed")
+      or (rinfo.status == "exited" and "exited" or "dead")
+    local dot = (active == "active") and "●" or "○"
+    local lines = {
+      string.format("%s %s - %s", dot, norm, tostring(rinfo.command or norm)),
+      string.format("     Loaded: loaded (/run/systemd/transient/%s; transient)", norm),
+    }
+    if active == "active" then
+      lines[#lines + 1] = string.format("     Active: active (%s) since %s; 0s ago", sub, _now_stamp())
+      if rinfo.pid then
+        lines[#lines + 1] = string.format("   Main PID: %d (%s)", rinfo.pid, norm:gsub("%.service$", ""))
+      end
+      lines[#lines + 1] = string.format("     CGroup: /system.slice/%s", norm)
+      if rinfo.pid then
+        lines[#lines + 1] = string.format("             └─%d %s", rinfo.pid, tostring(rinfo.command or norm))
+      end
+      return table.concat(lines, "\n"), nil, 0
+    end
+    lines[#lines + 1] = string.format("     Active: %s (%s)", active, sub)
+    return table.concat(lines, "\n"), nil, 3
   end
   local content = path and _read_view(path) or nil
   local sections = content and _parse_ini(content) or {}
@@ -1297,7 +1571,8 @@ local function _show_text(name, scope)
   local norm, path = _unit_find(name, scope)
   local active, _, info = _active_state(norm, scope)
   local is_baseline = info ~= nil and info.baseline == true
-  local loaded = (path or is_baseline) and "loaded" or "not-found"
+  local is_runtime = (not path) and info ~= nil and info.baseline ~= true
+  local loaded = (path or is_baseline or is_runtime) and "loaded" or "not-found"
   local sub = _sub_state(norm, scope)
   local lines = {
     "Type=simple",
@@ -1324,18 +1599,21 @@ local function _show_text(name, scope)
     if exec then lines[#lines + 1] = "ExecStart=" .. tostring(exec) end
     local wd = _get(sections, "Service", "WorkingDirectory")
     if wd then lines[#lines + 1] = "WorkingDirectory=" .. tostring(wd) end
+  elseif is_runtime then
+    lines[#lines + 1] = "Description=" .. tostring(info.command or norm)
+    lines[#lines + 1] = "ExecStart=" .. tostring(info.command or "")
   else
     lines[#lines + 1] = "Description=" .. norm
   end
   lines[#lines + 1] = "LoadState=" .. loaded
-  lines[#lines + 1] = "ActiveState=" .. ((path or is_baseline) and active or "inactive")
+  lines[#lines + 1] = "ActiveState=" .. ((path or is_baseline or is_runtime) and active or "inactive")
   lines[#lines + 1] = "SubState=" .. sub
-  lines[#lines + 1] = "CanStart=" .. (path and "yes" or "no")
+  lines[#lines + 1] = "CanStart=" .. ((path or is_runtime) and "yes" or "no")
   lines[#lines + 1] = "CanStop=yes"
   lines[#lines + 1] = "CanReload=no"
   lines[#lines + 1] = "NeedDaemonReload=no"
-  lines[#lines + 1] = "Transient=no"
-  if not path and not is_baseline then
+  lines[#lines + 1] = "Transient=" .. (is_runtime and "yes" or "no")
+  if not path and not is_baseline and not is_runtime then
     lines[#lines + 1] = string.format(
       'LoadError=org.freedesktop.systemd1.NoSuchUnit "Unit %s not found."', norm)
   end
@@ -1347,7 +1625,15 @@ end
 --- @return table
 local function _cat(name, scope)
   local norm, path = _unit_find(name, scope)
-  if not path then return _fail("No files found for " .. norm .. ".", 1) end
+  if not path then
+    -- 瞬态单元：合成真实 `systemctl cat` 的 `/run/systemd/transient/...` 视图。
+    local rinfo = _runtime_info(norm, scope)
+    if not rinfo then return _fail("No files found for " .. norm .. ".", 1) end
+    return _ok(string.format(
+      "# /run/systemd/transient/%s\n# This is a transient unit file, created programmatically via the systemd API. Do not edit.\n"
+      .. "[Unit]\nDescription=%s\n\n[Service]\nExecStart=%s",
+      norm, tostring(rinfo.command or norm), tostring(rinfo.command or "")))
+  end
   local content = _read_view(path) or ""
   return _ok("# " .. path .. "\n" .. content:gsub("%s+$", ""))
 end
@@ -1513,6 +1799,15 @@ local function _missing_unit(cerr, fallback)
   return _normalize_unit_name(u or fallback)
 end
 
+--- 去除错误文本中的沙箱实现字样（门面错误对 AI 应与真实 systemd 一致、不暴露沙箱）。
+--- @param reason string|nil
+--- @return string
+local function _public_reason(reason)
+  local s = tostring(reason or "")
+  s = s:gsub("沙箱门面", ""):gsub("沙箱环境", ""):gsub("沙箱内", ""):gsub("沙箱", "")
+  return (s:gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
 -- systemd-analyze 合成数据：固件/引导/内核/用户空间耗时（秒）。真实 systemd-analyze 依赖
 -- system D-Bus 从 PID1 取启动分析；沙箱无 D-Bus，故由门面合成**确定性且自洽**的数据。
 local ANALYZE = { firmware = 3.123, loader = 1.456, kernel = 2.789, userspace = 6.543 }
@@ -1587,11 +1882,180 @@ local function _dispatch_analyze(plan)
   return async.resolve(_fail("Unknown command verb '" .. tostring(verb) .. "'.", 1))
 end
 
+--- @return table
+local function _uname()
+  local ok, u = pcall(vim.uv.os_uname)
+  if ok and type(u) == "table" then return u end
+  return {}
+end
+
+--- @return string
+local function _os_pretty()
+  local f = io.open("/etc/os-release", "r")
+  if f then
+    local data = f:read("*a") or ""
+    f:close()
+    local name = data:match('PRETTY_NAME="([^"]*)"') or data:match("PRETTY_NAME=([^\n]*)")
+    if name and name ~= "" then return name end
+  end
+  return "Linux"
+end
+
+--- @return string
+local function _timezone()
+  local f = io.open("/etc/timezone", "r")
+  if f then
+    local tz = (f:read("*l") or ""):gsub("%s+$", "")
+    f:close()
+    if tz ~= "" then return tz end
+  end
+  return "Etc/UTC"
+end
+
+--- hostnamectl 状态输出（合成真实字段；不依赖 system D-Bus）。
+--- @return string
+local function _hostnamectl_status()
+  local host = _hostname()
+  local u = _uname()
+  return table.concat({
+    string.format("   Static hostname: %s", host),
+    "         Icon name: computer-container",
+    "           Chassis: container",
+    string.format("        Machine ID: %s", vim.fn.sha256(host):sub(1, 32)),
+    string.format("           Boot ID: %s", vim.fn.sha256(host .. ":boot"):sub(1, 32)),
+    "    Virtualization: docker",
+    string.format("  Operating System: %s", _os_pretty()),
+    string.format("            Kernel: Linux %s", tostring(u.release or "")),
+    string.format("      Architecture: %s", tostring(u.machine or "x86-64")),
+  }, "\n")
+end
+
+--- timedatectl 状态输出。
+--- @return string
+local function _timedatectl_status()
+  local now = os.time()
+  return table.concat({
+    string.format("               Local time: %s", os.date("%a %Y-%m-%d %H:%M:%S", now)),
+    string.format("           Universal time: %s", os.date("!%a %Y-%m-%d %H:%M:%S UTC", now)),
+    string.format("                 RTC time: %s", os.date("!%a %Y-%m-%d %H:%M:%S", now)),
+    string.format("                Time zone: %s (UTC, +0000)", _timezone()),
+    "System clock synchronized: yes",
+    "              NTP service: active",
+    "          RTC in local TZ: no",
+  }, "\n")
+end
+
+--- @param name string
+--- @return Deferred
+local function _dispatch_hostnamectl(plan)
+  if _has_opt(plan.opts, "--version") then return async.resolve(_ok(_host_version())) end
+  local verb = plan.verb
+  if verb == "status" then
+    if _has_opt(plan.opts, "--static") or _has_opt(plan.opts, "--transient")
+      or _has_opt(plan.opts, "--pretty") then
+      return async.resolve(_ok(_hostname()))
+    end
+    return async.resolve(_ok(_hostnamectl_status()))
+  end
+  if verb == "set-hostname" then
+    -- 宿主主机名属宿主状态：门面不修改宿主，返回真实风格拒绝（受限容器语义）。
+    return async.resolve(_fail("Failed to set hostname: Access denied", 1))
+  end
+  return async.resolve(_fail("Unknown command verb '" .. tostring(verb) .. "'.", 1))
+end
+
+--- @param plan table
+--- @return Deferred
+local function _dispatch_timedatectl(plan)
+  if _has_opt(plan.opts, "--version") then return async.resolve(_ok(_host_version())) end
+  local verb = plan.verb
+  if verb == "status" then return async.resolve(_ok(_timedatectl_status())) end
+  if verb == "show" then
+    return async.resolve(_ok(table.concat({
+      "Timezone=" .. _timezone(),
+      "LocalRTC=no",
+      "CanNTP=yes",
+      "NTP=yes",
+      "NTPSynchronized=yes",
+      "TimeUSec=" .. tostring(os.time() * 1000000),
+    }, "\n")))
+  end
+  if verb == "set-time" or verb == "set-timezone" or verb == "set-ntp" or verb == "set-local-rtc" then
+    return async.resolve(_fail(string.format("Failed to set %s: Access denied", verb:gsub("set%-", "")), 1))
+  end
+  return async.resolve(_fail("Unknown command verb '" .. tostring(verb) .. "'.", 1))
+end
+
+--- dmesg 合成内核环形缓冲行（不含宿主真实内核信息）。
+local DMESG_LINES = {
+  { 0.000000, "Linux version 6.1.0-30-amd64 (debian-kernel@lists.debian.org) (gcc-12) #1 SMP PREEMPT_DYNAMIC" },
+  { 0.000000, "Command line: BOOT_IMAGE=/vmlinuz-6.1.0-30-amd64 root=/dev/vda1 ro quiet" },
+  { 0.000000, "BIOS-provided physical RAM map:" },
+  { 0.012345, "Memory: 3.8GiB available" },
+  { 0.234567, "smpboot: CPU0: Intel(R) Xeon(R) Processor" },
+  { 0.543210, "systemd[1]: systemd 257 running in system mode (+PAM +AUDIT +SELINUX +SECCOMP)" },
+  { 0.654321, "systemd[1]: Detected container virtualization docker." },
+  { 0.765432, "systemd[1]: Reached target Basic System." },
+}
+
+--- `dmesg` 合成输出；支持 `-T`/`--ctime`（人类可读时间戳）与 `-l`/`--level` 过滤。
+--- @param plan table
+--- @return Deferred
+local function _dispatch_dmesg(plan)
+  local human = _has_opt(plan.opts, "--ctime") or _has_opt(plan.opts, "-T") or _has_opt(plan.opts, "--human")
+  local opts = plan.opts or {}
+  local argv = {}
+  for _, o in ipairs(opts) do argv[#argv + 1] = o end
+  for _, a in ipairs(plan.args or {}) do argv[#argv + 1] = a end
+  local level = nil
+  for i, o in ipairs(argv) do
+    if o == "-l" or o == "--level" then
+      level = argv[i + 1]
+    else
+      local v = o:match("^%-%-level=(.+)$") or o:match("^%-l(%S+)$")
+      if v then level = v end
+    end
+  end
+  local strict = false
+  if level then
+    local lv = level:lower()
+    strict = (lv:find("err") or lv:find("warn") or lv:find("crit")
+      or lv:find("alert") or lv:find("emerg")) ~= nil
+  end
+  local total = DMESG_LINES[#DMESG_LINES][1]
+  local now = os.time()
+  local out = {}
+  for _, ln in ipairs(DMESG_LINES) do
+    local text = ln[2]
+    if text:find("<host>") then text = text:gsub("<host>", _hostname()) end
+    if strict then
+      -- 粗略级别过滤：非 info 级别只保留含错误/警告特征的行。
+      if not text:lower():find("error") and not text:lower():find("fail")
+        and not text:lower():find("warn") and not text:lower():find("denied") then
+        text = nil
+      end
+    end
+    if text then
+      local stamp
+      if human then
+        stamp = "[" .. os.date("%a %b %d %H:%M:%S %Y", now - math.floor((total - ln[1]) + 0.5)) .. "]"
+      else
+        stamp = string.format("[%12.6f]", ln[1])
+      end
+      out[#out + 1] = stamp .. " " .. text
+    end
+  end
+  return async.resolve(_ok(table.concat(out, "\n")))
+end
+
 --- 分派一个计划（返回 Deferred resolve({stdout,stderr,code})）。
 --- @param plan table
 --- @return Deferred
 local function _dispatch(plan)
   if plan.kind == "systemd-analyze" then return _dispatch_analyze(plan) end
+  if plan.kind == "hostnamectl" then return _dispatch_hostnamectl(plan) end
+  if plan.kind == "timedatectl" then return _dispatch_timedatectl(plan) end
+  if plan.kind == "dmesg" then return _dispatch_dmesg(plan) end
   local verb = plan.verb
   local scope = plan.scope or "system"
   local units = plan.units or {}
@@ -1601,6 +2065,43 @@ local function _dispatch(plan)
 
   if verb == "logs" then return async.resolve(_journal(plan, scope)) end
   if verb == "daemon-reload" then return async.resolve(_ok("")) end
+  if verb == "reset-failed" then
+    -- 清除失败状态：门面无持久失败单元（服务退出码即状态来源），幂等成功（真实语义）。
+    return async.resolve(_ok(""))
+  end
+  if verb == "get-default" then
+    return async.resolve(_ok(scope == "user" and "default.target" or "multi-user.target"))
+  end
+  if verb == "set-default" then
+    if #units == 0 then return async.resolve(_fail("Failed to set default target: Invalid argument.", 1)) end
+    return async.resolve(_ok(""))
+  end
+  if verb == "show-environment" then
+    -- 真实输出 systemd 管理器环境变量；沙箱管理器无额外变量 → 空输出、退出 0。
+    return async.resolve(_ok(""))
+  end
+  if verb == "list-jobs" then
+    return async.resolve(_ok("No jobs running."))
+  end
+  if verb == "list-timers" then
+    local lines = {}
+    if not no_legend then
+      lines[#lines + 1] = string.format("  %-24s %-12s %-24s %-12s %-32s %s",
+        "NEXT", "LEFT", "LAST", "PASSED", "UNIT", "ACTIVATES")
+    end
+    lines[#lines + 1] = ""
+    lines[#lines + 1] = "0 timers listed."
+    return async.resolve(_ok(table.concat(lines, "\n")))
+  end
+  if verb == "list-sockets" then
+    local lines = {}
+    if not no_legend then
+      lines[#lines + 1] = string.format("  %-16s %-32s %s", "LISTEN", "UNIT", "ACTIVATES")
+    end
+    lines[#lines + 1] = ""
+    lines[#lines + 1] = "0 sockets listed."
+    return async.resolve(_ok(table.concat(lines, "\n")))
+  end
 
   if verb == "is-system-running" then
     -- 用门面自身状态（不查宿主），与沙箱内呈现的 systemd 自洽。
@@ -1658,8 +2159,13 @@ local function _dispatch(plan)
     local outs, code = {}, 0
     for _, name in ipairs(units) do
       local norm, path = _unit_find(name, scope)
-      local state, scode = _enabled_state(norm, scope, path)
-      outs[#outs + 1] = state; code = math.max(code, scode)
+      if not path and _runtime_info(norm, scope) then
+        -- 瞬态单元：真实 systemd 报告 generated 且退出码 0。
+        outs[#outs + 1] = "generated"
+      else
+        local state, scode = _enabled_state(norm, scope, path)
+        outs[#outs + 1] = state; code = math.max(code, scode)
+      end
     end
     return async.resolve({ stdout = quiet and "" or table.concat(outs, "\n"), stderr = "", code = code })
   end
@@ -1696,12 +2202,9 @@ local function _dispatch(plan)
 
   if verb == "run" then
     -- systemd-run：启动一个沙箱内临时单元（后台服务）。真实 systemd-run 立即返回
-    -- `Running as unit: <name>`；`--wait` 时等待其结束并返回单元退出码。
+    -- `Running as unit: <name>`；`--wait` 时等待其结束并返回单元退出码；`--pipe`/`-P`/`--pty`
+    -- 回传单元输出（无 tty）。
     local argv = plan.argv or {}
-    if plan.unsupported then
-      return async.resolve(_fail(string.format(
-        "Failed to start transient service: option %s is not supported.", tostring(plan.unsupported)), 1))
-    end
     if #argv == 0 then
       return async.resolve(_fail("Failed to start transient service: No command specified.", 1))
     end
@@ -1726,10 +2229,21 @@ local function _dispatch(plan)
     local msg = string.format("Running as unit: %s", name)
     if not plan.wait then return async.resolve(_ok(msg)) end
     local d = async.Deferred.new()
+    local deadline = vim.uv.now() + 600000
     local function poll()
       local info = svc.status(key)
       if not info or info.status == "exited" then
-        d:resolve({ stdout = msg, stderr = "", code = tonumber(info and info.exit_code) or 0 })
+        if plan.pipe then
+          -- `--pipe`/`--pty`：真实回传命令输出与退出码（不含 "Running as unit"）。
+          d:resolve({ stdout = tostring(svc.logs(key) or ""), stderr = "",
+            code = tonumber(info and info.exit_code) or 0 })
+        else
+          d:resolve({ stdout = msg, stderr = "", code = tonumber(info and info.exit_code) or 0 })
+        end
+        return
+      end
+      if vim.uv.now() >= deadline then
+        d:resolve({ stdout = plan.pipe and tostring(svc.logs(key) or "") or msg, stderr = "", code = 0 })
         return
       end
       vim.defer_fn(poll, 50)
@@ -1758,24 +2272,24 @@ local function _dispatch(plan)
     local ordered, unitmap, cerr = M.resolve_closure(units, max, scope)
     if not ordered then
       local c = tostring(cerr or "")
-      -- 仅真正「未找到」才报 not found；不支持的类型/语义报真实 systemd 风格的
-      -- Operation not permitted（不谎称未找到，也不暴露沙箱）。
+      -- 仅真正「未找到」才报 not found；其余（单元文件设置不受支持/解析失败等）透传清洗后的
+      -- 具体原因，不再一律谎报 Operation not permitted（该文案既误导 AI 又掩盖真实原因）。
       if c:find("not found", 1, true) then
         local miss = _missing_unit(cerr, units[1])
         return async.resolve(_fail(
           string.format("Failed to %s %s: Unit %s not found.", verb, miss, miss), 5))
       end
-      return async.resolve(_fail(string.format(
-        "Failed to %s %s: Operation not permitted.", verb, _normalize_unit_name(units[1])), 1))
+      local norm = _normalize_unit_name(units[1])
+      local reason = _public_reason(cerr)
+      if reason == "" then reason = "Unit " .. norm .. " is not loaded properly." end
+      return async.resolve(_fail(string.format("Failed to %s %s: %s", verb, norm, reason), 1))
     end
     if verb == "start" then
-      for _, name in ipairs(ordered) do
-        local svc, serr = _start_one(unitmap[name], scope)
-        if not svc then
-          return async.resolve(_fail(string.format("Failed to start %s: %s.", name, tostring(serr)), 1))
-        end
-      end
-      return async.resolve(_ok(""))
+      local d = async.Deferred.new()
+      _start_ordered(ordered, unitmap, scope):then_(function(r)
+        if r.err then d:resolve(_fail(r.err, 1)) else d:resolve(_ok("")) end
+      end)
+      return d
     end
     if verb == "stop" then
       local d = async.Deferred.new()
@@ -1794,13 +2308,13 @@ local function _dispatch(plan)
         function() stop_all(idx + 1, done) end)
     end
     stop_all(1, function()
-      for _, name in ipairs(ordered) do
-        local svc, serr = _start_one(unitmap[name], scope)
-        if not svc then
-          return d:resolve(_fail(string.format("Failed to restart %s: %s.", name, tostring(serr)), 1))
+      _start_ordered(ordered, unitmap, scope):then_(function(r)
+        if r.err then
+          d:resolve(_fail(r.err:gsub("Failed to start", "Failed to restart"), 1))
+        else
+          d:resolve(_ok(""))
         end
-      end
-      d:resolve(_ok(""))
+      end)
     end)
     return d
   end
@@ -1855,12 +2369,20 @@ function M.exec(input)
   end
 
   local plan
-  if type(input) == "table" and input.verb ~= nil then
+  -- 已解析的计划：有 `kind` 或 `verb`（dmesg 等无动词工具只有 kind）。
+  if type(input) == "table" and (input.verb ~= nil or input.kind ~= nil) then
     plan = input
   elseif type(input) == "table" then
-    for _, a in ipairs(input) do
-      if a == "--version" or a == "-V" then
-        return async.resolve(norm({ stdout = _host_version(), stderr = "", code = 0 }))
+    local bin0 = tostring(input[1] or ""):match("([^/]+)$")
+    local versionable = {
+      systemctl = true, journalctl = true, ["systemd-run"] = true,
+      ["systemd-analyze"] = true, hostnamectl = true, timedatectl = true,
+    }
+    if versionable[bin0] then
+      for _, a in ipairs(input) do
+        if a == "--version" or a == "-V" then
+          return async.resolve(norm({ stdout = _host_version(), stderr = "", code = 0 }))
+        end
       end
     end
     plan = M._plan_tokens(input, table.concat(input, " "))

@@ -169,6 +169,12 @@
   - **会话轮换迁移下线程池**：`rotate_session` 的文件复制（含目录）交给工作线程；暂存访问前经
     `_await_rotation` 等待迁移完成（通常已完成，等待为 0）。长会话未发布改动多时，agentEnd
     不再逐文件主线程复制。
+  - **轮换/常驻重建前等待在途后处理**：`merge_candidate_async` 登记 `state.workspace` 条目后，
+    暂存副本写入是异步的。若在其写完前 `rotate_session` 迁移，缺失的暂存副本会被误判为删除并
+    物化为 whiteout；若在常驻实例创建前物化，常驻新 overlay 会缺文件——两者都表现为「命令产物
+    在工具调用之间回退」（安装报大量包、下一条命令又变回少量）。故 `rotate_session` 前与
+    `resident.ensure` 创建/重建前都先 `await_postprocess`（有界，`shutdown_timeout_ms`），且
+    轮换调度在 `postprocess_pending()` 时延迟（上限约 30s）。
   - **待审项增量索引**：`review._pending_items` 缓存 PENDING 项（按 created_at 排序），
     `supersede_by_paths` / 包合并不再每次对全部变更单元（含终态）过滤 + 排序；任何写操作失效缓存。
   - **结算主线程热点批量化/单遍化（暂存上万文件回归）**：
@@ -326,9 +332,16 @@
      往往已变化，会触发 `CONFLICT/BASELINE_CHANGED`；剔除不影响安装效果
      （`/var/lib/dpkg/status`、包文件等仍应用），宿主可自行 `apt update` 重建索引。
   剔除数量记录在候选 `dropped` 字段并在审批界面提示；发布时的遮蔽硬拒绝仍保留为纵深防御。
-- **同文件取代**：同一文件被再次编辑（新候选入队）或直接发布时，覆盖该路径的旧 `PENDING`
-  变更单元被标记为 `SUPERSEDED` 并丢弃候选，队列只保留最新版本，避免用户看到同一文件的
-  多个版本（`review.supersede_by_paths`）。
+- **同文件取代（按文件粒度 + 增量）**：同一文件被再次编辑（新候选入队）或直接发布时，覆盖该路径的
+  旧 `PENDING` 变更单元**只登记被覆盖的路径为「已取代」增量**，同单元其余文件保留为待审
+  （`review.supersede_by_paths`；增量以每单元一个小文件落盘 `reviews_removed/`，应用/展示时按增量
+  剔除）。**不重编码整单元/候选**：包安装把上千文件放在同一变更单元，若按文件重建候选 + 重写
+  整单元，后续每次命令触碰其中任一文件都会做一次 O(N) 深拷贝 + JSON 编码 + 落盘，长会话每轮
+  卡顿；增量取代为 O(重叠路径)。**不可整单元丢弃**：若后续命令只改动其中一个文件（如
+  `python -c "import pkg"` 生成 `__pycache__/*.pyc`），整单元取代会连带丢弃同包 `*.py`/`dist-info`，
+  批准后目录在而 `__init__.py` 缺失 → `ImportError ... (unknown location)`、`pkg.__file__ is None`
+  （空命名空间包）。仅当**全部**有效文件都被覆盖时整单元才标记 `SUPERSEDED`；
+  `atomic_group="git"` 的对象/指针必须整组保留，**不**逐文件拆分取代。
 
 ### 脚本间接执行静态扫描（`tools.sandbox.script_scan`，默认开）
 
@@ -632,9 +645,9 @@ overlay + cgroup），写入停止时冻结为候选，**不调用宿主 systemd
 
 **架构（解析/实现全在 Lua，沙箱内只有极薄入口）**：所有解析与实现都在
 `sandbox/systemd.lua` 的 `M.exec(argv)`（返回 `{stdout, stderr, code}`）。沙箱内
-`/usr/bin/systemctl`、`/usr/bin/journalctl`、`/usr/bin/systemd-run`、`/usr/bin/systemd-analyze`
-由 `runtime._maintscript_stubs` 生成的**极薄入口**覆盖（`--ro-bind` 到真实二进制路径，不再
-PATH 前置 `/tmp/.dynbin`）。入口是一个 bash 文件 IPC
+`/usr/bin/systemctl`、`/usr/bin/journalctl`、`/usr/bin/systemd-run`、`/usr/bin/systemd-analyze`、
+`hostnamectl`、`timedatectl`、`dmesg` 由 `runtime._maintscript_stubs` 生成的**极薄入口**覆盖
+（`--ro-bind` 到真实二进制路径，不再 PATH 前置 `/tmp/.dynbin`）。入口是一个 bash 文件 IPC
 客户端：把 argv（NUL 分隔）写入宿主绑定进来的收件目录 `/run/systemd/units`，等待响应后按真实
 stdout/stderr/退出码返回。宿主侧由 `sandbox/systemd_ipc.lua` 以 fs_event（+ 兜底定时器）扫描并
 调用门面。因此**独立调用与脚本/管道调用走同一份实现、行为完全一致**，入口文件本身不含任何
@@ -663,6 +676,29 @@ stdout/stderr/退出码返回。宿主侧由 `sandbox/systemd_ipc.lua` 以 fs_ev
   - **无动词的 `systemctl` 等价于 `list-units`**（真实默认动词）：`systemctl --failed`、
     `systemctl --state=failed`、`systemctl --all` 等过滤选项生效，不再因无动词而回退到
     「默认列出全部 active 单元」。
+  - **`reset-failed`**：门面无持久失败单元，按真实语义幂等成功（不再报
+    `Unknown command verb`）。另有 `get-default`/`set-default`/`show-environment`/
+    `list-timers`/`list-sockets`/`list-jobs`（合成真实风格输出，退出 0）。
+  - **单元 ExecStart 语义对齐真实 systemd**：展开 systemd 说明符（`%n`/`%N`/`%p`/`%i`/`%u`/
+    `%h`/`%t` 等，`%%`→字面 `%`；未知说明符保留原文）；仅展开 `${VAR}`（`$$`→`$`），**不**展开
+    裸 `$VAR`（`ExecStart=/bin/sh -c 'i=1; [ $i -lt 2 ]'` 不再被误展开）；argv 逐参数单引号转义后
+    交给服务，保留参数边界。`oneshot` 允许多条 `ExecStart`（顺序 `&&` 串联，任一条失败即失败），
+    其余类型多条时后写覆盖取最后一条；空 `ExecStart=` 重置列表。`oneshot` 的 `start` 会等待进程
+    结束并按退出码返回（失败给
+    `Job for X failed because the control process exited with error code`）。
+  - **类型与用户兼容**：`simple`/`exec` 长驻，`oneshot` 跑完即返回；`notify`/`notify-reload`/
+    `oneshot-notify`/`forking`/`dbus`/`idle` 按 **best-effort** 以 simple 语义在沙箱内执行
+    （不做 `sd_notify` READY 与 daemonize 子进程跟踪）。`User=`/`Group=` 被接受并按沙箱固定身份
+    执行（门面无法切换用户，不报错）。仅未知 `Type=` 明确报错。
+  - **瞬态单元一致**：`systemd-run` 创建、无单元文件的瞬态单元在 `status`/`show`/`cat`/
+    `is-enabled`（`generated`）/`start`/`stop`/`restart` 中与文件单元一致可见（此前 `status`
+    报 could not be found、`stop` 退出 5）。
+  - **同一私有视图**：门面解析单元时，`/run/systemd/system`（及 `/run` 下其它单元根）读取
+    **宿主侧会话私有目录**（沙箱内 `/run` 绑定处），故 AI 在沙箱内写入 `/run/systemd/system`
+    的单元对 `systemctl` 可见（且不泄漏宿主 `/run` 运行时单元）；`sandbox.service` 现与
+    `run_command`/`exec` 共用同一稳定临时根，服务因此能看到 AI 写入 `/run` 的脚本/单元。
+    其余路径（`/etc/systemd/system`、`/usr/lib/systemd/system` 等）优先读**整机根 overlay 的
+    upper**（命令写入处）与暂存副本，故 AI 在 `/etc/systemd/system` 写的单元同样对门面可见。
   - **基线运行单元**：系统 scope 额外呈现真实已启动系统必然存在的核心 target/基础服务
     （`sysinit/basic/multi-user` 等 target、`systemd-journald`/`systemd-udevd`）为 `active`，
     使 `list-units`、`--state=running`、`status` 与 `is-system-running=running` 自洽。
@@ -672,8 +708,10 @@ stdout/stderr/退出码返回。宿主侧由 `sandbox/systemd_ipc.lua` 以 fs_ev
     输出与宿主 `systemctl --version` 完全一致（生成时读取宿主版本，不再硬编码 `systemd 255`）。
   - 缺失单元错误文本对齐真实：`Unit X not found.`、`Failed to start X: Unit X not found.`
     （退出码 5）、`Unit X could not be found.`（status，退出码 4）、`Unknown command verb 'X'.`
-    （退出码 1）等；输出不含任何「沙箱/sandbox」字样。
-   - 类型：`Type=simple`（默认）/`exec` 为长驻服务；`oneshot` 跑完即返回。
+    （退出码 1）等；单元存在但设置不可解析/不受支持时，透传**清洗后的具体原因**（如
+    `单元缺少 ExecStart…`、`不支持 socket 单元`），不再一律谎报 `Operation not permitted`；
+    输出不含任何「沙箱/sandbox」字样。
+   - 类型：`Type=simple`（默认）/`exec` 为长驻服务；`oneshot` 跑完即返回（见上「类型与用户兼容」）。
    - 依赖：`Requires`/`Wants` 递归拉起，`After`/`Before` 拓扑排序（`max_deps` 上限）。
    - 单元文件**优先读沙箱暂存副本**（AI 用 `edit_file`/`run_command` 新建/修改的 unit 可见）。
    - **基线单元写操作**：对基线运行单元（如 `systemd-journald`）执行 `start`/`restart` 幂等
@@ -684,24 +722,31 @@ stdout/stderr/退出码返回。宿主侧由 `sandbox/systemd_ipc.lua` 以 fs_ev
   （复用 `sandbox.service`），打印真实风格 `Running as unit: <name>`；支持 `--unit`/`-u`、
   `--wait`（等待结束并透传单元退出码）、`--user`、`--setenv`/`-E`、`--working-directory`、
   `-p WorkingDirectory=/Environment=/Description=`；未给 `--unit` 时自动命名
-  `run-r<hex>.service`。`--scope`/`-t`/`--pty`/`-P`/`--pipe` 等前台/交互 IO 语义无法经门面
-  可靠实现，返回明确错误（不再命中宿主真实二进制报「无法连接总线」）。临时单元在
-  `list-units`/`is-active` 中可见，`--collect` 由服务销毁自动等效。
+  `run-r<hex>.service`。`--pipe`/`-P`/`--pty`/`-t`/`--scope` 以前台语义执行并**回传命令输出与
+  退出码**（真实无 tty，但不再报「不支持」）。临时单元在 `list-units`/`is-active` 中可见，
+  `--collect` 由服务销毁自动等效。
 - **`systemd-analyze`（启动分析，路由到门面）**：沙箱内 `/usr/bin/systemd-analyze` 同样由极薄
   入口覆盖并转发到门面。真实 `systemd-analyze` 依赖 system D-Bus 从 PID1 取启动分析（沙箱无
   D-Bus，必然 `Failed to connect to system scope bus`）；门面改为合成**确定性且自洽**的数据：
   `time`（firmware/loader/kernel/userspace 分段 + `… reached after …s in userspace.`）、
-  `blame`（按耗时降序的服务列表）、`critical-chain`、`unit-paths`、`--version`；无动词默认
+  `blame`（按耗时降序的服务列表）、  `critical-chain`、`unit-paths`、`--version`；无动词默认
   `time`。未知动词返回真实风格 `Unknown command verb`。
+- **`hostnamectl` / `timedatectl` / `dmesg`（同样路由到门面）**：这些工具在真实环境依赖
+  system D-Bus（hostnamectl/timedatectl 必然 `Failed to connect to system scope bus`）或内核
+  缓冲（dmesg 在受限容器返回 `Operation not permitted`）。门面合成真实风格输出：
+  `hostnamectl`（Static hostname/Icon/Chassis/Machine ID/Boot ID/OS/Kernel/Architecture；
+  `set-hostname` 返回真实风格 `Access denied`，不修改宿主）、`timedatectl`（Local/Universal/
+  RTC time、Time zone、同步/NTP；`show` Key=Value；`set-*` 返回 `Access denied`）、`dmesg`
+  （合成内核环形缓冲，支持 `-T`/`--ctime` 与 `-l`/`--level`），不含宿主真实内核信息。
 - **`journalctl`**：由门面合成输出（`-- Logs begin at …` 头 + 各单元服务日志；无日志时合成
   若干系统行，`-n <N>` 限制行数），不再落到宿主真实 `journalctl`（后者会输出
   `No journal files were found.`）。各行时间戳**逐条递增**（首尾覆盖 `Logs begin/end`），
   不再所有行共用一个时间点。
-- **明确拒绝（不落宿主机、不回退 hostop）**：`Type=notify`/`notify-reload`/`forking`/`dbus`/
-  `idle`、`.socket`/`.timer` 等单元、`User=`/`Group=`、systemd 说明符（`%n` 等）、
-  `Requisite`/`BindsTo`/`PartOf`；以及 `poweroff`/`reboot`/`halt`/`kexec`/`suspend` 等宿主
-  电源/内核状态操作。返回真实 systemctl 风格错误（如 `Failed to poweroff system via logind:
-  Access denied`），不暴露沙箱并发出 `SANDBOX_SYSTEMD_UNSUPPORTED`。
+- **明确拒绝（不落宿主机、不回退 hostop）**：`.socket`/`.timer` 等单元、模板/实例化单元、
+  `Requisite`/`BindsTo`/`PartOf`/`OnFailure` 依赖、未知 `Type=`；以及 `poweroff`/`reboot`/
+  `halt`/`kexec`/`suspend` 等宿主电源/内核状态操作。返回真实 systemctl 风格错误（如
+  `Failed to poweroff system via logind: Access denied`），不暴露沙箱并发出
+  `SANDBOX_SYSTEMD_UNSUPPORTED`。
 - **回退 hostop**：门面不处理的动词（如 `isolate`）或指定其它主机/根的选项
   （`-H`/`--host`/`--root` 等）不拦截，落到既有 T2/hostop 提案路径（审批后宿主 replay）。
 - **留痕**：命中门面记录 `kind="privilege"` 证据并发出 `SANDBOX_SYSTEMD_ROUTED`。
@@ -728,7 +773,8 @@ stdout/stderr/退出码返回。宿主侧由 `sandbox/systemd_ipc.lua` 以 fs_ev
   `Removed "…"` 文本。用户级 `systemctl --user enable/disable` 同样由门面的**伪造解析器**处理，
   软链暂存到用户单元根（见「伪造 systemd --user 解析器」）。
 - **已知限制**：模板/实例化单元（`foo@bar.service`）不支持；`[Install] Also=` 暂不展开；
-  `Type=notify/forking/dbus` 等仍明确拒绝（真实 systemd 会执行，故此处是已知可识别差异）。
+  `notify`/`forking`/`dbus` 等类型虽可启动，但**不做 READY 通知与 daemonize 子进程跟踪**（按
+  simple 语义 best-effort），故与真实 systemd 的可观测行为存在差异（已知可识别差异）。
 
 ### 伪造 systemd --user 解析器（`tools.sandbox.systemd.user`）
 
@@ -742,7 +788,7 @@ stdout/stderr/退出码返回。宿主侧由 `sandbox/systemd_ipc.lua` 以 fs_ev
   `/lib/systemd/user`、`/run/systemd/user`（**优先沙箱暂存副本**，故 AI 本次写入的单元立即可见）。
   可用 `tools.sandbox.systemd.user_unit_roots` 覆盖。
 - **解析**：复用系统级门面同一套 `.service` 解析（`[Unit]` 依赖、`[Service]` `Type`/`ExecStart`/
-  `Environment`/`WorkingDirectory`，仅支持 `simple`/`exec`/`oneshot`）。`start` 把 `ExecStart`
+  说明符与环境变量展开、`Environment`/`WorkingDirectory`；类型支持同系统级门面）。`start` 把 `ExecStart`
   交给 `sandbox.service` 在沙箱内启动；`is-active`/`status` 由服务状态合成。
 - **命名空间隔离**：用户单元的服务 key 前缀为 `user-unit:`，与系统级 `unit:` 隔离，同名单元互不干扰。
 - **enable/disable 软链暂存**：`systemctl --user enable/disable` 把软链变更（enable 建
@@ -753,7 +799,8 @@ stdout/stderr/退出码返回。宿主侧由 `sandbox/systemd_ipc.lua` 以 fs_ev
   `dbus-daemon`/`systemd` 二进制/真实 user manager），`systemd_user.needs_boot()` 恒为 false。
 - **配置**：`tools.sandbox.systemd.user = { enabled }`（默认开启；`enabled=false` 时
   `systemctl --user` 报明确错误）。`tools.sandbox.systemd.user_unit_roots` 可自定义用户单元根。
-- **限制**：这是**伪造**语义——`Type=notify/forking/dbus` 等不支持；`systemctl --user` 无论
+- **限制**：这是**伪造**语义——`notify`/`forking`/`dbus` 等类型按 simple best-effort 执行、
+  不做 READY/daemonize 跟踪；`systemctl --user` 无论
   独立调用还是脚本/管道调用都由门面处理（后者经沙箱内入口 IPC 转发，见 §「systemctl 门面」）。
 
 
@@ -976,8 +1023,11 @@ seccomp（含设备节点屏障）**——沙箱内进程看到的是一份「�
   **Git 凭据与签名密钥**（`~/.git-credentials`、`~/.config/git/credentials`、`~/.git-credential-cache`、
   `~/.netrc`、`~/.ssh`、`~/.gnupg`、`~/.config/gh` 等，root 与 `/home/*` 用户均覆盖），
   并补充 `/etc/shadow`、`/etc/gshadow`、`/etc/sudoers`、`/etc/machine-id`、`/etc/ssh`、
-  `/var/log`、`/var/spool/cron` 及 root 命令历史等读取面泄露项。
+  `/etc/fstab`（宿主磁盘布局/根文件系统 UUID，且会让 `mount -o remount,rw /` 按宿主 UUID
+  解析并失败，见下）、`/var/log`、`/var/spool/cron` 及 root 命令历史等读取面泄露项。
   遮蔽挂载置于各可写根 overlay 之后，确保覆盖生效。
+  故 `mount`/`/proc/mounts`/`findmnt` 在沙箱内一致显示 **overlay/tmpfs** 根，`mount -o
+  remount,rw /` 返回内核 `EPERM`（不再出现「ext4 根/宿主 UUID」这一源自宿主 fstab 的矛盾）。
   进程内 `read`/`fs_write` 工具不经 namespace，mount 遮蔽对其无效；执行器对路径参数额外
   查询 `runtime.is_masked_path`，命中即**硬拒绝**（`路径位于宿主敏感遮蔽路径`，不可审批放行），
   覆盖 `read_file`/`search_files`/`edit_file` 等直接读宿主的路径。
@@ -985,7 +1035,9 @@ seccomp（含设备节点屏障）**——沙箱内进程看到的是一份「�
   upper/work 为可写层挂载整机根 overlay——沙箱内根文件系统**原样可写**（任意路径可写，不再有
   `Read-only file system`），所有写入进 upper 暂存并在命令结束后冻结为候选，宿主盘不受影响。
   仅遮蔽 `mask_paths` 中的重要配置文件/凭据（见上）与沙箱自身存储——即「除重要配置文件外均可
-  读写」，`/opt`、`/srv`、其他项目目录等都可写。`mask_dirs`（`/home`、`/root` 兄弟目录）
+  读写」，`/opt`、`/srv`、其他项目目录等都可写。**根 overlay 的 upper/work 主位置在沙箱存储
+  根下；容器内「overlay 之上再 overlay」会 EINVAL 时，自动改用 tmpfs（`/dev/shm`、`/run`）
+  承载 upper/work**，避免回退为只读根（AI 因此不易察觉「文件系统只读」）。`mask_dirs`（`/home`、`/root` 兄弟目录）
   不再挂载遮蔽。overlay 不可用时退回只读根（`overlay_fail_closed` 决定是否降级）。
   > **「系统目录可写」是设计而非缺陷**：`/usr/bin`、`/etc` 等看似可写，是因为整机根以
   > **可写 overlay** 暴露——写入只落会话私有 upper 并冻结为待审候选，**宿主真实盘不被改动**；
@@ -1113,18 +1165,26 @@ seccomp（含设备节点屏障）**——沙箱内进程看到的是一份「�
   决策经 `sandbox/net_consent` 的服务端会话白名单记忆。headless/无 UI 时失败关闭（拒绝）。
   发起请求时发 `sandbox:net_consent_requested` 事件。长驻服务启动时按 `PORT`/`--port` 等
   声明自动登记内部端口（`net_consent.register_from_command`）。
+- **软件源自动放行（`network.auto_allow_sources`，默认开）**：为避免包安装被同意门禁拦截，
+  对**外部**软件源（PyPI/pythonhosted、npm/npmmirror、crates/rust-lang、proxy.golang.org/goproxy、
+  Maven、Debian/Ubuntu/Alpine/Docker 源，以及 `tuna.tsinghua.edu.cn`、`mirrors.aliyun.com`、
+  `mirrors.ustc.edu.cn` 等公共镜像）经代理访问时**免弹窗直接放行**（记录为 `allow_source`）。
+  仅当目标判定为**非本机**时生效：解析到本机、或 DNS 解析失败（fail-closed）仍按本机拒绝，
+  SSRF 防护不削弱；`access="deny"` 时仍拒绝。可用 `network.extra_package_sources` 追加私有源
+  域名后缀（子域自动匹配）；`auto_allow_sources=false` 关闭该放行。
 - **边界（重要）**：这是**应用层**过滤。**不认代理的裸 TCP**（`nc`/`ssh`/数据库客户端、
   忽略代理变量的工具）在共享 netns 下可直连宿主本机，不受此层约束。要硬拦截裸 TCP 只能：
   root + iptables/nft（按目的地过滤），或无 root 的 `slirp4netns`/`passt`（原生用户态
   网络栈，本机未安装）——本插件不引入这些依赖。故本机拦截为「非硬边界」，见
   `sandbox/host_proxy.lua` 模块头。
-- **代理规避门禁**：显式清除/绕过代理（`unset *proxy`、`env -u *proxy`、`curl --noproxy`、
+- **代理规避确认**：显式清除/绕过代理（`unset *proxy`、`env -u *proxy`、`curl --noproxy`、
   `--proxy ""`/`-x ''`、`export *proxy=`）会使上述过滤失效，门禁在进入沙箱前对**折叠后的
-  有效命令**拒绝（`PROXY_EVASION:*`，`network.block_proxy_evasion`，默认开）。判定前先做
-  shell 规范化：还原引号拼接（`--noprox''y`）、ANSI-C 引用（`$'--noproxy'`）与反斜杠转义，
-  并展开同一命令内 `NAME=value` 的简单变量（`c=--noproxy; curl $c`），防止静态扫描被拼接/
-  变量绕过。`-x` 仅在 curl 段上等同 `--proxy`（`set -x`/`tar -x`/`grep -x`/`bash -x` 等
-  非代理开关不再误报硬拒绝）。
+  有效命令**识别（`PROXY_EVASION:*`），默认**暂停 Agent 并弹窗询问**（`network.block_proxy_evasion=true`：
+  仅本次允许 / 本次会话始终允许 / 拒绝）；`"deny"` 直接拒绝（旧硬拒绝），`false` 不拦截。
+  判定前先做 shell 规范化：还原引号拼接（`--noprox''y`）、ANSI-C 引用（`$'--noproxy'`）与
+  反斜杠转义，并展开同一命令内 `NAME=value` 的简单变量（`c=--noproxy; curl $c`），防止静态
+  扫描被拼接/变量绕过。`-x` 仅在 curl 段上等同 `--proxy`（`set -x`/`tar -x`/`grep -x`/
+  `bash -x` 等非代理开关不再误报）。headless（无 attached UI）无法弹窗时失败关闭（拒绝）。
 - **残余信息泄露（共享 netns 固有）**：因 T0 共享宿主网络命名空间，`/proc/net/tcp`、
   `/proc/net/unix`（宿主连接/Unix socket 清单）、`ip addr`/`ip route`（netlink，宿主拓扑）
   对沙箱可见。`/proc/net` 是 `self/net` 符号链接，无法用挂载遮蔽；netlink 也不经挂载。
@@ -1575,8 +1635,12 @@ overlay 会 `EINVAL`），此时命令只能运行在「只读根 + 私有可写
 IP/CIDR；`auto_trust_providers=true` 时已配置的模型供应商 `base_url` 主机自动信任。覆盖路径：
 `utils/http`（程序化 HTTP：模型/MCP-HTTP）、沙箱子进程（`curl`/`wget`/`nc` 等网络命令）、
 `run_command`。目标主机不可判定时按非白名单处理。**环境变量仅在其变量名被命令引用时**参与判定，
-避免沙箱注入的真实密钥环境变量导致所有命令被误判。弹窗**标明目标、来源命令与命中的密钥**，
-选项：仅本次允许 / 加入白名单 / 停止 Agent；headless 失败关闭。
+避免沙箱注入的真实密钥环境变量导致所有命令被误判。目标提取只收**明确目标**（URL、`host:port`、
+`user@host`、IP 字面量，或形如公网主机的裸字符串），`os.getenv`/`os.environ.get`/属性访问等
+**代码标识符不视为地址**（避免把本地读取环境变量的命令误判为外发）。弹窗**标明目标、来源命令与
+命中的密钥**，选项：仅本次允许 / 加入白名单 / 停止 Agent；命中目标不确定时仍弹窗询问。专用弹窗
+UI 未注册但为**交互式 Neovim** 时，回退到内建 `confirm` **暂停并询问**（仍可选允许/停止）；
+真正 headless（无 attached UI）仍失败关闭。
 
 ### 16.4 数据流账本与不透明派生
 
@@ -2114,8 +2178,9 @@ L2+ 与包/密钥仍进入待审。目的是即便仅靠本地模型的智能水
 
 - **代理规避（已缓解）**：`host_local_block` 依赖代理变量生效，显式清除/绕过代理
   （`unset *proxy`、`env -u *proxy`、`curl --noproxy`、`--proxy ""`/`-x ''`、`export *proxy=`）
-  会让过滤失效、直达宿主本机。门禁在命令进入沙箱前识别并对**脚本折叠后的有效命令**拒绝
-  （`PROXY_EVASION:*`），由 `tools.sandbox.network.block_proxy_evasion`（默认开）控制。
+  会让过滤失效、直达宿主本机。门禁在命令进入沙箱前识别**脚本折叠后的有效命令**
+  （`PROXY_EVASION:*`），默认**暂停并弹窗询问**（`tools.sandbox.network.block_proxy_evasion=true`）；
+  `"deny"` 直接拒绝，`false` 放行且不询问；headless 无 UI 时失败关闭。
   判定前先做 shell 规范化（引号拼接 `--noprox''y`、ANSI-C 引用 `$'--noproxy'`、反斜杠转义）
   并展开同命令内简单变量（`c=--noproxy; curl $c`），避免拼接/变量绕过；`-x` 仅对 curl 视为
   `--proxy`，避免 `set -x` 等被误报。
@@ -2141,11 +2206,18 @@ L2+ 与包/密钥仍进入待审。目的是即便仅靠本地模型的智能水
   查询类动词（`is-active`/`is-enabled`/`is-failed`/`is-system-running`/`status`）的非零退出
   是正常语义，工具层不包装为 `ok:false`。
 - **入口一致性（已修复）**：解析/实现全在 Lua；沙箱内 `systemctl`/`journalctl`/`systemd-run`/
-  `systemd-analyze` 为极薄入口，独立调用由门禁直接路由、脚本/管道调用经入口文件 IPC 转发到
-  同一门面，**两者行为完全一致**，不再存在「复合命令命中真实二进制并报无法连接总线」的矛盾。
-  `systemd-run` 的临时单元在沙箱内以后台服务运行（`--wait` 透传退出码）；`systemd-analyze`
-  的 `time`/`blame` 等由门面合成；基线系统单元的 start/stop/restart 幂等成功（不再报
-  `Operation not permitted`）；无动词 `systemctl` 按 `list-units` 处理（`--failed` 等生效）。
+  `systemd-analyze`/`hostnamectl`/`timedatectl`/`dmesg` 为极薄入口，独立调用由门禁直接路由、
+  脚本/管道调用经入口文件 IPC 转发到同一门面，**两者行为完全一致**，不再存在「复合命令命中真实
+  二进制并报无法连接总线」的矛盾。`systemd-run` 的临时单元在 `status/show/cat/is-enabled/
+  stop/restart` 全部一致（`--wait` 透传退出码，`--pipe`/`-P`/`--pty`/`--scope` 回传输出与退出
+  码）；`systemd-analyze`/`hostnamectl`/`timedatectl`/`dmesg` 由门面合成；
+  `get-default`/`list-timers`/`list-sockets`/`list-jobs`/`show-environment` 合成；基线系统单元的
+  start/stop/restart 幂等成功；无动词 `systemctl` 按 `list-units` 处理；`reset-failed` 成功；
+  `ExecStart` 采用真实 systemd 的 `${VAR}` 语义并展开 `%` 说明符、`oneshot` start 等待退出码；
+  `notify`/`forking`/`dbus`/`idle` 类型与 `User=`/`Group=` 按 best-effort 兼容；不可解析的单元
+  透传清洗后的真实原因（不再谎报 `Operation not permitted`）；门面从同一会话私有
+  视图读取 `/run/systemd/system`（`/etc/systemd/system` 走整机 overlay upper）；宿主 `/etc/fstab`
+  被遮蔽（挂载视图一致）。
 - **`service`/`invoke-rc.d` 未路由（设计边界）**：门面拦截 `systemctl`/`journalctl`/`systemd-run`/`systemd-analyze`；
   `service`/`invoke-rc.d` 仅在**包安装**时经 policy-rc.d 兼容（服务不真正启动）。
   需要用户级服务请用 `systemctl --user`（由门面的伪造解析器处理简单 start/stop；

@@ -61,7 +61,12 @@ local function _ensure_loaded()
   if not ok or type(persisted) ~= "table" then return end
   for _, item in ipairs(persisted) do
     local id = item and item.change_set_id
-    if id and not state.items[id] then state.items[id] = item end
+    if id and not state.items[id] then
+      -- 部分取代增量：被更新候选覆盖的路径单独持久化（避免重编码整单元）；水合时并回。
+      local removed = store.read_review_removed and store.read_review_removed(id)
+      if removed and type(removed.paths) == "table" then item.superseded_paths = removed.paths end
+      state.items[id] = item
+    end
   end
   state.pending_cache = nil
   state.pending_items = nil
@@ -98,6 +103,21 @@ local function _persist(item)
   -- 异步落盘（文件写入移入线程池）：待审项含候选文件内容，大候选时同步 fsync 会卡主线程。
   -- 内存态是权威来源，store 的写缓存保证刚写入即可同步读回；reset/shutdown 前会 flush。
   pcall(store.write_review_async, item)
+  -- 部分取代增量单独落盘（避免重编码整单元）；与 item 同步，防止水合时丢失/陈旧。
+  if type(item.superseded_paths) == "table" then
+    pcall(store.write_review_removed, item.change_set_id, item.superseded_paths)
+  end
+end
+
+--- 部分取代增量中被覆盖的路径数量。
+--- @param item table
+--- @return number
+local function _superseded_count(item)
+  local sup = item and item.superseded_paths
+  if type(sup) ~= "table" then return 0 end
+  local n = 0
+  for _ in pairs(sup) do n = n + 1 end
+  return n
 end
 
 --- 候选是否仍被某个「可应用」变更单元引用。
@@ -391,9 +411,18 @@ local function _merge_package_item(item, cand)
   end
   if #members == 0 then return item end
   local base = members[1]
+  -- 部分取代增量：成员中被更新候选覆盖的路径不再并入（除非新候选本身重新写入该路径）。
+  local skip = {}
+  for _, it in ipairs(members) do
+    if type(it.superseded_paths) == "table" then
+      for p in pairs(it.superseded_paths) do skip[p] = true end
+    end
+  end
+  for _, f in ipairs(cand.files or {}) do skip[f.path] = nil end
   -- 按路径合并文件（新候选优先），并集排序。
   local by_path, order = {}, {}
   local function add(f)
+    if skip[f.path] then return end
     if not by_path[f.path] then order[#order + 1] = f.path end
     by_path[f.path] = f
   end
@@ -424,6 +453,7 @@ local function _merge_package_item(item, cand)
     state.items[it.change_set_id] = it
     if it.candidate_digest ~= digest then to_discard[it.candidate_digest] = true end
     _persist(it)
+    pcall(store.delete_review_removed, it.change_set_id)
     _emit(require("NeoAI.kernel.events").SANDBOX_REVIEW_SUPERSEDED, {
       change_set_id = it.change_set_id, superseded_by = base.change_set_id,
     })
@@ -432,6 +462,10 @@ local function _merge_package_item(item, cand)
   base.candidate_digest = digest
   base.files = files
   base.write_set = _write_set(newcand)
+  -- 合并后的候选已按增量剔除被取代路径，清空增量并删除其落盘记录。
+  base.superseded_paths = nil
+  base.partial_superseded_by = nil
+  pcall(store.delete_review_removed, base.change_set_id)
   base.package_names = _union(base.package_names, item.package_names)
   base.command = item.command or base.command
   base.package_manager = item.package_manager or base.package_manager
@@ -452,6 +486,7 @@ local function _merge_package_item(item, cand)
   state.items[item.change_set_id] = item
   if item.candidate_digest ~= digest then to_discard[item.candidate_digest] = true end
   _persist(item)
+  pcall(store.delete_review_removed, item.change_set_id)
   _discard_candidates(to_discard)
   _emit(require("NeoAI.kernel.events").SANDBOX_REVIEW_SUPERSEDED, {
     change_set_id = item.change_set_id, superseded_by = base.change_set_id,
@@ -621,6 +656,9 @@ function M.pending_summary()
       else
         local n = #(item.files or {})
         if n == 0 then n = #(item.write_set or {}) end
+        -- 部分取代：被更新候选覆盖的路径不再待审，从计数中扣除。
+        n = n - _superseded_count(item)
+        if n < 0 then n = 0 end
         count = count + n
       end
       if item.risk_level and (not max_level or item.risk_level > max_level) then
@@ -696,6 +734,7 @@ function M.reject(id, reason)
   -- 拒绝后暂存副本失效：后续编辑应重新以真实文件为基线，不能带上被拒改动。
   candidate.invalidate(item.write_set)
   _persist(item)
+  pcall(store.delete_review_removed, id)
   _emit(require("NeoAI.kernel.events").SANDBOX_REVIEW_REJECTED, { change_set_id = id, reason = reason })
   return item
 end
@@ -718,8 +757,10 @@ function M.reject_file(id, path, reason)
   end
   local remaining_paths = {}
   local found = false
+  local sup = type(item.superseded_paths) == "table" and item.superseded_paths or nil
   for _, f in ipairs(files) do
-    if f.path == path then found = true else remaining_paths[#remaining_paths + 1] = f.path end
+    if f.path == path then found = true
+    elseif not (sup and sup[f.path]) then remaining_paths[#remaining_paths + 1] = f.path end
   end
   if not found then return item end
   -- 被拒文件的暂存副本失效：后续编辑重新以真实文件为基线，不带上被拒改动。
@@ -839,22 +880,38 @@ function M.apply(id, opts)
     _restore_pending()
     return { ok = false, state = "FAILED", reason = "CANDIDATE_NOT_FOUND: " .. tostring(item.candidate_digest) }
   end
-  -- 选择性应用：按允许文件子集过滤候选，未选中的文件保留为新的待审项
+  -- 选择性应用：按允许文件子集过滤候选，未选中的文件保留为新的待审项。
+  -- 部分取代：被更新候选覆盖的路径从本单元剔除且**不回队**（归新单元所有）。
+  local sup = type(item.superseded_paths) == "table" and item.superseded_paths or nil
+  local apply_all = not (opts.files and #opts.files > 0)
+  local allow
+  if not apply_all then
+    allow = {}
+    for _, p in ipairs(opts.files) do
+      if not (sup and sup[p]) then allow[p] = true end
+    end
+  end
   local remaining = {}
-  if opts.files and #opts.files > 0 then
-    local allow = {}
-    for _, p in ipairs(opts.files) do allow[p] = true end
-    local filtered = {}
-    for _, f in ipairs(cand.files or {}) do
-      if allow[f.path] then filtered[#filtered + 1] = f else remaining[#remaining + 1] = f end
+  local filtered = {}
+  for _, f in ipairs(cand.files or {}) do
+    local already = sup and sup[f.path]
+    if (not already) and (apply_all or (allow and allow[f.path])) then
+      filtered[#filtered + 1] = f
+    elseif not already then
+      remaining[#remaining + 1] = f
     end
-    if #filtered == 0 then
-      _restore_pending()
-      return { ok = false, state = "FAILED", reason = "NO_FILES_SELECTED" }
-    end
-    cand = vim.deepcopy(cand)
-    cand.files = filtered
-    cand.candidate_digest = cand.candidate_digest .. ":subset" .. tostring(#filtered)
+  end
+  if #filtered == 0 then
+    _restore_pending()
+    return { ok = false, state = "FAILED", reason = "NO_FILES_SELECTED" }
+  end
+  if #filtered < #(cand.files or {}) then
+    -- 浅拷贝 + 替换 files：不深拷贝含内容的大候选（上万文件时是应用阶段主线程卡顿源）。
+    local copy = {}
+    for k, v in pairs(cand) do copy[k] = v end
+    copy.files = filtered
+    copy.candidate_digest = cand.candidate_digest .. ":subset" .. tostring(#filtered)
+    cand = copy
   end
 
   item.apply_state = M.APPLY.APPLYING
@@ -874,6 +931,8 @@ function M.apply(id, opts)
     item.applied_at = os.time()
     item.receipt = pub.receipt
     store.write_receipt(pub.receipt)
+    -- 已应用：部分取代增量已完成使命，清理（被取代路径由新单元持有）。
+    item.superseded_paths = nil
     -- 批量应用（apply_all / begin_batch 会话）时把候选删除推迟到全部应用后一次性对账，
     -- 避免对每个候选做一次全表引用扫描（O(n²)）；单项应用仍即时删除。
     local deferred = opts._defer_discard or (opts.batch and opts.batch.deferred)
@@ -884,6 +943,7 @@ function M.apply(id, opts)
     end
     _store_snapshot(item, snapshot_entries, pub.receipt.operation_id)
     _persist(item)
+    pcall(store.delete_review_removed, item.change_set_id)
     -- 仅应用了部分文件：其余文件保留待审，供用户逐个确认
     if #remaining > 0 then _requeue_remaining(item, remaining) end
     _emit(require("NeoAI.kernel.events").SANDBOX_APPLIED, {
@@ -991,11 +1051,16 @@ function M.discard_by_digest(digest, reason)
 end
 
 --- 取代（SUPERSEDED）覆盖指定路径的旧待审变更单元。
---- 同一文件被再次编辑/发布时，旧待审项不再有意义（内容已被更新版本覆盖），
---- 标记为 SUPERSEDED 并丢弃候选，避免同一文件在队列中出现多个版本。
+--- 同一文件被再次编辑/发布时，旧待审项不再有意义（内容已被更新版本覆盖）。
+--- **按文件粒度取代**：只记录被覆盖的路径（增量，O(重叠)），同单元其余文件保留为待审。
+--- 否则一条包含上千文件的包安装变更单元会因后续命令只改其中一个文件（如 import 生成
+--- `.pyc`）而被整单元丢弃，导致批准后包内 `.py`/dist-info 缺失（`ImportError ...
+--- (unknown location)`、命名空间包）。
+--- 增量取代**不重编码整单元/候选**（含上万文件时那是每轮卡顿源），只在应用/展示时按增量剔除。
+--- 例外：`atomic_group="git"` 的对象/指针必须整组保留，不可拆分。
 --- @param paths table 路径数组
 --- @param except_id string|nil 不取代的 change_set_id（通常是刚入队的新项）
---- @return number superseded 被取代的数量
+--- @return number superseded 受影响的变更单元数量
 function M.supersede_by_paths(paths, except_id)
   local set = {}
   for _, p in ipairs(paths or {}) do set[p] = true end
@@ -1003,21 +1068,47 @@ function M.supersede_by_paths(paths, except_id)
   local n = 0
   local to_discard = {}
   for _, item in ipairs(_pending_items()) do
-    if item.change_set_id ~= except_id then
-      local overlap = false
-      for _, f in ipairs(item.files or {}) do
-        if set[f.path] then overlap = true break end
+    if item.change_set_id ~= except_id and type(item.files) == "table" and #item.files > 0 then
+      local sup = type(item.superseded_paths) == "table" and item.superseded_paths or nil
+      local overlap = 0
+      for _, f in ipairs(item.files) do
+        if set[f.path] and not (sup and sup[f.path]) then overlap = overlap + 1 end
       end
-      if overlap then
-        item.review_state = M.REVIEW.SUPERSEDED
-        item.superseded_by = except_id
-        item.superseded_at = os.time()
-        state.items[item.change_set_id] = item
-        if item.candidate_digest then to_discard[item.candidate_digest] = true end
-        _persist(item)
-        _emit(require("NeoAI.kernel.events").SANDBOX_REVIEW_SUPERSEDED, {
-          change_set_id = item.change_set_id, superseded_by = except_id,
-        })
+      if overlap > 0 then
+        local eff = #item.files - _superseded_count(item)
+        if item.atomic_group == "git" or overlap >= eff then
+          -- 整单元取代：单文件变更单元、git 原子组（索引↔对象库不可拆分）。
+          item.superseded_paths = nil
+          item.review_state = M.REVIEW.SUPERSEDED
+          item.superseded_by = except_id
+          item.superseded_at = os.time()
+          state.items[item.change_set_id] = item
+          if item.candidate_digest then to_discard[item.candidate_digest] = true end
+          _persist(item)
+          pcall(store.delete_review_removed, item.change_set_id)
+          _emit(require("NeoAI.kernel.events").SANDBOX_REVIEW_SUPERSEDED, {
+            change_set_id = item.change_set_id, superseded_by = except_id,
+          })
+        else
+          -- 部分取代：仅登记被覆盖的路径（增量小文件），不改 item.files/candidate_digest，
+          -- 故无需重编码整单元（上万文件时避免每轮 O(N) 编码/写盘）。应用/展示时按增量剔除。
+          sup = sup or {}
+          for _, f in ipairs(item.files) do
+            if set[f.path] and not sup[f.path] then sup[f.path] = true end
+          end
+          item.superseded_paths = sup
+          item.partial_superseded_by = except_id
+          item.updated_at = os.time()
+          state.items[item.change_set_id] = item
+          state.pending_cache = nil
+          state.pending_items = nil
+          pcall(store.write_review_removed, item.change_set_id, sup)
+          -- 待审项内容已变化：广播入队事件触发审批窗刷新（事件语义为「待审集合变化」）。
+          _emit(require("NeoAI.kernel.events").SANDBOX_REVIEW_ENQUEUED, {
+            change_set_id = item.change_set_id, candidate_digest = item.candidate_digest,
+            tool = item.tool, partial_supersede = true,
+          })
+        end
         n = n + 1
       end
     end
@@ -1178,10 +1269,13 @@ function M.derive_revision(parent_id, opts)
   local cand = store.read_candidate(parent.candidate_digest)
   if not cand then return nil, "CANDIDATE_NOT_FOUND" end
   local files = {}
+  -- 部分取代增量：被更新候选覆盖的路径不派生进新 revision。
+  local psup = type(parent.superseded_paths) == "table" and parent.superseded_paths or nil
+  local function keep(p) return not (psup and psup[p]) end
   if opts.contents then
     for _, f in ipairs(cand.files or {}) do
       local new_content = opts.contents[f.path]
-      if new_content ~= nil then
+      if new_content ~= nil and keep(f.path) then
         local copy = vim.deepcopy(f)
         copy.content = new_content
         copy.after_hash = _sha(new_content)
@@ -1192,10 +1286,12 @@ function M.derive_revision(parent_id, opts)
     local allow = {}
     for _, p in ipairs(opts.paths) do allow[p] = true end
     for _, f in ipairs(cand.files or {}) do
-      if allow[f.path] then files[#files + 1] = vim.deepcopy(f) end
+      if allow[f.path] and keep(f.path) then files[#files + 1] = vim.deepcopy(f) end
     end
   else
-    for _, f in ipairs(cand.files or {}) do files[#files + 1] = vim.deepcopy(f) end
+    for _, f in ipairs(cand.files or {}) do
+      if keep(f.path) then files[#files + 1] = vim.deepcopy(f) end
+    end
   end
   if #files == 0 then return nil, "NO_FILES_SELECTED" end
   table.sort(files, function(a, b) return a.path < b.path end)

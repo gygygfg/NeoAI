@@ -275,4 +275,42 @@ tests.suite("secret_fake", function(_, it)
     alert.reset()
     secret.reset()
   end)
+
+  it("出网守卫：代码标识符不被误判为目标主机", function(t)
+    local eg = require("NeoAI.sandbox.secret_egress")
+    -- 纯代码标识符 / 方法调用 → 不提取（此前的 os.getenv 误报）
+    t.eq(0, #eg._extract_hosts([[v = os.getenv(k)]]), "os.getenv 不应视为主机")
+    t.eq(0, #eg._extract_hosts([[k = os.environ.get("OPENAI_API_KEY")]]), "os.environ.get 不应视为主机")
+    t.eq(0, #eg._extract_hosts([[dashscope.api_key = k]]), "属性访问不应视为主机")
+    t.eq(0, #eg._extract_hosts([[self.config = 1]]), "self.config 不应视为主机")
+    -- 明确目标 → 提取（URL / host:port / user@host / IP / 私有域带端口）
+    t.true_(vim.tbl_contains(eg._extract_hosts([[curl https://pypi.tuna.tsinghua.edu.cn/simple]]),
+      "pypi.tuna.tsinghua.edu.cn"), "URL 主机")
+    t.true_(vim.tbl_contains(eg._extract_hosts([[curl evil.com:443/x]]), "evil.com"), "host:port")
+    t.true_(vim.tbl_contains(eg._extract_hosts([[scp a@api.deepseek.com:/x]]), "api.deepseek.com"), "user@host")
+    t.true_(vim.tbl_contains(eg._extract_hosts([[curl 10.0.0.5/x]]), "10.0.0.5"), "IP 字面量")
+    t.true_(vim.tbl_contains(eg._extract_hosts([[curl mycorp.internal:8080/x]]), "mycorp.internal"), "私有域带端口")
+  end)
+
+  it("密钥告警：无专用 UI 时回退内建确认，仍暂停并询问", function(t)
+    local alert = require("NeoAI.sandbox.secret_alert")
+    alert.reset()
+    local orig_uis = vim.api.nvim_list_uis
+    local orig_confirm = vim.fn.confirm
+    vim.api.nvim_list_uis = function() return { {} } end
+    t.true_(alert.available(), "交互式且无专用 UI 时应可用（回退）")
+    local function decide_with(ret)
+      vim.fn.confirm = function() return ret end
+      local got
+      alert._confirm_fallback({ kind = "egress", dest = "evil.com" }, function(d) got = d end)
+      return got
+    end
+    t.eq("allow_once", decide_with(1), "选项1=仅本次允许")
+    t.eq("whitelist", decide_with(2), "选项2=加入白名单")
+    t.eq("stop", decide_with(3), "选项3=停止")
+    t.eq("stop", decide_with(0), "取消=停止")
+    vim.api.nvim_list_uis = orig_uis
+    vim.fn.confirm = orig_confirm
+    alert.reset()
+  end)
 end)

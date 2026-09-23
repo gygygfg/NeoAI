@@ -568,6 +568,9 @@ local DEFAULT_CONFIG = {
         -- `privilege.sysadmin.unmask`）按需解除，使其能读写账户库。写入仍进 overlay 暂存。
         "/etc/shadow", "/etc/shadow-", "/etc/gshadow", "/etc/gshadow-",
         "/etc/sudoers", "/etc/sudoers.d", "/etc/machine-id", "/etc/hostid",
+        -- 宿主 fstab 泄露磁盘布局/根文件系统 UUID，并会让 `mount -o remount,rw /` 按宿主 UUID
+        -- 解析（沙箱根是 overlay/tmpfs，必然失败并暴露宿主身份）。遮蔽为空，容器语义。
+        "/etc/fstab",
         "/etc/ssh", "/etc/ssl/private", "/etc/ipa", "/etc/krb5.keytab",
         -- 日志、计划任务与审计
         "/var/log", "/var/spool/cron", "/etc/crontab", "/etc/cron.d",
@@ -693,9 +696,13 @@ local DEFAULT_CONFIG = {
         -- 代理拦截本机目标、放行外部并记录；网络整体仍为「放行 + 记录」。
         -- 边界：应用层过滤——不认代理的裸 TCP 可绕过（共享 netns 无法按目的地做内核过滤）。
         host_local_block = true,
-        -- 代理规避门禁（默认开）：host_local_block 生效时，拒绝显式清除/绕过代理变量的命令
-        -- （unset *proxy、env -u *proxy、curl --noproxy、--proxy "" 等），因为这些命令会使
-        -- 应用层过滤失效、直达宿主本机。裸 TCP（nc/ssh/自建 socket）无法由此覆盖，属已知边界。
+        -- 代理规避处理（host_local_block 生效时）：显式清除/绕过代理变量的命令
+        -- （unset *proxy、env -u *proxy、curl --noproxy、--proxy "" 等）会使应用层过滤失效、
+        -- 直达宿主本机。取值：
+        --   true（默认）= 暂停并弹窗询问（仅本次允许 / 本次会话始终允许 / 拒绝）；
+        --   "deny"      = 直接拒绝（旧硬拒绝行为）；
+        --   false       = 不拦截（允许绕过，应用层过滤边界失效）。
+        -- 裸 TCP（nc/ssh/自建 socket）无法由此覆盖，属已知边界。
         block_proxy_evasion = true,
         -- 宿主过滤代理监听端口（0 = 自动分配 loopback 随机端口）。
         host_local_proxy_port = 0,
@@ -710,6 +717,12 @@ local DEFAULT_CONFIG = {
         --   "allow"       = 直接放行并记录（旧行为）；
         --   "deny"        = 直接拒绝。
         access = "ask",
+        -- 软件源自动放行（默认开）：pip/uv/npm/go/cargo/apt 等**外部**软件源（PyPI、npm、crates、
+        -- 清华/阿里/中科大等镜像）经代理访问时免弹窗直接放行，避免包安装被网络同意门禁拦截。
+        -- 仅对非本机目标生效（解析到本机或解析失败仍拒绝，SSRF 防护不削弱）；access="deny" 时仍拒绝。
+        auto_allow_sources = true,
+        -- 额外软件源域名后缀（私有源/自建镜像），如 { "pypi.mycorp.com" }。子域自动匹配。
+        extra_package_sources = {},
         -- 国内/受限网络镜像（默认空 = 完全沿用系统配置）。仅对**沙箱外部命令**生效，
         -- 通过环境变量注入（npm 另经 settings 绑定）。用于绕过代理/源站不可达：
         --   pip   = "https://pypi.tuna.tsinghua.edu.cn/simple"（注入 PIP_INDEX_URL + PIP_TRUSTED_HOST）
@@ -757,6 +770,19 @@ local DEFAULT_CONFIG = {
         prewarm = true,
         -- 预热有效期（毫秒）：超时未被下一条进程命令复用则回收（停止探针、释放 cgroup）。
         prewarm_ttl_ms = 90000,
+        -- 越界访问留痕忽略路径：这些目录（软件包/依赖缓存）的读取是包管理/构建的正常行为，
+        -- 不记为「越界访问」、不在审批悬浮窗的「越界访问留痕」区展示，避免 `~/.cache/uv`、
+        -- `~/.npm` 等大量缓存读取刷屏。支持 `~` 展开与 glob（`*`）。默认还会合并
+        -- `tools.sandbox.packages.volatile_paths`；设为 `{}` 关闭默认忽略（仍合并 volatile）。
+        trace_ignore_paths = {
+          "~/.cache/uv", "~/.cache/pip", "~/.cache/pypoetry", "~/.cache/pdm", "~/.cache/poetry",
+          "~/.cache/yarn", "~/.cache/go-build", "~/.cache/composer", "~/.cache/deno",
+          "~/.cache/node-gyp", "~/.cache/electron", "~/.cache/pre-commit", "~/.cache/bun",
+          "~/.npm", "~/.pnpm-store", "~/.bun", "~/.deno",
+          "~/.cargo", "~/.rustup", "~/go/pkg",
+          "~/.gradle", "~/.m2", "~/.nuget/packages", "~/.gem",
+          "~/.local/share/uv", "~/.local/share/pipx",
+        },
       },
       -- 写日志增量捕获（默认 "auto"）：利用 eBPF 观测到的「本轮写入/删除路径」，capture 只处理
       -- 这些路径，不再全量遍历会话累积的 overlay upper（消除「缓存文件大量、多轮读写卡顿」）。
@@ -803,8 +829,9 @@ local DEFAULT_CONFIG = {
       -- `/usr/bin/systemctl`、`/usr/bin/journalctl` 是极薄入口（bash 文件 IPC 客户端），把 argv
       -- 转发给宿主门面后按真实 stdout/stderr/退出码返回。独立调用由门禁直接路由；脚本/管道调用
       -- 经入口走同一门面，行为与独立调用完全一致。不调用宿主 systemd、也不修改宿主机。支持
-      -- simple/exec/oneshot 与 Requires/Wants/After/Before 依赖；Type=notify/forking/dbus、
-      -- socket/timer 等语义明确报错；门面不处理的动词回退 T2/hostop 提案路径。
+      -- simple/exec/oneshot 与 Requires/Wants/After/Before 依赖，展开 `%` 说明符与 `${VAR}`；
+      -- notify/forking/dbus/idle 类型与 User=/Group= 按 best-effort 兼容；socket/timer、模板单元、
+      -- 未知 Type 等明确报错（透传清洗后的具体原因）；门面不处理的动词回退 T2/hostop 提案路径。
       systemd = {
         enabled = true, -- 总开关
         mode = "facade", -- facade（默认）：沙箱内处理；其余值保留给未来实现

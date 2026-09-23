@@ -422,21 +422,34 @@ function M.build_overlay_specs(cwd, base_dir, extra_roots)
   -- 使沙箱内根文件系统「原样可写」，所有写入进 upper 暂存、宿主盘不受影响；命令结束后从该
   -- upper 捕获全部改动为候选。overlay 不可写时退回旧的多根逻辑（process_prefix 以只读根运行，
   -- 是否允许降级由 overlay_fail_closed 决定）。
-  if runtime.read_all() and cwd then
-    local d = base .. "/root"
+  --- 尝试在给定基目录建立整机根 overlay；成功则返回 specs，否则 nil。
+  --- @param d string
+  --- @return table|nil
+  local function try_root_overlay(d)
     local upper, work, bind = d .. "/upper", d .. "/work", d .. "/bind"
     fs.ensure_dir(upper)
     fs.ensure_dir(work)
     fs.ensure_dir(bind)
     runtime.chown_payload(d)
-    if runtime.overlay_writable("/", upper, work) then
-      local specs = { { root = "/", upper = upper, work = work, bind = bind, mode = "overlay" } }
-      -- 整机 overlay 看不到会话私有 tmpfs 根（/tmp、/var/tmp 被私有目录覆盖），cwd 位于其下时
-      -- 仍需单独 overlay cwd，使命令能在工作目录运行（与旧多根逻辑一致）。
-      if under_tmpfs(cwd) and vim.fn.isdirectory(cwd) == 1 and not under(base, cwd) then
-        specs[#specs + 1] = make_spec(cwd)
-      end
-      return specs
+    if not runtime.overlay_writable("/", upper, work) then return nil end
+    runtime.register_root_overlay_upper(upper)
+    local specs = { { root = "/", upper = upper, work = work, bind = bind, mode = "overlay" } }
+    -- 整机 overlay 看不到会话私有 tmpfs 根（/tmp、/var/tmp 被私有目录覆盖），cwd 位于其下时
+    -- 仍需单独 overlay cwd，使命令能在工作目录运行（与旧多根逻辑一致）。
+    if under_tmpfs(cwd) and vim.fn.isdirectory(cwd) == 1 and not under(base, cwd) then
+      specs[#specs + 1] = make_spec(cwd)
+    end
+    return specs
+  end
+  if runtime.read_all() and cwd then
+    local specs = try_root_overlay(base .. "/root")
+    if specs then return specs end
+    -- 备用位置：容器内「overlay 之上再 overlay」会 EINVAL，改用 tmpfs（/dev/shm、/run）承载
+    -- upper/work，使沙箱根仍可写（不让 AI 察觉文件系统只读）。
+    local fb = runtime.overlay_fallback_dir()
+    if fb then
+      specs = try_root_overlay(fb .. "/root")
+      if specs then return specs end
     end
   end
   -- 无法 overlay 的 tmpfs 挂载根（overlay lower 为挂载点会 EINVAL）：这些根只能
@@ -1452,17 +1465,6 @@ local function _gate_inner(tool, args, ctx, call_original)
     end)
     local deny = require("NeoAI.sandbox.risk").deny_reason(
       (scan and scan.effective) or args.command, { caps = caps })
-    -- 代理规避门禁：host_local_block 生效时，显式清除/绕过代理变量会让应用层过滤失效、
-    -- 直达宿主本机。裸 TCP 不在覆盖范围（已知边界）。
-    if not deny then
-      local net = config_store.get("tools.sandbox.network") or {}
-      local ok_rt, rt = pcall(require, "NeoAI.sandbox.runtime")
-      if net.block_proxy_evasion ~= false and ok_rt and rt.host_local_block_enabled
-        and rt.host_local_block_enabled() then
-        deny = require("NeoAI.sandbox.risk").network_evasion_reason(
-          (scan and scan.effective) or args.command)
-      end
-    end
     if deny then
       control.transition(attempt, "PARSED")
       control.transition(attempt, "BLOCKED")
@@ -1472,6 +1474,38 @@ local function _gate_inner(tool, args, ctx, call_original)
         reason_codes = { deny },
         command_id = attempt.command_id,
       })
+    end
+    -- 代理规避：host_local_block 生效时，显式清除/绕过代理变量会让应用层过滤失效、直达宿主本机。
+    -- 默认（block_proxy_evasion=true）暂停并弹窗询问；"deny" 直接拒绝；false 不拦截。
+    -- 裸 TCP（nc/ssh/自建 socket）不在覆盖范围（已知边界）。
+    local net = config_store.get("tools.sandbox.network") or {}
+    local pmode = net.block_proxy_evasion
+    if pmode == false then pmode = "allow" elseif pmode == "deny" then pmode = "deny" else pmode = "ask" end
+    if pmode ~= "allow" then
+      local ok_rt, rt = pcall(require, "NeoAI.sandbox.runtime")
+      if ok_rt and rt.host_local_block_enabled and rt.host_local_block_enabled() then
+        local evasion = require("NeoAI.sandbox.risk").network_evasion_reason(
+          (scan and scan.effective) or args.command)
+        if evasion then
+          local allowed = pmode ~= "deny"
+          if allowed then
+            local decision = require("NeoAI.sandbox.policy_consent").ask("proxy_evasion", {
+              title = "代理规避确认：命令清除/绕过代理，将绕过宿主本机访问过滤。是否允许？",
+            })
+            allowed = (decision == "once" or decision == "session")
+          end
+          if not allowed then
+            control.transition(attempt, "PARSED")
+            control.transition(attempt, "BLOCKED")
+            return async.reject({
+              kind = "sandbox",
+              message = "沙箱拒绝（代理规避未获批准）: " .. evasion,
+              reason_codes = { evasion },
+              command_id = attempt.command_id,
+            })
+          end
+        end
+      end
     end
   end
   control.transition(attempt, "PARSED")

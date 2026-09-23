@@ -439,6 +439,16 @@ function M.build_lines(items, traces, audit, saved)
       files = {}
       for _, p in ipairs(item.write_set or {}) do files[#files + 1] = { path = p } end
     end
+    -- 部分取代：被更新候选覆盖的路径归新单元所有，不再展示/审批（否则会显示已被取代的旧版本）。
+    local sup = type(item.superseded_paths) == "table" and item.superseded_paths or nil
+    if sup then
+      local kept = {}
+      for _, f in ipairs(files) do
+        local p = type(f) == "table" and f.path or f
+        if not sup[p] then kept[#kept + 1] = f end
+      end
+      files = kept
+    end
     -- 包安装：标注管理器与包名（按安装命令合并为一个审批单元）。
     local pkg = ""
     if item.package then

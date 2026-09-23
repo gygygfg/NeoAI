@@ -205,7 +205,6 @@ local function _build_wire(messages, infos, policy)
           pending[#pending + 1] = { part = { type = "text", text = OFFLOADED_IMAGE_TEXT }, bytes = 0 }
         end
       else
-        flush()
         wire[#wire + 1] = m
       end
     else

@@ -140,8 +140,12 @@ local function _build(svc, opts)
     network = (opts.network ~= false) and sandbox_cfg.offline ~= true,
     cap_add = {}, mounts = {}, userns = false, unmask = roots,
   }
+  -- 与 run_command/exec 共用同一「稳定」临时根（/tmp、/var/tmp、/run）：服务据此看到 AI 写入
+  -- 会话私有 /run 的脚本/单元，避免「ExecStart 指向 /run 脚本却 No such file or directory」。
+  local tmp_base = runtime.stable_tmp_base()
   local prefix, perr = runtime.process_prefix({
-    cwd = real_cwd, overlays = specs, privileges = priv, session_tmp_dir = svc_dir,
+    cwd = real_cwd, overlays = specs, privileges = priv,
+    session_tmp_dir = tmp_base, tmpfs_base = tmp_base,
   })
   if not prefix then return nil, perr end
 

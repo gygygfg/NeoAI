@@ -191,4 +191,87 @@ tests.suite("review_cache", function(_, it)
     store.reset()
     review.reset()
   end)
+
+  it("部分取代：包安装单元不因单个 .pyc 改动被整单元丢弃（保留 .py/dist-info）", function(t)
+    local store, review = setup()
+    local dir = vim.fn.tempname()
+    vim.fn.mkdir(dir .. "/dashscope/__pycache__", "p")
+    vim.fn.mkdir(dir .. "/dashscope-1.27.6.dist-info", "p")
+    local p_py = dir .. "/dashscope/__init__.py"
+    local p_meta = dir .. "/dashscope-1.27.6.dist-info/METADATA"
+    local p_pyc = dir .. "/dashscope/__pycache__/__init__.cpython-311.pyc"
+    local candA = {
+      candidate_digest = "sha256:pkgA",
+      files = {
+        { path = p_py, action = "create", after_hash = "hp", content = "x" },
+        { path = p_meta, action = "create", after_hash = "hm", content = "m" },
+        { path = p_pyc, action = "create", after_hash = "hc", content = "c" },
+      },
+      created_at = 1,
+    }
+    store.write_candidate(candA)
+    local A = review.enqueue(candA, { tool = "run_command", package = true, package_key = "pip:dashscope" })
+    local candB = {
+      candidate_digest = "sha256:pkgB",
+      files = { { path = p_pyc, action = "modify", after_hash = "hc2", content = "c2" } },
+      created_at = 2,
+    }
+    store.write_candidate(candB)
+    local B = review.enqueue(candB, { tool = "run_command", package = true, package_key = "pip:*" })
+    t.true_(A ~= nil and B ~= nil, "两个变更单元都应入队")
+    -- 后续命令只改动 .pyc：只应登记该路径为「被取代」，其余文件保留待审
+    review.supersede_by_paths({ p_pyc }, B.change_set_id)
+    local A2 = review.get(A.change_set_id)
+    t.eq(review.REVIEW.PENDING, A2.review_state, "包安装单元应保持待审（不被整单元取代）")
+    t.true_(A2.superseded_paths and A2.superseded_paths[p_pyc], "应登记被取代的 .pyc")
+    t.eq(A.candidate_digest, A2.candidate_digest, "部分取代不应重编码整候选（保持摘要不变）")
+    t.not_nil(store.read_candidate(A2.candidate_digest), "候选保持有效（未重编码整单元）")
+    -- 目标包文件（.py/dist-info）未被取代
+    t.true_(not (A2.superseded_paths and (A2.superseded_paths[p_py] or A2.superseded_paths[p_meta])),
+      "不应取代 .py/dist-info")
+    -- B 仍为待审（持有被取代的 .pyc）
+    t.eq(review.REVIEW.PENDING, review.get(B.change_set_id).review_state, "新单元应保持待审")
+    -- 待审计数应扣除被取代路径：A 剩 2 + B 的 1 = 3
+    t.eq(3, review.pending_summary().count, "待审计数应扣除被取代路径")
+    -- 应用 A 时不得写入被取代的 .pyc（该路径归新单元），但必须写入 .py/dist-info
+    local candidate = require("NeoAI.sandbox.candidate")
+    local orig_pub, orig_receipt = candidate.publish, store.write_receipt
+    local published
+    candidate.publish = function(c)
+      published = {}
+      for _, f in ipairs(c.files) do published[f.path] = true end
+      return { ok = true, state = "COMMITTED", receipt = { operation_id = "op_pkg" } }
+    end
+    store.write_receipt = function() return true end
+    local res = review.apply(A.change_set_id, { auto_approve = true })
+    candidate.publish, store.write_receipt = orig_pub, orig_receipt
+    t.true_(res.ok, "应用应成功: " .. tostring(res and res.reason))
+    t.true_(published and published[p_py], "应写入 __init__.py")
+    t.true_(published and published[p_meta], "应写入 dist-info")
+    t.true_(published and not published[p_pyc], "不应写入被取代的 .pyc")
+    store.reset()
+    review.reset()
+  end)
+
+  it("取代：git 原子组整组取代（不可拆分）", function(t)
+    local store, review = setup()
+    local dir = vim.fn.tempname()
+    local cand = {
+      candidate_digest = "sha256:gitA",
+      files = {
+        { path = dir .. "/.git/objects/ab/cd", action = "create", after_hash = "o", content = "o" },
+        { path = dir .. "/.git/index", action = "modify", after_hash = "i", content = "i" },
+        { path = dir .. "/work.txt", action = "modify", after_hash = "w", content = "w" },
+      },
+      created_at = 1,
+    }
+    store.write_candidate(cand)
+    local item = review.enqueue(cand, { tool = "git_add" })
+    t.eq("git", item.atomic_group, "应标记 git 原子组")
+    review.supersede_by_paths({ dir .. "/work.txt" }, nil)
+    local after = review.get(item.change_set_id)
+    t.eq(review.REVIEW.SUPERSEDED, after.review_state, "git 原子组应整组取代，不逐文件拆分")
+    store.reset()
+    review.reset()
+  end)
 end)

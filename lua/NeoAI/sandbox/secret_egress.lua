@@ -105,6 +105,10 @@ end
 function M.add_trusted(host)
   if type(host) ~= "string" or host == "" then return end
   host = host:lower()
+  -- 仅接受像主机名的值（含点/为 localhost/IP），避免把「未知目标」等占位串写入白名单。
+  if host ~= "localhost" and not host:find(".", 1, true) and not host:match("^%d+%.%d+%.%d+%.%d+$") then
+    return
+  end
   local cfg = _cfg()
   local list = {}
   for _, p in ipairs(cfg.trusted_services or {}) do list[#list + 1] = p end
@@ -212,20 +216,60 @@ local function _may_egress(command)
   return false
 end
 
---- 从命令中提取候选目标主机
+-- 常见公网 TLD：用于把「裸主机名」与代码标识符（`os.getenv`/`self.config` 等）区分开。
+-- 不追求穷尽——URL、`host:port`、`user@host`、IP 字面量另有分支，均视为明确目标不受此限。
+local TLD_SET = {
+  com = true, org = true, net = true, edu = true, gov = true, mil = true, int = true,
+  io = true, dev = true, ai = true, app = true, cloud = true, tech = true, xyz = true,
+  info = true, biz = true, co = true, me = true, online = true, site = true, top = true,
+  shop = true, store = true, club = true, vip = true, wiki = true, cc = true, tv = true,
+  cn = true, us = true, uk = true, de = true, fr = true, jp = true, kr = true, ru = true,
+  ["in"] = true, au = true, ca = true, ch = true, nl = true, se = true, no = true, fi = true,
+  dk = true, pl = true, it = true, es = true, br = true, mx = true, sg = true, hk = true,
+  tw = true, la = true,
+}
+
+--- 裸字符串是否像可解析主机名（而非代码标识符/方法调用）。
+--- @param h string
+--- @return boolean
+local function _looks_like_host(h)
+  if h == "localhost" then return true end
+  if h:match("^%d+%.%d+%.%d+%.%d+$") then return true end
+  if h:find("_", 1, true) then return false end
+  local labels = {}
+  for part in h:gmatch("[^.]+") do labels[#labels + 1] = part end
+  if #labels < 2 then return false end
+  for _, l in ipairs(labels) do
+    if l == "" or l:sub(1, 1) == "-" or l:sub(-1) == "-" or not l:match("^[%w-]+$") then
+      return false
+    end
+  end
+  return TLD_SET[labels[#labels]] == true
+end
+
+--- 从命令中提取候选目标主机。仅收明确目标（URL/host:port/user@host/IP）或形如公网主机的
+--- 裸字符串，避免把 `os.getenv`、`dashscope.api_key` 等代码标识符误判为发送地址。
 --- @param command string
 --- @return table 主机数组
 local function _extract_hosts(command)
   local hosts, seen = {}, {}
-  local function add(h)
-    if h and h ~= "" and not seen[h] then seen[h] = true; hosts[#hosts + 1] = h end
+  local function add(h, explicit)
+    if type(h) ~= "string" or h == "" then return end
+    h = h:lower():gsub("%.$", ""):gsub("^%[", ""):gsub("%]$", ""):gsub(":%d+$", "")
+    if h == "" or (not explicit and not _looks_like_host(h)) then return end
+    if not seen[h] then seen[h] = true; hosts[#hosts + 1] = h end
   end
-  for url in command:gmatch("%a[%w+.-]*://[^%s'\"]+") do add(M.host_of(url)) end
-  -- 裸主机/IP（含 user@host:port）
-  for h in command:gmatch("[@%s]([%w][%w%._%-]*%.[%w][%w%._%-]*)") do
-    if not h:find("%.", 1, true) or h:match("%.%d") or h:match("%a%.") then add(h:lower()) end
+  -- 显式 URL
+  for url in command:gmatch("%a[%w+.-]*://[^%s'\"]+") do add(M.host_of(url), true) end
+  -- user@host
+  for h in command:gmatch("[%w%._%-]+@([%w%._%-]+)") do add(h, true) end
+  -- host:port
+  for h in command:gmatch("([%w][%w%._%-]*%.[%w][%w%._%-]*):%d+") do add(h, true) end
+  -- 裸主机名（排除后随 `(` 的方法/函数调用形态）
+  for h, nxt in command:gmatch("[@%s]([%w][%w%._%-]*%.[%w][%w%._%-]*)(%p?)") do
+    if nxt ~= "(" then add(h, false) end
   end
-  for ip in command:gmatch("(%d+%.%d+%.%d+%.%d+)") do add(ip) end
+  for ip in command:gmatch("(%d+%.%d+%.%d+%.%d+)") do add(ip, true) end
   return hosts
 end
 
@@ -261,6 +305,11 @@ function M.guard_process(command, env, meta)
     if not M.trusted(h) then return M.check(h, payload, m) end
   end
   return nil
+end
+
+--- 测试/内部：从命令提取候选目标主机
+function M._extract_hosts(command)
+  return _extract_hosts(command)
 end
 
 --- 重置（测试用）

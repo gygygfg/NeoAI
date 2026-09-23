@@ -102,6 +102,59 @@ tests.suite("sandbox_hardening", function(_, it)
     end
   end)
 
+  it("策略确认：headless 拒绝；交互式可仅本次/会话允许", function(t)
+    local pc = require("NeoAI.sandbox.policy_consent")
+    pc.reset()
+    local orig_uis = vim.api.nvim_list_uis
+    local orig_confirm = vim.fn.confirm
+    -- headless（无 attached UI）→ 失败关闭
+    t.eq("deny", pc.ask("proxy_evasion", { title = "t" }), "headless 应拒绝")
+    -- 交互式：伪造 UI 与 confirm
+    vim.api.nvim_list_uis = function() return { {} } end
+    vim.fn.confirm = function() return 1 end
+    t.eq("once", pc.ask("proxy_evasion", {}), "选项1=仅本次允许")
+    vim.fn.confirm = function() return 2 end
+    t.eq("session", pc.ask("proxy_evasion", {}), "选项2=本次会话始终允许")
+    t.true_(pc.is_session_allowed("proxy_evasion"), "应记住会话允许")
+    vim.fn.confirm = function() return 3 end
+    t.eq("session", pc.ask("proxy_evasion", {}), "已会话允许时不再弹窗")
+    t.eq("deny", pc.ask("other", {}), "其它策略选项3=拒绝")
+    vim.api.nvim_list_uis = orig_uis
+    vim.fn.confirm = orig_confirm
+    pc.reset()
+  end)
+
+  it("代理规避：默认弹窗拒绝（headless）；批准后放行；可配置 deny/allow", function(t)
+    local tools = require("NeoAI.tools")
+    local pc = require("NeoAI.sandbox.policy_consent")
+    local function run(cmd)
+      local done, out = false, nil
+      tools.execute("run_command", { command = cmd, description = "t" }, {})
+        :then_(function(r) out = tostring(r); done = true end,
+          function(e) out = "ERR:" .. tostring(e and e.message or e); done = true end)
+      t.true_(vim.wait(15000, function() return done end), "命令应完成")
+      return out
+    end
+    local cmd = "env -u http_proxy echo neoai_evasion_ok"
+    -- 默认 ask + headless（无 UI）→ 拒绝
+    t.matches("代理规避未获批准", run(cmd), "headless ask 应拒绝")
+    -- 用户批准（stub）→ 放行
+    local orig = pc.ask
+    pc.ask = function() return "once" end
+    local allowed_out = run(cmd)
+    pc.ask = orig
+    t.matches("neoai_evasion_ok", allowed_out, "批准后应执行")
+    -- "deny" → 直接拒绝
+    with_config({ tools = { sandbox = { network = { block_proxy_evasion = "deny" } } } }, function()
+      t.matches("代理规避未获批准", run(cmd), "deny 应拒绝")
+    end)
+    -- false → 不拦截
+    with_config({ tools = { sandbox = { network = { block_proxy_evasion = false } } } }, function()
+      t.matches("neoai_evasion_ok", run(cmd), "false 应放行")
+    end)
+    pc.reset()
+  end)
+
   it("cgroup：applied/unavailable 暴露真实生效状态，控制器列表可读", function(t)
     local cgroup = require("NeoAI.sandbox.cgroup")
     t.eq("function", type(cgroup.applied), "应导出 applied")
