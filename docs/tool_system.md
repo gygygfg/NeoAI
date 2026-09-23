@@ -170,18 +170,21 @@ M.execute(agent, name, args, tool_call_id, opts)
 
 ### 💻 Shell（shell.lua）
 
-`run_command`：异步 jobstart（非交互，默认），收集 stdout/stderr，支持 `timeout_ms`（默认 30000，-1 不限）。
-`tools.run_command.interactive.enabled` **默认开启**，`run_command` 以 **PTY** 运行（`jobstart pty=true`）：
-轮询 `/proc/<pid>/{fd/0,syscall,wchan}` 检测“进程阻塞在读取终端”（OS 级判据，不解析终端文字），
-并用 `/proc/<pid>/io` 的 `rchar` 增长区分连续两次读取；每次检测到等待输入都会发起**单轮大模型请求**
-（判官），模型返回 `{"action":"text"|"keys"|"kill"|"none",...}` JSON，直接注入文本/按键/结束进程；
-无法确定或判官不可用时由用户在悬浮终端手动输入。悬浮终端窗口由
-`ui/components/terminal_window.lua` 用 `nvim_open_term` 渲染，焦点在内时可手动键入。详见
-[configuration.md](configuration.md) 的 `tools.run_command.interactive`。
+`run_command`：执行 Shell 命令。`tools.run_command.interactive.enabled` **默认开启**，此时以**交互式 PTY**运行（`jobstart pty=true`）：
 
-`terminal_send_text` / `terminal_send_keys` / `terminal_kill`：交互式命令等待输入时注入一行文本 /
-按键序列 / 结束进程（`effect=in_process`，仅操作已存在的 PTY 会话，不新起进程）。
-stdout/stderr 合计超过 `tools.run_command.max_output_bytes`（默认 16 MiB）时截断并终止命令，
+- **目标**：运行命令并完成其中的交互（`read` 输入、y/n 确认、菜单选择、口令等）。
+- **如何操作**：`command` 必填；`timeout_ms` 可选（默认 30000，-1 不限；交互多轮请显式传大，如 120000~600000）。命令等待输入时，NeoAI 轮询 `/proc/<pid>/{fd/0,syscall,wchan}` 检测“进程阻塞在读取终端”（OS 级判据，不解析终端文字），并用 `/proc/<pid>/io` 的 `rchar` 增长区分连续两次读取；每次等待发起**单轮大模型请求**（判官），模型返回 `{"action":"text"|"keys"|"kill"|"none",...}` JSON，直接注入文本/按键/结束进程；同时（聊天光标跟随时）弹出悬浮终端显示，可手动键入兜底。
+- **工具描述要求**：`description` 必填且要写清命令**目标与预期输入**（判官据此作答）；开启时给模型的工具描述会标明「可交互」并说明目标与操作方式。
+- `enabled=false` 时退回原非交互 jobstart 路径并恢复常驻沙箱语义。
+
+`terminal_send_text` / `terminal_send_keys` / `terminal_kill`：**交互式终端**控制工具。
+
+- **目标**：分别在命令等待输入时注入一行文本、发送按键序列（Enter/Tab/Escape/Up/Ctrl-C 等）、结束进程。
+- **如何操作**：仅操作已存在的 PTY 会话（`effect=in_process`，不新起进程）；正常由判官自动调用，模型一般无需手动调用，除非需要精确控制。
+
+悬浮终端窗口由 `ui/components/terminal_window.lua` 用 `nvim_open_term` 渲染，焦点在内时可手动键入；`show_window` 控制弹出时机（always/on_wait/never，**均需聊天光标跟随**）。详见 [configuration.md](configuration.md) 的 `tools.run_command.interactive`。
+
+命令 stdout/stderr 合计超过 `tools.run_command.max_output_bytes`（默认 16 MiB）时截断并终止命令，
 避免超大输出（数百 MB）逐行处理冻结主线程；已产生内容仍回传并标注「已截断」。
 命令以退出码 137（SIGKILL）结束时读取资源域事件区分「疑似 OOM」与「被强制终止」。
 

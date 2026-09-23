@@ -201,7 +201,7 @@ NeoAI 的聊天/输入框/悬浮窗等都是纯 UI 文本，若 LSP 客户端（
 | `tool_approval` | 工具审批弹窗。`init()`；串行单槽位展示。 |
 | `ask_user` | 向用户提问弹窗。`init()`；经 `ask_user.set_ui` 注入。 |
 | `sub_agent_dock` | 子 Agent 状态监控。`init()`。 |
-| `terminal_window` | 交互式命令的悬浮终端（`nvim_open_term` 渲染，支持手动键入转发）。按会话 id 开窗；headless 下为 no-op。由 `services.pty` 驱动。 |
+| `terminal_window` | 交互式命令的悬浮**可交互**终端（`nvim_open_term` 渲染，焦点在内时可手动键入转发给命令）。按会话 id 开窗；**仅在聊天光标跟随时弹出**（`show_window` 控制时机）；headless 下为 no-op。由 `services.pty` 驱动。 |
 | `sandbox_review` | 沙箱待审审批界面。`open()`；按路径级别高亮（工作区绿/用户目录黄/系统红）、按安全级别显示高危/中危/低危风险档与原因；界面按「未应用（待审）/ 已应用（含快照，可撤销）」分区；审批单位为单个文件：`<CR>` 仅应用该文件、`A` 一键同意全部工作区内修改（工作区外文件与主机操作保留待审；逐项让出主循环、标题显示进度、进行中防重入）、`d` 仅拒绝该文件（其余文件保留待审）、`i` 临时关闭审批窗并打开该条目的修改 diff 预览（关闭后自动返回并恢复光标），头行仅作信息展示，`q` 关闭；**窗口打开期间订阅沙箱广播事件自动刷新**（待审/已应用/越界留痕/主机操作变化即时重绘，同一 tick 内事件合并），无需手动刷新。**「已应用」区默认折叠**：整区收起（`za`/`zo` 展开），展开后每条再各自收起（两级折叠），刷新后重新收起；**待审条目「头行显示、其余折叠」、`za`/`zo` 可展开**（头行保留整组审批入口与高亮，其后文件/风险列表默认收起），越界留痕区不折叠。**高危条目**（L3 critical，以及 `package_confirm` 开启时的 L2 包/敏感安装）首次 `<CR>` 不直接应用：调用模型生成一条后果警告并自动打开 diff（顶部展示警告，生成中显示占位；标题按级别区分 `⚠ L2 高危 · 确认应用` / `⚠ L3 严重 · 确认应用`，按键提示行高亮，若冻结时剔除了遮蔽/易变缓存文件会追加「将跳过 N 个」说明），用户在 diff 内再次 `<CR>` 才真正应用、`q`/`<Esc>` 取消；模型不可用时回退规则警告（见 `sandbox/l3_warning.lua`）。 |
 | `fold` | 折叠（推理/工具调用/结果共用实现）。`foldexpr`/`foldtext`/`record_start`/`record_end`/`has_running`/`set_live_timer`/`set_foldexpr_override`/`set_foldtext_override`/`set_reasoning_lines`/`is_reasoning_start`/`generic_label`。 |
 | `display_modes/` | 显示模式插件管理器 + `chat.lua`/`trajectory.lua`。 |

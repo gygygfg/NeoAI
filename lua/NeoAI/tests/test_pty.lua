@@ -154,6 +154,34 @@ tests.suite("pty", function(_, it, before_each)
     cfg.set("tools.run_command.interactive.show_window", old)
   end)
 
+  it("run_command 工具描述标明可交互并含目标/操作", function(t)
+    local shell = require("NeoAI.tools.builtin.shell")
+    local old = config_store.get("tools.run_command.interactive.enabled")
+
+    local function desc()
+      for _, x in ipairs(shell.get_tools()) do
+        if x.name == "run_command" then return x.description end
+      end
+      return nil
+    end
+
+    config_store.set("tools.run_command.interactive.enabled", true)
+    local d_on = desc()
+    t.not_nil(d_on)
+    t.matches("交互式 PTY", d_on)
+    t.matches("目标", d_on)
+    t.matches("如何操作", d_on)
+    t.matches("description", d_on)
+
+    config_store.set("tools.run_command.interactive.enabled", false)
+    local d_off = desc()
+    t.not_nil(d_off)
+    t.true_(d_off:find("交互式 PTY", 1, true) == nil, "非交互时不应标交互式 PTY")
+
+    config_store.set("tools.run_command.interactive.enabled", old)
+    shell.get_tools()
+  end)
+
   it("判官决策解析：裸 JSON / 代码块 / 前后说明 / 纯文本", function(t)
     local pty = require("NeoAI.services.pty")
     local d = pty._extract_decision('{"action":"text","text":"y"}')

@@ -188,19 +188,19 @@ approval is allowed by default and a notify is sent.
 
 ### 💻 Shell (shell.lua)
 
-`run_command`: async jobstart (non-interactive by default), collects stdout/stderr, supports `timeout_ms` (default 30000, -1 for unlimited).
-With `tools.run_command.interactive.enabled` (**on by default**), `run_command` runs under a **PTY** (`jobstart pty=true`):
-it polls `/proc/<pid>/{fd/0,syscall,wchan}` to detect "process blocked reading the terminal" (an OS-level
-signal, not terminal-text parsing) and uses `/proc/<pid>/io` `rchar` growth to tell consecutive reads apart.
-Each awaited input triggers a **single-turn LLM request** (the judge), which returns
-`{"action":"text"|"keys"|"kill"|"none",...}` JSON that directly injects text/keys or ends the process; when
-it cannot decide (or the judge is unavailable) the user answers manually. The floating terminal window is rendered with `nvim_open_term` by
-`ui/components/terminal_window.lua` and forwards manual typing when focused. See
-[configuration.md](configuration.md) `tools.run_command.interactive`.
+`run_command`: executes a Shell command. With `tools.run_command.interactive.enabled` (**on by default**) it runs under an **interactive PTY** (`jobstart pty=true`):
 
-`terminal_send_text` / `terminal_send_keys` / `terminal_kill`: inject a line of text / a key sequence /
-end the process while an interactive command awaits input (`effect=in_process`; only operates on an
-existing PTY session, never spawns a process).
+- **Goal**: run the command and complete its interactions (`read` input, y/n confirmations, menu choices, passphrases, ...).
+- **How to operate**: `command` is required; `timeout_ms` is optional (default 30000, -1 = unlimited; pass a large value such as 120000~600000 for multi-round interaction). While the command awaits input, NeoAI polls `/proc/<pid>/{fd/0,syscall,wchan}` to detect "process blocked reading the terminal" (an OS-level signal, not terminal-text parsing) and uses `/proc/<pid>/io` `rchar` growth to tell consecutive reads apart. Each wait fires a **single-turn LLM request** (the judge) returning `{"action":"text"|"keys"|"kill"|"none",...}` JSON that directly injects text/keys or ends the process; a floating terminal (when the chat cursor is following) mirrors the output for manual typing.
+- **Tool-description requirement**: `description` is required and must state the command's **goal and expected inputs** (the judge uses it). The description handed to the model marks it as "interactive" and explains the goal and how to operate.
+- With `enabled=false` it falls back to the original non-interactive jobstart path and restores resident-sandbox semantics.
+
+`terminal_send_text` / `terminal_send_keys` / `terminal_kill`: **interactive terminal** control tools.
+
+- **Goal**: while a command awaits input, inject a line of text / send a key sequence (Enter/Tab/Escape/Up/Ctrl-C, ...) / end the process.
+- **How to operate**: only operate on an existing PTY session (`effect=in_process`; never spawns a process); normally called automatically by the judge, so the model usually does not need to call them manually unless precise control is required.
+
+The floating terminal window is rendered with `nvim_open_term` by `ui/components/terminal_window.lua` and forwards manual typing when focused; `show_window` controls when it pops up (always/on_wait/never, **all requiring the chat cursor to be following**). See [configuration.md](configuration.md) `tools.run_command.interactive`.
 When combined stdout/stderr exceeds `tools.run_command.max_output_bytes` (default 16 MiB), the command is
 truncated and terminated so huge outputs (hundreds of MB) cannot freeze the main thread with line-by-line
 processing; already-produced content is still returned and marked "truncated".

@@ -381,12 +381,29 @@ end
 
 local shell_tools = {}
 
+-- 非交互（interactive 关闭）：前台一次性执行。交互式开启时在 get_tools 中改用交互式描述。
+local RUN_COMMAND_DESC_BASE =
+  "执行 Shell 命令（前台，单次调用内完成）。command 必填。timeout_ms 可选（默认 30000ms，-1 为不限）。"
+  .. "长任务（安装依赖/编译/下载）请在**同一次调用**内显式传较大的 timeout_ms（如 600000），"
+  .. "不要靠重试短命令规避超时。以 `&`/nohup/setsid 启动的后台进程，仅在会话使用常驻沙箱时"
+  .. "跨工具调用**且跨轮次**持续运行（可用 ps/kill 管理）；否则命令结束即被回收，其输出建议重定向到文件。"
+
+-- 交互式（PTY）：标明可交互，并写清【目标】与【如何操作】。
+local RUN_COMMAND_DESC_INTERACTIVE =
+  "执行 Shell 命令（**交互式 PTY**，可自动应答等待输入的命令）。"
+  .. "【目标】运行命令并完成其中的交互（read 输入、y/n 确认、菜单选择、口令等）。"
+  .. "【如何操作】command 必填；timeout_ms 可选（默认 30000ms，-1 不限）。"
+  .. "命令一旦等待输入，系统会**自动检测**并让判官模型依据 description 与近期输出自动作答"
+  .. "（输入文本 / 发送按键 / 结束进程），同时在聊天光标跟随时弹出悬浮终端显示；用户也可手动输入。"
+  .. "因此 **description 必填且要写清目标与预期**：说明命令目的、可能出现的提示与期望输入"
+  .. "（如“安装依赖，提示是否继续选 y”“登录，用户名 foo、密码 bar”）。"
+  .. "多轮交互较慢，请在同一次调用内显式传足够大的 timeout_ms（如 120000~600000）。"
+  .. "需要精确控制时可显式调用 terminal_send_text / terminal_send_keys / terminal_kill（仅当存在活动会话时有效）。"
+  .. "后台进程：交互式模式走一次性沙箱路径，`&`/nohup/setsid 不跨调用存活，输出建议重定向到文件。"
+
 shell_tools.run_command = helpers.define_tool(
   "run_command",
-  "执行 Shell 命令（前台，单次调用内完成）。command 必填。timeout_ms 可选（默认 30000ms，-1 为不限）。"
-    .. "长任务（安装依赖/编译/下载）请在**同一次调用**内显式传较大的 timeout_ms（如 600000），"
-    .. "不要靠重试短命令规避超时。以 `&`/nohup/setsid 启动的后台进程，仅在会话使用常驻沙箱时"
-    .. "跨工具调用**且跨轮次**持续运行（可用 ps/kill 管理）；否则命令结束即被回收，其输出建议重定向到文件。",
+  RUN_COMMAND_DESC_BASE,
   {
     type = "object",
     properties = {
@@ -603,6 +620,12 @@ shell_tools.run_command = helpers.define_tool(
 --- 获取工具列表
 --- @return table 数组
 function M.get_tools()
+  -- 按当前配置选择 run_command 描述：交互式开启时标明“可交互 + 目标 + 如何操作”。
+  local cfg = require("NeoAI.kernel.config_store").get("tools.run_command.interactive") or {}
+  local interactive = cfg.enabled == true and (cfg.engine or "auto") ~= "off"
+  if shell_tools.run_command then
+    shell_tools.run_command.description = interactive and RUN_COMMAND_DESC_INTERACTIVE or RUN_COMMAND_DESC_BASE
+  end
   local out = {}
   for _, tool in pairs(shell_tools) do
     out[#out + 1] = tool

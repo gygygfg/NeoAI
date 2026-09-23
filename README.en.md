@@ -694,17 +694,15 @@ one does). For risk levels and allowlists see the `approval` config and [docs/en
 
 | Tool name        | Description               | Parameters |
 | ------------- | ------------------ | -------- |
-| `run_command` | Execute a Shell command (asynchronous jobstart; with interactive enabled it runs under a PTY and is answered automatically) | `command` (required) the command to run (quote it when needed so it isn't split early); `timeout_ms` (optional, default 30000, -1 = unlimited). Pass a larger value explicitly in the same call for long tasks; with `tools.sandbox.resident` enabled, background processes started with `&`/`nohup`/`setsid` survive across tool calls (shared sandbox namespace per session). Common read-only commands `ls`/`wc`/`find`/`grep`/`pwd` hit the argument allowlist |
-| `terminal_send_text` | Type a line of text + Enter when an interactive command awaits input | `text` (required) |
-| `terminal_send_keys` | Send keys (Enter/Tab/Escape/Up/Ctrl-C, ...) when an interactive command awaits input | `keys` (required) array of key names |
-| `terminal_kill` | End the interactive command awaiting input | none |
+| `run_command` | Execute a Shell command (**interactive PTY** that answers awaited input automatically; falls back to non-interactive jobstart when disabled) | `command` (required; quote it when needed so it isn't split early); `timeout_ms` (optional, default 30000, -1 = unlimited; pass a large value for multi-round interaction, e.g. 120000~600000); `description` (required) **state the goal and expected inputs** (the judge uses it). With `tools.sandbox.resident` enabled, background processes survive across calls (interactive mode uses the one-shot path, so they do not). Common read-only commands `ls`/`wc`/`find`/`grep`/`pwd` hit the argument allowlist |
+| `terminal_send_text` | [interactive terminal] Type a line of text + Enter while a command awaits input | `text` (required); normally invoked by the judge |
+| `terminal_send_keys` | [interactive terminal] Send keys (Enter/Tab/Escape/Up/Ctrl-C, ...) while a command awaits input | `keys` (required) array of key names; normally invoked by the judge |
+| `terminal_kill` | [interactive terminal] End the command awaiting input | none; normally invoked by the judge |
 
-> Interactive shell: with `tools.run_command.interactive.enabled` (**on by default**), `run_command` runs under a **PTY** and
-> polls `/proc` to detect "process blocked reading the terminal = waiting for input" (an OS-level signal,
-> not text matching); each wait fires a **single-turn LLM request** (the judge) that returns a
-> `{"action":"text"|"keys"|"kill"|"none",...}` decision applied automatically, and an `nvim_open_term`
-> floating terminal mirrors the output for manual input as a fallback.
-> See [docs/en/configuration.md](docs/en/configuration.md).
+> **Interactive shell (on by default)**: `run_command` runs under a real **PTY**.
+> **Goal**: run the command and complete its interactions (`read` input, y/n confirmations, menu choices, passphrases, ...).
+> **How to operate**: while the command awaits input, NeoAI polls `/proc` to detect "process blocked reading the terminal = waiting for input" (an OS-level signal, not text matching); each wait fires a **single-turn LLM request** (the judge) returning a `{"action":"text"|"keys"|"kill"|"none",...}` decision applied automatically, and (when the chat cursor is following) an `nvim_open_term` floating terminal mirrors the output for manual input.
+> Therefore `description` should state the command's purpose and expected inputs. See [docs/en/configuration.md](docs/en/configuration.md).
 
 ### 🔄 Git Tools
 

@@ -25,7 +25,10 @@ local terminal_tools = {}
 
 terminal_tools.terminal_send_text = helpers.define_tool(
   "terminal_send_text",
-  "向正在等待输入的交互式命令输入一行文本并回车。text 必填。",
+  "【交互式终端】向正在等待输入的命令会话输入一行文本并回车。"
+    .. "【目标】为交互式命令（run_command，处于等待输入状态）提供一行答案（y/n、选项、普通文本）。"
+    .. "【如何操作】text 必填；仅当确实存在等待输入的会话时有效。正常由系统判官自动调用，"
+    .. "模型一般无需手动调用，除非需要精确控制某次输入。",
   {
     type = "object",
     properties = { text = { type = "string", description = "要输入的一行文本（会自动补回车）" } },
@@ -49,8 +52,10 @@ terminal_tools.terminal_send_text = helpers.define_tool(
 
 terminal_tools.terminal_send_keys = helpers.define_tool(
   "terminal_send_keys",
-  "向正在等待输入的交互式命令发送按键序列（如 Enter / Tab / Escape / Up / Down / Ctrl-C）。"
-    .. "keys 为按键名数组。",
+  "【交互式终端】向正在等待输入的命令会话发送按键序列（如 Enter / Tab / Escape / Up / Down / Ctrl-C）。"
+    .. "【目标】在不适合整行文本时按“键”驱动交互（移动/选择/中断）。"
+    .. "【如何操作】keys 为按键名数组，例如 {\"Ctrl-C\"}、{\"Up\"}、{\"Tab\",\"y\",\"Enter\"}；"
+    .. "仅当存在等待输入的会话时有效。正常由系统判官自动调用，模型一般无需手动调用。",
   {
     type = "object",
     properties = {
@@ -86,7 +91,9 @@ terminal_tools.terminal_send_keys = helpers.define_tool(
 
 terminal_tools.terminal_kill = helpers.define_tool(
   "terminal_kill",
-  "结束正在等待输入的交互式命令进程（适用于命令已失败或无需继续）。",
+  "【交互式终端】结束正在等待输入的命令进程。"
+    .. "【目标】命令已失败、卡死或无需继续时终止它，避免占用 timeout。"
+    .. "【如何操作】无参数；仅当存在活动会话时有效。正常由系统判官自动调用，模型一般无需手动调用。",
   { type = "object", properties = {} },
   function(_, on_success, on_error)
     local session, pty = _session()
