@@ -839,12 +839,19 @@ end
 --- @param argv table
 --- @param root_overlay table { upper, work }
 local function _append_root_overlay(argv, root_overlay)
-  argv[#argv + 1] = "--overlay-src"
-  argv[#argv + 1] = "/"
-  argv[#argv + 1] = "--overlay"
-  argv[#argv + 1] = root_overlay.upper
-  argv[#argv + 1] = root_overlay.work
-  argv[#argv + 1] = "/"
+  if root_overlay.mode == "fuse" and root_overlay.fuse_mnt then
+    -- 用户态 overlay（fuse-overlayfs）已在宿主建立合并视图：直接 bind 到 `/` 作为可写根。
+    argv[#argv + 1] = "--bind"
+    argv[#argv + 1] = root_overlay.fuse_mnt
+    argv[#argv + 1] = "/"
+  else
+    argv[#argv + 1] = "--overlay-src"
+    argv[#argv + 1] = "/"
+    argv[#argv + 1] = "--overlay"
+    argv[#argv + 1] = root_overlay.upper
+    argv[#argv + 1] = root_overlay.work
+    argv[#argv + 1] = "/"
+  end
   -- 保留宿主子挂载读取面（overlay lower 不跨挂载点，这些路径会变空）。
   for _, p in ipairs({ "/sys", "/run" }) do
     if vim.uv.fs_stat(p) then
@@ -1947,6 +1954,31 @@ function M.overlay_fallback_dir()
   return nil
 end
 
+--- 用户态 overlay 兜底：内核 overlay 不可用时用 fuse-overlayfs 建立整机根合并视图。
+--- 返回宿主挂载点（供 bwrap `--bind` 到 `/`），不可用返回 nil。
+--- @param lower string
+--- @param upper string
+--- @param work string
+--- @return string|nil
+function M.fuse_root_overlay(lower, upper, work)
+  local ok, mod = pcall(require, "NeoAI.sandbox.fuse_overlay")
+  if not ok or not mod or not mod.available() then return nil end
+  return mod.mount(lower, upper, work)
+end
+
+--- 释放全部用户态 overlay 挂载（会话轮换/重置/关闭）。
+function M.fuse_release_all()
+  local ok, mod = pcall(require, "NeoAI.sandbox.fuse_overlay")
+  if ok and mod and mod.release_all then pcall(mod.release_all) end
+end
+
+--- 释放某目录之下的用户态 overlay 挂载（会话轮换清理旧会话）。
+--- @param prefix string
+function M.fuse_release_under(prefix)
+  local ok, mod = pcall(require, "NeoAI.sandbox.fuse_overlay")
+  if ok and mod and mod.release_under then pcall(mod.release_under, prefix) end
+end
+
 --- 追加宿主敏感路径遮蔽挂载（供 LSP 命名空间等复用，保持与 run_command 一致的遮蔽面）：
 --- 仅应用配置/内置 mask_paths 与沙箱自身存储，不含按 cwd 的遮蔽目录（避免遮蔽工作区兄弟）。
 --- @param argv table|nil
@@ -2096,6 +2128,75 @@ end
 --- @return boolean
 function M.read_all()
   return _read_all()
+end
+
+-- ========== 挂载点解析（跨挂载点工作区检测） ==========
+
+--- 解析 mountinfo 中的八进制转义（\040 空格、\011 制表、\012 换行、\134 反斜杠）
+--- @param s string
+--- @return string
+local function _decode_mount_path(s)
+  return (tostring(s):gsub("\\(%d%d%d)", function(oct)
+    return string.char(tonumber(oct, 8) or 63)
+  end))
+end
+
+--- 读取宿主挂载点列表（`/proc/self/mountinfo` 第 5 字段）。短 TTL 缓存，避免逐命令重复解析。
+--- 测试注入：设置 `state.mountinfo_override` 为挂载点数组即可覆盖真实读取。
+--- @return table 挂载点数组
+local function _mount_points()
+  if type(state.mountinfo_override) == "table" then return state.mountinfo_override end
+  local now = vim.uv.hrtime() / 1e6
+  local cache = state.mountinfo_cache
+  if cache and (now - cache.at) < 5000 then return cache.points end
+  local points = {}
+  local ok, lines = pcall(vim.fn.readfile, "/proc/self/mountinfo")
+  if ok and type(lines) == "table" then
+    for _, line in ipairs(lines) do
+      local mp = tostring(line):match("^%S+ %S+ %S+ %S+ (%S+)")
+      if mp then points[#points + 1] = _decode_mount_path(mp) end
+    end
+  end
+  state.mountinfo_cache = { at = now, points = points }
+  return points
+end
+
+--- 返回包含 `path` 的最深挂载点（宿主命名空间视角）。`/` 为兜底。
+--- @param path string|nil
+--- @return string 挂载点绝对路径
+function M.mount_root_of(path)
+  if type(path) ~= "string" or path == "" then return "/" end
+  if path:sub(1, 1) ~= "/" then
+    local cwd = vim.fn.getcwd()
+    path = cwd .. "/" .. path
+  end
+  local best = "/"
+  for _, mp in ipairs(_mount_points()) do
+    local m = tostring(mp):gsub("/+$", "")
+    if m == "" then m = "/" end
+    local matches = (m == "/") or (path == m) or (path:sub(1, #m + 1) == m .. "/")
+    if matches and #m > #best then best = m end
+  end
+  return best
+end
+
+--- 跨挂载点工作区检测：`path` 位于 `/` 之外独立挂载点（如容器卷 `/mnt/<uuid>`）时返回该挂载点。
+--- 此时整机根 overlay（lower=`/`）无法投影其内容，命令视图会与只读工具分裂（见 build_overlay_specs）。
+--- 已在沙箱内被特殊处理、可正常投影的挂载点不算跨挂载：
+---   * 每会话私有 tmpfs 根（`/tmp`、`/var/tmp`，由 runtime 以会话私有目录覆盖，非 overlay lower）；
+---   * 伪文件系统/基础挂载（`/proc`、`/dev`、`/sys`、`/run`、`/dev/shm`）。
+--- @param path string|nil
+--- @return string|nil 独立挂载点；`/` 或被排除的挂载点返回 nil
+function M.cross_mount_root(path)
+  local r = M.mount_root_of(path)
+  if not r or r == "/" then return nil end
+  for _, x in ipairs({ "/tmp", "/var/tmp", "/dev/shm", "/run", "/proc", "/dev", "/sys" }) do
+    if r == x then return nil end
+  end
+  for _, x in ipairs(M.tmpfs_roots()) do
+    if r == x then return nil end
+  end
+  return r
 end
 
 --- 沙箱自有作用域（宿主）路径：这些路径位于遮蔽目录（/root、/var/tmp 等）之下，
@@ -2425,7 +2526,7 @@ function M.process_prefix(opts)
     local rest_overlays = {}
     for _, ov in ipairs(overlays) do
       if ov.root == "/" then
-        -- 根不可 overlay（mode="bind"）时退回只读根；是否允许降级由 overlay_fail_closed 决定。
+        -- 根不可 overlay（mode="bind"）时退回只读根 + 会话私有可写层（降级一律允许，不再 fail-closed）。
         if ov.mode ~= "bind" then root_overlay = ov end
       else
         rest_overlays[#rest_overlays + 1] = ov
@@ -2881,7 +2982,17 @@ function M.reset()
   state.apk_repos = nil
   state.maven_settings = nil
   state.self_paths_cache = nil
+  state.mountinfo_cache = nil
+  state.mountinfo_override = nil
   pcall(M.cleanup_tmp_roots)
+  pcall(M.fuse_release_all)
+end
+
+--- 测试注入挂载点列表（nil 恢复正常读取）。仅测试使用。
+--- @param points table|nil
+function M.set_mountinfo_for_test(points)
+  state.mountinfo_override = points
+  state.mountinfo_cache = nil
 end
 
 return M

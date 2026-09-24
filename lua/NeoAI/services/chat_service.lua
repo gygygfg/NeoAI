@@ -438,29 +438,31 @@ end
 local mcp_pre_round_registered = false
 local mcp_observer_sub = nil
 
---- MCP 刷新钩子：每轮模型请求前刷新 stale 的 MCP 工具定义并就地更新 agent.tools 中
---- 已有 MCP 工具的签名，保证下一轮模型看到与服务器一致的 schema（失败驱动时序）。
+--- 与工具注册表同步主 Agent 的工具集（幂等）。仅在注册表非空时替换，避免启动/回滚
+--- 期间的瞬时空注册表把 Agent 工具集清空（否则本轮请求会缺失全部工具）。
+--- @param agent table|nil
+local function _sync_agent_tools(agent)
+  if not (agent and not agent.parent and agent._tools_from_registry) then return end
+  local registry = require("NeoAI.tools.registry")
+  if registry.count() > 0 then
+    agent.tools = registry.list_as_map()
+  end
+end
+
+--- MCP 刷新钩子：每轮模型请求前刷新 stale 的 MCP 工具定义，并**在刷新完成后**把主 Agent
+--- 的工具集与注册表同步。顺序很关键：此前在刷新前整体替换 agent.tools，若此刻注册表处于
+--- 瞬时/异常空态会把工具集清空且不会再补齐（"只有部分/MCP 工具消失"）；改为刷新后同步，
+--- 保证本轮请求看到刚刷新的 MCP 定义，且空注册表不清空既有工具。
 --- @param agent table
 --- @return Deferred resolve(boolean changed)
 local function _mcp_pre_round(agent)
-  -- 自动挂载：每轮请求前把**主 Agent** 的工具集与注册表同步，补齐晚于 Agent 创建而注册的工具
-  -- （插件阶段 2、热重载、按配置启用后的 terminal_* 等）。子 Agent 的工具子集由 spawn 显式指定，
-  -- 绝不在此刷新，避免越权获得全部工具。
-  if agent and not agent.parent and agent._tools_from_registry then
-    agent.tools = require("NeoAI.tools.registry").list_as_map()
-  end
   local mcp = services.use("services.mcp")
-  if not mcp then return async.resolve(false) end
+  if not mcp then
+    _sync_agent_tools(agent)
+    return async.resolve(false)
+  end
   return mcp.pre_round():then_(function(changed)
-    if changed and agent and agent.tools then
-      local registry = require("NeoAI.tools.registry")
-      for name in pairs(agent.tools) do
-        local def = registry.get(name)
-        if def and def.source == "mcp" then
-          agent.tools[name] = def
-        end
-      end
-    end
+    _sync_agent_tools(agent)
     return changed
   end)
 end
@@ -478,12 +480,11 @@ end
 local function _ensure_mcp_observer()
   if mcp_observer_sub then return end
   mcp_observer_sub = event_bus.on(events.MCP_TOOLS_UPDATED, function()
-    local registry = require("NeoAI.tools.registry")
     local aid = state.current_agent_id
     local agent = aid and runtime.get(aid)
     if agent and not agent_mod_is_disposed(agent) and not _is_busy(agent) and agent.tools then
-      agent.tools = registry.list_as_map()
       agent._tools_from_registry = true
+      _sync_agent_tools(agent)
     end
   end)
 end

@@ -94,12 +94,27 @@ function M.start()
     for arg in args:gmatch("%S+") do
       table.insert(names, arg)
     end
-    local results = tests.run_all(unpack(names))
-    vim.notify(string.format("测试结果: %d 通过, %d 失败", results.passed, results.failed), vim.log.levels.INFO)
-    if #results.errors > 0 then
-      vim.notify("失败测试:\n  " .. table.concat(results.errors, "\n  "), vim.log.levels.WARN)
-    end
-  end, { nargs = "*", desc = "运行 NeoAI 测试" })
+    -- 隔离子进程运行：套件会改写 registry/plugins/sandbox 等全局状态，且运行器无 after_each
+    -- 恢复；在当前进程内跑会清空线上工具集（导致后续请求缺失 run_command 等），因此一律
+    -- 用全新 headless nvim 执行，绝不触碰当前进程。
+    vim.notify("[NeoAI] 已在隔离子进程启动测试…", vim.log.levels.INFO)
+    tests.run_isolated(names, {
+      on_done = function(res)
+        if res.passed + res.failed > 0 then
+          vim.notify(
+            string.format("[NeoAI] 测试结果（隔离子进程）: %d 通过, %d 失败", res.passed, res.failed),
+            res.failed > 0 and vim.log.levels.WARN or vim.log.levels.INFO)
+        else
+          vim.notify(
+            "[NeoAI] 测试子进程异常退出（code=" .. tostring(res.exit_code) .. "）\n" .. res.output:sub(1, 2000),
+            vim.log.levels.ERROR)
+        end
+        if #res.errors > 0 then
+          vim.notify("失败测试:\n  " .. table.concat(res.errors, "\n  "), vim.log.levels.WARN)
+        end
+      end,
+    })
+  end, { nargs = "*", desc = "在隔离子进程运行 NeoAI 测试" })
 
   _cmd("NeoAIChatStatus", function()
     local ui = _svc("services.ui")
@@ -252,8 +267,6 @@ function M.start()
     local diag = runtime.overlay_diagnosis(vim.fn.getcwd())
     parts[#parts + 1] = "overlay=" .. (diag.available and "ready"
       or ("unavailable(" .. tostring(diag.reason) .. ")"))
-    local scfg = require("NeoAI.kernel.config_store").get("tools.sandbox") or {}
-    parts[#parts + 1] = "overlay_fail_closed=" .. tostring(scfg.overlay_fail_closed ~= false)
     vim.notify("[NeoAI] 沙箱能力: " .. table.concat(parts, " "), vim.log.levels.INFO)
   end, { desc = "显示沙箱运行时能力探测结果" })
 

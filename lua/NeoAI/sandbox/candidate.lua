@@ -591,6 +591,12 @@ function M.rotate_session()
   state.seeded = {}
   for _, e in pairs(migrated) do e.version = _bump_version() end
   -- 旧目录延后清理（见 _defer_cleanup 注释）：避免删除仍在被 bind 挂载引用的源目录。
+  -- 先卸载旧会话目录下的用户态 overlay（fuse-overlayfs）挂载，否则挂载点会阻止目录删除。
+  do
+    local rt = require("NeoAI.sandbox.runtime")
+    if old_dir then pcall(rt.fuse_release_under, old_dir) end
+    if old_proc then pcall(rt.fuse_release_under, old_proc) end
+  end
   _defer_cleanup(old_dir)
   _defer_cleanup(old_proc)
   local work = require("NeoAI.utils.work")
@@ -940,7 +946,7 @@ function M.materialize_overlay(specs, opts)
         else
         local dest = base .. "/" .. rel
         if entry.deleted then
-          if spec.mode == "overlay" then
+          if spec.mode == "overlay" or spec.mode == "fuse" then
             pcall(vim.fn.delete, dest, "rf")
             fs.ensure_dir(vim.fn.fnamemodify(dest, ":h"))
             pcall(vim.fn.system, { "mknod", dest, "c", "0", "0" })
@@ -3338,6 +3344,13 @@ local function _publish_worker(payload, sha_src)
       local n, err = uv.fs_write(fd, content:sub(off + 1), off)
       if not n or n == 0 then uv.fs_close(fd); uv.fs_unlink(tmp); return false, err end
       off = off + n
+    end
+    -- 落盘完整性校验（fail-closed）：写入字节数与内容不符（短写/撕裂写）时绝不 rename 提交，
+    -- 避免静默损坏真实文件；失败仅删临时文件。
+    local wst = uv.fs_stat(tmp)
+    if not wst or wst.size ~= #content then
+      uv.fs_close(fd); uv.fs_unlink(tmp)
+      return false, ("SHORT_WRITE: expected %d got %s"):format(#content, tostring(wst and wst.size))
     end
     local synced, serr = uv.fs_fsync(fd)
     uv.fs_close(fd)

@@ -389,8 +389,12 @@ end
 --- @param cwd string
 --- @param base_dir string 进程 overlay 基目录（宿主路径）
 --- @param extra_roots table|nil 额外可写根
+--- @param opts table|nil { no_root_overlay? = boolean } 跨挂载点兼容模式：跳过整机根
+---   overlay（lower=`/` 不跨挂载点，会把独立挂载的工作区投影为空），改由调用方以
+---   `--ro-bind / /`（递归、保留全部挂载读取面）+ 对工作区单层 overlay 承载。
 --- @return table 数组 { root, upper, work }
-function M.build_overlay_specs(cwd, base_dir, extra_roots)
+function M.build_overlay_specs(cwd, base_dir, extra_roots, opts)
+  opts = opts or {}
   local cfg_roots = config_store.get("tools.sandbox.process_roots")
   if type(cfg_roots) ~= "table" then
     cfg_roots = {}
@@ -423,8 +427,8 @@ function M.build_overlay_specs(cwd, base_dir, extra_roots)
   end
   -- read_all（默认）整机根模式：用单一整机 overlay（lower=/，upper/work 会话私有）替换只读根，
   -- 使沙箱内根文件系统「原样可写」，所有写入进 upper 暂存、宿主盘不受影响；命令结束后从该
-  -- upper 捕获全部改动为候选。overlay 不可写时退回旧的多根逻辑（process_prefix 以只读根运行，
-  -- 是否允许降级由 overlay_fail_closed 决定）。
+  -- upper 捕获全部改动为候选。整机根 overlay 不可用时退回多根/降级视图（以会话私有可写层 +
+  -- `degraded_seed` 播种真实内容），不再 fail-closed 拒绝。
   --- 尝试在给定基目录建立整机根 overlay；成功则返回 specs，否则 nil。
   --- @param d string
   --- @return table|nil
@@ -434,7 +438,19 @@ function M.build_overlay_specs(cwd, base_dir, extra_roots)
     fs.ensure_dir(work)
     fs.ensure_dir(bind)
     runtime.chown_payload(d)
-    if not runtime.overlay_writable("/", upper, work) then return nil end
+    if not runtime.overlay_writable("/", upper, work) then
+      -- 内核 overlay 不可用（嵌套 overlay/跨挂载 EINVAL）：尝试用户态 fuse-overlayfs 兜底，
+      -- 以 root 在宿主建立「lower=/ 只读 + 会话私有 upper/work」合并视图，再 bind 到 `/`，
+      -- 使功能与内核 overlay 一致（整机可写、写入进 upper 冻结为候选），不再降级。
+      local mnt = runtime.fuse_root_overlay("/", upper, work)
+      if not mnt then return nil end
+      runtime.register_root_overlay_upper(upper)
+      local specs = { { root = "/", upper = upper, work = work, bind = bind, mode = "fuse", fuse_mnt = mnt } }
+      if under_tmpfs(cwd) and vim.fn.isdirectory(cwd) == 1 and not under(base, cwd) then
+        specs[#specs + 1] = make_spec(cwd)
+      end
+      return specs
+    end
     runtime.register_root_overlay_upper(upper)
     local specs = { { root = "/", upper = upper, work = work, bind = bind, mode = "overlay" } }
     -- 整机 overlay 看不到会话私有 tmpfs 根（/tmp、/var/tmp 被私有目录覆盖），cwd 位于其下时
@@ -444,7 +460,7 @@ function M.build_overlay_specs(cwd, base_dir, extra_roots)
     end
     return specs
   end
-  if runtime.read_all() and cwd then
+  if runtime.read_all() and cwd and not opts.no_root_overlay then
     local specs = try_root_overlay(base .. "/root")
     if specs then return specs end
     -- 备用位置：容器内「overlay 之上再 overlay」会 EINVAL，改用 tmpfs（/dev/shm、/run）承载
@@ -510,7 +526,7 @@ function M.overlay_gate(specs, opts)
   local any_overlay = false
   local degraded_reason
   for _, s in ipairs(specs or {}) do
-    if s.mode == "overlay" then
+    if s.mode == "overlay" or s.mode == "fuse" then
       any_overlay = true
       covered[#covered + 1] = s.root
     end
@@ -544,15 +560,8 @@ function M.overlay_gate(specs, opts)
     end
     degraded_reason = "存在未发布暂存改动但无 overlay 可写层（" .. tostring(why) .. "）"
   end
-  -- 降级门禁：仅在**完全没有任何 overlay**（整机/多根都不可 overlay）时因「降级」拒绝；
-  -- 有 overlay 但部分根未覆盖已由上面的 split 分支处理。
-  if not userns and not any_overlay and cfg.overlay_fail_closed ~= false
-    and (cfg.staging_uncovered or "reject") ~= "warn" then
-    local detail = degraded_reason and ("原因：" .. tostring(degraded_reason)) or "无可写根可用 overlay"
-    return false, "SANDBOX_OVERLAY_UNAVAILABLE: 无法为可写根挂载 overlay 可写层，拒绝以降级模式运行（"
-      .. detail .. "）；请用 :NeoAISandboxCaps 排查，或在 tools.sandbox.overlay_fail_closed=false 显式允许降级",
-      true, degraded_reason
-  end
+  -- 无 overlay（整机/多根都不可 overlay）时不再 fail-closed：默认降级运行——以会话私有可写层
+  -- 覆盖可写根并播种真实内容（见 `degraded_seed`），命令仍可用；降级/只读状态对模型不可见。
   return true, nil, not any_overlay, degraded_reason
 end
 
@@ -1408,7 +1417,7 @@ local function _resident_eligible(attempt, spec, args, req)
   if attempt.package then return false end
   if type(args.command) ~= "string" or args.command == "" then return false end
   -- overlay 不可用时（降级/无 overlay）常驻实例无法提供一致暂存视图：交回一次性路径处理
-  -- （其 staging_uncovered / overlay_fail_closed 语义与提示更完整）。
+  -- （其 staging_uncovered 语义与提示更完整）。
   if not runtime.overlay_available() then return false end
   local ok, mod = pcall(require, "NeoAI.sandbox.resident")
   if not ok or not mod then return false end
@@ -1723,7 +1732,10 @@ local function _gate_inner(tool, args, ctx, call_original)
     -- 仅 T0 的 run_command 适用；使用稳定 overlay 基目录（`<sandbox_root>/resident`，跨轮次保活），
     -- 避免与一次性进程的 upper 并发挂载冲突。
     local resident_mod = require("NeoAI.sandbox.resident")
-    local resident_ok = _resident_eligible(attempt, spec, args, req)
+    -- 跨挂载点兼容模式：工作区不在 `/` 上，常驻实例的整机根 overlay 会把它投影为空，
+    -- 故强制走一次性路径（`--ro-bind / /` + 工作区单层 overlay），避免复用错误视图。
+    local resident_ok = (ctx.sandbox_cross_mount_approved ~= true)
+      and _resident_eligible(attempt, spec, args, req)
     -- 常驻实例的 overlay/session 基目录**不随会话轮换**（放在沙箱存储根下的稳定目录），
     -- 使实例（连同其中的后台进程）跨轮次保活：agentEnd 轮换只迁移工作区暂存，不再停实例。
     local resident_base = nil
@@ -1761,10 +1773,13 @@ local function _gate_inner(tool, args, ctx, call_original)
       end
     end
     local specs = M.build_overlay_specs(real_cwd,
-      resident_base or proc_dir, extra_roots)
-    -- 选定每个可写根实际使用的层（overlay 或 bind），供物化/捕获/前缀构造一致使用
+      resident_base or proc_dir, extra_roots,
+      { no_root_overlay = ctx.sandbox_cross_mount_approved == true })
+    -- 选定每个可写根实际使用的层（overlay / fuse / bind），供物化/捕获/前缀构造一致使用
     for _, spec in ipairs(specs) do
-      if runtime.overlay_writable(spec.root, spec.upper, spec.work) then
+      if spec.mode == "fuse" then
+        -- 已由 fuse-overlayfs 建立的用户态合并视图，保持不动。
+      elseif runtime.overlay_writable(spec.root, spec.upper, spec.work) then
         spec.mode = "overlay"
       else
         spec.mode = "bind"
@@ -1772,6 +1787,8 @@ local function _gate_inner(tool, args, ctx, call_original)
         spec.overlay_reason = runtime.overlay_reason(spec.root, spec.upper, spec.work)
       end
     end
+    -- 用户态 overlay（fuse）与常驻沙箱不兼容：强制走一次性路径（其物化/捕获已支持 fuse）。
+    for _, s in ipairs(specs) do if s.mode == "fuse" then resident_ok = false end end
     -- 无 overlay 播种视图：把可写根真实内容复制进会话私有 bind 目录，使降级视图也能看到
     -- 真实磁盘文件（写入仍落私有副本、冻结为候选；真实盘保持只读）。仅在无 overlay 且
     -- `degraded_seed=true` 时启用；T2 的私有 cwd（staging）在 _build_prefix 内单独播种。
@@ -1779,10 +1796,10 @@ local function _gate_inner(tool, args, ctx, call_original)
     local seeded_covered_roots = nil
     do
       local any_overlay = false
-      for _, s in ipairs(specs) do if s.mode == "overlay" then any_overlay = true end end
-      -- 仅当降级确会被允许时才播种（否则门禁必然拒绝，避免白复制）；T2 不受 overlay_fail_closed 约束。
-      local degrade_allowed = cfg.overlay_fail_closed == false or cfg.staging_uncovered == "warn"
-      if (not any_overlay) and cfg.degraded_seed == true and degrade_allowed then
+      for _, s in ipairs(specs) do if s.mode == "overlay" or s.mode == "fuse" then any_overlay = true end end
+      -- 无 overlay 时若启用播种，把可写根真实内容复制进私有 bind 视图，使降级视图也看到真实
+      -- 文件（写入仍落私有副本并冻结为候选）。降级一律允许，不再有门禁开关。
+      if (not any_overlay) and cfg.degraded_seed == true then
         local covered, truncated = {}, false
         for _, s in ipairs(specs) do
           if s.mode == "bind" and s.bind then
@@ -2064,7 +2081,15 @@ local function _gate_inner(tool, args, ctx, call_original)
       if deleg_handle then cgroup.release_delegated(deleg_handle); deleg_handle = nil end
       candidate.cleanup(attempt.attempt_id)
       control.transition(attempt, "FAILED")
-      return async.reject({ kind = "sandbox", message = msg, command_id = attempt.command_id })
+      local text = tostring(msg or "")
+      -- 降级/overlay 相关拒绝：真实原因（只读视图、overlay 不可用、暂存未覆盖）仅放进
+      -- 用户可见的 UI 提示，回传模型的消息改为中性，避免 AI 据此判断沙箱只读/降级。
+      if text:find("SANDBOX_OVERLAY_UNAVAILABLE", 1, true)
+        or text:find("SANDBOX_STAGING_UNCOVERED", 1, true) then
+        ctx.ui_notice = "[NeoAI] 沙箱未能执行本次命令（仅用户可见）：" .. text
+        return async.reject({ kind = "sandbox", message = "命令未能执行（安全策略拒绝）", command_id = attempt.command_id })
+      end
+      return async.reject({ kind = "sandbox", message = text, command_id = attempt.command_id })
     end
 
     -- 禁止访问本机 SSH 服务：命令级硬拒绝（ssh/scp/sftp/sshpass 或 ssh:// 指向回环/本机）。

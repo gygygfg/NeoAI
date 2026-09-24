@@ -150,6 +150,12 @@ function M.write_file_atomic(path, content, opts)
     if not n or n == 0 then return fail(err or "文件写入未完成") end
     offset = offset + n
   end
+  -- 落盘完整性校验（fail-closed）：写入字节数与内容不符说明发生短写/撕裂写，
+  -- 此时绝不 rename 提交（否则会静默损坏原文件）。校验失败仅删临时文件、保留原文件。
+  local wst = uv.fs_stat(tmp)
+  if not wst or wst.size ~= #content then
+    return fail(("写入校验失败：期望 %d 字节，实际 %s 字节"):format(#content, tostring(wst and wst.size)))
+  end
   -- sync=false：会话级 overlay 私有可写层等临时草稿无需落盘，逐文件 fsync 在暂存量大时
   -- 是主要卡顿源；真实工作区发布等需要持久化的路径保持默认 fsync。
   if not (opts and opts.sync == false) then

@@ -164,28 +164,39 @@ local function _browse_tools(server)
 end
 
 --- 注册/覆盖某服务器的全部工具（tools + resources + prompts）
+--- 差量更新：**先注册/覆盖新集合，成功后再移除本服务器中已消失的旧名**。此前「先全删再
+--- 重加」存在删-加窗口：任何并发快照或单条注册失败都会让部分 MCP 工具在本轮消失
+--- （"只有部分/MCP 工具消失"）。逐条 pcall，单个坏 def 不影响同批其余工具。
 --- @param server string
 --- @return table 注册的工具名数组
 local function _register_server_tools(server)
   local cfg = state.servers[server]
+  local old_names = cfg.toolnames or {}
   local names = {}
-  -- 移除旧的（防残留/漂移）
-  for _, old in ipairs(cfg.toolnames or {}) do
-    registry.remove(old)
+  local function _put(def)
+    local ok, err = pcall(registry.update, def)
+    if ok then
+      names[#names + 1] = def.name
+    else
+      logger.warn("[mcp] %s 注册工具失败 %s: %s", server, tostring(def and def.name), tostring(err))
+    end
   end
-  cfg.toolnames = {}
   -- 远端 tools
   if _expose(server, "tools") then
     for _, raw in ipairs(cfg.tools or {}) do
-      local def = _register_tool(server, raw)
-      registry.update(def)
-      names[#names + 1] = def.name
+      local ok, def = pcall(_register_tool, server, raw)
+      if ok and def then _put(def) end
     end
   end
   -- resources / prompts 浏览工具
-  local browse = _browse_tools(server)
-  for _, b in ipairs(browse) do
-    names[#names + 1] = b.name
+  for _, b in ipairs(_browse_tools(server) or {}) do
+    if registry.get(b.name) then names[#names + 1] = b.name end
+  end
+  -- 新集合已就位，移除本服务器中不再提供的旧名
+  local keep = {}
+  for _, n in ipairs(names) do keep[n] = true end
+  for _, old in ipairs(old_names) do
+    if not keep[old] then pcall(registry.remove, old) end
   end
   cfg.toolnames = names
   return names
@@ -322,6 +333,9 @@ end
 local function _pull_and_register(server)
   local cfg = state.servers[server]
   if not cfg then return async.resolve(false) end
+  -- 并发合并：通知刷新、失败驱动 stale 刷新、连接初始化可能同时触发。若已有刷新在途，
+  -- 复用同一 Deferred，避免两次刷新交错删改注册表导致 toolnames/注册项错乱。
+  if cfg._refreshing then return cfg._refreshing end
   local old_tools_json = json.encode(cfg.tools or {})
   local old_names = vim.deepcopy(cfg.toolnames or {})
   local client = cfg.client
@@ -349,14 +363,21 @@ local function _pull_and_register(server)
   else
     cfg.prompts = {}
   end
-  return async.all(tasks):then_(function()
+  local d = async.all(tasks):then_(function()
     _register_server_tools(server)
     cache.update_all(server, { tools = cfg.tools, resources = cfg.resources or {}, prompts = cfg.prompts or {} })
     event_bus.emit(events.MCP_TOOLS_UPDATED, { server = server })
     local changed = old_tools_json ~= json.encode(cfg.tools or {})
       or json.encode(old_names) ~= json.encode(cfg.toolnames or {})
+    if #(cfg.toolnames or {}) < #old_names then
+      logger.warn("[mcp] %s 工具数减少 %d→%d（可能是服务器端移除；若非预期请查连接稳定性）",
+        server, #old_names, #(cfg.toolnames or {}))
+    end
     return changed
   end)
+  cfg._refreshing = d
+  d:finally(function() cfg._refreshing = nil end)
+  return d
 end
 
 --- 连接一个服务器：initialize → initialized → 拉取列表 → 注册 → 回写缓存 → 事件
@@ -652,6 +673,10 @@ function M.shutdown()
     if cfg.client then
       pcall(cfg.client.close, cfg.client, {})
     end
+    -- 注销本服务器注册的工具：避免热重载/重连后旧定义残留在注册表（幽灵工具），
+    -- 否则新会话可能看到已下线服务器的工具或旧 schema。
+    for _, n in ipairs(cfg.toolnames or {}) do pcall(registry.remove, n) end
+    cfg.toolnames = {}
   end
   state.servers = {}
   state.started = false

@@ -174,6 +174,8 @@ function M.shutdown()
   pcall(function() require("NeoAI.sandbox.service").stop_all({ timeout_ms = 10000 }) end)
   -- 停止会话级常驻沙箱实例（连同其命名空间内的后台进程）。
   pcall(function() require("NeoAI.sandbox.resident").stop({ timeout_ms = 2000 }) end)
+  -- 卸载用户态 overlay（fuse-overlayfs）兜底挂载，避免残留挂载点影响后续/清理。
+  pcall(function() require("NeoAI.sandbox.runtime").fuse_release_all() end)
   -- 先等后台后处理（异步模式下命令结果已返回、捕获/冻结/结算未完成）与异步写入落盘，
   -- 避免关闭时丢失最后一笔冻结与待审入队。等待有上限（tools.sandbox.shutdown_timeout_ms，
   -- 默认 3s）：后处理卡住时不至于让 `:qall` / 插件热重载长时间无响应。

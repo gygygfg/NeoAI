@@ -80,8 +80,16 @@ MCP 工具调用按 `sandbox.approval.default`（默认 `review`）进入**待�
 ### 4.2 动态更新
 
 触发来源：连接成功、`notifications/tools/list_changed`、手动刷新、上一轮失败触发。
-流程：重拉 `tools/list` → `registry.update` 覆盖定义 → 写回缓存 → 发 `MCP_TOOLS_UPDATED` →
-`chat_service` 重绑定当前 Agent 的 `agent.tools`（`tool_loop._tool_definitions` 每轮从 `agent.tools` 读取，下一轮即生效）。
+
+流程：重拉 `tools/list` → **差量更新**注册表（先注册/覆盖新集合，成功后再移除本服务器中已
+消失的旧名；单条 `registry.update` 失败以 `pcall` 隔离，不影响同批其余工具）→ 写回缓存 →
+发 `MCP_TOOLS_UPDATED`。
+
+- **不出现「只有部分 MCP 工具消失」**：差量更新消除了「先全删再重加」的窗口期；同一服务器的
+  并发刷新（通知刷新 / stale 刷新 / 连接初始化）合并为同一个在途请求，不会交错改写注册表。
+- **Agent 工具集在刷新完成后同步**：`chat_service` 的轮前钩子先执行 `mcp.pre_round()`，其完成
+  后再与注册表同步 `agent.tools`（注册表为空时**不替换**，避免瞬时空态清空工具集）；`tool_loop._tool_definitions`
+  每轮从 `agent.tools` 读取，下一轮即生效。
 
 ### 4.3 失败驱动（stale）刷新
 
@@ -104,7 +112,8 @@ MCP 工具调用按 `sandbox.approval.default`（默认 `review`）进入**待�
 
 - 连接惰性：首次需要某服务器时才真正建立；无服务器的环境完全 no-op。
 - 重连：HTTP 404-with-session 或连接级失败时重新初始化一次；工具调用错误返回给模型，不静默重试。
-- 清理：`mcp.shutdown()`（插件关闭调用）关闭子进程/会话。
+- 清理：`mcp.shutdown()`（插件关闭调用）关闭子进程/会话，并**注销本服务器注册的工具**
+  （避免热重载/重连后旧定义残留为幽灵工具）。
 
 ---
 

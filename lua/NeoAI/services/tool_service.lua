@@ -71,8 +71,9 @@ end
 --- 构建审批 UI 内容
 --- @param tool_name string
 --- @param args table
+--- @param ctx table|nil
 --- @return string
-local function _approval_text(tool_name, args)
+local function _approval_text(tool_name, args, ctx)
   local tool = registry.get(tool_name)
   local desc = tool and tool.description or ""
   local json = require("NeoAI.utils.json")
@@ -81,6 +82,14 @@ local function _approval_text(tool_name, args)
     "工具: %s\n描述: %s\n参数: %s",
     tool_name, desc, args_str
   )
+  -- 跨挂载点兼容模式说明：工作区在独立挂载点时，命令沙箱默认视图无法投影其内容，
+  -- 需用户批准以「整机只读 + 工作区单层 overlay」运行。
+  local mount_root = ctx and ctx.sandbox_cross_mount_root
+  if mount_root then
+    text = text .. "\n\n[兼容模式] 工作区位于独立挂载点 " .. tostring(mount_root)
+      .. "，整机根沙箱视图无法投影其内容。批准后本次命令将以"
+      .. "「整机只读 + 工作区单层 overlay」运行；工作区写入仍冻结为待审改动。"
+  end
   -- 越界访问留痕：把近期访问 cwd 之外用户工作目录的记录附在审批窗内（非阻塞、仅展示）。
   -- 按文件路径合并（同一路径的多工具访问合并）、路径升序排序后展示。
   local ok, trace = pcall(require, "NeoAI.sandbox.trace")
@@ -116,7 +125,7 @@ end
 --- @param decision_cb function(true=allow, false=deny)
 --- @param ctx table
 local function _show_approval(tool_name, args, decision_cb, ctx)
-  local text = _approval_text(tool_name, args)
+  local text = _approval_text(tool_name, args, ctx)
   if approval_ui and approval_ui.show then
     approval_ui.show({
       text = text,

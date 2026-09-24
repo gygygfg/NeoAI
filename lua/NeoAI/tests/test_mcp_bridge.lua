@@ -165,4 +165,107 @@ tests.suite("mcp_bridge", function(_, it, before_each)
 
     transports.create = orig_create
   end)
+
+  it("refresh 差量更新：移除消失的工具、保留其余", function(t)
+    local transports = require("NeoAI.services.mcp.transports")
+    local orig_create = transports.create
+    local function tool(n)
+      return { name = n, description = n, inputSchema = { type = "object", properties = {}, required = {} } }
+    end
+    local ft = { open_ = true, tools = { tool("a"), tool("b") } }
+    function ft:open() self.open_ = true end
+    function ft:close() self.open_ = false end
+    function ft:is_open() return self.open_ end
+    function ft:send(encoded)
+      local msg = json.decode(encoded)
+      local result
+      if msg.method == "initialize" then
+        result = { protocolVersion = "2025-06-18", capabilities = { tools = {} }, serverInfo = { name = "f" } }
+      elseif msg.method == "tools/list" then
+        result = { tools = ft.tools }
+      else
+        result = {}
+      end
+      if msg.id ~= nil then ft.on_message({ jsonrpc = "2.0", id = msg.id, result = result }) end
+    end
+    transports.create = function() return ft end
+
+    config_store.load({ mcp = { enabled = true, servers = { demo = { transport = "stdio" } } } })
+    local mcp = require("NeoAI.services.mcp")
+    mcp.reset()
+    registry.reset()
+    mcp.init()
+    t.true_(vim.wait(4000, function() return mcp.state.servers.demo and mcp.state.servers.demo.state == "ready" end), "demo 应就绪")
+    t.not_nil(registry.get("mcp__demo__a"))
+    t.not_nil(registry.get("mcp__demo__b"))
+
+    -- 服务器端移除 a：刷新后 a 应被注销，b 保留（差量更新而非先全删）
+    ft.tools = { tool("b") }
+    local d = mcp.refresh("demo")
+    t.true_(vim.wait(4000, function() return not d:is_pending() end), "refresh 应 settle")
+    t.nil_(registry.get("mcp__demo__a"), "消失的工具应被注销")
+    t.not_nil(registry.get("mcp__demo__b"), "仍提供的工具应保留")
+
+    transports.create = orig_create
+  end)
+
+  it("并发 refresh 合并：同一服务器在途刷新复用同一 Deferred，仅一次 tools/list", function(t)
+    local transports = require("NeoAI.services.mcp.transports")
+    local orig_create = transports.create
+    local list_calls = 0
+    local ft = { open_ = true }
+    function ft:open() self.open_ = true end
+    function ft:close() self.open_ = false end
+    function ft:is_open() return self.open_ end
+    function ft:send(encoded)
+      local msg = json.decode(encoded)
+      local id = msg.id
+      local function respond(result)
+        if id ~= nil then ft.on_message({ jsonrpc = "2.0", id = id, result = result }) end
+      end
+      if msg.method == "initialize" then
+        respond({ protocolVersion = "2025-06-18", capabilities = { tools = {} }, serverInfo = { name = "f" } })
+      elseif msg.method == "tools/list" then
+        list_calls = list_calls + 1
+        vim.defer_fn(function()
+          respond({ tools = { { name = "get_time", description = "d", inputSchema = { type = "object", properties = {}, required = {} } } } })
+        end, 40)
+      else
+        respond({})
+      end
+    end
+    transports.create = function() return ft end
+
+    config_store.load({ mcp = { enabled = true, servers = { demo = { transport = "stdio" } } } })
+    local mcp = require("NeoAI.services.mcp")
+    mcp.reset()
+    registry.reset()
+    mcp.init()
+    t.true_(vim.wait(4000, function() return mcp.state.servers.demo and mcp.state.servers.demo.state == "ready" end), "demo 应就绪")
+
+    list_calls = 0
+    local d1 = mcp.refresh("demo")
+    local d2 = mcp.refresh("demo")
+    t.true_(d1 == d2, "在途刷新应复用同一 Deferred")
+    t.true_(vim.wait(4000, function() return not d1:is_pending() end), "refresh 应 settle")
+    t.eq(1, list_calls, "并发刷新应合并为一次 tools/list")
+
+    transports.create = orig_create
+  end)
+
+  it("shutdown 注销本服务器工具，避免幽灵工具残留", function(t)
+    local transports = require("NeoAI.services.mcp.transports")
+    local orig_create = transports.create
+    transports.create = function() return _fake_transport() end
+    config_store.load({ mcp = { enabled = true, servers = { demo = { transport = "stdio" } } } })
+    local mcp = require("NeoAI.services.mcp")
+    mcp.reset()
+    registry.reset()
+    mcp.init()
+    t.true_(vim.wait(4000, function() return mcp.state.servers.demo and mcp.state.servers.demo.state == "ready" end), "demo 应就绪")
+    t.not_nil(registry.get("mcp__demo__get_time"))
+    mcp.shutdown()
+    t.nil_(registry.get("mcp__demo__get_time"), "shutdown 后应注销 MCP 工具")
+    transports.create = orig_create
+  end)
 end)

@@ -263,11 +263,41 @@ tests.suite("sandbox_publish_async", function(_, it)
       files = { { path = p, action = "create", content = "async-payload", mode = 420, after_hash = sha("async-payload") } },
       created_at = 1,
     }
-    local res = await(candidate.blobify_async(cand))
+    local     res = await(candidate.blobify_async(cand))
     t.not_nil(res, "blobify_async 应完成")
     t.nil_(cand.files[1].content, "内容应剥离")
     t.eq("async-payload", fs.read_file(cand.files[1].blob or "") or "", "blob 应含内容")
     store.reset()
+    vim.fn.delete(dir, "rf")
+  end)
+
+  it("发布完整性：多字节大内容逐字节无损（同步 + 异步）", function(t)
+    local candidate = require("NeoAI.sandbox.candidate")
+    local fs = require("NeoAI.utils.fs")
+    local dir = fs.canonical(vim.fn.tempname())
+    fs.ensure_dir(dir)
+    local parts = {}
+    for i = 1, 4000 do
+      parts[i] = "第" .. i .. "行 收稿日期: ; 修改日期: ; 录用日期: ) 日本語 🎉 é"
+    end
+    local content = table.concat(parts, "\n") .. "\n"
+    local p1 = dir .. "/sync.md"
+    local p2 = dir .. "/async.md"
+
+    local r1 = candidate.publish({
+      candidate_digest = "sha256:mb_sync",
+      files = { { path = p1, action = "create", content = content, mode = 420 } },
+    })
+    t.true_(r1 and r1.ok, "同步发布应成功: " .. tostring(r1 and r1.reason))
+    t.eq(content, fs.read_file(p1), "同步发布内容应逐字节一致")
+
+    local res = await(candidate.publish_async({
+      candidate_digest = "sha256:mb_async",
+      files = { { path = p2, action = "create", content = content, mode = 420 } },
+    }))
+    t.true_(res and res.ok, "异步发布应成功: " .. tostring(res and res.reason))
+    t.eq(content, fs.read_file(p2), "异步发布内容应逐字节一致")
+
     vim.fn.delete(dir, "rf")
   end)
 end)

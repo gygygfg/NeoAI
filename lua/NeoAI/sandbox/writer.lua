@@ -119,6 +119,21 @@ local function _input_for(action, content)
   return c
 end
 
+--- 落盘后完整性校验：目标存在且字节与内容完全一致。用于 shell（setpriv/sudo）写入路径，
+--- 这些路径无法在 rename 前校验临时文件，故写后核对；不一致返回失败而非静默成功。
+--- @param path string
+--- @param content string
+--- @return boolean
+local function _verify_content(path, content)
+  local st = vim.uv.fs_stat(path)
+  if not st or st.type ~= "file" or st.size ~= #content then return false end
+  local f = io.open(path, "rb")
+  if not f then return false end
+  local got = f:read("*a")
+  f:close()
+  return got == content
+end
+
 --- 以非 root 身份执行（经 setpriv 降权；仅 root 进程可调用）
 --- @param action string
 --- @param path string
@@ -138,7 +153,12 @@ local function _nonroot_op(action, path, content, uid, gid, mode)
     "sh", "-c", _nonroot_snippet(action, binary), "sh", path, arg2,
   }
   local out = vim.fn.system(argv, _input_for(action, content))
-  if vim.v.shell_error == 0 then return true end
+  if vim.v.shell_error == 0 then
+    if action == "write" and not _verify_content(path, content or "") then
+      return false, "WRITE_INTEGRITY_FAILED: " .. tostring(path)
+    end
+    return true
+  end
   return false, tostring(out)
 end
 
@@ -153,7 +173,12 @@ function M.sudo_op(action, path, content, mode)
   local arg2 = action == "symlink" and (content or "") or (mode and string.format("%o", mode) or "")
   local argv = { "sudo", "sh", "-c", _nonroot_snippet(action, binary), "sh", path, arg2 }
   local out = vim.fn.system(argv, _input_for(action, content))
-  if vim.v.shell_error == 0 then return true end
+  if vim.v.shell_error == 0 then
+    if action == "write" and not _verify_content(path, content or "") then
+      return false, "WRITE_INTEGRITY_FAILED: " .. tostring(path)
+    end
+    return true
+  end
   return false, tostring(out)
 end
 

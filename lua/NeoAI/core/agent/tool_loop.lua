@@ -134,6 +134,9 @@ local function _execute_single(agent, tool_call, tool_service, opts)
   -- 等待用户审批或 ask_user 回答期间暂停，耗时与超时均不含等待时间。
   local timer = require("NeoAI.utils.timer").create()
   local exec_opts = vim.tbl_extend("force", {}, opts or {}, { timer = timer })
+  -- 取消信号：ESC/abort 时传播到工具执行层，使 run_command/工具子进程/常驻沙箱能真正
+  -- 终止运行中的进程（shell/exec/resident 均订阅 signal），而不是等工具自然结束。
+  if exec_opts.signal == nil then exec_opts.signal = agent.signal end
   exec_opts.ui_notice = nil -- 由 tool_service 在执行后回填（仅 UI 展示，不进入模型上下文）
   logger.warn("[tool_loop] 执行工具 %s round=%s", name, tostring(agent._round_seq or ""))
 
@@ -197,8 +200,16 @@ function M._tool_definitions(agent)
         agent.tools = registry.list_as_map()
       else
         -- 注册表仍为空（阶段 2 尚未加载）：触发全量启动，本轮先按现有工具集发送。
+        -- 诊断：若 `is_fully_started()` 已为 true 却无任何工具，说明运行态被外部改写过
+        -- （历史上 `:NeoAITest` 同进程运行会 reset registry / stop plugins）；此时发出的
+        -- 请求会缺失 run_command 等全部内置工具。:NeoAITest 现已隔离到子进程，此告警用于
+        -- 暴露其它同类不一致，避免再次静默退化。
         pcall(function()
           local NeoAI = require("NeoAI")
+          if type(NeoAI.is_fully_started) == "function" and NeoAI.is_fully_started() then
+            require("NeoAI.kernel.logger").warn(
+              "[tool_loop] 主 Agent 工具集为空且已 fully_started（运行态不一致？）；本轮将缺失全部内置工具")
+          end
           if type(NeoAI.ensure_fully_started) == "function" then
             NeoAI.ensure_fully_started(function() end)
           end
@@ -436,6 +447,15 @@ function M.run(agent, tool_calls, tool_service, opts)
             duration_ms = res.duration_ms, notice = res.notice, secret_paths = res.secret_paths,
           })
         end
+      end
+
+      -- 取消（ESC）：工具在途时信号被 abort，工具已按 aborted 结果落库。此时必须立即
+      -- 终止本轮，绝不能再 `set_state("generating")` 并继续下一轮——否则会覆盖 abort 的
+      -- `aborted` 状态，随后下一轮请求因信号已取消而拒绝，且该拒绝发生在成功分支内部、
+      -- 绕过 runtime 的错误回调，最终把 Agent 永久留在 generating（busy）状态，
+      -- 后续消息全部被吞进 pending_queue 永不刷新（"一直存在待发"）。
+      if agent.signal:aborted() then
+        return async.reject({ kind = "aborted", message = "工具循环被取消" })
       end
 
       -- 循环护栏：检测连续重复工具调用并注入提醒（observe-and-enrich，不否决）。

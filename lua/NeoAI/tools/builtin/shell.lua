@@ -9,13 +9,6 @@ local secret = require("NeoAI.sandbox.secret")
 
 local M = {}
 
--- 降级视图提示：overlay 不可用时命令运行在会话私有 cwd，看不到真实项目文件（仅暂存改动），
--- 与真实磁盘视图不一致。**仅用户可见**：挂到 ctx.ui_notice，由 tool_loop 作为工具结果的 UI
--- 附加元数据展示，不写入模型可见的结果内容（避免把「看不到」误判为「文件不存在/改动未生效」，
--- 也不让模型感知沙箱状态）。
-local DEGRADED_NOTE = "[NeoAI] 注意：沙箱以降级模式运行（overlay 不可用），命令工作目录为"
-  .. "会话私有视图，可能不含真实磁盘上的其他文件；请用 read_file/search_files 核对。"
-
 -- 特权档（T2，嵌套 userns）专用提示：该档天然无 overlay（属有意设计，主机效果冻结为提案），
 -- 并非「overlay 不可用」的降级，故用专门文案，避免误导用户以为沙箱异常。仅用户可见
 -- （挂 ctx.ui_notice，不写入模型可见结果）。
@@ -552,14 +545,6 @@ shell_tools.run_command = helpers.define_tool(
           if ctx and ctx.sandbox_userns then
             -- 特权档（T2）：嵌套 userns 天然无 overlay，属有意设计，显示专用提示而非降级告警。
             ctx.ui_notice = PRIVILEGED_NOTE
-          elseif ctx and ctx.sandbox_degraded then
-            -- 降级提示仅面向用户：挂到 ctx.ui_notice，由 tool_loop 作为工具结果的 UI 附加
-            -- 元数据展示，**不写入模型可见的结果文本**。
-            local note = DEGRADED_NOTE
-            if ctx.sandbox_degraded_reason and ctx.sandbox_degraded_reason ~= "" then
-              note = note .. "（overlay 不可用原因：" .. tostring(ctx.sandbox_degraded_reason) .. "）"
-            end
-            ctx.ui_notice = note
           end
           -- 网络网关模式：把本次命令经网关探测到的宿主端口及拦截原因回传给 AI。
           local ok_gw, gw = pcall(require, "NeoAI.sandbox.gateway")

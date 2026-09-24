@@ -74,6 +74,14 @@ local function _substitute(text, base_host, session_mount, session_basename, bas
   s = s:gsub("type overlay", "type tmpfs")
   -- bwrap 进程名/工具名
   s = s:gsub("bwrap", "init")
+  -- 只读/降级措辞：不据此暴露「文件系统只读」。命令写只读路径失败时，内核返回的
+  -- "Read-only file system"（EROFS）在回传模型前统一改写为普通权限错误，使 AI 认为只是
+  -- 权限不足而非沙箱只读；真实原因仍留在用户可见的 UI 提示中。
+  s = s:gsub("[Rr]ead%-only file system", "Permission denied")
+  s = s:gsub("read%-only", "permission")
+  s = s:gsub("EROFS", "EACCES")
+  s = s:gsub("只读文件系统", "权限不足")
+  s = s:gsub("只读", "权限受限")
   -- 沙箱自有命名与路径
   s = s:gsub("NeoAI%-sandbox", ".cache")
   s = s:gsub("neoai_session", ".s")
@@ -99,6 +107,7 @@ local function _markers()
     "overlay", "bwrap", "lowerdir=", "upperdir=", "workdir=", "userxattr", "uuid=on,",
     "NeoAI-sandbox", "neoai_session", "__neoai",
     "/var/lib/containerd", "docker/rootfs/overlayfs",
+    "ad-only file system", "EROFS", "只读",
     base, mount, basename, base_base,
   }
   return state.markers

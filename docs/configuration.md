@@ -255,8 +255,8 @@ sandbox = {
   -- 宿主盘不受影响；仅遮蔽 mask_paths 中的重要配置文件/凭据（~/.ssh、~/.aws、/etc/shadow、
   -- sudoers、docker.sock 等）与沙箱自身存储；mask_dirs（home/root 兄弟目录）不再挂载遮蔽，但
   -- 访问 cwd 之外的用户目录会**留痕**（evidence + `sandbox:outside_access` 事件）并在审批悬浮窗
-  -- `:NeoAISandboxReview` 的「越界访问留痕」区展示（非阻塞，仍放行）。overlay 不可用时退回只读根
-  -- （overlay_fail_closed 决定是否降级）。false 时退回下面的最小只读白名单。
+  -- `:NeoAISandboxReview` 的「越界访问留痕」区展示（非阻塞，仍放行）。overlay 不可用时降级为
+  -- 「整机只读 + 可写根会话私有可写层（`degraded_seed` 播种真实内容）」。false 时退回最小只读白名单。
   read_all = true,
   -- 最小只读系统集（白名单，仅在 read_all=false 时生效）：仅这些宿主根/子树/文件以只读方式
   -- 暴露给外部命令；未列出的路径在沙箱内不存在。不整目录暴露 /usr（避免泄露
@@ -473,9 +473,8 @@ sandbox = {
   staging_backend = "disk",
   session_shell = true,            -- run_command 会话内保留 shell 状态（export/cd 跨命令生效；仅 bwrap）
   process_roots = {},              -- 额外可写根（仅 read_all=false 或整机 overlay 不可用时生效；overlay 覆盖，默认仅 cwd 自动补入）。read_all=true（默认）时整机根已是可写 overlay，本项不再需要。/tmp、/var/tmp 属 tmpfs_roots；按需显式加回
-  overlay_fail_closed = true,      -- overlay 不可用时拒绝 process 工具（不降级为私有 cwd）；false 才允许降级运行
-  staging_uncovered = "reject",    -- 有未发布暂存但本次命令无 overlay 可写层时："reject"（默认，fail-closed）| "warn"（降级执行并在结果附提示，便于临时绕过偶发失败）
-  degraded_seed = false,           -- 无 overlay 播种视图：true 时把可写根真实内容复制进会话私有 bind 目录，使降级/嵌套 userns 视图也能看到真实文件（写入仍落私有副本并冻结为候选；真实盘只读）。默认 false；容器/无 overlay 环境可开启，配合 overlay_fail_closed=false
+  staging_uncovered = "reject",    -- 有未发布暂存但本次命令无 overlay 可写层时："reject"（默认，fail-closed）| "warn"（降级执行并在结果附提示，便于临时绕过偶发失败）。播种覆盖到的根内暂存不算分裂
+  degraded_seed = true,            -- 无 overlay 播种视图：true 时把可写根真实内容复制进会话私有 bind 目录，使降级/嵌套 userns 视图也能看到真实文件（写入仍落私有副本并冻结为候选；真实盘只读）。默认 true：无 overlay 环境命令仍可用；设 false 则降级视图看不到真实文件。只读/降级字样不对模型暴露（见 sandbox.conceal）
   degraded_seed_max_bytes = 2 * 1024 * 1024 * 1024, -- 播种字节上限（0=不限）；超限放弃播种并回退 fail-closed（避免复制超大工作区）
   -- 异步审批：候选进入待审队列，用户确认后应用。session_auto_approve 开启后 L0/L1 自动应用。
   -- l3_warning：高危条目二次确认（AI 生成后果警告 + 自动打开 diff，需再次确认才应用）。

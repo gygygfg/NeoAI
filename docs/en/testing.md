@@ -13,12 +13,27 @@
 :NeoAITest flow_tools  " run a specific suite (by name)
 ```
 
+**Isolated execution (important)**: `:NeoAITest` runs `run_all()` inside a **fresh headless child
+process** (`nvim --headless --clean -u NONE --cmd "set rtp+=<plugin root>"`) and reports the result
+back via a `SUMMARY passed=.. failed=..` line. It never touches the current instance's plugin host or
+tool registry.
+
+> Why isolation is required: many suites mutate global runtime state directly
+> (`registry.reset()`, `plugins.stop_all()`, `sandbox.shutdown()`, `config_store.load`, …) and the
+> runner has no after_each restore. Running them in-process in a live nvim wipes the tool registry
+> while `NeoAI.is_fully_started()` stays true, so the lazy gate never re-registers tools — later
+> requests (e.g. `run_command`) go out with an empty toolset. Child-process isolation removes the
+> problem at the root.
+
 Running headless:
 
 ```bash
 nvim --headless -u NONE --cmd 'set rtp+=.' \
   -c 'lua local r=require("NeoAI.tests").run_all(); vim.cmd(r.failed>0 and "cquit 1" or "qa!")'
 ```
+
+For custom integration (CI/scripts), the equivalent API is
+`require("NeoAI.tests").run_isolated(names, { on_done = fn })`.
 
 ## 2. Test Organization
 

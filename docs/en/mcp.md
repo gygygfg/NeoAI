@@ -80,8 +80,17 @@ Addressing the two problems of "slow server connection / changing tool signature
 ### 4.2 Dynamic Updates
 
 Triggers: successful connection, `notifications/tools/list_changed`, manual refresh, previous-round failure.
-Flow: re-fetch `tools/list` → `registry.update` overwrites the definitions → write back to cache → emit `MCP_TOOLS_UPDATED` →
-`chat_service` rebinds the current Agent's `agent.tools` (`tool_loop._tool_definitions` reads from `agent.tools` every round, taking effect on the next round).
+Flow: re-fetch `tools/list` → **differentially update** the registry (register/overwrite the new set
+first, then remove only the old names that are gone; a single `registry.update` failure is isolated
+with `pcall` and does not affect the rest of the batch) → write back to cache → emit `MCP_TOOLS_UPDATED`.
+
+- **No "only some MCP tools vanish"**: the diff-based update removes the "delete-all-then-re-add"
+  window; concurrent refreshes of the same server (notification / stale / connection init) coalesce
+  into one in-flight request and cannot interleave registry mutations.
+- **The Agent tool set syncs after the refresh completes**: `chat_service`'s pre-round hook runs
+  `mcp.pre_round()` first and syncs `agent.tools` from the registry only afterwards (it does **not**
+  replace when the registry is empty, avoiding a transient empty state wiping the tool set);
+  `tool_loop._tool_definitions` reads from `agent.tools` every round.
 
 ### 4.3 Failure-driven (stale) Refresh
 
@@ -105,7 +114,9 @@ When a `tools/call` fails due to a parameter/schema mismatch (`isError` and the 
 
 - Lazy connection: a server is only actually established when first needed; environments with no servers are completely no-op.
 - Reconnect: re-initialize once on HTTP 404-with-session or connection-level failure; tool call errors are returned to the model with no silent retry.
-- Cleanup: `mcp.shutdown()` (called on plugin shutdown) closes subprocesses/sessions.
+- Cleanup: `mcp.shutdown()` (called on plugin shutdown) closes subprocesses/sessions and
+  **unregisters this server's tools** (avoiding ghost tools from stale definitions after
+  reload/reconnect).
 
 ---
 

@@ -150,27 +150,29 @@ local function _run_generation(agent, opts)
 
           return _finish_idle(response)
         end)
-    end, function(err)
-      -- 用户取消（ESC）：正常停止而非错误。错误回调在 abort 时也会被触发，
-      -- 若按普通错误处理会把状态覆盖为 error、并发 GENERATION_ERROR，
-      -- 导致聊天界面弹"发送失败"提示。这里屏蔽并转为 benign 取消信号；
-      -- 同时把状态复位为 idle，否则 `_run_generation` 已置的 "generating"
-      -- （或 abort 的 "aborted"）会让同一 Agent 在取消后继续发送时卡在 busy。
-      local is_cancel = err and (err.kind == "aborted" or err.kind == "cancelled")
-      -- 所有结束路径都释放生成占用令牌（_run_generation 内已置 _turn_claim），
-      -- 否则 Agent 会永久停留在"忙碌"，后续发送被吞进 pending_queue 且永不刷新。
-      agent._turn_claim = nil
-      if is_cancel then
-        agent:set_state("idle")
-        return async.reject({ kind = "cancelled", message = err.message or "已取消" })
-      end
-      agent:set_state("error")
-      event_bus.emit(events.GENERATION_ERROR, { agent_id = agent.id, error = err })
-      return async.reject(err)
     end)
   end
 
-  return _run()
+  -- 统一终结：承接**整条链**（send_stream 的拒绝、以及 tool_loop 在成功回调内抛出的拒绝）
+  -- 的失败路径。此前把处理函数作为 `send_stream(...):then_(success, error)` 的兄弟回调，
+  -- 只能捕获 send_stream 自身的拒绝：工具循环里的拒绝发生在成功分支内部，会绕过它，
+  -- 导致状态永远停在 generating（见 tool_loop 取消路径）。改为外层 catch 后，任何失败
+  -- 都归一复位 state（取消→idle，其余→error），保证后续消息不会被误判为 busy 而卡待发。
+  local function _fail(err)
+    local is_cancel = err and (err.kind == "aborted" or err.kind == "cancelled")
+    agent._turn_claim = nil
+    if is_cancel then
+      agent:set_state("idle")
+      return async.reject({ kind = "cancelled", message = (type(err) == "table" and err.message) or "已取消" })
+    end
+    agent:set_state("error")
+    event_bus.emit(events.GENERATION_ERROR, { agent_id = agent.id, error = err })
+    return async.reject(err)
+  end
+
+  return _run():catch(function(err)
+    return _fail(err)
+  end)
 end
 
 -- ========== 公开 API ==========

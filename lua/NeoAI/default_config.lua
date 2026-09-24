@@ -604,7 +604,7 @@ local DEFAULT_CONFIG = {
       -- 冻结为候选，宿主盘不受影响；仅遮蔽 `mask_paths` 中的重要配置文件/凭据（~/.ssh、
       -- ~/.aws、/etc/shadow、sudoers、docker.sock 等）与沙箱自身存储；`mask_dirs`
       -- （home/root 兄弟目录）不再挂载遮蔽，但访问 cwd 之外的用户目录会**留痕**并在审批悬浮窗
-      -- 展示（见 trace）。overlay 不可用时退回只读根（`overlay_fail_closed` 决定是否降级）。
+      -- 展示（见 trace）。overlay 不可用时降级为「整机只读 + 可写根会话私有可写层（播种真实内容）」。
       -- false 时退回最小只读白名单（`readonly_roots`/`readonly_paths`）——更小读取面。
       read_all = true,
       -- 最小只读系统集（白名单）：仅这些宿主根/子树以只读方式暴露给外部命令；未列出的
@@ -1084,22 +1084,16 @@ local DEFAULT_CONFIG = {
       -- 需要。安全默认仅 cwd（自动补入）；不覆盖 `/tmp`、`/var/tmp`（属每会话私有 tmpfs，
       -- 见 `tmpfs_roots`）。需要任意路径写入时按需显式加回（注意同时收紧 mask_paths）。
       process_roots = {},
-      -- overlay 不可用（无法为可写根挂载 overlay 可写层）时是否拒绝外部进程执行。
-      -- 默认 true（fail-closed）：**不降级**为「私有可写 cwd」——那种视图看不到真实磁盘
-      -- 文件，会把「看不到」误判为「文件不存在/改动未生效」。设为 false 才允许降级运行
-      -- （命令在会话私有 cwd 执行，结果会附加降级提示）。
-      overlay_fail_closed = true,
-      -- 存在未发布暂存改动、但本次命令无 overlay 可写层时的处理（默认 fail-closed）：
+      -- 存在未发布暂存改动、但本次命令无 overlay 可写层时的处理：
       --   "reject"（默认）= 拒绝执行（命令会读到真实磁盘、与只读工具的暂存视图分裂）；
-      --   "warn" = 降级执行并在结果里附「未发布暂存改动不可见」提示，便于临时绕过
-      --            （如安装脚本触碰 /run 等路径时的偶发失败，重试或改用等价命令）。
+      --   "warn" = 降级执行（提示仅用户可见）。播种覆盖到的根内暂存不算分裂。
       staging_uncovered = "reject",
       -- 无 overlay 播种视图（`true` 时，overlay 不可用的降级/bind 视图会先把可写根的**真实
       -- 内容**复制进会话私有目录，使命令既能看到真实磁盘文件、写入又落私有副本并冻结为候选；
       -- 真实盘保持只读）。仅对配置的可写根（process_roots/包根/cwd）生效，不播种整机 `/`。
-      -- 默认 false（关闭，保持原 fail-closed 行为）；容器/嵌套 userns 无 overlay 环境可开启，
-      -- 并配合 `overlay_fail_closed=false`（或 `staging_uncovered="warn"`）使用。
-      degraded_seed = false,
+      -- 默认 true：容器/嵌套 userns（根为 overlay）等无法 overlay 的环境下命令仍可用；
+      -- 降级/只读字样不对模型暴露（见 `sandbox.conceal`）。
+      degraded_seed = true,
       -- 播种字节上限（0 = 不限）。超过上限时放弃播种并回退 fail-closed（拒绝执行），
       -- 避免把超大工作区复制进私有目录。默认 2 GiB。
       degraded_seed_max_bytes = 2 * 1024 * 1024 * 1024,

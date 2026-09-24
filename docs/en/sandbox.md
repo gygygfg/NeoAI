@@ -153,6 +153,13 @@ is only kept for other `approval.mode` values (`prompt`/`strict`).
   - **No fsync for overlay scratch**: the per-session overlay upper is ephemeral scratch (rotated on
     agentEnd), so `write_file_atomic(..., { sync = false })` drops the per-file fsync; real workspace
     publishing still fsyncs for durability.
+  - **Fail-closed write-integrity check (torn/short writes)**: atomic writes (`fs.write_file_atomic`
+    and the publish worker's `write_atomic`) verify the temp file's byte count equals the intended
+    content **before** the `rename` commit; on mismatch (short/torn write) the temp file is removed,
+    the original file is preserved, and the write fails — corrupted content is never silently
+    committed. The shell (`setpriv`/`sudo`) write path reads the target back byte-for-byte and
+    returns `WRITE_INTEGRITY_FAILED` on mismatch. This prevents committing files damaged by a
+    truncated multi-byte character (e.g. "2 bytes lost / trailing fragment").
   - **Evidence carries no file content**: `evidence.add("fs", ...)` stores only the impact manifest
     (path/action/hash) and caps the file-entry count, avoiding another huge JSON encode for large
     candidates.
@@ -238,6 +245,16 @@ is only kept for other `approval.mode` values (`prompt`/`strict`).
     its own PID namespace, so `jobstop` only kills the outer bwrap. The gate exposes `cgroup.kill`
     via `ctx.sandbox_kill`; `run_command` / tool subprocesses precisely kill the whole resource
     domain on cancel, timeout, or output truncation (falling back to `jobstop` when no cgroup).
+  - **Agent-loop cancellation propagates to the execution layer**: `tool_loop._execute_single`
+    injects `agent.signal` into `exec_opts.signal`, carried through `tool_service` into the
+    executor context and down to the tool; `run_command` / tool subprocesses / the resident sandbox
+    all subscribe to it. After the user presses `<Esc>` (`chat_service.cancel_generation` →
+    `runtime.abort`), running external processes are **killed at the process level** via
+    `cgroup.kill`/`jobstop` rather than waiting for natural completion. After cancellation
+    `tool_loop` ends the turn immediately and `runtime`'s single `catch` resets the state to
+    `idle`, so the Agent no longer sticks in `generating` (busy) and later messages are not
+    swallowed into the pending queue (see `core/agent/runtime.lua` and
+    `core/agent/tool_loop.lua`).
   - **Wall-clock safety net**: `tools.run_command.max_wall_ms` (default 0 = unlimited) > 0 bounds
     every command (including `timeout_ms=-1` "unlimited" ones); on expiry the resource domain is
     killed, so long tasks cannot occupy resources forever or leave the tool never returning.
@@ -1425,8 +1442,15 @@ defense-in-depth to the bwrap prefix by default (`--cap-drop ALL` plus the tier 
   overlay's primary upper/work live under the sandbox store root; when nesting an overlay on top of
   an overlay (common in containers) would fail with EINVAL, it automatically uses tmpfs
   (`/dev/shm`, `/run`) for upper/work instead, so the root does not fall back to read-only (and the
-  AI is less likely to notice a read-only filesystem). When the overlay is unavailable it falls back
-  to a read-only root (`overlay_fail_closed` decides whether to degrade).
+  AI is less likely to notice a read-only filesystem). When the overlay is unavailable (e.g. the
+  container root is itself an overlay and nested overlay returns EINVAL), it **runs degraded by
+  default** (`overlay_fail_closed=false`): the writable roots (cwd/`process_roots`) get a
+  session-private writable layer seeded with real content via `degraded_seed=true`, so commands still
+  see real files while writes land in the private copy and freeze as candidates, leaving the host disk
+  read-only; other paths stay read-only. This degraded/read-only state is **not exposed to the
+  model** — `sandbox.conceal` strips "read-only"/"overlay"/"degraded" wording from model-visible
+  command output and errors (the real reason only goes to a user-visible UI notice). Set
+  `overlay_fail_closed=true` to restore fail-closed (reject outright).
   > **"System dirs are writable" is by design, not a defect**: `/usr/bin`, `/etc`, etc. appear
   > writable because the whole root is exposed as a **writable overlay** — writes only land in the
   > session-private upper and are frozen as review candidates; **the host disk is untouched**.
@@ -1458,6 +1482,19 @@ defense-in-depth to the bwrap prefix by default (`--cap-drop ALL` plus the tier 
     caching the mask-dir list by config reference; outside-access evidence is written via
     **async write-behind** (`evidence.add_async`) instead of a synchronous per-record disk write on
     the main thread.
+  - **Workspace on a separate mount (container volumes, etc.)**: the whole-root overlay's lower is
+    `/`, and an overlay lower **does not cross mount points**. When the working directory lives on a
+    separate mount outside `/` (e.g. a container volume `/mnt/<uuid>/...`), the root overlay cannot
+    project its contents: the command side only sees the staged files materialized into the overlay
+    upper, and `--chdir` may fail because the path does not exist in that view
+    (`init: Can't chdir to ...: No such file or directory`) — a split from the read-only tool view.
+    `runtime.cross_mount_root(cwd)` (deepest ancestor mount from `/proc/self/mountinfo`) then fires
+    and an **approval floating window** explains why before the command runs. After approval, for
+    this session and mount point the command falls back to a compatibility mode of "whole root
+    read-only (`--ro-bind / /`, recursively preserving all mounts' read surface) + a **single-layer**
+    overlay over just the workspace" (writes still land in staging for review) — no overlay stacking,
+    no extra computation; the approval is cached per mount point on the current Agent so later
+    commands do not prompt again. Sub-agents / callers without approval capability fail closed.
   - **`read_all = false` (fall back to the minimal allowlist)**: no whole-root bind, and `/usr`
     is **not exposed as a whole** (avoids leaking `/usr/local/go_workspace`, `/usr/src`, etc.). Via
     `tools.sandbox.readonly_roots` it exposes the `/usr` runtime subtrees

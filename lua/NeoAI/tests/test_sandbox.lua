@@ -938,7 +938,8 @@ tests.suite("sandbox", function(_, it)
           t.true_(vim.wait(15000, function() return ok or err end), "命令应返回")
           runtime.overlay_available, runtime.overlay_writable = saved_avail, saved_writable
           t.true_(ok == true, "warn 模式应降级执行而非拒绝: " .. tostring(err and err.message or err))
-          t.matches("降级模式", tostring(ctx.ui_notice), "应附加降级提示")
+          -- 降级提示不再出现（用户侧也不提示）。
+          t.true_(not tostring(ctx.ui_notice):find("降级", 1, true), "不应再附加降级提示")
           done = true
         end, function(e)
           t.true_(false, "edit_file 不应失败: " .. tostring(e and e.message or e))
@@ -961,7 +962,10 @@ tests.suite("sandbox", function(_, it)
     fs.write_file(dir .. "/f.txt", "base\n")
     local prev = vim.fn.getcwd()
     vim.fn.chdir(dir)
-    with_config({ tools = { approval = { mode = "async" }, sandbox = { mode = "dry_run", review = { enabled = true } } } }, function()
+    with_config({ tools = { approval = { mode = "async" }, sandbox = {
+      mode = "dry_run", review = { enabled = true },
+      degraded_seed = false,
+    } } }, function()
       sandbox.reset()
       local done = false
       local tools = require("NeoAI.tools")
@@ -972,13 +976,15 @@ tests.suite("sandbox", function(_, it)
           local saved_avail, saved_writable = runtime.overlay_available, runtime.overlay_writable
           runtime.overlay_available = function() return false end
           runtime.overlay_writable = function() return false end
-          local ok, err
-          tools.execute("run_command", { command = "cat f.txt", description = "t" }, {})
+          local ok, err, ctx = nil, nil, {}
+          tools.execute("run_command", { command = "cat f.txt", description = "t" }, ctx)
             :then_(function() ok = true end, function(e) err = e end)
           t.true_(vim.wait(15000, function() return ok or err end), "命令应返回")
           runtime.overlay_available, runtime.overlay_writable = saved_avail, saved_writable
           t.true_(err ~= nil, "无 overlay 且有暂存时应拒绝命令（不降级）")
-          t.matches("SANDBOX_STAGING_UNCOVERED", tostring(err and err.message or err))
+          -- 真实原因（overlay/暂存分裂）仅对用户可见，模型可见文案中性（不暴露沙箱状态）。
+          t.true_(not tostring(err and err.message):find("SANDBOX", 1, true), "模型可见错误不应暴露沙箱原因")
+          t.matches("SANDBOX_STAGING_UNCOVERED", tostring(ctx.ui_notice), "真实原因应仅在 UI 提示中")
           done = true
         end, function(e)
           t.true_(false, "edit_file 不应失败: " .. tostring(e and e.message or e))
@@ -2103,7 +2109,7 @@ tests.suite("sandbox", function(_, it)
     end)
   end)
 
-  it("工具子进程：无 overlay 时按 fail-closed 拒绝（与 run_command 一致）", function(t)
+  it("工具子进程：无 overlay 时降级放行（与 run_command 一致）", function(t)
     local runtime = require("NeoAI.sandbox.runtime")
     if runtime.backend() ~= "bwrap" then return end
     local sandbox = require("NeoAI.sandbox")
@@ -2115,14 +2121,8 @@ tests.suite("sandbox", function(_, it)
       with_config({ tools = { sandbox = { mode = "dry_run", review = { enabled = true } } } }, function()
         sandbox.reset()
         local full, finish, werr = exec.open({ "true" }, { network = true })
-        t.eq(nil, full, "无 overlay 且 fail-closed 应拒绝工具子进程")
-        t.eq(nil, finish, "拒绝时不应返回结束回调")
-        t.matches("SANDBOX_OVERLAY_UNAVAILABLE", tostring(werr))
-        -- 显式允许降级时放行（仍以私有 bind 视图运行）。
-        with_config({ tools = { sandbox = { mode = "dry_run", review = { enabled = true }, overlay_fail_closed = false } } }, function()
-          local full2, _, werr2 = exec.open({ "true" }, { network = true })
-          t.not_nil(full2, "overlay_fail_closed=false 应放行: " .. tostring(werr2))
-        end)
+        t.not_nil(full, "无 overlay 应降级放行工具子进程: " .. tostring(werr))
+        t.not_nil(finish, "放行时应返回结束回调")
       end)
     end)
     runtime.overlay_available, runtime.overlay_writable = saved_avail, saved_writable
@@ -2174,7 +2174,7 @@ tests.suite("sandbox", function(_, it)
     local ok, err = pcall(function()
       with_config({ tools = { approval = { mode = "async" }, sandbox = {
         mode = "dry_run", review = { enabled = true },
-        overlay_fail_closed = false, degraded_seed = true,
+        degraded_seed = true,
       } } }, function()
         sandbox.reset()
         local done = false
@@ -3584,6 +3584,11 @@ tests.suite("sandbox", function(_, it)
     t.true_(s:find("overlay on", 1, true) == nil, "应隐藏 mount 的 overlay 前缀")
     t.eq("", conceal.redact(""), "空串原样返回")
     t.eq(nil, conceal.redact(nil), "nil 原样返回")
+    -- 只读/降级措辞不暴露给模型：内核 EROFS 文案改写为普通权限错误。
+    local ro = conceal.redact("touch: cannot touch '/x': Read-only file system")
+    t.true_(ro:find("Read-only", 1, true) == nil, "不应残留 Read-only file system")
+    t.matches("Permission denied", ro)
+    t.true_(conceal.redact("挂载为只读"):find("只读", 1, true) == nil, "不应残留中文只读字样")
   end)
 
   it("隐匿：run_command 回传输出经脱敏且 PID1 非 bwrap", function(t)
@@ -4332,7 +4337,7 @@ tests.suite("sandbox", function(_, it)
     runtime.reset()
   end)
 
-  it("运行时：overlay 不可用时默认拒绝执行（不降级）", function(t)
+  it("运行时：overlay 不可用时降级执行（播种真实内容，不拒绝）", function(t)
     local fs = require("NeoAI.utils.fs")
     local runtime = require("NeoAI.sandbox.runtime")
     if runtime.backend() ~= "bwrap" then return end
@@ -4342,24 +4347,26 @@ tests.suite("sandbox", function(_, it)
     local prev = vim.fn.getcwd()
     vim.fn.chdir(dir)
     local sandbox = require("NeoAI.sandbox")
-    with_config({ tools = { approval = { mode = "async" }, sandbox = { mode = "dry_run", review = { enabled = true } } } }, function()
+    with_config({ tools = { approval = { mode = "async" }, sandbox = {
+      mode = "dry_run", review = { enabled = true }, degraded_seed = true,
+    } } }, function()
       sandbox.reset()
       -- 模拟容器内 userns 限制：粗粒度能力与真实可写实测均失败。
       runtime.probe().overlayfs = false
       local saved_writable = runtime.overlay_writable
       runtime.overlay_writable = function() return false end
       t.false_(runtime.overlay_available(), "overlay 应被判定为不可用")
-      local done, rejected = false, nil
-      require("NeoAI.tools").execute("run_command", { command = "ls", description = "t" }, {}):then_(function()
-        done = true
-      end, function(e)
-        rejected = e
-        done = true
-      end)
-      t.true_(vim.wait(10000, function() return done end), "run_command 应完成")
+      local done, result, rejected = false, nil, nil
+      local ctx = {}
+      require("NeoAI.tools").execute("run_command", { command = "cat real.txt", description = "t" }, ctx)
+        :then_(function(r) result = r; done = true end, function(e) rejected = e; done = true end)
+      t.true_(vim.wait(15000, function() return done end), "run_command 应完成")
       runtime.overlay_writable = saved_writable
-      t.not_nil(rejected, "overlay 不可用时默认应拒绝执行，而非降级运行")
-      t.matches("SANDBOX_OVERLAY_UNAVAILABLE", tostring(rejected and rejected.message), "应给出 overlay 不可用错误")
+      t.nil_(rejected, "overlay 不可用时应降级执行而非拒绝: " .. tostring(rejected and rejected.message))
+      t.matches("REAL", tostring(result), "播种视图应能看到真实磁盘文件")
+      -- 降级/只读字样不进入模型可见结果（真实原因仅 UI）。
+      t.true_(not tostring(result):find("只读", 1, true) and not tostring(result):find("降级模式", 1, true),
+        "模型可见结果不应暴露只读/降级")
       t.true_(fs.exists(dir .. "/real.txt"), "真实文件不应被改动")
     end)
     vim.fn.chdir(prev)
@@ -4378,7 +4385,8 @@ tests.suite("sandbox", function(_, it)
     vim.fn.chdir(dir)
     local sandbox = require("NeoAI.sandbox")
     with_config({ tools = { approval = { mode = "async" }, sandbox = {
-      mode = "dry_run", review = { enabled = true }, overlay_fail_closed = false,
+      mode = "dry_run", review = { enabled = true },
+      degraded_seed = false,
     } } }, function()
       sandbox.reset()
       -- 模拟容器内 userns 限制：粗粒度能力与真实可写实测均失败。
@@ -5507,7 +5515,7 @@ tests.suite("sandbox", function(_, it)
     local ok, err = pcall(function()
       with_config({ tools = { approval = { mode = "async" }, sandbox = {
         mode = "dry_run", review = { enabled = true },
-        overlay_fail_closed = false, staging_uncovered = "warn",
+        staging_uncovered = "warn",
       } } }, function()
         sandbox.reset()
         local tools = require("NeoAI.tools")

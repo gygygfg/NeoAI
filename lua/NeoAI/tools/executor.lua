@@ -572,6 +572,39 @@ local function _execute_after_secret_guard(tool, resolved, args, ctx)
     needs_approval = true
   end
 
+  -- 跨挂载点工作区：整机根 overlay（lower=`/`）不跨挂载点，工作区位于独立挂载（如容器卷
+  -- `/mnt/<uuid>`）时，命令视图会只投影出 overlay upper 里被物化的暂存文件，chdir 也可能
+  -- 因路径在该视图不存在而失败。经审批悬浮窗确认后，本次命令退回「整机只读 + 工作区单层
+  -- overlay」兼容模式（见 sandbox/wrapper.build_overlay_specs 的 no_root_overlay）。
+  if spec.effect == "process" and ctx.sandbox_cross_mount_approved ~= true then
+    local rt = require("NeoAI.sandbox.runtime")
+    local cwd = ctx.sandbox_exec_cwd or vim.fn.getcwd()
+    local mount_root = rt.cross_mount_root(cwd)
+    if mount_root then
+      -- 批准缓存按 Agent 记；子 Agent 继承父链上的批准，避免同一工作区反复/无法批准。
+      local approved = false
+      local a = ctx.agent
+      local seen = {}
+      while a and not seen[a.id] do
+        seen[a.id] = true
+        local c = a._cross_mount_approved
+        if c and c[mount_root] then approved = true break end
+        a = a.parent and require("NeoAI.core.agent.runtime").get(a.parent)
+      end
+      if approved then
+        -- 本会话已批准过该挂载点：直接以兼容模式运行，不再重复弹窗。
+        ctx.sandbox_cross_mount_approved = true
+      elseif can_approve then
+        ctx.sandbox_cross_mount_root = mount_root
+        needs_approval = true
+      else
+        return async.reject({ kind = "sandbox",
+          message = "工作区位于独立挂载点 " .. mount_root
+            .. "，命令沙箱需用户批准以兼容模式运行（当前调用无审批能力）" })
+      end
+    end
+  end
+
 
   -- 可暂停计时器：tool_loop 在调用前已创建并注入 ctx.timer（用于展示活跃耗时）。
   -- 直接调用（无 tool_loop，如测试）时自建一个，仅用于超时。
@@ -586,6 +619,16 @@ local function _execute_after_secret_guard(tool, resolved, args, ctx)
     -- 交由 tool_service 做审批 UI，审批通过后继续执行。
     -- 计时器只在审批通过后才 start，因此等待审批的时间不计入耗时、也不消耗超时预算。
     return _tokenize_out(ctx.tool_service.approve_and_execute(resolved, args, ctx, function()
+      -- 审批通过：允许本次进程命令以跨挂载点兼容模式构建 overlay 前缀，并记住该挂载点，
+      -- 本会话后续命令不再重复弹窗。
+      if ctx.sandbox_cross_mount_root then
+        ctx.sandbox_cross_mount_approved = true
+        local a = ctx.agent
+        if a then
+          a._cross_mount_approved = a._cross_mount_approved or {}
+          a._cross_mount_approved[ctx.sandbox_cross_mount_root] = true
+        end
+      end
       return _execute_tool(tool, args, ctx, timer)
     end), ctx, resolved, args)
   end

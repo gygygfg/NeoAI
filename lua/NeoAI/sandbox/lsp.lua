@@ -102,7 +102,10 @@ local function _resolve_specs(cwd)
   local specs = wrapper.build_overlay_specs(cwd, base, extra)
   local any = false
   for _, s in ipairs(specs) do
-    if runtime.overlay_writable(s.root, s.upper, s.work) then
+    if s.mode == "fuse" then
+      -- 用户态 overlay 合并视图：视为可写视图。
+      any = true
+    elseif runtime.overlay_writable(s.root, s.upper, s.work) then
       s.mode = "overlay"; any = true
     else
       s.mode = "bind"

@@ -23,6 +23,8 @@ local PHASE1_COMMANDS = {
   NeoAIPlan = true,
   NeoAIApprovePlan = true,
   NeoAIStatusline = true,
+  -- 测试在隔离子进程中运行，不依赖当前进程的服务/工具，阶段 1 即可执行。
+  NeoAITest = true,
 }
 
 -- ========== 私有函数 ==========

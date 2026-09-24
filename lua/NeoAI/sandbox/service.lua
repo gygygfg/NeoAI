@@ -254,7 +254,9 @@ local function _build(svc, opts)
   for _, r in ipairs(candidate.staged_overlay_roots(known)) do extra[#extra + 1] = r end
   local specs = wrapper.build_overlay_specs(real_cwd, svc_dir, extra)
   for _, s in ipairs(specs) do
-    if runtime.overlay_writable(s.root, s.upper, s.work) then
+    if s.mode == "fuse" then
+      -- 用户态 overlay 已建立合并视图，保持不动。
+    elseif runtime.overlay_writable(s.root, s.upper, s.work) then
       s.mode = "overlay"
     else
       s.mode = "bind"

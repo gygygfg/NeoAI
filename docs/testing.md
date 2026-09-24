@@ -13,12 +13,23 @@
 :NeoAITest flow_tools  " 运行指定套件（按名字）
 ```
 
+**隔离运行（重要）**：`:NeoAITest` 会在一个**全新 headless 子进程**（`nvim --headless --clean
+-u NONE --cmd "set rtp+=<插件根>"`）中执行 `run_all()`，结果经 `SUMMARY passed=.. failed=..`
+回传到当前实例，绝不触碰当前进程的插件宿主/工具注册表。
+
+> 为什么必须隔离：许多套件会直接改写全局运行态（`registry.reset()`、`plugins.stop_all()`、
+> `sandbox.shutdown()`、`config_store.load` 等），而运行器没有 after_each 恢复。若在正在使用的
+> nvim 里同进程运行，会清空工具注册表，且 `NeoAI.is_fully_started()` 仍为 true，懒加载门禁
+> 不会重新注册工具——表现为后续请求（如 `run_command`）工具集为空。子进程隔离从根上避免。
+
 headless 运行：
 
 ```bash
 nvim --headless -u NONE --cmd 'set rtp+=.' \
   -c 'lua local r=require("NeoAI.tests").run_all(); vim.cmd(r.failed>0 and "cquit 1" or "qa!")'
 ```
+
+如需自行集成（CI/脚本），等价接口为 `require("NeoAI.tests").run_isolated(names, { on_done = fn })`。
 
 ## 2. 测试组织
 

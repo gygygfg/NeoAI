@@ -73,7 +73,7 @@ tests.suite("sandbox_staging", function(_, it)
     local other = vim.fn.tempname()
     fs.ensure_dir(dir)
     fs.ensure_dir(other)
-    with_config({ tools = { sandbox = { overlay_fail_closed = false } } }, function()
+    with_config({ tools = { sandbox = { staging_uncovered = "reject" } } }, function()
       sandbox.reset()
       candidate.begin_session()
       candidate.merge_candidate({

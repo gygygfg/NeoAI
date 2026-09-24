@@ -360,6 +360,183 @@ function M.run_all(...)
   return { passed = total_passed, failed = total_failed, errors = all_errors }
 end
 
+-- ========== 隔离子进程运行 ==========
+--
+-- 为什么隔离：本套件大量用例会直接改写全局运行态（`registry.reset()` / `plugins.stop_all()`
+-- / `sandbox.shutdown()` / `config_store.load` 等），而运行器没有 after_each 恢复；若在用户
+-- 正在使用的 nvim 进程内运行，会把线上插件宿主/工具注册表清空，且 `NeoAI.is_fully_started()`
+-- 仍为 true，懒加载门禁不会重新注册工具 —— 表现为后续请求（如 run_command）工具集为空。
+-- 因此 `:NeoAITest` 一律在全新 headless 子进程中运行，绝不触碰当前进程状态。
+
+--- 子进程预置脚本（注入套件名）
+--- @param names table 套件名数组
+--- @return string
+function M._isolated_script(names)
+  local quoted = {}
+  for _, n in ipairs(names or {}) do
+    quoted[#quoted + 1] = string.format("%q", tostring(n))
+  end
+  return table.concat({
+    "-- NeoAI 隔离测试子进程（自动生成，勿手改）",
+    'require("NeoAI").setup({ log = { level = "ERROR" }, session = { auto_save = false } })',
+    "local names = {" .. table.concat(quoted, ", ") .. "}",
+    'local r = require("NeoAI.tests").run_all(unpack(names))',
+    'print(("SUMMARY passed=%d failed=%d"):format(r.passed, r.failed))',
+    "for _, e in ipairs(r.errors or {}) do",
+    '  io.stdout:write("ERROR:: " .. tostring(e) .. "\\n")',
+    "end",
+  }, "\n")
+end
+
+--- 定位插件根目录（含 lua/ 的仓库根）；失败返回 nil
+--- @return string|nil
+function M._plugin_root()
+  local src = debug.getinfo(1, "S").source or ""
+  local path = src:match("^@(.+)$") or src
+  return path:match("^(.*)[/\\]lua[/\\]NeoAI[/\\]tests[/\\]init%.lua$")
+end
+
+--- 构造子进程 argv
+--- @param root string 插件根目录
+--- @param script_path string 预置脚本路径
+--- @return table
+function M._child_cmd(root, script_path)
+  local prog = (vim.v.progpath ~= "" and vim.v.progpath) or "nvim"
+  return {
+    prog, "--headless", "--clean", "-u", "NONE",
+    "--cmd", "set rtp+=" .. root,
+    "-c", "luafile " .. vim.fn.fnameescape(script_path),
+    "-c", "qa!",
+  }
+end
+
+--- 解析子进程输出为结果表
+--- @param stdout string
+--- @param stderr string
+--- @param code number|nil
+--- @return table { ok, exit_code, passed, failed, errors, output }
+function M._parse_child_output(stdout, stderr, code)
+  stdout = stdout or ""
+  stderr = stderr or ""
+  local output = stdout
+  if stderr ~= "" then output = output .. "\n" .. stderr end
+  -- 按合并流解析：headless nvim 的 print 在部分构建落到 stderr，只扫 stdout 会漏。
+  local passed, failed = 0, 0
+  for p, f in output:gmatch("SUMMARY passed=(%d+) failed=(%d+)") do
+    passed, failed = tonumber(p) or 0, tonumber(f) or 0
+  end
+  local errors = {}
+  for e in output:gmatch("ERROR:: ([^\n]*)") do
+    errors[#errors + 1] = e
+  end
+  return {
+    ok = code == 0 and (passed + failed) > 0,
+    exit_code = code,
+    passed = passed,
+    failed = failed,
+    errors = errors,
+    output = output,
+  }
+end
+
+--- 测试可注入的子进程执行器：fn(cmd, script_path, opts)；须调用 opts.on_done(result)。
+local test_spawner = nil
+
+--- 覆盖子进程执行器（测试用）；传 nil 恢复默认
+--- @param fn function|nil
+function M._set_child_spawner(fn)
+  test_spawner = fn
+end
+
+--- 默认子进程执行器：jobstart 异步运行，退出后回调（带超时终止）
+--- @param cmd table argv
+--- @param script_path string
+--- @param opts table { on_done, timeout_ms? }
+local function _default_child_spawn(cmd, script_path, opts)
+  local stdout, stderr = {}, {}
+  local done = false
+  local timer = nil
+  local job = vim.fn.jobstart(cmd, {
+    stdout_buffered = true,
+    stderr_buffered = true,
+    on_stdout = function(_, data)
+      if not data then return end
+      for _, line in ipairs(data) do
+        if line ~= "" then stdout[#stdout + 1] = line end
+      end
+    end,
+    on_stderr = function(_, data)
+      if not data then return end
+      for _, line in ipairs(data) do
+        if line ~= "" then stderr[#stderr + 1] = line end
+      end
+    end,
+    on_exit = function(_, code)
+      if done then return end
+      done = true
+      if timer then pcall(function() timer:stop(); timer:close() end) timer = nil end
+      local res = M._parse_child_output(table.concat(stdout, "\n"), table.concat(stderr, "\n"), code)
+      opts.on_done(res)
+    end,
+  })
+  if job <= 0 then
+    local res = M._parse_child_output("", "无法启动测试子进程（jobstart 失败）", -1)
+    opts.on_done(res)
+    return
+  end
+  local timeout_ms = tonumber(opts.timeout_ms) or 900000
+  if timeout_ms > 0 then
+    timer = vim.uv.new_timer()
+    if timer then
+      timer:start(timeout_ms, 0, function()
+        if done then return end
+        pcall(vim.fn.jobstop, job)
+        -- jobstop 触发 on_exit；若未触发则兜底回调
+        vim.schedule(function()
+          if done then return end
+          done = true
+          opts.on_done(M._parse_child_output(table.concat(stdout, "\n"), table.concat(stderr, "\n") .. "\n测试超时", -1))
+        end)
+      end)
+    end
+  end
+end
+
+--- 在隔离子进程中运行测试套件（异步；不触碰当前进程状态）
+--- @param names table 套件名数组（空 = 全部）
+--- @param opts table|nil { on_done? = fun(result), timeout_ms? = number }
+function M.run_isolated(names, opts)
+  opts = opts or {}
+  local on_done = opts.on_done or function() end
+  local root = M._plugin_root()
+  if not root then
+    on_done(M._parse_child_output("", "无法定位插件根目录（tests/init.lua 路径异常）", -1))
+    return
+  end
+  local script_path = vim.fn.tempname() .. "_neoai_test_child.lua"
+  local f = io.open(script_path, "w")
+  if not f then
+    on_done(M._parse_child_output("", "无法写入测试脚本: " .. script_path, -1))
+    return
+  end
+  f:write(M._isolated_script(names or {}))
+  f:close()
+
+  local cmd = M._child_cmd(root, script_path)
+  local finished = false
+  local function finish(res)
+    if finished then return end
+    finished = true
+    pcall(os.remove, script_path)
+    on_done(res)
+  end
+  local runner = test_spawner or _default_child_spawn
+  local ok, err = pcall(runner, cmd, script_path, { on_done = finish, timeout_ms = opts.timeout_ms })
+  if not ok then
+    finish(M._parse_child_output("", "测试子进程执行异常: " .. tostring(err), -1))
+  end
+end
+
 --- 重置（测试用）
 function M.reset()
   state.suites = {}

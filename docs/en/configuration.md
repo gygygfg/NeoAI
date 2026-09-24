@@ -271,9 +271,9 @@ sandbox = {
   -- sudoers, docker.sock, ...) plus the sandbox's own storage are masked; `mask_dirs` (home/root
   -- sibling dirs) are no longer mount-masked, but accessing user dirs outside cwd is **traced**
   -- (evidence + `sandbox:outside_access` event) and shown in the `:NeoAISandboxReview` window under
-  -- "越界访问留痕" (non-blocking, still allowed). When the overlay is unavailable it falls back to a
-  -- read-only root (overlay_fail_closed decides whether to degrade). When false, falls back to the
-  -- minimal read-only allowlist below.
+  -- "越界访问留痕" (non-blocking, still allowed). When the overlay is unavailable it degrades to a
+  -- whole-root read-only view plus a session-private writable layer over the writable roots (seeded
+  -- with real content via `degraded_seed`). When false, falls back to the minimal read-only allowlist.
   read_all = true,
   -- Minimal read-only system set (allowlist, only when read_all=false): only these host
   -- roots/subtrees/files are exposed read-only to external commands; unlisted paths do not exist
@@ -524,9 +524,8 @@ sandbox = {
   staging_backend = "disk",
   session_shell = true,            -- persist shell state (export/cd) across run_command within a session (bwrap only)
   process_roots = {},              -- extra writable roots (only when read_all=false or the whole-root overlay is unavailable; overlaid, default cwd only, auto-added). With read_all=true (default) the whole root is already a writable overlay, so this is unnecessary. /tmp, /var/tmp belong to tmpfs_roots; add explicitly if needed
-  overlay_fail_closed = true,      -- reject process tools when overlay is unavailable (no private-cwd downgrade); set false to allow degraded execution
-  staging_uncovered = "reject",    -- when unpublished staged changes exist but the command has no writable overlay layer: "reject" (default, fail-closed) | "warn" (run degraded with a notice, to bypass transient failures)
-  degraded_seed = false,           -- seeded view without overlay: when true, copy the writable roots' real content into the session-private bind dir so a degraded/nested-userns view can see real files (writes still land in the private copy and freeze as candidates; the real disk stays read-only). Default false; enable in containers/no-overlay setups together with overlay_fail_closed=false
+  staging_uncovered = "reject",    -- when unpublished staged changes exist but the command has no writable overlay layer: "reject" (default, fail-closed) | "warn" (run degraded with a notice, to bypass transient failures). Staged changes inside seeded roots do not count as a split
+  degraded_seed = true,            -- seeded view without overlay: when true, copy the writable roots' real content into the session-private bind dir so a degraded/nested-userns view can see real files (writes still land in the private copy and freeze as candidates; the real disk stays read-only). Default true: commands still work without overlay; set false to hide real files in the degraded view. Read-only/degraded wording is not exposed to the model (see sandbox.conceal)
   degraded_seed_max_bytes = 2 * 1024 * 1024 * 1024, -- seeding byte cap (0 = unlimited); over the cap seeding is abandoned and falls back to fail-closed (avoids copying a huge workspace)
   -- Async review: candidates enter a pending queue. session_auto_approve auto-applies L0/L1.
   -- l3_warning: high-risk items require second confirmation (AI consequence warning + auto diff; apply only after re-confirming).

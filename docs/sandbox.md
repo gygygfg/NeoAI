@@ -141,6 +141,11 @@
     `materialize_overlay(specs, { force = true })` 强制全量重物化。
   - **overlay 临时层写入不 fsync**：会话级 overlay 私有可写层是临时草稿（agentEnd 轮换即清理），
     `write_file_atomic(..., { sync = false })` 去掉逐文件 fsync；真实工作区发布仍 fsync 保证持久化。
+  - **落盘完整性校验（fail-closed，防撕裂/短写）**：原子写入（`fs.write_file_atomic` 与发布
+    工作线程的 `write_atomic`）在 `rename` 提交前核对临时文件的字节数与内容一致，不一致
+    （短写/撕裂写）即删除临时文件、**保留原文件**并返回失败，绝不静默提交损坏内容；shell
+    （`setpriv`/`sudo`）写入路径在写后逐字节回读校验，不一致返回 `WRITE_INTEGRITY_FAILED`。
+    用于杜绝「只丢 2 字节 / 尾部残片」这类多字节字符被截断的损坏文件被提交。
   - **证据不嵌入文件内容**：`evidence.add("fs", ...)` 只存影响清单（路径/动作/哈希），
     并对文件条目数做上限截断，避免大候选在证据里再做一次巨量 JSON 编码。
   - **生成高熵检测有扫描预算**：`detect_generated` 受 `tools.sandbox.secrets.generated_scan_max_bytes`
@@ -205,6 +210,13 @@
   - **取消/超时/输出截断真正终止进程树**：bwrap 载荷在独立 pid 命名空间内，`jobstop` 只杀外层
     bwrap；门禁经 `ctx.sandbox_kill` 暴露 `cgroup.kill`，`run_command` / 工具子进程在取消、超时、
     输出截断时按资源域精确终止全部子进程（无 cgroup 时仍 `jobstop`）。
+  - **Agent 循环取消传播到执行层**：`tool_loop._execute_single` 把 `agent.signal` 注入
+    `exec_opts.signal`，经 `tool_service` → 执行器上下文传到工具；`run_command`/工具子进程/
+    常驻沙箱均订阅该信号。用户按 `<Esc>`（`chat_service.cancel_generation` → `runtime.abort`）
+    后，正在运行的外部进程会被 `cgroup.kill`/`jobstop` **进程级**终止，而不是等其自然结束。
+    取消后 `tool_loop` 立即结束本轮、`runtime` 单一 `catch` 把状态复位为 `idle`，避免卡在
+    `generating`（busy）导致后续消息被吞进待发队列（详见 `core/agent/runtime.lua` 与
+    `core/agent/tool_loop.lua`）。
   - **墙钟安全网**：`tools.run_command.max_wall_ms`（默认 0 = 不限）>0 时约束所有命令（含
     `timeout_ms=-1` 的「不限」命令），到时经资源域终止，避免长任务永久占用、工具永不返回。
   - **基准复现**：`require("NeoAI.sandbox.diag").bench_capture({ files = N })` 返回
@@ -543,8 +555,8 @@
   - **无 overlay 时禁止降级**：命令将运行在**没有任何 overlay 可写层**的模式（overlay 不
     可用降级为 bind、或 T2 嵌套 userns 无 overlay）且存在**未发布的实质暂存改动**
     （`candidate.has_staged`）时，直接以 `SANDBOX_STAGING_UNCOVERED` 拒绝执行——此时命令只能
-    读到真实磁盘、与只读工具的暂存视图分裂，且可能绕过暂存。这是对既有
-    `overlay_fail_closed`（仅拒绝非 userns 降级）的收紧：**有暂存时 userns 也不放行**。
+    读到真实磁盘、与只读工具的暂存视图分裂，且可能绕过暂存。（无 overlay 但**没有**未发布
+    暂存时不再 fail-closed：降级运行并播种真实内容，见下。）
     - **覆盖判定精确到根**：门禁只在暂存改动落在**本次命令实际可覆盖的根之外**时才拒绝——
       可覆盖根 = `mode=overlay` 的可写根 + 播种视图覆盖根。此前「存在任一 overlay 即放行」
       会漏掉「cwd 是 overlay、但暂存位于 bind 根」的视图分裂；现在按 `has_staged_outside`
@@ -993,15 +1005,13 @@ stdout/stderr/退出码返回。宿主侧由 `sandbox/systemd_ipc.lua` 以 fs_ev
   （详见 §15）。root 下优先使用无 user namespace 的显式隔离标志，否则用 `--unshare-all`。
   - **overlay 可用时**：每个可写根（`process_roots`）真实内容作为只读 lower、会话 upper
     作为可写层，命令看到真实内容且写入可捕获。
-  - **overlay 不可用时（默认 fail-closed）**：不降级运行——`process` 工具直接拒绝，返回
-    `SANDBOX_OVERLAY_UNAVAILABLE`（附不可用原因），避免命令在「看不到真实磁盘文件」的私有
-    视图里静默运行、把「看不到」误判为「文件不存在/改动未生效」。可用
-    `tools.sandbox.overlay_fail_closed = false` 显式允许降级：此时把会话私有目录 `--bind`
-    到该根（命名空间隔离与只读 rootfs 保留），命令看到的是会话私有视图（仅含暂存改动），
-    `run_command` 会以**仅用户可见**的方式提示「降级模式」（`ctx.sandbox_degraded` →
-    工具结果的 UI 附加元数据 `notice`，附 `ctx.sandbox_degraded_reason` 原因），
-    **不写入模型可见的结果内容**，避免把「看不到」误判为「文件不存在/改动未生效」，
-    也不让模型据此感知沙箱状态。
+  - **overlay 不可用时（默认降级）**：不再拒绝——把会话私有可写目录 `--bind` 到可写根，并配合
+    `degraded_seed=true` 先播种真实内容（命名空间隔离与只读 rootfs 保留），命令仍能看到真实
+    文件、写入落私有副本并冻结为候选。降级/只读状态**不对模型暴露**：`run_command` 的提示以
+    **仅用户可见**的方式挂到 `ctx.ui_notice`（`ctx.sandbox_degraded` → 工具结果的 UI 附加元数据
+    `notice`，附 `ctx.sandbox_degraded_reason` 原因），且 `sandbox.conceal` 抹除命令输出/错误中的
+    「只读/overlay/降级」字样，避免模型据此感知沙箱状态。仅在存在未发布暂存且落在可覆盖根之外时
+    才按 `staging_uncovered` 拒绝。
   - **T2 特权档（嵌套 userns）**：天然无 overlay，其主机效果冻结为提案，属有意设计，**不算
     「降级」**。该档单独以 `ctx.sandbox_userns` 标记，`run_command` 显示**特权档专用提示**
     （「以特权档（T2）在嵌套命名空间内执行……主机效果将冻结为提案待审」），**仅用户可见**，
@@ -1132,7 +1142,12 @@ seccomp（含设备节点屏障）**——沙箱内进程看到的是一份「�
   读写」，`/opt`、`/srv`、其他项目目录等都可写。**根 overlay 的 upper/work 主位置在沙箱存储
   根下；容器内「overlay 之上再 overlay」会 EINVAL 时，自动改用 tmpfs（`/dev/shm`、`/run`）
   承载 upper/work**，避免回退为只读根（AI 因此不易察觉「文件系统只读」）。`mask_dirs`（`/home`、`/root` 兄弟目录）
-  不再挂载遮蔽。overlay 不可用时退回只读根（`overlay_fail_closed` 决定是否降级）。
+  不再挂载遮蔽。overlay 不可用（如容器内根为 overlay、嵌套 overlay EINVAL）时，默认
+  **降级运行**（`overlay_fail_closed=false`）：以会话私有可写层覆盖可写根（cwd/`process_roots`）
+  并用 `degraded_seed=true` 播种真实内容，命令仍能看到真实文件、写入进私有副本并冻结为候选，
+  宿主真实盘保持只读；其余路径只读。该降级/只读状态**不对模型暴露**——回传模型的命令输出与
+  错误中的“只读/overlay/降级”字样由 `sandbox.conceal` 抹除（真实原因仅进用户可见的 UI 提示）。
+  设 `overlay_fail_closed=true` 可恢复 fail-closed（无 overlay 直接拒绝）。
   > **「系统目录可写」是设计而非缺陷**：`/usr/bin`、`/etc` 等看似可写，是因为整机根以
   > **可写 overlay** 暴露——写入只落会话私有 upper 并冻结为待审候选，**宿主真实盘不被改动**；
   > 敏感条目（`/etc/shadow`、`/etc/sudoers`、`/etc/ssh`、cron 等）仍被 `mask_paths` 遮蔽。
@@ -1168,6 +1183,15 @@ seccomp（含设备节点屏障）**——沙箱内进程看到的是一份「�
   两种模式下危险/敏感子路径都由 `mask_paths` 遮蔽（如 `/var/lib/docker`、`/var/lib/containerd`；
   如需隐藏软件清单可把 `/usr/share/doc|man|info` 加入 `mask_paths`）。该读取面同样用于 LSP
   命名空间覆盖（见 §5）。
+  - **跨挂载点工作区（容器卷等）**：整机根 overlay 的 lower 为 `/`，而 overlay 的 lower
+    **不跨挂载点**。当工作目录位于 `/` 之外的独立挂载（如容器卷 `/mnt/<uuid>/...`）时，根
+    overlay 无法投影其内容：命令侧只看到 overlay upper 里被物化的暂存文件，且 `--chdir`
+    可能因路径在该视图不存在而失败（`init: Can't chdir to ...: No such file or directory`），
+    与只读工具视图分裂。此时 `runtime.cross_mount_root(cwd)`（基于 `/proc/self/mountinfo`
+    的最深祖先挂载点）命中，命令执行前弹**审批悬浮窗**说明原因；用户批准后本次会话对该挂载点
+    退回「整机只读（`--ro-bind / /`，递归绑定保留全部挂载读取面）+ 仅对工作区做**单层**
+    overlay」的兼容模式（写入仍进暂存待审），不堆叠 overlay、不产生额外计算；批准结果按挂载点
+    缓存在当前 Agent，后续命令不再重复弹窗。子 Agent / 无审批能力时 fail-closed 拒绝并说明原因。
 - **工具子进程统一经沙箱（`NeoAI.sandbox.exec`）**：所有工具内部 spawn 的子进程
   （`run_command` 的 shell、`git` 操作、`read_image` 的 curl 下载、`web_fetch` 的
   bash/node 渲染与依赖安装、MCP stdio server 等）都在 bwrap 命名空间内创建，而非宿主。
