@@ -185,7 +185,7 @@ local function _run_command(command, opts)
   job = vim.fn.jobstart(_sandboxed_argv({ _shell_bin(), "-c", command }, opts), {
     cwd = opts.cwd,
     -- 环境变量脱敏 + 宿主运行时直通；优先使用门禁预构造的沙箱环境（含档位 env/PATH）。
-    env = opts.env or secret.sanitized_env(),
+    env = require("NeoAI.utils.env").for_jobstart(opts.env or secret.sanitized_env()),
     stdout_buffered = false,
     stderr_buffered = false,
     on_stdout = function(_, data)
@@ -264,7 +264,7 @@ local function _run_interactive(command, opts)
   local session, oerr = pty.open({
     argv = full,
     cwd = opts.cwd,
-    env = opts.env,
+    env = require("NeoAI.utils.env").for_jobstart(opts.env),
     cgroup_path = opts.cgroup_path,
     kill = opts.kill,
     description = opts.description,

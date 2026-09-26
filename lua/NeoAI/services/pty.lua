@@ -585,7 +585,7 @@ function M.open(opts)
   local job = vim.fn.jobstart(opts.argv, {
     pty = true,
     cwd = opts.cwd,
-    env = opts.env,
+    env = require("NeoAI.utils.env").for_jobstart(opts.env),
     on_stdout = function(_, data) append(data) end,
     on_stderr = function(_, data) append(data) end,
     on_exit = function(_, code)

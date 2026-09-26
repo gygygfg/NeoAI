@@ -4,6 +4,7 @@ output.txt
 /*fix*
 /*example*
 *.log
+.neoai_test_timings.json
 !lua/NeoAI/tests/
 !lua/NeoAI/tests/*.lua
 !lua/NeoAI/tests/**/*.json

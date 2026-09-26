@@ -17,16 +17,30 @@ NeoAI 是一个 Neovim AI 编程助手插件（Lua）。分层：
 ## 关键命令
 
 ```bash
-# 运行全部内置测试（headless，输出 SUMMARY passed/failed）
+# 运行全部内置测试（并行，多 worker 隔离子进程，输出 SUMMARY passed/failed）
+# 可选环境变量 NEOAI_TEST_WORKERS 覆盖 worker 数（默认 min(nproc, 8)）
+nvim --headless --clean -u NONE --cmd "set rtp+=$PWD" \
+  --cmd "lua require('NeoAI').setup({ log={level='ERROR'}, session={auto_save=false} })" \
+  -c "lua local r=require('NeoAI.tests.parallel').run(); print('SUMMARY passed='..r.passed..' failed='..r.failed); vim.cmd(r.failed>0 and 'cquit 1' or 'qa!')"
+
+# 顺序运行（调试单套件）：run_all("plugins") / run_all("kernel","services")
 nvim --headless --clean -u NONE --cmd "set rtp+=$PWD" \
   --cmd "lua require('NeoAI').setup({ log={level='ERROR'}, session={auto_save=false} })" \
   -c "lua local r=require('NeoAI.tests').run_all(); print('SUMMARY passed='..r.passed..' failed='..r.failed); vim.cmd('qa!')"
-
-# 只跑某个套件（如插件专项）
-# run_all("plugins") / run_all("kernel","services")
 ```
 
 - 测试框架：`lua/NeoAI/tests/init.lua`，套件文件 `lua/NeoAI/tests/test_*.lua`，运行器自动加载。
+- 并行运行器：`lua/NeoAI/tests/parallel.lua`，按「文件（套件）」分片到多个隔离 headless
+  子进程；权重优先用实测耗时缓存 `.neoai_test_timings.json`（gitignored），无缓存按用例数。
+  文件级分片保证固定端口（各文件唯一）与文件内固定临时路径不跨 worker 冲突；子进程注入独立
+  `mcp.cache_path`。资源重/时序敏感套件（`sandbox*`、`pty`）自动走**串行通道**，避免并发下
+  bwrap/cgroup 争抢导致 137/SIGKILL 与 PTY 时序 flaky。
+- 过滤（隔离复现/跳过危险用例）：`NEOAI_TEST_ONLY=<p1,p2>`（仅跑含任一子串的用例）、
+  `NEOAI_TEST_SKIP=<p1,p2>`（跳过）。`run_all` 每个套件前会恢复干净环境（配置默认 + 插件
+  `start_all` + 工具 `reload_tools`），杜绝跨套件污染。
+- **宿主稳定性告警**：在嵌套容器/VM 上，强制关闭 overlay 的降级用例会触发宿主内核看门狗
+  硬重启。在此类环境跑 sandbox 套件请加
+  `NEOAI_TEST_SKIP=无 overlay,overlay 不可用,降级 --bind`（在具备真实内核隔离的 CI/VM 上无需跳过）。
 - 测试必须离线可复现：HTTP 用 `tests/http_server.lua` 的本地 TCP mock；除非用例明确要求，不要访问真实外部 API。
 - 每个测试套件有独立会话临时目录；`kernel.*` 与 `core.session.*` 提供 `reset()` 供隔离。
 

@@ -9,11 +9,34 @@
 ## 1. Running
 
 ```vim
-:NeoAITest          " run all suites
-:NeoAITest flow_tools  " run a specific suite (by name)
+:NeoAITest              " run all suites in parallel (no args)
+:NeoAITest flow_tools   " run a specific suite sequentially (by name, for debugging)
 ```
 
-**Isolated execution (important)**: `:NeoAITest` runs `run_all()` inside a **fresh headless child
+- **Parallel by default (no args)**: `lua/NeoAI/tests/parallel.lua` shards every suite by
+  **file (suite)** across `min(nproc, 8)` isolated headless child processes (override with
+  `NEOAI_TEST_WORKERS`), aggregates `passed/failed`, and prints per-shard timing. Shard weights
+  prefer the measured timing cache `.neoai_test_timings.json` (gitignored, repo root); without a
+  cache it falls back to case-count LPT balancing.
+- **Serial lane**: resource-heavy / timing-sensitive suites (default `sandbox*`, `pty`) do not run
+  in parallel; they run one at a time to avoid bwrap/cgroup contention (137/SIGKILL, timeouts) and
+  PTY timing flakiness. Override with `opts.serial_suites` (pattern list or predicate).
+- **Sequential (with suite names)**: single-process `run_isolated`, sequential, for pinpointing one suite.
+- **Filters (isolated repro / skip risky cases)**: `NEOAI_TEST_ONLY=<p1,p2>` runs only cases whose
+  name contains any pattern; `NEOAI_TEST_SKIP=<p1,p2>` skips them. Comma-separated.
+- **Cross-suite isolation**: before each suite `run_all` restores a clean environment — config reset
+  to test defaults + plugin `start_all()` (idempotent) + tool `reload_tools()`, so a suite that
+  `config_store.load` / `registry.reset` without restoring cannot pollute later suites.
+- **Host stability warning**: inside nested containers/VMs, the **tests that force overlay off**
+  (set `runtime.overlay_available/writable=false`, i.e. the degraded `--bind` path) can trigger the
+  host kernel watchdog and hard-reboot the machine every few minutes. On such hosts add
+  `NEOAI_TEST_SKIP=无 overlay,overlay 不可用,降级 --bind`; CI/VMs with real kernel isolation need no skip.
+- **Why parallel is safe**: sharding is per file — fixed listening ports are unique per file and
+  file-local temp paths are only self-used, so file-level shards have no cross-process conflict.
+  Each worker is its own nvim (no shared registry/sandbox/session state), and workers get an
+  injected per-worker `mcp.cache_path`. Do not start a second run before the previous one finishes.
+
+**Isolated execution (important)**: `:NeoAITest` runs inside a **fresh headless child
 process** (`nvim --headless --clean -u NONE --cmd "set rtp+=<plugin root>"`) and reports the result
 back via a `SUMMARY passed=.. failed=..` line. It never touches the current instance's plugin host or
 tool registry.
@@ -25,15 +48,23 @@ tool registry.
 > requests (e.g. `run_command`) go out with an empty toolset. Child-process isolation removes the
 > problem at the root.
 
-Running headless:
+### 1.1 Command line / CI
 
 ```bash
+# Parallel full run (recommended)
+nvim --headless --clean -u NONE --cmd "set rtp+=$PWD" \
+  --cmd "lua require('NeoAI').setup({ log={level='ERROR'}, session={auto_save=false} })" \
+  -c "lua local r=require('NeoAI.tests.parallel').run(); print('SUMMARY passed='..r.passed..' failed='..r.failed); vim.cmd(r.failed>0 and 'cquit 1' or 'qa!')"
+
+# Sequential (debug a single suite)
 nvim --headless -u NONE --cmd 'set rtp+=.' \
   -c 'lua local r=require("NeoAI.tests").run_all(); vim.cmd(r.failed>0 and "cquit 1" or "qa!")'
 ```
 
-For custom integration (CI/scripts), the equivalent API is
-`require("NeoAI.tests").run_isolated(names, { on_done = fn })`.
+For custom integration: parallel API `require("NeoAI.tests.parallel").run(opts)`
+(`opts.workers / opts.suites / opts.wait / opts.on_done / opts.timings_path / opts.verbose`);
+sequential-isolated API `require("NeoAI.tests").run_isolated(names, { on_done = fn })`; suite
+manifest discovery `require("NeoAI.tests").list_suites()`.
 
 ## 2. Test Organization
 
@@ -148,6 +179,20 @@ ensures there are no leftover subscriptions or state between tests.
 | `test_sandbox_maintscript` | systemd facade entry: `process_prefix` binds the thin entry over the real binary paths (no more PATH-prepended `/tmp/.dynbin`), package installs inject policy-rc.d, and the entry forwards over file IPC to the Lua facade (stdout/stderr/exit code match real systemctl) |
 | `test_net_consent` | Sandbox network consent: ask/allow/deny policy, internal-port registration is permission-free, headless fail-closed, prompt allow_once/deny/allow_session memory, external targets handled per policy |
 | `test_sandbox_overlay_invalidate` | Overlay view sync: after publish/reject `resident.sync_real` makes commands read the new real content (no stale materialization; view-split fix); permission-bit changes trigger re-materialization |
+| `test_grant` | Sandbox task grants: exact/prefix/`/**` scope, operation allowlist, budget accumulation, ttl expiry, revoke, `find_covering`, active_only listing |
+| `test_replay` | Policy replay: same rules+facts reproducible, tampered verdict `same=false`, policy version drift, error codes for missing facts / non-decision / unknown evidence |
+| `test_mcp_cache` | MCP description cache: set/get/has, partial-merge updates, update_all clears pending/stale, pending/stale lifecycle, persistence, corrupt/missing-field tolerance |
+| `test_git_ops` | git tools: status/diff/log/commit_detail/branch/file_history, add/commit/stash arg validation, rollback restore, sandbox_prefix wrapping (incl. empty-env regression) |
+| `test_read_image` | read_image gating: model capability / attachments enabled / type allowlist / readability / magic consistency, valid PNG ingest returns a reference |
+| `test_service_tool` | Long-lived service tool layer (stub `sandbox.service`): start validation/success, empty logs placeholder, status one/all/unknown, stop callback + tail logs, long_lived flags |
+| `test_commands_plugin` | Command plugin: unique NAMES, register/cleanup/idempotence, silent degradation when services are missing |
+| `test_keymaps_plugin` | Keymap plugin and `ui.keymap`: global/buffer register and unregister, dual-mode expansion, action dispatch, `show_keymaps` float |
+| `test_lazy_plugin` | Lazy placeholders: placeholder command register/cleanup contract, no deletion once started, phase-1 vs full-start dispatch |
+| `test_ui_components` | UI components: net_consent prompt and decision callback, sub_agent_dock event rendering, terminal_window headless no-op, `display_modes.chat` register/load/unload/render |
+| `test_sandbox_shims` | `fault`/`bench` compatibility shims forward to `diag` |
+| `test_parallel_runner` | Parallel runner: LPT shard balance/reproducibility/empty bins, SUITE/LOADFAIL parsing, passed/failed + timing-cache aggregation, suite filtering, shard crash, discovery failure (injected fake spawner, no real child) |
+
+> `test_grant`…`test_sandbox_shims` were added to fill existing blind spots (these modules had zero coverage before).
 
 ### 5.1 Sandbox Escape / Info-leak Audit (`scripts/sandbox_audit.lua`)
 

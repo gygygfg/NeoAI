@@ -97,24 +97,47 @@ function M.start()
     -- 隔离子进程运行：套件会改写 registry/plugins/sandbox 等全局状态，且运行器无 after_each
     -- 恢复；在当前进程内跑会清空线上工具集（导致后续请求缺失 run_command 等），因此一律
     -- 用全新 headless nvim 执行，绝不触碰当前进程。
-    vim.notify("[NeoAI] 已在隔离子进程启动测试…", vim.log.levels.INFO)
-    tests.run_isolated(names, {
+    if #names > 0 then
+      -- 指定套件：单进程顺序执行，便于定位单个套件。
+      vim.notify("[NeoAI] 已在隔离子进程启动测试（顺序）…", vim.log.levels.INFO)
+      tests.run_isolated(names, {
+        on_done = function(res)
+          if res.passed + res.failed > 0 then
+            vim.notify(
+              string.format("[NeoAI] 测试结果（隔离子进程）: %d 通过, %d 失败", res.passed, res.failed),
+              res.failed > 0 and vim.log.levels.WARN or vim.log.levels.INFO)
+          else
+            vim.notify(
+              "[NeoAI] 测试子进程异常退出（code=" .. tostring(res.exit_code) .. "）\n" .. res.output:sub(1, 2000),
+              vim.log.levels.ERROR)
+          end
+          if #res.errors > 0 then
+            vim.notify("失败测试:\n  " .. table.concat(res.errors, "\n  "), vim.log.levels.WARN)
+          end
+        end,
+      })
+      return
+    end
+    -- 空参数：并行全量运行（多 worker 隔离子进程），交互式等待不阻塞。
+    local ok_p, parallel = pcall(require, "NeoAI.tests.parallel")
+    if not ok_p then
+      vim.notify("[NeoAI] 并行测试模块加载失败: " .. tostring(parallel), vim.log.levels.ERROR)
+      return
+    end
+    vim.notify("[NeoAI] 已并行启动全量测试…", vim.log.levels.INFO)
+    parallel.run({
+      wait = false,
       on_done = function(res)
-        if res.passed + res.failed > 0 then
-          vim.notify(
-            string.format("[NeoAI] 测试结果（隔离子进程）: %d 通过, %d 失败", res.passed, res.failed),
-            res.failed > 0 and vim.log.levels.WARN or vim.log.levels.INFO)
-        else
-          vim.notify(
-            "[NeoAI] 测试子进程异常退出（code=" .. tostring(res.exit_code) .. "）\n" .. res.output:sub(1, 2000),
-            vim.log.levels.ERROR)
-        end
+        vim.notify(
+          string.format("[NeoAI] 并行测试结果: %d 通过, %d 失败（%.1fs, %d worker）",
+            res.passed, res.failed, res.elapsed_ms / 1000, res.workers),
+          res.failed > 0 and vim.log.levels.WARN or vim.log.levels.INFO)
         if #res.errors > 0 then
           vim.notify("失败测试:\n  " .. table.concat(res.errors, "\n  "), vim.log.levels.WARN)
         end
       end,
     })
-  end, { nargs = "*", desc = "在隔离子进程运行 NeoAI 测试" })
+  end, { nargs = "*", desc = "并行运行 NeoAI 测试（指定套件名则顺序执行）" })
 
   _cmd("NeoAIChatStatus", function()
     local ui = _svc("services.ui")

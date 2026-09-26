@@ -2951,7 +2951,7 @@ function M.run(argv, opts)
   job = vim.fn.jobstart(full, {
     cwd = opts.cwd,
     -- 环境变量脱敏 + 宿主运行时直通（统一经 sandbox_env 构造）。
-    env = M.sandbox_env(opts.privileges),
+    env = require("NeoAI.utils.env").for_jobstart(M.sandbox_env(opts.privileges)),
     stdout_buffered = true,
     stderr_buffered = true,
     on_stdout = function(_, data)

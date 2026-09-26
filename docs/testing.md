@@ -9,12 +9,32 @@
 ## 1. 运行
 
 ```vim
-:NeoAITest          " 运行全部套件
-:NeoAITest flow_tools  " 运行指定套件（按名字）
+:NeoAITest              " 并行运行全部套件（无参数）
+:NeoAITest flow_tools   " 顺序运行指定套件（按名字，便于调试）
 ```
 
+- **默认并行（无参数）**：`lua/NeoAI/tests/parallel.lua` 按「文件（套件）」把全部套件分片到
+  `min(nproc, 8)` 个隔离 headless 子进程并发执行（环境变量 `NEOAI_TEST_WORKERS` 可覆盖），
+  聚合 `passed/failed` 并打印各分片耗时。分片权重优先用实测耗时缓存
+  `.neoai_test_timings.json`（gitignored，仓库根），无缓存时按用例数做 LPT 贪心均衡。
+- **串行通道**：资源重/时序敏感套件（默认 `sandbox*`、`pty`）不参与并行，改为逐个串行执行，
+  避免并发 bwrap/cgroup 资源争抢（137/SIGKILL、超时）与 PTY 时序 flaky。可用
+  `opts.serial_suites`（模式数组或判定函数）覆盖。
+- **顺序（带套件名）**：单进程 `run_isolated` 顺序执行，便于定位单个套件。
+- **过滤（隔离复现/跳过危险用例）**：`NEOAI_TEST_ONLY=<p1,p2>` 仅跑名字含任一子串的用例；
+  `NEOAI_TEST_SKIP=<p1,p2>` 跳过。逗号分隔多模式。
+- **跨套件隔离**：`run_all` 在每个套件前恢复干净环境——配置重置为测试默认 + 插件
+  `start_all()`（幂等）+ 工具 `reload_tools()`，杜绝某套件 `config_store.load` / `registry.reset`
+  后未恢复而污染后续套件。
+- **宿主稳定性告警**：在嵌套容器/VM 上，**强制关闭 overlay 的降级用例**（改 `runtime.overlay_available/writable=false`）
+  会触发宿主内核看门狗硬重启（表现为每几分钟整机 reboot）。在此类环境请加
+  `NEOAI_TEST_SKIP=无 overlay,overlay 不可用,降级 --bind` 跳过这类用例；具备真实内核隔离的 CI/VM 无需跳过。
+- **为什么能安全并行**：分片以「文件」为单位——各测试文件固定监听端口互不重复、文件内固定
+  临时路径仅自用，故文件级分片天然无跨进程冲突；每个 worker 是独立 nvim，互不共享注册表/
+  沙箱/会话状态；子进程注入独立 `mcp.cache_path`。请勿在上一轮并行尚未结束时重复启动。
+
 **隔离运行（重要）**：`:NeoAITest` 会在一个**全新 headless 子进程**（`nvim --headless --clean
--u NONE --cmd "set rtp+=<插件根>"`）中执行 `run_all()`，结果经 `SUMMARY passed=.. failed=..`
+-u NONE --cmd "set rtp+=<插件根>"`）中执行，结果经 `SUMMARY passed=.. failed=..`
 回传到当前实例，绝不触碰当前进程的插件宿主/工具注册表。
 
 > 为什么必须隔离：许多套件会直接改写全局运行态（`registry.reset()`、`plugins.stop_all()`、
@@ -22,14 +42,23 @@
 > nvim 里同进程运行，会清空工具注册表，且 `NeoAI.is_fully_started()` 仍为 true，懒加载门禁
 > 不会重新注册工具——表现为后续请求（如 `run_command`）工具集为空。子进程隔离从根上避免。
 
-headless 运行：
+### 1.1 命令行 / CI
 
 ```bash
+# 并行全量（推荐）
+nvim --headless --clean -u NONE --cmd "set rtp+=$PWD" \
+  --cmd "lua require('NeoAI').setup({ log={level='ERROR'}, session={auto_save=false} })" \
+  -c "lua local r=require('NeoAI.tests.parallel').run(); print('SUMMARY passed='..r.passed..' failed='..r.failed); vim.cmd(r.failed>0 and 'cquit 1' or 'qa!')"
+
+# 顺序（调试单套件）
 nvim --headless -u NONE --cmd 'set rtp+=.' \
   -c 'lua local r=require("NeoAI.tests").run_all(); vim.cmd(r.failed>0 and "cquit 1" or "qa!")'
 ```
 
-如需自行集成（CI/脚本），等价接口为 `require("NeoAI.tests").run_isolated(names, { on_done = fn })`。
+如需自行集成：并行接口 `require("NeoAI.tests.parallel").run(opts)`（`opts.workers / opts.suites /
+opts.wait / opts.on_done / opts.timings_path / opts.verbose`）；顺序隔离接口
+`require("NeoAI.tests").run_isolated(names, { on_done = fn })`；套件清单发现
+`require("NeoAI.tests").list_suites()`。
 
 ## 2. 测试组织
 
@@ -147,6 +176,20 @@ end)
 | `test_sandbox_maintscript` | systemd 门面入口：`process_prefix` 把极薄入口覆盖绑定真实二进制路径（不再 PATH 前置 `/tmp/.dynbin`）、包安装注入 policy-rc.d、入口经文件 IPC 转发到 Lua 门面（stdout/stderr/退出码与真实 systemctl 一致） |
 | `test_net_consent` | 沙箱网络访问同意：策略 ask/allow/deny、内部端口登记免权限、headless 失败关闭、弹窗 allow_once/deny/allow_session 记忆、外部目标按策略处理 |
 | `test_sandbox_overlay_invalidate` | overlay 视图同步：发布/拒绝后 `resident.sync_real` 使命令读到真实盘新内容（不再读到旧物化，修复视图分裂）；权限位变化触发重新物化 |
+| `test_grant` | 沙箱任务授权：scope 精确/前缀/`/**`、操作白名单、预算累计、ttl 过期、撤销、`find_covering`、active_only 列表 |
+| `test_replay` | 策略回放：同规则同事实可复现、被篡改裁决 `same=false`、策略版本漂移、缺事实/非裁决/不存在证据的错误码 |
+| `test_mcp_cache` | MCP 描述缓存：set/get/has、部分更新合并、update_all 清 pending/stale、pending/stale 生命周期、持久化、损坏/缺字段容错 |
+| `test_git_ops` | git 工具：status/diff/log/commit_detail/branch/file_history、add/commit/stash 参数校验、rollback 还原、sandbox_prefix 前缀包裹（含空 env 回归） |
+| `test_read_image` | read_image 门禁：模型能力/附件启用/类型白名单/可读性/magic 一致性，合法 PNG 摄入返回引用 |
+| `test_service_tool` | 长驻服务工具层（stub `sandbox.service`）：start 校验/成功、logs 空占位、status 单/全量/未知、stop 回调与末尾日志、long_lived 标记 |
+| `test_commands_plugin` | 命令插件：NAMES 唯一、注册/清理/幂等、缺服务静默降级 |
+| `test_keymaps_plugin` | 键位插件与 `ui.keymap`：全局/buffer 注册与卸载、双模式展开、action 分派、`show_keymaps` 浮窗 |
+| `test_lazy_plugin` | 懒加载占位：占位命令注册/清理契约、已启动不误删、阶段 1 与全量启动分派 |
+| `test_ui_components` | UI 组件：net_consent 弹窗与决策回调、sub_agent_dock 事件渲染、terminal_window headless no-op、`display_modes.chat` 注册/load/unload/render |
+| `test_sandbox_shims` | `fault`/`bench` 兼容 shim 转发到 `diag` |
+| `test_parallel_runner` | 并行运行器：LPT 分片均衡/可复现/空档、SUITE/LOADFAIL 解析、聚合 passed/failed 与耗时缓存、过滤套件、分片异常、发现失败（注入假 spawner，不启动真实子进程） |
+
+> 上述 `test_grant`…`test_sandbox_shims` 为补齐既有盲区新增（此前这些模块零覆盖）。
 
 ### 5.1 沙箱逃逸/信息泄露审计（`scripts/sandbox_audit.lua`）
 

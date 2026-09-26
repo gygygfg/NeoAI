@@ -13,4 +13,13 @@ function M.in_sandbox()
   return vim.env.NEOAI_SANDBOX == "1"
 end
 
+--- 规整 `jobstart`/`vim.system` 的 env 选项：Neovim 不接受空表（报 `E475: Invalid argument: env`），
+--- 空表时返回 nil 以继承父进程环境（等价于「清空自定义环境」的合理语义）。
+--- @param env table|nil
+--- @return table|nil
+function M.for_jobstart(env)
+  if type(env) == "table" and next(env) == nil then return nil end
+  return env
+end
+
 return M

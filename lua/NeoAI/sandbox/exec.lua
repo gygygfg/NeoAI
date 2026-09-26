@@ -69,7 +69,7 @@ local function _spawn(argv, opts)
   end
   job = vim.fn.jobstart(argv, {
     cwd = opts.cwd,
-    env = opts.env or require("NeoAI.sandbox.secret").sanitized_env(),
+    env = require("NeoAI.utils.env").for_jobstart(opts.env or require("NeoAI.sandbox.secret").sanitized_env()),
     stdout_buffered = false,
     stderr_buffered = false,
     on_stdout = function(_, data)

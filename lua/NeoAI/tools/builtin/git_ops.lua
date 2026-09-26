@@ -38,7 +38,7 @@ local function _git(args, ctx)
   env.GIT_OPTIONAL_LOCKS = "0"
   local job = vim.fn.jobstart(_sandboxed_argv({ "git", unpack(args) }, ctx), {
     cwd = ctx and ctx.sandbox_cwd or nil,
-    env = env,
+    env = next(env) ~= nil and env or nil,
     stdout_buffered = true,
     stderr_buffered = true,
     on_stdout = function(_, data)
@@ -71,7 +71,7 @@ local function _git_write(args, ctx)
   end
   local job = vim.fn.jobstart(_sandboxed_argv({ "git", unpack(args) }, ctx), {
     cwd = ctx and ctx.sandbox_cwd or nil,
-    env = env,
+    env = next(env) ~= nil and env or nil,
     stdout_buffered = true,
     stderr_buffered = true,
     on_stdout = function(_, data)

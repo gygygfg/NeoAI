@@ -120,7 +120,7 @@ require("NeoAI").setup({
 | `:NeoAITree`       | Open the session tree UI                         |
 | `:NeoAIClose`      | Close all NeoAI windows                          |
 | `:NeoAIKeymaps`    | Show the current keymap configuration            |
-| `:NeoAITest`       | Run tests (all tests with no arguments, or a specific test with an argument) |
+| `:NeoAITest`       | Run tests (parallel full run with no arguments; sequential run of named suites with arguments) |
 | `:NeoAIChatStatus` | Show the chat window status                      |
 | `:NeoAICycleDisplay`| Cycle through chat display modes (chat/trace)   |
 | `:NeoAIReloadDisplay`| Hot-reload the display mode plugin (reloads the current mode by default) |
@@ -986,8 +986,9 @@ NeoAI/
 │   ├── stringx.lua           # String extensions
 │   └── textmetrics.lua       # Pure-Lua text metrics (display width/codepoint slicing/wrapping; thread-pool ready)
 │
-└── tests/                      # Tests (custom runner, :NeoAITest; 45 test_*.lua files total)
-    ├── init.lua               # Assertions + runner
+└── tests/                      # Tests (custom + parallel runner, :NeoAITest; 105 test_*.lua files total)
+    ├── init.lua               # Assertions + sequential runner + isolated child runner
+    ├── parallel.lua           # Parallel runner (file-level sharding / LPT balancing / timing cache)
     ├── test_kernel.lua        # Kernel (config_store/event_bus/events/lifecycle)
     ├── test_session.lua       # Session (session/store/context_builder/compactor)
     ├── test_tool_result_pruner.lua # Tool result pruning
@@ -1078,17 +1079,21 @@ See [docs/EVENTS.md](docs/en/EVENTS.md) for details (the single authoritative ev
 
 ## 🧪 Testing
 
-Run all tests:
+Run all tests (parallel by default, isolated headless workers):
 
 ```vim
 :NeoAITest
 ```
 
-Run specific tests:
+Run specific tests (sequential, for debugging):
 
 ```vim
 :NeoAITest flow_config flow_tools
 ```
+
+> The parallel runner shards by file (suite); worker count defaults to `min(nproc, 8)`
+> (override with `NEOAI_TEST_WORKERS`) and self-balances using a measured-timing cache.
+> See [docs/en/testing.md](docs/en/testing.md).
 
 ---
 
@@ -1135,8 +1140,8 @@ Run specific tests:
 ### Running Tests
 
 ```vim
-:NeoAITest           " run all tests
-:NeoAITest flow_tools  " run specific tests
+:NeoAITest             " run all tests in parallel
+:NeoAITest flow_tools  " run specific tests sequentially
 ```
 
 ---

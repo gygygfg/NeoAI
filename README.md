@@ -118,7 +118,7 @@ require("NeoAI").setup({
 | `:NeoAITree`       | 打开会话树界面                                   |
 | `:NeoAIClose`      | 关闭所有 NeoAI 窗口                              |
 | `:NeoAIKeymaps`    | 显示当前键位配置                                 |
-| `:NeoAITest`       | 运行测试（不带参数运行全部，带参数运行指定测试） |
+| `:NeoAITest`       | 运行测试（不带参数并行全量；带参数顺序运行指定套件） |
 | `:NeoAIChatStatus` | 显示聊天窗口状态                                 |
 | `:NeoAICycleDisplay`| 循环切换聊天显示模式（对话/轨迹）                  |
 | `:NeoAIReloadDisplay`| 热重载显示模式插件（缺省重载当前模式）            |
@@ -965,8 +965,9 @@ NeoAI/
 │   ├── stringx.lua           # 字符串扩展
 │   └── textmetrics.lua       # 纯 Lua 文本度量（显示宽度/码点切片/折行，可入线程池）
 │
-└── tests/                      # 测试（自定义运行器，:NeoAITest；共 45 个 test_*.lua）
-    ├── init.lua               # 断言 + 运行器
+└── tests/                      # 测试（自定义运行器 + 并行 runner；共 105 个 test_*.lua）
+    ├── init.lua               # 断言 + 顺序运行器 + 隔离子进程运行器
+    ├── parallel.lua           # 并行运行器（文件级分片 / LPT 均衡 / 耗时缓存）
     ├── test_kernel.lua        # 内核（config_store/event_bus/events/lifecycle）
     ├── test_session.lua       # 会话（session/store/context_builder/compactor）
     ├── test_tool_result_pruner.lua # 工具结果裁剪
@@ -1057,17 +1058,20 @@ NeoAI 基于 Neovim 原生 `User` 自动命令实现事件驱动架构，事件�
 
 ## 🧪 测试
 
-运行所有测试：
+运行所有测试（默认并行，多 worker 隔离 headless 子进程）：
 
 ```vim
 :NeoAITest
 ```
 
-运行指定测试：
+运行指定测试（顺序执行，便于调试）：
 
 ```vim
 :NeoAITest flow_config flow_tools
 ```
+
+> 并行运行器按「文件（套件）」分片，worker 数默认 `min(nproc, 8)`（`NEOAI_TEST_WORKERS` 可覆盖），
+> 并用实测耗时缓存自均衡。详见 [docs/testing.md](docs/testing.md)。
 
 ---
 
@@ -1115,8 +1119,8 @@ NeoAI 基于 Neovim 原生 `User` 自动命令实现事件驱动架构，事件�
 ### 运行测试
 
 ```vim
-:NeoAITest           " 运行所有测试
-:NeoAITest flow_tools  " 运行指定测试
+:NeoAITest             " 并行运行所有测试
+:NeoAITest flow_tools  " 顺序运行指定测试
 ```
 
 ---

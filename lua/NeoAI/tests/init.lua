@@ -168,42 +168,58 @@ end
 local function _run_suite(suite)
   local passed, failed = 0, 0
   local errors = {}
+  -- 可选按用例名过滤（子串匹配，逗号分隔多模式），便于隔离复现/跳过危险用例：
+  --   NEOAI_TEST_ONLY=<p1,p2>  仅运行名字含任一模式的用例
+  --   NEOAI_TEST_SKIP=<p1,p2>  跳过名字含任一模式的用例
+  local only = vim.env.NEOAI_TEST_ONLY
+  local skip = vim.env.NEOAI_TEST_SKIP
+  local function _matches_any(patterns, name)
+    for pat in (patterns or ""):gmatch("[^,]+") do
+      pat = pat:gsub("^%s+", ""):gsub("%s+$", "")
+      if pat ~= "" and name:find(pat, 1, true) then return true end
+    end
+    return false
+  end
   for _, test in ipairs(suite.tests) do
-    local ok, err = xpcall(function()
-      if suite.before_each then
-        suite.before_each()
-      end
-      local t = {}
-      for k, v in pairs(assert_helpers) do t[k] = v end
-      local result = test.fn(t)
-      if type(result) == "table" and type(result.then_) == "function" then
-        assert_helpers.await(result)
-      end
-    end, debug.traceback)
-    if ok then
-      passed = passed + 1
-      print(("  ✓ %s"):format(test.name))
+    local selected = true
+    if only and only ~= "" and not _matches_any(only, test.name) then selected = false end
+    if skip and skip ~= "" and _matches_any(skip, test.name) then selected = false end
+    if not selected then
+      print("  ↷ " .. test.name)
     else
-      failed = failed + 1
-      local err_str = _fmt_err(err)
-      errors[#errors + 1] = ("%s :: %s\n%s"):format(suite.name, test.name, err_str)
-      print(("  ✗ %s\n    %s"):format(test.name, err_str:gsub("\n", "\n    ")))
+      local ok, err = xpcall(function()
+        if suite.before_each then
+          suite.before_each()
+        end
+        local t = {}
+        for k, v in pairs(assert_helpers) do t[k] = v end
+        local result = test.fn(t)
+        if type(result) == "table" and type(result.then_) == "function" then
+          assert_helpers.await(result)
+        end
+      end, debug.traceback)
+      if ok then
+        passed = passed + 1
+        print(("  ✓ %s"):format(test.name))
+      else
+        failed = failed + 1
+        local err_str = _fmt_err(err)
+        errors[#errors + 1] = ("%s :: %s\n%s"):format(suite.name, test.name, err_str)
+        print(("  ✗ %s\n    %s"):format(test.name, err_str:gsub("\n", "\n    ")))
+      end
     end
   end
   return passed, failed, errors
 end
 
---- 运行指定套件
---- @param names ... string 套件名（可选；空则全部）
---- @return table { passed, failed, errors }
-function M.run_all(...)
-  local requested = { ... }
-  local total_passed, total_failed = 0, 0
-  local all_errors = {}
+-- ========== 测试环境准备 ==========
 
-  -- 测试默认以 root 运行载荷（run_as.uid=0，显式放弃降权）以保持既有行为：
-  -- 测试环境通常以 root 运行且工作区文件归 root，非 root 载荷无法写入。非 root 场景的
-  -- 专项用例自行传入 tools.sandbox.run_as 覆盖。
+--- 安装测试默认配置覆盖，返回恢复函数。
+--- 测试默认以 root 运行载荷（run_as.uid=0，显式放弃降权）以保持既有行为：
+--- 测试环境通常以 root 运行且工作区文件归 root，非 root 载荷无法写入。非 root 场景的
+--- 专项用例自行传入 tools.sandbox.run_as 覆盖。
+--- @return function restore 恢复原始 config_store.load
+local function _install_test_defaults()
   local config_store = require("NeoAI.kernel.config_store")
   local orig_config_load = config_store.load
   config_store.load = function(user_config)
@@ -259,6 +275,74 @@ function M.run_all(...)
       orig_config_load(cur)
     end
   end)
+  return function() config_store.load = orig_config_load end
+end
+
+--- 动态加载所有 test_*.lua 文件（幂等；require 缓存）。
+--- @param all_errors table 收集加载失败消息
+--- @return number 加载失败的模块数
+local function _load_test_modules(all_errors)
+  local src = debug.getinfo(1, "S").source
+  local test_dir = src:match("^@(.+)[/\\][^/\\]+$")
+  if not test_dir then
+    test_dir = "/root/NeoAI/lua/NeoAI/tests"
+  end
+  local files = vim.fn.glob(test_dir .. "/test_*.lua", false, true)
+  local load_failed = 0
+  for _, file in ipairs(files) do
+    local mod_name = "NeoAI.tests." .. vim.fn.fnamemodify(file, ":t:r")
+    if vim.fn.fnamemodify(file, ":t") ~= "init.lua" then
+      local suite_count = #state.suites
+      local ok, err = pcall(require, mod_name)
+      if not ok then
+        -- 模块中途抛错时撤销已注册的半成品套件。
+        while #state.suites > suite_count do table.remove(state.suites) end
+        state.current_suite = nil
+        local message = ("加载测试模块 %s 失败: %s"):format(mod_name, tostring(err))
+        all_errors[#all_errors + 1] = message
+        print("  ✗ " .. message)
+        load_failed = load_failed + 1
+      end
+    end
+  end
+  return load_failed
+end
+
+--- 仅加载测试模块并返回套件清单（不执行用例）。
+--- 供并行运行器在专用进程中发现分片单元；返回 [{ name, cases }]。
+--- @return table[] 套件数组 { name = string, cases = number }
+--- @return table 加载错误列表
+function M.list_suites()
+  local all_errors = {}
+  local restore_defaults = _install_test_defaults()
+  local session_store = require("NeoAI.core.session.session_store")
+  local real_sessions = {}
+  for id, s in pairs(session_store.get_all()) do
+    real_sessions[id] = s
+  end
+  local dir = vim.fn.tempname() .. "-NeoAI-discover"
+  local prev = session_store.set_default_path_redirect(dir)
+  _load_test_modules(all_errors)
+  session_store.set_default_path_redirect(prev)
+  session_store.restore(real_sessions)
+  vim.fn.delete(dir, "rf")
+  restore_defaults()
+  local out = {}
+  for _, suite in ipairs(state.suites) do
+    out[#out + 1] = { name = suite.name, cases = #suite.tests }
+  end
+  return out, all_errors
+end
+
+--- 运行指定套件
+--- @param names ... string 套件名（可选；空则全部）
+--- @return table { passed, failed, errors }
+function M.run_all(...)
+  local requested = { ... }
+  local total_passed, total_failed = 0, 0
+  local all_errors = {}
+
+  local restore_defaults = _install_test_defaults()
 
   -- 会话隔离：防止测试把会话写入真实历史（~/.cache/nvim/NeoAI/sessions.jsonl）。
   -- 测试期间把“默认路径”会话重定向到临时目录，结束后清理并恢复内存中的真实会话。
@@ -283,28 +367,7 @@ function M.run_all(...)
   end
 
   -- 动态加载所有 test_*.lua 文件（幂等）
-  local src = debug.getinfo(1, "S").source
-  local test_dir = src:match("^@(.+)[/\\][^/\\]+$")
-  if not test_dir then
-    test_dir = "/root/NeoAI/lua/NeoAI/tests"
-  end
-  local files = vim.fn.glob(test_dir .. "/test_*.lua", false, true)
-  for _, file in ipairs(files) do
-    local mod_name = "NeoAI.tests." .. vim.fn.fnamemodify(file, ":t:r")
-    if vim.fn.fnamemodify(file, ":t") ~= "init.lua" then
-      local suite_count = #state.suites
-      local ok, err = pcall(require, mod_name)
-      if not ok then
-        -- 模块中途抛错时撤销已注册的半成品套件。
-        while #state.suites > suite_count do table.remove(state.suites) end
-        state.current_suite = nil
-        local message = ("加载测试模块 %s 失败: %s"):format(mod_name, tostring(err))
-        all_errors[#all_errors + 1] = message
-        total_failed = total_failed + 1
-        print("  ✗ " .. message)
-      end
-    end
-  end
+  total_failed = total_failed + _load_test_modules(all_errors)
 
   local suites_to_run = {}
   if #requested > 0 then
@@ -338,7 +401,19 @@ function M.run_all(...)
       suite_dirs[#suite_dirs + 1] = suite_dir
       session_store.set_default_path_redirect(suite_dir)
       session_store.reset()
+      -- 每个套件前恢复到一个干净的完整环境，杜绝跨套件污染：
+      --   1) 配置重置为测试默认（某些套件直接 config_store.load 改 providers/tools 后未恢复）；
+      --   2) 重新启动被 stop_all 的插件（幂等，无操作时几乎零开销）；
+      --   3) 重建工具注册表（某些套件 registry.reset 后未恢复，会掏空后续套件的工具集）。
+      pcall(function()
+        require("NeoAI.kernel.config_store").load({})
+        require("NeoAI.kernel.plugins").start_all()
+      end)
+      pcall(function() require("NeoAI.tools").reload_tools() end)
+      local suite_t0 = vim.uv.hrtime()
       local p, f, errs = _run_suite(suite)
+      local suite_ms = (vim.uv.hrtime() - suite_t0) / 1e6
+      print(("TIMING %s %.1f"):format(suite.name, suite_ms))
       total_passed = total_passed + p
       total_failed = total_failed + f
       for _, e in ipairs(errs) do all_errors[#all_errors + 1] = e end
@@ -350,7 +425,7 @@ function M.run_all(...)
   end
 
   local ok_cleanup, cleanup_err = pcall(_cleanup)
-  config_store.load = orig_config_load
+  restore_defaults()
   if not ok_cleanup then
     all_errors[#all_errors + 1] = "测试清理失败: " .. tostring(cleanup_err)
     total_failed = total_failed + 1
@@ -370,15 +445,23 @@ end
 
 --- 子进程预置脚本（注入套件名）
 --- @param names table 套件名数组
+--- @param opts table|nil { mcp_cache_path?: string } 可选：为子进程注入独立 MCP 缓存路径，
+---        避免并行 worker 争用同一 `mcp.cache_path`。
 --- @return string
-function M._isolated_script(names)
+function M._isolated_script(names, opts)
+  opts = opts or {}
   local quoted = {}
   for _, n in ipairs(names or {}) do
     quoted[#quoted + 1] = string.format("%q", tostring(n))
   end
+  local setup = 'require("NeoAI").setup({ log = { level = "ERROR" }, session = { auto_save = false }'
+  if opts.mcp_cache_path then
+    setup = setup .. ', mcp = { cache_path = ' .. string.format("%q", tostring(opts.mcp_cache_path)) .. " }"
+  end
+  setup = setup .. " })"
   return table.concat({
     "-- NeoAI 隔离测试子进程（自动生成，勿手改）",
-    'require("NeoAI").setup({ log = { level = "ERROR" }, session = { auto_save = false } })',
+    setup,
     "local names = {" .. table.concat(quoted, ", ") .. "}",
     'local r = require("NeoAI.tests").run_all(unpack(names))',
     'print(("SUMMARY passed=%d failed=%d"):format(r.passed, r.failed))',
