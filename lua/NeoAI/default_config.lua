@@ -1097,6 +1097,12 @@ local DEFAULT_CONFIG = {
       -- 播种字节上限（0 = 不限）。超过上限时放弃播种并回退 fail-closed（拒绝执行），
       -- 避免把超大工作区复制进私有目录。默认 2 GiB。
       degraded_seed_max_bytes = 2 * 1024 * 1024 * 1024,
+      -- 整机根 overlay 不可用（嵌套 overlay/跨挂载 EINVAL）时，是否尝试用 `fuse-overlayfs`
+      -- 在宿主建立「lower=/ 只读 + 会话 upper/work」的用户态合并视图，以保持整机可写。
+      -- 注意：FUSE 挂载 `/` 在嵌套容器/VM 上可能卡死内核（进而触发硬件看门狗整机复位），
+      -- 故测试默认关闭（见 tests/init.lua 的测试默认），降级为 bind+seed。真实主机内核
+      -- overlay 可用时不会走到此路径。
+      fuse_root_overlay = true,
       retention = {
         candidate_days = 7, -- 未应用候选保留期（天）
         max_pending = 20, -- 每任务最多待审候选数

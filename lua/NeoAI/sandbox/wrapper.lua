@@ -439,17 +439,21 @@ function M.build_overlay_specs(cwd, base_dir, extra_roots, opts)
     fs.ensure_dir(bind)
     runtime.chown_payload(d)
     if not runtime.overlay_writable("/", upper, work) then
-      -- 内核 overlay 不可用（嵌套 overlay/跨挂载 EINVAL）：尝试用户态 fuse-overlayfs 兜底，
-      -- 以 root 在宿主建立「lower=/ 只读 + 会话私有 upper/work」合并视图，再 bind 到 `/`，
-      -- 使功能与内核 overlay 一致（整机可写、写入进 upper 冻结为候选），不再降级。
-      local mnt = runtime.fuse_root_overlay("/", upper, work)
-      if not mnt then return nil end
-      runtime.register_root_overlay_upper(upper)
-      local specs = { { root = "/", upper = upper, work = work, bind = bind, mode = "fuse", fuse_mnt = mnt } }
-      if under_tmpfs(cwd) and vim.fn.isdirectory(cwd) == 1 and not under(base, cwd) then
-        specs[#specs + 1] = make_spec(cwd)
+      -- 内核 overlay 不可用。可选：用用户态 fuse-overlayfs 兜底建立整机根合并视图（保持整机
+      -- 可写）。但 FUSE 挂载 `/` 在嵌套容器/VM 上风险极高（可能卡死内核 → 看门狗整机复位），
+      -- 故可通过 `tools.sandbox.fuse_root_overlay=false` 关闭（测试默认关闭）；关闭时返回 nil，
+      -- 交由调用方走 bind + degraded_seed 降级视图。
+      if config_store.get("tools.sandbox.fuse_root_overlay") ~= false then
+        local mnt = runtime.fuse_root_overlay("/", upper, work)
+        if not mnt then return nil end
+        runtime.register_root_overlay_upper(upper)
+        local specs = { { root = "/", upper = upper, work = work, bind = bind, mode = "fuse", fuse_mnt = mnt } }
+        if under_tmpfs(cwd) and vim.fn.isdirectory(cwd) == 1 and not under(base, cwd) then
+          specs[#specs + 1] = make_spec(cwd)
+        end
+        return specs
       end
-      return specs
+      return nil
     end
     runtime.register_root_overlay_upper(upper)
     local specs = { { root = "/", upper = upper, work = work, bind = bind, mode = "overlay" } }

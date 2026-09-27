@@ -252,6 +252,12 @@ local function _install_test_defaults()
     if uc.tools.run_command.interactive.enabled == nil then
       uc.tools.run_command.interactive.enabled = false
     end
+    -- 测试默认关闭 fuse-overlayfs 整机根兜底：在嵌套容器/VM 上 FUSE 挂载 `/` 会卡死内核并
+    -- 触发硬件看门狗整机复位。测试需要的是「overlay 不可用 → bind+seed 降级」行为，不应做
+    -- 真实 FUSE 挂载。专项用例可显式覆盖 tools.sandbox.fuse_root_overlay。
+    if uc.tools.sandbox.fuse_root_overlay == nil then
+      uc.tools.sandbox.fuse_root_overlay = false
+    end
     return orig_config_load(uc)
   end
   pcall(function()
@@ -271,6 +277,9 @@ local function _install_test_defaults()
       cur.tools.run_command.interactive = cur.tools.run_command.interactive or {}
       if cur.tools.run_command.interactive.enabled == nil then
         cur.tools.run_command.interactive.enabled = false
+      end
+      if cur.tools.sandbox.fuse_root_overlay == nil then
+        cur.tools.sandbox.fuse_root_overlay = false
       end
       orig_config_load(cur)
     end

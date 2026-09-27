@@ -9,6 +9,7 @@
 local async = require("NeoAI.utils.async")
 local config_store = require("NeoAI.kernel.config_store")
 local fs = require("NeoAI.utils.fs")
+local lock = require("NeoAI.utils.lock")
 
 local M = {}
 
@@ -1162,6 +1163,26 @@ end
 --- 与新建 userns 不同源，内核返回 EINVAL。必须实测，且**必须用真实执行时的路径**
 --- 实测：lower 与 upper/work 落在不同挂载/不同 userns 归属时才会触发 EINVAL，
 --- 用同源临时目录探测会产生假阳性。
+-- ========== overlay 挂载探测互斥（跨进程） ==========
+--
+-- 内核 overlayfs 对同一 upper/work 的重叠挂载属于未定义行为。能力探测（overlay_mountable /
+-- overlay_writable）会**真实挂载** overlay 做实测，故用跨进程文件锁按 work 目录串行化探测挂载：
+-- 取不到锁即判为「overlay 不可用」（降级 bind），不阻塞、不影响命令执行。
+
+--- 从 bwrap argv 中提取 overlay 的 work 目录（`--overlay <upper> <work> <dest>`）。
+--- @param argv table
+--- @return string[] work 目录列表（可能含重复）
+function M.overlay_lock_keys(argv)
+  local keys = {}
+  for i, v in ipairs(argv or {}) do
+    if v == "--overlay" then
+      local work = argv[i + 2]
+      if type(work) == "string" and work ~= "" then keys[#keys + 1] = work end
+    end
+  end
+  return keys
+end
+
 --- @param lower string
 --- @param upper string
 --- @param work string
@@ -1182,7 +1203,12 @@ local function _overlay_mount_works(lower, upper, work, flags)
     end
   end
   for _, f in ipairs({ "--chdir", lower, "--", "true" }) do argv[#argv + 1] = f end
-  return _run_probe(argv)
+  -- 取不到该 workdir 的挂载锁（另有挂载进行中）：判为不可用而不再尝试挂载，避免内核死锁。
+  local h = lock.try_acquire(work)
+  if not h then return false end
+  local ok = _run_probe(argv)
+  lock.release(h)
+  return ok
 end
 
 --- 用真实执行路径 + 真实载荷 uid 实测 overlay **可写**（挂载探测只证明能挂，不证明能写）。
@@ -1232,7 +1258,11 @@ local function _overlay_write_works(lower, upper, work, flags)
     'p=.wprobe-$$; printf x > "$p" && [ -s "$p" ] && rm -f "$p"' }) do
     argv[#argv + 1] = v
   end
-  return _run_probe(argv)
+  local h = lock.try_acquire(work)
+  if not h then return false end
+  local ok = _run_probe(argv)
+  lock.release(h)
+  return ok
 end
 
 --- 功能探测 overlay 是否可用（同源临时目录）。仅作粗粒度能力门禁，
@@ -2948,6 +2978,7 @@ function M.run(argv, opts)
       settle({ code = -1, stdout = table.concat(stdout, "\n"), stderr = table.concat(stderr, "\n"), timed_out = true })
     end, opts.timeout_ms)
   end
+
   job = vim.fn.jobstart(full, {
     cwd = opts.cwd,
     -- 环境变量脱敏 + 宿主运行时直通（统一经 sandbox_env 构造）。

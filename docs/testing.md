@@ -26,9 +26,11 @@
 - **跨套件隔离**：`run_all` 在每个套件前恢复干净环境——配置重置为测试默认 + 插件
   `start_all()`（幂等）+ 工具 `reload_tools()`，杜绝某套件 `config_store.load` / `registry.reset`
   后未恢复而污染后续套件。
-- **宿主稳定性告警**：在嵌套容器/VM 上，**强制关闭 overlay 的降级用例**（改 `runtime.overlay_available/writable=false`）
-  会触发宿主内核看门狗硬重启（表现为每几分钟整机 reboot）。在此类环境请加
-  `NEOAI_TEST_SKIP=无 overlay,overlay 不可用,降级 --bind` 跳过这类用例；具备真实内核隔离的 CI/VM 无需跳过。
+- **宿主稳定性**：在嵌套容器/VM 上，内核 overlay 不可用时若回退 **fuse-overlayfs 挂载整机 `/`**
+  会卡死内核并触发硬件看门狗整机复位。测试默认关闭该兜底（测试默认 `tools.sandbox.fuse_root_overlay=false`），
+  降级为 bind+seed，故无需再跳过相关用例；确需验证真实 fuse 兜底用 `NEOAI_TEST_ALLOW_FUSE=1`
+  （仅限具备真实内核隔离的环境）。overlay **能力探测**的真实挂载已用跨进程文件锁（`utils/lock.lua`）
+  按 work 目录串行化。
 - **为什么能安全并行**：分片以「文件」为单位——各测试文件固定监听端口互不重复、文件内固定
   临时路径仅自用，故文件级分片天然无跨进程冲突；每个 worker 是独立 nvim，互不共享注册表/
   沙箱/会话状态；子进程注入独立 `mcp.cache_path`。请勿在上一轮并行尚未结束时重复启动。

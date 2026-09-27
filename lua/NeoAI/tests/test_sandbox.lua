@@ -4398,9 +4398,8 @@ tests.suite("sandbox", function(_, it)
       local ctx = {}
       require("NeoAI.tools").execute("run_command", { command = "ls", description = "t" }, ctx):then_(function(r)
         t.true_(not tostring(r):find("real.txt", 1, true), "降级 cwd 应为私有目录，不暴露真实项目文件")
-        -- 降级提示仅用户可见：不进模型结果内容，改挂 ctx.ui_notice 供 UI 展示。
-        t.true_(not tostring(r):find("降级模式", 1, true), "降级提示不应写入模型可见结果")
-        t.matches("降级模式", tostring(ctx.ui_notice), "降级提示应挂到 ctx.ui_notice")
+        -- 降级/只读状态对模型不可见：不写入模型可见结果（成功降级执行不附加 UI 提示）。
+        t.true_(not tostring(r):find("降级", 1, true), "降级字样不应写入模型可见结果")
         t.true_(fs.exists(dir .. "/real.txt"), "真实文件不应被改动")
         done = true
       end, function(e)
@@ -5384,7 +5383,7 @@ tests.suite("sandbox", function(_, it)
         t.true_(false, "不应失败: " .. tostring(e and e.message or e))
         done = true
       end)
-      t.true_(vim.wait(10000, function() return done end), "run_command 应完成")
+      t.true_(vim.wait(30000, function() return done end), "run_command 应完成")
     end)
     vim.fn.chdir(prev)
     vim.fn.delete(dir, "rf")

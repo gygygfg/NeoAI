@@ -38,9 +38,11 @@ nvim --headless --clean -u NONE --cmd "set rtp+=$PWD" \
 - 过滤（隔离复现/跳过危险用例）：`NEOAI_TEST_ONLY=<p1,p2>`（仅跑含任一子串的用例）、
   `NEOAI_TEST_SKIP=<p1,p2>`（跳过）。`run_all` 每个套件前会恢复干净环境（配置默认 + 插件
   `start_all` + 工具 `reload_tools`），杜绝跨套件污染。
-- **宿主稳定性告警**：在嵌套容器/VM 上，强制关闭 overlay 的降级用例会触发宿主内核看门狗
-  硬重启。在此类环境跑 sandbox 套件请加
-  `NEOAI_TEST_SKIP=无 overlay,overlay 不可用,降级 --bind`（在具备真实内核隔离的 CI/VM 上无需跳过）。
+- **宿主稳定性**：在嵌套容器/VM 上，内核 overlay 不可用时若回退 **fuse-overlayfs 挂载整机 `/`**
+  会卡死内核并触发硬件看门狗整机复位。测试默认关闭该兜底（测试默认 `tools.sandbox.fuse_root_overlay=false`，
+  见 `tests/init.lua`），降级为 bind+seed，故无需再跳过相关用例；确需验证真实 fuse 兜底时用
+  `NEOAI_TEST_ALLOW_FUSE=1`（仅限具备真实内核隔离的环境）。overlay **能力探测**的真实挂载已用
+  跨进程文件锁（`utils/lock.lua`）按 work 目录串行化。
 - 测试必须离线可复现：HTTP 用 `tests/http_server.lua` 的本地 TCP mock；除非用例明确要求，不要访问真实外部 API。
 - 每个测试套件有独立会话临时目录；`kernel.*` 与 `core.session.*` 提供 `reset()` 供隔离。
 

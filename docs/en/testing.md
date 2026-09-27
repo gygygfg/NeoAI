@@ -27,10 +27,13 @@
 - **Cross-suite isolation**: before each suite `run_all` restores a clean environment — config reset
   to test defaults + plugin `start_all()` (idempotent) + tool `reload_tools()`, so a suite that
   `config_store.load` / `registry.reset` without restoring cannot pollute later suites.
-- **Host stability warning**: inside nested containers/VMs, the **tests that force overlay off**
-  (set `runtime.overlay_available/writable=false`, i.e. the degraded `--bind` path) can trigger the
-  host kernel watchdog and hard-reboot the machine every few minutes. On such hosts add
-  `NEOAI_TEST_SKIP=无 overlay,overlay 不可用,降级 --bind`; CI/VMs with real kernel isolation need no skip.
+- **Host stability**: inside nested containers/VMs, when kernel overlay is unavailable the
+  **fuse-overlayfs fallback that mounts the whole `/`** can wedge the kernel and trigger a
+  hardware-watchdog reboot. Tests disable that fallback by default
+  (`tools.sandbox.fuse_root_overlay=false`), falling back to bind+seed, so no case needs to be
+  skipped. To verify the real fuse fallback use `NEOAI_TEST_ALLOW_FUSE=1` (real kernel isolation
+  only). Real overlay **capability-probe** mounts are serialized per work dir via a cross-process
+  file lock (`utils/lock.lua`).
 - **Why parallel is safe**: sharding is per file — fixed listening ports are unique per file and
   file-local temp paths are only self-used, so file-level shards have no cross-process conflict.
   Each worker is its own nvim (no shared registry/sandbox/session state), and workers get an

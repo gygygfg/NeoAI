@@ -50,30 +50,42 @@ tests.suite("sandbox_mountview", function(_, it)
     rt.reset()
   end)
 
-  it("内核 overlay 不可用时回退 fuse-overlayfs 根视图（可用时）", function(t)
+  it("内核 overlay 不可用时按配置回退 fuse-overlayfs 根视图", function(t)
     local rt = require("NeoAI.sandbox.runtime")
     local wrapper = require("NeoAI.sandbox.wrapper")
     local fo = require("NeoAI.sandbox.fuse_overlay")
-    if not fo.available() then return end
+    local config_store = require("NeoAI.kernel.config_store")
     local orig_read_all = rt.read_all
     local orig_ow = rt.overlay_writable
     rt.read_all = function() return true end
     rt.overlay_writable = function() return false end
     local cwd = vim.fn.getcwd()
     local base = vim.fn.tempname()
-    local specs = wrapper.build_overlay_specs(cwd, base, {}, {})
+    local saved = config_store.get("tools.sandbox.fuse_root_overlay")
+    -- 关闭兜底（测试默认）：内核 overlay 不可用时不应回退 fuse，而是降级 bind。
+    config_store.set("tools.sandbox.fuse_root_overlay", false)
+    local specs_off = wrapper.build_overlay_specs(cwd, base, {}, {})
+    local has_fuse_off = false
+    for _, s in ipairs(specs_off) do if s.mode == "fuse" then has_fuse_off = true end end
+    t.false_(has_fuse_off, "fuse_root_overlay=false 时不应回退 fuse（避免 FUSE 挂载 / 卡死宿主）")
+    -- 真实 fuse 挂载有卡死宿主内核的风险，仅在显式开启且 fuse 可用时验证。
+    if vim.env.NEOAI_TEST_ALLOW_FUSE == "1" and fo.available() then
+      config_store.set("tools.sandbox.fuse_root_overlay", true)
+      local specs = wrapper.build_overlay_specs(cwd, base, {}, {})
+      local fuse_spec
+      for _, s in ipairs(specs) do if s.mode == "fuse" then fuse_spec = s end end
+      t.not_nil(fuse_spec, "开启后内核 overlay 不可用时应回退到 fuse 根 overlay")
+      if fuse_spec then
+        t.eq("/", fuse_spec.root)
+        t.not_nil(fuse_spec.fuse_mnt, "应返回 fuse 挂载点")
+        t.true_(fo._is_mounted(fuse_spec.fuse_mnt), "fuse 合并视图应已挂载")
+        rt.fuse_release_all()
+        t.false_(fo._is_mounted(fuse_spec.fuse_mnt), "释放后不应仍挂载")
+      end
+    end
+    config_store.set("tools.sandbox.fuse_root_overlay", saved)
     rt.read_all = orig_read_all
     rt.overlay_writable = orig_ow
-    local fuse_spec
-    for _, s in ipairs(specs) do if s.mode == "fuse" then fuse_spec = s end end
-    t.not_nil(fuse_spec, "内核 overlay 不可用时应回退到 fuse 根 overlay")
-    if fuse_spec then
-      t.eq("/", fuse_spec.root)
-      t.not_nil(fuse_spec.fuse_mnt, "应返回 fuse 挂载点")
-      t.true_(fo._is_mounted(fuse_spec.fuse_mnt), "fuse 合并视图应已挂载")
-      rt.fuse_release_all()
-      t.false_(fo._is_mounted(fuse_spec.fuse_mnt), "释放后不应仍挂载")
-    end
     rt.reset()
   end)
 end)

@@ -476,6 +476,7 @@ sandbox = {
   staging_uncovered = "reject",    -- 有未发布暂存但本次命令无 overlay 可写层时："reject"（默认，fail-closed）| "warn"（降级执行并在结果附提示，便于临时绕过偶发失败）。播种覆盖到的根内暂存不算分裂
   degraded_seed = true,            -- 无 overlay 播种视图：true 时把可写根真实内容复制进会话私有 bind 目录，使降级/嵌套 userns 视图也能看到真实文件（写入仍落私有副本并冻结为候选；真实盘只读）。默认 true：无 overlay 环境命令仍可用；设 false 则降级视图看不到真实文件。只读/降级字样不对模型暴露（见 sandbox.conceal）
   degraded_seed_max_bytes = 2 * 1024 * 1024 * 1024, -- 播种字节上限（0=不限）；超限放弃播种并回退 fail-closed（避免复制超大工作区）
+  fuse_root_overlay = true,        -- 整机根 overlay 不可用时，是否用 fuse-overlayfs 在宿主建立 lower=/ 的用户态合并视图（保持整机可写）。注意：FUSE 挂载 / 在嵌套容器/VM 上可能卡死内核并触发硬件看门狗整机复位；测试默认关闭（降级为 bind+seed）。真实主机内核 overlay 可用时不会走到此路径
   -- 异步审批：候选进入待审队列，用户确认后应用。session_auto_approve 开启后 L0/L1 自动应用。
   -- l3_warning：高危条目二次确认（AI 生成后果警告 + 自动打开 diff，需再次确认才应用）。
   --   L3（critical）恒触发；package_confirm=true 时 L2 包安装/敏感安装（apt-key、gpg --import、
