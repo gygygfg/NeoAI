@@ -159,6 +159,20 @@ function M.create(opts)
       opts.root_id = parent.root_id or parent.id
     end
   end
+  -- 会话绑定工作目录（metadata.cwd）：显式 opts.cwd/metadata.cwd 优先；子会话继承父会话；
+  -- 否则记录创建时的 cwd。此后从其他路径重开该会话时以其为工作区基准，不跟随当前 cwd。
+  opts.metadata = opts.metadata or {}
+  if opts.metadata.cwd == nil then
+    local cwd = opts.cwd
+    if not cwd and opts.parent_id then
+      local parent = state.sessions[opts.parent_id]
+      cwd = parent and parent.metadata and parent.metadata.cwd
+    end
+    opts.metadata.cwd = cwd or vim.fn.getcwd()
+  end
+  if opts.metadata.tags == nil then opts.metadata.tags = {} end
+  if opts.metadata.usage == nil then opts.metadata.usage = { prompt = 0, completion = 0 } end
+  if opts.metadata.name == nil then opts.metadata.name = opts.name end
   local s = session_mod.create(opts)
   state.sessions[s.id] = s
   local ok, err = M.persist(s)

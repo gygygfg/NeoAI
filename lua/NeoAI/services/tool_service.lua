@@ -336,6 +336,9 @@ function M.execute(agent, tool_name, args, tool_call_id, opts)
     tool_service = M,
     approval_mode = _current_mode(),
     timer = opts.timer, -- 可暂停计时器（tool_loop 注入，用于展示活跃耗时并排除等待时间）
+    -- 会话绑定工作目录：工具/沙箱以该会话记录的工作区为基准（不跟随编辑器当前 cwd）。
+    cwd = agent and agent.cwd or nil,
+    sandbox_exec_cwd = agent and agent.cwd or nil,
   }
 
   -- UI-only 通知（如沙箱降级提示）：执行完成后经 opts 回传 tool_loop，作为工具结果的

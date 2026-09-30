@@ -229,6 +229,8 @@ function M.spawn(parent, override)
   })
   -- 子 Agent 拥有独立信号（不继承父信号）
   child.signal = async.create_signal()
+  -- 子 Agent 继承父 Agent 的会话工作目录（子任务与父任务同一工作区）。
+  child.cwd = override.cwd or parent.cwd
   state.agents[child.id] = child
   event_bus.emit(events.AGENT_SPAWNED, { parent = parent.id, agent = child })
   if override.task then

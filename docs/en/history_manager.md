@@ -22,11 +22,17 @@ A session is a pure data structure with no side effects and no I/O:
 ```
 { id, parent_id, root_id, created_at, updated_at, model,
   messages = { { role, content, reasoning?, tool_calls?, tool_call_id?, ts, checkpoint? } },
-  metadata = { name?, tags?, usage? } }
+  metadata = { name?, tags?, usage?, cwd? } }
 ```
 
 - `parent_id`: the parent session id (nil for a root session).
 - `root_id`: the root session id (when a child session does not specify one explicitly, the parent is used as the root).
+- `metadata.cwd`: the **session-bound working directory**. Recorded at creation time (`session_store.create`,
+  child sessions inherit it from their parent); when an old session is reopened (`chat_service.load_session`),
+  `agent.cwd` is taken from it and tools/sandbox use it as the workspace base (relative-path resolution,
+  masking/out-of-workspace checks, `run_command` overlay cwd) — it does **not** follow the editor's current
+  cwd and does **not** change the global cwd. Sessions without the field fall back to the current cwd
+  (backward compatible).
 - `fork(session, {copy_messages})`: derives a new session (`parent_id = session.id`).
 - Message operations: `add_message` / `get_message` / `update_message` / `delete_message` / `trim_messages` /
   `clear_messages`.

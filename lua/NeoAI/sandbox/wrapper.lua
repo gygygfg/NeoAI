@@ -689,7 +689,7 @@ local function _settle_candidate(cand, attempt, ctx, cfg, spec, result, process_
     local roots = config_store.get("tools.sandbox.ephemeral_roots")
     if type(roots) ~= "table" then roots = require("NeoAI.sandbox.runtime").tmpfs_roots() end
     if #roots > 0 and #(cand.files or {}) > 0 then
-      local cwd = (vim.fn.getcwd() or ""):gsub("/+$", "")
+      local cwd = ((ctx and (ctx.sandbox_exec_cwd or ctx.cwd)) or vim.fn.getcwd() or ""):gsub("/+$", "")
       local function under(p, r)
         return p == r or p:sub(1, #r + 1) == r .. "/"
       end
@@ -1064,7 +1064,9 @@ local function _on_observed(attempt, ctx, evt)
   -- 每 attempt 缓存一次 read_all/cwd，避免逐事件读取配置与 getcwd。
   if ctx._observed_read_all == nil then ctx._observed_read_all = runtime.read_all() end
   if ctx._observed_read_all then
-    if ctx._observed_cwd == nil then ctx._observed_cwd = vim.fn.getcwd() end
+    if ctx._observed_cwd == nil then
+      ctx._observed_cwd = ctx.sandbox_exec_cwd or ctx.cwd or vim.fn.getcwd()
+    end
     local hit = runtime.outside_workspace(p, ctx._observed_cwd)
     if hit then
       pcall(function()
@@ -1481,7 +1483,7 @@ local function _gate_inner(tool, args, ctx, call_original)
     tool = attempt.tool_name,
     effect = spec.effect,
     args = args,
-    cwd = vim.fn.getcwd(),
+    cwd = ctx.sandbox_exec_cwd or ctx.cwd or vim.fn.getcwd(),
     mode = ctx.sandbox_mode or cfg.mode or "dry_run",
   }
   local verdict = policy.evaluate(facts)
@@ -1505,7 +1507,9 @@ local function _gate_inner(tool, args, ctx, call_original)
   -- bash -c '…'）时，读取脚本内容（含 AI 暂存副本）与高级语言内嵌 shell 调用，折叠为
   -- effective 文本，供硬拒绝/档位/分级复用；无法解析时标记不透明（强制复核）。
   if spec.effect == "process" and type(args.command) == "string" then
-    local scan = require("NeoAI.sandbox.script_scan").scan(args.command, { cwd = vim.fn.getcwd() })
+    local scan = require("NeoAI.sandbox.script_scan").scan(args.command, {
+      cwd = ctx.sandbox_exec_cwd or ctx.cwd or vim.fn.getcwd(),
+    })
     attempt.script_scan = scan
   end
   -- 内核/破坏性命令硬拒绝（不执行）：普通命令（python/node/go/rust/apt/pip/npm 等）不受影响，

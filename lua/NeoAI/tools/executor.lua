@@ -23,11 +23,12 @@ local M = {}
 --- 进程内 read/fs_write 不经 namespace，mount 遮蔽无效，必须硬拒绝（不可审批放行）。
 --- @param tool_name string
 --- @param args table
+--- @param ctx table|nil 会话上下文（`ctx.cwd`/`ctx.sandbox_exec_cwd` 为会话绑定工作目录）
 --- @return string|nil mask_entry
 --- @return boolean hard
-local function _masked_target(tool_name, args)
+local function _masked_target(tool_name, args, ctx)
   local runtime = require("NeoAI.sandbox.runtime")
-  local cwd = vim.fn.getcwd()
+  local cwd = (ctx and (ctx.sandbox_exec_cwd or ctx.cwd)) or vim.fn.getcwd()
   local spec = tool_spec.get(tool_name)
   for _, field in ipairs(spec.paths or {}) do
     local p = args and args[field]
@@ -71,7 +72,7 @@ local function _trace_outside_access(tool_name, args, ctx)
   if not ok or not runtime.read_all() then return end
   local ok2, trace = pcall(require, "NeoAI.sandbox.trace")
   if not ok2 then return end
-  local cwd = vim.fn.getcwd()
+  local cwd = (ctx and (ctx.sandbox_exec_cwd or ctx.cwd)) or vim.fn.getcwd()
   local spec = tool_spec.get(tool_name)
   local seen = {}
   local function consider(p, command)
@@ -140,6 +141,36 @@ local function _expand_path_args(args)
   for _, k in ipairs(PATH_KEYS) do
     if type(args[k]) == "string" then
       args[k] = fs.expand(args[k])
+    end
+  end
+  return args
+end
+
+--- 把相对路径字段按**会话绑定工作目录**解析为绝对路径。
+--- 仅在提供了会话 cwd 且它与进程 cwd 不同时改写（非会话/测试场景保持原行为）。
+--- 已是绝对路径或 URL 的字段不动；`dirs` 数组逐项处理。
+--- @param args table
+--- @param tool_name string
+--- @param cwd string|nil
+--- @return table
+local function _resolve_session_paths(args, tool_name, cwd)
+  if type(args) ~= "table" or type(cwd) ~= "string" or cwd == "" then return args end
+  local proc_cwd = vim.fn.getcwd()
+  if cwd == proc_cwd then return args end
+  if proc_cwd ~= "" and fs.canonical(cwd) == fs.canonical(proc_cwd) then return args end
+  local function is_rel(s)
+    return type(s) == "string" and s ~= ""
+      and not s:match("^/") and not s:match("^%a[%w+.-]*://")
+  end
+  local spec = tool_spec.get(tool_name)
+  for _, k in ipairs(spec.paths or {}) do
+    local v = args[k]
+    if is_rel(v) then
+      args[k] = fs.join(cwd, v)
+    elseif type(v) == "table" then
+      for i, item in ipairs(v) do
+        if is_rel(item) then v[i] = fs.join(cwd, item) end
+      end
     end
   end
   return args
@@ -548,7 +579,7 @@ local function _execute_after_secret_guard(tool, resolved, args, ctx)
   local approval_config = registry.get_approval_config(resolved)
   local mode = ctx.approval_mode or config_store.get("tools.approval.mode") or "async"
   local spec = tool_spec.get(resolved)
-  local masked_hit, masked_hard = _masked_target(resolved, args)
+  local masked_hit, masked_hard = _masked_target(resolved, args, ctx)
   local approval_on = config_store.get("tools.sandbox.mask_dirs_approval") ~= false
   -- 进程内读写（read/fs_write）不受 mount 遮蔽约束，必须显式拦截；外部进程（process/network）
   -- 由 mount 硬遮蔽。有审批界面且开启审批时弹窗放行，否则 fail-closed 拒绝。
@@ -665,6 +696,8 @@ function M.execute(tool_name, raw_args, ctx)
     args = _normalize_arguments(resolved, raw_args)
     -- 展开路径字段的 ~ 别名（~/... ↔ 主目录）
     args = _expand_path_args(args)
+    -- 相对路径按会话绑定工作目录解析（从其他路径重开旧会话时仍以其原目录为基准）
+    args = _resolve_session_paths(args, resolved, ctx and ctx.cwd)
   end
 
   -- schema 校验

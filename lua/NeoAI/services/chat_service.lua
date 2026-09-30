@@ -101,6 +101,8 @@ local function _get_or_create_agent(opts)
     local registry = require("NeoAI.tools.registry")
     agent.tools = registry.list_as_map()
     agent._tools_from_registry = true
+    -- 会话绑定工作目录：新 Agent 以其会话记录的工作区为基准（不跟随后续编辑器 cwd 变化）。
+    agent.cwd = (session.metadata and session.metadata.cwd) or vim.fn.getcwd()
     state.agents[agent.id] = { session_id = session.id }
     state.sessions[session.id] = agent.id
     state.current_agent_id = agent.id
@@ -904,6 +906,8 @@ function M.load_session(session_id, opts)
     model = session.model,
     config = session.provider and { provider = session.provider } or nil,
   })
+  -- 会话绑定工作目录：重开旧会话时以会话记录的工作区为基准，不跟随当前编辑器 cwd。
+  agent.cwd = (session.metadata and session.metadata.cwd) or vim.fn.getcwd()
   local registry = require("NeoAI.tools.registry")
   agent.tools = registry.list_as_map()
   agent._tools_from_registry = true
