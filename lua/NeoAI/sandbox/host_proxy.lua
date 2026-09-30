@@ -284,17 +284,33 @@ local function _gate(local_, host, port, ips, proto, cb)
   if policy == "deny" then return cb(false, block_reason) end
   local ok, nc = pcall(require, "NeoAI.sandbox.net_consent")
   if not ok then return cb(false, block_reason) end
-  if nc.is_session_allowed(host, port) then
+  -- 服务进程身份（宿主监听进程）：按 (端口,进程) 颗粒度记忆与展示；外部目标为 nil。
+  -- 仅在确实需要决策（有独立弹窗或统一窗口）时解析，headless 直接失败关闭、不做全扫 /proc。
+  -- 每次连接都重新解析（带短 TTL 缓存），故端口换成另一进程（服务换版本/被抢占）时会
+  -- 因服务键不匹配而重新弹窗，杜绝「批准一次后任意进程接管同端口」的绕过。
+  local can_prompt = type(nc.can_prompt) == "function" and nc.can_prompt()
+  -- 若该端口存在服务粒度的会话批准，即便当前无 UI 也必须解析进程身份以重校验
+  -- （端口换成其它进程即视为未同意，需重新询问）。
+  local need_owner = local_ and (can_prompt
+    or (type(nc.has_session_approval) == "function" and nc.has_session_approval(host, port)))
+  local owner = nil
+  if need_owner and type(nc.port_owner) == "function" then
+    local oko, o = pcall(nc.port_owner, port)
+    if oko then owner = o end
+  end
+  if nc.is_session_allowed(host, port, owner) then
     return cb(true, local_ and "allow_local" or "allow")
   end
   pcall(function()
     require("NeoAI.kernel.event_bus").emit(
       require("NeoAI.kernel.events").SANDBOX_NET_CONSENT_REQUESTED,
-      { host = host, port = port, local_ = local_, proto = proto })
+      { host = host, port = port, local_ = local_, proto = proto,
+        service = owner and { pid = owner.pid, comm = owner.comm, exe = owner.exe } or nil })
   end)
-  nc.request({ host = host, port = port, local_ = local_, proto = proto }):then_(function(decision)
+  nc.request({ host = host, port = port, local_ = local_, proto = proto, owner = owner,
+    owner_resolved = true }):then_(function(decision)
     if decision == "deny" then return cb(false, block_reason) end
-    if decision == "allow_session" then nc.allow_session(host, port) end
+    if decision == "allow_session" then nc.allow_session(host, port, owner) end
     cb(true, local_ and "allow_local" or "allow")
   end, function()
     cb(false, block_reason)

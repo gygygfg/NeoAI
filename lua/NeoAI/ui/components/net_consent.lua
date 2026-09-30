@@ -24,6 +24,27 @@ local function _close()
   state.decide = nil
 end
 
+--- 单行化（浮窗内容不接受换行）
+--- @param s any
+--- @return string
+local function _one_line(s)
+  if s == nil then return "" end
+  return (tostring(s):gsub("[\r\n]", " "))
+end
+
+--- 脱敏命令行摘要（复用密钥脱敏，避免把密钥参数展示在弹窗）。
+--- @param s string|nil
+--- @return string|nil
+local function _sanitize_cmdline(s)
+  if type(s) ~= "string" or s == "" then return nil end
+  local ok, red = pcall(function()
+    return require("NeoAI.sandbox.secret").redact(s)
+  end)
+  local v = (ok and red) or s
+  if #v > 160 then v = v:sub(1, 157) .. "…" end
+  return v
+end
+
 local function _text(ctx)
   local lines = {}
   lines[#lines + 1] = "⚠ 沙箱外部命令请求访问沙箱外目标"
@@ -33,10 +54,35 @@ local function _text(ctx)
   if ctx.proto then
     lines[#lines + 1] = "协议: " .. tostring(ctx.proto)
   end
+  -- 宿主服务进程身份（端口背后的监听进程）：用户据此判断是否放行。
+  local svc = ctx.service
+  if svc then
+    local who = _one_line(svc.comm or "?")
+    if svc.pid then who = who .. " (pid " .. tostring(svc.pid) .. ")" end
+    lines[#lines + 1] = "服务: " .. who
+    if svc.exe then lines[#lines + 1] = "程序: " .. _one_line(svc.exe) end
+    local cmd = _sanitize_cmdline(svc.cmdline)
+    if cmd then lines[#lines + 1] = "命令行: " .. cmd end
+  elseif ctx.local_ then
+    lines[#lines + 1] = "服务: （未识别到监听进程）"
+  end
+  -- 相关历史批准提示：同进程的其它端口 / 同端口的其它进程（按 (端口,进程) 颗粒度批准）。
+  local rel = ctx.related
+  if rel and ((rel.ports and #rel.ports > 0) or (rel.services and #rel.services > 0)) then
+    lines[#lines + 1] = ""
+    lines[#lines + 1] = "相关已批准（本会话）:"
+    if rel.services and #rel.services > 0 then
+      lines[#lines + 1] = "  同端口其它进程: " .. _one_line(table.concat(rel.services, ", "))
+    end
+    if rel.ports and #rel.ports > 0 then
+      lines[#lines + 1] = "  同一服务的其它端口: " .. _one_line(table.concat(rel.ports, ", "))
+    end
+  end
   lines[#lines + 1] = ""
   lines[#lines + 1] = "沙箱内部进程/端口互访无需确认；此处为出沙箱访问，请确认是否放行。"
+  lines[#lines + 1] = "S 仅记住当前「端口+服务进程」，同端口换进程会重新询问。"
   lines[#lines + 1] = ""
-  lines[#lines + 1] = "快捷键: [回车] 仅本次允许    [S] 本次会话始终允许    [Esc] 拒绝"
+  lines[#lines + 1] = "快捷键: [回车] 仅本次允许    [S] 本次会话允许该服务    [Esc] 拒绝"
   return lines
 end
 

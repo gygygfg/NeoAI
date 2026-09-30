@@ -83,7 +83,9 @@ local state = {
   win_id = nil,
   buf = nil,
   ns = nil,
+  page = "files", -- 当前页面（多级页面：files/behavior/resource/network/anomaly）
   line_to_target = {}, -- 行号 -> { change_set_id, path? }
+  line_to_hub = {}, -- 行号 -> 审批分流中心条目 id（阻塞类页面）
   line_to_trace = {}, -- 行号 -> 越界留痕路径（`i` 查看详情，非审批目标）
   fold_levels = {}, -- 行号 -> 折叠级别（仅「已应用」区 > 0）：区标题=1，条目及其文件行=2
   last_cursor = nil, -- { line, col } 关闭时记录，重开时恢复
@@ -110,6 +112,7 @@ local WATCH_EVENTS = {
   events.SANDBOX_OUTSIDE_ACCESS,
   events.SANDBOX_HOST_OP_ENQUEUED, events.SANDBOX_HOST_OP_APPLIED,
   events.SANDBOX_HOST_OP_REJECTED,
+  events.SANDBOX_APPROVAL_CHANGED,
 }
 
 -- 安全级别 -> 中文风险档（高危 / 中危 / 低危）
@@ -1623,6 +1626,242 @@ _open_l3_confirm = function(target, item)
   end)
 end
 
+-- ========== 多级页面（审批分流） ==========
+
+local hub_mod = require("NeoAI.sandbox.approval_hub")
+local PAGE_LABEL = {}
+for _, p in ipairs(hub_mod.PAGES) do PAGE_LABEL[p.id] = p.label end
+
+--- 逐页数据来源（阻塞类来自 approval_hub，观测类来自 provider/现取）
+--- @return table ctx
+local function _gather_ctx()
+  local sandbox = services.use("services.sandbox")
+  if not sandbox then return { items = {}, hostops = {}, traces = {}, saved = {}, anomalies = {} } end
+  local pending = sandbox.list_reviews({ review_state = "PENDING" })
+  local items, hostops = {}, {}
+  for _, it in ipairs(pending) do
+    -- 按安全级别降序（高风险优先）
+    if it.kind == "host_op" then hostops[#hostops + 1] = it else items[#items + 1] = it end
+  end
+  local function _by_risk(a, b)
+    local la, lb = tonumber(a.risk_level) or 0, tonumber(b.risk_level) or 0
+    if la ~= lb then return la > lb end
+    return (a.created_at or 0) < (b.created_at or 0)
+  end
+  table.sort(items, _by_risk)
+  table.sort(hostops, _by_risk)
+  local traces = (sandbox.list_traces and sandbox.list_traces()) or {}
+  local saved = (sandbox.list_saved and sandbox.list_saved()) or {}
+  -- 行为审计异常（level >= 2）：仅内存观测，供「越界/异常」页展示。
+  local anomalies = {}
+  pcall(function()
+    anomalies = require("NeoAI.sandbox.audit").list({ min_level = 2, limit = 200 })
+  end)
+  return { items = items, hostops = hostops, traces = traces, saved = saved, anomalies = anomalies }
+end
+
+--- 各页展示计数
+--- @param page string
+--- @param ctx table
+--- @return number
+local function _page_count(page, ctx)
+  if page == "files" then return #(ctx.items or {}) + #(ctx.saved or {}) end
+  if page == "behavior" then return hub_mod.pending_count("behavior") + #(ctx.hostops or {}) end
+  if page == "resource" then return hub_mod.pending_count("resource") end
+  if page == "network" then return hub_mod.pending_count("network") end
+  if page == "anomaly" then
+    local n = 0
+    for _ in ipairs(ctx.traces or {}) do n = n + 1 end
+    return n + #(ctx.anomalies or {})
+  end
+  return 0
+end
+
+--- 构建页头（页面标签行 + 切换提示），当前页高亮。
+--- @param page string
+--- @param ctx table
+--- @return table lines
+--- @return table marks
+local function _build_header(page, ctx)
+  local lines, marks = { "" }, {}
+  local col = 0
+  local function seg(text, level)
+    local start = col
+    lines[1] = lines[1] .. text
+    col = col + #text
+    if level then marks[#marks + 1] = { line = 1, start_col = start, end_col = start + #text, level = level } end
+  end
+  seg("页面: ")
+  for i, p in ipairs(hub_mod.PAGES) do
+    local n = _page_count(p.id, ctx)
+    local text = string.format("[%d %s%s]", i, p.label, n > 0 and (" " .. n) or "")
+    seg(text, p.id == page and "ai" or "note")
+    if i < #hub_mod.PAGES then seg("  ") end
+  end
+  seg("      h/l 切换页面    q 关闭")
+  lines[#lines + 1] = ""
+  return lines, marks
+end
+
+--- 构建阻塞类页面（工具行为 / 资源访问 / 网络请求）。
+--- @param page string
+--- @param ctx table
+--- @return table
+local function _build_blocking_page(page, ctx)
+  local lines, marks, line_to_hub, line_to_target = {}, {}, {}, {}
+  local entries = hub_mod.list(page)
+  local head = ("── %s（待批准 %d）──"):format(PAGE_LABEL[page] or page, #entries)
+  lines[#lines + 1] = head
+  lines[#lines + 1] = "快捷键: <CR> 仅本次允许    S 本次会话允许    d 拒绝"
+  lines[#lines + 1] = ""
+  if #entries == 0 and not (page == "behavior" and #ctx.hostops > 0) then
+    lines[#lines + 1] = "（无待批准项）"
+    lines[#lines + 1] = ""
+  end
+  for _, e in ipairs(entries) do
+    local text = string.format("[%s] %s", e.id, _one_line(e.title))
+    local hln = #lines + 1
+    lines[#lines + 1] = text
+    line_to_hub[hln] = e.id
+    marks[#marks + 1] = { line = hln, start_col = 0, end_col = #text, level = "pending1" }
+    for _, d in ipairs(e.detail or {}) do
+      lines[#lines + 1] = "    " .. _one_line(d)
+    end
+    lines[#lines + 1] = ""
+  end
+  -- 工具行为页并入主机操作提案（T2）：整条审批后主机 replay。
+  if page == "behavior" then
+    for _, item in ipairs(ctx.hostops or {}) do
+      local tier = item.privilege_tier or 0
+      local badge = tier > 0 and string.format(" [T%d]", tier) or ""
+      local risk_badge = ""
+      if item.risk_level ~= nil then
+        risk_badge = string.format(" [%s]%s", require("NeoAI.sandbox.risk").badge(item.risk_level), _risk_label(item.risk_level))
+      end
+      local cmd = _one_line((item.write_set and item.write_set[1]) or "?")
+      local base = _one_line(string.format("[%s] %s%s%s（主机操作）  ", item.change_set_id, item.tool or "?", badge, risk_badge))
+      local hln = #lines + 1
+      lines[#lines + 1] = base .. "待批准"
+      line_to_target[hln] = { change_set_id = item.change_set_id, host_op = true }
+      marks[#marks + 1] = { line = hln, start_col = #base, end_col = #base + #"待批准", level = _pending_hl(item) }
+      local text = "  $ " .. cmd
+      local ln = #lines + 1
+      lines[#lines + 1] = text
+      line_to_target[ln] = { change_set_id = item.change_set_id, host_op = true }
+      marks[#marks + 1] = { line = ln, start_col = 2, end_col = 2 + #cmd, level = "system" }
+      lines[#lines + 1] = ""
+    end
+  end
+  return { lines = lines, marks = marks, line_to_hub = line_to_hub, line_to_target = line_to_target }
+end
+
+--- 构建「越界/异常」页：越界访问留痕（只读）+ 行为审计异常（只读）。
+--- @param ctx table
+--- @return table
+local function _build_anomaly_page(ctx)
+  local lines, marks, line_to_trace = {}, {}, {}
+  local lvl_ctx = { cwd = _canon_base(vim.fn.getcwd()), home = _canon_base(vim.fn.expand("~")) }
+  lines[#lines + 1] = "── 越界访问留痕（工作区外，仅记录）──"
+  local grouped = require("NeoAI.sandbox.trace").group(ctx.traces or {})
+  if #grouped == 0 then
+    lines[#lines + 1] = "（无）"
+  end
+  for _, tr in ipairs(grouped) do
+    local path = _one_line(tr.path or "")
+    local tool = _one_line(table.concat(tr.tools or { tr.tool or "?" }, ", "))
+    if tool == "" then tool = "?" end
+    local text = string.format("  [%s] %s", tool, path)
+    local ln = #lines + 1
+    lines[#lines + 1] = text
+    local start_col = 2 + #tool + 3
+    marks[#marks + 1] = { line = ln, start_col = start_col, end_col = start_col + #path, level = M.level_of(path, lvl_ctx) }
+    line_to_trace[ln] = path
+  end
+  lines[#lines + 1] = ""
+  lines[#lines + 1] = "── 行为审计异常（L2+，仅记录）──"
+  local anom = ctx.anomalies or {}
+  if #anom == 0 then
+    lines[#lines + 1] = "（无）"
+  end
+  for _, e in ipairs(anom) do
+    local reasons = _one_line(table.concat(_merge_reasons(e.reasons or {}), ", "))
+    local text = string.format("  [L%d] %s %s%s", tonumber(e.level) or 0, _one_line(e.kind or "?"),
+      _one_line(e.tool or ""), reasons ~= "" and ("  " .. reasons) or "")
+    local ln = #lines + 1
+    lines[#lines + 1] = text
+    marks[#marks + 1] = { line = ln, start_col = 0, end_col = #text, level = _risk_hl(e.level) }
+  end
+  lines[#lines + 1] = ""
+  lines[#lines + 1] = "快捷键: i 查看越界详情    h/l 切换页面    q 关闭"
+  return { lines = lines, marks = marks, line_to_trace = line_to_trace }
+end
+
+--- 当前页是否阻塞类
+--- @param page string|nil
+--- @return boolean
+local function _is_blocking_page(page)
+  return page == "behavior" or page == "resource" or page == "network"
+end
+
+--- 切换页面（delta=-1 上一页 / +1 下一页，环绕）。
+--- @param delta number
+local function _switch_page(delta)
+  local pages = hub_mod.PAGES
+  local n = #pages
+  if n == 0 then return end
+  local cur = 1
+  for i, p in ipairs(pages) do if p.id == state.page then cur = i end end
+  cur = ((cur - 1 + delta) % n + n) % n + 1
+  state.page = pages[cur].id
+  state.last_target = nil
+  state.last_cursor = nil
+  M.refresh()
+end
+
+--- 阻塞类页面：对光标所在审批条目做决策（allow_once / allow_session / deny）。
+--- 工具行为页可能同时含主机操作提案（line_to_target），一并处理。
+--- @param value string
+local function _blocking_decide(value)
+  local ln = vim.api.nvim_win_get_cursor(0)[1]
+  local id = state.line_to_hub and state.line_to_hub[ln]
+  if id then
+    if hub_mod.resolve(id, value) then
+      vim.notify(("[NeoAI] 审批: %s"):format(value), vim.log.levels.INFO)
+      _schedule_refresh()
+    end
+    return
+  end
+  local tgt = state.line_to_target and state.line_to_target[ln]
+  if tgt and tgt.host_op then
+    if value == "deny" then _reject_current() else _apply_current() end
+    return
+  end
+  vim.notify("[NeoAI] 请将光标移到待批准的条目行", vim.log.levels.WARN)
+end
+
+--- 由审批分流中心拉起/刷新窗口并切页。
+--- @param page string|nil
+function M.open_page(page)
+  if page and PAGE_LABEL[page] then state.page = page end
+  if state.win_id and vim.api.nvim_win_is_valid(state.win_id) then
+    M.refresh()
+  else
+    M.open()
+  end
+end
+
+--- 注册审批分流中心窗口（ui/init.lua 调用）。
+function M.setup()
+  hub_mod.set_ui({
+    refresh = function()
+      if state.win_id and vim.api.nvim_win_is_valid(state.win_id) then _schedule_refresh() end
+    end,
+    open_page = function(page)
+      M.open_page(page)
+    end,
+  })
+end
+
 -- ========== 公开 API ==========
 
 --- 打开待审审批界面
@@ -1636,11 +1875,11 @@ function M.open()
     M.refresh()
     return
   end
-  local traces = (sandbox.list_traces and sandbox.list_traces()) or {}
-  local pending = sandbox.list_reviews({ review_state = "PENDING" })
-  local saved = (sandbox.list_saved and sandbox.list_saved()) or {}
-  if #pending == 0 and #traces == 0 and #saved == 0 then
-    vim.notify("[NeoAI] 无待审修改", vim.log.levels.INFO)
+  local ctx = _gather_ctx()
+  local total = 0
+  for _, p in ipairs(hub_mod.PAGES) do total = total + _page_count(p.id, ctx) end
+  if total == 0 then
+    vim.notify("[NeoAI] 无待审/审批/留痕事项", vim.log.levels.INFO)
     return
   end
   _ensure_hl()
@@ -1690,9 +1929,24 @@ function M.open()
 
   vim.keymap.set("n", "q", function() M.close() end, { buffer = state.buf })
   vim.keymap.set("n", "<Esc>", function() M.close() end, { buffer = state.buf })
-  vim.keymap.set("n", "<CR>", _apply_current, { buffer = state.buf })
+  -- 多级页面切换（左右 / hl）
+  vim.keymap.set("n", "h", function() _switch_page(-1) end, { buffer = state.buf, desc = "NeoAI 上一审批页" })
+  vim.keymap.set("n", "l", function() _switch_page(1) end, { buffer = state.buf, desc = "NeoAI 下一审批页" })
+  vim.keymap.set("n", "<Left>", function() _switch_page(-1) end, { buffer = state.buf })
+  vim.keymap.set("n", "<Right>", function() _switch_page(1) end, { buffer = state.buf })
+  -- <CR>/d：阻塞类页面用于允许/拒绝该审批条目；「待修改」页用于应用/拒绝文件。
+  vim.keymap.set("n", "<CR>", function()
+    if _is_blocking_page(state.page) then return _blocking_decide("allow_once") end
+    _apply_current()
+  end, { buffer = state.buf })
+  vim.keymap.set("n", "S", function()
+    if _is_blocking_page(state.page) then return _blocking_decide("allow_session") end
+  end, { buffer = state.buf, desc = "NeoAI 本次会话允许该审批" })
   vim.keymap.set("n", "A", _apply_all_workspace, { buffer = state.buf, desc = "NeoAI 一键同意全部工作区修改" })
-  vim.keymap.set("n", "d", _reject_current, { buffer = state.buf })
+  vim.keymap.set("n", "d", function()
+    if _is_blocking_page(state.page) then return _blocking_decide("deny") end
+    _reject_current()
+  end, { buffer = state.buf })
   vim.keymap.set("n", "i", _open_diff_current, { buffer = state.buf })
   vim.keymap.set("n", "u", _undo_current, { buffer = state.buf, desc = "NeoAI 撤销保存（回到待审）" })
   -- AI 审计（可配置按键；默认 a）
@@ -1705,7 +1959,7 @@ function M.open()
   M.refresh()
   -- 自动 AI 审计（tools.sandbox.review.ai_audit.auto，默认关闭）：集合变化时自动重审。
   if ai_cfg.enabled ~= false and ai_cfg.auto == true then
-    if state.audit_sig ~= _pending_sig(pending) then
+    if state.audit_sig ~= _pending_sig(ctx.items) then
       _ai_audit({ silent = true })
     end
   end
@@ -1725,39 +1979,60 @@ function M.refresh()
       state.last_target = state.line_to_target[pos[1]]
     end)
   end
-  local items = sandbox.list_reviews({ review_state = "PENDING" })
-  local traces = (sandbox.list_traces and sandbox.list_traces()) or {}
-  local saved = (sandbox.list_saved and sandbox.list_saved()) or {}
-  if #items == 0 and #traces == 0 and #saved == 0 then
-    vim.notify("[NeoAI] 无待审修改", vim.log.levels.INFO)
+  local ctx = _gather_ctx()
+  local total = 0
+  for _, p in ipairs(hub_mod.PAGES) do total = total + _page_count(p.id, ctx) end
+  if total == 0 then
+    vim.notify("[NeoAI] 无待审/审批/留痕事项", vim.log.levels.INFO)
     M.close()
     return
   end
   -- 待审集合变化：作废已完成的审计（避免展示过期结论；自动模式下 open 会重审）。
-  local sig = _pending_sig(items)
+  local sig = _pending_sig(ctx.items)
   if state.audit and not state.audit.pending and state.audit_sig and state.audit_sig ~= sig then
     state.audit = nil
     state.audit_sig = nil
   end
-  -- 审批按安全级别分级：高风险优先展示。
-  table.sort(items, function(a, b)
-    local la, lb = tonumber(a.risk_level) or 0, tonumber(b.risk_level) or 0
-    if la ~= lb then return la > lb end
-    return (a.created_at or 0) < (b.created_at or 0)
-  end)
-  local data = M.build_lines(items, traces, state.audit, saved)
-  -- 折叠级别必须在写 buffer 前更新：写行后 nvim 会立即按 foldexpr 求值。
-  state.fold_levels = data.fold_levels or {}
-  vim.api.nvim_buf_set_lines(state.buf, 0, -1, false, data.lines)
-  state.line_to_target = data.line_to_target
-  state.line_to_trace = data.line_to_trace or {}
-  vim.api.nvim_buf_clear_namespace(state.buf, state.ns, 0, -1)
-  for _, m in ipairs(data.marks) do
-    vim.api.nvim_buf_add_highlight(state.buf, state.ns, LEVEL_HL[m.level], m.line - 1, m.start_col, m.end_col)
+  local header_lines, header_marks = _build_header(state.page, ctx)
+  local body
+  if state.page == "anomaly" then
+    body = _build_anomaly_page(ctx)
+  elseif _is_blocking_page(state.page) then
+    body = _build_blocking_page(state.page, ctx)
+  else
+    -- 「待修改」页：越界留痕/异常移入「越界/异常」页，故此处 traces 传 nil。
+    body = M.build_lines(ctx.items, nil, state.audit, ctx.saved)
   end
-  -- 恢复光标：优先回到原目标条目，否则回到原行号（越界则夹取）。
+  local lines = {}
+  for _, l in ipairs(header_lines) do lines[#lines + 1] = l end
+  local offset = #header_lines
+  for _, l in ipairs(body.lines or {}) do lines[#lines + 1] = l end
+  local marks = {}
+  for _, m in ipairs(header_marks) do marks[#marks + 1] = m end
+  for _, m in ipairs(body.marks or {}) do
+    marks[#marks + 1] = { line = m.line + offset, start_col = m.start_col, end_col = m.end_col, level = m.level }
+  end
+  local function _shift(src)
+    local out = {}
+    for ln, v in pairs(src or {}) do out[ln + offset] = v end
+    return out
+  end
+  -- 折叠级别必须在写 buffer 前更新：写行后 nvim 会立即按 foldexpr 求值。
+  state.fold_levels = _shift(body.fold_levels)
+  vim.api.nvim_buf_set_lines(state.buf, 0, -1, false, lines)
+  state.line_to_target = _shift(body.line_to_target)
+  state.line_to_trace = _shift(body.line_to_trace)
+  state.line_to_hub = _shift(body.line_to_hub)
+  vim.api.nvim_buf_clear_namespace(state.buf, state.ns, 0, -1)
+  for _, m in ipairs(marks) do
+    if LEVEL_HL[m.level] then
+      vim.api.nvim_buf_add_highlight(state.buf, state.ns, LEVEL_HL[m.level], m.line - 1, m.start_col, m.end_col)
+    end
+  end
+  _set_review_title(("🗂 沙箱审批 · %s"):format(PAGE_LABEL[state.page] or ""))
+  -- 恢复光标：仅「待修改」页按目标条目恢复；其余页回到顶部。
   local restore = nil
-  if state.last_target then
+  if state.page == "files" and state.last_target then
     for ln, tgt in pairs(state.line_to_target) do
       if tgt.change_set_id == state.last_target.change_set_id
         and tgt.path == state.last_target.path
@@ -1766,8 +2041,8 @@ function M.refresh()
       end
     end
   end
-  if not restore and state.last_cursor then
-    restore = math.max(1, math.min(state.last_cursor.line, #data.lines))
+  if not restore and state.page == "files" and state.last_cursor then
+    restore = math.max(1, math.min(state.last_cursor.line, #lines))
   end
   if restore and state.win_id and vim.api.nvim_win_is_valid(state.win_id) then
     pcall(vim.api.nvim_win_set_cursor, state.win_id, {
@@ -1796,6 +2071,7 @@ function M.close()
   state.buf = nil
   state.ns = nil
   state.line_to_target = {}
+  state.line_to_hub = {}
   state.line_to_trace = {}
   state.fold_levels = {}
   -- 作废在途 AI 审计结果；保留已完成结论（diff 预览返回/重开时复用，集合变化时由 refresh 清除）。
@@ -1868,6 +2144,9 @@ function M.reset()
   state.audit_sig = nil
   state.audit_seq = state.audit_seq + 1
   state.fold_levels = {}
+  state.page = "files"
+  state.line_to_hub = {}
+  pcall(function() require("NeoAI.sandbox.approval_hub").reset() end)
   _close_root_prompt()
   _close_diff()
   M.close()

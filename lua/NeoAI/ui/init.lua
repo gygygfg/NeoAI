@@ -33,6 +33,8 @@ function M.init()
   pcall(function() require("NeoAI.ui.components.secret_alert").init() end)
   -- 注册网络访问同意 UI（沙箱外部命令访问沙箱外目标时阻塞确认）
   pcall(function() require("NeoAI.ui.components.net_consent").init() end)
+  -- 注册审批分流中心（多级页面审批悬浮窗：待修改/工具行为/资源访问/网络请求/越界异常）
+  pcall(function() require("NeoAI.ui.components.sandbox_review").setup() end)
   -- 启动子 Agent 监控监听
   local sub_agent_dock = require("NeoAI.ui.components.sub_agent_dock")
   sub_agent_dock.init()

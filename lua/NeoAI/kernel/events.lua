@@ -169,6 +169,9 @@ M.SANDBOX_SENSITIVE_REDACTED = "sandbox:sensitive_redacted"
 -- 沙箱网络访问同意：沙箱外部命令访问沙箱外目标（宿主本机其他端口/外部主机）时请求用户同意
 M.SANDBOX_NET_CONSENT_REQUESTED = "sandbox:net_consent_requested"
 
+-- 审批分流中心：阻塞类审批条目或观测类页面内容变化（多级页面审批悬浮窗据此自动刷新）
+M.SANDBOX_APPROVAL_CHANGED = "sandbox:approval_changed"
+
 -- 越界访问留痕：读取/操作当前工作区（cwd）之外的用户目录（home/root 等）
 M.SANDBOX_OUTSIDE_ACCESS = "sandbox:outside_access"
 

@@ -126,16 +126,22 @@ end
 --- @param ctx table
 local function _show_approval(tool_name, args, decision_cb, ctx)
   local text = _approval_text(tool_name, args, ctx)
+  local done = false
+  local function decide(allowed, reason)
+    if done then return end
+    done = true
+    decision_cb(allowed, reason)
+  end
   if approval_ui and approval_ui.show then
     approval_ui.show({
       text = text,
       tool_name = tool_name,
       args = args,
-      on_confirm = function() decision_cb(true) end,
-      on_cancel = function(reason) decision_cb(false, reason) end,
+      on_confirm = function() decide(true) end,
+      on_cancel = function(reason) decide(false, reason) end,
       on_confirm_all = function()
         state.allow_all[tool_name] = true
-        decision_cb(true)
+        decide(true)
       end,
       on_add_to_workspace = function()
         local path = _target_path(tool_name, args)
@@ -149,13 +155,49 @@ local function _show_approval(tool_name, args, decision_cb, ctx)
             vim.notify("[NeoAI] 目录已在工作目录中: " .. dir, vim.log.levels.INFO)
           end
         end
-        decision_cb(true)
+        decide(true)
       end,
     })
   else
     -- 无 UI（headless/测试）：默认允许
     vim.notify("[NeoAI] 工具审批: " .. text, vim.log.levels.WARN)
-    decision_cb(true)
+    decide(true)
+  end
+  -- 镜像到审批分流中心（多级页面审批悬浮窗可决策）：
+  --   命中遮蔽目录（ctx.sandbox_unmask）→「资源访问」页；其余工具调用同意 →「工具行为」页。
+  -- 独立弹窗仍为即时通道；先决策者生效（decide 幂等）。
+  local okhub, hub = pcall(require, "NeoAI.sandbox.approval_hub")
+  if okhub and hub.available() then
+    local page = (type(ctx) == "table" and type(ctx.sandbox_unmask) == "table"
+      and #ctx.sandbox_unmask > 0) and "resource" or "behavior"
+    local tool = registry.get(tool_name)
+    local detail = {}
+    if tool and tool.description then detail[#detail + 1] = "描述: " .. tostring(tool.description) end
+    if type(args) == "table" then
+      local okj, js = pcall(function() return require("NeoAI.utils.json").encode(args) end)
+      if okj and type(js) == "string" then
+        if #js > 200 then js = js:sub(1, 197) .. "…" end
+        detail[#detail + 1] = "参数: " .. js
+      end
+    end
+    hub.submit(page, {
+      title = tool_name,
+      detail = detail,
+      on_decision = function(v)
+        if v == "deny" then
+          if approval_ui and approval_ui.hide then pcall(approval_ui.hide) end
+          decide(false, "用户拒绝（审批中心）")
+        elseif v == "allow_session" then
+          state.allow_all[tool_name] = true
+          if approval_ui and approval_ui.hide then pcall(approval_ui.hide) end
+          decide(true)
+        else
+          if approval_ui and approval_ui.hide then pcall(approval_ui.hide) end
+          decide(true)
+        end
+      end,
+      meta = { tool_name = tool_name },
+    })
   end
 end
 
