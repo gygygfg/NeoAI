@@ -1408,9 +1408,28 @@ local function _resident_eligible(attempt, spec, args, req)
   if spec.long_lived then return false end
   -- 交互式（PTY）run_command 需要一次性路径的沙箱前缀与 stdin/PTY，常驻命令服务器不适用。
   if spec.interactive then return false end
+  -- 例外：带后台意图（`&`/nohup/setsid）的命令不是交互命令，且其后台进程需跨调用存活——
+  -- 一次性路径在命令结束即 cgroup.kill 回收进程树，后台进程无法存活。故此类命令仍走常驻实例
+  -- （会话级命名空间内执行，后台进程跨调用/跨轮次存活），即使 interactive 处于开启状态。
+  local bg = false
+  do
+    local okb, bmod = pcall(require, "NeoAI.sandbox.background")
+    if okb and bmod and type(bmod.parse) == "function" and type(args.command) == "string" then
+      bg = bmod.parse(args.command) ~= nil
+    end
+  end
   do
     local icfg = config_store.get("tools.run_command.interactive")
-    if type(icfg) == "table" and icfg.enabled and (icfg.engine or "auto") ~= "off" then
+    -- 已有常驻实例在运行（此前有后台命令/降权命令激活）时，后续命令也走常驻实例：
+    -- 否则后台进程虽存活却位于常驻命名空间，而普通命令在 PTY 一次性命名空间，`ps`/`kill`
+    -- 看不到也管不到它（跨命名空间）。保持同一会话命名空间一致。
+    local active_resident = false
+    do
+      local okr, rmod = pcall(require, "NeoAI.sandbox.resident")
+      active_resident = okr and rmod and type(rmod.active) == "function" and rmod.active() ~= nil
+    end
+    if type(icfg) == "table" and icfg.enabled and (icfg.engine or "auto") ~= "off"
+      and not bg and not active_resident then
       return false
     end
   end

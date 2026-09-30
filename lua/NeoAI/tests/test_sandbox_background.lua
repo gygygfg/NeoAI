@@ -101,6 +101,34 @@ tests.suite("sandbox_background", function(_, it)
     end)
   end)
 
+  it("interactive 开启时后台命令仍走常驻实例（后台进程跨调用存活）", function(t)
+    local runtime = require("NeoAI.sandbox.runtime")
+    if runtime.backend() ~= "bwrap" then return end
+    local resident = require("NeoAI.sandbox.resident")
+    if not resident.available() then return end
+    with_config({
+      tools = { approval = { mode = "auto_allow" },
+        run_command = { interactive = { enabled = true, engine = "auto" } },
+        sandbox = resident_sandbox_config() },
+    }, function()
+      require("NeoAI.sandbox").reset()
+      local tools = require("NeoAI.tools")
+      local function run(cmd)
+        local out, done = nil, false
+        tools.execute("run_command", { command = cmd, description = "t" }, {}):then_(
+          function(v) out = tostring(v); done = true end, function() done = true end)
+        vim.wait(15000, function() return done end, 50)
+        return out
+      end
+      run("nohup sleep 45 & echo started")
+      -- 后台意图命令即使 interactive 开启也应走常驻实例（否则一次性路径结束即回收）。
+      t.not_nil(resident.active(), "后台意图命令应走常驻实例")
+      t.matches("[1-9]", tostring(run("ps -e -o args 2>/dev/null | grep '[s]leep 45' | wc -l")),
+        "interactive 开启时后台进程也应跨调用存活")
+      resident.stop({ timeout_ms = 5000 })
+    end)
+  end)
+
   it("resident：后台进程跨 agentEnd 会话轮换存活", function(t)
     local runtime = require("NeoAI.sandbox.runtime")
     if runtime.backend() ~= "bwrap" then return end

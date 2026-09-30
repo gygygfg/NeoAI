@@ -344,9 +344,11 @@ local DEFAULT_CONFIG = {
       -- 到时经沙箱资源域真正终止进程树，避免长任务永久占用资源、工具永不返回。0 = 不限制。
       max_wall_ms = 0,
       -- 交互式等待输入（默认开启）：以 PTY 运行命令，轮询 /proc 检测“阻塞读终端 = 等待输入”，
-      -- 由判官子 agent 或用户手动输入注入答案。启用时 run_command 走一次性沙箱路径
-      -- （常驻沙箱命令服务器 stdin 为 /dev/null，无法交互），即 tools.sandbox.resident 对其不生效。
-      -- 如需恢复常驻沙箱（后台进程跨调用存活）语义，可设 enabled=false。
+      -- 由判官子 agent 或用户手动输入注入答案。启用时普通前台命令走一次性沙箱路径
+      -- （常驻沙箱命令服务器 stdin 为 /dev/null，无法交互）。
+      -- 例外（保证后台进程可用）：① 带后台意图（`&`/nohup/setsid）的命令仍走常驻实例，
+      -- 使后台进程跨调用存活；② 一旦已有常驻实例在运行，后续命令也走该实例，保证同一命名
+      -- 空间内 `ps`/`kill`/日志可见可管。设 enabled=false 则所有命令都走常驻实例。
       interactive = {
         enabled = true,           -- 启用交互式 PTY 执行层（替换 run_command 的进程执行方式）
         engine = "auto",          -- "auto" | "procfs" | "off"（off 等价于不启用）
