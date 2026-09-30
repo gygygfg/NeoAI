@@ -26,16 +26,19 @@ local function _current_id()
 end
 
 --- 全局按键转发：焦点在终端窗时，把按键转成字节写入会话（交互式）。
+--- 注意：Neovim 0.12 起 `vim.on_key` 回调**只允许返回空字符串 `""`（消费按键）或不返回**；
+--- 返回非空字符串会报 `With ns_id ...: return string must be empty`。故「保留原按键」一律
+--- 用 `return`（nil），不要 `return key`。
 local function _on_key(key)
   local id = _current_id()
-  if not id then return key end
+  if not id then return end
   -- 仅在终端/插入模式转发按键，Normal 模式下保留原按键（可 : 命令、i 进入输入、<C-q> 关窗）
   local mode = vim.api.nvim_get_mode().mode
-  if mode ~= "t" and mode ~= "i" then return key end
+  if mode ~= "t" and mode ~= "i" then return end
   -- 保留退出终端模式的按键，避免把用户困在终端里
-  if key == "<Esc>" or key == "<C-\\>" or key == "<C-n>" then return key end
+  if key == "<Esc>" or key == "<C-\\>" or key == "<C-n>" then return end
   local pty = require("NeoAI.kernel.services").use("services.pty")
-  if not pty then return key end
+  if not pty then return end
   local b = pty.key_bytes and pty.key_bytes(key)
   if b then
     pcall(pty.send_bytes, id, b)
@@ -46,7 +49,7 @@ local function _on_key(key)
     end
     return ""
   end
-  return key
+  return
 end
 
 local function _install_on_key()
