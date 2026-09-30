@@ -1621,6 +1621,22 @@ commands (SSRF, e.g. host admin panels, internal ports, cloud metadata):
   `sandbox/net_consent`. Headless / no UI fails closed (deny). A `sandbox:net_consent_requested`
   event is emitted on each request. Long-lived services auto-register internal ports declared via
   `PORT`/`--port` etc. (`net_consent.register_from_command`).
+  - **Per "port + service process" granularity** (`network.consent_process_granularity`, on by
+    default): for host-local targets the sandbox resolves the **host listening process** behind the
+    port (`net_consent.port_owner`: parse LISTEN inodes from `/proc/net/tcp{,6}`, scan the full pid
+    range's `fd → socket:[inode]`, exclude the `/neoai/` cgroup scope, read `comm`/`exe`/`cmdline`),
+    and the prompt shows the service name (pid) / executable path / cmdline summary (secret-redacted)
+    plus related prior approvals (other ports of the same process / other processes on the same
+    port). The session key is refined from `host:port` to `host:port@<executable>`; it is
+    **revalidated on every connection** (short TTL cache) — a different process taking over the port
+    (service upgrade / hijack) counts as not-approved and re-prompts; a restart with the same `exe`
+    does not. On resolution failure / non-root unable to read others' processes it falls back to
+    port-only granularity and shows "no listening process identified".
+  - **No-response timeout** (`network.consent_timeout_ms`, default 30s, 0 = unlimited): auto-deny on
+    timeout (fail-closed) so a connection never hangs forever; headless does no expensive process
+    resolution and fails closed immediately.
+  - The prompt can be shown standalone or decided in the unified review window's "network requests"
+    page (see the multi-page approval window section).
 - **Software-source auto-allow (`network.auto_allow_sources`, on by default)**: so that package
   installs are not intercepted by the consent gate, access to **external** software sources
   (PyPI/pythonhosted, npm/npmmirror, crates/rust-lang, proxy.golang.org/goproxy, Maven,

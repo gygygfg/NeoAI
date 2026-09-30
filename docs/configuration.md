@@ -407,6 +407,12 @@ sandbox = {
     --   "allow"       = 直接放行并记录（旧行为）；
     --   "deny"        = 直接拒绝。
     access = "ask",
+    -- 访问本机网络服务的审批颗粒度（默认开）：弹窗展示目标端口背后的**宿主监听进程**
+    -- （命令名 / pid / 可执行路径 / 命令行摘要），并按「端口 + 服务进程」记忆本次会话同意——
+    -- 同端口换成另一个进程（服务换版本/被抢占）会重新弹窗。关闭则退回纯 host:port 颗粒度。
+    consent_process_granularity = true,
+    consent_timeout_ms = 30000,      -- 网络访问弹窗无响应超时（毫秒；0=不限）；超时自动拒绝（fail-closed），避免连接无限悬挂
+    consent_owner_ttl_ms = 2000,     -- 端口→宿主服务进程解析结果的短缓存 TTL（毫秒）；每次连接重校验，TTL 内复用避免频繁全扫 /proc
     auto_allow_sources = true,       -- 软件源自动放行（默认开）：pip/uv/npm/go/cargo/apt 等**外部**软件源（PyPI、npm、crates、清华/阿里/中科大等镜像）经代理访问时免弹窗直接放行，避免包安装被网络同意门禁拦截。仅对非本机目标生效（解析到本机或解析失败仍拒绝，SSRF 防护不削弱）；access="deny" 时仍拒绝；自动放行不回传命令结果（仅回传拦截/失败）
     extra_package_sources = {},      -- 额外软件源域名后缀（私有源/自建镜像），如 { "pypi.mycorp.com" }；子域自动匹配
     -- 沙箱外部命令代理策略：strip（默认，不把宿主代理传入沙箱，如 mihomo 只代理 opencode 自身，

@@ -388,6 +388,15 @@
       上限 `max_concurrent`（默认 10）：在途审计请求超出即排队 FIFO，避免 auto 频繁触发时请求风暴。
       **自动审计**（`ai_audit.auto`，默认 `false`）：开启后打开待审界面即自动发起审计，待审
       集合变化时自动重审；也可随时按 `key`（默认 `a`）手动触发。
+  - **多级页面审批悬浮窗（审批分流）**：`:NeoAISandboxReview` 采用多级页面，页头按
+    **待修改 / 工具行为 / 资源访问 / 网络请求 / 越界·异常** 分页，`h`/`l`（或 `←`/`→`）切换、
+    各页计数醒目。分流机制（`sandbox/approval_hub.lua`）汇聚所有需批准/需关注的请求与观测：
+    **待修改**＝文件变更单元（`files`，非阻塞，走异步待审队列，`<CR>` 应用 / `d` 拒绝）；
+    **工具行为**＝工具调用同意（阻塞，审批通过才执行）与 T2 主机操作提案；
+    **资源访问**＝命中遮蔽目录等资源访问审批（阻塞）；**网络请求**＝出沙箱访问同意（阻塞）；
+    **越界·异常**＝越界访问留痕与行为审计异常（L2+，仅记录）。阻塞类条目由来源模块
+    （`tool_service` / `net_consent`）提交并镜像；独立弹窗仍作即时通道，窗口内亦可决策
+    （`<CR>` 仅本次 / `S` 本次会话 / `d` 拒绝，决策幂等）。
   - `:NeoAISandboxApprove <id>` / `:NeoAISandboxReject <id>` — 批准（不应用）/ 拒绝并丢弃。
   - `:NeoAISandboxApply <id>` — 批准并应用（CAS 发布）；`:NeoAISandboxApplyAll` 批量应用。
   - `:NeoAISandboxList` / `:NeoAISandboxShow` / `:NeoAISandboxDiscard <digest>` / `:NeoAISandboxCommit <digest>`。
@@ -1279,10 +1288,21 @@ seccomp（含设备节点屏障）**——沙箱内进程看到的是一份「�
   服务端口登记表，见 `sandbox/net_consent.lua`）在沙箱内访问**免权限**；访问沙箱外（宿主本机
   其他端口、宿主网卡 IP、外部主机）按 `access` 处理：`"ask"`（默认）弹窗请求用户同意，
   `"allow"` 直接放行并记录（旧行为），`"deny"` 直接拒绝。弹窗由
-  `ui/components/net_consent.lua` 提供（`<CR>` 仅本次 / `S` 本次会话始终 / `Esc` 拒绝），
-  决策经 `sandbox/net_consent` 的服务端会话白名单记忆。headless/无 UI 时失败关闭（拒绝）。
-  发起请求时发 `sandbox:net_consent_requested` 事件。长驻服务启动时按 `PORT`/`--port` 等
-  声明自动登记内部端口（`net_consent.register_from_command`）。
+   `ui/components/net_consent.lua` 提供（`<CR>` 仅本次 / `S` 本次会话始终 / `Esc` 拒绝），
+   决策经 `sandbox/net_consent` 的服务端会话白名单记忆。headless/无 UI 时失败关闭（拒绝）。
+   发起请求时发 `sandbox:net_consent_requested` 事件。长驻服务启动时按 `PORT`/`--port` 等
+   声明自动登记内部端口（`net_consent.register_from_command`）。
+   - **按「端口 + 服务进程」颗粒度**（`network.consent_process_granularity`，默认开）：命中
+     宿主本机目标时解析该端口的**宿主监听进程**（`net_consent.port_owner`：读 `/proc/net/tcp{,6}`
+     的 LISTEN inode，扫全 pid 域的 `fd → socket:[inode]`，排除 `/neoai/` cgroup 域，取
+     `comm`/`exe`/`cmdline`），弹窗展示「服务名(pid) / 程序路径 / 命令行摘要（经密钥脱敏）」，
+     并列出相关已批准项（同进程其它端口 / 同端口其它进程）。会话白名单键由 `host:port` 细化为
+     `host:port@<可执行路径>`；**每次连接都重校验**（短 TTL 缓存）——端口换成另一进程
+     （服务换版本/被抢占）即视为未同意、重新弹窗；进程重启（exe 不变）不重新弹。解析失败/
+     非 root 读不到他人进程时退回纯端口粒度并显示「未识别到监听进程」。
+   - **弹窗无响应超时**（`network.consent_timeout_ms`，默认 30s，0=不限）：超时自动拒绝
+     （fail-closed），避免用户离开时连接永久悬挂；headless 不做昂贵进程解析、直接失败关闭。
+   - 弹窗可独立呈现，也可在统一审批悬浮窗「网络请求」页决策（见 §5 多级页面审批悬浮窗）。
 - **软件源自动放行（`network.auto_allow_sources`，默认开）**：为避免包安装被同意门禁拦截，
   对**外部**软件源（PyPI/pythonhosted、npm/npmmirror、crates/rust-lang、proxy.golang.org/goproxy、
   Maven、Debian/Ubuntu/Alpine/Docker 源，以及 `tuna.tsinghua.edu.cn`、`mirrors.aliyun.com`、

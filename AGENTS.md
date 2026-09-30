@@ -36,7 +36,8 @@ nvim --headless --clean -u NONE --cmd "set rtp+=$PWD" \
   `mcp.cache_path`。资源重/时序敏感套件（`sandbox*`、`pty`）自动走**串行通道**，避免并发下
   bwrap/cgroup 争抢导致 137/SIGKILL 与 PTY 时序 flaky。
 - 过滤（隔离复现/跳过危险用例）：`NEOAI_TEST_ONLY=<p1,p2>`（仅跑含任一子串的用例）、
-  `NEOAI_TEST_SKIP=<p1,p2>`（跳过）。`run_all` 每个套件前会恢复干净环境（配置默认 + 插件
+  `NEOAI_TEST_SKIP=<p1,p2>`（跳过）。`NEOAI_TEST_HEAVY=1` 开启重资源/环境敏感用例
+  （真实 OOM、双实例并存等，见 `test_sandbox_boundary_consistency.lua`），默认跳过。`run_all` 每个套件前会恢复干净环境（配置默认 + 插件
   `start_all` + 工具 `reload_tools`），杜绝跨套件污染。
 - **宿主稳定性**：在嵌套容器/VM 上，内核 overlay 不可用时若回退 **fuse-overlayfs 挂载整机 `/`**
   会卡死内核并触发硬件看门狗整机复位。测试默认关闭该兜底（测试默认 `tools.sandbox.fuse_root_overlay=false`，

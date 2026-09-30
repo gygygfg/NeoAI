@@ -223,6 +223,29 @@ residual boundaries** (inherent to the shared netns / global procfs, see
 - Tests that stop/start builtin plugins restore `plugins.start_all()` before asserting, so a failure cannot affect later suites.
 - Real message requests use the local `tests/http_server.lua` mock and stay offline reproducible.
 
+### 5.3 Sandbox Boundary Test Suites (`test_sandbox_boundary_*`)
+
+Besides `scripts/sandbox_audit.lua` (a manual audit script), key boundaries are frozen into the
+standard regression suites (the `test_sandbox*` prefix routes them through the serial channel of
+`parallel.lua`, avoiding concurrent bwrap/cgroup contention):
+
+- `test_sandbox_boundary_escape.lua`: real full-denylist syscall interception (python ctypes),
+  clone/clone3 namespaces, socket address-family allowlist, mknod device-node barrier, real
+  negative `mount`/`chroot`/`pivot_root`/`umount`, pid-namespace isolation, `/proc/sys` read-only
+  with dangerous proc leaks empty, end-to-end `mask_paths` (sentinel/hash proves the host is
+  untouched), whole-root overlay staging sentinels, private `/run` writes, `NoNewPrivs=1`;
+  `/proc/net`, `hostname`, etc. are **design boundaries** frozen as baseline assertions.
+- `test_sandbox_boundary_net.lua`: host filtering-proxy local interception and service-process
+  identity, bare-TCP baseline (design boundary), reverse exposure of sandbox listening ports, DNS,
+  and the **port+process granularity consent** end-to-end (deny blocks / approve allows).
+- `test_sandbox_boundary_consistency.lua`: concurrent writes to one file (no loss/tearing),
+  recovery after a timed-out command is killed, ancestor-dir TOCTOU symlink swap not reaching the
+  host, and read_all ordinary-command writes to system paths (candidate freeze + publish).
+
+Shared helpers live in `tests/sandbox_boundary_helpers.lua` (config override, real bwrap prefix
+`direct`/`python`, host sentinel files, syscall probe template). **Heavy / environment-sensitive**
+cases (real OOM, dual instances) are opt-in via `NEOAI_TEST_HEAVY=1` and skipped by default.
+
 ## 6. Related Docs
 
 - [threaded_testing.md](threaded_testing.md): Test framework structure and runner.

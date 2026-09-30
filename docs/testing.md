@@ -217,6 +217,25 @@ nvim --headless --clean -u NONE --cmd "set rtp+=$PWD" -c "luafile scripts/sandbo
 - 涉及内置插件启停的用例，在断言前先恢复 `plugins.start_all()`，防止失败时影响后续套件；
 - 实际消息请求用 `tests/http_server.lua` 本地 mock，离线可复现。
 
+### 5.3 沙箱边界测试套件（`test_sandbox_boundary_*`）
+
+在 `scripts/sandbox_audit.lua`（人工审计脚本）之外，把关键边界固化进标准回归套件
+（`test_sandbox*` 前缀自动走 `parallel.lua` 串行通道，避免 bwrap/cgroup 并发争抢）：
+
+- `test_sandbox_boundary_escape.lua`：seccomp denylist **全量真实** syscall 拦截（python
+  ctypes）、clone/clone3 命名空间、socket 地址族白名单、mknod 设备节点屏障、`mount`/`chroot`/
+  `pivot_root`/`umount` 真实负向、pid namespace 隔离、`/proc/sys` 只读与危险 proc 泄露项为空、
+  `mask_paths` 端到端（哨兵/哈希校验宿主未改）、整机 overlay 暂存哨兵、`/run` 私有写、
+  `NoNewPrivs=1`；`/proc/net`、`hostname` 等**设计边界**以基线断言固化。
+- `test_sandbox_boundary_net.lua`：宿主过滤代理本机拦截与服务进程身份、裸 TCP 基线（设计边界）、
+  沙箱内监听端口反向暴露、DNS、**端口+服务进程粒度弹窗端到端**（拒绝拦截 / 批准放行）。
+- `test_sandbox_boundary_consistency.lua`：并发写同一文件（无丢失/撕裂）、命令超时被终止后的
+  恢复、祖先目录 TOCTOU 符号链接替换不落宿主、read_all 普通命令写系统路径的候选冻结与发布落盘。
+
+共享基建见 `tests/sandbox_boundary_helpers.lua`（配置覆盖、真实 bwrap 前缀直跑 `direct/python`、
+宿主哨兵文件、syscall 探测模板）。**重资源/环境敏感**用例（真实 OOM、双实例）以
+`NEOAI_TEST_HEAVY=1` opt-in，默认跳过。
+
 ## 6. 相关文档
 
 - [threaded_testing.md](threaded_testing.md)：测试框架结构与运行器。
