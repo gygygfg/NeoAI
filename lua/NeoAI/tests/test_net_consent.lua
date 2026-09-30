@@ -129,15 +129,16 @@ tests.suite("net_consent", function(_, it)
     t.matches("403", r2, "拒绝后应 403")
     hp.stop()
 
-    -- allow_session 记住（随后即使无 UI 也放行）
-    nc.set_ui({ show = function(_, decide) decide("allow_session") end })
+    -- allow_session 记住（随后即使无 UI 也放行）——按 (端口, 服务进程) 颗粒度记忆
+    local seen_owner
+    nc.set_ui({ show = function(ctx, decide) seen_owner = ctx.owner; decide("allow_session") end })
     local a3 = hp.start("127.0.0.1", 0)
     local r3 = tcp_exchange(a3.host, a3.port,
       ("CONNECT 127.0.0.1:%d HTTP/1.1\r\n\r\n"):format(port))
     t.matches("200 Connection Established", r3, "会话允许后应放行")
     hp.stop()
     nc.set_ui(nil)
-    t.true_(nc.is_session_allowed("127.0.0.1", port), "应记住会话同意")
+    t.true_(nc.is_session_allowed("127.0.0.1", port, seen_owner), "应记住会话同意（端口+进程）")
     local a4 = hp.start("127.0.0.1", 0)
     local r4 = tcp_exchange(a4.host, a4.port,
       ("CONNECT 127.0.0.1:%d HTTP/1.1\r\n\r\n"):format(port))
@@ -247,5 +248,75 @@ tests.suite("net_consent", function(_, it)
     t.true_(s:find("已拦截", 1, true) ~= nil, "应标注已拦截")
     t.true_(s:find("pypi.tuna", 1, true) == nil, "自动放行不应出现在摘要")
     hp.reset()
+  end)
+
+  it("端口→宿主进程解析：真实监听进程（pid+comm）", function(t)
+    local nc = require("NeoAI.sandbox.net_consent")
+    nc.reset()
+    local port, close_srv = echo_server()
+    local owner = nc.port_owner(port)
+    t.not_nil(owner, "应解析出宿主监听进程")
+    t.eq(vim.uv.os_getpid(), owner.pid, "监听进程应为本测试进程")
+    t.not_nil(owner.comm, "应含进程名")
+    -- 非同端口的端口无监听者
+    t.nil_(nc.port_owner(port + 1), "未监听端口应解析为 nil")
+    close_srv()
+    nc.reset()
+  end)
+
+  it("服务粒度会话记忆：同端口换进程视为未同意", function(t)
+    local nc = require("NeoAI.sandbox.net_consent")
+    nc.reset()
+    local ownerA = { pid = 1, comm = "postgres", exe = "/usr/lib/postgresql/16/bin/postgres" }
+    local ownerB = { pid = 2, comm = "evil", exe = "/tmp/evil" }
+    nc.allow_session("127.0.0.1", 5432, ownerA)
+    t.true_(nc.is_session_allowed("127.0.0.1", 5432, ownerA), "同进程应免弹窗")
+    t.false_(nc.is_session_allowed("127.0.0.1", 5432, ownerB), "换进程应重新询问")
+    t.true_(nc.has_session_approval("127.0.0.1", 5432), "端口应存在服务粒度批准标记")
+    t.false_(nc.has_session_approval("127.0.0.1", 5433), "其它端口无标记")
+    nc.reset()
+  end)
+
+  it("相关批准提示：同进程其它端口 / 同端口其它进程", function(t)
+    local nc = require("NeoAI.sandbox.net_consent")
+    nc.reset()
+    local pg = { comm = "postgres", exe = "/usr/bin/postgres" }
+    local other = { comm = "redis", exe = "/usr/bin/redis-server" }
+    nc.allow_session("127.0.0.1", 5432, pg)
+    nc.allow_session("127.0.0.1", 5433, pg)
+    nc.allow_session("127.0.0.1", 5432, other)
+    local rel = nc.related_approvals("127.0.0.1", 5432, pg)
+    local has_port, has_svc = false, false
+    for _, p in ipairs(rel.ports) do if p == "127.0.0.1:5433" then has_port = true end end
+    for _, s in ipairs(rel.services) do if s == other.exe then has_svc = true end end
+    t.true_(has_port, "应提示同进程的其它端口")
+    t.true_(has_svc, "应提示同端口的其它进程")
+    nc.reset()
+  end)
+
+  it("弹窗无响应超时自动拒绝（fail-closed）", function(t)
+    local nc = require("NeoAI.sandbox.net_consent")
+    nc.reset()
+    nc.set_ui({ show = function() end }) -- 永不决策
+    with_config({ tools = { sandbox = { network = { consent_timeout_ms = 100 } } } }, function()
+      local decision
+      local d = nc.request({ host = "127.0.0.1", port = 1, local_ = true })
+      d:then_(function(v) decision = v end)
+      vim.wait(1500, function() return decision ~= nil end, 20)
+      t.eq("deny", decision, "超时应自动拒绝")
+    end)
+    nc.set_ui(nil)
+    nc.reset()
+  end)
+
+  it("端口→进程解析带 TTL 缓存（重复调用复用）", function(t)
+    local nc = require("NeoAI.sandbox.net_consent")
+    nc.reset()
+    local port, close_srv = echo_server()
+    local a = nc.port_owner(port)
+    local b = nc.port_owner(port)
+    t.eq(a and a.pid, b and b.pid, "TTL 内应复用缓存结果")
+    close_srv()
+    nc.reset()
   end)
 end)

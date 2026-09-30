@@ -468,6 +468,7 @@ tests.suite("sandbox_review", function(_, it)
       reject = function() end,
     })
     sr.open()
+    sr.open_page("anomaly")
     t.not_nil(sr.get_buf(), "仅有留痕也应打开审批窗")
     local text = table.concat(vim.api.nvim_buf_get_lines(sr.get_buf(), 0, -1, false), "\n")
     t.matches("越界访问留痕", text, "应展示留痕区")
@@ -494,6 +495,7 @@ tests.suite("sandbox_review", function(_, it)
       reject = function() end,
     })
     sr.open()
+    sr.open_page("anomaly")
     local buf = sr.get_buf()
     t.not_nil(buf, "应打开审批窗")
     local trace_line
@@ -673,6 +675,7 @@ tests.suite("sandbox_review", function(_, it)
       reject_file = function() end,
     })
     sr.open()
+    sr.open_page("behavior")
     local buf = sr.get_buf()
     local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
     local header
@@ -1254,5 +1257,95 @@ tests.suite("sandbox_review", function(_, it)
     local after = review.get(item2.change_set_id)
     t.eq(review.REVIEW.REJECTED, after.review_state, "reject_file 应整组拒绝 git 原子组")
     review.reset()
+  end)
+
+  it("多级页面：页头展示 5 个页面并可 h/l 切换", function(t)
+    local services = require("NeoAI.kernel.services")
+    local sr = require("NeoAI.ui.components.sandbox_review")
+    sr.reset()
+    local saved = services.use("services.sandbox")
+    services.provide("services.sandbox", {
+      list_reviews = function() return {} end,
+      list_traces = function() return { { tool = "read_file", path = "/root/x.txt" } } end,
+      list_saved = function() return {} end,
+      apply = function() return { ok = true } end,
+      reject = function() end,
+    })
+    sr.open()
+    local buf = sr.get_buf()
+    local text = table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n")
+    for _, label in ipairs({ "待修改", "工具行为", "资源访问", "网络请求", "越界/异常" }) do
+      t.true_(text:find(label, 1, true) ~= nil, "页头应含 " .. label)
+    end
+    -- l 切到下一页，页头高亮段变化（越界/异常页应出现留痕区）
+    for _, m in ipairs(vim.api.nvim_buf_get_keymap(buf, "n")) do
+      if m.lhs == "l" then m.callback(); m.callback(); m.callback(); m.callback() end
+    end
+    local text2 = table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n")
+    t.matches("越界访问留痕", text2, "切到第 5 页应显示留痕区")
+    sr.close()
+    services.provide("services.sandbox", saved)
+  end)
+
+  it("阻塞类页面渲染分流条目并按 <CR> 决策", function(t)
+    local services = require("NeoAI.kernel.services")
+    local sr = require("NeoAI.ui.components.sandbox_review")
+    local hub = require("NeoAI.sandbox.approval_hub")
+    sr.reset()
+    local saved = services.use("services.sandbox")
+    services.provide("services.sandbox", {
+      list_reviews = function() return {} end,
+      list_traces = function() return {} end,
+      list_saved = function() return {} end,
+      apply = function() return { ok = true } end,
+      reject = function() end,
+    })
+    local decided
+    local id = hub.submit("network", {
+      title = "127.0.0.1:9999（mockd pid 42）",
+      detail = { "程序: /usr/bin/mockd" },
+      on_decision = function(v) decided = v end,
+    })
+    sr.open()
+    sr.open_page("network")
+    local buf = sr.get_buf()
+    local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+    local entry_line
+    for i, l in ipairs(lines) do if l:find(id, 1, true) then entry_line = i end end
+    t.not_nil(entry_line, "网络页应展示分流条目")
+    t.true_(table.concat(lines, "\n"):find("mockd", 1, true) ~= nil, "应展示服务身份")
+    vim.api.nvim_win_set_cursor(0, { entry_line, 0 })
+    for _, m in ipairs(vim.api.nvim_buf_get_keymap(buf, "n")) do
+      if m.lhs == "<CR>" then m.callback() end
+    end
+    t.eq("allow_once", decided, "<CR> 应决策为 allow_once")
+    t.eq(0, hub.pending_count("network"), "决策后条目应移除")
+    sr.close()
+    services.provide("services.sandbox", saved)
+  end)
+
+  it("工具行为页并入主机操作提案", function(t)
+    local services = require("NeoAI.kernel.services")
+    local sr = require("NeoAI.ui.components.sandbox_review")
+    sr.reset()
+    local saved = services.use("services.sandbox")
+    services.provide("services.sandbox", {
+      list_reviews = function()
+        return { { change_set_id = "csHO", kind = "host_op", tool = "run_command",
+          host_op_id = "ho1", risk_level = 3, privilege_tier = 2,
+          write_set = { "systemctl restart nginx" }, files = {} } }
+      end,
+      list_traces = function() return {} end,
+      list_saved = function() return {} end,
+      apply = function() return { ok = true } end,
+      reject = function() end,
+    })
+    sr.open()
+    sr.open_page("behavior")
+    local text = table.concat(vim.api.nvim_buf_get_lines(sr.get_buf(), 0, -1, false), "\n")
+    t.matches("csHO", text, "工具行为页应展示主机操作提案")
+    t.matches("systemctl restart nginx", text, "应展示主机操作命令")
+    sr.close()
+    services.provide("services.sandbox", saved)
   end)
 end)
