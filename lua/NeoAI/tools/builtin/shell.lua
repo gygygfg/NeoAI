@@ -42,6 +42,35 @@ local function _shell_bin()
   return vim.fn.executable("bash") == 1 and "bash" or "sh"
 end
 
+--- 采集资源域 OOM 计数基线（命令开始前调用；结束后差分）。
+--- @param cgroup_path string|nil
+--- @return table|nil
+local function _oom_baseline(cgroup_path)
+  if not cgroup_path then return nil end
+  local ok, cg = pcall(require, "NeoAI.sandbox.cgroup")
+  if not (ok and cg and cg.oom_baseline) then return nil end
+  local b
+  pcall(function() b = cg.oom_baseline(cgroup_path) end)
+  return b
+end
+
+--- 归因 OOM：137/-1 结束时读资源域 memory.events 增量（子域→祖先）。
+--- @param cgroup_path string|nil
+--- @param baseline table|nil
+--- @param code number|nil
+--- @return boolean oom
+--- @return string|nil level "sandbox"|"ancestor"
+local function _oom_attribution(cgroup_path, baseline, code)
+  if not cgroup_path or (code ~= 137 and code ~= -1) then return false, nil end
+  local ok, cg = pcall(require, "NeoAI.sandbox.cgroup")
+  if not (ok and cg) then return false, nil end
+  if cg.oom_attribution then
+    local attr = cg.oom_attribution(cgroup_path, { baseline = baseline }) or {}
+    return attr.oom == true, attr.level
+  end
+  return false, nil
+end
+
 --- 执行 shell 命令（jobstart，实时累积 stdout/stderr）。
 --- 采用非缓冲输出：命令超时/被取消时也能回传「此刻终端已产生的内容」，
 --- 而不是只剩一句错误信息。始终 resolve 结果表（含 timed_out/aborted 标记），
@@ -261,6 +290,8 @@ local function _run_interactive(command, opts)
   full[#full + 1] = _shell_bin()
   full[#full + 1] = "-c"
   full[#full + 1] = command
+  -- 命令开始时的资源域 OOM 计数基线：结束后差分归因（PTY 路径此前缺失，导致 137 无法归因）。
+  local cgroup_baseline = _oom_baseline(opts.cgroup_path)
   local session, oerr = pty.open({
     argv = full,
     cwd = opts.cwd,
@@ -281,11 +312,12 @@ local function _run_interactive(command, opts)
   return pty.await(session):then_(function(result)
     -- 终端输出含 ANSI/回车控制：回传模型前剥离 ANSI 并归一化换行（UI 窗口仍展示原始字节）。
     local out = result.output or ""
-    local ok_ansi, ansi = pcall(require, "NeoAI.utils.ansi")
+    local ok_ansi, ansi = pcall(require("NeoAI.utils.ansi"))
     if ok_ansi and ansi and ansi.strip then
       out = ansi.strip(out)
     end
     out = out:gsub("\r\n", "\n"):gsub("\r", "\n")
+    local oom, oom_level = _oom_attribution(opts.cgroup_path, cgroup_baseline, result.code)
     return {
       code = result.code,
       stdout = out,
@@ -294,6 +326,8 @@ local function _run_interactive(command, opts)
       aborted = result.aborted,
       truncated = result.truncated,
       message = result.message,
+      oom = oom,
+      oom_level = oom_level,
     }
   end)
 end

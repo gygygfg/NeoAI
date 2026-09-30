@@ -7,6 +7,8 @@
 -- 关注：所有 `write_*` 应为 READONLY；`raw_tcp_host`/`proc_net_*`/`ip_*` 为已知残余边界。
 local function main()
   require("NeoAI").setup({ log = { level = "ERROR" }, session = { auto_save = false } })
+  -- 启动插件与工具（同步等待）：末尾的 conceal 旁路检查需要 read_file 工具已注册。
+  pcall(function() require("NeoAI").ensure_started_sync(120000) end)
   local runtime = require("NeoAI.sandbox.runtime")
   local store = require("NeoAI.sandbox.store")
   store.init(vim.fn.stdpath("cache") .. "/NeoAI/sandbox")
@@ -151,7 +153,7 @@ python3 /tmp/audit_r3.py 2>&1
   -- conceal 旁路检查：read_file 直读 /proc/self/mountinfo 是否泄露 overlay 真实路径
   local done = false
   require("NeoAI.tools").execute("read_file",
-    { filepath = "/proc/self/mountinfo", description = "audit" }, {}):then_(function(r)
+    { file_path = "/proc/self/mountinfo", description = "audit" }, {}):then_(function(r)
     local s = tostring(r)
     print("\n### read_file_mountinfo")
     print("path_leak=" .. tostring(s:find("/.cache-", 1, true) ~= nil or s:find(store_root, 1, true) ~= nil))
