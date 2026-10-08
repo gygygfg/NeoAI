@@ -2399,6 +2399,10 @@ local function _classify_paths_async(paths, unmask)
   })
 end
 
+--- 前向声明：`.git` 保守判定（定义见文件后部）。写日志增量捕获会调用它，
+--- 若直接以后方 `local function` 定义，Lua 局部作用域按位置生效会导致调用点为 nil。
+local _journal_definitely_no_git
+
 --- 异步登记 overlay 改动：遍历/读取/哈希 base 在 utils.work 线程池执行，
 --- 主线程仅按预取结果登记 mapping（工作区跳过/上限判定仍与同步版一致）。
 --- 遍历（scandir+stat）在单个 job；base 内容哈希按 `work_chunk_files` 分块并发补算（多核）。
@@ -2439,6 +2443,15 @@ function M.capture_overlay_async(attempt_id, real_root, upper_root, hint, opts)
       if under(p) and not paths_set[p] then paths_set[p] = true; list[#list + 1] = p end
     end
     paths_encoded = _encode_paths(list)
+    -- B1：`.git` 保守——若本轮可能触及 `.git`（写/删路径命中、`.git` 锁/内容新鲜），
+    -- 放弃写日志增量、强制全量遍历，杜绝漏捕获对象产生悬空引用。
+    if not _journal_definitely_no_git(root, hint) then
+      paths_encoded, paths_set = nil, nil
+      pcall(function()
+        require("NeoAI.kernel.logger").warn(
+          "[sandbox] 检测到 .git 可能被改动，改用全量遍历捕获（防悬空引用）")
+      end)
+    end
   end
   local expected_encoded = _encode_expected(state.materialized[upper_root], paths_set)
   local ws_encoded = _encode_ws(state.workspace, root, paths_set)
@@ -3086,6 +3099,307 @@ local function _apply_order(files)
   return out
 end
 
+-- ========== `.git` 保守捕获与发布闸门（防悬空引用） ==========
+-- 背景：写日志（eBPF 写探针）**无丢事件检测**——高并发/海量 syscall 下事件可能被丢弃。
+-- `.git` 是「索引↔对象库↔refs」强耦合数据库：一旦漏捕获某些对象（尤其 stash/rebase 期间
+-- 大量小对象），而指针（index/HEAD/refs）被照常写入，就会产生**悬空引用**（存了指针丢了对象，
+-- `git fsck` 报 missing blob/commit，rebase/pull 直接失败）。为此加两道防线：
+--   B1 捕获阶段：只要本轮可能触及 `.git`（git 写工具 / 日志命中 / `.git` 内容新鲜），就
+--      **放弃写日志增量、强制全量遍历**（hint=nil），用 O(仓库) 时间换正确性。
+--   B3 发布阶段：真正写指针**之前**校验其引用的对象（候选提供 + 宿主现存）齐全，否则 fail-closed。
+
+--- git 内容新鲜度窗口（秒）：`.git` 内容/指针 mtime 落在此窗口内即视为「可能被本轮改动」。
+local _GIT_FRESH_S = 120
+
+--- 路径是否可能位于某 git 仓库 `.git` 内部（含符号链接解析）。
+--- @param p string
+--- @return boolean
+local function _path_maybe_git_internal(p)
+  if type(p) ~= "string" or p == "" then return false end
+  local runtime = require("NeoAI.sandbox.runtime")
+  if runtime.is_git_internal(p) then return true end
+  local real = vim.uv.fs_realpath(p)
+  return real ~= nil and runtime.is_git_internal(real)
+end
+
+--- 收集捕获根下可能的 gitdir（含 `.git` 为文件的工作树/子模块形式）。
+--- @param root string
+--- @return string[]
+local function _git_dirs_of(root)
+  local out = {}
+  local gd = (root == nil or root == "") and ".git" or (root .. "/.git")
+  local st = vim.uv.fs_lstat(gd)
+  if not st then return out end
+  if st.type == "directory" then
+    out[#out + 1] = gd
+  elseif st.type == "file" then
+    local f = io.open(gd, "rb")
+    if f then
+      local line = f:read("*l") or ""
+      f:close()
+      local p = line:match("^gitdir:%s*(.+)$")
+      if p then
+        if p:sub(1, 1) ~= "/" then p = (root or "") .. "/" .. p end
+        out[#out + 1] = p
+      end
+    end
+  end
+  return out
+end
+
+--- 本轮写日志是否**确定未触碰**捕获根下的 `.git`。任一不确定性返回 false（→ 强制全量遍历）。
+--- 排除项：写/删路径命中或符号链接解析进 `.git`；`.git/index.lock` 新鲜存在（git 正持锁）；
+--- `.git` 下 objects/refs/logs 目录或主要指针文件 mtime 落在命令窗口内（兜底覆盖「命令未产生
+--- 写事件却改了 .git」的观测缺口——这是丢事件时最后的防线）。
+--- @param root string 捕获根（真实路径）
+--- @param hint table { writes = {path=true}, deletes = {path=true} }
+--- @return boolean 安全（未触碰 .git）
+_journal_definitely_no_git = function(root, hint)
+  local now = os.time()
+  local gds = _git_dirs_of(root)
+  if #gds == 0 then return true end
+  local function under(p, r) return p == r or p:sub(1, #r + 1) == r .. "/" end
+  local function hits_git(p)
+    if _path_maybe_git_internal(p) then return true end
+    for _, g in ipairs(gds) do if under(p, g) then return true end end
+    return false
+  end
+  for p in pairs(hint.writes or {}) do if hits_git(p) then return false end end
+  for p in pairs(hint.deletes or {}) do if hits_git(p) then return false end end
+  for _, g in ipairs(gds) do
+    local lst = vim.uv.fs_lstat(g .. "/index.lock")
+    if lst and lst.mtime and (now - lst.mtime.sec) <= _GIT_FRESH_S then return false end
+    for _, sub in ipairs({ "objects", "refs", "logs" }) do
+      local dst = vim.uv.fs_stat(g .. "/" .. sub)
+      if dst and dst.mtime and (now - dst.mtime.sec) <= _GIT_FRESH_S then return false end
+    end
+    for _, fn in ipairs({ "HEAD", "ORIG_HEAD", "packed-refs", "MERGE_HEAD",
+      "CHERRY_PICK_HEAD", "REVERT_HEAD", "FETCH_HEAD", "index" }) do
+      local st = vim.uv.fs_stat(g .. "/" .. fn)
+      if st and st.mtime and (now - st.mtime.sec) <= _GIT_FRESH_S then return false end
+    end
+  end
+  return true
+end
+
+--- 读取 pack `.idx`（v2）排序 oid 表（N×20 字节原始串）；无法解析返回 nil。单条目缓存。
+--- @param idx_path string
+--- @return string|nil
+local _pack_oid_cache = nil
+local function _pack_oid_table(idx_path)
+  local st = vim.uv.fs_stat(idx_path)
+  if not st then return nil end
+  local key = idx_path .. "|" .. tostring(st.mtime and st.mtime.sec) .. "|" .. tostring(st.size)
+  if _pack_oid_cache and _pack_oid_cache.key == key then return _pack_oid_cache.data end
+  local f = io.open(idx_path, "rb")
+  if not f then return nil end
+  local data = nil
+  local magic = f:read(4)
+  local ver = f:read(4)
+  local fan = f:read(1024)
+  if magic == "\255tOc" and ver and #ver >= 4 and fan and #fan == 1024 then
+    local v = ver:byte(1) * 16777216 + ver:byte(2) * 65536 + ver:byte(3) * 256 + ver:byte(4)
+    if v == 2 then
+      local function u32(b, i) return b:byte(i) * 16777216 + b:byte(i + 1) * 65536 + b:byte(i + 2) * 256 + b:byte(i + 3) end
+      local n = u32(fan, 1024 - 3) -- 扇区 255 的累计计数即对象总数
+      data = f:read(n * 20)
+      if data and #data < n * 20 then data = nil end
+    end
+  end
+  f:close()
+  _pack_oid_cache = { key = key, data = data }
+  return data
+end
+
+--- oid 是否在某 pack 的排序 oid 表中（二分）。
+--- @param oid_table string N×20 字节原始串
+--- @param oid string 40 位十六进制
+--- @return boolean
+local function _pack_has(oid_table, oid)
+  local lo, hi = 0, math.floor(#oid_table / 20) - 1
+  while lo <= hi do
+    local mid = math.floor((lo + hi) / 2)
+    local cur = oid_table:sub(mid * 20 + 1, mid * 20 + 20)
+    local hex = cur:gsub(".", function(c) return string.format("%02x", c:byte()) end)
+    if hex == oid then return true end
+    if hex < oid then lo = mid + 1 else hi = mid - 1 end
+  end
+  return false
+end
+
+--- 对象是否存在：候选提供的对象库写入 ∪ 宿主松散对象 ∪ 宿主 pack 索引。
+--- 候选含 pack 写入时无法廉价判定 pack 内容 → 宽容放行（pack 由 git 原子写入、内部自洽）。
+--- @param dir string gitdir
+--- @param oid string
+--- @param provided table { ["objects/ab/cdef..."] = true }
+--- @param cand_has_pack boolean
+--- @return boolean
+local function _object_present(dir, oid, provided, cand_has_pack)
+  if type(oid) ~= "string" or #oid ~= 40 then return true end
+  if provided["objects/" .. oid:sub(1, 2) .. "/" .. oid:sub(3)] then return true end
+  if vim.uv.fs_stat(dir .. "/objects/" .. oid:sub(1, 2) .. "/" .. oid:sub(3)) then return true end
+  if cand_has_pack then return true end
+  local pdir = dir .. "/objects/pack"
+  local h = vim.uv.fs_scandir(pdir)
+  if h then
+    while true do
+      local name = vim.uv.fs_scandir_next(h)
+      if not name then break end
+      if name:sub(-4) == ".idx" then
+        local t = _pack_oid_table(pdir .. "/" .. name)
+        if t and _pack_has(t, oid) then return true end
+      end
+    end
+  end
+  return false
+end
+
+--- 解析 git index（v2）字节流中的 blob oid 列表；无法解析（v3/扩展/损坏）返回 nil（→ 宽容跳过）。
+--- @param data string index 文件字节内容
+--- @return table|nil oid 数组
+local function _index_blob_oids_data(data)
+  if type(data) ~= "string" or #data < 12 or data:sub(1, 4) ~= "DIRC" then return nil end
+  local function gb(i) return data:byte(i) end
+  local ver = gb(5) * 16777216 + gb(6) * 65536 + gb(7) * 256 + gb(8)
+  if ver ~= 2 then return nil end
+  local count = gb(9) * 16777216 + gb(10) * 65536 + gb(11) * 256 + gb(12)
+  local out = {}
+  local pos = 13
+  for _ = 1, count do
+    if pos + 61 > #data then return nil end
+    out[#out + 1] = (data:sub(pos + 40, pos + 59):gsub(".", function(c) return string.format("%02x", c:byte()) end))
+    local e = pos + 62
+    while e <= #data and gb(e) ~= 0 do e = e + 1 end
+    if e > #data then return nil end
+    local nb = e - (pos + 62) + 1 -- 文件名 + NUL 字节数
+    local pad = (8 - ((62 + nb) % 8)) % 8
+    pos = e + 1 + pad
+  end
+  return out
+end
+
+--- 解析磁盘上 git index（v2）的 blob oid 列表；读不到/不可解析返回 nil。
+--- @param path string
+--- @return table|nil
+local function _index_blob_oids(path)
+  local f = io.open(path, "rb")
+  if not f then return nil end
+  local data = f:read("*a") or ""
+  f:close()
+  return _index_blob_oids_data(data)
+end
+
+--- 发布前 `.git` 完整性闸门（fail-closed）：本候选将写入/更新 index 或 HEAD/refs 指针时，
+--- 在真正写指针**之前**校验——这些指针（候选新值）所引用的每个对象，必须由「候选提供的对象库
+--- 写入」或「宿主现存对象（松散/pack）」覆盖；任一缺失即拒绝发布。
+--- 这是「对象先于指针」应用序之外的第二道防线：即便捕获阶段漏掉对象，也绝不写出悬空引用。
+--- @param candidate table
+--- @return table|nil { ok=false, state="FAILED", reason } 校验失败时
+local function _git_publish_gate(candidate)
+  local runtime = require("NeoAI.sandbox.runtime")
+  local files = candidate.files or {}
+  local function rel_git(p)
+    local d, r = p:match("^(.*)/%.git/(.+)$")
+    if d then return d .. "/.git", r end
+    local r2 = p:match("^%.git/(.+)$")
+    if r2 then return ".git", r2 end
+    return nil, nil
+  end
+  local dir, provided, cand_content = nil, {}, {}
+  local ref_targets, gate_needed, cand_has_pack = {}, false, false
+  for _, f in ipairs(files) do
+    local gc = f.git_class or runtime.git_path_class(f.path)
+    if gc == "object" or gc == "pointer" then
+      local gd, rel = rel_git(f.path)
+      if gd and not dir then dir = gd end
+      if rel then
+        if gc == "object" then
+          if rel:sub(1, 13) == "objects/pack/" then cand_has_pack = true end
+          if f.action == "create" or f.action == "modify" then provided[rel] = true end
+        elseif f.action == "create" or f.action == "modify" then
+          local c = _candidate_content(f)
+          if c then cand_content[rel] = c end
+          if rel == "index" then
+            gate_needed = true
+          elseif rel == "HEAD" or rel:sub(-5) == "_HEAD" or rel:sub(1, 5) == "refs/" then
+            ref_targets[rel] = true
+            gate_needed = true
+          end
+        end
+      end
+    end
+  end
+  if not (gate_needed and dir) then return nil end
+  -- 磁盘 packed-refs 映射（松散 ref 未命中时回退）
+  local pr = {}
+  do
+    local f = io.open(dir .. "/packed-refs")
+    if f then
+      for line in f:lines() do
+        if line:sub(1, 1) ~= "#" and line:sub(1, 1) ~= "^" then
+          local oid, name = line:match("^(%x+)%s+(.+)$")
+          if oid and name then pr[name] = oid end
+        end
+      end
+      f:close()
+    end
+  end
+  --- 解析 ref 名到 oid：候选新值优先，其次磁盘现状，再回退 packed-refs。
+  local function resolve(name)
+    for _ = 1, 8 do
+      local c = cand_content[name]
+      if c then
+        local line = c:match("^([^\n]*)") or ""
+        local t = line:match("^ref:%s*(.+)$")
+        if t then name = t else return line end
+      else
+        local fh = io.open(dir .. "/" .. name, "rb")
+        if fh then
+          local line = fh:read("*l") or ""
+          fh:close()
+          local t = line:match("^ref:%s*(.+)$")
+          if t then name = t else return line end
+        else
+          return pr[name]
+        end
+      end
+    end
+    return nil
+  end
+  local bad = nil
+  local function check(oid, what)
+    if type(oid) == "string" then oid = oid:match("^(%x+)") end
+    if oid and #oid == 40 and not _object_present(dir, oid, provided, cand_has_pack) then
+      bad = what .. " -> " .. oid
+    end
+  end
+  check(resolve("HEAD"), "HEAD")
+  if not bad then
+    for name in pairs(ref_targets) do
+      check(resolve(name), name)
+      if bad then break end
+    end
+  end
+  if not bad then
+    local idx_data = cand_content["index"]
+    local oids = idx_data and _index_blob_oids_data(idx_data) or _index_blob_oids(dir .. "/index")
+    if oids then
+      for _, oid in ipairs(oids) do
+        check(oid, "index")
+        if bad then break end
+      end
+    end
+  end
+  if bad then
+    pcall(function()
+      require("NeoAI.kernel.logger").warn(
+        "[sandbox] 发布前 .git 完整性闸门拒绝：指针引用的对象缺失（%s）", bad)
+    end)
+    return { ok = false, state = "FAILED", reason = "GIT_REFERENTIAL_INTEGRITY: " .. bad }
+  end
+  return nil
+end
+
 --- 发布前校验（纵深防御）：候选路径可能来自落盘存储（本地可篡改）或旧版本记录。
 --- 逐文件重规范化：若解析结果与记录的路径不一致（`..`/符号链接被引入或替换），
 --- 或命中宿主敏感遮蔽路径，一律拒绝，绝不把内容写到未经验证的真实位置。
@@ -3093,6 +3407,9 @@ end
 --- @return table|nil 校验失败时返回 { ok=false, state, reason }
 local function _publish_validate(candidate)
   local runtime = require("NeoAI.sandbox.runtime")
+  -- `.git` 完整性闸门（fail-closed）：写指针前校验其引用对象齐全，杜绝悬空引用。
+  local git_invalid = _git_publish_gate(candidate)
+  if git_invalid then return git_invalid end
   for _, f in ipairs(candidate.files or {}) do
     if type(f.path) ~= "string" or f.path == "" then
       return { ok = false, state = "FAILED", reason = "INVALID_PATH" }

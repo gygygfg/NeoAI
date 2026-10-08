@@ -23,6 +23,15 @@ local fs = require("NeoAI.utils.fs")
 
 local M = {}
 
+-- git 变更类工具（沙箱内执行、会改写 `.git`）：这些工具必须**始终全量捕获** overlay 改动，
+-- 绝不启用写日志增量捕获——`.git` 是索引↔对象库↔refs 强耦合数据库，漏捕获任一对象都会
+-- 产生悬空引用（见 candidate `_journal_definitely_no_git` 与 `_git_publish_gate`）。git 改动量
+-- 相对整仓很小，全量遍历代价可接受。
+local GIT_WRITE_TOOLS = {
+  git_add = true, git_commit = true, git_stash = true,
+  git_restore = true, git_rollback = true,
+}
+
 -- ========== 性能埋点（tools.sandbox.diagnostics.enabled） ==========
 -- 仅写 NeoAI 日志，不改变行为、不进入模型可见结果。用于定位 run_command 固定开销
 -- （执行 vs 冻结/结算 vs 后处理）。开启后每条命令记录分段耗时。
@@ -2320,14 +2329,17 @@ local function _gate_inner(tool, args, ctx, call_original)
       local chain = _serialize_capture(function()
         local captures = {}
         local pkg_opts = { package = attempt.package == true }
+        -- git 写工具（git_add/commit/stash/restore/rollback）：**强制全量捕获**，绝不带
+        -- 写日志 hint——`.git` 漏捕获任一对象都会产生悬空引用（详见顶部 GIT_WRITE_TOOLS 注释）。
+        local cap_hint = GIT_WRITE_TOOLS[attempt.tool_name] and nil or journal_hint
         if runtime.backend() == "bwrap" and #active_specs > 0 then
           for _, cap_spec in ipairs(active_specs) do
             captures[#captures + 1] = candidate.capture_overlay_async(attempt.attempt_id, cap_spec.root,
-              cap_spec.mode == "bind" and cap_spec.bind or cap_spec.upper, journal_hint, pkg_opts)
+              cap_spec.mode == "bind" and cap_spec.bind or cap_spec.upper, cap_hint, pkg_opts)
           end
         else
           captures[#captures + 1] = candidate.capture_overlay_async(
-            attempt.attempt_id, real_cwd, staging, journal_hint, pkg_opts)
+            attempt.attempt_id, real_cwd, staging, cap_hint, pkg_opts)
         end
         local _t_freeze = vim.uv.hrtime()
         return async.all(captures):then_(function()

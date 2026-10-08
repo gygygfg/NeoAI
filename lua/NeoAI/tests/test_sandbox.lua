@@ -536,6 +536,50 @@ tests.suite("sandbox", function(_, it)
     vim.fn.delete(dir, "rf")
   end)
 
+  it("git 发布闸门：指针引用的对象缺失时 fail-closed（防悬空引用）", function(t)
+    local candidate = require("NeoAI.sandbox.candidate")
+    local dir = vim.fn.tempname()
+    require("NeoAI.utils.fs").ensure_dir(dir .. "/.git")
+    -- HEAD 指向不存在的 commit → 发布前闸门拒绝（不触发任何写盘）。
+    local res = candidate.publish({
+      files = {
+        { path = dir .. "/.git/HEAD", action = "create", content = string.rep("d", 40) .. "\n" },
+      },
+    })
+    t.eq(false, res.ok, "指针引用缺失对象时应拒绝发布")
+    t.eq("FAILED", res.state)
+    t.matches("GIT_REFERENTIAL_INTEGRITY", res.reason or "", "应给出完整性拒绝原因")
+    -- refs 指向不存在的对象 → 同样拒绝。
+    local res_ref = candidate.publish({
+      files = {
+        { path = dir .. "/.git/refs/heads/newbranch", action = "create",
+          content = string.rep("f", 40) .. "\n" },
+      },
+    })
+    t.eq(false, res_ref.ok, "ref 指向缺失对象时应拒绝发布")
+    t.matches("GIT_REFERENTIAL_INTEGRITY", res_ref.reason or "", "应给出完整性拒绝原因")
+    -- 对照：候选自带被引用对象 → 闸门放行（写盘经 writer 拦截）。
+    local oid = string.rep("a", 40)
+    local writer = require("NeoAI.sandbox.writer")
+    local orig_apply = writer.apply
+    local applied = {}
+    writer.apply = function(action, path, content, opts)
+      applied[#applied + 1] = path
+      return { ok = true, state = "COMMITTED" }
+    end
+    local ok = candidate.publish({
+      files = {
+        { path = dir .. "/.git/HEAD", action = "create", content = oid .. "\n" },
+        { path = dir .. "/.git/objects/aa/" .. string.rep("a", 38), action = "create", content = "obj" },
+      },
+    })
+    writer.apply = orig_apply
+    t.true_(ok.ok, "候选自带被引用对象时应放行: " .. tostring(ok.reason))
+    t.true_(#applied >= 2, "应写入对象与指针")
+    t.matches("objects", applied[1] or "", "对象应先于指针写入")
+    vim.fn.delete(dir, "rf")
+  end)
+
   it("一致性：命令还原暂存编辑后同步视图（不残留待审候选，不被旧暂存回滚）", function(t)
     local runtime = require("NeoAI.sandbox.runtime")
     if runtime.backend() ~= "bwrap" then return end
