@@ -90,6 +90,8 @@ M.WINDOW_OPENED = "window:opened"
 M.WINDOW_CLOSED = "window:closed"
 M.UI_REFRESHED = "ui:refreshed"
 M.UI_MODE_CHANGED = "ui:mode_changed"
+-- 光标跟随状态跳变（跟随 ↔ 非跟随）：payload { following = boolean }
+M.UI_FOLLOW_CHANGED = "ui:follow_changed"
 M.DISPLAY_MODE_CHANGED = "display:mode_changed"
 
 -- ========== 子 Agent ==========

@@ -223,7 +223,10 @@ tests.suite("chat_keys", function(_, it)
     vim.cmd("new")
     local win = vim.api.nvim_get_current_win()
     input_box.attach_window(win)
-    -- 模拟用户把输入窗口切到一个"文件" buffer（焦点跳到别的 buffer）
+    -- 模拟输入窗口显示了别的 buffer（winfixbuf 已阻止用户切换；这里是 focus() 的兜底防御路径，
+    -- 需先临时关闭 winfixbuf 才能构造该状态）。
+    local fix = vim.fn.exists("&winfixbuf") == 1
+    if fix then pcall(function() vim.wo[win].winfixbuf = false end) end
     local file_buf = vim.api.nvim_create_buf(false, true)
     vim.api.nvim_buf_set_lines(file_buf, 0, -1, false, { "FILE-ORIG" })
     vim.api.nvim_win_set_buf(win, file_buf)
@@ -237,6 +240,44 @@ tests.suite("chat_keys", function(_, it)
     t.eq("FILE-ORIG", file_lines[1], "文件 buffer 不应被追加 'A' 等字符")
     pcall(vim.api.nvim_win_close, win, true)
     pcall(vim.api.nvim_buf_delete, file_buf, { force = true })
+    input_box.reset()
+  end)
+
+  it("输入窗口锁定 winfixbuf：:e 文件不改写输入 buffer（回归 N1）", function(t)
+    local input_box = require("NeoAI.ui.components.input_box")
+    input_box.reset()
+    input_box.create({ on_submit = function() end })
+    local buf = input_box.get_buf()
+    vim.cmd("new")
+    local win = vim.api.nvim_get_current_win()
+    input_box.attach_window(win)
+
+    if vim.fn.exists("&winfixbuf") == 0 then
+      -- 旧版 Neovim 无 winfixbuf：跳过（功能本就不支持）
+      pcall(vim.api.nvim_win_close, win, true)
+      input_box.reset()
+      return
+    end
+
+    t.true_(vim.wo[win].winfixbuf, "绑定输入窗口后应开启 winfixbuf")
+
+    -- 输入框写入内容
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "用户输入" })
+    vim.api.nvim_win_set_buf(win, buf)
+
+    -- 用户在输入窗口执行 :e <file>：winfixbuf 应拦下，输入 buffer 不被复用为文件 buffer
+    local tmp = vim.fn.tempname()
+    local ok, err = pcall(function()
+      vim.api.nvim_win_call(win, function() vim.cmd("edit " .. vim.fn.fnameescape(tmp)) end)
+    end)
+    t.false_(ok, "winfixbuf 下 :e 其它文件应失败（E1513）")
+    t.true_(tostring(err):find("1513") ~= nil, "应报 E1513（Cannot switch buffer），实际: " .. tostring(err))
+    t.eq(buf, vim.api.nvim_win_get_buf(win), "输入窗口应仍显示输入 buffer")
+    t.eq("用户输入", vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1], "输入内容不应被 :e 覆盖")
+    t.eq("nofile", vim.bo[buf].buftype, "输入 buffer 仍应为 nofile（未被复用为文件 buffer）")
+
+    pcall(vim.api.nvim_win_close, win, true)
+    pcall(vim.api.nvim_buf_delete, buf, { force = true })
     input_box.reset()
   end)
 

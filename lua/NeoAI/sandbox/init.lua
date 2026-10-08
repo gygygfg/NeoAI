@@ -414,6 +414,12 @@ function M.list_traces_grouped()
   return trace.list_grouped()
 end
 
+--- 越界访问留痕（按命令聚合：命令 → 涉及文件；供审批悬浮窗「越界命令」视角展示）
+--- @return table 数组
+function M.list_traces_grouped_by_command()
+  return trace.list_grouped_by_command()
+end
+
 --- 越界访问留痕的去重文件数（供状态栏徽标）
 --- @return number
 function M.trace_count()

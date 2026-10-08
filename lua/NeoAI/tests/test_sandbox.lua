@@ -1989,6 +1989,41 @@ tests.suite("sandbox", function(_, it)
     trace.reset()
   end)
 
+  it("越界访问留痕：同 (tool,path) 的不同命令累积（去重有界）", function(t)
+    local trace = require("NeoAI.sandbox.trace")
+    trace.reset()
+    trace.record({ tool = "run_command", path = "/root/a.txt", command = "cat /root/a.txt" })
+    trace.record({ tool = "run_command", path = "/root/a.txt", command = "grep token /root/a.txt" })
+    -- 重复命令只累积一次
+    trace.record({ tool = "run_command", path = "/root/a.txt", command = "cat /root/a.txt" })
+    t.eq(1, trace.count(), "同 (tool,path) 仍只有一条留痕")
+    t.eq(1, trace.file_count(), "去重文件数不变")
+    local g = trace.list_grouped()[1]
+    t.deep_eq({ "cat /root/a.txt", "grep token /root/a.txt" }, g.commands, "应累积不同命令（去重有序）")
+    -- 无命令的文件类访问不产生命令
+    trace.record({ tool = "read_file", path = "/root/b.txt" })
+    local gb = trace.list_grouped()[2]
+    t.deep_eq({}, gb.commands, "无命令访问的 commands 为空")
+    trace.reset()
+  end)
+
+  it("越界访问留痕：按命令聚合（命令 → 涉及文件）", function(t)
+    local trace = require("NeoAI.sandbox.trace")
+    trace.reset()
+    trace.record({ tool = "run_command", path = "/root/a.txt", command = "cat /root/a.txt" })
+    trace.record({ tool = "run_command", path = "/root/b.txt", command = "cat /root/a.txt" })
+    trace.record({ tool = "run_command", path = "/root/a.txt", command = "grep x /root/a.txt" })
+    trace.record({ tool = "read_file", path = "/root/c.txt" })
+    local by = trace.list_grouped_by_command()
+    -- 有命令者按命令升序在前（cat… < grep…），无命令哨兵组置末。
+    t.eq("cat /root/a.txt", by[1].command, "命令应升序（cat 在前）")
+    t.deep_eq({ "/root/a.txt", "/root/b.txt" }, by[1].files, "同一命令应合并文件（去重有序）")
+    t.eq("grep x /root/a.txt", by[2].command)
+    t.eq(nil, by[3].command, "无命令访问归入哨兵组（command=nil）")
+    t.deep_eq({ "/root/c.txt" }, by[3].files, "哨兵组应含无命令访问的文件")
+    trace.reset()
+  end)
+
   it("保存/撤销保存：撤销回滚原文件并回到待审，冲突时拒绝", function(t)
     local fs = require("NeoAI.utils.fs")
     local sandbox = require("NeoAI.sandbox")

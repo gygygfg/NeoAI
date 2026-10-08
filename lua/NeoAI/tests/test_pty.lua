@@ -146,12 +146,116 @@ tests.suite("pty", function(_, it, before_each)
     package.loaded["NeoAI.ui.window.chat_view"] = { is_following = function() return true end }
     t.true_(pty._should_show_window({}, false), "跟随且 always 启动即弹")
 
-    t.false_(pty._should_show_window({ window = {} }, true), "已打开不应重复弹")
+    -- session.window 只是「曾打开」标记：真打开（组件 is_open 为 true）时不重复弹
+    local tw_saved = package.loaded["NeoAI.ui.components.terminal_window"]
+    pcall(pty.reset)
+    cfg.set("tools.run_command.interactive.show_window", "on_wait")
+    package.loaded["NeoAI.ui.components.terminal_window"] = {
+      is_open = function(id) return id == "s1" end,
+    }
+    t.false_(pty._should_show_window({ id = "s1", window = {} }, true), "已打开不应重复弹")
+    -- 句柄失效（组件 is_open 为 false，如用户手动关窗）→ 视为未打开，可再次弹出并清除 stale 句柄
+    local stale = { id = "s2", window = {} }
+    t.true_(pty._should_show_window(stale, true), "句柄失效后应可再次弹出")
+    t.nil_(stale.window, "失效句柄应被清除")
+    package.loaded["NeoAI.ui.components.terminal_window"] = tw_saved
+    pcall(pty.reset)
+
     cfg.set("tools.run_command.interactive.show_window", "never")
     t.false_(pty._should_show_window({}, true), "never 不弹")
 
     package.loaded["NeoAI.ui.window.chat_view"] = saved
     cfg.set("tools.run_command.interactive.show_window", old)
+  end)
+
+  it("悬浮终端句柄失效后仍能再次弹出（回归“不是每次都弹出”）", function(t)
+    local pty = require("NeoAI.services.pty")
+    local cfg = config_store
+    local old_sw = cfg.get("tools.run_command.interactive.show_window")
+    local tw_saved = package.loaded["NeoAI.ui.components.terminal_window"]
+    local cv_saved = package.loaded["NeoAI.ui.window.chat_view"]
+    pcall(pty.reset)
+
+    local opened = true
+    package.loaded["NeoAI.ui.components.terminal_window"] = {
+      is_open = function() return opened end,
+    }
+    package.loaded["NeoAI.ui.window.chat_view"] = { is_following = function() return true end }
+    pty._set_force_ui(true)
+    cfg.set("tools.run_command.interactive.show_window", "on_wait")
+
+    -- 窗口打开：判定已打开，不重复弹
+    local session = { id = "ptyS", window = {} }
+    t.false_(pty._should_show_window(session, true), "窗口打开时不重复弹")
+
+    -- 用户手动关闭（<C-q>）/窗口被关：组件 is_open 变 false，但 session.window 句柄仍残留。
+    -- 修复前会据此永久判定「已打开」而不再弹（伪终端“不是每次都弹出”的根因）。
+    opened = false
+    t.true_(pty._should_show_window(session, true), "句柄失效后应可再次弹出")
+    t.nil_(session.window, "失效句柄应被清除")
+
+    pty._set_force_ui(false)
+    pcall(pty.reset)
+    package.loaded["NeoAI.ui.components.terminal_window"] = tw_saved
+    package.loaded["NeoAI.ui.window.chat_view"] = cv_saved
+    cfg.set("tools.run_command.interactive.show_window", old_sw)
+  end)
+
+  it("跟随跳变时隐藏/重弹悬浮终端窗", function(t)
+    local pty = require("NeoAI.services.pty")
+    local cfg = config_store
+    local old_sw = cfg.get("tools.run_command.interactive.show_window")
+    local tw_saved = package.loaded["NeoAI.ui.components.terminal_window"]
+    local cv_saved = package.loaded["NeoAI.ui.window.chat_view"]
+    pcall(pty.reset)
+
+    local opens = {}
+    package.loaded["NeoAI.ui.components.terminal_window"] = {
+      open = function(session) opens[session.id] = true; return { id = session.id } end,
+      close = function(id) opens[id] = nil end,
+      is_open = function(id) return opens[id] == true end,
+      reset = function() opens = {} end,
+    }
+    package.loaded["NeoAI.ui.window.chat_view"] = { is_following = function() return true end }
+    pty._set_force_ui(true)
+    cfg.set("tools.run_command.interactive.show_window", "on_wait")
+
+    -- 等待中的会话：隐藏 → 重弹
+    local session = { id = "ptyA", waiting = true, window = { id = "ptyA" } }
+    opens["ptyA"] = true
+    pty._inject_session(session)
+    pty._hide_all_windows()
+    t.nil_(session.window, "隐藏后应清除窗口句柄")
+    t.nil_(opens["ptyA"], "隐藏后组件窗口应关闭")
+    t.true_(session.window_hidden == true, "应标记为已隐藏")
+    pty._restore_pending_windows()
+    t.not_nil(session.window, "重弹后应重新打开窗口")
+    t.true_(opens["ptyA"] == true, "重弹后组件窗口应打开")
+
+    -- on_wait 下非等待中的会话不重弹
+    local idle = { id = "ptyB", waiting = false, window = { id = "ptyB" } }
+    opens["ptyB"] = true
+    pty._inject_session(idle)
+    pty._hide_all_windows()
+    t.nil_(opens["ptyB"], "隐藏后 idle 窗口应关闭")
+    pty._restore_pending_windows()
+    t.nil_(opens["ptyB"], "on_wait 下非等待会话不应重弹")
+
+    -- always 下未结束会话一律重弹
+    cfg.set("tools.run_command.interactive.show_window", "always")
+    local s2 = { id = "ptyC", waiting = false, window = { id = "ptyC" } }
+    opens["ptyC"] = true
+    pty._inject_session(s2)
+    pty._hide_all_windows()
+    t.nil_(opens["ptyC"], "隐藏后应关闭")
+    pty._restore_pending_windows()
+    t.true_(opens["ptyC"] == true, "always 下未结束会话应重弹")
+
+    pty._set_force_ui(false)
+    pcall(pty.reset)
+    package.loaded["NeoAI.ui.components.terminal_window"] = tw_saved
+    package.loaded["NeoAI.ui.window.chat_view"] = cv_saved
+    cfg.set("tools.run_command.interactive.show_window", old_sw)
   end)
 
   it("run_command 工具描述标明可交互并含目标/操作", function(t)

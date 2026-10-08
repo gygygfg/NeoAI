@@ -266,7 +266,10 @@ is only kept for other `approval.mode` values (`prompt`/`strict`).
   surfaced to the user only via a **prominent statusline badge** (the `sandbox` part shows a
   bold yellow `待审N` only when pending reviews > 0, see [configuration.md](configuration.md)).
 - Async confirmation commands:
-  - `:NeoAISandboxReview` — open the review UI (`ui/components/sandbox_review.lua`), which
+  - `:NeoAISandboxReview` — open the review UI (`ui/components/sandbox_review.lua`)
+    (**it opens even with no pending / approval / trace items, showing an empty view — no
+    "nothing to review" notice and no auto-close**; refreshing into an empty queue keeps the
+    window open, and new items arriving are picked up by the event subscription), which
     highlights files by path level — **workspace=green, user directory=yellow, system=red** —
     with the `待审` state label **colored by security level** (L0 gray / L1 yellow / L2 orange / L3 red),
     and shows a **high/medium/low** risk grade (`[L0]低危` …
@@ -1465,7 +1468,15 @@ defense-in-depth to the bwrap prefix by default (`--cap-drop ALL` plus the tier 
     blocked. In that view traces are **merged by file path** (multiple tools for the same path collapse
     into one line `[tool1, tool2] path`) and **sorted by path ascending**; the statusline `sandbox`
     part also shows `越界N` when traces exist (`N` = distinct file count), in addition to pending
-    changes. Dedup is by `(tool, path)`. By default the source is **kernel-level behavior
+    changes. Dedup is by `(tool, path)`, but **multiple distinct commands for the same `(tool, path)`
+    accumulate on that entry** (`commands`, ordered/deduped/bounded), so the `i` detail can answer
+    "which commands accessed this file out of bounds"; the "越界·异常" page also has a **"越界命令
+    (command → files)"** section that aggregates by command (`trace.group_by_command`), listing the
+    files and tools each command accessed out of bounds (command-less file-tool accesses fall into a
+    "non-command tool access" sentinel group). Command source: process tools use `args.command`
+    (stored on `attempt.command`, token form; **not** part of the request hash and not persisted), and
+    the observation path `_on_observed` carries it when recording; file tools have no shell command,
+    so the detail falls back to tool+kind. By default the source is **kernel-level behavior
     observation** (`tools.sandbox.observe`; backends `ebpf` (bpftrace) → `strace` → `procfs`),
     attributed precisely to the attempt cgroup and watching real `openat/open` calls instead of
     parsing command strings; when none is available it falls back to command-string heuristics

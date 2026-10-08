@@ -199,6 +199,7 @@ All event constants are defined in `NeoAI.kernel.events`. They are listed below 
 | `WINDOW_CLOSED` | `window:closed` | Window closed | `{ win_id }` |
 | `UI_REFRESHED` | `ui:refreshed` | UI refreshed | — |
 | `UI_MODE_CHANGED` | `ui:mode_changed` | UI mode toggled | `{ mode }` |
+| `UI_FOLLOW_CHANGED` | `ui:follow_changed` | Chat cursor follow state flipped (following ↔ not following) | `{ following }` |
 | `DISPLAY_MODE_CHANGED` | `display:mode_changed` | Display mode toggled | `{ name }` |
 
 ### Sub-agents

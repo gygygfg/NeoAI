@@ -45,7 +45,24 @@ local state = {
   input_resize_augroup = nil, -- 输入框随内容增高自动命令组
   resize_augroup = nil, -- 窗口大小变化时重排表格自动命令组（VimResized）
   last_table_width = nil, -- 上次渲染表格所用宽度（resize 后宽度变化才重排）
+  folds_dirty = false, -- 插入模式期间写入过内容、折叠尚未补算（详见 _recompute_folds）
 }
+
+-- ========== 流式自动浮窗状态 ==========
+
+-- 三路流式自动浮窗（思考过程 / 接收参数 / 上下文压缩·计划蒸馏）当前是否有内容可重弹。
+-- 在各自事件 handler 的「跟随判定」**之前**置位：用户从「跟随」跳到「非跟随」时统一隐藏，
+-- 跳回「跟随」时按优先级重弹仍在进行的那个（详见 _hide_floats / _reshow_floats）。
+local reasoning_active = false
+local tool_args_active = false
+local ctxop_active = false
+local last_tool_calls = nil -- 最近一次工具参数快照（重弹用）
+local ctxop_last_text = "" -- 最近一次上下文操作展示文本（重弹用）
+local reasoning_last_text = "" -- 最近一次思考过程展示文本（隐藏时捕获，重弹用）
+local ctxop_kind = "compaction" -- 当前上下文操作类型（决定悬浮窗标题）"compaction" | "distill"
+
+-- 跟随状态跳变处理（前向声明：_schedule_render / _scroll / _wheel_scroll 先于其定义引用）。
+local _set_following
 
 -- 输入框高度：光标在主界面 → idle_height；光标在输入框 → min_height 起步，随内容行数增长，上限为主窗口高度的 max_ratio。
 local function _input_box_cfg()
@@ -113,6 +130,42 @@ local function _open_fold_start_lines()
   return starts
 end
 
+--- 补算插入模式期间被 nvim 抑制的折叠。
+--- 只要**任一**窗口处于插入模式，nvim 全局不计算 foldlevel（所有 buffer 均为 0），
+--- 且 InsertLeave 后也不会自动补算，除非聊天窗口重新获得焦点或内容再次写入。表现为：
+--- 光标在输入框进入插入模式后新写入的折叠文本不折叠（始终展开）。
+--- 这里在 InsertLeave 后（延迟到事件循环末尾）按需强制重算：
+---   1) 在聊天窗口上下文中重新赋值 foldexpr（同值赋值也会触发整段折叠重算）；
+---   2) foldclose! 收起重算后新出现的折叠块；
+---   3) 恢复用户此前已展开的折叠（重算会丢失手动开合状态）。
+local function _recompute_folds()
+  if not state.folds_dirty then return end
+  -- 仍处于插入模式（如用户切到其它窗口继续编辑）时不补算：补算会被再次抑制。
+  if vim.api.nvim_get_mode().mode:sub(1, 1) == "i" then return end
+  if not M.has_window() or not _win_shows_buf() then return end
+  local buf = state.buf
+  if not buf or not vim.api.nvim_buf_is_valid(buf) then return end
+  -- 重算前记录已展开的折叠，随后恢复：foldexpr 重算会丢失手动开合状态。
+  local open_folds = _open_fold_start_lines()
+  vim.api.nvim_win_call(state.win_id, function()
+    local expr = vim.wo[state.win_id].foldexpr
+    vim.wo[state.win_id].foldexpr = expr
+    -- 收起重算后新出现的折叠块（引用原折叠状态的块开合被重算清掉，稍后一并恢复）。
+    pcall(vim.cmd, "silent! 1,$foldclose!")
+    local cur = vim.api.nvim_win_get_cursor(state.win_id)
+    for _, ln in ipairs(open_folds) do
+      if ln <= vim.api.nvim_buf_line_count(buf) then
+        if vim.fn.foldclosed(ln) ~= -1 then
+          pcall(vim.api.nvim_win_set_cursor, state.win_id, { ln, 0 })
+          vim.cmd("silent! normal! zo")
+        end
+      end
+    end
+    pcall(vim.api.nvim_win_set_cursor, state.win_id, cur)
+  end)
+  state.folds_dirty = false
+end
+
 --- 当前聊天窗口对应的表格宽度上限：随窗口宽度自适应（窄窗收表、宽窗放表）。
 --- 无有效聊天窗口时返回 nil（表格用默认单列上限）。
 --- @return number|nil
@@ -155,6 +208,12 @@ local function _render(keep_view)
   -- 完全不触碰 buffer / 折叠 / 视口，直接返回。
   if diff and diff.changed == false then
     return false
+  end
+  -- 插入/替换模式期间 nvim 全局不计算折叠（见 _recompute_folds）：本次写入的新折叠块
+  -- 不会被收起。记下 dirty，待 InsertLeave 后由 _recompute_folds 统一补算。
+  local mode = vim.api.nvim_get_mode().mode
+  if mode:find("^[iR]") then
+    state.folds_dirty = true
   end
   -- 折叠/视口操作只在窗口确实显示聊天 buffer 时执行：nvim_win_call 内的 foldlevel/
   -- foldclose!/set_cursor/getline/foldexpr 都作用于窗口当前 buffer，若窗口已被 :bnext
@@ -295,7 +354,7 @@ local function _schedule_render(keep_view)
       -- 用实时光标重判跟随：此前 keep_view 调度时缓存的判定可能已过期，
       -- 避免把仍贴底的光标误判为不跟随而不再滚动。
       render_pending_follow = _cursor_within_follow_margin()
-      state.following = render_pending_follow
+      _set_following(render_pending_follow)
     end
     return
   end
@@ -305,7 +364,7 @@ local function _schedule_render(keep_view)
   -- 渲染后再判断会导致跟随失效），把决定缓存在调度时，并同步给 state.following
   -- （不跟随时用于抑制思考悬浮窗弹出与折叠收起）。
   render_pending_follow = _cursor_within_follow_margin()
-  state.following = render_pending_follow
+  _set_following(render_pending_follow)
   render_pending_keep_view = kv
   local epoch = render_epoch
   local function _run()
@@ -400,8 +459,6 @@ local ctxop_pending = ""
 local ctxop_flush_scheduled = false
 -- 上下文操作已终止（完成 / 正文开始 / 窗口关闭）：已排队的冲刷回调应作废。
 local ctxop_cancelled = true
--- 当前上下文操作类型（决定悬浮窗标题）："compaction" | "distill"
-local ctxop_kind = "compaction"
 
 --- 取消未冲刷的上下文操作分片（完成 / 正文开始 / 窗口关闭时调用）
 local function _cancel_ctxop()
@@ -459,6 +516,9 @@ local function _on_message_updated(payload)
   local msg = payload.message
   -- 事件 payload 只带标量标志（has_content）；兼容直接传完整 message 的调用方（测试/插件）。
   if msg and (msg.has_content or msg.content ~= "") then
+    -- 正文开始：推理已结束（思考浮窗进入正文阶段本就该关），清 active 标记避免重弹过期的
+    -- 思考浮窗内容（正文流期间 reasoning_active 不再代表"进行中"）。
+    reasoning_active = false
     -- 正文开始：取消尚未冲刷的推理分片并关闭悬浮窗。若不取消，已 vim.schedule 的
     -- _flush_reasoning 稍后还会把残留分片 append 上去、把已关闭的悬浮窗重新打开。
     _cancel_pending_reasoning()
@@ -499,6 +559,8 @@ local function _on_reasoning_chunk(payload)
     -- 新一轮推理（如工具循环第二/多轮 turn）会重新发射分片：重置取消标记，
     -- 允许后续分片正常冲刷到悬浮窗。
     reasoning_cancelled = false
+    -- 先于跟随判定置位：跟随↔非跟随跳变时据此决定是否隐藏 / 重弹该浮窗。
+    reasoning_active = true
     -- 光标不跟随时抑制思考悬浮窗：既不缓存分片也不调度冲刷，避免弹出悬浮窗干扰查看。
     -- 用实时光标位置判断（而非缓存的 state.following），用户切回底部后下一分片即可恢复。
     if not _cursor_within_follow_margin() then return end
@@ -508,6 +570,7 @@ local function _on_reasoning_chunk(payload)
       vim.schedule(_flush_reasoning)
     end
   else
+    reasoning_active = true
     if not _cursor_within_follow_margin() then return end
     -- 事件不再随分片携带完整 reasoning；缺失时从当前 Agent 消息队列取末条正文兜底。
     local text = payload.reasoning
@@ -583,6 +646,7 @@ local function _close_reasoning_panel(payload)
   if not payload or payload.agent_id ~= state.agent_id then return end
   -- 推理结束：取消尚未冲刷的分片（避免已排队的 flush 回调重新打开悬浮窗），再关闭。
   _cancel_pending_reasoning()
+  reasoning_active = false
   reasoning_panel.close()
 end
 
@@ -592,6 +656,9 @@ local function _on_tool_arg_chunk(payload)
   if not payload or payload.agent_id ~= state.agent_id then return end
   if not payload.tool_calls or #payload.tool_calls == 0 then return end
   tool_args_cancelled = false
+  -- 先于跟随判定置位（含最近快照）：跟随↔非跟随跳变时据此决定是否隐藏 / 重弹该浮窗。
+  tool_args_active = true
+  last_tool_calls = payload.tool_calls
   -- 光标不跟随时抑制接收参数悬浮窗，避免弹出悬浮窗干扰用户查看。
   if not _cursor_within_follow_margin() then return end
   -- 参数接收阶段收起思考过程悬浮窗（含作废其已排队的冲刷），避免两窗重叠遮挡。
@@ -608,6 +675,8 @@ end
 local function _close_tool_args_panel(payload)
   if not payload or payload.agent_id ~= state.agent_id then return end
   _cancel_pending_tool_args()
+  tool_args_active = false
+  last_tool_calls = nil
   tool_args_panel.close()
 end
 
@@ -620,9 +689,12 @@ local function _on_ctxop_started(payload, kind)
   if not payload or payload.agent_id ~= state.agent_id then return end
   ctxop_cancelled = false
   ctxop_kind = kind or "compaction"
+  -- 先于跟随判定置位（含占位文本）：跟随↔非跟随跳变时据此决定是否隐藏 / 重弹该浮窗。
+  ctxop_active = true
+  local placeholder = kind == "distill" and "正在计划蒸馏…" or "正在压缩上下文…"
+  ctxop_last_text = placeholder
   -- 光标不跟随时抑制悬浮窗：既不缓存分片也不调度冲刷，避免弹出悬浮窗干扰查看。
   if not _cursor_within_follow_margin() then return end
-  local placeholder = kind == "distill" and "正在计划蒸馏…" or "正在压缩上下文…"
   ctxop_pending = placeholder
   if not ctxop_flush_scheduled then
     ctxop_flush_scheduled = true
@@ -635,8 +707,10 @@ end
 local function _on_ctxop_chunk(payload)
   if not payload or payload.agent_id ~= state.agent_id then return end
   ctxop_cancelled = false
+  ctxop_active = true
+  ctxop_last_text = _format_ctxop(payload.reasoning, payload.content)
   if not _cursor_within_follow_margin() then return end
-  ctxop_pending = _format_ctxop(payload.reasoning, payload.content)
+  ctxop_pending = ctxop_last_text
   if not ctxop_flush_scheduled then
     ctxop_flush_scheduled = true
     vim.schedule(_flush_ctxop)
@@ -648,7 +722,87 @@ end
 local function _close_ctxop_panel(payload)
   if not payload or payload.agent_id ~= state.agent_id then return end
   _cancel_ctxop()
+  ctxop_active = false
+  ctxop_last_text = ""
   float_stream_window.close()
+end
+
+-- ========== 光标跟随跳变 → 自动浮窗隐藏 / 重弹 ==========
+
+--- 广播跟随状态跳变（供伪终端等其它自动浮窗订阅）
+--- @param following boolean
+local function _emit_follow_changed(following)
+  event_bus.emit(events.UI_FOLLOW_CHANGED, { following = following })
+end
+
+--- 隐藏全部流式自动浮窗（思考过程 / 接收参数 / 上下文压缩·计划蒸馏）。
+--- 用户从「跟随」跳到「非跟随」（回看上方历史）时调用：这些浮窗是跟随底部流式内容的
+--- 辅助视图，跟着光标一起"留在底部"，光标离开底部就应一并隐去，避免遮挡用户正在看的内容。
+--- 仅隐藏窗口，不清 *_active 标记：仍在进行的流在跳回跟随时会据此重弹（见 _reshow_floats）。
+local function _hide_floats()
+  -- 隐藏前捕获思考悬浮窗当前文本：重弹时优先用它（若该窗口正被占用则是别的消费者内容，
+  -- 重弹会回退到消息末条 reasoning 兜底）。
+  if reasoning_active and reasoning_panel.is_open() then
+    reasoning_last_text = float_stream_window.get_text()
+  end
+  reasoning_panel.close()
+  tool_args_panel.close()
+  float_stream_window.close()
+end
+
+--- 重弹仍在进行的流式自动浮窗。用户从「非跟随」跳回「跟随」时调用。
+--- 三个浮窗共用同一个 float_stream_window，必须互斥，只弹优先级最高的一个：
+--- 上下文压缩·计划蒸馏 > 接收参数 > 思考过程。
+local function _reshow_floats()
+  -- 无聊天窗口时（如窗口已关闭）不重弹，避免弹出游离浮窗。
+  if not M.has_window() then return end
+  if ctxop_active then
+    _open_ctxop_window()
+    if ctxop_last_text ~= "" then
+      float_stream_window.set_text(ctxop_last_text)
+    end
+    return
+  end
+  if tool_args_active and last_tool_calls then
+    tool_args_panel.show(last_tool_calls)
+    return
+  end
+  if reasoning_active then
+    -- 优先用隐藏时捕获的文本；否则从当前 Agent 消息队列取末条正文兜底。
+    local text = reasoning_last_text
+    if text == "" then
+      local get_messages = chat_service.get_messages
+      local msgs = type(get_messages) == "function" and get_messages() or nil
+      local last = msgs and msgs[#msgs]
+      text = last and last.reasoning or ""
+    end
+    if text and text ~= "" then
+      reasoning_panel.show(text)
+    end
+  end
+end
+
+--- 设置跟随状态：仅在「跟随 ↔ 非跟随」真正跳变时隐藏 / 重弹流式自动浮窗并广播事件。
+--- 用缓存值比较即可：state.following 之前由各处直接赋值维护，这里统一收口，避免每帧
+--- 都触发一次隐藏/重弹（流式期间会频繁重算跟随，跳变只在用户实际滚动时发生）。
+--- @param following boolean
+_set_following = function(following)
+  local f = following == true
+  local changed = (state.following == true) ~= f
+  -- 先落状态：_reshow_floats/_hide_floats 内部会读写浮窗，不再回调至此，无重入。
+  state.following = f
+  if not changed or not M.has_window() then return end
+  if f then
+    _reshow_floats()
+  else
+    _hide_floats()
+  end
+  _emit_follow_changed(f)
+end
+
+--- 按实时光标重算跟随状态（供滚动 / 光标移动 / buffer 切换后同步）。测试可手动驱动。
+function M._sync_follow()
+  _set_following(_cursor_within_follow_margin())
 end
 
 --- @param payload table
@@ -1011,8 +1165,13 @@ local function _on_buf_enter()
   if state.buf and shown == state.buf then
     _restore_aux()
     _set_input_height(_input_idle_height())
+    -- 用户 :bnext 切走再切回聊天 buffer：按实时光标重同步跟随（切走时视为不跟随并隐藏了
+    -- 自动浮窗，切回若光标贴底则重弹仍在进行的浮窗）。
+    M._sync_follow()
   else
     _collapse_aux()
+    -- 主窗口被切到别的 buffer：视为不跟随，隐藏流式自动浮窗（避免遮挡用户文件）。
+    _set_following(false)
   end
 end
 
@@ -1056,6 +1215,25 @@ local function _register_focus_tracking()
   vim.api.nvim_create_autocmd("BufEnter", {
     group = state.focus_augroup,
     callback = _on_buf_enter,
+  })
+  -- 光标在聊天 buffer 内移动（j/k、gg/G、鼠标、插件跳转等）后重同步跟随：
+  -- 光标离开底部（回看上方）→ 隐藏流式自动浮窗；回到贴底 → 重弹仍在进行的浮窗。
+  vim.api.nvim_create_autocmd({ "CursorMoved", "CursorMovedI" }, {
+    group = state.focus_augroup,
+    buffer = state.buf,
+    callback = function()
+      if vim.api.nvim_get_current_win() == state.win_id then
+        M._sync_follow()
+      end
+    end,
+  })
+  -- 插入模式期间 nvim 不计算 foldlevel（所有 buffer 均为 0）且 InsertLeave 后也不自动补算，
+  -- 导致在 chat 输入框括入插入模式时新增的折叠文本不被折叠。离开插入模式后按需补算折叠。
+  vim.api.nvim_create_autocmd("InsertLeave", {
+    group = state.focus_augroup,
+    callback = function()
+      vim.schedule(_recompute_folds)
+    end,
   })
 end
 
@@ -1165,6 +1343,7 @@ _scroll = function(delta)
   local total = vim.api.nvim_buf_line_count(state.buf)
   local new_line = math.max(1, math.min(total, cur[1] + delta))
   vim.api.nvim_win_set_cursor(state.win_id, { new_line, cur[2] })
+  M._sync_follow()
 end
 
 --- 主窗口鼠标滚轮滚动：用 <C-E>/<C-Y> 平滑滚动视口（原生手感，会带动光标移出屏幕外），
@@ -1214,7 +1393,7 @@ _wheel_scroll = function(delta)
   elseif new_topline and new_topline >= 1 then
     pcall(vim.api.nvim_win_set_cursor, win, { math.min(new_topline, total), 0 })
   end
-  state.following = _cursor_within_follow_margin()
+  M._sync_follow()
 end
 
 -- ========== 公开 API ==========
@@ -1387,6 +1566,15 @@ function M.close()
   _clear_focus_tracking()
   _clear_input_resize()
   _clear_resize_reflow()
+  -- 重置流式自动浮窗状态：避免窗口重开后残留上次的 active 标记导致误重弹。
+  reasoning_active = false
+  tool_args_active = false
+  ctxop_active = false
+  last_tool_calls = nil
+  ctxop_last_text = ""
+  reasoning_last_text = ""
+  ctxop_kind = "compaction"
+  state.folds_dirty = false
   state.collapsed = false
   state.win_id = nil
   state.buf = nil
@@ -1408,6 +1596,22 @@ end
 --- @return boolean
 function M.is_following()
   return _cursor_within_follow_margin()
+end
+
+--- 补算插入模式期间被抑制的折叠（测试用：等价于 InsertLeave 自动命令触发的动作）
+function M._recompute_folds()
+  _recompute_folds()
+end
+
+--- 标记「有折叠待补算」（测试用：模拟插入模式期间写入内容）
+function M._mark_folds_dirty()
+  state.folds_dirty = true
+end
+
+--- 是否有折叠待补算（测试用）
+--- @return boolean
+function M._is_folds_dirty()
+  return state.folds_dirty == true
 end
 
 --- 刷新聊天窗口

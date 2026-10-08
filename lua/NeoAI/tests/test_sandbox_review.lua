@@ -456,6 +456,37 @@ tests.suite("sandbox_review", function(_, it)
     services.provide("services.sandbox", saved)
   end)
 
+  it("open 无待审/审批/留痕事项时也打开窗口（不提示、不自动关闭）", function(t)
+    local services = require("NeoAI.kernel.services")
+    local sr = require("NeoAI.ui.components.sandbox_review")
+    sr.reset()
+    local saved = services.use("services.sandbox")
+    services.provide("services.sandbox", {
+      list_reviews = function() return {} end,
+      list_traces = function() return {} end,
+      list_saved = function() return {} end,
+      apply = function() return { ok = true } end,
+      reject = function() end,
+    })
+    local notified = {}
+    local orig_notify = vim.notify
+    vim.notify = function(msg, ...)
+      notified[#notified + 1] = tostring(msg)
+      return orig_notify(msg, ...)
+    end
+    sr.open()
+    vim.notify = orig_notify
+    t.not_nil(sr.get_buf(), "无任何事项时也应打开审批窗（而非仅提示）")
+    -- refresh 在空队列下不应自动关闭窗口。
+    sr.refresh()
+    t.not_nil(sr.get_buf(), "空队列刷新后仍应保持窗口打开")
+    for _, m in ipairs(notified) do
+      t.true_(not m:find("无待审", 1, true), "不应再弹「无待审」提示")
+    end
+    sr.close()
+    services.provide("services.sandbox", saved)
+  end)
+
   it("open 仅有越界留痕时也能打开审批窗", function(t)
     local services = require("NeoAI.kernel.services")
     local sr = require("NeoAI.ui.components.sandbox_review")
@@ -501,7 +532,8 @@ tests.suite("sandbox_review", function(_, it)
     local trace_line
     local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
     for i, l in ipairs(lines) do
-      if l:find("/root/other/x.txt", 1, true) then trace_line = i end
+      -- 文件段行为 "  [工具] 路径…"；命令段行为 "  $ 命令  → N 个文件"（不匹配此模式）。
+      if l:find("  %[.-%] /root/other/x.txt", 1) then trace_line = i end
     end
     t.not_nil(trace_line, "应展示越界留痕行")
     t.eq(nil, sr.get_line_map()[trace_line], "留痕行不应是审批目标")
@@ -517,6 +549,88 @@ tests.suite("sandbox_review", function(_, it)
     sr.close_diff()
     t.nil_(sr.get_diff_buf(), "详情应已关闭")
     t.not_nil(sr.get_buf(), "关闭详情后应恢复审批窗")
+    sr.close()
+    services.provide("services.sandbox", saved)
+  end)
+
+  it("越界/异常页展示「越界命令（命令 → 文件）」段", function(t)
+    local services = require("NeoAI.kernel.services")
+    local sr = require("NeoAI.ui.components.sandbox_review")
+    sr.reset()
+    local saved = services.use("services.sandbox")
+    services.provide("services.sandbox", {
+      list_reviews = function() return {} end,
+      list_traces = function()
+        return {
+          { tool = "run_command", kind = "read", path = "/root/a.txt",
+            command = "cat /root/a.txt", commands = { "cat /root/a.txt" } },
+          { tool = "read_file", kind = "read", path = "/root/b.txt" },
+        }
+      end,
+      apply = function() return { ok = true } end,
+      reject = function() end,
+    })
+    sr.open()
+    sr.open_page("anomaly")
+    local buf = sr.get_buf()
+    t.not_nil(buf, "应打开审批窗")
+    local text = table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n")
+    t.matches("越界命令", text, "应展示越界命令段标题")
+    t.matches("$ cat /root/a%.txt", text, "命令段应展示命令字符串")
+    t.matches("→ 1 个文件", text, "命令段应展示涉及文件数")
+    t.matches("（非命令工具访问）", text, "无命令访问应归入哨兵组展示")
+    -- 命令段行不是审批目标
+    local cmd_line
+    for i, l in ipairs(vim.api.nvim_buf_get_lines(buf, 0, -1, false)) do
+      if l:find("$ cat /root/a.txt", 1, true) then cmd_line = i end
+    end
+    t.not_nil(cmd_line, "应存在命令行")
+    t.eq(nil, sr.get_line_map()[cmd_line], "命令行不应是审批目标")
+    -- 按 i 查看该命令涉及的文件
+    vim.api.nvim_win_set_cursor(0, { cmd_line, 0 })
+    sr.preview_current()
+    local dbuf = sr.get_diff_buf()
+    t.not_nil(dbuf, "按 i 应打开命令详情浮窗")
+    local dtext = table.concat(vim.api.nvim_buf_get_lines(dbuf, 0, -1, false), "\n")
+    t.matches("越界命令详情", dtext, "命令详情标题")
+    t.matches("/root/a%.txt", dtext, "命令详情应列出涉及文件")
+    sr.close_diff()
+    sr.close()
+    services.provide("services.sandbox", saved)
+  end)
+
+  it("越界文件详情汇总「涉及命令」并逐条列出", function(t)
+    local services = require("NeoAI.kernel.services")
+    local sr = require("NeoAI.ui.components.sandbox_review")
+    sr.reset()
+    local saved = services.use("services.sandbox")
+    services.provide("services.sandbox", {
+      list_reviews = function() return {} end,
+      list_traces = function()
+        return {
+          { tool = "run_command", kind = "read", path = "/root/a.txt",
+            command = "cat /root/a.txt", commands = { "cat /root/a.txt", "grep token /root/a.txt" } },
+        }
+      end,
+      apply = function() return { ok = true } end,
+      reject = function() end,
+    })
+    sr.open()
+    sr.open_page("anomaly")
+    local buf = sr.get_buf()
+    local trace_line
+    for i, l in ipairs(vim.api.nvim_buf_get_lines(buf, 0, -1, false)) do
+      if l:find("[run_command]", 1, true) then trace_line = i end
+    end
+    t.not_nil(trace_line, "应展示越界文件行")
+    vim.api.nvim_win_set_cursor(0, { trace_line, 0 })
+    sr.preview_current()
+    local dbuf = sr.get_diff_buf()
+    t.not_nil(dbuf, "按 i 应打开文件详情浮窗")
+    local dtext = table.concat(vim.api.nvim_buf_get_lines(dbuf, 0, -1, false), "\n")
+    t.matches("涉及命令: 2 条", dtext, "文件详情应汇总涉及命令数")
+    t.matches("grep token /root/a%.txt", dtext, "文件详情应列出累积的命令")
+    sr.close_diff()
     sr.close()
     services.provide("services.sandbox", saved)
   end)

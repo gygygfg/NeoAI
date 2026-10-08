@@ -78,13 +78,16 @@ local function _trace_outside_access(tool_name, args, ctx)
   local function consider(p, command)
     if type(p) ~= "string" or p == "" then return end
     local hit = runtime.outside_workspace(p, cwd)
-    if hit and not seen[hit] then
-      seen[hit] = true
-      trace.record({
-        path = hit, tool = tool_name, kind = "read", command = command,
-        source = (ctx and ctx.is_sub_agent) and "sub_agent" or "observed",
-      })
-    end
+    if not hit then return end
+    -- 同一路径的多条不同命令都要留痕（trace.record 按 (tool,path) 去重并累积 commands），
+    -- 故 seen 键含命令，避免先出现的无命令访问吞掉后续带命令的访问。
+    local skey = hit .. "\0" .. tostring(command or "")
+    if seen[skey] then return end
+    seen[skey] = true
+    trace.record({
+      path = hit, tool = tool_name, kind = "read", command = command,
+      source = (ctx and ctx.is_sub_agent) and "sub_agent" or "observed",
+    })
   end
   for _, field in ipairs(spec.paths or {}) do consider(args and args[field]) end
   -- 进程命令：扫描命令串中的绝对路径 token（启发式，仍非阻塞放行）。

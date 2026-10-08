@@ -200,7 +200,7 @@ approval is allowed by default and a notify is sent.
 - **Goal**: while a command awaits input, inject a line of text / send a key sequence (Enter/Tab/Escape/Up/Ctrl-C, ...) / end the process.
 - **How to operate**: only operate on an existing PTY session (`effect=in_process`; never spawns a process); normally called automatically by the judge, so the model usually does not need to call them manually unless precise control is required.
 
-The floating terminal window is rendered with `nvim_open_term` by `ui/components/terminal_window.lua` and forwards manual typing when focused; `show_window` controls when it pops up (always/on_wait/never, **all requiring the chat cursor to be following**). See [configuration.md](configuration.md) `tools.run_command.interactive`.
+The floating terminal window is rendered with `nvim_open_term` by `ui/components/terminal_window.lua` and forwards manual typing when focused; `show_window` controls when it pops up (always/on_wait/never, **all requiring the chat cursor to be following**). On a follow flip it automatically hides (reviewing earlier content) / re-pops (back at the bottom, while still awaiting input or in always mode) via `UI_FOLLOW_CHANGED`. See [configuration.md](configuration.md) `tools.run_command.interactive`.
 When combined stdout/stderr exceeds `tools.run_command.max_output_bytes` (default 16 MiB), the command is
 truncated and terminated so huge outputs (hundreds of MB) cannot freeze the main thread with line-by-line
 processing; already-produced content is still returned and marked "truncated".

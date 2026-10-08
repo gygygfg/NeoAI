@@ -100,6 +100,14 @@
 「闭合折叠首行」（`foldclosed(ln)==ln`）与工具块首行文本兜底。且结构性变化（如某工具完成追加结果
 行）可能与就地刷新**同批写入**，故不能只在 `inserted==removed` 时判定，否则同批中仍在执行工具的
 折叠会漏修（表现为内容一行行露在折叠外）。
+
+**插入模式折叠抑制与补算**：只要**任一**窗口处于插入模式，nvim 全局不计算 `foldlevel`（所有 buffer
+均为 0），且 `InsertLeave` 后也不自动补算，除非聊天窗口重新获得焦点或内容再次写入。表现为「光标在
+输入框进入插入模式后」新写入的折叠文本不被折叠。`_render` 在检测到当前模式为插入/替换时置
+`state.folds_dirty=true`，`_register_focus_tracking` 注册的 `InsertLeave` 自动命令（延迟到事件循环末尾）
+调 `_recompute_folds`：在聊天窗口上下文中重建 `foldexpr`（同值赋值也触发整段重算）→ `1,$foldclose!`
+收起重算后新出现的折叠 → 恢复此前已展开的折叠。非 dirty、仍处插入模式、或窗口已不在聊天 buffer 上时
+跳过（补算会被再次抑制 / 作用到错误 buffer）。
 命令**参数或结果含密钥**（沙箱假密钥 或具名规则命中的原始密钥）时，在该工具折叠块**外**
 追加**高亮警告**（`NeoAISecretWarning`），折叠文本保持干净（不含 `⚠ 密钥`）。
 警告**指明具体是哪个命令/工具获取或使用了哪些密钥文件**，并按项换行格式化：首行
@@ -136,11 +144,24 @@
 （`nvim_win_text_height`，含 wrap 折行）自适应高度、开启 `smoothscroll`、写入后**先增高再滚**，
 并把光标移到内容末尾（`G$`）后 `zb` 贴底，保证长单行/大量内容始终滚到最新尾部。
 
+**跟随跳变即隐藏 / 重弹**：这些浮窗跟随底部流式内容，光标离开底部就应一并隐去。各流式 handler 在
+「跟随判定」**之前**把 `*_active` 置位（工具参数另存 `last_tool_calls`、上下文操作另存 `ctxop_last_text`），
+统一经 `_set_following(f)` 收口：仅在 `state.following` **真正跳变**时动作——跟随→非跟随调 `_hide_floats()`
+隐藏全部（思考 / 接收参数 / 上下文压缩·计划蒸馏）；非跟随→跟随调 `_reshow_floats()` 重弹**仍在进行**的那个。
+三个浮窗共用同一 `float_stream_window`，故重弹**互斥**：优先级 上下文压缩·计划蒸馏 > 接收参数 > 思考过程。
+跳变还会广播 `UI_FOLLOW_CHANGED`（见 `events.lua`），供伪终端（`services.pty`）等其它自动浮窗订阅。
+滚动 / 光标移动 / `BufEnter` 等处统一调 `M._sync_follow()` 按实时光标重判并同步（取代原先各处直接给
+`state.following` 赋值），保证跳变只在用户实际滚动时发生一次。
+
 ### 4.6 输入框联动与滚动
 
 主消息区（上）+ 输入 split（下，高度 3）。发送后切回主窗口并进入普通模式（生成期间可滚动浏览）；
 主体与输入框共用一套 chat 上下文键位（`_build_chat_actions`）。`input_box` 用 `virt_text` 渲染 `> `
 前缀（不用 `buftype=prompt`，避免与 nvim-cmp 冲突），并放开 `neoai_input` filetype 的补全。
+`attach_window` 会用 `'winfixbuf'`（Neovim 0.10+，`pcall` 兼容旧版）**锁定输入窗口**：输入 buffer 是
+无名 `nofile` 暂存 buffer，若允许在输入窗口执行 `:e <file>` / `:bnext` 等，该窗口会**复用输入 buffer**
+（`buftype` 变空、内容被文件名替换），此后输入落进用户文件、`:wq` 误保存。开启后此类切换抛
+`E1513`（Cannot switch buffer），输入 buffer 与内容保持不变（顺序：临时关 `winfixbuf` → `set_buf` → 重开）。
 
 主消息区滚动分两套：
 
@@ -191,7 +212,7 @@ NeoAI 的聊天/输入框/悬浮窗等都是纯 UI 文本，若 LSP 客户端（
 
 | 组件 | 职责 |
 | --- | --- |
-| `input_box` | 聊天输入框。`create`/`attach_window`/`focus`/`submit`/`on_submitted`/`clear`；`virt_text` 渲染 `>` 前缀；放开 `neoai_input` 文件类型补全。 |
+| `input_box` | 聊天输入框。`create`/`attach_window`/`focus`/`submit`/`on_submitted`/`clear`；`virt_text` 渲染 `>` 前缀；放开 `neoai_input` 文件类型补全；`attach_window` 用 `'winfixbuf'`（0.10+）锁窗，禁止 `:e`/`:bnext` 复用输入 buffer。 |
 | `message_list` | 消息列表渲染。`render(buf, messages)`；`toggle_reasoning()`。 |
 | `float_stream_window` | 复用流式悬浮窗。`open(title,{filetype,max_height})`/`set_text`/`append`/`get_text`/`close`/`is_open`/`reset`；思考过程 / 接收参数 / 计划蒸馏共享同一窗口（上下文压缩为后台异步、不弹窗，不再使用）。窗口高度按显示行数（`nvim_win_text_height`）自适应，受 `max_height` 限制，开启 `smoothscroll`，写入后先增高再滚、光标移到内容末尾后 `zb` 贴底。 |
 | `reasoning_panel` | 思考过程悬浮窗（`float_stream_window` 适配器，高度上限 5 行）。`open`/`show`/`append`/`close`/`is_open`；`filetype=neoai_reasoning`。 |
@@ -201,8 +222,8 @@ NeoAI 的聊天/输入框/悬浮窗等都是纯 UI 文本，若 LSP 客户端（
 | `tool_approval` | 工具审批弹窗。`init()`；串行单槽位展示。 |
 | `ask_user` | 向用户提问弹窗。`init()`；经 `ask_user.set_ui` 注入。 |
 | `sub_agent_dock` | 子 Agent 状态监控。`init()`。 |
-| `terminal_window` | 交互式命令的悬浮**可交互**终端（`nvim_open_term` 渲染，焦点在内时可手动键入转发给命令）。按会话 id 开窗；**仅在聊天光标跟随时弹出**（`show_window` 控制时机）；headless 下为 no-op。由 `services.pty` 驱动。 |
-| `sandbox_review` | 沙箱待审审批界面。`open()`；按路径级别高亮（工作区绿/用户目录黄/系统红）、按安全级别显示高危/中危/低危风险档与原因；界面按「未应用（待审）/ 已应用（含快照，可撤销）」分区；审批单位为单个文件：`<CR>` 仅应用该文件、`A` 一键同意全部工作区内修改（工作区外文件与主机操作保留待审；逐项让出主循环、标题显示进度、进行中防重入）、`d` 仅拒绝该文件（其余文件保留待审）、`i` 临时关闭审批窗并打开该条目的修改 diff 预览（关闭后自动返回并恢复光标），头行仅作信息展示，`q` 关闭；**窗口打开期间订阅沙箱广播事件自动刷新**（待审/已应用/越界留痕/主机操作变化即时重绘，同一 tick 内事件合并），无需手动刷新。**「已应用」区默认折叠**：整区收起（`za`/`zo` 展开），展开后每条再各自收起（两级折叠），刷新后重新收起；**待审条目「头行显示、其余折叠」、`za`/`zo` 可展开**（头行保留整组审批入口与高亮，其后文件/风险列表默认收起），越界留痕区不折叠。**高危条目**（L3 critical，以及 `package_confirm` 开启时的 L2 包/敏感安装）首次 `<CR>` 不直接应用：调用模型生成一条后果警告并自动打开 diff（顶部展示警告，生成中显示占位；标题按级别区分 `⚠ L2 高危 · 确认应用` / `⚠ L3 严重 · 确认应用`，按键提示行高亮，若冻结时剔除了遮蔽/易变缓存文件会追加「将跳过 N 个」说明），用户在 diff 内再次 `<CR>` 才真正应用、`q`/`<Esc>` 取消；模型不可用时回退规则警告（见 `sandbox/l3_warning.lua`）。 |
+| `terminal_window` | 交互式命令的悬浮**可交互**终端（`nvim_open_term` 渲染，焦点在内时可手动键入转发给命令）。按会话 id 开窗；**仅在聊天光标跟随时弹出**（`show_window` 控制时机），跟随跳变时随 `UI_FOLLOW_CHANGED` 隐藏 / 重弹（见 `services.pty`）；headless 下为 no-op。由 `services.pty` 驱动。 |
+| `sandbox_review` | 沙箱待审审批界面。`open()`（**无待审/审批/留痕事项时同样打开窗口并展示空界面，不弹提示、不自动关闭**；刷新到空队列也保持窗口，待新事项到达由事件订阅自动刷新）；按路径级别高亮（工作区绿/用户目录黄/系统红）、按安全级别显示高危/中危/低危风险档与原因；界面按「未应用（待审）/ 已应用（含快照，可撤销）」分区；审批单位为单个文件：`<CR>` 仅应用该文件、`A` 一键同意全部工作区内修改（工作区外文件与主机操作保留待审；逐项让出主循环、标题显示进度、进行中防重入）、`d` 仅拒绝该文件（其余文件保留待审）、`i` 临时关闭审批窗并打开该条目的修改 diff 预览（关闭后自动返回并恢复光标），头行仅作信息展示，`q` 关闭；在**越界访问留痕**行按 `i` 打开访问详情（汇总涉及工具/来源/涉及命令数/首末时间，逐条列出工具/类型/命令/时间），在**越界命令**行按 `i` 打开命令详情（列出该命令越界访问的文件）；**窗口打开期间订阅沙箱广播事件自动刷新**（待审/已应用/越界留痕/主机操作变化即时重绘，同一 tick 内事件合并），无需手动刷新。**「已应用」区默认折叠**：整区收起（`za`/`zo` 展开），展开后每条再各自收起（两级折叠），刷新后重新收起；**待审条目「头行显示、其余折叠」、`za`/`zo` 可展开**（头行保留整组审批入口与高亮，其后文件/风险列表默认收起），越界留痕区不折叠。**高危条目**（L3 critical，以及 `package_confirm` 开启时的 L2 包/敏感安装）首次 `<CR>` 不直接应用：调用模型生成一条后果警告并自动打开 diff（顶部展示警告，生成中显示占位；标题按级别区分 `⚠ L2 高危 · 确认应用` / `⚠ L3 严重 · 确认应用`，按键提示行高亮，若冻结时剔除了遮蔽/易变缓存文件会追加「将跳过 N 个」说明），用户在 diff 内再次 `<CR>` 才真正应用、`q`/`<Esc>` 取消；模型不可用时回退规则警告（见 `sandbox/l3_warning.lua`）。 |
 | `fold` | 折叠（推理/工具调用/结果共用实现）。`foldexpr`/`foldtext`/`record_start`/`record_end`/`has_running`/`set_live_timer`/`set_foldexpr_override`/`set_foldtext_override`/`set_reasoning_lines`/`is_reasoning_start`/`generic_label`。 |
 | `display_modes/` | 显示模式插件管理器 + `chat.lua`/`trajectory.lua`。 |
 | `markdown_view` | Markdown 渲染器。 |

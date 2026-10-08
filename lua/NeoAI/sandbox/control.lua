@@ -149,6 +149,10 @@ function M.new_attempt(tool_name, args, ctx, spec)
     state = M.STATE.RECEIVED,
     state_version = 1,
     created_at = os.time(),
+    -- 进程类工具的实际命令（token 形态，安全）：供越界留痕归因「哪条命令访问了哪个文件」。
+    -- 仅内存诊断用，**不参与** request_hash/execution_intent_hash，也不落盘。
+    command = (type(args) == "table" and type(args.command) == "string" and args.command ~= "")
+      and args.command or nil,
   }
   state.attempts[command_id] = attempt
   return attempt

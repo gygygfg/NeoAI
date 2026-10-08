@@ -27,7 +27,9 @@ The chat window = **main message area (top)** + **input box (bottom, split, heig
   viewport (`_wheel_scroll`), clamping the blank space below the last line to `ui.chat.mousescroll_max_blank`
   (default 3) lines instead of leaving more and more white space like the native behavior.
 - Input box: a regular buffer with a `virt_text`-rendered `> ` prefix (not using `buftype=prompt`, to avoid
-  conflicts with nvim-cmp); completion is enabled for the `neoai_input` filetype.
+  conflicts with nvim-cmp); completion is enabled for the `neoai_input` filetype; the input window is locked with
+  `'winfixbuf'` (0.10+), so an accidental `:e <file>` there errors with `E1513` and does **not** turn the input box
+  into that file (avoiding input landing in the user's file / a wrong `:wq`).
 
 ## 3. Basic Interaction
 
@@ -65,6 +67,12 @@ The chat window = **main message area (top)** + **input box (bottom, split, heig
   content (last line, last column), and then uses `zb` to pin it to the bottom.
 - Auto-follow scrolling and popup floating windows happen only when the cursor is within the last 5 lines of the
   message area; reviewing earlier content does not disturb them.
+- **When the cursor flips from following to not following (reviewing earlier content), any already-open streaming
+  floating window (reasoning / receiving arguments / context compaction·plan distillation) is hidden automatically**;
+  when it flips back to following at the bottom, the one whose stream is still in progress is **re-popped automatically**
+  (the three share one window, so re-popping is mutually exclusive; priority context compaction·plan distillation >
+  receiving arguments > reasoning). The flip also broadcasts `UI_FOLLOW_CHANGED`, on which the pseudo-terminal floating
+  window likewise hides/re-pops.
 
 ## 5. Folding (components/fold)
 
@@ -74,6 +82,11 @@ re-renders once per second so that the **elapsed time** in the fold text ticks i
 elapsed time of the pausable timer `utils.timer`, excluding time spent waiting on approvals/questions).
 
 Expand/collapse: `zM` (collapse all) / `zo` (expand) / `zR` (expand all).
+
+> While the input box is in **insert mode**, Neovim globally suppresses fold computation (all buffers report
+> `foldlevel` 0), so fold text written at that moment is not folded. NeoAI automatically recomputes folds once after
+> you leave insert mode (`InsertLeave`): it rebuilds `foldexpr` to collapse the new blocks and **restores the folds you
+> had expanded**, with no manual `zx` needed.
 
 ## 6. Plan Mode (PLAN)
 

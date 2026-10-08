@@ -210,6 +210,7 @@ vim.api.nvim_create_autocmd("User", {
 | `WINDOW_CLOSED` | `window:closed` | 关闭窗口 | `{ win_id }` |
 | `UI_REFRESHED` | `ui:refreshed` | UI 刷新 | — |
 | `UI_MODE_CHANGED` | `ui:mode_changed` | UI 模式切换 | `{ mode }` |
+| `UI_FOLLOW_CHANGED` | `ui:follow_changed` | 聊天光标跟随状态跳变（跟随 ↔ 非跟随） | `{ following }` |
 | `DISPLAY_MODE_CHANGED` | `display:mode_changed` | 显示模式切换 | `{ name }` |
 
 ### 子 Agent
@@ -275,7 +276,7 @@ vim.api.nvim_create_autocmd("User", {
 | `SANDBOX_APPLIED` | `sandbox:applied` | 变更单元已 CAS 应用到真实工作区 | `{ change_set_id, operation_id }` |
 | `SANDBOX_GRANT_CREATED` | `sandbox:grant_created` | 创建任务授权 | `{ grant_id, scope, operations }` |
 | `SANDBOX_GRANT_REVOKED` | `sandbox:grant_revoked` | 撤销任务授权 | `{ grant_id }` |
-| `SANDBOX_OUTSIDE_ACCESS` | `sandbox:outside_access` | 越界访问留痕（访问 cwd 之外用户工作目录，非阻塞） | `{ trace_id, path, tool, kind }` |
+| `SANDBOX_OUTSIDE_ACCESS` | `sandbox:outside_access` | 越界访问留痕（访问 cwd 之外用户工作目录，非阻塞） | `{ trace_id, path, tool, kind, command? }` |
 | `SANDBOX_SYSTEMD_ROUTED` | `sandbox:systemd_routed` | systemctl/journalctl 调用被门面路由到沙箱内长驻服务 | `{ verb, units, ok, command_id }` |
 | `SANDBOX_SYSTEMD_UNSUPPORTED` | `sandbox:systemd_unsupported` | 门面明确拒绝不支持的 systemd 语义（不落宿主机） | `{ verb, units, command_id }` |
 | `SANDBOX_CONTAINER_PLANNED` | `sandbox:container_planned` | 容器受控计划（命名空间共享 / 受控 socket） | `{ manager, mode, share_namespace, reason, command_id }` |

@@ -87,6 +87,7 @@ local state = {
   line_to_target = {}, -- 行号 -> { change_set_id, path? }
   line_to_hub = {}, -- 行号 -> 审批分流中心条目 id（阻塞类页面）
   line_to_trace = {}, -- 行号 -> 越界留痕路径（`i` 查看详情，非审批目标）
+  line_to_cmd = {}, -- 行号 -> { command = string|nil } 越界命令（`i` 查看该命令涉及的文件）
   fold_levels = {}, -- 行号 -> 折叠级别（仅「已应用」区 > 0）：区标题=1，条目及其文件行=2
   last_cursor = nil, -- { line, col } 关闭时记录，重开时恢复
   last_target = nil, -- { change_set_id, path? } 关闭时光标所在条目（优先恢复）
@@ -658,7 +659,14 @@ function M.build_lines(items, traces, audit, saved)
         local path = _one_line(tr.path or "")
         local tool = _one_line(table.concat(tr.tools or { tr.tool or "?" }, ", "))
         if tool == "" then tool = "?" end
-        local text = string.format("  [%s] %s", tool, path)
+        local cmds = tr.commands or {}
+        local suffix = ""
+        if #cmds == 1 then
+          suffix = "  ⟵ " .. _one_line(cmds[1])
+        elseif #cmds > 1 then
+          suffix = string.format("  ⟵ %d 条命令", #cmds)
+        end
+        local text = string.format("  [%s] %s%s", tool, path, suffix)
         local ln = #lines + 1
         lines[#lines + 1] = text
         local start_col = 2 + #tool + 3
@@ -1477,7 +1485,7 @@ local function _open_detail_float(title, lines)
   state.diff = { win = win, buf = buf, ns = ns, mode = "detail", width = width }
 end
 
---- 查看某条越界留痕的详情：列出每次访问的工具 / 类型 / 命令 / 时间。
+--- 查看某条越界留痕的详情：汇总涉及工具/命令/时间，并逐条列出工具 / 类型 / 命令 / 时间。
 --- @param path string
 local function _open_trace_detail(path)
   local sandbox = services.use("services.sandbox")
@@ -1491,13 +1499,52 @@ local function _open_trace_detail(path)
     vim.notify("[NeoAI] 越界留痕已不存在: " .. tostring(path), vim.log.levels.WARN)
     return
   end
+  -- 聚合：涉及工具 / 涉及命令 / 来源 / 时间范围（去重有序）。
+  local tools, cmds, sources = {}, {}, {}
+  local first_at, last_at
+  local function _add(list, v)
+    if type(v) ~= "string" or v == "" then return end
+    for _, p in ipairs(list) do if p == v then return end end
+    list[#list + 1] = v
+  end
+  for _, tr in ipairs(entries) do
+    _add(tools, tr.tool)
+    local c = tr.commands
+    if c and #c > 0 then
+      for _, cmd in ipairs(c) do _add(cmds, cmd) end
+    else
+      _add(cmds, tr.command)
+    end
+    for _, s in ipairs(tr.sources or {}) do _add(sources, s) end
+    local t0 = tonumber(tr.created_at)
+    if t0 and (not first_at or t0 < first_at) then first_at = t0 end
+    local t1 = tonumber(tr.last_at) or t0
+    if t1 and (not last_at or t1 > last_at) then last_at = t1 end
+  end
   local lines = { "越界访问详情（工作区外，仅记录）", "q/Esc 返回审批", "" }
   lines[#lines + 1] = "路径: " .. _one_line(path)
+  lines[#lines + 1] = "涉及工具: " .. (#tools > 0 and table.concat(tools, ", ") or "?")
+  if #sources > 0 then lines[#lines + 1] = "来源: " .. table.concat(sources, ", ") end
+  lines[#lines + 1] = string.format("涉及命令: %d 条", #cmds)
+  if #cmds > 0 then
+    for _, cmd in ipairs(cmds) do lines[#lines + 1] = "  $ " .. _one_line(cmd) end
+  else
+    lines[#lines + 1] = "  （无命令记录：非命令工具访问）"
+  end
+  if first_at then
+    local fmt = function(ts) return os.date("%Y-%m-%d %H:%M:%S", ts) end
+    lines[#lines + 1] = "时间: " .. fmt(first_at)
+      .. ((last_at and last_at ~= first_at) and (" ～ " .. fmt(last_at)) or "")
+  end
   lines[#lines + 1] = ""
+  lines[#lines + 1] = string.format("访问记录: %d 条", #entries)
   for i, tr in ipairs(entries) do
     lines[#lines + 1] = string.format("#%d  工具: %s  类型: %s", i,
       _one_line(tr.tool or "?"), _one_line(tr.kind or "read"))
-    if type(tr.command) == "string" and tr.command ~= "" then
+    local ec = tr.commands
+    if ec and #ec > 0 then
+      for _, cmd in ipairs(ec) do lines[#lines + 1] = "    命令: " .. _one_line(cmd) end
+    elseif type(tr.command) == "string" and tr.command ~= "" then
       lines[#lines + 1] = "    命令: " .. _one_line(tr.command)
     end
     if tr.created_at then
@@ -1506,6 +1553,48 @@ local function _open_trace_detail(path)
     lines[#lines + 1] = ""
   end
   _open_detail_float("🔎 越界访问详情", lines)
+end
+
+--- 查看某条越界命令涉及的文件（命令 → 文件）。
+--- @param command string|nil nil 表示「非命令工具访问」聚合组
+local function _open_command_detail(command)
+  local sandbox = services.use("services.sandbox")
+  local matched = {}
+  if sandbox and sandbox.list_traces then
+    for _, tr in ipairs(sandbox.list_traces() or {}) do
+      local match
+      if command == nil then
+        local has = (type(tr.command) == "string" and tr.command ~= "")
+          or (tr.commands and #tr.commands > 0)
+        match = not has
+      else
+        match = (tr.command == command)
+        if not match and tr.commands then
+          for _, c in ipairs(tr.commands) do if c == command then match = true break end end
+        end
+      end
+      if match then matched[#matched + 1] = tr end
+    end
+  end
+  if #matched == 0 then
+    vim.notify("[NeoAI] 越界命令已不存在", vim.log.levels.WARN)
+    return
+  end
+  local lvl_ctx = { cwd = _canon_base(vim.fn.getcwd()), home = _canon_base(vim.fn.expand("~")) }
+  local grouped = require("NeoAI.sandbox.trace").group(matched)
+  local lines = { "越界命令详情（工作区外，仅记录）", "q/Esc 返回审批", "" }
+  lines[#lines + 1] = "命令: " .. (command and ("$ " .. _one_line(command)) or "（非命令工具访问）")
+  lines[#lines + 1] = string.format("涉及文件: %d 个", #grouped)
+  lines[#lines + 1] = ""
+  for _, tr in ipairs(grouped) do
+    local path = _one_line(tr.path or "")
+    local tool = _one_line(table.concat(tr.tools or { tr.tool or "?" }, ", "))
+    if tool == "" then tool = "?" end
+    local level = M.level_of(path, lvl_ctx)
+    local tag = level == "user" and "用户目录" or (level == "system" and "系统路径" or "工作区外")
+    lines[#lines + 1] = string.format("  [%s] %s  (%s)", tool, path, tag)
+  end
+  _open_detail_float("🔎 越界命令详情", lines)
 end
 
 --- 选择用于 diff 预览的文件路径。
@@ -1533,6 +1622,12 @@ local function _open_diff_current()
   local trace_path = state.line_to_trace[line]
   if trace_path then
     _open_trace_detail(trace_path)
+    return
+  end
+  -- 越界命令行：`i` 查看该命令涉及的文件（非审批目标，无 diff）。
+  local cmd_target = state.line_to_cmd[line]
+  if cmd_target then
+    _open_command_detail(cmd_target.command)
     return
   end
   local target = state.line_to_target[line]
@@ -1755,14 +1850,17 @@ local function _build_blocking_page(page, ctx)
   return { lines = lines, marks = marks, line_to_hub = line_to_hub, line_to_target = line_to_target }
 end
 
---- 构建「越界/异常」页：越界访问留痕（只读）+ 行为审计异常（只读）。
+--- 构建「越界/异常」页：越界访问留痕（按文件，只读）+ 越界命令（命令 → 文件，只读）
+--- + 行为审计异常（只读）。
 --- @param ctx table
 --- @return table
 local function _build_anomaly_page(ctx)
-  local lines, marks, line_to_trace = {}, {}, {}
+  local lines, marks, line_to_trace, line_to_cmd = {}, {}, {}, {}
   local lvl_ctx = { cwd = _canon_base(vim.fn.getcwd()), home = _canon_base(vim.fn.expand("~")) }
-  lines[#lines + 1] = "── 越界访问留痕（工作区外，仅记录）──"
-  local grouped = require("NeoAI.sandbox.trace").group(ctx.traces or {})
+  local trace_mod = require("NeoAI.sandbox.trace")
+  -- === 越界访问留痕（按文件路径合并）===
+  lines[#lines + 1] = "── 越界访问留痕（工作区外，仅记录，i 查看文件涉及的命令）──"
+  local grouped = trace_mod.group(ctx.traces or {})
   if #grouped == 0 then
     lines[#lines + 1] = "（无）"
   end
@@ -1770,12 +1868,35 @@ local function _build_anomaly_page(ctx)
     local path = _one_line(tr.path or "")
     local tool = _one_line(table.concat(tr.tools or { tr.tool or "?" }, ", "))
     if tool == "" then tool = "?" end
-    local text = string.format("  [%s] %s", tool, path)
+    local cmds = tr.commands or {}
+    local suffix = ""
+    if #cmds == 1 then
+      suffix = "  ⟵ " .. _one_line(cmds[1])
+    elseif #cmds > 1 then
+      suffix = string.format("  ⟵ %d 条命令", #cmds)
+    end
+    local text = string.format("  [%s] %s%s", tool, path, suffix)
     local ln = #lines + 1
     lines[#lines + 1] = text
     local start_col = 2 + #tool + 3
     marks[#marks + 1] = { line = ln, start_col = start_col, end_col = start_col + #path, level = M.level_of(path, lvl_ctx) }
     line_to_trace[ln] = path
+  end
+  lines[#lines + 1] = ""
+  -- === 越界命令（命令 → 涉及文件）===
+  lines[#lines + 1] = "── 越界命令（命令 → 涉及文件，i 查看该命令涉及的文件）──"
+  local by_cmd = trace_mod.group_by_command(ctx.traces or {})
+  if #by_cmd == 0 then
+    lines[#lines + 1] = "（无）"
+  end
+  for _, g in ipairs(by_cmd) do
+    local nfiles = #(g.files or {})
+    local label = g.command and ("$ " .. _one_line(g.command)) or "（非命令工具访问）"
+    local text = string.format("  %s  → %d 个文件", label, nfiles)
+    local ln = #lines + 1
+    lines[#lines + 1] = text
+    marks[#marks + 1] = { line = ln, start_col = 0, end_col = #text, level = "pending" }
+    line_to_cmd[ln] = { command = g.command }
   end
   lines[#lines + 1] = ""
   lines[#lines + 1] = "── 行为审计异常（L2+，仅记录）──"
@@ -1793,7 +1914,7 @@ local function _build_anomaly_page(ctx)
   end
   lines[#lines + 1] = ""
   lines[#lines + 1] = "快捷键: i 查看越界详情    h/l 切换页面    q 关闭"
-  return { lines = lines, marks = marks, line_to_trace = line_to_trace }
+  return { lines = lines, marks = marks, line_to_trace = line_to_trace, line_to_cmd = line_to_cmd }
 end
 
 --- 当前页是否阻塞类
@@ -1875,13 +1996,9 @@ function M.open()
     M.refresh()
     return
   end
+  -- 无待审/审批/留痕事项时同样打开窗口（展示空界面并订阅事件，新事项到达时自动刷新），
+  -- 不再提前返回、也不再弹「无事项」提示。
   local ctx = _gather_ctx()
-  local total = 0
-  for _, p in ipairs(hub_mod.PAGES) do total = total + _page_count(p.id, ctx) end
-  if total == 0 then
-    vim.notify("[NeoAI] 无待审/审批/留痕事项", vim.log.levels.INFO)
-    return
-  end
   _ensure_hl()
   _watch()
 
@@ -1965,7 +2082,7 @@ function M.open()
   end
 end
 
---- 重新拉取待审列表并重绘（无待审时自动关闭）
+--- 重新拉取待审列表并重绘（无待审/审批/留痕事项时保持窗口、渲染空界面）
 function M.refresh()
   if not (state.buf and vim.api.nvim_buf_is_valid(state.buf)) then return end
   local sandbox = services.use("services.sandbox")
@@ -1980,13 +2097,8 @@ function M.refresh()
     end)
   end
   local ctx = _gather_ctx()
-  local total = 0
-  for _, p in ipairs(hub_mod.PAGES) do total = total + _page_count(p.id, ctx) end
-  if total == 0 then
-    vim.notify("[NeoAI] 无待审/审批/留痕事项", vim.log.levels.INFO)
-    M.close()
-    return
-  end
+  -- 无待审/审批/留痕事项时不再提示、也不再自动关闭：保持窗口并渲染空界面，
+  -- 新事项到达时仍由事件订阅自动刷新。
   -- 待审集合变化：作废已完成的审计（避免展示过期结论；自动模式下 open 会重审）。
   local sig = _pending_sig(ctx.items)
   if state.audit and not state.audit.pending and state.audit_sig and state.audit_sig ~= sig then
@@ -2022,6 +2134,7 @@ function M.refresh()
   vim.api.nvim_buf_set_lines(state.buf, 0, -1, false, lines)
   state.line_to_target = _shift(body.line_to_target)
   state.line_to_trace = _shift(body.line_to_trace)
+  state.line_to_cmd = _shift(body.line_to_cmd)
   state.line_to_hub = _shift(body.line_to_hub)
   vim.api.nvim_buf_clear_namespace(state.buf, state.ns, 0, -1)
   for _, m in ipairs(marks) do
@@ -2073,6 +2186,7 @@ function M.close()
   state.line_to_target = {}
   state.line_to_hub = {}
   state.line_to_trace = {}
+  state.line_to_cmd = {}
   state.fold_levels = {}
   -- 作废在途 AI 审计结果；保留已完成结论（diff 预览返回/重开时复用，集合变化时由 refresh 清除）。
   state.audit_seq = state.audit_seq + 1

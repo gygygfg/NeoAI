@@ -1072,6 +1072,8 @@ local function _on_observed(attempt, ctx, evt)
       pcall(function()
         require("NeoAI.sandbox.trace").record({
           path = hit, tool = attempt.tool_name, kind = "read", source = "observed",
+          -- 实际命令（token 形态）：观测到「命令访问了哪个越界文件」时携带，供详情归因。
+          command = attempt.command,
         })
       end)
     end

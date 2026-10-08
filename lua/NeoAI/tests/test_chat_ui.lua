@@ -2250,4 +2250,151 @@ tests.suite("chat_ui", function(_, it)
     chat_service.reset()
   end)
 
+  it("跟随跳变时自动隐藏/重弹流式浮窗（思考过程）", function(t)
+    local chat_view = require("NeoAI.ui.window.chat_view")
+    local chat_service = require("NeoAI.services.chat_service")
+    local reasoning_panel = require("NeoAI.ui.components.reasoning_panel")
+    local float_window = require("NeoAI.ui.components.float_stream_window")
+    local event_bus = require("NeoAI.kernel.event_bus")
+    local events = require("NeoAI.kernel.events")
+    chat_view.reset()
+    chat_service.reset()
+    reasoning_panel.reset()
+    float_window.reset()
+
+    local opened = chat_view.open()
+    local agent = chat_service.get_current_agent()
+    -- 预置足够长的内容，使 buffer 行数超过 5（底部跟随区外可放光标）
+    agent.messages = {
+      { role = "user", content = "q1" },
+      { role = "assistant", content = "a1\na2\na3\na4\na5\na6\na7" },
+    }
+    chat_view.refresh()
+    vim.api.nvim_set_current_win(opened.win_id)
+
+    -- 跟随态：推理分片弹出思考悬浮窗
+    local total = vim.api.nvim_buf_line_count(opened.buf)
+    vim.api.nvim_win_set_cursor(opened.win_id, { total, 0 })
+    chat_view._sync_follow()
+    t.true_(chat_view.is_following(), "光标贴底应处于跟随态")
+    event_bus.emit(events.REASONING_CHUNK, { agent_id = agent.id, chunk = "思考一 ", reasoning = "思考一" })
+    event_bus.emit(events.REASONING_CHUNK, { agent_id = agent.id, chunk = "思考二", reasoning = "思考一思考二" })
+    chat_view.flush()
+    t.true_(reasoning_panel.is_open(), "跟随时推理分片应弹出思考悬浮窗")
+
+    -- 跳到非跟随（回看上方）：浮窗应自动隐藏
+    vim.api.nvim_win_set_cursor(opened.win_id, { 2, 0 })
+    chat_view._sync_follow()
+    t.false_(chat_view.is_following(), "光标回看上方应为非跟随态")
+    t.false_(reasoning_panel.is_open(), "从跟随跳到非跟随应自动隐藏思考悬浮窗")
+
+    -- 跳回跟随：仍在进行的推理流应重弹浮窗
+    vim.api.nvim_win_set_cursor(opened.win_id, { vim.api.nvim_buf_line_count(opened.buf), 0 })
+    chat_view._sync_follow()
+    t.true_(chat_view.is_following(), "光标回底应重新跟随")
+    t.true_(reasoning_panel.is_open(), "跳回跟随时应重弹仍在进行的思考悬浮窗")
+
+    -- 广播事件（供伪终端等订阅）
+    local got = nil
+    local unsub = event_bus.on(events.UI_FOLLOW_CHANGED, function(p) got = p end)
+    vim.api.nvim_win_set_cursor(opened.win_id, { 2, 0 })
+    chat_view._sync_follow()
+    t.not_nil(got, "跟随跳变应广播 UI_FOLLOW_CHANGED")
+    t.eq(false, got.following, "广播 payload 应带 following=false")
+    unsub()
+
+    chat_view.reset()
+    chat_service.reset()
+    reasoning_panel.reset()
+    float_window.reset()
+  end)
+
+  it("跟随跳变时浮窗互斥重弹（上下文压缩优先于思考过程）", function(t)
+    local chat_view = require("NeoAI.ui.window.chat_view")
+    local chat_service = require("NeoAI.services.chat_service")
+    local float_window = require("NeoAI.ui.components.float_stream_window")
+    local event_bus = require("NeoAI.kernel.event_bus")
+    local events = require("NeoAI.kernel.events")
+    chat_view.reset()
+    chat_service.reset()
+    float_window.reset()
+
+    local opened = chat_view.open()
+    local agent = chat_service.get_current_agent()
+    agent.messages = {
+      { role = "user", content = "q1" },
+      { role = "assistant", content = "a1\na2\na3\na4\na5\na6\na7" },
+    }
+    chat_view.refresh()
+    vim.api.nvim_set_current_win(opened.win_id)
+    local total = vim.api.nvim_buf_line_count(opened.buf)
+    vim.api.nvim_win_set_cursor(opened.win_id, { total, 0 })
+    chat_view._sync_follow()
+
+    -- 先推理，后进入上下文压缩（二者共用 float_stream_window）
+    event_bus.emit(events.REASONING_CHUNK, { agent_id = agent.id, chunk = "思考", reasoning = "思考" })
+    chat_view.flush()
+    event_bus.emit(events.COMPACTION_STARTED, { agent_id = agent.id })
+    event_bus.emit(events.COMPACTION_CHUNK, { agent_id = agent.id, content = "压缩摘要正文" })
+    chat_view.flush()
+    t.true_(float_window.is_open(), "压缩分片应打开悬浮窗")
+
+    -- 非跟随隐藏 → 跟随重弹：应弹压缩（优先级最高），而非思考过程
+    vim.api.nvim_win_set_cursor(opened.win_id, { 2, 0 })
+    chat_view._sync_follow()
+    t.false_(float_window.is_open(), "非跟随应隐藏悬浮窗")
+    vim.api.nvim_win_set_cursor(opened.win_id, { vim.api.nvim_buf_line_count(opened.buf), 0 })
+    chat_view._sync_follow()
+    t.true_(float_window.is_open(), "跳回跟随应重弹上下文压缩悬浮窗")
+    t.eq("🧬 上下文压缩", vim.api.nvim_win_get_config(float_window.open()).title[1][1],
+      "重弹的应是上下文压缩悬浮窗（优先级高于思考过程）")
+
+    chat_view.reset()
+    chat_service.reset()
+    float_window.reset()
+  end)
+
+  it("插入模式期间新增折叠文本在离开插入模式后补算折叠", function(t)
+    local chat_view = require("NeoAI.ui.window.chat_view")
+    local chat_service = require("NeoAI.services.chat_service")
+    chat_view.reset()
+    chat_service.reset()
+
+    local opened = chat_view.open()
+    local agent = chat_service.get_current_agent()
+    -- 模拟「插入模式期间写入折叠文本」：置 dirty 标记后补算
+    agent.messages = {
+      { role = "user", content = "q1" },
+      { role = "assistant", content = "answer", reasoning = "step 1\nstep 2" },
+    }
+    chat_view.refresh()
+
+    t.false_(chat_view._is_folds_dirty(), "初始不应有折叠待补算")
+    chat_view._mark_folds_dirty()
+    t.true_(chat_view._is_folds_dirty(), "标记后应有折叠待补算")
+    chat_view._recompute_folds()
+    t.false_(chat_view._is_folds_dirty(), "补算后应清除 dirty 标记")
+
+    -- 补算后推理块应处于折叠状态
+    vim.api.nvim_set_current_win(opened.win_id)
+    local fold_ln = nil
+    for ln = 1, vim.api.nvim_buf_line_count(opened.buf) do
+      if vim.fn.foldlevel(ln) > 0 then fold_ln = ln break end
+    end
+    t.not_nil(fold_ln, "推理内容应可折叠")
+    t.eq(fold_ln, vim.fn.foldclosed(fold_ln), "补算后推理块应处于折叠状态")
+
+    -- 非 dirty 时补算为 no-op（不改变已展开折叠）
+    if fold_ln then
+      vim.api.nvim_win_set_cursor(opened.win_id, { fold_ln, 0 })
+      vim.cmd("silent! normal! zo")
+      t.eq(-1, vim.fn.foldclosed(fold_ln), "zo 后推理块应展开")
+      chat_view._recompute_folds()
+      t.eq(-1, vim.fn.foldclosed(fold_ln), "非 dirty 时补算不应改动折叠状态")
+    end
+
+    chat_view.reset()
+    chat_service.reset()
+  end)
+
 end)

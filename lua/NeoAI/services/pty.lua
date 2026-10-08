@@ -27,6 +27,8 @@ local state = {
   judge = nil,     -- 自定义判官（测试/替换）：function(session) -> Deferred|nil
   active_id = nil, -- 当前判官会话 id（供 terminal_* 工具定位）
   window = nil,    -- 惰性加载的悬浮终端组件
+  follow_unsub = nil, -- UI_FOLLOW_CHANGED 事件订阅句柄
+  force_ui = false,   -- 测试钩子：强制视作「有 UI」（headless 下也能验证弹窗逻辑）
 }
 
 -- ========== 私有函数 ==========
@@ -40,6 +42,7 @@ end
 --- 是否有可用 UI（headless 下不建窗口）
 --- @return boolean
 local function _has_ui()
+  if state.force_ui then return true end
   local ok, uis = pcall(vim.api.nvim_list_uis)
   return ok and type(uis) == "table" and #uis > 0
 end
@@ -51,6 +54,22 @@ local function _window()
   local ok, mod = pcall(require, "NeoAI.ui.components.terminal_window")
   if ok and mod then state.window = mod end
   return state.window
+end
+
+--- 某会话的悬浮终端窗口是否确实可见。
+--- session.window 只是「曾打开」的标记：用户手动关闭（<C-q>）或窗口被关后，
+--- terminal_window 内部已删除条目，但旧句柄仍留在 session 上（stale handle），
+--- 据此会让 _should_show_window 永久判定「已打开」而不再弹（这正是伪终端「不是每次
+--- 都能弹出」的根因）。这里以组件的 is_open 为准，并顺手清掉失效句柄。
+--- @param session table|nil
+--- @return boolean
+local function _window_visible(session)
+  if not session or not session.window then return false end
+  local win = _window()
+  if not win or type(win.is_open) ~= "function" then return false end
+  if win.is_open(session.id) then return true end
+  session.window = nil
+  return false
 end
 
 --- 聊天窗口当前是否「跟随光标」。UI 未加载/无聊天窗口时默认允许弹出（不在缺失时永久抑制）。
@@ -68,7 +87,7 @@ end
 --- @param session table
 --- @param title string|nil
 local function _open_window(session, title)
-  if session.window or not _has_ui() then return end
+  if _window_visible(session) or not _has_ui() then return end
   local win = _window()
   if not win then return end
   pcall(function() session.window = win.open(session, title or session.title) end)
@@ -81,7 +100,7 @@ end
 --- @param on_wait boolean 本次是否为「检测到等待输入」触发（false=会话启动）
 --- @return boolean
 local function _should_show_window(session, on_wait)
-  if session.window then return false end
+  if _window_visible(session) then return false end
   local sw = _cfg().show_window or "on_wait"
   if sw == "never" then return false end
   if on_wait then
@@ -90,6 +109,62 @@ local function _should_show_window(session, on_wait)
     if sw ~= "always" then return false end
   end
   return _chat_following()
+end
+
+--- 关闭某会话的悬浮终端窗口，并清掉 session 上的句柄标记。
+--- @param session table
+local function _close_session_window(session)
+  local win = _window()
+  if win and type(win.close) == "function" then
+    pcall(win.close, session.id)
+  end
+  session.window = nil
+end
+
+--- 隐藏全部会话的悬浮终端窗口（用户从「跟随」跳到「非跟随」时调用）。
+--- 与流式自动浮窗一致：终端窗跟随底部命令输出，光标离开底部即应隐去，避免遮挡回看内容。
+--- 仅隐藏窗口，不清 session 的「曾打开/正在等待」语义——跳回跟随时据此重弹（见 _restore_pending_windows）。
+local function _hide_all_windows()
+  for _, session in pairs(state.sessions) do
+    if session.window then
+      _close_session_window(session)
+      session.window_hidden = true
+    end
+  end
+end
+
+--- 重弹仍应可见的会话终端窗（跳回跟随时调用）。
+--- - show_window=always：所有未结束会话都应可见 → 重弹；
+--- - show_window=on_wait：仅当前「等待输入中」的会话重弹；
+--- - never：不弹。
+--- 覆盖两种情况：窗口被隐藏（window_hidden）的，以及非跟随期间从未弹出过的（首次弹窗被抑制）。
+local function _restore_pending_windows()
+  if not _has_ui() or not _chat_following() then return end
+  local sw = _cfg().show_window or "on_wait"
+  if sw == "never" then return end
+  for _, session in pairs(state.sessions) do
+    if not session.done and not _window_visible(session) then
+      local want = (sw == "always") or session.waiting
+      if want then
+        session.window_hidden = nil
+        _open_window(session)
+      end
+    end
+  end
+end
+
+--- 订阅「光标跟随状态跳变」：跟随→非跟随隐藏终端窗；非跟随→跟随重弹仍在等待的终端窗。
+--- 懒订阅：首次 open 会话时注册；reset 时注销。
+local function _ensure_follow_subscription()
+  if state.follow_unsub then return end
+  state.follow_unsub = event_bus.on(events.UI_FOLLOW_CHANGED, function(payload)
+    local following = payload and payload.following
+    if following == false then
+      _hide_all_windows()
+    elseif following == true then
+      _restore_pending_windows()
+    end
+  end)
 end
 
 --- 读取单行 /proc 文件；失败返回 nil
@@ -625,6 +700,9 @@ function M.open(opts)
     end, timeout_ms)
   end
 
+  -- 订阅跟随跳变：跟随↔非跟随时隐藏/重弹终端窗（懒订阅，首次 open 时注册）。
+  _ensure_follow_subscription()
+
   -- 悬浮终端：always 立即弹出；on_wait 仅在检测到等待输入时弹出（见 _poll）。
   -- 两者都要求「光标跟随」，不跟随时不弹（用户正在回看上方内容）。
   session.title = opts.title
@@ -740,6 +818,19 @@ end
 M._extract_decision = _extract_decision
 -- 测试钩子：悬浮终端弹出判定（纯函数，受 chat follow 与 show_window 影响）
 M._should_show_window = _should_show_window
+-- 测试钩子：隐藏 / 重弹全部会话终端窗（模拟跟随跳变，headless 下配合 _set_force_ui 使用）
+M._hide_all_windows = _hide_all_windows
+M._restore_pending_windows = _restore_pending_windows
+-- 测试钩子：注入会话状态（无真实 job 时验证弹窗逻辑）
+--- @param session table
+function M._inject_session(session)
+  if session and session.id then state.sessions[session.id] = session end
+end
+-- 测试钩子：强制视作「有 UI」（headless 下验证弹窗逻辑；true 时组件仍需真实可用）
+--- @param v boolean
+function M._set_force_ui(v)
+  state.force_ui = v == true
+end
 
 --- 运行中的会话数量
 --- @return number
@@ -760,10 +851,17 @@ end
 --- 重置（测试用）
 function M.reset()
   M.stop_all()
+  if state.follow_unsub then
+    pcall(state.follow_unsub)
+    state.follow_unsub = nil
+  end
+  local win = _window()
+  if win and type(win.reset) == "function" then pcall(win.reset) end
   state.sessions = {}
   state.judge = nil
   state.active_id = nil
   state.window = nil
+  state.force_ui = false
 end
 
 return M

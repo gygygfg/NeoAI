@@ -112,6 +112,16 @@ the level does not rise; combine it with the "closed-fold first line" check (`fo
 header text. Moreover, a structural change (e.g. a tool completing and appending result lines) can be written **in the
 same batch** as in-place refreshes, so this must not be gated on `inserted==removed`; otherwise the fold of a tool still
 running in the same batch is missed and its content leaks line by line outside the fold.
+
+**Insert-mode fold suppression and recompute**: as long as **any** window is in insert mode, nvim does not compute
+`foldlevel` globally (it is 0 for all buffers), and it does not recompute after `InsertLeave` either, unless the chat
+window regains focus or content is written again. The symptom is that fold text written after the cursor enters insert
+mode in the input box is not folded. `_render` sets `state.folds_dirty=true` when it detects insert/replace mode, and
+the `InsertLeave` autocmd registered by `_register_focus_tracking` (deferred to the end of the event loop) calls
+`_recompute_folds`: within the chat window context it rebuilds `foldexpr` (reassigning the same value still triggers a
+full recompute) → `1,$foldclose!` to collapse the folds that appeared after the recompute → restores the folds the user
+had expanded. It skips when not dirty, still in insert mode, or the window is no longer on the chat buffer (the
+recompute would be suppressed again / applied to the wrong buffer).
 When a command's **arguments or result contain a secret** (sandbox fake key or a raw secret matched by a
 named rule), a **highlighted warning** (`NeoAISecretWarning`) is appended **outside** the
 tool fold block; the fold title stays clean (no `⚠ 密钥` suffix) and the warning remains visible while collapsed.
@@ -161,12 +171,29 @@ including wrapped lines), enables `smoothscroll`, **grows first and then scrolls
 to the end of the content (`G$`) followed by `zb` to stick to the bottom, ensuring that a long single line/large
 amount of content always scrolls to the latest tail.
 
+**Hide / re-pop on follow flip**: these windows track the bottom streaming content, so they should disappear together
+when the cursor leaves the bottom. Each streaming handler sets its `*_active` flag (tool arguments additionally store
+`last_tool_calls`, context operations store `ctxop_last_text`) **before** the follow check, and everything funnels
+through `_set_following(f)`: it acts only on a **real flip** of `state.following` — following→not following calls
+`_hide_floats()` to hide all (reasoning / tool arguments / context compaction·plan distillation); not following→following
+calls `_reshow_floats()` to re-pop **the one still in progress**. The three windows share a single
+`float_stream_window`, so re-popping is **mutually exclusive**: priority context compaction·plan distillation > tool
+arguments > reasoning. The flip also broadcasts `UI_FOLLOW_CHANGED` (see `events.lua`) for other automatic floating
+windows such as the terminal (`services.pty`) to subscribe to. Scrolling / cursor movement / `BufEnter` all call
+`M._sync_follow()` to re-evaluate the live cursor and stay in sync (replacing the previous direct assignments to
+`state.following`), so a flip only happens once when the user actually scrolls.
+
 ### 4.6 Input Box Linkage and Scrolling
 
 Main message area (top) + input split (bottom, height 3). After sending, focus returns to the main window and enters
 normal mode (you can scroll and browse during generation); the main body and the input box share the same set of chat
 context keymaps (`_build_chat_actions`). `input_box` renders the `> ` prefix with `virt_text` (it does not use
 `buftype=prompt`, to avoid conflicts with nvim-cmp), and enables completion for the `neoai_input` filetype.
+`attach_window` uses `'winfixbuf'` (Neovim 0.10+, `pcall` for older versions) to **lock the input window**: the input
+buffer is an unnamed `nofile` scratch buffer, and if `:e <file>` / `:bnext` etc. were allowed in the input window, that
+window would **reuse the input buffer** (`buftype` becomes empty, content replaced by the filename), after which input
+lands in the user's file and `:wq` saves the wrong thing. With it enabled, such switches raise `E1513` (Cannot switch
+buffer) and the input buffer and its content stay intact (order: temporarily disable `winfixbuf` → `set_buf` → re-enable).
 
 Scrolling in the main message area uses two paths:
 
@@ -223,7 +250,7 @@ Following deepseek-harness's Cordis plugin model, the chat view's "display modes
 
 | Component | Responsibility |
 | --- | --- |
-| `input_box` | Chat input box. `create`/`attach_window`/`focus`/`submit`/`on_submitted`/`clear`; renders the `>` prefix with `virt_text`; enables completion for the `neoai_input` filetype. |
+| `input_box` | Chat input box. `create`/`attach_window`/`focus`/`submit`/`on_submitted`/`clear`; renders the `>` prefix with `virt_text`; enables completion for the `neoai_input` filetype; `attach_window` locks the window with `'winfixbuf'` (0.10+) to forbid `:e`/`:bnext` from reusing the input buffer. |
 | `message_list` | Message list rendering. `render(buf, messages)`; `toggle_reasoning()`. |
 | `float_stream_window` | Reusable streaming floating window. `open(title,{filetype,max_height})`/`set_text`/`append`/`get_text`/`close`/`is_open`/`reset`; reasoning process / receiving arguments / context compaction / plan distillation share the same window. The window height adapts to the number of display lines (`nvim_win_text_height`), bounded by `max_height`, `smoothscroll` is enabled, and after writing it grows first then scrolls, with the cursor moved to the end of the content followed by `zb` to stick to the bottom. |
 | `reasoning_panel` | Reasoning process floating window (`float_stream_window` adapter, height capped at 5 lines). `open`/`show`/`append`/`close`/`is_open`; `filetype=neoai_reasoning`. |
@@ -233,8 +260,8 @@ Following deepseek-harness's Cordis plugin model, the chat view's "display modes
 | `tool_approval` | Tool approval popup. `init()`; serial single-slot display. |
 | `ask_user` | User questioning popup. `init()`; injected via `ask_user.set_ui`. |
 | `sub_agent_dock` | Sub-agent status monitoring. `init()`. |
-| `terminal_window` | Floating **interactive** terminal for interactive commands (`nvim_open_term` rendering; typing when focused is forwarded to the command). Opens per session id; **pops only when the chat cursor is following** (`show_window` controls timing); no-op in headless. Driven by `services.pty`. |
-| `sandbox_review` | Sandbox pending-review UI. `open()`; highlights by path level (workspace green / user yellow / system red) and shows high/medium/low risk grades; items are sectioned into **unapplied (pending)** and **applied (snapshotted, revertible)**. Per-file approval: `<CR>` applies the file under the cursor, `A` approves every workspace change in one key (files outside the workspace and host-operation proposals stay pending; yields to the main loop between items, shows progress in the title, and refuses re-entry while running), `d` rejects only that file, `i` opens that item's diff preview (returns with cursor restored), `u` undoes/redoes the save, `q` closes; while open the window subscribes to sandbox broadcast events and refreshes automatically (multiple events in the same tick are coalesced). The applied section is collapsed by default (two-level fold); **a pending item shows its header line with the rest folded and can be expanded with `za`/`zo`** (header keeps the whole-unit approval entry and highlight), while the trace section does not fold. High-risk items (L3, and L2 package/sensitive installs when `package_confirm` is on) require an AI consequence warning plus a second `<CR>` in the diff. |
+| `terminal_window` | Floating **interactive** terminal for interactive commands (`nvim_open_term` rendering; typing when focused is forwarded to the command). Opens per session id; **pops only when the chat cursor is following** (`show_window` controls timing), and hides / re-pops on follow flips via `UI_FOLLOW_CHANGED` (see `services.pty`); no-op in headless. Driven by `services.pty`. |
+| `sandbox_review` | Sandbox pending-review UI. `open()` (**opens even with no pending / approval / trace items, showing an empty view — no notice and no auto-close**; refreshing into an empty queue keeps the window open and new items are picked up by the event subscription); highlights by path level (workspace green / user yellow / system red) and shows high/medium/low risk grades; items are sectioned into **unapplied (pending)** and **applied (snapshotted, revertible)**. Per-file approval: `<CR>` applies the file under the cursor, `A` approves every workspace change in one key (files outside the workspace and host-operation proposals stay pending; yields to the main loop between items, shows progress in the title, and refuses re-entry while running), `d` rejects only that file, `i` opens that item's diff preview (returns with cursor restored), `u` undoes/redoes the save, `q` closes; on an **outside-access trace** row `i` opens the access detail (summary of tools/source/command count/first-last time, then per-access tool/kind/command/time), and on an **outside-command** row `i` opens the command detail (files that command accessed out of bounds); while open the window subscribes to sandbox broadcast events and refreshes automatically (multiple events in the same tick are coalesced). The applied section is collapsed by default (two-level fold); **a pending item shows its header line with the rest folded and can be expanded with `za`/`zo`** (header keeps the whole-unit approval entry and highlight), while the trace section does not fold. High-risk items (L3, and L2 package/sensitive installs when `package_confirm` is on) require an AI consequence warning plus a second `<CR>` in the diff. |
 | `fold` | Folds (shared implementation for reasoning/tool calls/results). `foldexpr`/`foldtext`/`record_start`/`record_end`/`has_running`/`set_live_timer`/`set_foldexpr_override`/`set_foldtext_override`/`set_reasoning_lines`/`is_reasoning_start`/`generic_label`. |
 | `display_modes/` | Display mode plugin manager + `chat.lua`/`trajectory.lua`. |
 | `markdown_view` | Markdown renderer. |
