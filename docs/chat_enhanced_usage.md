@@ -24,8 +24,9 @@
   鼠标滚轮用 `<C-E>`/`<C-Y>` 平滑滚动视口（`_wheel_scroll`），滚到底时末行下方留白钳制在
   `ui.chat.mousescroll_max_blank`（默认 3）行内，不会像原生那样越滚越白。
 - 输入框：普通 buffer + `virt_text` 渲染 `> ` 前缀（不用 `buftype=prompt`，避免与 nvim-cmp 冲突）；
-  放开 `neoai_input` filetype 的补全；输入窗口用 `'winfixbuf'`（0.10+）锁定，误在其中执行 `:e <file>` 会
-  报 `E1513` 而**不会**把输入框变成该文件（避免输入落进用户文件 / `:wq` 误保存）。
+  放开 `neoai_input` filetype 的补全；输入窗口用 `'winfixbuf'`（0.10+）低层锁定，并在 `chat_view` 用
+  `CmdlineLeave` 拦截其中执行 `:e <file>` / `:bnext` 等 buffer 切换命令：原命令被中止、改在**新标签页**
+  打开目标文件，既不报 `E1513`，也**不会**把输入框变成该文件（避免输入落进用户文件 / `:wq` 误保存）。
 
 ## 3. 基本交互
 

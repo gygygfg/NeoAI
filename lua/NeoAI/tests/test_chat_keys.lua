@@ -244,6 +244,9 @@ tests.suite("chat_keys", function(_, it)
   end)
 
   it("输入窗口锁定 winfixbuf：:e 文件不改写输入 buffer（回归 N1）", function(t)
+    -- 本用例锁定的是【低层 winfixbuf 兜底】：用 nvim_win_call + vim.cmd 直接执行 :edit，
+    -- 不经过 Cmdline，故不会触发 chat_view 的 CmdlineLeave 拦截（详见 test_chat_ui 的
+    -- 「输入框内 :e 文件不报 E1513」用例）；此处验证 winfixbuf 仍会拦下并保留输入 buffer。
     local input_box = require("NeoAI.ui.components.input_box")
     input_box.reset()
     input_box.create({ on_submit = function() end })

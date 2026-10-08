@@ -237,11 +237,14 @@ function M.create(opts)
 end
 
 --- 绑定到已存在的窗口（用于 split 布局）
---- 用 'winfixbuf' 锁住输入窗口，禁止把窗口切到其它 buffer：输入 buffer 是无名 nofile 暂存
---- buffer，用户在此窗口执行 :e <file> / :bnext 等会**复用该窗口的 buffer**、把输入 buffer 变成一个
+--- 用 'winfixbuf' 锁住输入窗口，作为**低层兜底**：输入 buffer 是无名 nofile 暂存 buffer，
+--- 用户在此窗口执行 :e <file> / :bnext 等会**复用该窗口的 buffer**、把输入 buffer 变成一个
 --- 命名文件 buffer（buftype 变空），之后输入就会落进用户文件、且 :wq 会误保存。
 --- 开启 winfixbuf 后，此类切换会抛 E1513（Cannot switch buffer. 'winfixbuf' is enabled），
 --- 保持输入 buffer 不变。Neovim 0.10+ 才有该选项，旧版本 pcall 静默跳过。
+--- 注意：正常用户在输入框敲 :e / :bnext 时，**更高层**的 chat_view 已用 CmdlineLeave
+--- （_on_input_cmdline_leave）拦截并改在新标签页打开，不会把 E1513 抛给用户；
+--- winfixbuf 只兜住不触发 Cmdline 事件的路径（插件直接 nvim_win_set_buf / <Cmd> 等）。
 --- 顺序：先临时关闭 winfixbuf（否则 set_buf 自身也会被 E1513 拦下）→ 绑定输入 buffer → 重新开启。
 --- @param win_id number
 function M.attach_window(win_id)

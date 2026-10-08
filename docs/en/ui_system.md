@@ -192,8 +192,19 @@ context keymaps (`_build_chat_actions`). `input_box` renders the `> ` prefix wit
 `attach_window` uses `'winfixbuf'` (Neovim 0.10+, `pcall` for older versions) to **lock the input window**: the input
 buffer is an unnamed `nofile` scratch buffer, and if `:e <file>` / `:bnext` etc. were allowed in the input window, that
 window would **reuse the input buffer** (`buftype` becomes empty, content replaced by the filename), after which input
-lands in the user's file and `:wq` saves the wrong thing. With it enabled, such switches raise `E1513` (Cannot switch
-buffer) and the input buffer and its content stay intact (order: temporarily disable `winfixbuf` → `set_buf` → re-enable).
+lands in the user's file and `:wq` saves the wrong thing.
+
+To avoid surfacing the low-level `E1513` (Cannot switch buffer) to the user, `chat_view` additionally intercepts
+buffer-switch commands typed **in the input window** at a higher layer via `CmdlineLeave` (`_on_input_cmdline_leave`)
+(`:e`/`:edit`/`:ex`/`:enew`/`:view`/`:find` and `:bnext`/`:bprevious`/`:buffer`/`:bfirst`/`:blast`/`:brewind`): it aborts the
+original command with `let v:event.abort = v:true` (assigning `ev.abort` directly from a Lua callback does not work) and
+instead opens the target file / jumps to the target buffer in a **new tab page** (`tabnew`), leaving the chat main window
+and input box unchanged, so the user never sees E1513. `winfixbuf` remains the **low-level backstop**: paths that do not
+fire Cmdline events (plugins calling `nvim_win_set_buf` directly, `<Cmd>`, etc.) are still blocked by it, keeping the
+input buffer from being reused. (order: temporarily disable `winfixbuf` → `set_buf` → re-enable.)
+
+> Note: `:sp`/`:vsp`/`:tabedit`/`:tabnew`/`:sbuffer`/`:sview` etc. open new windows without touching this window's
+> buffer, so `winfixbuf` already lets them through and no interception is needed.
 
 Scrolling in the main message area uses two paths:
 
@@ -215,6 +226,13 @@ Focus tracking (`WinEnter`/`BufEnter`) determines whether the current window bel
 displayed buffer rather than the window handle): when focus leaves (or the main window is switched to another file via
 `:bnext`), the input box is collapsed (`_collapse_aux`), and when returning to the chat it is restored
 (`_restore_aux`, with the input buffer content preserved).
+
+`_restore_aux` now means **"ensure the input area exists"**: whenever the chat main window is valid and the input window
+is missing/invalid it is recreated, not only when `state.collapsed` is true. So even if the user closes the input window
+with `:q`/`<C-w>c` (which `winfixbuf` does not block, and `collapsed` is still false at that point), the input box is
+automatically restored when returning to the chat rather than staying gone forever. `WinClosed` promptly clears the
+stale handle when the input window is closed, and a re-entrancy guard `_input_creating` prevents the nested `WinEnter`
+fired synchronously by `:split` from creating a second input box.
 
 ### 4.8 LSP Isolation for UI Buffers (ui/lsp_guard)
 
@@ -250,7 +268,7 @@ Following deepseek-harness's Cordis plugin model, the chat view's "display modes
 
 | Component | Responsibility |
 | --- | --- |
-| `input_box` | Chat input box. `create`/`attach_window`/`focus`/`submit`/`on_submitted`/`clear`; renders the `>` prefix with `virt_text`; enables completion for the `neoai_input` filetype; `attach_window` locks the window with `'winfixbuf'` (0.10+) to forbid `:e`/`:bnext` from reusing the input buffer. |
+| `input_box` | Chat input box. `create`/`attach_window`/`focus`/`submit`/`on_submitted`/`clear`; renders the `>` prefix with `virt_text`; enables completion for the `neoai_input` filetype; `attach_window` locks the window with `'winfixbuf'` (0.10+) as a low-level backstop against `:e`/`:bnext` reusing the input buffer (user-typed commands are intercepted by `chat_view`'s `CmdlineLeave`). |
 | `message_list` | Message list rendering. `render(buf, messages)`; `toggle_reasoning()`. |
 | `float_stream_window` | Reusable streaming floating window. `open(title,{filetype,max_height})`/`set_text`/`append`/`get_text`/`close`/`is_open`/`reset`; reasoning process / receiving arguments / context compaction / plan distillation share the same window. The window height adapts to the number of display lines (`nvim_win_text_height`), bounded by `max_height`, `smoothscroll` is enabled, and after writing it grows first then scrolls, with the cursor moved to the end of the content followed by `zb` to stick to the bottom. |
 | `reasoning_panel` | Reasoning process floating window (`float_stream_window` adapter, height capped at 5 lines). `open`/`show`/`append`/`close`/`is_open`; `filetype=neoai_reasoning`. |

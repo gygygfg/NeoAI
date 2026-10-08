@@ -2397,4 +2397,91 @@ tests.suite("chat_ui", function(_, it)
     chat_service.reset()
   end)
 
+  it("输入窗口被关闭后聚焦聊天主窗口自动重建输入框（回归 N2）", function(t)
+    local chat_view = require("NeoAI.ui.window.chat_view")
+    local chat_service = require("NeoAI.services.chat_service")
+    local input_box = require("NeoAI.ui.components.input_box")
+    chat_view.reset()
+    chat_service.reset()
+
+    local opened = chat_view.open()
+    local ibuf = input_box.get_buf()
+    local iwin = input_box.get_win()
+    t.true_(iwin ~= nil and vim.api.nvim_win_is_valid(iwin), "打开后应创建输入窗口")
+
+    -- flush 打开时的待处理按键（open 会 feedkeys("A")），再写入草稿
+    vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<Esc>", true, false, true), "x", false)
+    vim.wait(50, function() return false end)
+    vim.api.nvim_buf_set_lines(ibuf, 0, -1, false, { "draft keep" })
+
+    -- 用户在输入框里按 :q / <C-w>c 关掉输入窗口（winfixbuf 不阻止关窗）
+    vim.api.nvim_set_current_win(iwin)
+    vim.cmd("stopinsert")
+    vim.cmd("q")
+    vim.wait(80, function() return false end)
+    t.false_(vim.api.nvim_win_is_valid(iwin), "输入窗口应已被关闭")
+
+    -- 焦点回到聊天主窗口：应无条件重建输入框（旧实现因 collapsed==false 而不重建导致永久丢失）
+    vim.api.nvim_set_current_win(opened.win_id)
+    t.true_(vim.wait(500, function()
+      local w = input_box.get_win()
+      return w ~= nil and vim.api.nvim_win_is_valid(w)
+    end), "切回聊天主窗口后应重建输入窗口")
+
+    -- 不得重复创建：恰好一个窗口显示输入 buffer（同一草稿 buffer）
+    local input_buf = input_box.get_buf()
+    t.eq(ibuf, input_buf, "应复用同一输入 buffer")
+    local n = 0
+    for _, w in ipairs(vim.api.nvim_list_wins()) do
+      if vim.api.nvim_win_get_buf(w) == input_buf then n = n + 1 end
+    end
+    t.eq(1, n, "重建后应只有一个输入框")
+    t.eq("draft keep", vim.api.nvim_buf_get_lines(input_buf, 0, 1, false)[1], "草稿内容应保留")
+
+    chat_view.reset()
+    chat_service.reset()
+  end)
+
+  it("输入框内 :e 文件不报 E1513，改为新标签页打开且聊天界面不变（回归 N1）", function(t)
+    local chat_view = require("NeoAI.ui.window.chat_view")
+    local chat_service = require("NeoAI.services.chat_service")
+    local input_box = require("NeoAI.ui.components.input_box")
+    chat_view.reset()
+    chat_service.reset()
+
+    local opened = chat_view.open()
+    local ibuf = input_box.get_buf()
+    local iwin = input_box.get_win()
+    t.true_(iwin ~= nil and vim.api.nvim_win_is_valid(iwin), "打开后应创建输入窗口")
+
+    vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<Esc>", true, false, true), "x", false)
+    vim.wait(50, function() return false end)
+    vim.api.nvim_set_current_win(iwin)
+    vim.cmd("stopinsert")
+    vim.api.nvim_buf_set_lines(ibuf, 0, -1, false, { "用户输入" })
+
+    vim.cmd("messages clear")
+    local tmp = vim.fn.tempname() .. "_n1.txt"
+    vim.api.nvim_feedkeys(
+      vim.api.nvim_replace_termcodes(":edit " .. vim.fn.fnameescape(tmp) .. "<CR>", true, false, true),
+      "x", false)
+    vim.wait(300, function() return false end)
+
+    -- 1) 不再向用户抛 E1513
+    local msgs = vim.api.nvim_exec2("messages", { output = true }).output or ""
+    t.true_(msgs:find("1513") == nil, "输入框内 :e 不应报 E1513，实际消息: " .. msgs)
+    -- 2) 输入 buffer 未被复用（winfixbuf 低层兜底仍成立）
+    t.eq(ibuf, vim.api.nvim_win_get_buf(iwin), "输入窗口应仍显示输入 buffer")
+    t.eq("nofile", vim.bo[ibuf].buftype, "输入 buffer 仍应为 nofile")
+    t.eq("用户输入", vim.api.nvim_buf_get_lines(ibuf, 0, 1, false)[1], "输入内容不应被改写")
+    -- 3) 文件在新标签页打开，聊天界面的主窗口与输入框保持不变
+    t.eq(vim.fn.fnamemodify(tmp, ":t"), vim.fn.fnamemodify(vim.api.nvim_buf_get_name(0), ":t"),
+      "新标签页应显示 :e 的文件")
+    t.true_(chat_view.has_window(), "聊天窗口应仍然存在")
+    t.true_(vim.api.nvim_win_is_valid(opened.win_id), "聊天主窗口应仍然有效")
+
+    chat_view.reset()
+    chat_service.reset()
+  end)
+
 end)

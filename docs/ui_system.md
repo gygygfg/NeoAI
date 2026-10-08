@@ -160,8 +160,17 @@
 前缀（不用 `buftype=prompt`，避免与 nvim-cmp 冲突），并放开 `neoai_input` filetype 的补全。
 `attach_window` 会用 `'winfixbuf'`（Neovim 0.10+，`pcall` 兼容旧版）**锁定输入窗口**：输入 buffer 是
 无名 `nofile` 暂存 buffer，若允许在输入窗口执行 `:e <file>` / `:bnext` 等，该窗口会**复用输入 buffer**
-（`buftype` 变空、内容被文件名替换），此后输入落进用户文件、`:wq` 误保存。开启后此类切换抛
-`E1513`（Cannot switch buffer），输入 buffer 与内容保持不变（顺序：临时关 `winfixbuf` → `set_buf` → 重开）。
+（`buftype` 变空、内容被文件名替换），此后输入落进用户文件、`:wq` 误保存。
+
+为避免把底层的 `E1513`（Cannot switch buffer）直接抛给用户，`chat_view` 另在高层用 `CmdlineLeave`
+（`_on_input_cmdline_leave`）拦截**输入窗口内**的 buffer 切换命令（`:e`/`:edit`/`:ex`/`:enew`/`:view`/`:find`
+与 `:bnext`/`:bprevious`/`:buffer`/`:bfirst`/`:blast`/`:brewind`）：用 `let v:event.abort = v:true` 中止原命令
+（Lua 回调里直接给 `ev.abort` 赋值无效），改在新标签页（`tabnew`）打开目标文件/跳转目标 buffer，
+聊天主窗口与输入框保持不变，用户拿不到 E1513。`winfixbuf` 仍是**低层兜底**：未触发 Cmdline 事件的
+路径（插件直接 `nvim_win_set_buf`、`<Cmd>` 等）仍被它拦下，保输入 buffer 不被复用。（顺序：临时关 `winfixbuf` → `set_buf` → 重开。）
+
+> 注：`:sp`/`:vsp`/`:tabedit`/`:tabnew`/`:sbuffer`/`:sview` 等会新开窗口、不碰本窗口 buffer，
+> `winfixbuf` 本就放行，无需拦截。
 
 主消息区滚动分两套：
 
@@ -180,6 +189,12 @@
 焦点追踪（`WinEnter`/`BufEnter`）判断当前窗口是否属于聊天界面（按显示的 buffer 而非窗口句柄）：
 焦点离开（或主窗口被 `:bnext` 切到别的文件）时收起输入框（`_collapse_aux`），回到聊天时恢复
 （`_restore_aux`，输入 buffer 内容保留）。
+
+`_restore_aux` 为**「确保输入区存在」**语义：只要聊天主窗口有效且输入窗口缺失/失效就重建，不再只在
+`state.collapsed` 为真时才建。这样即使用户在输入框里 `:q`/`<C-w>c` 把输入窗口关掉（`winfixbuf` 并不阻止关窗，
+且此时 `collapsed` 仍为 false），回到聊天界面时输入框也会自动补回，不会永久消失。
+`WinClosed` 负责在输入窗口被关掉时及时清除失效句柄；创建时用重入守卫 `_input_creating` 防止 `:split`
+同步触发的嵌套 `WinEnter` 建出第二个输入框。
 
 ### 4.8 界面 buffer 的 LSP 隔离（ui/lsp_guard）
 
@@ -212,7 +227,7 @@ NeoAI 的聊天/输入框/悬浮窗等都是纯 UI 文本，若 LSP 客户端（
 
 | 组件 | 职责 |
 | --- | --- |
-| `input_box` | 聊天输入框。`create`/`attach_window`/`focus`/`submit`/`on_submitted`/`clear`；`virt_text` 渲染 `>` 前缀；放开 `neoai_input` 文件类型补全；`attach_window` 用 `'winfixbuf'`（0.10+）锁窗，禁止 `:e`/`:bnext` 复用输入 buffer。 |
+| `input_box` | 聊天输入框。`create`/`attach_window`/`focus`/`submit`/`on_submitted`/`clear`；`virt_text` 渲染 `>` 前缀；放开 `neoai_input` 文件类型补全；`attach_window` 用 `'winfixbuf'`（0.10+）锁窗，作为低层兜底防止 `:e`/`:bnext` 复用输入 buffer（用户级拦截见 `chat_view` 的 `CmdlineLeave`）。 |
 | `message_list` | 消息列表渲染。`render(buf, messages)`；`toggle_reasoning()`。 |
 | `float_stream_window` | 复用流式悬浮窗。`open(title,{filetype,max_height})`/`set_text`/`append`/`get_text`/`close`/`is_open`/`reset`；思考过程 / 接收参数 / 计划蒸馏共享同一窗口（上下文压缩为后台异步、不弹窗，不再使用）。窗口高度按显示行数（`nvim_win_text_height`）自适应，受 `max_height` 限制，开启 `smoothscroll`，写入后先增高再滚、光标移到内容末尾后 `zb` 贴底。 |
 | `reasoning_panel` | 思考过程悬浮窗（`float_stream_window` 适配器，高度上限 5 行）。`open`/`show`/`append`/`close`/`is_open`；`filetype=neoai_reasoning`。 |

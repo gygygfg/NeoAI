@@ -28,8 +28,10 @@ The chat window = **main message area (top)** + **input box (bottom, split, heig
   (default 3) lines instead of leaving more and more white space like the native behavior.
 - Input box: a regular buffer with a `virt_text`-rendered `> ` prefix (not using `buftype=prompt`, to avoid
   conflicts with nvim-cmp); completion is enabled for the `neoai_input` filetype; the input window is locked with
-  `'winfixbuf'` (0.10+), so an accidental `:e <file>` there errors with `E1513` and does **not** turn the input box
-  into that file (avoiding input landing in the user's file / a wrong `:wq`).
+  `'winfixbuf'` (0.10+) as a low-level backstop, and `chat_view` intercepts buffer-switch commands (`:e <file>`, `:bnext`,
+  etc.) typed there via `CmdlineLeave`: the original command is aborted and the target file is opened in a **new tab**,
+  so it neither raises `E1513` nor turns the input box into that file (avoiding input landing in the user's file /
+  a wrong `:wq`).
 
 ## 3. Basic Interaction
 

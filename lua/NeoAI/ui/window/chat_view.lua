@@ -1107,22 +1107,29 @@ local function _collapse_aux()
   state.input_win_id = nil
 end
 
---- 恢复收起前的输入框（回到聊天界面）。输入 buffer 内容保留（bufhidden=hide）。
+--- 确保输入区存在（回到聊天界面时）。输入 buffer 内容保留（bufhidden=hide）。
+--- 与旧实现不同：不再只在 state.collapsed 为真时才重建。只要输入窗口缺失/失效（例如用户在
+--- 输入框里 :q / <C-w>c 关掉了它，或它随 :only 等被一并关闭），就重新创建，避免输入框
+--- 因「窗口被关但 collapsed 仍为 false」而永久消失（回归 N2）。
 --- 在 WinEnter/BufEnter 自动命令内直接 :split 可能撞上另一个窗口正在关闭
 --- （如 telescope 关闭窗口时触发 WinEnter），报 E242 "Can't split a window while
 --- closing another"。此时不能直接失败：先同步尝试，仅在 E242 时推迟到主循环下一拍重试。
 local _restore_pending = false
+local _input_creating = false
 local function _restore_aux()
-  if not state.collapsed then return end
   if not state.win_id or not vim.api.nvim_win_is_valid(state.win_id) then return end
   if state.input_win_id and vim.api.nvim_win_is_valid(state.input_win_id) then
     state.collapsed = false
     return
   end
-  -- 先标记为已恢复：创建输入窗口时会同步触发 WinEnter，若不提前置位，
-  -- 嵌套的 _restore_aux 会再次进入并创建出第二个输入框。
+  -- 输入窗口缺失/失效：重建。重入守卫：创建输入窗口时 :split 会同步触发 WinEnter，
+  -- 嵌套调用若再次进入会建出第二个输入框。
+  if _input_creating then return end
+  _input_creating = true
   state.collapsed = false
-  if pcall(_create_input_area, false) then return end
+  local ok = pcall(_create_input_area, false)
+  _input_creating = false
+  if ok then return end
   -- 失败但窗口其实已建出（失败发生在后续步骤）：视为已恢复，绝不再建一个。
   if state.input_win_id and vim.api.nvim_win_is_valid(state.input_win_id) then return end
   state.collapsed = true
@@ -1131,15 +1138,20 @@ local function _restore_aux()
   _restore_pending = true
   vim.schedule(function()
     _restore_pending = false
-    if not state.collapsed then return end
     if not M.has_window() then return end
     if not _is_chat_affiliated(vim.api.nvim_get_current_win()) then return end
     if state.input_win_id and vim.api.nvim_win_is_valid(state.input_win_id) then
       state.collapsed = false
       return
     end
+    if _input_creating then return end
+    _input_creating = true
     state.collapsed = false
-    if not pcall(_create_input_area, false) then state.collapsed = true end
+    local ok2 = pcall(_create_input_area, false)
+    _input_creating = false
+    if not ok2 and not (state.input_win_id and vim.api.nvim_win_is_valid(state.input_win_id)) then
+      state.collapsed = true
+    end
   end)
 end
 
@@ -1152,6 +1164,56 @@ local function _on_win_enter()
     _resize_input_for_focus()
   else
     _collapse_aux()
+  end
+end
+
+--- 输入框窗口内「切换 buffer」类命令集合：这些命令会复用输入窗口的 nofile 暂存 buffer
+--- （buftype 变空、内容被文件名替换），既而输入落进用户文件 / :wq 误保存。
+--- input_box 的 'winfixbuf' 会在低层阻止它们，但会向用户抛 E1513；这里在更高层
+--- 拦截并把命令重定向到新标签页执行，既不报错也不复用输入 buffer。
+--- 注：:sp/:vsp/:tabedit/:tabnew/:sbuffer/:sview 等会新开窗口、不碰本窗口 buffer，
+--- winfixbuf 本就放行，无需拦截。
+local _REDIRECT_FILE_CMDS = { edit = true, ex = true, enew = true, view = true, find = true }
+local _REDIRECT_NAV_CMDS = {
+  bnext = true, bprevious = true, buffer = true,
+  bfirst = true, blast = true, brewind = true,
+}
+
+--- CmdlineLeave：输入窗口内执行 buffer 切换命令时，中止原命令并改在新标签页打开，
+--- 避免向用户抛 E1513（winfixbuf），同时保证输入 buffer 不被复用。
+--- 关键：Lua 回调里 ev.abort / vim.v.event.abort 均无效（实测命令仍执行），
+--- 必须用 vim.cmd("let v:event.abort = v:true") 才能真正中止（且不显示错误）。
+--- @param ev table
+local function _on_input_cmdline_leave(ev) -- luacheck: ignore ev
+  if not M.has_window() then return end
+  if vim.fn.getcmdtype() ~= ":" then return end
+  if not state.input_win_id or not vim.api.nvim_win_is_valid(state.input_win_id) then return end
+  -- CmdlineLeave 是 cmdwin 等场景也会触发，只处理「当前窗口恰为输入窗口」的情况。
+  if vim.api.nvim_get_current_win() ~= state.input_win_id then return end
+  local line = vim.fn.getcmdline()
+  if not line or line == "" then return end
+  local ok, parsed = pcall(vim.api.nvim_parse_cmd, line, {})
+  if not ok or not parsed or not parsed.cmd then return end
+  local cmd = parsed.cmd
+  local is_file = _REDIRECT_FILE_CMDS[cmd] and #(parsed.args or {}) > 0
+  local is_nav = _REDIRECT_NAV_CMDS[cmd]
+  if not is_file and not is_nav then return end
+  -- 中止原命令（抑制 E1513），改在新标签页执行；聊天主窗口与输入框保持不变。
+  pcall(vim.cmd, "let v:event.abort = v:true")
+  vim.schedule(function()
+    if not M.has_window() then return end
+    pcall(vim.cmd, "tabnew")
+    pcall(vim.cmd, line)
+  end)
+end
+
+--- WinClosed：输入窗口被用户关掉（:q / <C-w>c 等）时及时清除失效句柄，
+--- 使后续回到聊天界面时 _restore_aux 能重建输入框（回归 N2）。
+--- @param ev table
+local function _on_win_closed(ev) -- luacheck: ignore ev
+  if not state.input_win_id then return end
+  if tonumber(ev.match) == state.input_win_id then
+    state.input_win_id = nil
   end
 end
 
@@ -1215,6 +1277,16 @@ local function _register_focus_tracking()
   vim.api.nvim_create_autocmd("BufEnter", {
     group = state.focus_augroup,
     callback = _on_buf_enter,
+  })
+  -- 输入窗口被 :q 等关掉时清理句柄，回到聊天时才能重建输入框（回归 N2）。
+  vim.api.nvim_create_autocmd("WinClosed", {
+    group = state.focus_augroup,
+    callback = _on_win_closed,
+  })
+  -- 输入窗口内 buffer 切换命令拦截：改在新标签页打开，避免 E1513（回归 N1）。
+  vim.api.nvim_create_autocmd("CmdlineLeave", {
+    group = state.focus_augroup,
+    callback = _on_input_cmdline_leave,
   })
   -- 光标在聊天 buffer 内移动（j/k、gg/G、鼠标、插件跳转等）后重同步跟随：
   -- 光标离开底部（回看上方）→ 隐藏流式自动浮窗；回到贴底 → 重弹仍在进行的浮窗。
