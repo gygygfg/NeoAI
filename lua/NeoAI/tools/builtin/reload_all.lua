@@ -1,4 +1,4 @@
---- 插件热重载工具
+--- 插件热重载实现（供 `:NeoAIReloadAll` 命令使用的底层实现，不暴露为 AI 工具）
 --- @module NeoAI.tools.builtin.reload_all
 --- 热重载整个 NeoAI 插件。安全策略：
 --- 1. 隔离子进程预检：用一个全新的 headless nvim（--clean -u NONE + rtp=插件根）
@@ -8,7 +8,6 @@
 ---    重新 setup → 重建工具/技能/MCP 与聊天界面，尽量保留当前会话）。
 --- 4. 重载本身 pcall 包裹，失败时按 require 缓存快照尽力回滚。
 
-local helpers = require("NeoAI.tools.builtin.tool_helpers")
 local stringx = require("NeoAI.utils.stringx")
 
 local M = {}
@@ -17,19 +16,11 @@ local M = {}
 
 -- 子进程执行器：cmd(数组) + timeout_ms -> { code, stdout, stderr, timed_out?, failed_to_start? }
 local spawner = nil
--- 受控重载执行器：-> ok(boolean), err(string|nil)。nil 表示使用默认实现。
-local perform_fn = nil
 
 --- 覆盖子进程执行器（测试用）；传 nil 恢复默认
 --- @param fn function|nil
 function M._set_spawner(fn)
   spawner = fn
-end
-
---- 覆盖受控重载执行器（测试用）；传 nil 恢复默认
---- @param fn function|nil
-function M._set_perform(fn)
-  perform_fn = fn
 end
 
 -- ========== 私有函数 ==========
@@ -243,70 +234,6 @@ function M._perform_reload()
   end
 
   return true, nil
-end
-
---- 调度真正重载：Agent 忙碌时等本轮结束（回到 idle）后执行，避免在工具循环栈内清缓存。
---- @param ctx table|nil
-local function _schedule_reload(ctx)
-  local chat_service = require("NeoAI.kernel.services").use("services.chat_service")
-  local agent = ctx and ctx.agent or (chat_service and chat_service.get_current_agent())
-  local busy = agent and (agent.state == "generating" or agent.state == "tool_running")
-
-  local function do_it()
-    local fn = perform_fn or M._perform_reload
-    local ok, err = fn()
-    if ok then
-      vim.notify("[NeoAI] 插件已热重载完成", vim.log.levels.INFO)
-    else
-      vim.notify("[NeoAI] 插件热重载失败（已尽力回滚）：" .. tostring(err), vim.log.levels.ERROR)
-    end
-  end
-
-  if busy then
-    local event_bus = require("NeoAI.kernel.event_bus")
-    local events = require("NeoAI.kernel.events")
-    local unsub
-    unsub = event_bus.on(events.AGENT_STATE_CHANGED, function(d)
-      if d and d.agent_id == agent.id and d.new == "idle" then
-        if unsub then unsub() end
-        vim.schedule(do_it)
-      end
-    end)
-  else
-    vim.schedule(do_it)
-  end
-end
-
--- ========== 工具定义 ==========
-
-local reload_tools = {}
-
-reload_tools.reload_all = helpers.define_tool(
-  "reload_all",
-  "热重载整个 NeoAI 插件：先以隔离的子进程做预检（全新 headless nvim 加载插件并冒烟校验），"
-    .. "通过后清空 NeoAI.* 模块缓存并重新 setup（重建工具/技能/MCP 与聊天界面，尽量保留当前会话）。"
-    .. "预检失败会返回报错信息并取消重载，不影响当前会话。用于修改插件源码后即时生效。",
-  { type = "object", properties = {}, required = {} },
-  function(_, on_success, on_error, ctx)
-    local res = M._precheck()
-    if not res.ok then
-      on_error("插件热重载预检失败，已取消重载：\n" .. tostring(res.message))
-      return
-    end
-    _schedule_reload(ctx)
-    on_success("预检通过，已调度插件热重载（本轮生成结束后执行）。")
-  end,
-  { category = "system", approval = { auto_allow = false } }
-)
-
---- 获取工具列表
---- @return table 数组
-function M.get_tools()
-  local out = {}
-  for _, tool in pairs(reload_tools) do
-    out[#out + 1] = tool
-  end
-  return out
 end
 
 return M

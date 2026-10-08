@@ -60,7 +60,7 @@ ensure_started() -- 阶段 2：tools/sandbox/tool_service/skills/mcp/herder + �
 ```
 
 - `plugins.start_list_async(ids, on_done)` 每帧启动一个插件并 `vim.defer_fn(...,0)` 让出事件循环；阶段 1 完成即打开界面。
-- `ensure_started_sync(timeout)` 供测试 / `reload_all` 同步等待两阶段完成。
+- `ensure_started_sync(timeout)` 供测试 / `:NeoAIReloadAll` 同步等待两阶段完成。
 - 只读访问器（`get_*_service` / `get_statusline*`）不触发启动。
 
 ## 4. AbortSignal 级联取消

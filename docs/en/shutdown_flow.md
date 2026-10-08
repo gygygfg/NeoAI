@@ -61,7 +61,7 @@ ensure_started() -- phase 2: tools/sandbox/tool_service/skills/mcp/herder + all 
 ```
 
 - `plugins.start_list_async(ids, on_done)` starts one plugin per frame and yields via `vim.defer_fn(...,0)`; the UI opens once phase 1 finishes.
-- `ensure_started_sync(timeout)` lets tests / `reload_all` wait for both phases synchronously.
+- `ensure_started_sync(timeout)` lets tests / `:NeoAIReloadAll` wait for both phases synchronously.
 - Read-only accessors (`get_*_service` / `get_statusline*`) never trigger startup.
 
 ## 4. AbortSignal Cascade Cancellation

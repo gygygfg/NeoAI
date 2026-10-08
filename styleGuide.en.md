@@ -497,7 +497,7 @@ subscriptions) were registered but never released, making hot reload and test is
 
 **Cleanup contract**: every registration (commands, global keymaps, event subscriptions, prompt
 sections, MCP connections, tools, statusline listeners, UI injection) must return a cleanup function
-invoked by the host on unload. `NeoAIReloadAll` / `reload_all` call `plugins.stop_all()` before
+invoked by the host on unload. `:NeoAIReloadAll` calls `plugins.stop_all()` before
 clearing the cache and reloading.
 
 > See [docs/plugins.md](docs/en/plugins.md).

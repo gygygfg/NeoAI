@@ -10,6 +10,11 @@ tests.suite("git_ops", function(_, it, before_each)
     return vim.fn.system("git -C " .. vim.fn.shellescape(repo) .. " " .. args)
   end
 
+  -- 在任意目录执行 git（用于「操作其它 git 目录」测试）
+  local function git_in(dir, args)
+    return vim.fn.system("git -C " .. vim.fn.shellescape(dir) .. " " .. args)
+  end
+
   local function write(rel, content)
     local f = assert(io.open(repo .. "/" .. rel, "w"))
     f:write(content)
@@ -106,6 +111,50 @@ tests.suite("git_ops", function(_, it, before_each)
   it("git_auto_commit_config：回显配置", function(t)
     local out = invoke(tools.git_auto_commit_config, { auto_commit = true })
     t.matches("自动提交配置: true", out)
+  end)
+
+  it("repo：只读操作作用于其它 git 目录（缺省仍为会话仓库）", function(t)
+    local other = vim.fn.tempname() .. "-neoai_git_other"
+    vim.fn.mkdir(other, "p")
+    git_in(other, "init -q")
+    git_in(other, "config user.email t@example.com")
+    git_in(other, "config user.name t")
+    local f = assert(io.open(other .. "/b.txt", "w"))
+    f:write("other-only\n")
+    f:close()
+    git_in(other, "add b.txt")
+    git_in(other, "commit -qm other-commit")
+    -- 指定 repo：看到其它仓库的提交，而非会话仓库
+    t.matches("other%-commit", invoke(tools.git_log, { repo = other, max = 5 }))
+    t.matches("other%-commit", invoke(tools.git_commit_detail, { repo = other, ref = "HEAD" }))
+    t.matches("other%-commit", invoke(tools.git_file_history, { repo = other, file_path = "b.txt" }))
+    -- 缺省（无 repo）仍读会话仓库
+    t.matches("initial", invoke(tools.git_log, { max = 5 }))
+    -- 分支列表也能定向
+    t.matches("master", invoke(tools.git_branch, { repo = other }))
+  end)
+
+  it("repo：写操作在其它 git 目录产生提交（会话仓库不受影响）", function(t)
+    local other = vim.fn.tempname() .. "-neoai_git_other_w"
+    vim.fn.mkdir(other, "p")
+    git_in(other, "init -q")
+    git_in(other, "config user.email t@example.com")
+    git_in(other, "config user.name t")
+    local f = assert(io.open(other .. "/c.txt", "w"))
+    f:write("new\n")
+    f:close()
+    local _, add_err = invoke(tools.git_add, { all = true, repo = other })
+    t.nil_(add_err)
+    local _, commit_err = invoke(tools.git_commit, { message = "via-tool", repo = other })
+    t.nil_(commit_err)
+    t.matches("via%-tool", git_in(other, "log --oneline -n 1"))
+    t.matches("initial", git_in(repo, "log --oneline -n 1"))
+  end)
+
+  it("repo：无效目录时写操作报错（不静默成功）", function(t)
+    local _, err = invoke(tools.git_commit, { message = "x", repo = "/nonexistent-neoai-repo-xyz" })
+    t.not_nil(err)
+    t.matches("git 退出码", err)
   end)
 
   it("sandbox_prefix：命令被前缀包裹（沙箱命名空间执行）", function(t)

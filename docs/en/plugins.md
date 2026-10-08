@@ -171,12 +171,12 @@ Every side effect must be unloadable and is invoked by the host on `stop`:
 - Herder: `herder.reset()`
 
 `lifecycle.shutdown()` runs the cleanup function registered in `setup()` (which calls
-`plugins.stop_all()`); `NeoAIReloadAll` / `reload_all` also call `plugins.stop_all()` before
+`plugins.stop_all()`); `:NeoAIReloadAll` also calls `plugins.stop_all()` before
 clearing the module cache and reloading.
 
 ## 6. Hot Reload
 
-The controlled reload in `reload_all`:
+The controlled reload in `:NeoAIReloadAll`:
 
 1. Snapshot the `NeoAI.*` module cache (for rollback);
 2. Read the current config, session id;

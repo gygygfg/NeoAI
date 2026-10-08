@@ -496,7 +496,7 @@ if signal:aborted() then return end
 - 业务代码一律 `services.use("services.x")`，并显式处理 `nil`（降级），实现运行期替换与禁用。
 
 **清理契约**：任何注册（命令、全局键位、事件订阅、提示段、MCP 连接、工具、状态栏监听、UI 注入）
-都必须返回清理函数，由插件宿主在卸载时调用。`NeoAIReloadAll` / `reload_all` 先 `plugins.stop_all()`
+都必须返回清理函数，由插件宿主在卸载时调用。`NeoAIReloadAll` 先 `plugins.stop_all()`
 再清缓存重载。
 
 > 详见 [docs/plugins.md](docs/plugins.md)。

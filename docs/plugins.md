@@ -169,11 +169,11 @@ require("NeoAI").setup({
 - Herder：`herder.reset()`
 
 `lifecycle.shutdown()` 会执行 `setup()` 登记的清理函数（内部调用 `plugins.stop_all()`）；
-`NeoAIReloadAll` / `reload_all` 也先 `plugins.stop_all()` 再清缓存重载。
+`:NeoAIReloadAll` 也先 `plugins.stop_all()` 再清缓存重载。
 
 ## 6. 热重载
 
-`reload_all` 的受控重载流程：
+`:NeoAIReloadAll` 的受控重载流程：
 
 1. 快照 `NeoAI.*` 模块缓存（失败回滚用）；
 2. 读取当前配置、会话 id；

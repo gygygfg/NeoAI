@@ -32,7 +32,6 @@ local SPECS = {
   delete_file = { effect = "fs_write", paths = { "file_path" } },
   -- 进程
   run_command = { effect = "process" },
-  reload_all = { effect = "process" },
   -- git：读操作在沙箱命名空间内执行（与 run_command 同一 overlay），看到暂存内容而非真实磁盘；
   -- read_only 表示不捕获候选（只读，无副作用）。
   git_status = { effect = "process", read_only = true },

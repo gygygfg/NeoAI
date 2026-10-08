@@ -192,7 +192,7 @@ local function _render(keep_view)
   end
   local messages = chat_service.get_messages and chat_service.get_messages()
   -- 服务不可用（插件停止/热重载期间已注销 services.chat_service）：跳过渲染而非报错。
-  -- 典型触发：reload_all → plugins.stop_all 停止沙箱（cgroup.release 的 vim.wait 处理事件循环）
+  -- 典型触发：:NeoAIReloadAll → plugins.stop_all 停止沙箱（cgroup.release 的 vim.wait 处理事件循环）
   -- 时，先前调度的渲染回调执行，而此时 chat_service 已注销（get_messages 为 nil）。
   if messages == nil then return false end
   -- 还在生成（agent 忙碌 / 暂存队列非空）时，仅对末尾消息做流式渲染：

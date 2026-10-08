@@ -765,12 +765,8 @@ one does). For risk levels and allowlists see the `approval` config and [docs/en
 
 ### 🔁 System Tools
 
-| Tool name    | Description                                          | Parameters |
-| ------------ | ---------------------------------------------------- | -------- |
-| `reload_all` | Hot-reload the whole NeoAI plugin (isolated pre-check) | no parameters |
-
-> **Plugin hot-reload (isolated & safe)**: the `reload_all` tool and the `:NeoAIReloadAll` command
-> reload the whole NeoAI plugin without restarting nvim (so source edits take effect immediately).
+> **Plugin hot-reload (isolated & safe)**: the `:NeoAIReloadAll` command
+> reloads the whole NeoAI plugin without restarting nvim (so source edits take effect immediately).
 > To avoid a half-loaded state corrupting the live session, it uses a two-phase strategy:
 > 1. **Isolated subprocess pre-check**: first spawn a fresh headless nvim (`--clean -u NONE` + rtp=plugin root),
 >    load the plugin and run a smoke check (core modules requireable, tools registerable). Any error stays
