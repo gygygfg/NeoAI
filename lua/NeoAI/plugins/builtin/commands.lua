@@ -55,9 +55,9 @@ function M.start()
 
   _cmd("NeoAIChat", function()
     local ui = _svc("services.ui")
-    -- 每次显式打开都另起新会话（不复用当前会话）；已有聊天窗口时切换到新会话。
-    if ui then ui.open_chat({ new_session = true }) end
-  end, { desc = "打开 NeoAI 聊天界面（新建会话）" })
+    -- 每次显式打开都在**新标签页**开一个独立聊天实例（唯一 buffer 名；旧实例保留继续运行）。
+    if ui then ui.open_chat({ new_window = true }) end
+  end, { desc = "打开 NeoAI 聊天界面（新标签页/新会话）" })
 
   _cmd("NeoAITree", function()
     local ui = _svc("services.ui")

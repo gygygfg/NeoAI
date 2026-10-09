@@ -53,7 +53,8 @@ function M.open_default()
 end
 
 --- 打开聊天界面
---- @param opts table|nil { session_id?, round?, new_session? } 透传给 chat_view.open
+--- @param opts table|nil { session_id?, round?, new_session?, new_window? } 透传给 chat_view.open
+---   new_window=true 时在**新标签页**开一个独立聊天实例（唯一 buffer 名）。
 --- @return table
 function M.open_chat(opts)
   M.init()
@@ -69,9 +70,9 @@ function M.open_tree()
   return tree_view.open()
 end
 
---- 关闭所有窗口
+--- 关闭所有窗口（含全部聊天实例）
 function M.close_all()
-  chat_view.close()
+  chat_view.close_all()
   tree_view.close()
   window_manager.close_all()
 end

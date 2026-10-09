@@ -607,6 +607,15 @@ function M.get_current_agent()
   return runtime.get(state.current_agent_id)
 end
 
+--- 设置「当前 Agent」（多聊天实例：焦点切到某实例时把 current 指向其 Agent，
+--- 使既有 get_current_agent()/状态栏/审批等调用自动落到聚焦实例）。
+--- @param agent_id string|nil
+function M.set_current_agent(agent_id)
+  if not agent_id then return end
+  if not runtime.get(agent_id) then return end
+  state.current_agent_id = agent_id
+end
+
 --- 当前 Agent 暂存队列中的消息数（agent 正忙时入队的待发消息）
 --- @return number
 function M.pending_count()

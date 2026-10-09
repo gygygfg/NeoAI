@@ -37,6 +37,12 @@ local _current_id = nil -- 当前聚焦实例 id（浮窗/输入框/current agen
 local _title_used = {}  -- 已占用的聊天 buffer 名
 local _seq = 0
 local _note_focus -- 前向声明：工厂内 _on_win_enter / open 引用
+-- 多实例「跳转到别的聊天实例」路由设施，前向声明（工厂内的 _on_buf_enter /
+-- _on_input_cmdline_leave 引用），实际实现在文件末尾的实例管理器段定义。
+local _inst_by_buf -- 前向声明：按 buffer 反查所属（存活的）聊天实例
+local _route_to_inst -- 前向声明：把焦点路由到目标聊天实例
+local _resolve_target_inst -- 前向声明：从 `:b` 类命令文本解析目标聊天实例
+local _routing = false -- 路由重入守卫（模块级，跨实例共享；防止 set_buf 触发的嵌套 BufEnter 递归）
 
 --- 分配唯一实例 id
 --- @return number
@@ -1040,12 +1046,24 @@ local function _create_input_window()
   return win
 end
 
+--- 派生本实例输入 buffer 的唯一名：`NeoAI Chat` → `NeoAI Input`；`NeoAI Chat 2` → `NeoAI Input 2`。
+--- 多实例下各实例输入 buffer 名字唯一，避免第二个实例因重名而改名失败、退化为无名 buffer。
+--- @return string
+local function _derive_input_name()
+  local title = state.title or "NeoAI Chat"
+  local n = title:match("^NeoAI Chat%s*(%d*)$")
+  if n and n ~= "" then return "NeoAI Input " .. n end
+  return "NeoAI Input"
+end
+
 --- 创建输入区（主窗口下方 split，高度 3）
 --- @param fresh boolean|nil true=首次/重开（input_box.create 新建 buffer+键位）；false=收起后恢复（复用已有输入 buffer）
 local function _create_input_area(fresh)
   local win = _create_input_window()
   if fresh then
     input_box.create({
+      -- 唯一输入 buffer 名（多实例各自不同），供 :ls 辨识与会话恢复识别/清理。
+      name = _derive_input_name(),
       on_submit = _on_submit,
       on_cancel = _on_cancel,
       on_quit = function() M.close() end,
@@ -1054,6 +1072,8 @@ local function _create_input_area(fresh)
     })
     -- 输入框随内容增高：注册文本/光标变化时重算高度
     _register_input_resize()
+    -- 登记输入 buffer 为「辅助 buffer」：收起（窗口关闭、buffer 保留）后仍豁免会话恢复孤儿清理。
+    window_manager.register_aux(input_box.get_buf())
   end
   input_box.attach_window(win)
   state.input_win_id = win
@@ -1266,6 +1286,14 @@ local function _on_input_cmdline_leave(ev) -- luacheck: ignore ev
   pcall(vim.cmd, "let v:event.abort = v:true")
   vim.schedule(function()
     if not M.has_window() then return end
+    -- 若命令目标是**另一个聊天实例**的 buffer（`:b <聊天buffer>` / `:sbuffer <聊天buffer>`）：
+    -- 不做「新标签页重放」——那会产出只有聊天内容、却没有输入框的裸标签页（多实例回归）。
+    -- 改为路由到该实例：切到它的标签页并聚焦其输入框。
+    local target = _resolve_target_inst and _resolve_target_inst(line) or nil
+    if target then
+      _route_to_inst(target, M)
+      return
+    end
     local ok, err = pcall(vim.cmd, line)
     if ok then return end
     if type(err) == "string" and err:find("E1513", 1, true) then
@@ -1309,6 +1337,15 @@ local function _on_buf_enter()
     -- 自动浮窗，切回若光标贴底则重弹仍在进行的浮窗）。
     M._sync_follow()
   else
+    -- 主窗口被切到别的 buffer。若该 buffer 属于**另一个聊天实例**（聊天主 buffer 或其输入
+    -- buffer），视为「跳转到那个聊天实例」：路由过去——切到它的标签页、显示其完整界面（含输入框），
+    -- 并把本窗口回退到自己的聊天 buffer。避免出现「显示着聊天内容却没有输入框」的残缺界面
+    -- （多实例下在主窗口 :b/:bnext 到另一个聊天 buffer 的场景）。
+    local target = _inst_by_buf and _inst_by_buf(shown) or nil
+    if target then
+      _route_to_inst(target, M)
+      return
+    end
     _collapse_aux()
     -- 主窗口被切到别的 buffer：视为不跟随，隐藏流式自动浮窗（避免遮挡用户文件）。
     _set_following(false)
@@ -1738,6 +1775,7 @@ function M.close()
     pcall(vim.api.nvim_buf_delete, state.buf, { force = true })
   end
   -- 连带销毁输入 buffer（nofile 命名 buffer 不会被 :e 复用，必须显式删除，否则泄漏）。
+  window_manager.unregister_aux(input_box.get_buf())
   input_box.destroy()
   -- 释放浮窗窄屏留白基准（仅当本实例是当前聚焦实例；否则会误清聚焦实例的基准）
   if was_focused then geometry.clear_narrow_base() end
@@ -1851,6 +1889,10 @@ end
   function M._win_id() return state.win_id end
   --- @return number|nil
   function M._input_win_id() return state.input_win_id end
+  --- @return number|nil
+  function M._buf() return state.buf end
+  --- @return number|nil
+  function M._input_buf() return input_box.get_buf() end
   --- @return string|nil
   function M._agent_id() return state.agent_id end
   --- @return string|nil
@@ -1923,6 +1965,79 @@ _note_focus = function(id)
   inst._on_focus()
   local aid = inst._agent_id()
   if aid and chat_service.set_current_agent then chat_service.set_current_agent(aid) end
+end
+
+--- 按 buffer 反查所属的**存活**聊天实例：命中某实例的聊天主 buffer 或其输入 buffer 即返回该实例。
+--- 供「主窗口被 :b/:bnext 切到别的实例聊天 buffer」与「输入框内 :b 到别的实例聊天 buffer」时
+--- 判定跳转目标。找不到（普通文件 buffer / 已关闭实例）返回 nil。
+--- @param buf number|nil
+--- @return table|nil
+_inst_by_buf = function(buf)
+  if not buf or buf == 0 or not vim.api.nvim_buf_is_valid(buf) then return nil end
+  for i = #_order, 1, -1 do
+    local it = _instances[_order[i]]
+    if it and it._is_alive() then
+      if it._buf() == buf or it._input_buf() == buf then return it end
+    end
+  end
+  return nil
+end
+
+--- 把焦点路由到目标聊天实例（多实例「跳转到某聊天界面」的统一入口）。
+--- 语义：调用方（from_inst）的主窗口当前显示着 target 的聊天/输入 buffer（如用户 :b 到该 buffer），
+--- 期望切到 target 的聊天界面。做法：
+---   1) 先把 from_inst 主窗口回退到它自己的聊天 buffer——回收本实例输入框、避免其残留显示 target 的
+---      buffer（否则之后切回 from_inst 标签页会再次触发路由，来回弹跳）；
+---   2) `target.open({})` 复用目标实例界面：切到其标签页、`_note_focus`、经 WinEnter 恢复其输入框。
+--- 用模块级 `_routing` 守卫防止 set_buf 同步触发的嵌套 BufEnter 递归；全程 pcall，异常最多退化为
+--- 不路由（维持既有收起行为），绝不新增裸标签页。
+--- @param target table 目标实例 API 表
+--- @param from_inst table 触发路由的实例 API 表（一般为闭包内 M）
+--- @return boolean 是否完成路由
+_route_to_inst = function(target, from_inst)
+  if not target or type(target._is_alive) ~= "function" or not target._is_alive() then return false end
+  if _routing then return false end
+  _routing = true
+  local ok = pcall(function()
+    -- 1) 回收本实例：主窗口若显示着别的 buffer（= 目标的聊天/输入 buffer），回退到自己的聊天 buffer。
+    if from_inst and from_inst ~= target then
+      local w = from_inst._win_id()
+      local b = from_inst._buf()
+      if w and vim.api.nvim_win_is_valid(w) and b and vim.api.nvim_buf_is_valid(b) then
+        if vim.api.nvim_win_get_buf(w) ~= b then
+          pcall(vim.api.nvim_win_set_buf, w, b)
+        end
+      end
+    end
+    -- 2) 切到目标实例：复用其界面并聚焦其输入框（含 _note_focus；WinEnter 会恢复其输入框）。
+    target.open({})
+  end)
+  _routing = false
+  return ok
+end
+
+--- 从 `:b` 类命令文本解析「目标聊天实例」：命令指向某 buffer，且该 buffer 属于一个存活的聊天实例时
+--- 返回该实例，否则 nil。仅识别带显式缓冲区参数的形式（`:b[uffer] <arg>` / `:sb[uffer] <arg>`），
+--- `:bnext`/`:bprev`/`:b#`/`:b`（无参）等无法直接确定目标的一律返回 nil（由调用方走既有兜底）。
+--- @param line string 冒号命令行（不含前导 `:`，如 "buffer NeoAI Chat 2"）
+--- @return table|nil
+_resolve_target_inst = function(line)
+  if type(line) ~= "string" then return nil end
+  local arg = line:match("^%s*%d*%s*%a+!?%s+(.+)$")
+  if not arg then return nil end
+  arg = vim.trim(arg)
+  if arg == "" then return nil end
+  -- 纯数字参数是缓冲区编号，必须 tonumber（vim.fn.bufnr("17") 会把字符串当名字模式匹配，得 -1）；
+  -- 其余按缓冲区名/模式解析（vim.fn.bufnr 支持 "NeoAI Chat 2" 这类名字）。
+  local nr
+  if arg:match("^%d+$") then
+    nr = tonumber(arg) or -1
+  else
+    local ok, r = pcall(vim.fn.bufnr, arg)
+    nr = (ok and type(r) == "number") and r or -1
+  end
+  if not nr or nr < 1 then return nil end
+  return _inst_by_buf(nr)
 end
 
 local ChatView = {}

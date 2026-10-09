@@ -13,6 +13,7 @@ local M = {}
 
 local state = {
   windows = {}, -- win_id -> { type, buf, win, mode }
+  aux = {},     -- buf -> true：辅助 buffer（输入框等）登记，供会话恢复孤儿清理豁免
 }
 
 -- 各视图 buffer 的固定名称，便于 :ls 检索、:b 切换
@@ -179,6 +180,22 @@ function M.close_all()
     end
   end
   state.windows = {}
+  state.aux = {}
+end
+
+--- 登记辅助 buffer（如各实例的输入框）：会话恢复孤儿清理时豁免，即使其窗口已收起。
+--- 由 chat_view 在创建输入框时调用、关闭实例时经 `unregister_aux` 注销。
+--- @param buf number|nil
+function M.register_aux(buf)
+  if buf and buf ~= 0 and vim.api.nvim_buf_is_valid(buf) then
+    state.aux[buf] = true
+  end
+end
+
+--- 注销辅助 buffer 登记。
+--- @param buf number|nil
+function M.unregister_aux(buf)
+  if buf then state.aux[buf] = nil end
 end
 
 --- 聚焦窗口
@@ -275,12 +292,20 @@ end
 --- @return number 删除的孤儿 buffer 数
 function M.cleanup_session_orphans()
   local registered = {}
-  local has_live_chat = false
   for win_id, info in pairs(state.windows) do
     -- 只统计仍有效的窗口：state.windows 可能残留已失效（被外部关闭）的条目。
     if vim.api.nvim_win_is_valid(win_id) then
       if info.buf then registered[info.buf] = true end
-      if info.type == "chat" then has_live_chat = true end
+    end
+  end
+  -- 辅助 buffer（各实例的输入框）：由实例显式登记，收起（窗口关闭、buffer 保留）后仍豁免清理，
+  -- 从而无需再靠「有实时聊天窗口即整体豁免所有 NeoAI Input N」的粗粒度规则——
+  -- 后者会连带放过会话恢复残留的 `NeoAI Input N`，占名导致新实例输入退化为无名 buffer。
+  for buf in pairs(state.aux) do
+    if vim.api.nvim_buf_is_valid(buf) then
+      registered[buf] = true
+    else
+      state.aux[buf] = nil
     end
   end
 
@@ -288,14 +313,8 @@ function M.cleanup_session_orphans()
   local orphan_set = {}
   for _, buf in ipairs(vim.api.nvim_list_bufs()) do
     if not registered[buf] and _is_neoai_orphan(buf) then
-      -- 有实时聊天窗口时，"NeoAI Input"/"NeoAI Input N" 属于某个实例的输入框
-      -- （未登记在 state.windows），不得当孤儿删除。
-      local base = vim.fn.fnamemodify(vim.api.nvim_buf_get_name(buf), ":t")
-      local is_input = base == "NeoAI Input" or base:match("^NeoAI Input %d+$") ~= nil
-      if not (has_live_chat and is_input) then
-        orphans[#orphans + 1] = buf
-        orphan_set[buf] = true
-      end
+      orphans[#orphans + 1] = buf
+      orphan_set[buf] = true
     end
   end
   if #orphans == 0 then return 0 end

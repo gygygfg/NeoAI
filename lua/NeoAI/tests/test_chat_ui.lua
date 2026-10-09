@@ -2596,6 +2596,30 @@ tests.suite("chat_ui", function(_, it)
     chat_service.reset()
   end)
 
+  it("多实例：先开历史会话再 new_window 会新开 buffer（用户流程回归）", function(t)
+    local chat_view = require("NeoAI.ui.window.chat_view")
+    local chat_service = require("NeoAI.services.chat_service")
+    chat_view.reset()
+    chat_service.reset()
+
+    -- 1) 先打开一个历史会话（创建首个实例 / 复用）
+    chat_service.new_session({})
+    local first = chat_view.open({ session_id = chat_service.get_current_session_id() })
+    t.eq("NeoAI Chat", vim.fn.fnamemodify(vim.api.nvim_buf_get_name(first.buf), ":t"),
+      "历史会话应命名 NeoAI Chat")
+
+    -- 2) <leader>ac / :NeoAIChat → 新标签页 + 新实例（唯一名）
+    local second = chat_view.open({ new_window = true })
+    t.eq("NeoAI Chat 2", vim.fn.fnamemodify(vim.api.nvim_buf_get_name(second.buf), ":t"),
+      "new_window 应新开 NeoAI Chat 2，而非复用旧 buffer")
+    t.true_(first.buf ~= second.buf, "新旧 buffer 不应相同")
+    t.true_(vim.api.nvim_buf_is_valid(first.buf), "旧实例 buffer 应保留")
+
+    chat_view.close_all()
+    t.false_(chat_view.has_window(), "close_all 后无聊天窗口")
+    chat_service.reset()
+  end)
+
   it("多实例：默认 open() 复用当前实例（不开新 buffer）", function(t)
     local chat_view = require("NeoAI.ui.window.chat_view")
     local chat_service = require("NeoAI.services.chat_service")
@@ -2766,6 +2790,131 @@ tests.suite("chat_ui", function(_, it)
     t.eq("nofile", vim.bo[ibuf].buftype, "输入 buffer 仍应为 nofile")
     t.true_(chat_view.has_window(), "聊天窗口应仍然存在")
 
+    chat_view.reset()
+    chat_service.reset()
+  end)
+
+  --- 找到显示 chat_buf 的标签页里的输入窗口（多实例测试用）。
+  local function _input_win_of(chat_buf)
+    for _, w in ipairs(vim.api.nvim_list_wins()) do
+      if vim.api.nvim_win_is_valid(w) and vim.api.nvim_win_get_buf(w) == chat_buf then
+        local tab = vim.api.nvim_win_get_tabpage(w)
+        for _, w2 in ipairs(vim.api.nvim_tabpage_list_wins(tab)) do
+          if vim.bo[vim.api.nvim_win_get_buf(w2)].filetype == "neoai_input" then return w2 end
+        end
+      end
+    end
+  end
+
+  it("多实例：主窗口 :b 到另一实例聊天 buffer → 路由到该实例（不产生无输入框的残缺界面）", function(t)
+    local chat_view = require("NeoAI.ui.window.chat_view")
+    local chat_service = require("NeoAI.services.chat_service")
+    chat_view.reset()
+    chat_service.reset()
+
+    local a = chat_view.open({ new_window = true })
+    local b = chat_view.open({ new_window = true })
+    local tabs_before = vim.fn.tabpagenr("$")
+
+    -- 在 A 主窗口 :b 到 B 的聊天 buffer
+    vim.api.nvim_set_current_win(a.win_id)
+    vim.cmd("buffer " .. b.buf)
+    vim.wait(200, function() return false end)
+
+    -- 1) 不新增标签页（不得产生「只有聊天内容、没有输入框」的裸标签页）
+    t.eq(tabs_before, vim.fn.tabpagenr("$"), "主窗口 :b 到另一实例不应新增标签页")
+    -- 2) 路由到 B：当前窗口为 B 主窗口，且 B 标签页有输入框（完整聊天界面）
+    t.eq(b.win_id, vim.api.nvim_get_current_win(), "应路由到 B 的聊天主窗口")
+    t.eq(b.buf, vim.api.nvim_win_get_buf(b.win_id), "B 主窗口应显示 B 的聊天 buffer")
+    t.true_(_input_win_of(b.buf) ~= nil, "目标实例标签页应有输入框")
+    -- 3) A 主窗口回退到自己的聊天 buffer（不再停在 B 的 buffer 上）
+    t.eq(a.buf, vim.api.nvim_win_get_buf(a.win_id), "A 主窗口应回退到 A 的聊天 buffer")
+
+    chat_view.close_all()
+    chat_service.reset()
+  end)
+
+  it("多实例：输入框内 :b 另一实例聊天 buffer → 路由，不产生裸标签页（回归 S4）", function(t)
+    local chat_view = require("NeoAI.ui.window.chat_view")
+    local chat_service = require("NeoAI.services.chat_service")
+    chat_view.reset()
+    chat_service.reset()
+
+    local a = chat_view.open({ new_window = true })
+    local b = chat_view.open({ new_window = true })
+    local tabs_before = vim.fn.tabpagenr("$")
+
+    local iwin = _input_win_of(a.buf)
+    t.true_(iwin ~= nil and vim.api.nvim_win_is_valid(iwin), "应有 A 的输入窗口")
+    vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<Esc>", true, false, true), "x", false)
+    vim.wait(50, function() return false end)
+    vim.api.nvim_set_current_win(iwin)
+    vim.cmd("stopinsert")
+
+    -- 在 A 的输入框内敲 :b <B 的聊天 buffer>（数字参数）
+    vim.api.nvim_feedkeys(
+      vim.api.nvim_replace_termcodes(":buffer " .. b.buf .. "<CR>", true, false, true), "x", false)
+    vim.wait(400, function() return false end)
+
+    -- 不新增标签页；路由到 B 主窗口
+    t.eq(tabs_before, vim.fn.tabpagenr("$"), "输入框内 :b 到另一实例不应新增标签页")
+    t.eq(b.win_id, vim.api.nvim_get_current_win(), "应路由到 B 的聊天主窗口")
+    t.true_(chat_view.has_window(), "聊天窗口应仍然存在")
+
+    chat_view.close_all()
+    chat_service.reset()
+  end)
+
+  it("多实例：输入框 buffer 唯一命名（NeoAI Input / NeoAI Input 2）", function(t)
+    local chat_view = require("NeoAI.ui.window.chat_view")
+    local chat_service = require("NeoAI.services.chat_service")
+    chat_view.reset()
+    chat_service.reset()
+
+    local a = chat_view.open({ new_window = true })
+    local b = chat_view.open({ new_window = true })
+
+    local function input_buf_of(chat_buf)
+      local w = _input_win_of(chat_buf)
+      return w and vim.api.nvim_win_get_buf(w)
+    end
+    local ia = input_buf_of(a.buf)
+    local ib = input_buf_of(b.buf)
+    t.true_(ia ~= nil and vim.api.nvim_buf_is_valid(ia), "A 应有输入 buffer")
+    t.true_(ib ~= nil and vim.api.nvim_buf_is_valid(ib), "B 应有输入 buffer")
+    t.true_(ia ~= ib, "两实例输入 buffer 应不同")
+    t.eq("NeoAI Input", vim.fn.fnamemodify(vim.api.nvim_buf_get_name(ia), ":t"),
+      "首实例输入 buffer 应命名 NeoAI Input")
+    t.eq("NeoAI Input 2", vim.fn.fnamemodify(vim.api.nvim_buf_get_name(ib), ":t"),
+      "次实例输入 buffer 应命名 NeoAI Input 2（唯一名，而非无名 buffer）")
+
+    chat_view.close_all()
+    chat_service.reset()
+  end)
+
+  it("cleanup_session_orphans：折叠（收起）状态下实时实例的输入 buffer 也不被误删", function(t)
+    local window_manager = require("NeoAI.ui.window.manager")
+    local chat_view = require("NeoAI.ui.window.chat_view")
+    local chat_service = require("NeoAI.services.chat_service")
+    local input_box = require("NeoAI.ui.components.input_box")
+    chat_view.reset()
+    chat_service.reset()
+
+    local opened = chat_view.open()
+    local ibuf = input_box.get_buf()
+    t.true_(vim.api.nvim_buf_is_valid(ibuf), "打开后应有输入 buffer")
+
+    -- 主窗口切到普通文件 → 输入框收起（输入窗口关闭，输入 buffer 保留）
+    local fb = vim.api.nvim_create_buf(true, false)
+    vim.api.nvim_buf_set_name(fb, vim.fn.tempname() .. "_plain.txt")
+    vim.api.nvim_set_current_win(opened.win_id)
+    vim.api.nvim_win_set_buf(opened.win_id, fb)
+    vim.wait(100, function() return false end)
+
+    window_manager.cleanup_session_orphans()
+    t.true_(vim.api.nvim_buf_is_valid(ibuf), "折叠状态下实时实例的输入 buffer 不应被清理")
+
+    pcall(vim.api.nvim_buf_delete, fb, { force = true })
     chat_view.reset()
     chat_service.reset()
   end)

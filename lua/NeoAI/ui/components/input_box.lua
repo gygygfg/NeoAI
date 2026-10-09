@@ -210,7 +210,7 @@ end
 -- ========== 公开 API ==========
 
 --- 创建输入框
---- @param opts table { on_submit?, on_cancel?, buf?, win_id?, chat_actions? }
+--- @param opts table { on_submit?, on_cancel?, on_quit?, buf?, win_id?, chat_actions?, name? }
 --- @return table { buf, win_id }
 function M.create(opts)
   opts = opts or {}
@@ -220,10 +220,11 @@ function M.create(opts)
   state.chat_actions = opts.chat_actions
 
   state.buf = opts.buf or vim.api.nvim_create_buf(false, true)
-  -- 给输入 buffer 一个稳定名字，便于会话恢复（:mksession）后识别/清理残留，
-  -- 并在 :ls 中可辨识。nofile + buftype 下改名不会触发 E37/E162。
+  -- 给输入 buffer 一个稳定名字，便于会话恢复（:mksession）后识别/清理残留，并在 :ls 中可辨识。
+  -- 多实例下由调用方经 `opts.name` 传入**唯一**名（`NeoAI Input` / `NeoAI Input 2`…），
+  -- 避免第二个实例改名重名失败、退化为无名 buffer。nofile + buftype 下改名不触发 E37/E162。
   -- pcall 容错：极端情况下重名（如上次会话遗留的孤儿 buffer）失败也不影响输入功能。
-  pcall(vim.api.nvim_buf_set_name, state.buf, "NeoAI Input")
+  pcall(vim.api.nvim_buf_set_name, state.buf, opts.name or "NeoAI Input")
   -- 注意：不设置 buftype=prompt。之前用 prompt buffer 是为了显示 "> " 前缀，但 prompt buffer
   -- 与 nvim-cmp 存在冲突（nvim-cmp 默认 enabled 排除 buftype=prompt，导致插入补全不生效；
   -- 且 prompt 回车回调与插件自定义 <CR> 语义冲突）。这里改成普通可编辑 buffer，用 virt_text

@@ -83,6 +83,11 @@
 - `input_box.lua` 同法工厂化；模块表是「当前输入框」代理（无实例时惰性建默认实例，
   兼容不涉及多实例的既有调用与单测）。关联单体（`reasoning_panel`/`tool_args_panel`/
   `float_stream_window`/`display_modes`/`geometry` 基准）为**共享单例**，只服务当前聚焦实例。
+- **跳转到别的实例（路由）**：主窗口里 `:b`/`:bnext` 落到**另一实例**的聊天 buffer（或其输入
+  buffer）时，不把该 buffer 就地显示在残缺界面里，而是**路由到那个实例**——切到它的标签页、聚焦
+  其输入框，并把本窗口回退到自己的聊天 buffer（`_inst_by_buf` / `_route_to_inst`，带 `_routing`
+  重入守卫）。输入框内敲 `:b <某聊天 buffer>` 同样先按此路由（`_resolve_target_inst`），**不再**
+  走「新标签页重放」——后者会产出「只有聊天内容、没有输入框」的裸标签页（多实例回归）。
 - **每实例独立流式浮窗**：`float_stream_window` / `reasoning_panel` / `tool_args_panel` 均已
   工厂化（`.new()`）；chat_view 在每个实例内建一套（三者共享该实例的一个浮动窗口，互斥复用），
   各实例的思考/接收参数/上下文压缩浮窗**互不干扰**（关闭一个不影响另一个）。`tool_args_panel`
@@ -216,7 +221,8 @@
 主体与输入框共用一套 chat 上下文键位（`_build_chat_actions`）。`input_box` 用 `virt_text` 渲染 `> `
 前缀（不用 `buftype=prompt`，避免与 nvim-cmp 冲突），并放开 `neoai_input` filetype 的补全。
 `attach_window` 会用 `'winfixbuf'`（Neovim 0.10+，`pcall` 兼容旧版）**锁定输入窗口**：输入 buffer 是
-`nofile` 暂存 buffer（命名为 `NeoAI Input`，便于会话恢复识别/清理），若允许在输入窗口执行
+`nofile` 暂存 buffer（命名为 `NeoAI Input`；多实例按聊天名派生唯一名 `NeoAI Input 2`/`NeoAI Input 3`…，
+便于会话恢复识别/清理与 `:ls` 辨识），若允许在输入窗口执行
 `:e <file>` / `:bnext` 等，该窗口会**复用输入 buffer**
 （`buftype` 变空、内容被文件名替换），此后输入落进用户文件、`:wq` 误保存。
 
@@ -252,7 +258,9 @@
 
 焦点追踪（`WinEnter`/`BufEnter`）判断当前窗口是否属于聊天界面（按显示的 buffer 而非窗口句柄）：
 焦点离开（或主窗口被 `:bnext` 切到别的文件）时收起输入框（`_collapse_aux`），回到聊天时恢复
-（`_restore_aux`，输入 buffer 内容保留）。
+（`_restore_aux`，输入 buffer 内容保留）。**特例**：主窗口被切到的 buffer 若属于**另一聊天实例**
+（聊天主 buffer 或其输入 buffer），不收起了事，而是路由到那个实例（见 §4.0）——避免出现「显示着
+聊天内容却没有输入框」的残缺界面。
 
 `_restore_aux` 为**「确保输入区存在」**语义：只要聊天主窗口有效且输入窗口缺失/失效就重建，不再只在
 `state.collapsed` 为真时才建。这样即使用户在输入框里 `:q`/`<C-w>c` 把输入窗口关掉（`winfixbuf` 并不阻止关窗，
@@ -290,10 +298,12 @@ NeoAI 的聊天/输入框/悬浮窗等都是纯 UI 文本，若 LSP 客户端（
 - **`VimEnter` 且 `v:startreason ~= "normal"`**（`:restart` / `-S` 兜底）
 
 两个时机 `vim.schedule` 延迟一拍调用 `manager.cleanup_session_orphans()`：识别 `filetype` 以
-`neoai` 开头、或 basename 命中 `NeoAI Chat` / `NeoAI Sessions` / `NeoAI Input` / `NeoAI-<数字>`
-的**无主** buffer（跳过 `state.windows` 登记的有效窗口 buffer，以及有实时聊天窗口时的
-`NeoAI Input`），安全关窗 + `nvim_buf_delete(force)`，全程 `pcall`、幂等、不触碰非 NeoAI buffer。
-效果：重启后聊天界面完全关闭，用户需显式 `:NeoAIChat` 重开（新会话）。
+`neoai` 开头、或 basename 命中 `NeoAI Chat` / `NeoAI Sessions` / `NeoAI Input`（含 `NeoAI Input N`）/
+`NeoAI-<数字>` 的**无主** buffer（跳过 `state.windows` 登记的有效窗口 buffer，以及各实例经
+`manager.register_aux` 登记的输入 buffer——收起时窗口虽关、buffer 仍保留），安全关窗 +
+`nvim_buf_delete(force)`，全程 `pcall`、幂等、不触碰非 NeoAI buffer。
+效果：重启后聊天界面完全关闭，用户需显式 `:NeoAIChat` 重开（新会话）；恢复残留的
+`NeoAI Input N` 不会被「有实时聊天即整体豁免」放过而占名（多实例下输入 buffer 名唯一化依赖于此）。
 
 同时定义 `_G.NeoAIFoldExpr` 兜底桩（返回 0），避免恢复出的窗口 `foldexpr=v:lua.NeoAIFoldExpr()`
 在重绘首帧报错（`chat_view.open` 会用真实实现覆盖）。

@@ -71,6 +71,13 @@ Implementation: the whole body of `chat_view.lua` is a **closure factory** `_mak
 `M` inside the factory is the **instance API**, so existing `M.xxx` self-references point at the
 instance); the module table at the end is the **instance manager**:
 
+- **Jump to another instance (routing)**: when `:b`/`:bnext` in a main window lands on **another
+  instance's** chat buffer (or its input buffer), the buffer is not shown in a crippled view;
+  instead the focus is **routed to that instance** — its tab is activated, its input box focused,
+  and the originating window falls back to its own chat buffer (`_inst_by_buf` / `_route_to_inst`,
+  guarded by `_routing`). `:b <a chat buffer>` typed inside an input box is routed the same way
+  (`_resolve_target_inst`) and **no longer** replays in a new tab — that used to create a bare tab
+  with chat content but no input box (a multi-instance regression).
 - `open(opts)`: reuses the **current focused** instance by default; `opts.new_window=true` creates a
   new instance (new tab).
 - `open_new(opts)`: creates an instance directly (unique id + unique buffer name).
@@ -290,7 +297,9 @@ scrolls back, and if too little it adds breathing room. The blank count is compu
 Focus tracking (`WinEnter`/`BufEnter`) determines whether the current window belongs to the chat view (based on the
 displayed buffer rather than the window handle): when focus leaves (or the main window is switched to another file via
 `:bnext`), the input box is collapsed (`_collapse_aux`), and when returning to the chat it is restored
-(`_restore_aux`, with the input buffer content preserved).
+(`_restore_aux`, with the input buffer content preserved). **Exception**: if the buffer the main window is switched to
+belongs to **another chat instance** (its chat main buffer or input buffer), it is not merely collapsed but routed to
+that instance (see §4.0) — avoiding a view that shows chat content with no input box.
 
 `_restore_aux` now means **"ensure the input area exists"**: whenever the chat main window is valid and the input window
 is missing/invalid it is recreated, not only when `state.collapsed` is true. So even if the user closes the input window
@@ -328,10 +337,13 @@ buffers. But the restored ones are mere shells — the Lua-side window handles/s
 `ui/session_cleanup.install()` (called by `NeoAI.setup()`) schedules, on **`SessionLoadPost`** and on
 **`VimEnter` with `v:startreason ~= "normal"`**, a `vim.schedule` call to `manager.cleanup_session_orphans()`: it
 recognizes **ownerless** buffers whose `filetype` starts with `neoai` or whose basename is `NeoAI Chat` /
-`NeoAI Sessions` / `NeoAI Input` / `NeoAI-<n>` (skipping buffers of valid windows in `state.windows`, and
-`NeoAI Input` while a live chat window exists), safely closes their windows and `nvim_buf_delete(force)` — all
+`NeoAI Sessions` / `NeoAI Input` (incl. `NeoAI Input N`) / `NeoAI-<n>` (skipping buffers of valid windows in
+`state.windows`, and input buffers registered by each instance via `manager.register_aux` — kept alive even when
+collapsed, i.e. its window is closed but the buffer survives), safely closes their windows and `nvim_buf_delete(force)` — all
 `pcall`-wrapped, idempotent, never touching non-NeoAI buffers. Result: after a restart the chat UI is fully closed and
-the user must explicitly `:NeoAIChat` (new session).
+the user must explicitly `:NeoAIChat` (new session); restored `NeoAI Input N` leftovers are no longer spared by a
+blanket "live chat exists ⇒ exempt every input buffer" rule (which would otherwise occupy names — unique input naming
+relies on this).
 
 It also defines the `_G.NeoAIFoldExpr` fallback stub (returns 0) so a restored window's
 `foldexpr=v:lua.NeoAIFoldExpr()` does not error on the first repaint (overwritten by `chat_view.open`).
