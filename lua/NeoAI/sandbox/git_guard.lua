@@ -4,7 +4,8 @@
 --- 与 `candidate._apply_order`：对象先于指针），否则会「存了索引丢了对象」产生悬空引用。
 --- 因此外部命令中的 git **变更**子命令在此识别并拒绝，改由专用 git 工具
 --- （`git_add`/`git_commit`/`git_stash`/`git_restore`/`git_rollback`，沙箱内执行、改动原子暂存
---- 进审批悬浮窗）处理。只读 git 子命令（status/diff/log/show/...）不拦截。
+--- 进审批悬浮窗）处理。只读 git 子命令（status/diff/log/show/...）不拦截；
+--- 变更子命令中的**纯只读子动作**（如 `git stash list` / `git stash show`）亦放行。
 
 local M = {}
 
@@ -28,6 +29,39 @@ local VALUE_OPTS = {
   ["-C"] = true, ["-c"] = true, ["--git-dir"] = true, ["--work-tree"] = true,
   ["--namespace"] = true, ["--exec-path"] = true, ["--config-env"] = true,
 }
+
+--- 变更子命令中的**纯只读子动作**白名单：命中则放行（不写仓库）。
+--- 例如 `git stash`（裸/`push`/`pop`/`apply`/`drop`/`clear`/`save`/`store`）写仓库，
+--- 但 `git stash list` / `git stash show` 只读取、不改工作区与 refs/index。
+local READONLY_SUBACTION = {
+  stash = { list = true, show = true },
+}
+
+--- 判断变更子命令 `sub`（`tokens[k]`）之后的第一个**位置参数**是否为只读子动作。
+--- 跳过其间的选项（`--x=y`、带值选项、`-x`）。
+--- @param sub string 子命令名（如 "stash"）
+--- @param tokens string[]
+--- @param k integer 子命令在 tokens 中的下标
+--- @return boolean
+local function _readonly_subaction(sub, tokens, k)
+  local allow = READONLY_SUBACTION[sub]
+  if not allow then return false end
+  local j = k + 1
+  while j <= #tokens do
+    local t = tokens[j]
+    if t == "" or t:match("^[;|&()]") then return false end
+    if t:match("^%-%-[%w%-]+=") then
+      j = j + 1
+    elseif VALUE_OPTS[t] then
+      j = j + 2
+    elseif t:match("^%-") then
+      j = j + 1
+    else
+      return allow[t] == true
+    end
+  end
+  return false
+end
 
 --- 粗略 shell 分词：按空白与 `;|&()` 切分，跳过单/双引号内容（降低误报）。
 --- @param command string
@@ -73,7 +107,11 @@ function M.mutating(command)
         elseif a:match("^%-") then
           k = k + 1
         else
-          if MUTATING[a] then return a end
+          if MUTATING[a] then
+            -- 只读子动作（如 `stash list`）放行：继续扫描后续命令中的 git 调用。
+            if _readonly_subaction(a, tokens, k) then break end
+            return a
+          end
           break
         end
       end

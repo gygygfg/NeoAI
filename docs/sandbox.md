@@ -127,6 +127,11 @@
     目录下成千上万文件）只解析一次「最近存在祖先」，不再逐文件 `fnamemodify`/`isdirectory`。
     冻结结果本身已由 `state.materialized` 的签名/版本增量跳过，故「读取+哈希+冻结」过的文件
     在后续命令中不再重复参与计算（实测 3000 暂存文件时该步由 ~16ms 降至 <1ms）。
+    **例外：`.git` 内部路径永不套用「未变快速跳过」**——`.git` 是索引↔对象库↔refs 强耦合数据库，
+    已捕获对象可能因 git 原子组候选被同路径新候选**整组取代**而失去唯一承载候选（旧候选连同其
+    对象一并丢弃）；若此时沿用「未变跳过」，新候选便不再包含该对象，而 index/HEAD 仍引用它 →
+    发布闸门以 `GIT_REFERENTIAL_INTEGRITY` fail-closed 拒绝。故 `.git` 内部每次捕获都重新登记其
+    内容（git 写工具本已强制全量遍历，此处只是不再省去内容读取）。
   - **写日志增量捕获**（`tools.sandbox.journal_capture`，默认 auto）：用 eBPF 观测到的「本轮
     写入/删除路径」驱动 capture，**只处理这些路径**（`_capture_worker` 路径驱动分支），不再
     全量遍历会话累积的 overlay upper；`_encode_expected`/`_encode_ws` 也按这些路径增量编码。
@@ -2315,6 +2320,9 @@ L2+ 与包/密钥仍进入待审。目的是即便仅靠本地模型的智能水
   仍返回 `EPERM`（需 copy-up）。属内核限制，postinst 通常已容错；必要时在脚本里 `|| true`。
 - **`git clone`/`git init`**：放行（新建仓库，`.git` 由候选层按 `git_path_class` 原子捕获）；
   `commit/checkout/fetch/pull/push/add/reset/…` 仍拦截，改走专用 git 工具。
+- **`git stash`**：仅 `list` / `show` 只读子动作放行（只读、不碰工作区与 refs/index）；
+  裸 `stash`（=push）及 `push`/`pop`/`apply`/`drop`/`clear`/`save`/`store` 等仍拦截，
+  改走 `git_stash` 工具（改动原子暂存并进审批悬浮窗）。
 - **本机端口白名单 / 沙箱外访问**：沙箱内启动的服务端口默认免权限（长驻服务按 `PORT`/`--port`
   自动登记，或设 `tools.sandbox.network.allow_localhost_ports = { 5432, 6379 }`，仅放行
   **回环 + 白名单端口**；宿主网卡 IP/链路本地/云元数据永不放行）。其余沙箱外目标按

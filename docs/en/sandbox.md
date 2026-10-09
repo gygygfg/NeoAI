@@ -150,6 +150,14 @@ is only kept for other `approval.mode` values (`prompt`/`strict`).
     staged copy and target (mtime/size/mode) are both unchanged it also avoids re-read + detokenize +
     write. Only when the upper is externally cleared (e.g. `_wipe_upper` before an LSP overlay
     refresh) is `materialize_overlay(specs, { force = true })` used to force a full rewrite.
+  - **`.git`-internal paths never take the "unchanged" fast-path** on capture: `.git` is a tightly
+    coupled index↔object-store↔refs database, and an already-captured object may lose its only
+    carrying candidate when a git atomic-group candidate is wholly superseded by a newer candidate on
+    the same paths (the old candidate, and thus its objects, are discarded). If the object then took
+    the unchanged skip, the new candidate would omit it while its `index`/`HEAD` still reference it,
+    and the publish gate would fail-closed with `GIT_REFERENTIAL_INTEGRITY`. So `.git`-internal paths
+    are re-registered on every capture (git write tools already force a full walk; this only stops
+    skipping the content read).
   - **No fsync for overlay scratch**: the per-session overlay upper is ephemeral scratch (rotated on
     agentEnd), so `write_file_atomic(..., { sync = false })` drops the per-file fsync; real workspace
     publishing still fsyncs for durability.
@@ -2806,6 +2814,10 @@ freeze time to avoid whole-unit publish conflicts.
 - **`git clone`/`git init`**: allowed (they create a new repository; `.git` is captured atomically by
   `git_path_class`); `commit/checkout/fetch/pull/push/add/reset/...` remain blocked and must use the
   dedicated git tools.
+- **`git stash`**: only the read-only sub-actions `list` / `show` are allowed (pure reads; they do not
+  touch the worktree, refs or index). Bare `stash` (= push) and `push`/`pop`/`apply`/`drop`/`clear`/
+  `save`/`store` remain blocked and must use the `git_stash` tool (changes are staged atomically and
+  enter the approval window).
 - **Localhost port allowlist / out-of-sandbox access**: service ports started inside the sandbox are
   allowed without permission by default (long-lived services auto-register via `PORT`/`--port`, or
   set `tools.sandbox.network.allow_localhost_ports = { 5432, 6379 }` — only **loopback + listed

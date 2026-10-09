@@ -2013,6 +2013,21 @@ local function _capture_worker(upper_root, real_root, session_basename, expected
     return false
   end
 
+  --- 路径（相对捕获根）是否位于某 git 仓库 `.git` 内部（任一路径段为 `.git`）。
+  --- `.git` 是「索引↔对象库↔refs」强耦合数据库：若某个已捕获对象因「未变快速跳过」而不进入
+  --- 本次候选，而它的**承载候选**又因 git 原子组「整组取代」被丢弃（见 review.supersede_by_paths），
+  --- 则该对象在所有候选与宿主中均不可得 → 新候选的 index/HEAD 会引用缺失对象，发布闸门
+  --- 必然拒绝（GIT_REFERENTIAL_INTEGRITY）。故 `.git` 内部路径**永不**走未变快速跳过：
+  --- 每次捕获都重新登记其内容（git 写工具本已强制全量遍历，此处只是不再省去内容读取）。
+  --- @param rel string 相对捕获根路径
+  --- @return boolean
+  local function is_git_internal_rel(rel)
+    for seg in rel:gmatch("[^/]+") do
+      if seg == ".git" then return true end
+    end
+    return false
+  end
+
   --- 处理一条「文件」条目（walk 与写日志按路径驱动共用）。
   local function handle_file(child_rel, real, dest)
     -- 符号链接：以目标字符串登记（kind="link"），不跟随链接读取目标内容。
@@ -2030,8 +2045,9 @@ local function _capture_worker(upper_root, real_root, session_basename, expected
     end
     local exp = expected[real]
     -- 未变快速判定：物化时记录的目标签名（mtime/size/mode）未变即视为命令未改动，
-    -- 直接跳过——不读文件、不做纯 Lua SHA。
-    if exp and exp.hash and exp.dsig then
+    -- 直接跳过——不读文件、不做纯 Lua SHA。`.git` 内部路径例外（见上）：其对象可能因原子组
+    -- 整组取代而失去唯一承载候选，必须每次重新登记，否则产生悬空引用。
+    if exp and exp.hash and exp.dsig and not is_git_internal_rel(child_rel) then
       local dsig = dsig_of(vim.uv.fs_stat(dest))
       if dsig ~= "" and dsig == exp.dsig then return end
     end
