@@ -128,7 +128,7 @@ require("NeoAI").setup({
 | `:NeoAIPlan`       | Toggle plan mode (the tool context retains only read-only / informational queries + asking the user) |
 | `:NeoAIApprovePlan`| Confirm the plan and switch to CHAT mode to execute it per the task list |
 | `:NeoAISandboxCommit`| Apply a sandbox candidate to the real workspace (CAS publish; arg = candidate digest) |
-| `:NeoAISandboxReview`| List pending changes and apply the selected one (async review) |
+| `:NeoAISandboxReview`| List pending changes and apply the selected one (async review; press `E` on the "Resource Access" page to add/remove workspace/masked dirs, session-only) |
 | `:NeoAISandboxApprove` / `:NeoAISandboxReject` | Approve (no apply) / reject & discard a change set |
 | `:NeoAISandboxApply` / `:NeoAISandboxApplyAll` | Approve and apply one / all pending change sets |
 | `:NeoAISandboxGrant` / `:NeoAISandboxRevoke` | Create a narrow task grant / revoke a grant |

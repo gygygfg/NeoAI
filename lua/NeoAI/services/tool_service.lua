@@ -196,7 +196,10 @@ local function _show_approval(tool_name, args, decision_cb, ctx)
           decide(true)
         end
       end,
-      meta = { tool_name = tool_name },
+      meta = { tool_name = tool_name,
+        -- 资源访问页：记录命中的遮蔽路径，供审批悬浮窗「W」便捷加入工作目录。
+        masked = page == "resource" and type(ctx.sandbox_unmask) == "table"
+          and ctx.sandbox_unmask[1] or nil },
     })
   end
 end

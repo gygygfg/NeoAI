@@ -126,7 +126,7 @@ require("NeoAI").setup({
 | `:NeoAIPlan`       | 切换计划模式（工具上下文只保留只读/信息查询 + 提问）|
 | `:NeoAIApprovePlan`| 确认计划并转入 CHAT 模式按任务清单执行             |
 | `:NeoAISandboxCommit`| 应用沙箱候选到真实工作区（CAS 发布，参数为候选摘要）|
-| `:NeoAISandboxReview`| 列出待审修改并选择应用（异步审批）              |
+| `:NeoAISandboxReview`| 列出待审修改并选择应用（异步审批；「资源访问」页按 `E` 可增删工作目录/遮蔽目录，仅本会话）             |
 | `:NeoAISandboxApprove` / `:NeoAISandboxReject` | 批准（不应用）/ 拒绝并丢弃变更单元 |
 | `:NeoAISandboxApply` / `:NeoAISandboxApplyAll` | 批准并应用单个 / 全部待审变更单元 |
 | `:NeoAISandboxGrant` / `:NeoAISandboxRevoke` | 创建窄范围任务授权 / 撤销授权 |

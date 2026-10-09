@@ -212,6 +212,8 @@ approval = {
 > `allowed_directories` 为**全局工作区允许目录**（对所有工具生效，且**包含其所有子目录**）；
 > 工具自身与 `per_tool` 的条目与之**并集**合并，只追加不覆盖。文件类工具只按路径判定
 > （无命令参数时不要求命令白名单），故配置工作区目录后其子目录无需逐个审批。
+> 亦可在 `:NeoAISandboxReview`「资源访问」页按 `E` 打开目录编辑器热增删本列表（及遮蔽目录
+> `sandbox.mask_dirs`、切换 `sandbox.mask_dirs_enabled`）——**仅当前会话生效，不写盘**。
 
 **sandbox（工具执行沙箱）**：
 
@@ -305,6 +307,7 @@ sandbox = {
   mask_dirs_enabled = true,        -- 总开关
   mask_dirs = { "/home", "/root" }, -- 遮蔽目录列表（支持 * 通配）
   mask_dirs_approval = true,       -- 命中遮蔽目录时弹窗审批（复用工具审批 UI）
+  -- 上述遮蔽目录列表与总开关可在 `:NeoAISandboxReview`「资源访问」页按 `E` 热编辑（仅当前会话）。
   -- 内核级行为观测（eBPF/strace/procfs）：以实际 syscall 判定「越界访问」与「密钥文件访问」，
   -- 替代/补充命令字符串解析启发式；事件按 attempt cgroup 精确归属。
   -- 后端优先级 auto：ebpf（bpftrace，需 root）→ strace（命令前缀包裹）→ procfs（/proc/<pid>/fd）。

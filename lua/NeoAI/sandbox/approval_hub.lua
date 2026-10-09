@@ -139,6 +139,13 @@ function M.clear(id)
   _emit_changed(page)
 end
 
+--- 查询某条目的记录（不存在返回 nil）
+--- @param id string
+--- @return table|nil
+function M.get(id)
+  return state.entries[id]
+end
+
 --- 某页的阻塞类条目（提交顺序）
 --- @param page string
 --- @return table[] 数组（浅拷贝引用）

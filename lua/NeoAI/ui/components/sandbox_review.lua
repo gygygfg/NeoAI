@@ -1726,6 +1726,219 @@ local hub_mod = require("NeoAI.sandbox.approval_hub")
 local PAGE_LABEL = {}
 for _, p in ipairs(hub_mod.PAGES) do PAGE_LABEL[p.id] = p.label end
 
+-- ========== 目录设置（工作目录 / 遮蔽目录，仅本会话） ==========
+-- 「资源访问」页可管理两类目录（仅当前会话生效：config_store.set 热更新，不写盘，
+-- 重开 nvim 恢复默认）：
+--   * 工作目录列表 = tools.approval.allowed_directories：命令审批时自动放行的目录（含子目录）。
+--   * 遮蔽目录列表 = tools.sandbox.mask_dirs：命中即触发本页「资源访问」审批。
+-- 注意：`read_all=true`（默认）时遮蔽目录不生效（改为只读放行 + 越界留痕）；
+-- 遮蔽目录列表清空则回退到默认（/home、/root）。编辑器会给出相应提示。
+local CFG_DIRS_WS = "tools.approval.allowed_directories"
+local CFG_DIRS_MASK = "tools.sandbox.mask_dirs"
+local CFG_MASK_ENABLED = "tools.sandbox.mask_dirs_enabled"
+local DEFAULT_DIRS_MASK = { "/home", "/root" }
+
+local dirs_editor = { win = nil, buf = nil, ns = nil, line_map = {} }
+
+--- 规范化目录路径（展开 ~/$VAR → 绝对化 → 去尾部斜杠）
+--- @param p string
+--- @return string
+local function _norm_dir(p)
+  return fs.canonical(p)
+end
+
+--- 当前目录快照（只读）
+--- @return table { workspace, mask, mask_enabled, read_all }
+local function _dirs_snapshot()
+  local cfg = require("NeoAI.kernel.config_store")
+  local ws = cfg.get(CFG_DIRS_WS)
+  local mask = cfg.get(CFG_DIRS_MASK)
+  return {
+    workspace = type(ws) == "table" and vim.deepcopy(ws) or {},
+    mask = type(mask) == "table" and vim.deepcopy(mask) or {},
+    mask_enabled = cfg.get(CFG_MASK_ENABLED) ~= false,
+    read_all = cfg.get("tools.sandbox.read_all") ~= false,
+  }
+end
+
+--- 遮蔽目录当前状态文本（生效中 / 已关闭 / 因 read_all 暂不生效）
+--- @param snap table
+--- @return string
+local function _mask_state_text(snap)
+  if not snap.mask_enabled then return "已关闭" end
+  if snap.read_all then return "因 read_all=true 暂不生效" end
+  return "生效中"
+end
+
+--- 构建「目录设置」区（资源访问页，纯只读展示；编辑请按 E 打开编辑器）
+--- @return table lines
+--- @return table marks
+local function _build_dirs_section()
+  local snap = _dirs_snapshot()
+  local lines, marks = {}, {}
+  local function add(text, level)
+    lines[#lines + 1] = text
+    if level then marks[#marks + 1] = { line = #lines, start_col = 0, end_col = #text, level = level } end
+  end
+  local lvl_ctx = { cwd = _canon_base(vim.fn.getcwd()), home = _canon_base(vim.fn.expand("~")) }
+  add("── 目录设置（仅本会话，E 编辑）──", "note")
+  add(string.format("工作目录列表（命令审批自动放行，共 %d）:", #snap.workspace))
+  if #snap.workspace == 0 then
+    add("  （空，E 编辑器内按 a 添加）")
+  else
+    for i, d in ipairs(snap.workspace) do
+      add(string.format("  %d. %s", i, _one_line(d)), M.level_of(tostring(d), lvl_ctx))
+    end
+  end
+  add(string.format("遮蔽目录列表（命中触发本页审批，共 %d，%s）:", #snap.mask, _mask_state_text(snap)))
+  if #snap.mask == 0 then
+    add("  （未显式设置 → 默认 " .. table.concat(DEFAULT_DIRS_MASK, "、") .. "，E 编辑器内按 A 添加）")
+  else
+    for i, d in ipairs(snap.mask) do
+      add(string.format("  %d. %s", i, _one_line(d)), "system")
+    end
+  end
+  add("")
+  return lines, marks
+end
+
+--- 重绘目录编辑器
+local function _refresh_dirs_editor()
+  if not (dirs_editor.buf and vim.api.nvim_buf_is_valid(dirs_editor.buf)) then return end
+  local snap = _dirs_snapshot()
+  local lines, map = {}, {}
+  local function add(text, entry)
+    lines[#lines + 1] = text
+    if entry then map[#lines] = entry end
+  end
+  add("⚙ 目录设置（仅本会话，重开 nvim 后恢复默认）")
+  add("")
+  add(string.format("─ 工作目录列表（命令审批自动放行，共 %d）─", #snap.workspace))
+  if #snap.workspace == 0 then
+    add("  （空，按 a 添加）")
+  else
+    for i, d in ipairs(snap.workspace) do add("  " .. _one_line(d), { kind = "workspace", index = i }) end
+  end
+  add("")
+  add(string.format("─ 遮蔽目录列表（命中触发资源访问审批，共 %d，%s）─", #snap.mask, _mask_state_text(snap)))
+  if #snap.mask == 0 then
+    add("  （未显式设置 → 默认 " .. table.concat(DEFAULT_DIRS_MASK, "、") .. "，按 A 添加）")
+  else
+    for i, d in ipairs(snap.mask) do add("  " .. _one_line(d), { kind = "mask", index = i }) end
+  end
+  add("")
+  add("按键: a 加工作目录    A 加遮蔽目录    d 删除光标处目录    t 切换遮蔽开关    q/Esc 关闭")
+  dirs_editor.line_map = map
+  vim.bo[dirs_editor.buf].modifiable = true
+  vim.api.nvim_buf_set_lines(dirs_editor.buf, 0, -1, false, lines)
+  if dirs_editor.ns then
+    vim.api.nvim_buf_clear_namespace(dirs_editor.buf, dirs_editor.ns, 0, -1)
+    for ln, e in pairs(map) do
+      local lvl = e.kind == "workspace" and "workspace" or "system"
+      vim.api.nvim_buf_add_highlight(dirs_editor.buf, dirs_editor.ns, LEVEL_HL[lvl], ln - 1, 2, -1)
+    end
+  end
+  -- 内容行数变化时自适应窗口高度。
+  if dirs_editor.win and vim.api.nvim_win_is_valid(dirs_editor.win) then
+    pcall(function()
+      local cfg = vim.api.nvim_win_get_config(dirs_editor.win)
+      local h = math.max(6, math.min(#lines, vim.o.lines - 4))
+      if cfg.height ~= h then
+        cfg.height = h
+        vim.api.nvim_win_set_config(dirs_editor.win, cfg)
+      end
+    end)
+  end
+end
+
+--- 关闭目录编辑器
+local function _close_dirs_editor()
+  if dirs_editor.win and vim.api.nvim_win_is_valid(dirs_editor.win) then
+    pcall(vim.api.nvim_win_close, dirs_editor.win, true)
+  end
+  dirs_editor.win, dirs_editor.buf, dirs_editor.ns = nil, nil, nil
+  dirs_editor.line_map = {}
+end
+
+--- 编辑器内新增目录：vim.ui.input 输入路径（静默同步回调，避免 E5560）
+--- @param kind string "workspace" | "mask"
+local function _edit_add_dir(kind)
+  local label = kind == "workspace" and "工作目录" or "遮蔽目录"
+  local function handle(input)
+    if not input or input == "" then return end
+    local ok, err = M.add_dir(kind, input)
+    if ok then
+      vim.notify(("[NeoAI] 已加入%s: %s"):format(label, _norm_dir(input)), vim.log.levels.INFO)
+    else
+      vim.notify(("[NeoAI] 添加失败: %s"):format(tostring(err or "无效路径")), vim.log.levels.WARN)
+    end
+    _refresh_dirs_editor()
+  end
+  local called = false
+  local ok = pcall(vim.ui.input, { prompt = label .. "路径: " }, function(input)
+    called = true
+    handle(input)
+  end)
+  -- 少数实现同步触发回调/异常：兜底保证刷新与提示不丢。
+  if not ok and not called then
+    vim.notify("[NeoAI] 无法打开输入框", vim.log.levels.WARN)
+  end
+end
+
+--- 编辑器内删除光标所在目录行
+local function _edit_remove_dir()
+  local ln = vim.api.nvim_win_get_cursor(0)[1]
+  local entry = dirs_editor.line_map[ln]
+  if not entry then
+    vim.notify("[NeoAI] 请将光标移到目录行再按 d", vim.log.levels.WARN)
+    return
+  end
+  local ok, err = M.remove_dir(entry.kind, entry.index)
+  if ok then
+    vim.notify("[NeoAI] 已移除目录", vim.log.levels.INFO)
+  else
+    vim.notify(("[NeoAI] 移除失败: %s"):format(tostring(err or "")), vim.log.levels.WARN)
+  end
+  _refresh_dirs_editor()
+end
+
+--- 打开目录编辑器（可增删工作目录/遮蔽目录、切换遮蔽开关）
+local function _open_dirs_editor()
+  if dirs_editor.win and vim.api.nvim_win_is_valid(dirs_editor.win) then
+    _refresh_dirs_editor()
+    return
+  end
+  _ensure_hl()
+  dirs_editor.buf = vim.api.nvim_create_buf(false, true)
+  vim.bo[dirs_editor.buf].filetype = "neoai_sandbox_dirs"
+  dirs_editor.ns = vim.api.nvim_create_namespace("NeoAISandboxDirs")
+  local geom = geometry.compute({ w_ratio = 0.62, h_ratio = 0.5, fit_h = 20 })
+  dirs_editor.win = vim.api.nvim_open_win(dirs_editor.buf, true, {
+    relative = "editor",
+    width = geom.width,
+    height = math.max(6, math.min(geom.height, vim.o.lines - 4)),
+    col = geom.col,
+    row = geom.row,
+    style = "minimal",
+    border = "rounded",
+    title = "⚙ 目录设置（仅本会话）",
+    title_pos = "center",
+  })
+  vim.wo[dirs_editor.win].wrap = true
+  vim.wo[dirs_editor.win].cursorline = true
+  local function bind(mode, key, fn) vim.keymap.set(mode, key, fn, { buffer = dirs_editor.buf }) end
+  for _, mode in ipairs({ "n", "i" }) do
+    bind(mode, "q", function() _close_dirs_editor(); M.refresh() end)
+    bind(mode, "<Esc>", function() _close_dirs_editor(); M.refresh() end)
+    bind(mode, "a", function() _edit_add_dir("workspace") end)
+    bind(mode, "A", function() _edit_add_dir("mask") end)
+    bind(mode, "d", _edit_remove_dir)
+    bind(mode, "t", function() M.toggle_mask_dirs_enabled() end)
+  end
+  _refresh_dirs_editor()
+  pcall(vim.cmd, "stopinsert")
+end
+
 --- 逐页数据来源（阻塞类来自 approval_hub，观测类来自 provider/现取）
 --- @return table ctx
 local function _gather_ctx()
@@ -1846,6 +2059,15 @@ local function _build_blocking_page(page, ctx)
       lines[#lines + 1] = ""
     end
   end
+  -- 资源访问页追加「目录设置」区（工作目录 / 遮蔽目录，仅本会话；E 编辑）。
+  if page == "resource" then
+    local ds_lines, ds_marks = _build_dirs_section()
+    for _, l in ipairs(ds_lines) do lines[#lines + 1] = l end
+    local off = #lines - #ds_lines
+    for _, m in ipairs(ds_marks) do
+      marks[#marks + 1] = { line = m.line + off, start_col = m.start_col, end_col = m.end_col, level = m.level }
+    end
+  end
   return { lines = lines, marks = marks, line_to_hub = line_to_hub, line_to_target = line_to_target }
 end
 
@@ -1959,6 +2181,90 @@ local function _blocking_decide(value)
   vim.notify("[NeoAI] 请将光标移到待批准的条目行", vim.log.levels.WARN)
 end
 
+--- 资源访问页便捷键：把光标所在条目命中的遮蔽路径加入工作目录列表。
+local function _add_masked_to_workspace()
+  local ln = vim.api.nvim_win_get_cursor(0)[1]
+  local id = state.line_to_hub and state.line_to_hub[ln]
+  local entry = id and hub_mod.get(id)
+  local masked = entry and entry.meta and entry.meta.masked
+  if not masked then
+    vim.notify("[NeoAI] 光标所在条目没有可加入工作目录的遮蔽路径", vim.log.levels.WARN)
+    return
+  end
+  local ok, err = M.add_dir("workspace", masked)
+  if ok then
+    vim.notify("[NeoAI] 已加入工作目录: " .. _norm_dir(masked), vim.log.levels.INFO)
+    _schedule_refresh()
+  else
+    vim.notify("[NeoAI] 加入失败: " .. tostring(err or ""), vim.log.levels.WARN)
+  end
+end
+
+-- ========== 目录管理公开 API（资源访问页，仅本会话） ==========
+
+--- 当前目录快照（工作目录 / 遮蔽目录 / 遮蔽开关 / read_all）
+--- @return table { workspace, mask, mask_enabled, read_all }
+function M.list_dirs()
+  return _dirs_snapshot()
+end
+
+--- 新增目录到工作目录或遮蔽目录列表（仅当前会话；自动规范化 + 去重）
+--- @param kind string "workspace" | "mask"
+--- @param path string
+--- @return boolean, string|nil err
+function M.add_dir(kind, path)
+  if kind ~= "workspace" and kind ~= "mask" then return false, "未知目录类型" end
+  if type(path) ~= "string" or path == "" then return false, "路径为空" end
+  local abs = _norm_dir(path)
+  if abs == "" then return false, "路径无效" end
+  local cfg = require("NeoAI.kernel.config_store")
+  local key = kind == "workspace" and CFG_DIRS_WS or CFG_DIRS_MASK
+  local list = vim.deepcopy(cfg.get(key) or {})
+  for _, d in ipairs(list) do
+    if _norm_dir(d) == abs then return false, "目录已存在" end
+  end
+  list[#list + 1] = abs
+  cfg.set(key, list)
+  return true
+end
+
+--- 从工作目录或遮蔽目录列表移除一项（按 1-based 序号；仅当前会话）
+--- @param kind string "workspace" | "mask"
+--- @param index number
+--- @return boolean, string|nil err
+function M.remove_dir(kind, index)
+  if kind ~= "workspace" and kind ~= "mask" then return false, "未知目录类型" end
+  local key = kind == "workspace" and CFG_DIRS_WS or CFG_DIRS_MASK
+  local cfg = require("NeoAI.kernel.config_store")
+  local list = vim.deepcopy(cfg.get(key) or {})
+  local i = tonumber(index)
+  if not i or i < 1 or i > #list then return false, "序号越界" end
+  table.remove(list, i)
+  cfg.set(key, list)
+  return true
+end
+
+--- 切换遮蔽目录总开关（仅当前会话）
+--- @return boolean 新状态
+function M.toggle_mask_dirs_enabled()
+  local cfg = require("NeoAI.kernel.config_store")
+  local new = not (cfg.get(CFG_MASK_ENABLED) ~= false)
+  cfg.set(CFG_MASK_ENABLED, new)
+  vim.notify("[NeoAI] 遮蔽目录已 " .. (new and "开启" or "关闭"), vim.log.levels.INFO)
+  return new
+end
+
+--- 打开目录编辑器（公开，供键位/命令/测试调用）
+function M.open_dirs_editor()
+  _open_dirs_editor()
+end
+
+--- 获取目录编辑器 buffer（测试用）
+--- @return number|nil
+function M.get_dirs_editor_buf()
+  return dirs_editor.buf
+end
+
 --- 由审批分流中心拉起/刷新窗口并切页。
 --- @param page string|nil
 function M.open_page(page)
@@ -2066,6 +2372,9 @@ function M.open()
   end, { buffer = state.buf })
   vim.keymap.set("n", "i", _open_diff_current, { buffer = state.buf })
   vim.keymap.set("n", "u", _undo_current, { buffer = state.buf, desc = "NeoAI 撤销保存（回到待审）" })
+  -- E：打开目录设置（工作目录 / 遮蔽目录，仅本会话）；W：资源访问页把光标条目的遮蔽路径加入工作目录。
+  vim.keymap.set("n", "E", function() M.open_dirs_editor() end, { buffer = state.buf, desc = "NeoAI 目录设置" })
+  vim.keymap.set("n", "W", function() _add_masked_to_workspace() end, { buffer = state.buf, desc = "NeoAI 遮蔽路径加入工作目录" })
   -- AI 审计（可配置按键；默认 a）
   local ai_cfg = require("NeoAI.kernel.config_store").get("tools.sandbox.review.ai_audit") or {}
   if ai_cfg.enabled ~= false then
@@ -2167,6 +2476,7 @@ end
 --- 关闭界面
 function M.close()
   _unwatch()
+  _close_dirs_editor()
   if state.win_id and vim.api.nvim_win_is_valid(state.win_id) then
     -- 关闭前记录光标/目标/几何，供下次打开恢复。
     pcall(function()
@@ -2262,6 +2572,7 @@ function M.reset()
   state.line_to_hub = {}
   pcall(function() require("NeoAI.sandbox.approval_hub").reset() end)
   _close_root_prompt()
+  _close_dirs_editor()
   _close_diff()
   M.close()
 end

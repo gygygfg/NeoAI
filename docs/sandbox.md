@@ -402,6 +402,13 @@
     （命令 → 涉及文件，`i` 查看该命令越界访问的文件）及行为审计异常（L2+，仅记录）。阻塞类条目由来源模块
     （`tool_service` / `net_consent`）提交并镜像；独立弹窗仍作即时通道，窗口内亦可决策
     （`<CR>` 仅本次 / `S` 本次会话 / `d` 拒绝，决策幂等）。
+    - **资源访问页的「目录设置」区**（仅本会话）：页内可见工作目录/遮蔽目录列表，按 `E` 打开目录
+      编辑器浮窗——`a` 加工作目录（`tools.approval.allowed_directories`，命令审批自动放行）、`A` 加
+      遮蔽目录（`tools.sandbox.mask_dirs`，命中触发本页审批）、`d` 删除光标处目录、`t` 切换遮蔽目录
+      总开关（`tools.sandbox.mask_dirs_enabled`）、`q`/`Esc` 关闭。改动经 `config_store.set` 热更新
+      **仅当前会话生效，不写盘，重开 nvim 恢复默认**。光标落在资源访问条目上时按 `W` 可把该条目命中
+      的遮蔽路径父目录快速加入工作目录。注意 `read_all=true`（默认）时遮蔽目录不生效（改为只读放行 +
+      越界留痕），列表清空则回退默认（`/home`、`/root`）。
   - `:NeoAISandboxApprove <id>` / `:NeoAISandboxReject <id>` — 批准（不应用）/ 拒绝并丢弃。
   - `:NeoAISandboxApply <id>` — 批准并应用（CAS 发布）；`:NeoAISandboxApplyAll` 批量应用。
   - `:NeoAISandboxList` / `:NeoAISandboxShow` / `:NeoAISandboxDiscard <digest>` / `:NeoAISandboxCommit <digest>`。

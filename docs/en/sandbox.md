@@ -295,7 +295,18 @@ is only kept for other `approval.mode` values (`prompt`/`strict`).
     `u` **undoes the save (back to pending)**, `q`/`<Esc>` closes. **While open, the window subscribes to sandbox
     broadcast events and refreshes automatically** (enqueue/apply/reject/revert, out-of-bounds traces,
     host operations; multiple events in the same tick are coalesced into one redraw) — no manual
-    refresh. **The "applied" section is
+    refresh. The review window uses **multi-level pages** whose header splits into
+    **Files / Tool Behavior / Resource Access / Network Requests / Out-of-bounds·Anomaly**, switched
+    with `h`/`l` (or `←`/`→`), each page counting its items (`sandbox/approval_hub.lua` aggregates all
+    blocking/observe entries). On the **Resource Access** page, a **directory-settings section** shows
+    the workspace allowlist and masked-dir list; press `E` to open a directory editor (`a` add a
+    workspace dir → `tools.approval.allowed_directories`, `A` add a masked dir →
+    `tools.sandbox.mask_dirs`, `d` delete the dir under the cursor, `t` toggle
+    `tools.sandbox.mask_dirs_enabled`, `q`/`Esc` close). Changes go through `config_store.set` and are
+    **session-only (never written to disk; reopening nvim restores defaults)**. With the cursor on a
+    resource entry, `W` quickly adds that entry's masked parent dir to the workspace allowlist. Note
+    that with `read_all=true` (default) masked dirs are inactive (read-only pass + out-of-bounds trace
+    instead), and clearing the list falls back to the defaults (`/home`, `/root`). **The "applied" section is
     collapsed by default** (whole section collapsed via `za`/`zo`, then each item collapsed again);
     **after a successful apply the section is auto-revealed to level one** (`reveal_applied`, item
     headers visible, files still folded) so a just-applied item no longer looks "gone" because of the

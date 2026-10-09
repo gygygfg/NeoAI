@@ -219,6 +219,9 @@ approval = {
 > subdirectories**); tool-level and `per_tool` entries are **unioned** with it (append-only, never overriding).
 > File tools are judged by path alone (the command allowlist does not apply when there is no command argument),
 > so once the workspace directory is configured its subdirectories need no per-file approval.
+> You can also press `E` on the "Resource Access" page of `:NeoAISandboxReview` to open a directory editor and
+> hot-add/remove this list (plus masked dirs `sandbox.mask_dirs` and the `sandbox.mask_dirs_enabled` toggle) —
+> **session-only, not persisted to disk**.
 
 **sandbox (tool execution sandbox)**:
 
@@ -326,6 +329,8 @@ sandbox = {
   mask_dirs_enabled = true,        -- master switch
   mask_dirs = { "/home", "/root" }, -- masked dirs (supports * globs)
   mask_dirs_approval = true,       -- request approval on masked hits (reuses tool approval UI)
+  -- The masked-dir list and master switch can be hot-edited via `E` on the "Resource Access" page of
+  -- `:NeoAISandboxReview` (session-only).
   -- Kernel-level behavior observation (eBPF/strace/procfs): decides "outside-workspace access" and
   -- "secret-file access" from actual syscalls, replacing/augmenting command-string heuristics;
   -- events are attributed precisely to the attempt cgroup.

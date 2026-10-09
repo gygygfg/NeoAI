@@ -1462,4 +1462,100 @@ tests.suite("sandbox_review", function(_, it)
     sr.close()
     services.provide("services.sandbox", saved)
   end)
+
+  it("资源访问页展示目录设置区（工作目录/遮蔽目录）", function(t)
+    local services = require("NeoAI.kernel.services")
+    local sr = require("NeoAI.ui.components.sandbox_review")
+    local config_store = require("NeoAI.kernel.config_store")
+    sr.reset()
+    config_store.load({
+      tools = {
+        approval = { allowed_directories = { "/tmp/ws-a" } },
+        sandbox = { mask_dirs = { "/etc/secret" } },
+      },
+    })
+    local saved = services.use("services.sandbox")
+    services.provide("services.sandbox", {
+      list_reviews = function() return {} end,
+      list_traces = function() return {} end,
+      list_saved = function() return {} end,
+      apply = function() return { ok = true } end,
+      reject = function() end,
+    })
+    sr.open()
+    sr.open_page("resource")
+    local text = table.concat(vim.api.nvim_buf_get_lines(sr.get_buf(), 0, -1, false), "\n")
+    t.matches("目录设置", text, "资源访问页应含目录设置区")
+    t.matches("工作目录列表", text, "应含工作目录列表标题")
+    t.matches("遮蔽目录列表", text, "应含遮蔽目录列表标题")
+    t.matches("/tmp/ws%-a", text, "应展示预置工作目录")
+    t.matches("/etc/secret", text, "应展示预置遮蔽目录")
+    sr.close()
+    services.provide("services.sandbox", saved)
+  end)
+
+  it("资源访问页目录管理 API：增删改生效且去重", function(t)
+    local sr = require("NeoAI.ui.components.sandbox_review")
+    local config_store = require("NeoAI.kernel.config_store")
+    config_store.load({})
+    -- 新增工作目录（规范化 + 去重）
+    t.true_(sr.add_dir("workspace", "/tmp/ws-x/"), "应能新增工作目录")
+    t.false_(sr.add_dir("workspace", "/tmp/ws-x"), "重复目录应被去重拒绝")
+    t.eq("/tmp/ws-x", config_store.get("tools.approval.allowed_directories")[1], "工作目录应写入配置")
+    -- 新增遮蔽目录（默认含 /home、/root，追加后应出现且去重）
+    t.true_(sr.add_dir("mask", "/tmp/mask-y"), "应能新增遮蔽目录")
+    t.false_(sr.add_dir("mask", "/tmp/mask-y/"), "重复遮蔽目录应被去重拒绝")
+    local mask_list = config_store.get("tools.sandbox.mask_dirs")
+    local found_mask = false
+    for _, d in ipairs(mask_list) do if d == "/tmp/mask-y" then found_mask = true end end
+    t.true_(found_mask, "遮蔽目录应写入配置")
+    -- 快照
+    local snap = sr.list_dirs()
+    t.eq(1, #snap.workspace, "快照工作目录数应为 1")
+    t.eq(#mask_list, #snap.mask, "快照遮蔽目录数应与配置一致")
+    -- 删除（按序号）
+    t.true_(sr.remove_dir("workspace", 1), "应能删除工作目录")
+    t.eq(0, #config_store.get("tools.approval.allowed_directories"), "删除后工作目录应为空")
+    t.false_(sr.remove_dir("mask", 99), "越界序号应失败")
+    -- 切换遮蔽开关
+    local before = config_store.get("tools.sandbox.mask_dirs_enabled")
+    local now = sr.toggle_mask_dirs_enabled()
+    t.eq(not before, now, "切换后开关应翻转")
+    t.eq(not before, config_store.get("tools.sandbox.mask_dirs_enabled"), "配置应随之更新")
+    config_store.load({})
+  end)
+
+  it("E 键打开目录编辑器并含两列表", function(t)
+    local services = require("NeoAI.kernel.services")
+    local sr = require("NeoAI.ui.components.sandbox_review")
+    local config_store = require("NeoAI.kernel.config_store")
+    sr.reset()
+    config_store.load({
+      tools = { approval = { allowed_directories = { "/tmp/ws-b" } } },
+    })
+    local saved = services.use("services.sandbox")
+    services.provide("services.sandbox", {
+      list_reviews = function() return {} end,
+      list_traces = function() return {} end,
+      list_saved = function() return {} end,
+      apply = function() return { ok = true } end,
+      reject = function() end,
+    })
+    sr.open()
+    sr.open_page("resource")
+    local buf = sr.get_buf()
+    for _, m in ipairs(vim.api.nvim_buf_get_keymap(buf, "n")) do
+      if m.lhs == "E" then m.callback() end
+    end
+    local ebuf = sr.get_dirs_editor_buf()
+    t.not_nil(ebuf, "E 应打开目录编辑器")
+    local text = table.concat(vim.api.nvim_buf_get_lines(ebuf, 0, -1, false), "\n")
+    t.matches("工作目录列表", text, "编辑器应含工作目录列表")
+    t.matches("遮蔽目录列表", text, "编辑器应含遮蔽目录列表")
+    t.matches("/tmp/ws%-b", text, "编辑器应展示预置工作目录")
+    sr.close()
+    t.eq(nil, sr.get_dirs_editor_buf(), "关闭审批窗应同时关闭目录编辑器")
+    services.provide("services.sandbox", saved)
+    config_store.load({})
+  end)
 end)
