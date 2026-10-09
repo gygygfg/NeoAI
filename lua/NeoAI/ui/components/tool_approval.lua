@@ -3,6 +3,7 @@
 --- 工具执行审批 UI。注册到 tool_service。
 
 local services = require("NeoAI.kernel.services")
+local geometry = require("NeoAI.ui.geometry")
 
 local M = {}
 
@@ -132,14 +133,13 @@ function M.show(config)
   end
   vim.api.nvim_buf_set_lines(state.buf, 0, -1, false, lines)
 
-  local height = math.min(#lines + 4, 20)
-  local width = math.min(70, vim.o.columns - 10)
+  local geom = geometry.compute({ w_ratio = 0.55, h_ratio = 0.50, fit_h = #lines + 4 })
   local ok, wid = pcall(vim.api.nvim_open_win, state.buf, true, {
     relative = "editor",
-    width = width,
-    height = height,
-    col = math.floor((vim.o.columns - width) / 2),
-    row = math.floor((vim.o.lines - height) / 2),
+    width = geom.width,
+    height = geom.height,
+    col = geom.col,
+    row = geom.row,
     style = "minimal",
     border = "rounded",
     title = "🔒 工具审批: " .. (config.tool_name or ""),

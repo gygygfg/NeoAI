@@ -84,29 +84,43 @@ local function _chat_following()
 end
 
 --- 打开某会话的悬浮终端（幂等；有 UI 且组件可用时）
+--- 组件每次都用新的 `nvim_open_term` 通道渲染（如跟随跳变隐藏后重开、或首个输出早于
+--- 弹出时机），新通道是空白的；而 `append` 只在窗口已存在时才逐片喂入，窗口创建前的
+--- 输出不会自动补上。这里在打开后把**累计输出重放一次**，避免窗口「看起来没打开」
+--- （弹出的是空白窗口）。
 --- @param session table
 --- @param title string|nil
 local function _open_window(session, title)
   if _window_visible(session) or not _has_ui() then return end
   local win = _window()
   if not win then return end
-  pcall(function() session.window = win.open(session, title or session.title) end)
+  pcall(function()
+    session.window = win.open(session, title or session.title)
+    if session.window and type(session.output) == "string" and #session.output > 0 then
+      win.feed(session.id, session.output)
+    end
+  end)
 end
 
 --- 是否应弹出悬浮终端。
---- 规则：`show_window` 决定触发时机（always=会话启动 | on_wait=检测到等待），二者都要求
---- **聊天光标跟随**；光标不跟随时（用户正在回看上方内容）一律不弹。
+--- 规则：`show_window` 决定触发时机，二者都要求 **聊天光标跟随**（光标不跟随时——
+--- 用户正在回看上方内容——一律不弹）：
+---   - always  : 会话启动（trigger="start"）即弹；
+---   - on_wait : 命令运行超过 `show_window_delay_ms`（trigger="delay"）才弹；
+---   - never   : 不弹。
 --- @param session table
---- @param on_wait boolean 本次是否为「检测到等待输入」触发（false=会话启动）
+--- @param trigger string "start"（会话启动）| "delay"（运行超时阈值到达）
 --- @return boolean
-local function _should_show_window(session, on_wait)
+local function _should_show_window(session, trigger)
   if _window_visible(session) then return false end
   local sw = _cfg().show_window or "on_wait"
   if sw == "never" then return false end
-  if on_wait then
+  if trigger == "start" then
+    if sw ~= "always" then return false end
+  elseif trigger == "delay" then
     if sw ~= "on_wait" then return false end
   else
-    if sw ~= "always" then return false end
+    return false
   end
   return _chat_following()
 end
@@ -135,7 +149,7 @@ end
 
 --- 重弹仍应可见的会话终端窗（跳回跟随时调用）。
 --- - show_window=always：所有未结束会话都应可见 → 重弹；
---- - show_window=on_wait：仅当前「等待输入中」的会话重弹；
+--- - show_window=on_wait：已运行超过 `show_window_delay_ms`（window_eligible）且未结束的会话重弹；
 --- - never：不弹。
 --- 覆盖两种情况：窗口被隐藏（window_hidden）的，以及非跟随期间从未弹出过的（首次弹窗被抑制）。
 local function _restore_pending_windows()
@@ -144,7 +158,7 @@ local function _restore_pending_windows()
   if sw == "never" then return end
   for _, session in pairs(state.sessions) do
     if not session.done and not _window_visible(session) then
-      local want = (sw == "always") or session.waiting
+      local want = (sw == "always") or (sw == "on_wait" and session.window_eligible == true)
       if want then
         session.window_hidden = nil
         _open_window(session)
@@ -555,10 +569,6 @@ local function _poll(session)
         id = session.id, pid = pid,
         description = session.description, command = session.command,
       })
-      -- 悬浮终端：仅在「光标跟随」时弹出（不跟随时不打扰用户回看）。
-      if _should_show_window(session, true) then
-        _open_window(session)
-      end
       _invoke_judge(session)
     end
   else
@@ -577,6 +587,11 @@ local function _finish(session, result)
     pcall(function() session.timer:stop() end)
     pcall(function() session.timer:close() end)
     session.timer = nil
+  end
+  if session.delay_timer then
+    pcall(function() session.delay_timer:stop() end)
+    pcall(function() session.delay_timer:close() end)
+    session.delay_timer = nil
   end
   if session.unsub then pcall(session.unsub) session.unsub = nil end
   if state.active_id == session.id then state.active_id = nil end
@@ -703,11 +718,29 @@ function M.open(opts)
   -- 订阅跟随跳变：跟随↔非跟随时隐藏/重弹终端窗（懒订阅，首次 open 时注册）。
   _ensure_follow_subscription()
 
-  -- 悬浮终端：always 立即弹出；on_wait 仅在检测到等待输入时弹出（见 _poll）。
-  -- 两者都要求「光标跟随」，不跟随时不弹（用户正在回看上方内容）。
+  -- 悬浮终端触发时机（均要求「光标跟随」，不跟随时不弹，用户正在回看上方内容）：
+  --   always  : 会话启动即弹；
+  --   on_wait : 命令运行超过 show_window_delay_ms 才弹（2 秒内结束的命令不弹）；
+  --   never   : 不弹。
   session.title = opts.title
-  if _should_show_window(session, false) then
-    _open_window(session, opts.title)
+  local sw = cfg.show_window or "on_wait"
+  if sw == "always" then
+    if _should_show_window(session, "start") then
+      _open_window(session, opts.title)
+    end
+  elseif sw == "on_wait" then
+    -- 运行超过阈值（仍未结束）即视为可观时长，标记为可弹并在跟随时弹出。
+    local delay_ms = tonumber(cfg.show_window_delay_ms) or 2000
+    if delay_ms < 0 then delay_ms = 0 end
+    session.delay_timer = vim.uv.new_timer()
+    session.delay_timer:start(delay_ms, 0, vim.schedule_wrap(function()
+      session.delay_timer = nil
+      if session.done then return end
+      session.window_eligible = true
+      if _should_show_window(session, "delay") then
+        _open_window(session, opts.title)
+      end
+    end))
   end
 
   -- 轮询检测

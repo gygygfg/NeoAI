@@ -25,8 +25,9 @@
   `ui.chat.mousescroll_max_blank`（默认 3）行内，不会像原生那样越滚越白。
 - 输入框：普通 buffer + `virt_text` 渲染 `> ` 前缀（不用 `buftype=prompt`，避免与 nvim-cmp 冲突）；
   放开 `neoai_input` filetype 的补全；输入窗口用 `'winfixbuf'`（0.10+）低层锁定，并在 `chat_view` 用
-  `CmdlineLeave` 拦截其中执行 `:e <file>` / `:bnext` 等 buffer 切换命令：原命令被中止、改在**新标签页**
-  打开目标文件，既不报 `E1513`，也**不会**把输入框变成该文件（避免输入落进用户文件 / `:wq` 误保存）。
+  `CmdlineLeave` **通用拦截**其中执行的任意 `:` 命令：原命令在当前窗口原样重放，仅当因 winfixbuf 报
+  E1513 时改在**新标签页**打开。因此不论是 `:e <file>` 还是 `:terminal`/`:help` 等，都既不报 `E1513`，
+  也**不会**把输入框变成该 buffer（避免输入落进用户文件 / `:wq` 误保存）。
 
 ## 3. 基本交互
 

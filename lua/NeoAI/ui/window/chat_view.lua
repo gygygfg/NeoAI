@@ -1167,43 +1167,45 @@ local function _on_win_enter()
   end
 end
 
---- 输入框窗口内「切换 buffer」类命令集合：这些命令会复用输入窗口的 nofile 暂存 buffer
---- （buftype 变空、内容被文件名替换），既而输入落进用户文件 / :wq 误保存。
---- input_box 的 'winfixbuf' 会在低层阻止它们，但会向用户抛 E1513；这里在更高层
---- 拦截并把命令重定向到新标签页执行，既不报错也不复用输入 buffer。
---- 注：:sp/:vsp/:tabedit/:tabnew/:sbuffer/:sview 等会新开窗口、不碰本窗口 buffer，
---- winfixbuf 本就放行，无需拦截。
-local _REDIRECT_FILE_CMDS = { edit = true, ex = true, enew = true, view = true, find = true }
-local _REDIRECT_NAV_CMDS = {
-  bnext = true, bprevious = true, buffer = true,
-  bfirst = true, blast = true, brewind = true,
-}
-
---- CmdlineLeave：输入窗口内执行 buffer 切换命令时，中止原命令并改在新标签页打开，
---- 避免向用户抛 E1513（winfixbuf），同时保证输入 buffer 不被复用。
+--- 输入框窗口内的任何命令都可能复用输入窗口的 nofile 暂存 buffer（buftype 变空、内容被文件名替换），
+--- 既而输入落进用户文件 / :wq 误保存；除了 :e/:bnext，还有 :terminal / :help / 各类插件命令等，
+--- 无法穷举。input_box 的 'winfixbuf' 会在低层阻止这种切换，但会向用户抛 E1513。
+--- 因此这里不做命令白名单，而是**通用拦截所有 `:` 命令行**：中止原命令 → 在当前窗口原样重放；
+--- 仅当重放因 winfixbuf 报 E1513 时，才改用**新标签页**执行（:terminal/:help 这类会接管当前窗口的
+--- 命令也能正确在新标签页打开）。普通输入（回车发送）、:set/:w/:q 等一概不受影响。
 --- 关键：Lua 回调里 ev.abort / vim.v.event.abort 均无效（实测命令仍执行），
---- 必须用 vim.cmd("let v:event.abort = v:true") 才能真正中止（且不显示错误）。
+--- 必须用 vim.cmd("let v:event.abort = v:true") 才能真正中止。
+--- 注：新标签页兜底只在确实撞上 E1513（winfixbuf）时发生；:sp/:vsp/:tabnew 等新开窗口的命令
+--- 由 winfixbuf 直接放行，重放即成功，不会误开标签。
 --- @param ev table
 local function _on_input_cmdline_leave(ev) -- luacheck: ignore ev
   if not M.has_window() then return end
   if vim.fn.getcmdtype() ~= ":" then return end
   if not state.input_win_id or not vim.api.nvim_win_is_valid(state.input_win_id) then return end
-  -- CmdlineLeave 是 cmdwin 等场景也会触发，只处理「当前窗口恰为输入窗口」的情况。
+  -- CmdlineLeave 在 cmdwin 等场景也会触发，只处理「当前窗口恰为输入窗口」的情况。
   if vim.api.nvim_get_current_win() ~= state.input_win_id then return end
   local line = vim.fn.getcmdline()
-  if not line or line == "" then return end
-  local ok, parsed = pcall(vim.api.nvim_parse_cmd, line, {})
-  if not ok or not parsed or not parsed.cmd then return end
-  local cmd = parsed.cmd
-  local is_file = _REDIRECT_FILE_CMDS[cmd] and #(parsed.args or {}) > 0
-  local is_nav = _REDIRECT_NAV_CMDS[cmd]
-  if not is_file and not is_nav then return end
-  -- 中止原命令（抑制 E1513），改在新标签页执行；聊天主窗口与输入框保持不变。
+  if not line or line:match("^%s*$") then return end
+  -- 中止原命令后在主循环下一拍重放：一是让输入框的按键映射（如回车发送）不被本拦截吞掉，
+  -- 二是用 pcall 捕获错误，从而仅对 winfixbuf(E1513) 做新标签页兜底，其它错误原样提示。
   pcall(vim.cmd, "let v:event.abort = v:true")
   vim.schedule(function()
     if not M.has_window() then return end
-    pcall(vim.cmd, "tabnew")
-    pcall(vim.cmd, line)
+    local ok, err = pcall(vim.cmd, line)
+    if ok then return end
+    if type(err) == "string" and err:find("E1513", 1, true) then
+      -- 输入窗口被 winfixbuf 锁住：在新标签页重放（:terminal/:help 等也能正确打开）。
+      pcall(vim.cmd, "tabnew")
+      local ok2, err2 = pcall(vim.cmd, line)
+      if not ok2 then
+        local msg = tostring(err2)
+        vim.notify(msg:match("E%d+:[^\n]*") or msg, vim.log.levels.ERROR)
+      end
+      return
+    end
+    -- 其它错误（如 :write 遇上 nofile）照常提示，但裁掉内部调用链，保留 E 码信息。
+    local msg = tostring(err)
+    vim.notify(msg:match("E%d+:[^\n]*") or msg, vim.log.levels.ERROR)
   end)
 end
 

@@ -12,6 +12,7 @@
 local manager = require("NeoAI.ui.components.display_modes")
 local stringx = require("NeoAI.utils.stringx")
 local incremental = require("NeoAI.ui.components.incremental")
+local geometry = require("NeoAI.ui.geometry")
 
 local M = {
   name = "trajectory",
@@ -791,8 +792,7 @@ local function _open_path_dialog(default, on_confirm, on_cancel)
   vim.bo[dlg.buf].modifiable = true
   vim.bo[dlg.buf].bufhidden = "wipe"
   vim.bo[dlg.buf].swapfile = false
-  local height = 3
-  local width = math.min(90, vim.o.columns - 6)
+  local geom = geometry.compute({ w_ratio = 0.66, h_ratio = 0.30, fit_h = 3 })
   -- 第 1 行放不可编辑的提示文本（virt_text，不进入 buffer 内容）；第 2 行是可编辑的输入。
   vim.api.nvim_buf_set_lines(dlg.buf, 0, -1, false, { "", default })
   dlg.prompt_ns = vim.api.nvim_create_namespace("neoai_traj_prompt")
@@ -802,10 +802,10 @@ local function _open_path_dialog(default, on_confirm, on_cancel)
   })
   local ok, wid = pcall(vim.api.nvim_open_win, dlg.buf, false, {
     relative = "editor",
-    width = width,
-    height = height,
-    col = math.floor((vim.o.columns - width) / 2),
-    row = math.floor((vim.o.lines - height) / 2),
+    width = geom.width,
+    height = geom.height,
+    col = geom.col,
+    row = geom.row,
     style = "minimal",
     border = "rounded",
     title = "💾 NeoAI 保存轨迹日志",

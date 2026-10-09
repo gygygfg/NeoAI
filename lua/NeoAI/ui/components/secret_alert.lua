@@ -3,6 +3,8 @@
 --- 真实密钥出现在 AI 上下文/工具调用，或向非白名单地址发送密钥时，阻塞 Agent 并请用户确认。
 --- 注册到 sandbox.secret_alert。
 
+local geometry = require("NeoAI.ui.geometry")
+
 local M = {}
 
 -- ========== 私有状态 ==========
@@ -113,14 +115,13 @@ function M.show(ctx, decide)
   vim.bo[state.buf].filetype = "neoai_secret_alert"
   local lines = _text(ctx)
   vim.api.nvim_buf_set_lines(state.buf, 0, -1, false, lines)
-  local height = math.min(#lines + 2, 16)
-  local width = math.min(76, vim.o.columns - 8)
+  local geom = geometry.compute({ w_ratio = 0.60, h_ratio = 0.40, fit_h = #lines + 2 })
   local ok, wid = pcall(vim.api.nvim_open_win, state.buf, true, {
     relative = "editor",
-    width = width,
-    height = height,
-    col = math.floor((vim.o.columns - width) / 2),
-    row = math.floor((vim.o.lines - height) / 2),
+    width = geom.width,
+    height = geom.height,
+    col = geom.col,
+    row = geom.row,
     style = "minimal",
     border = "rounded",
     title = "🔑 密钥告警",

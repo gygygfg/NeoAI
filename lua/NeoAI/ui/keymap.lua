@@ -4,6 +4,7 @@
 --- 支持运行时注册/注销。
 
 local config_store = require("NeoAI.kernel.config_store")
+local geometry = require("NeoAI.ui.geometry")
 
 local M = {}
 
@@ -119,14 +120,13 @@ function M.show_keymaps()
   local buf = vim.api.nvim_create_buf(false, true)
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
   vim.bo[buf].filetype = "markdown"
-  local width = math.min(70, vim.o.columns - 10)
-  local height = math.min(#lines, vim.o.lines - 10)
+  local geom = geometry.compute({ w_ratio = 0.55, h_ratio = 0.70, fit_h = #lines })
   vim.api.nvim_open_win(buf, true, {
     relative = "editor",
-    width = width,
-    height = height,
-    col = math.floor((vim.o.columns - width) / 2),
-    row = math.floor((vim.o.lines - height) / 2),
+    width = geom.width,
+    height = geom.height,
+    col = geom.col,
+    row = geom.row,
     style = "minimal",
     border = "rounded",
     title = "NeoAI 键位配置",

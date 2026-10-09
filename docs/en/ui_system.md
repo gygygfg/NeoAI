@@ -16,6 +16,7 @@
 | `ui/window/chat_view.lua` | Chat view: binds events, streaming updates, folds, floating window scheduling, input box linkage, background collapse/restore, display mode host. |
 | `ui/window/tree_view.lua` | Session tree view: branch tree display and CRUD. |
 | `ui/components/*` | Reusable components (see below). |
+| `ui/geometry.lua` | Floating-window geometry: derives width/height and centering/anchoring from **screen-relative ratios**, avoiding hard-coded pixel sizes. `compute{ w_ratio, h_ratio, fit_h, min_w, max_w, min_h, max_h, margin, anchor, row }` → `{ width, height, col, row }`. |
 | `ui/keymap.lua` | Keymap registration (`register_context`) and display. |
 
 ## 2. Window Management (manager.lua)
@@ -194,17 +195,20 @@ buffer is an unnamed `nofile` scratch buffer, and if `:e <file>` / `:bnext` etc.
 window would **reuse the input buffer** (`buftype` becomes empty, content replaced by the filename), after which input
 lands in the user's file and `:wq` saves the wrong thing.
 
-To avoid surfacing the low-level `E1513` (Cannot switch buffer) to the user, `chat_view` additionally intercepts
-buffer-switch commands typed **in the input window** at a higher layer via `CmdlineLeave` (`_on_input_cmdline_leave`)
-(`:e`/`:edit`/`:ex`/`:enew`/`:view`/`:find` and `:bnext`/`:bprevious`/`:buffer`/`:bfirst`/`:blast`/`:brewind`): it aborts the
-original command with `let v:event.abort = v:true` (assigning `ev.abort` directly from a Lua callback does not work) and
-instead opens the target file / jumps to the target buffer in a **new tab page** (`tabnew`), leaving the chat main window
-and input box unchanged, so the user never sees E1513. `winfixbuf` remains the **low-level backstop**: paths that do not
-fire Cmdline events (plugins calling `nvim_win_set_buf` directly, `<Cmd>`, etc.) are still blocked by it, keeping the
-input buffer from being reused. (order: temporarily disable `winfixbuf` → `set_buf` → re-enable.)
+To avoid surfacing the low-level `E1513` (Cannot switch buffer) to the user, `chat_view` additionally
+**generically intercepts any `:` command typed in the input window** at a higher layer via `CmdlineLeave`
+(`_on_input_cmdline_leave`): it aborts the original command and replays it as-is in the same window; only when the
+replay fails with E1513 (winfixbuf) does it fall back to running it in a **new tab page** (`tabnew`). Since the set of
+commands that can switch the input window's buffer cannot be enumerated (`:e`/`:bnext` plus `:terminal`/`:help` and
+countless plugin commands), a whitelist would inevitably leak, so the strategy is "execute as-is first, flip to a new tab
+only on E1513": the chat main window and input box stay unchanged, the user never sees E1513, and normal input (Enter to
+send), `:set`/`:w`/`:q` etc. are unaffected. `winfixbuf` remains the **low-level backstop**: paths that do not fire
+Cmdline events (plugins calling `nvim_win_set_buf` directly, `<Cmd>`, etc.) are still blocked by it.
 
-> Note: `:sp`/`:vsp`/`:tabedit`/`:tabnew`/`:sbuffer`/`:sview` etc. open new windows without touching this window's
-> buffer, so `winfixbuf` already lets them through and no interception is needed.
+> Key point: assigning `ev.abort`/`vim.v.event.abort` directly from a Lua callback does not work; only
+> `let v:event.abort = v:true` truly aborts. Note: `:sp`/`:vsp`/`:tabedit`/`:tabnew`/`:sbuffer`/`:sview` etc. open new
+> windows without touching this window's buffer, so `winfixbuf` lets them through and replaying them as-is succeeds
+> (no spurious tab).
 
 Scrolling in the main message area uses two paths:
 
@@ -268,9 +272,9 @@ Following deepseek-harness's Cordis plugin model, the chat view's "display modes
 
 | Component | Responsibility |
 | --- | --- |
-| `input_box` | Chat input box. `create`/`attach_window`/`focus`/`submit`/`on_submitted`/`clear`; renders the `>` prefix with `virt_text`; enables completion for the `neoai_input` filetype; `attach_window` locks the window with `'winfixbuf'` (0.10+) as a low-level backstop against `:e`/`:bnext` reusing the input buffer (user-typed commands are intercepted by `chat_view`'s `CmdlineLeave`). |
+| `input_box` | Chat input box. `create`/`attach_window`/`focus`/`submit`/`on_submitted`/`clear`; renders the `>` prefix with `virt_text`; enables completion for the `neoai_input` filetype; `attach_window` locks the window with `'winfixbuf'` (0.10+) as a low-level backstop against `:e`/`:bnext`/`:terminal` etc. reusing the input buffer (user-typed commands are generically intercepted by `chat_view`'s `CmdlineLeave`). |
 | `message_list` | Message list rendering. `render(buf, messages)`; `toggle_reasoning()`. |
-| `float_stream_window` | Reusable streaming floating window. `open(title,{filetype,max_height})`/`set_text`/`append`/`get_text`/`close`/`is_open`/`reset`; reasoning process / receiving arguments / context compaction / plan distillation share the same window. The window height adapts to the number of display lines (`nvim_win_text_height`), bounded by `max_height`, `smoothscroll` is enabled, and after writing it grows first then scrolls, with the cursor moved to the end of the content followed by `zb` to stick to the bottom. |
+| `float_stream_window` | Reusable streaming floating window. `open(title,{filetype,max_height})`/`set_text`/`append`/`get_text`/`close`/`is_open`/`reset`; reasoning process / receiving arguments / plan distillation share the same window. The window **opens at screen-relative ratios** (width 0.70×columns, height 0.60×lines, top-anchored); its height adapts to the number of display lines (`nvim_win_text_height`), bounded by `max_height`, `smoothscroll` is enabled, and after writing it grows first then scrolls, with the cursor moved to the end of the content followed by `zb` to stick to the bottom. |
 | `reasoning_panel` | Reasoning process floating window (`float_stream_window` adapter, height capped at 5 lines). `open`/`show`/`append`/`close`/`is_open`; `filetype=neoai_reasoning`. |
 | `tool_args_panel` | Tool arguments receiving floating window (`float_stream_window` adapter, streaming tool call arguments, height capped at 5 lines). For a single tool it `append`s incrementally by chunk, otherwise it rebuilds the whole segment; `open`/`show`/`close`/`is_open`/`get_content`/`reset`; `filetype=neoai_tool_args`. |
 | `lsp_guard` | LSP isolation for UI buffers. `install()`/`uninstall()`/`disable(buf)`; disables LSP/Copilot for `neoai*` filetypes and detaches attached clients (see §4.8). |
@@ -278,7 +282,7 @@ Following deepseek-harness's Cordis plugin model, the chat view's "display modes
 | `tool_approval` | Tool approval popup. `init()`; serial single-slot display. |
 | `ask_user` | User questioning popup. `init()`; injected via `ask_user.set_ui`. |
 | `sub_agent_dock` | Sub-agent status monitoring. `init()`. |
-| `terminal_window` | Floating **interactive** terminal for interactive commands (`nvim_open_term` rendering; typing when focused is forwarded to the command). Opens per session id; **pops only when the chat cursor is following** (`show_window` controls timing), and hides / re-pops on follow flips via `UI_FOLLOW_CHANGED` (see `services.pty`); no-op in headless. Driven by `services.pty`. |
+| `terminal_window` | Floating **interactive** terminal for interactive commands (`nvim_open_term` rendering; typing when focused is forwarded to the command). Opens per session id; **pops only when the chat cursor is following** (`show_window` controls timing: always = at session start / on_wait = only after the command has been running longer than `show_window_delay_ms` (default 2000ms) without finishing, so a fast command never flashes a window), and hides / re-pops on follow flips via `UI_FOLLOW_CHANGED` (see `services.pty`; each open renders a fresh `nvim_open_term` channel, so accumulated output is replayed on open to avoid a blank window); no-op in headless. Driven by `services.pty`. |
 | `sandbox_review` | Sandbox pending-review UI. `open()` (**opens even with no pending / approval / trace items, showing an empty view — no notice and no auto-close**; refreshing into an empty queue keeps the window open and new items are picked up by the event subscription); highlights by path level (workspace green / user yellow / system red) and shows high/medium/low risk grades; items are sectioned into **unapplied (pending)** and **applied (snapshotted, revertible)**. Per-file approval: `<CR>` applies the file under the cursor, `A` approves every workspace change in one key (files outside the workspace and host-operation proposals stay pending; yields to the main loop between items, shows progress in the title, and refuses re-entry while running), `d` rejects only that file, `i` opens that item's diff preview (returns with cursor restored), `u` undoes/redoes the save, `q` closes; on an **outside-access trace** row `i` opens the access detail (summary of tools/source/command count/first-last time, then per-access tool/kind/command/time), and on an **outside-command** row `i` opens the command detail (files that command accessed out of bounds); while open the window subscribes to sandbox broadcast events and refreshes automatically (multiple events in the same tick are coalesced). The applied section is collapsed by default (two-level fold); **a pending item shows its header line with the rest folded and can be expanded with `za`/`zo`** (header keeps the whole-unit approval entry and highlight), while the trace section does not fold. High-risk items (L3, and L2 package/sensitive installs when `package_confirm` is on) require an AI consequence warning plus a second `<CR>` in the diff. |
 | `fold` | Folds (shared implementation for reasoning/tool calls/results). `foldexpr`/`foldtext`/`record_start`/`record_end`/`has_running`/`set_live_timer`/`set_foldexpr_override`/`set_foldtext_override`/`set_reasoning_lines`/`is_reasoning_start`/`generic_label`. |
 | `display_modes/` | Display mode plugin manager + `chat.lua`/`trajectory.lua`. |

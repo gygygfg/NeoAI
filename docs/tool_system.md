@@ -182,7 +182,7 @@ M.execute(agent, name, args, tool_call_id, opts)
 - **目标**：分别在命令等待输入时注入一行文本、发送按键序列（Enter/Tab/Escape/Up/Ctrl-C 等）、结束进程。
 - **如何操作**：仅操作已存在的 PTY 会话（`effect=in_process`，不新起进程）；正常由判官自动调用，模型一般无需手动调用，除非需要精确控制。
 
-悬浮终端窗口由 `ui/components/terminal_window.lua` 用 `nvim_open_term` 渲染，焦点在内时可手动键入；`show_window` 控制弹出时机（always/on_wait/never，**均需聊天光标跟随**）。跟随状态跳变时经 `UI_FOLLOW_CHANGED` 自动隐藏（回看上方）/ 重弹（跳回底部，仍等待输入或 always 模式下）。详见 [configuration.md](configuration.md) 的 `tools.run_command.interactive`。
+悬浮终端窗口由 `ui/components/terminal_window.lua` 用 `nvim_open_term` 渲染，焦点在内时可手动键入；`show_window` 控制弹出时机（always/on_wait/never，**均需聊天光标跟随**）：`always` 会话启动即弹；`on_wait` 仅当命令运行超过 `show_window_delay_ms`（默认 2000ms）仍未结束时弹（2 秒内结束的短命令不弹，避免一闪而过）。跟随状态跳变时经 `UI_FOLLOW_CHANGED` 自动隐藏（回看上方）/ 重弹（跳回底部，仍满足对应条件者）。窗口每次打开（首弹或重弹）都按**新的 `nvim_open_term` 通道**渲染，因此打开时会**重放该会话的累计输出**，避免弹出空白窗口（看起来「打不开」）。详见 [configuration.md](configuration.md) 的 `tools.run_command.interactive`。
 
 命令 stdout/stderr 合计超过 `tools.run_command.max_output_bytes`（默认 16 MiB）时截断并终止命令，
 避免超大输出（数百 MB）逐行处理冻结主线程；已产生内容仍回传并标注「已截断」。

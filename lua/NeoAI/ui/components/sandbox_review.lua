@@ -14,6 +14,7 @@ local services = require("NeoAI.kernel.services")
 local fs = require("NeoAI.utils.fs")
 local event_bus = require("NeoAI.kernel.event_bus")
 local events = require("NeoAI.kernel.events")
+local geometry = require("NeoAI.ui.geometry")
 
 local M = {}
 
@@ -778,14 +779,13 @@ local function _show_root_prompt(res, target, retry, retry_op)
   vim.bo[buf].filetype = "neoai_root_prompt"
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
   vim.bo[buf].modifiable = false
-  local width = math.min(72, vim.o.columns - 10)
-  local height = #lines + 2
+  local geom = geometry.compute({ w_ratio = 0.60, h_ratio = 0.40, fit_h = #lines + 2 })
   local win = vim.api.nvim_open_win(buf, true, {
     relative = "editor",
-    width = width,
-    height = height,
-    col = math.floor((vim.o.columns - width) / 2),
-    row = math.floor((vim.o.lines - height) / 2),
+    width = geom.width,
+    height = geom.height,
+    col = geom.col,
+    row = geom.row,
     style = "minimal",
     border = "rounded",
     title = "⚠ 需要 root 权限",
@@ -1388,7 +1388,8 @@ local function _open_diff(target, item, opts)
   state.suspended = true
   M.close()
 
-  local width = math.min(120, vim.o.columns - 8)
+  local diff_geom = geometry.compute({ w_ratio = 0.80, h_ratio = 0.75 })
+  local width = diff_geom.width
   local lines = {
     ("%s  %s"):format(is_confirm and "确认应用" or "修改预览", _one_line(title)),
   }
@@ -1421,13 +1422,12 @@ local function _open_diff(target, item, opts)
   -- 按键提示行高亮，使确认/取消操作更醒目。
   pcall(vim.api.nvim_buf_add_highlight, buf, ns, HINT_HL, 1, 0, -1)
 
-  local height = math.min(30, vim.o.lines - 6)
   local win = vim.api.nvim_open_win(buf, true, {
     relative = "editor",
-    width = width,
-    height = height,
-    col = math.floor((vim.o.columns - width) / 2),
-    row = math.floor((vim.o.lines - height) / 2),
+    width = diff_geom.width,
+    height = diff_geom.height,
+    col = diff_geom.col,
+    row = diff_geom.row,
     style = "minimal",
     border = "rounded",
     title = is_confirm and confirm_title or "🔍 修改预览",
@@ -1457,19 +1457,18 @@ end
 local function _open_detail_float(title, lines)
   state.suspended = true
   M.close()
-  local width = math.min(120, vim.o.columns - 8)
+  local detail_geom = geometry.compute({ w_ratio = 0.80, h_ratio = 0.75 })
   local buf = vim.api.nvim_create_buf(false, true)
   vim.bo[buf].filetype = "neoai_sandbox_detail"
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
   vim.bo[buf].modifiable = false
   local ns = vim.api.nvim_create_namespace("NeoAISandboxDetail")
-  local height = math.min(30, vim.o.lines - 6)
   local win = vim.api.nvim_open_win(buf, true, {
     relative = "editor",
-    width = width,
-    height = height,
-    col = math.floor((vim.o.columns - width) / 2),
-    row = math.floor((vim.o.lines - height) / 2),
+    width = detail_geom.width,
+    height = detail_geom.height,
+    col = detail_geom.col,
+    row = detail_geom.row,
     style = "minimal",
     border = "rounded",
     title = title,
@@ -1482,7 +1481,7 @@ local function _open_detail_float(title, lines)
   vim.api.nvim_create_autocmd("BufWipeout", {
     buffer = buf, once = true, callback = function() _close_diff() end,
   })
-  state.diff = { win = win, buf = buf, ns = ns, mode = "detail", width = width }
+  state.diff = { win = win, buf = buf, ns = ns, mode = "detail", width = detail_geom.width }
 end
 
 --- 查看某条越界留痕的详情：汇总涉及工具/命令/时间，并逐条列出工具 / 类型 / 命令 / 时间。
@@ -2005,11 +2004,12 @@ function M.open()
   state.buf = vim.api.nvim_create_buf(false, true)
   vim.bo[state.buf].filetype = "neoai_sandbox_review"
   state.ns = vim.api.nvim_create_namespace("NeoAISandboxReview")
-  local width = math.min(100, vim.o.columns - 10)
-  local height = math.min(24, vim.o.lines - 8)
+  local base_geom = geometry.compute({ w_ratio = 0.70, h_ratio = 0.65 })
+  local width = base_geom.width
+  local height = base_geom.height
   -- 恢复上次窗口几何（若仍可用），否则居中。
-  local col = math.floor((vim.o.columns - width) / 2)
-  local row = math.floor((vim.o.lines - height) / 2)
+  local col = base_geom.col
+  local row = base_geom.row
   local g = state.geom
   if g and type(g.col) == "number" and type(g.row) == "number" then
     local max_col = math.max(0, vim.o.columns - (g.width or width))

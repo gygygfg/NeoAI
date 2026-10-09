@@ -3,6 +3,8 @@
 --- 沙箱内进程/端口在沙箱内访问免权限；访问沙箱外部（宿主本机其他端口、外部主机）时
 --- 阻塞并请用户确认。注册到 sandbox.net_consent。
 
+local geometry = require("NeoAI.ui.geometry")
+
 local M = {}
 
 -- ========== 私有状态 ==========
@@ -117,14 +119,13 @@ function M.show(ctx, decide)
   vim.bo[state.buf].filetype = "neoai_net_consent"
   local lines = _text(ctx)
   vim.api.nvim_buf_set_lines(state.buf, 0, -1, false, lines)
-  local height = math.min(#lines + 2, 16)
-  local width = math.min(78, vim.o.columns - 8)
+  local geom = geometry.compute({ w_ratio = 0.60, h_ratio = 0.40, fit_h = #lines + 2 })
   local ok, wid = pcall(vim.api.nvim_open_win, state.buf, true, {
     relative = "editor",
-    width = width,
-    height = height,
-    col = math.floor((vim.o.columns - width) / 2),
-    row = math.floor((vim.o.lines - height) / 2),
+    width = geom.width,
+    height = geom.height,
+    col = geom.col,
+    row = geom.row,
     style = "minimal",
     border = "rounded",
     title = "🌐 沙箱网络访问",

@@ -7,6 +7,7 @@
 
 local services = require("NeoAI.kernel.services")
 local config_store = require("NeoAI.kernel.config_store")
+local geometry = require("NeoAI.ui.geometry")
 
 local M = {}
 
@@ -138,14 +139,13 @@ function M.open(on_select)
   vim.bo[state.buf].filetype = "neoai_model_picker"
   vim.api.nvim_buf_set_lines(state.buf, 0, -1, false, { "加载模型列表..." })
 
-  local width = math.min(60, vim.o.columns - 10)
-  local height = math.min(20, vim.o.lines - 10)
+  local geom = geometry.compute({ w_ratio = 0.50, h_ratio = 0.60 })
   state.win_id = vim.api.nvim_open_win(state.buf, true, {
     relative = "editor",
-    width = width,
-    height = height,
-    col = math.floor((vim.o.columns - width) / 2),
-    row = math.floor((vim.o.lines - height) / 2),
+    width = geom.width,
+    height = geom.height,
+    col = geom.col,
+    row = geom.row,
     style = "minimal",
     border = "rounded",
     title = "🤖 选择模型",

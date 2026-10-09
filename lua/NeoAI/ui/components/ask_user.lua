@@ -4,6 +4,7 @@
 --- 数字键 1-9 直接选择选项；i / 回车进入自由输入（vim.ui.input）；Esc 取消提问。
 
 local ask_user = require("NeoAI.tools.builtin.ask_user")
+local geometry = require("NeoAI.ui.geometry")
 
 local M = {}
 
@@ -169,14 +170,13 @@ function M.show(config)
     pcall(vim.api.nvim_buf_add_highlight, state.buf, HL_NS, h.group, h.line, h.col, h.col + h.len)
   end
 
-  local height = math.min(#lines + 4, 24)
-  local width = math.min(80, vim.o.columns - 10)
+  local geom = geometry.compute({ w_ratio = 0.66, h_ratio = 0.60, fit_h = #lines + 4 })
   local ok, wid = pcall(vim.api.nvim_open_win, state.buf, true, {
     relative = "editor",
-    width = width,
-    height = height,
-    col = math.floor((vim.o.columns - width) / 2),
-    row = math.floor((vim.o.lines - height) / 2),
+    width = geom.width,
+    height = geom.height,
+    col = geom.col,
+    row = geom.row,
     style = "minimal",
     border = "rounded",
     title = "❓ 向用户提问",

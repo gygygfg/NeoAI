@@ -6,6 +6,8 @@
 --- 各消费者通过 open(title, {filetype = ...}) 复用切换，互不重叠。
 --- 思考过程与接收参数均走 append 增量追加（逐片追加，不整段重排）。
 
+local geometry = require("NeoAI.ui.geometry")
+
 local M = {}
 
 -- ========== 私有状态 ==========
@@ -21,9 +23,10 @@ local state = {
 -- ========== 私有函数 ==========
 
 --- 窗口高度上限：内容变长时自动增高，避免长摘要被截断。
+--- 依屏幕相对比例（h_ratio=0.6，受最小留白约束）计算，而非像素硬编码。
 --- @return number
 local function _max_height()
-  return math.max(6, math.min(30, math.floor(vim.o.lines * 0.6)))
+  return math.max(6, geometry.compute({ h_ratio = 0.6 }).height)
 end
 
 --- 当前内容的显示行数（考虑 wrap 折行）。buffer 行数在 wrap 开启时低估了实际占用行数，
@@ -42,7 +45,7 @@ local function _maybe_grow()
   if not state.buf or not vim.api.nvim_buf_is_valid(state.buf) then return end
   -- 消费者可指定高度上限（如思考过程/接收参数限 5 行）；未指定时用默认上限。
   local max_h = state.max_height or _max_height()
-  local base = math.min(6, max_h, vim.o.lines - 10)
+  local base = math.min(6, max_h)
   -- 以显示行数（含 wrap 折行）为准：长单行也能把窗口撑到足够高度。
   local rows = math.max(vim.api.nvim_buf_line_count(state.buf), _content_rows())
   local h = math.max(base, math.min(max_h, rows + 1))
@@ -105,14 +108,20 @@ function M.open(title, opts)
   if opts.filetype then
     vim.bo[state.buf].filetype = opts.filetype
   end
-  local width = math.min(70, vim.o.columns - 10)
-  local height = math.min(state.max_height or 6, vim.o.lines - 10)
+  -- 初始高度：消费者上限（或默认 6）与屏高比例上限取小；宽度按屏宽比例。
+  local geom = geometry.compute({
+    w_ratio = 0.70,
+    h_ratio = 0.60,
+    fit_h = state.max_height or 6,
+    anchor = "top",
+    row = 2,
+  })
   state.win_id = vim.api.nvim_open_win(state.buf, false, {
     relative = "editor",
-    width = width,
-    height = height,
-    col = math.floor((vim.o.columns - width) / 2),
-    row = 2,
+    width = geom.width,
+    height = geom.height,
+    col = geom.col,
+    row = geom.row,
     style = "minimal",
     border = "rounded",
     title = title or "",

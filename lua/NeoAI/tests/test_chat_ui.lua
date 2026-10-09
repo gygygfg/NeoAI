@@ -2484,4 +2484,42 @@ tests.suite("chat_ui", function(_, it)
     chat_service.reset()
   end)
 
+  it("输入框内 :terminal 不报 E1513，改为新标签页打开（回归 N1 泛化）", function(t)
+    local chat_view = require("NeoAI.ui.window.chat_view")
+    local chat_service = require("NeoAI.services.chat_service")
+    local input_box = require("NeoAI.ui.components.input_box")
+    chat_view.reset()
+    chat_service.reset()
+
+    local opened = chat_view.open()
+    local ibuf = input_box.get_buf()
+    local iwin = input_box.get_win()
+    t.true_(iwin ~= nil and vim.api.nvim_win_is_valid(iwin), "打开后应创建输入窗口")
+
+    vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<Esc>", true, false, true), "x", false)
+    vim.wait(50, function() return false end)
+    vim.api.nvim_set_current_win(iwin)
+    vim.cmd("stopinsert")
+    vim.api.nvim_buf_set_lines(ibuf, 0, -1, false, { "用户输入" })
+
+    vim.cmd("messages clear")
+    local tabs_before = vim.fn.tabpagenr("$")
+    vim.api.nvim_feedkeys(
+      vim.api.nvim_replace_termcodes(":terminal<CR>", true, false, true), "x", false)
+    vim.wait(800, function() return false end)
+
+    -- 1) 不再向用户抛 E1513（旧白名单只覆盖 :e/:bnext，:terminal 会漏网）
+    local msgs = vim.api.nvim_exec2("messages", { output = true }).output or ""
+    t.true_(msgs:find("1513") == nil, "输入框内 :terminal 不应报 E1513，实际消息: " .. msgs)
+    -- 2) 终端在新标签页打开（winfixbuf 锁住输入窗口 → 翻转到新标签页兜底）
+    t.eq(tabs_before + 1, vim.fn.tabpagenr("$"), "应在新标签页打开终端")
+    -- 3) 输入 buffer 未被复用；聊天窗口仍在
+    t.eq(ibuf, vim.api.nvim_win_get_buf(iwin), "输入窗口应仍显示输入 buffer")
+    t.eq("nofile", vim.bo[ibuf].buftype, "输入 buffer 仍应为 nofile")
+    t.true_(chat_view.has_window(), "聊天窗口应仍然存在")
+
+    chat_view.reset()
+    chat_service.reset()
+  end)
+
 end)

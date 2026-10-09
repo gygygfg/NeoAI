@@ -4,6 +4,8 @@
 --- 并支持手动键入转发给会话。多会话按 id 独立窗口。
 --- headless（无 UI）下所有接口为安全 no-op。
 
+local geometry = require("NeoAI.ui.geometry")
+
 local M = {}
 
 -- ========== 私有状态 ==========
@@ -91,14 +93,13 @@ function M.open(session, title)
   local ok, res = pcall(function()
     local buf = vim.api.nvim_create_buf(false, true)
     vim.bo[buf].filetype = "neoai_terminal"
-    local width = math.min(90, math.max(20, vim.o.columns - 8))
-    local height = math.min(24, math.max(5, vim.o.lines - 8))
+    local geom = geometry.compute({ w_ratio = 0.80, h_ratio = 0.70, min_h = 5 })
     local win = vim.api.nvim_open_win(buf, false, {
       relative = "editor",
-      width = width,
-      height = height,
-      col = math.floor((vim.o.columns - width) / 2),
-      row = math.max(1, math.floor((vim.o.lines - height) / 2)),
+      width = geom.width,
+      height = geom.height,
+      col = geom.col,
+      row = geom.row,
       style = "minimal",
       border = "rounded",
       title = title or ("命令终端 · " .. id),

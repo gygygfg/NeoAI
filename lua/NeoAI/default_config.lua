@@ -353,9 +353,12 @@ local DEFAULT_CONFIG = {
         enabled = true,           -- 启用交互式 PTY 执行层（替换 run_command 的进程执行方式）
         engine = "auto",          -- "auto" | "procfs" | "off"（off 等价于不启用）
         poll_ms = 80,             -- /proc 轮询间隔（ms）
-        -- 悬浮终端弹出时机：always=会话启动即开 | on_wait=检测到等待输入时开 | never=不开。
+        -- 悬浮终端弹出时机：always=会话启动即开 | on_wait=命令运行超过 show_window_delay_ms 时开 | never=不开。
         -- 二者都要求「聊天光标跟随」：光标不跟随（用户回看上方）时一律不弹。
         show_window = "on_wait",
+        -- on_wait 模式的弹出阈值（ms）：命令运行超过该时长仍未结束则弹出悬浮终端；
+        -- 时长内结束（短命令）不弹，避免一闪而过的窗口打扰。
+        show_window_delay_ms = 2000,
         judge = {
           enabled = true,         -- 用判官子 agent 自动决定输入
           model = nil,            -- nil = 继承父 agent 模型
