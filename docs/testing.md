@@ -81,7 +81,7 @@ tests.suite("flow_config", function(describe, it, before_each)
   it("reads dotted path", function(t)
     local cs = require("NeoAI.kernel.config_store")
     cs.load({})
-    t.eq(cs.get("ui.window.width"), 80)
+    t.eq(cs.get("ui.window.w_ratio"), 0.85)
   end)
 end)
 ```

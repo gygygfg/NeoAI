@@ -15,7 +15,7 @@ Herdr 识别 agent 有两条途径：
 
 NeoAI 走的是第 2 条：Neovim 插件内的
 [`NeoAI.services.herder`](../../lua/NeoAI/services/herder.lua) 把多会话（含子 Agent）聚合为
-pane 级状态（`blocked > working > idle`），带严格递增 `--seq` 上报；并在接管权威时附带一次
+pane 级状态（`blocked > working > idle`），带严格递增 `--seq` 上报（seq 以挂钟微秒为基数，插件热重载 / 重开 nvim 后不回退）；并在接管权威时附带一次
 `report-metadata`（`--display-agent NeoAI` + 中文状态文案），让 Herdr 侧边栏显示 **NeoAI** 而非裸 `neoai` 标签。
 
 ### 为什么没有「检测清单（manifest）」
@@ -43,12 +43,13 @@ Herdr 支持本地清单覆盖：`~/.config/herdr/agent-detection/<id>.toml`。�
 它**不影响**生命周期识别，仅影响展示。
 
 **默认自动安装**：NeoAI 启动时若处于 Herder 环境，会**异步、静默、幂等**地把该片段写入
-`~/.config/herdr/config.toml`（marker 幂等、写入前备份、`herdr config check` 校验失败自动回滚、
+Herdr 配置（解析顺序：`HERDR_CONFIG_PATH` 原路径 → `$XDG_CONFIG_HOME/herdr/config.toml` →
+`~/.config/herdr/config.toml`；与 herdr 自身一致）（marker 幂等、写入前备份、`herdr config check` 校验失败自动回滚、
 已安装则跳过）。可用 `herder.auto_install = false` 关闭。
 
 也可手动控制：
 
-- **手动**：把 `config.snippet.toml` 内容追加到 `~/.config/herdr/config.toml`，然后
+- **手动**：把 `config.snippet.toml` 内容追加到 `$XDG_CONFIG_HOME/herdr/config.toml`（缺省 `~/.config/herdr/config.toml`），然后
   `herdr server reload-config`。
 - **从 Neovim**（带 marker 幂等、写入前备份、写入后 `herdr config check` 校验、失败自动回滚）：
 

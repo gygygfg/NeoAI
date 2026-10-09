@@ -139,7 +139,8 @@ function M.open(on_select)
   vim.bo[state.buf].filetype = "neoai_model_picker"
   vim.api.nvim_buf_set_lines(state.buf, 0, -1, false, { "加载模型列表..." })
 
-  local geom = geometry.compute({ w_ratio = 0.50, h_ratio = 0.60 })
+  local geom_opts = { w_ratio = 0.50, h_ratio = 0.60 }
+  local geom = geometry.compute(geom_opts)
   state.win_id = vim.api.nvim_open_win(state.buf, true, {
     relative = "editor",
     width = geom.width,
@@ -151,6 +152,7 @@ function M.open(on_select)
     title = "🤖 选择模型",
     title_pos = "center",
   })
+  geometry.track(state.win_id, geom_opts)
 
   -- 加载模型
   local model_service = services.use("services.model_service")
@@ -196,6 +198,7 @@ function M.close()
   if state.win_id and vim.api.nvim_win_is_valid(state.win_id) then
     pcall(vim.api.nvim_win_close, state.win_id, true)
   end
+  geometry.untrack(state.win_id)
   state.win_id = nil
   state.buf = nil
   state.on_select = nil

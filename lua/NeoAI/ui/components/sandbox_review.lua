@@ -752,6 +752,7 @@ local function _close_root_prompt()
   if root_prompt.win and vim.api.nvim_win_is_valid(root_prompt.win) then
     pcall(vim.api.nvim_win_close, root_prompt.win, true)
   end
+  geometry.untrack(root_prompt.win)
   root_prompt.win, root_prompt.buf = nil, nil
 end
 
@@ -779,7 +780,8 @@ local function _show_root_prompt(res, target, retry, retry_op)
   vim.bo[buf].filetype = "neoai_root_prompt"
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
   vim.bo[buf].modifiable = false
-  local geom = geometry.compute({ w_ratio = 0.60, h_ratio = 0.40, fit_h = #lines + 2 })
+  local geom_opts = { w_ratio = 0.60, h_ratio = 0.40, fit_h = #lines + 2 }
+  local geom = geometry.compute(geom_opts)
   local win = vim.api.nvim_open_win(buf, true, {
     relative = "editor",
     width = geom.width,
@@ -792,6 +794,7 @@ local function _show_root_prompt(res, target, retry, retry_op)
     title_pos = "center",
   })
   root_prompt.win, root_prompt.buf = win, buf
+  geometry.track(win, geom_opts)
   vim.wo[win].wrap = true
   pcall(vim.cmd, "stopinsert")
   local function close_then(fn)
@@ -1238,6 +1241,7 @@ local function _close_diff()
   state.pending_l3 = nil
   state.l3_seq = state.l3_seq + 1 -- 作废过期的 AI 警告结果
   if d then
+    geometry.untrack(d.win)
     if d.win and vim.api.nvim_win_is_valid(d.win) then
       pcall(vim.api.nvim_win_close, d.win, true)
     end
@@ -1388,7 +1392,8 @@ local function _open_diff(target, item, opts)
   state.suspended = true
   M.close()
 
-  local diff_geom = geometry.compute({ w_ratio = 0.80, h_ratio = 0.75 })
+  local diff_geom_opts = { w_ratio = 0.80, h_ratio = 0.75 }
+  local diff_geom = geometry.compute(diff_geom_opts)
   local width = diff_geom.width
   local lines = {
     ("%s  %s"):format(is_confirm and "确认应用" or "修改预览", _one_line(title)),
@@ -1435,6 +1440,7 @@ local function _open_diff(target, item, opts)
   })
   vim.wo[win].wrap = true
   vim.wo[win].linebreak = true
+  geometry.track(win, diff_geom_opts)
   vim.keymap.set("n", "q", function() _close_diff() end, { buffer = buf })
   vim.keymap.set("n", "<Esc>", function() _close_diff() end, { buffer = buf })
   if is_confirm and opts.on_confirm then
@@ -1457,7 +1463,8 @@ end
 local function _open_detail_float(title, lines)
   state.suspended = true
   M.close()
-  local detail_geom = geometry.compute({ w_ratio = 0.80, h_ratio = 0.75 })
+  local detail_geom_opts = { w_ratio = 0.80, h_ratio = 0.75 }
+  local detail_geom = geometry.compute(detail_geom_opts)
   local buf = vim.api.nvim_create_buf(false, true)
   vim.bo[buf].filetype = "neoai_sandbox_detail"
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
@@ -1476,6 +1483,7 @@ local function _open_detail_float(title, lines)
   })
   vim.wo[win].wrap = true
   vim.wo[win].linebreak = true
+  geometry.track(win, detail_geom_opts)
   vim.keymap.set("n", "q", function() _close_diff() end, { buffer = buf })
   vim.keymap.set("n", "<Esc>", function() _close_diff() end, { buffer = buf })
   vim.api.nvim_create_autocmd("BufWipeout", {
@@ -1856,6 +1864,7 @@ local function _close_dirs_editor()
   if dirs_editor.win and vim.api.nvim_win_is_valid(dirs_editor.win) then
     pcall(vim.api.nvim_win_close, dirs_editor.win, true)
   end
+  geometry.untrack(dirs_editor.win)
   dirs_editor.win, dirs_editor.buf, dirs_editor.ns = nil, nil, nil
   dirs_editor.line_map = {}
 end
@@ -1912,7 +1921,8 @@ local function _open_dirs_editor()
   dirs_editor.buf = vim.api.nvim_create_buf(false, true)
   vim.bo[dirs_editor.buf].filetype = "neoai_sandbox_dirs"
   dirs_editor.ns = vim.api.nvim_create_namespace("NeoAISandboxDirs")
-  local geom = geometry.compute({ w_ratio = 0.62, h_ratio = 0.5, fit_h = 20 })
+  local geom_opts = { w_ratio = 0.62, h_ratio = 0.5, fit_h = 20 }
+  local geom = geometry.compute(geom_opts)
   dirs_editor.win = vim.api.nvim_open_win(dirs_editor.buf, true, {
     relative = "editor",
     width = geom.width,
@@ -1924,6 +1934,7 @@ local function _open_dirs_editor()
     title = "⚙ 目录设置（仅本会话）",
     title_pos = "center",
   })
+  geometry.track(dirs_editor.win, geom_opts)
   vim.wo[dirs_editor.win].wrap = true
   vim.wo[dirs_editor.win].cursorline = true
   local function bind(mode, key, fn) vim.keymap.set(mode, key, fn, { buffer = dirs_editor.buf }) end
@@ -2310,7 +2321,8 @@ function M.open()
   state.buf = vim.api.nvim_create_buf(false, true)
   vim.bo[state.buf].filetype = "neoai_sandbox_review"
   state.ns = vim.api.nvim_create_namespace("NeoAISandboxReview")
-  local base_geom = geometry.compute({ w_ratio = 0.70, h_ratio = 0.65 })
+  local base_geom_opts = { w_ratio = 0.70, h_ratio = 0.65 }
+  local base_geom = geometry.compute(base_geom_opts)
   local width = base_geom.width
   local height = base_geom.height
   -- 恢复上次窗口几何（若仍可用），否则居中。
@@ -2336,6 +2348,7 @@ function M.open()
     title = "🗂 沙箱待审/已保存",
     title_pos = "center",
   })
+  geometry.track(state.win_id, base_geom_opts)
   -- 自动换行：AI 审计结论 / diff 等长文本按窗口宽度折行显示（CJK 按字断行）。
   vim.wo[state.win_id].wrap = true
   vim.wo[state.win_id].linebreak = true
@@ -2490,6 +2503,7 @@ function M.close()
     end)
     pcall(vim.api.nvim_win_close, state.win_id, true)
   end
+  geometry.untrack(state.win_id)
   state.win_id = nil
   state.buf = nil
   state.ns = nil

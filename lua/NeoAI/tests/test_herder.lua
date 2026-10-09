@@ -127,6 +127,23 @@ tests.suite("herder", function(_, it)
     restore_env(orig)
   end)
 
+  it("Herdr 不注入 BIN_PATH 时回退 PATH 上的 herdr", function(t)
+    local orig = reset_herder_env()
+    -- Herdr 在 pane 内并不注入这两个变量（实测 env 内无 BIN_PATH）
+    vim.env.HERDER_BIN_PATH = nil
+    vim.env.HERDR_BIN_PATH = nil
+    local herder = init_herder()
+    t.true_(herder.is_available(), "缺省应回退 PATH 上的 herdr，而非永久 no-op")
+
+    emit_created("a1")
+    emit_state("a1", "generating")
+    local reports = collect("report-agent")
+    t.eq(1, #reports)
+    t.eq("herdr", reports[1][1], "应调用 PATH 上的 herdr")
+    t.eq("working", arg_state(reports[1]))
+    restore_env(orig)
+  end)
+
   it("首个非 idle 信号才接管权威，随后上报回到 idle", function(t)
     local orig = reset_herder_env()
     local herder = init_herder()
@@ -194,6 +211,41 @@ tests.suite("herder", function(_, it)
       t.ok(s[i] > s[i - 1], "seq 应严格递增")
     end
     t.eq(herder.get_seq(), s[#s])
+    restore_env(orig)
+  end)
+
+  it("seq 以挂钟为基数（不从 1 开始）", function(t)
+    local orig = reset_herder_env()
+    local herder = init_herder()
+    emit_created("a1")
+    emit_state("a1", "generating")
+    local s = seqs()
+    t.ok(#s >= 1)
+    t.ok(s[1] >= 1e12, "seq 应以挂钟为基数（否则重启后会被 herdr 当过期包丢弃）")
+    -- CLI 参数必须是纯整数（不能是科学计数法）
+    t.matches("^%d+$", arg_value(collect("report-agent")[1], "--seq"))
+    restore_env(orig)
+  end)
+
+  it("reset 后 seq 不回退（reload/重开 nvim 仍被 herdr 接受）", function(t)
+    local orig = reset_herder_env()
+    local herder = init_herder()
+    emit_created("a1")
+    emit_state("a1", "generating")
+    emit_state("a1", "idle")
+    local max1 = seqs()[#seqs()]
+
+    -- 模拟插件 reload / 同一 pane 内重开 nvim：模块状态被重置
+    vim.wait(5, function() return false end) -- 让挂钟前进，避免同一微秒内基数相等
+    herder.reset()
+    herder = init_herder()
+    emit_created("a2")
+    emit_state("a2", "generating")
+    local s2 = seqs()
+    t.ok(#s2 >= 1)
+    for _, v in ipairs(s2) do
+      t.ok(v > max1, "重置后新的 seq 必须大于此前最大值，否则 herdr 会当过期包丢弃")
+    end
     restore_env(orig)
   end)
 

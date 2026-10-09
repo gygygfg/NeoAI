@@ -44,7 +44,8 @@ function M.open()
   end
   state.buf = vim.api.nvim_create_buf(false, true)
   vim.bo[state.buf].filetype = "neoai_subagents"
-  local geom = geometry.compute({ w_ratio = 0.50, h_ratio = 0.35, anchor = "bottom" })
+  local geom_opts = { w_ratio = 0.50, h_ratio = 0.35, anchor = "bottom" }
+  local geom = geometry.compute(geom_opts)
   state.win_id = vim.api.nvim_open_win(state.buf, false, {
     relative = "editor",
     width = geom.width,
@@ -56,6 +57,7 @@ function M.open()
     title = "子 Agent",
     title_pos = "center",
   })
+  geometry.track(state.win_id, geom_opts)
   _render()
   return state.win_id
 end
@@ -65,6 +67,7 @@ function M.close()
   if state.win_id and vim.api.nvim_win_is_valid(state.win_id) then
     pcall(vim.api.nvim_win_close, state.win_id, true)
   end
+  geometry.untrack(state.win_id)
   state.win_id = nil
   state.buf = nil
 end

@@ -12,9 +12,13 @@ tests.suite("geometry", function(_, it)
   --- @param body function
   local function on_screen(cols, lines, body)
     local old_cols, old_lines = vim.o.columns, vim.o.lines
-    vim.o.columns, vim.o.lines = cols, lines
+    -- 某些后端/版本对过小的 columns/lines 直接报错（E593）而非 clamp，这里容错赋值，
+    -- 失败时保留原值；用例内以运行时实际 vim.o.columns/lines 为准。
+    pcall(function() vim.o.columns = cols end)
+    pcall(function() vim.o.lines = lines end)
     local ok, err = pcall(body)
-    vim.o.columns, vim.o.lines = old_cols, old_lines
+    pcall(function() vim.o.columns = old_cols end)
+    pcall(function() vim.o.lines = old_lines end)
     if not ok then error(err) end
   end
 
@@ -95,5 +99,68 @@ tests.suite("geometry", function(_, it)
       t.true_(g.col >= 0 and g.col + g.width <= cols, "col 应在屏内")
       t.true_(g.row >= 0 and g.row + g.height <= lines, "row 应在屏内")
     end)
+  end)
+
+  it("全局最小尺寸兜底：比例算出的过小尺寸被抬到默认最小", function(t)
+    on_screen(300, 100, function()
+      -- w=floor(300*0.02)=6、h=floor(100*0.01)=1，均应被抬到默认最小（宽/高）。
+      local g = geometry.compute({ w_ratio = 0.02, h_ratio = 0.01 })
+      t.eq(geometry.MIN_WIDTH, g.width)
+      t.eq(geometry.MIN_HEIGHT, g.height)
+    end)
+  end)
+
+  it("显式 min 覆盖默认；传 0 可解除默认下限", function(t)
+    on_screen(300, 100, function()
+      local g = geometry.compute({ w_ratio = 0.02, h_ratio = 0.01, min_w = 10, min_h = 2 })
+      t.eq(10, g.width)
+      t.eq(2, g.height)
+
+      local g0 = geometry.compute({ w_ratio = 0.02, h_ratio = 0.01, min_w = 0, min_h = 0 })
+      t.eq(6, g0.width)
+      t.eq(1, g0.height)
+    end)
+  end)
+
+  it("track + refresh：窗口几何按新屏幕尺寸重算", function(t)
+    on_screen(200, 50, function()
+      local buf = vim.api.nvim_create_buf(false, true)
+      local g = geometry.compute({ w_ratio = 0.5, h_ratio = 0.4 })
+      local win = vim.api.nvim_open_win(buf, false, {
+        relative = "editor", width = g.width, height = g.height, col = g.col, row = g.row, style = "minimal",
+      })
+      geometry.track(win, { w_ratio = 0.5, h_ratio = 0.4 })
+      -- 屏幕变小：refresh 后窗口宽高应跟随重算。
+      vim.o.columns, vim.o.lines = 100, 40
+      geometry.refresh()
+      local cfg = vim.api.nvim_win_get_config(win)
+      local expect = geometry.compute({ w_ratio = 0.5, h_ratio = 0.4 })
+      t.eq(expect.width, cfg.width)
+      t.eq(expect.height, cfg.height)
+      t.eq(expect.col, cfg.col)
+      t.eq(expect.row, cfg.row)
+      geometry.untrack(win)
+      pcall(vim.api.nvim_win_close, win, true)
+      pcall(vim.api.nvim_buf_delete, buf, { force = true })
+    end)
+  end)
+
+  it("untrack 后 refresh 不再更新窗口几何", function(t)
+    on_screen(200, 50, function()
+      local buf = vim.api.nvim_create_buf(false, true)
+      local win = vim.api.nvim_open_win(buf, false, {
+        relative = "editor", width = 40, height = 8, col = 0, row = 0, style = "minimal",
+      })
+      geometry.track(win, { w_ratio = 0.5, h_ratio = 0.4 })
+      geometry.untrack(win)
+      vim.o.columns, vim.o.lines = 120, 40
+      geometry.refresh()
+      local cfg = vim.api.nvim_win_get_config(win)
+      t.eq(40, cfg.width)
+      t.eq(8, cfg.height)
+      pcall(vim.api.nvim_win_close, win, true)
+      pcall(vim.api.nvim_buf_delete, buf, { force = true })
+    end)
+    geometry.reset()
   end)
 end)

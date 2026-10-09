@@ -24,6 +24,7 @@ local function _close()
   if state.win_id and vim.api.nvim_win_is_valid(state.win_id) then
     pcall(vim.api.nvim_win_close, state.win_id, true)
   end
+  geometry.untrack(state.win_id)
   state.win_id = nil
   state.buf = nil
   state.on_confirm = nil
@@ -133,7 +134,8 @@ function M.show(config)
   end
   vim.api.nvim_buf_set_lines(state.buf, 0, -1, false, lines)
 
-  local geom = geometry.compute({ w_ratio = 0.55, h_ratio = 0.50, fit_h = #lines + 4 })
+  local geom_opts = { w_ratio = 0.55, h_ratio = 0.50, fit_h = #lines + 4 }
+  local geom = geometry.compute(geom_opts)
   local ok, wid = pcall(vim.api.nvim_open_win, state.buf, true, {
     relative = "editor",
     width = geom.width,
@@ -152,6 +154,7 @@ function M.show(config)
     error("无法打开审批弹窗: " .. tostring(wid))
   end
   state.win_id = wid
+  geometry.track(state.win_id, geom_opts)
   vim.wo[state.win_id].wrap = true
   -- 强制退出插入模式：弹窗打开时若用户正在输入框打字（插入模式），模式会延续到新窗口，
   -- 导致快捷键失效；只读防止误编辑弹窗内容

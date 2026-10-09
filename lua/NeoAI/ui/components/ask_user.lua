@@ -53,6 +53,7 @@ local function _close()
   if state.win_id and vim.api.nvim_win_is_valid(state.win_id) then
     pcall(vim.api.nvim_win_close, state.win_id, true)
   end
+  geometry.untrack(state.win_id)
   state.win_id = nil
   state.buf = nil
   state.on_answer = nil
@@ -170,7 +171,8 @@ function M.show(config)
     pcall(vim.api.nvim_buf_add_highlight, state.buf, HL_NS, h.group, h.line, h.col, h.col + h.len)
   end
 
-  local geom = geometry.compute({ w_ratio = 0.66, h_ratio = 0.60, fit_h = #lines + 4 })
+  local geom_opts = { w_ratio = 0.66, h_ratio = 0.60, fit_h = #lines + 4 }
+  local geom = geometry.compute(geom_opts)
   local ok, wid = pcall(vim.api.nvim_open_win, state.buf, true, {
     relative = "editor",
     width = geom.width,
@@ -187,6 +189,7 @@ function M.show(config)
     error("无法打开提问弹窗: " .. tostring(wid))
   end
   state.win_id = wid
+  geometry.track(state.win_id, geom_opts)
   vim.wo[state.win_id].wrap = true
   -- 提问内容禁止折叠：minimal 浮窗会继承全局 foldenable/foldmethod
   -- （如用户的 foldmethod=indent + foldenable），导致问题/选项被自动收起而看不到。

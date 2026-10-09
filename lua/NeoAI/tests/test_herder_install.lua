@@ -13,12 +13,14 @@ local function save_env()
     config = vim.env.HERDR_CONFIG_PATH,
     herder_bin = vim.env.HERDER_BIN_PATH,
     herdr_bin = vim.env.HERDR_BIN_PATH,
+    xdg = vim.env.XDG_CONFIG_HOME,
   }
 end
 local function restore_env(orig)
   vim.env.HERDR_CONFIG_PATH = orig.config
   vim.env.HERDER_BIN_PATH = orig.herder_bin
   vim.env.HERDR_BIN_PATH = orig.herdr_bin
+  vim.env.XDG_CONFIG_HOME = orig.xdg
 end
 
 --- 建一个退出码固定的假 herdr 可执行文件
@@ -52,7 +54,12 @@ end
 
 local function write_raw(path, content)
   local fd = vim.uv.fs_open(path, "w", 420)
-  vim.uv.fs_write(fd, content, 0)
+  local off = 0
+  while off < #content do
+    local n = vim.uv.fs_write(fd, content:sub(off + 1), off)
+    if not n or n == 0 then break end
+    off = off + n
+  end
   vim.uv.fs_close(fd)
 end
 
@@ -196,5 +203,56 @@ tests.suite("herder_install", function(_, it)
     t.ok(snip:find(KEY_LINE, 1, true) ~= nil, "应含展示设置键")
     t.ok(snip:find(MARKER_BEGIN, 1, true) ~= nil)
     t.ok(snip:find(MARKER_END, 1, true) ~= nil)
+  end)
+
+  it("尊重 XDG_CONFIG_HOME（herdr 按 XDG 读取配置）", function(t)
+    local orig = save_env()
+    vim.env.HERDR_CONFIG_PATH = nil
+    local xdg = vim.fn.tempname() .. "-neoai-xdg"
+    vim.env.XDG_CONFIG_HOME = xdg
+    local bin = fake_herdr(0)
+    vim.env.HERDER_BIN_PATH = bin
+    vim.env.HERDR_BIN_PATH = bin
+
+    local install = require("NeoAI.services.herder_install")
+    t.eq(xdg .. "/herdr/config.toml", install.config_path(), "应按 XDG_CONFIG_HOME 解析")
+
+    local res = install.install()
+    t.true_(res.ok)
+    local content = read_file(xdg .. "/herdr/config.toml")
+    t.not_nil(content, "片段应写入 XDG 配置路径")
+    t.ok(content:find(MARKER_BEGIN, 1, true) ~= nil, "应含 marker")
+    restore_env(orig)
+  end)
+
+  it("HERDR_CONFIG_PATH 原样使用（不折叠成 config.toml）", function(t)
+    local orig = save_env()
+    local dir = vim.fn.tempname() .. "-neoai-herdr-custom"
+    vim.fn.mkdir(dir, "p")
+    local custom = dir .. "/my-herdr.toml"
+    vim.env.HERDR_CONFIG_PATH = custom
+    local bin = fake_herdr(0)
+    vim.env.HERDER_BIN_PATH = bin
+    vim.env.HERDR_BIN_PATH = bin
+
+    local install = require("NeoAI.services.herder_install")
+    t.eq(custom, install.config_path(), "应原样返回 HERDR_CONFIG_PATH")
+    local res = install.install()
+    t.true_(res.ok)
+    t.not_nil(read_file(custom), "片段应写入自定义文件名")
+    restore_env(orig)
+  end)
+
+  it("大配置写入不截断（原子写整段）", function(t)
+    local env = setup(0)
+    local big = string.rep("# padding line to force a large write path\n", 40000)
+    write_raw(env.config_path, big)
+    local install = require("NeoAI.services.herder_install")
+    local res = install.install()
+    t.true_(res.ok)
+    local content = read_file(env.config_path)
+    t.ok(content:find(big, 1, true) ~= nil, "原有大配置应被完整保留（不截断）")
+    t.ok(content:find(MARKER_BEGIN, 1, true) ~= nil, "应含 marker")
+    restore_env(env.orig)
   end)
 end)

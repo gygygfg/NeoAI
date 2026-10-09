@@ -198,7 +198,7 @@ Herder 侧的识别/解析由 Herder 自身处理。
 
 **前提条件**（须全部满足）：
 
-1. 运行在 Herder 注入的窗格内（环境变量 `HERDR_ENV=1`、`HERDR_PANE_ID`、`HERDER_BIN_PATH`）；
+1. 运行在 Herder 注入的窗格内（环境变量 `HERDR_ENV=1`、`HERDR_PANE_ID`；herdr 可执行文件从 `HERDER_BIN_PATH`/`HERDR_BIN_PATH` 解析，缺省回退 PATH 上的 `herdr`）；
 2. `herder.enabled = true`（默认值）。
 
 在非 Herder 环境下，该模块是严格的空操作：不订阅任何事件，
@@ -220,7 +220,7 @@ Herder 侧的识别/解析由 Herder 自身处理。
 （包括子 Agent）。NeoAI 将它们聚合为一个固定的 `source`（默认
 `custom:neoai`），并上报单一的窗格状态，优先级为 `blocked > working > idle`。
 每次上报都携带严格递增的 `--seq`，因此 Herder 会忽略同一 `source` 的过期数据包，
-避免并发/异步回滚。
+避免并发/异步回滚。seq 以挂钟微秒为基数（非每次从 1 开始），故插件热重载或同一 pane 内重开 nvim 后序号不回退。
 
 **上报流程示例**：
 

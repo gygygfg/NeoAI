@@ -727,6 +727,7 @@ local function _dlg_close()
   if dlg.win and vim.api.nvim_win_is_valid(dlg.win) then
     pcall(vim.api.nvim_win_close, dlg.win, true)
   end
+  geometry.untrack(dlg.win)
   if dlg.guard_aucmd then
     pcall(vim.api.nvim_del_autocmd, dlg.guard_aucmd)
   end
@@ -792,7 +793,8 @@ local function _open_path_dialog(default, on_confirm, on_cancel)
   vim.bo[dlg.buf].modifiable = true
   vim.bo[dlg.buf].bufhidden = "wipe"
   vim.bo[dlg.buf].swapfile = false
-  local geom = geometry.compute({ w_ratio = 0.66, h_ratio = 0.30, fit_h = 3 })
+  local geom_opts = { w_ratio = 0.66, h_ratio = 0.30, fit_h = 3 }
+  local geom = geometry.compute(geom_opts)
   -- 第 1 行放不可编辑的提示文本（virt_text，不进入 buffer 内容）；第 2 行是可编辑的输入。
   vim.api.nvim_buf_set_lines(dlg.buf, 0, -1, false, { "", default })
   dlg.prompt_ns = vim.api.nvim_create_namespace("neoai_traj_prompt")
@@ -818,6 +820,7 @@ local function _open_path_dialog(default, on_confirm, on_cancel)
     return
   end
   dlg.win = wid
+  geometry.track(dlg.win, geom_opts)
   vim.wo[dlg.win].wrap = true
   vim.wo[dlg.win].foldenable = false
   _dlg_set_keymaps()

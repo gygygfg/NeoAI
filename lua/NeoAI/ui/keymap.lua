@@ -120,8 +120,9 @@ function M.show_keymaps()
   local buf = vim.api.nvim_create_buf(false, true)
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
   vim.bo[buf].filetype = "markdown"
-  local geom = geometry.compute({ w_ratio = 0.55, h_ratio = 0.70, fit_h = #lines })
-  vim.api.nvim_open_win(buf, true, {
+  local geom_opts = { w_ratio = 0.55, h_ratio = 0.70, fit_h = #lines }
+  local geom = geometry.compute(geom_opts)
+  local win = vim.api.nvim_open_win(buf, true, {
     relative = "editor",
     width = geom.width,
     height = geom.height,
@@ -132,6 +133,8 @@ function M.show_keymaps()
     title = "NeoAI 键位配置",
     title_pos = "center",
   })
+  -- 无关闭钩子（由用户自行关闭）：登记跟随 resize，失效窗口由 refresh 自动清理。
+  geometry.track(win, geom_opts)
 end
 
 --- 重置（测试用）

@@ -242,7 +242,8 @@ require("NeoAI").setup({
   ui = {
     default_view = "chat",               -- 默认界面：tree / chat
     window_mode = "tab",                 -- 窗口模式：float / tab / split
-    window = { width = 80, height = 24, border = "rounded" },
+    window = { w_ratio = 0.85, h_ratio = 0.85, border = "rounded" }, -- float 窗口按屏幕比例；resize 实时跟随；显式 width/height 作为上限
+    float = { min_width = 24, min_height = 4 }, -- 所有悬浮窗最小尺寸兜底
     split = { size = 80, direction = "right" },
     colors = {                           -- 各元素链接的高亮组
       background = "Normal", border = "FloatBorder",
@@ -564,7 +565,7 @@ NeoAI 可以在 **Herder** 管理的 pane 内向 Herder 上报 AI Agent 的真�
 
 **生效条件**（缺一不可）：
 
-1. 运行在 Herder 注入环境的 pane 内（存在环境变量 `HERDR_ENV=1`、`HERDR_PANE_ID`、`HERDER_BIN_PATH`）；
+1. 运行在 Herder 注入环境的 pane 内（存在环境变量 `HERDR_ENV=1`、`HERDR_PANE_ID`；herdr 可执行文件从 `HERDER_BIN_PATH`/`HERDR_BIN_PATH` 解析，缺省回退到 PATH 上的 `herdr`）；
 2. `herder.enabled = true`（默认开启）。
 
 非 Herder 环境下本模块完全 no-op：不订阅事件、不产生任何副作用。
@@ -585,7 +586,7 @@ NeoAI 可以在 **Herder** 管理的 pane 内向 Herder 上报 AI Agent 的真�
 
 **多会话聚合**：单个 Neovim pane 内可能有多个 AI 会话（含子 Agent），NeoAI 聚合成一个固定的
 `source`（默认 `custom:neoai`）统一上报，聚合优先级为 `blocked > working > idle`。所有上报带
-严格递增的 `--seq`，令 Herder 忽略同一 `source` 的旧包，避免并发/异步回调导致状态回退。
+严格递增的 `--seq`，令 Herder 忽略同一 `source` 的旧包，避免并发/异步回调导致状态回退。seq 以**挂钟微秒**为基数（而非每次从 1 开始），因此插件热重载（`:NeoAIReloadAll`）或同一 pane 内重开 nvim 后序号不会回退——否则 Herder 会把新报告当过期包丢弃，表现为“不再跟随生命周期”。
 
 **展示识别**：接管权威时会附带一次 `report-metadata`，令 Herder 侧边栏/边框显示
 `display_agent = "NeoAI"` 与本地化状态文案（`生成中` / `等待确认` / `就绪`），而非裸 `neoai` 标签；
@@ -626,7 +627,7 @@ require("NeoAI").setup({
 
 **展示增强片段（自动安装）**：启动时若处于 Herder 环境，NeoAI 会**异步、静默、幂等**地把
 一段 Herdr 配置片段（在 `[ui]` 下开启 `show_agent_labels_on_pane_borders`，让分屏边框显示上报的
-agent 标签）写入 `~/.config/herdr/config.toml`；若文件已有 `[ui]` 段则插入其内（避免重复定义 `[ui]`
+agent 标签）写入 Herdr 配置（`$XDG_CONFIG_HOME/herdr/config.toml`，缺省 `~/.config/herdr/config.toml`；`HERDR_CONFIG_PATH` 覆盖时按其原路径）；若文件已有 `[ui]` 段则插入其内（避免重复定义 `[ui]`
 的 TOML 冲突）。已安装或该键已存在则跳过、不重复写入；写入前备份、写入后 `herdr config check`
 校验失败自动回滚。整个流程不阻塞启动、不弹提示。设 `auto_install = false` 可关闭；也可用手动命令控制。
 
@@ -635,7 +636,7 @@ agent 标签）写入 `~/.config/herdr/config.toml`；若文件已有 `[ui]` 段
 | 命令 | 说明 |
 |---|---|
 | `:NeoAIHerderStatus` | 显示集成状态（环境/上报标识/是否已写入展示增强片段） |
-| `:NeoAIHerderConfig [show\|install\|uninstall]` | 预览 / 安装 / 卸载 Herder 展示增强配置片段（写 `~/.config/herdr/config.toml`，marker 幂等、写入前备份、`herdr config check` 校验失败自动回滚） |
+| `:NeoAIHerderConfig [show\|install\|uninstall]` | 预览 / 安装 / 卸载 Herder 展示增强配置片段（写 Herdr 配置 `$XDG_CONFIG_HOME/herdr/config.toml`，缺省 `~/.config/herdr/config.toml`，marker 幂等、写入前备份、`herdr config check` 校验失败自动回滚） |
 | `herdr agent list` / `herdr pane get "$HERDR_PANE_ID"` | Herdr 侧查看 `agent=neoai`、`display_agent`、`state_labels` |
 | `herdr agent explain <pane-id>` | 查看状态来源（上报型 agent 会提示无检测标签） |
 

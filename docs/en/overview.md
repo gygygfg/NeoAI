@@ -208,7 +208,7 @@ and reports it; the Herder-side recognition/parsing is handled by Herder itself.
 
 **Requirements** (all must hold):
 
-1. Running inside a Herder-injected pane (env `HERDR_ENV=1`, `HERDR_PANE_ID`, `HERDER_BIN_PATH`);
+1. Running inside a Herder-injected pane (env `HERDR_ENV=1`, `HERDR_PANE_ID`; the `herdr` binary is resolved from `HERDER_BIN_PATH`/`HERDR_BIN_PATH`, falling back to `herdr` on PATH);
 2. `herder.enabled = true` (default).
 
 Outside a Herder environment the module is a strict no-op: it subscribes to no events and
@@ -231,7 +231,9 @@ sidebar shows `display_agent = "NeoAI"` with localized state labels.
 (including sub-agents). NeoAI aggregates them into one fixed `source` (default
 `custom:neoai`) and reports a single pane state, with priority `blocked > working > idle`.
 Every report carries a strictly increasing `--seq`, so Herder ignores stale packets for
-the same `source` and avoids concurrent/async rollback.
+the same `source` and avoids concurrent/async rollback. The seq is seeded from the wall clock
+(microseconds) rather than restarted at 1, so after a plugin hot-reload or reopening nvim in the
+same pane the sequence never regresses (otherwise Herder would drop the new reports as stale).
 
 **Report flow example**:
 

@@ -29,12 +29,16 @@ local function _bin()
   return os.getenv("HERDER_BIN_PATH") or os.getenv("HERDR_BIN_PATH") or "herdr"
 end
 
---- Herdr 配置目录（HERDR_CONFIG_PATH 覆盖优先，否则 ~/.config/herdr）
+--- Herdr 配置目录（尊重 XDG_CONFIG_HOME；herdr 自身即按 XDG 解析）。
+--- 注意：herdr 会读取 `$XDG_CONFIG_HOME/herdr/config.toml`；若只写死 `~/.config`，
+--- 展示片段会被写到 herdr 并不读取的位置（静默失效）。
 --- @return string
 local function _config_dir()
-  local override = os.getenv("HERDR_CONFIG_PATH")
-  if override and override ~= "" then
-    return vim.fn.fnamemodify(override, ":p:h")
+  local xdg = os.getenv("XDG_CONFIG_HOME")
+  if xdg and xdg ~= "" then
+    -- fnamemodify(":p") 对不存在的目录不会补尾斜杠，需自行规范化后再拼 "herdr"。
+    local base = vim.fn.fnamemodify(xdg, ":p"):gsub("/+$", "")
+    return base .. "/herdr"
   end
   return vim.fn.expand("~/.config/herdr")
 end
@@ -61,12 +65,19 @@ local function _atomic_write(path, content)
   local tmp = path .. ".neoai.tmp"
   local fd, oerr = vim.uv.fs_open(tmp, "w", 420)
   if not fd then return false, tostring(oerr) end
-  local wok, werr = vim.uv.fs_write(fd, content, 0)
-  vim.uv.fs_close(fd)
-  if not wok then
-    vim.uv.fs_unlink(tmp)
-    return false, tostring(werr)
+  -- 完整写入：fs_write 可能短写（返回已写字节数 < 内容长度），必须循环补齐，
+  -- 否则会静默截断 config.toml（内容被部分写入仍返回成功）。
+  local total, offset = #content, 0
+  while offset < total do
+    local n, werr = vim.uv.fs_write(fd, content:sub(offset + 1), offset)
+    if not n or n == 0 then
+      vim.uv.fs_close(fd)
+      vim.uv.fs_unlink(tmp)
+      return false, tostring(werr)
+    end
+    offset = offset + n
   end
+  vim.uv.fs_close(fd)
   local rok, rerr = vim.uv.fs_rename(tmp, path)
   if not rok then return false, tostring(rerr) end
   return true
@@ -192,6 +203,12 @@ end
 --- 当前 Herdr 配置文件路径
 --- @return string
 function M.config_path()
+  -- HERDR_CONFIG_PATH 被 herdr **原样**当作配置文件路径（含自定义文件名），故原样返回；
+  -- 不能再折叠成「目录 + config.toml」，否则用户自定义文件名时会写到错误文件。
+  local override = os.getenv("HERDR_CONFIG_PATH")
+  if override and override ~= "" then
+    return override
+  end
   return _config_dir() .. "/config.toml"
 end
 

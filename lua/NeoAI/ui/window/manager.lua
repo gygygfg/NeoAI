@@ -5,6 +5,7 @@
 local config_store = require("NeoAI.kernel.config_store")
 local event_bus = require("NeoAI.kernel.event_bus")
 local events = require("NeoAI.kernel.events")
+local geometry = require("NeoAI.ui.geometry")
 
 local M = {}
 
@@ -25,7 +26,7 @@ local BUFFER_NAMES = {
 --- 获取窗口配置
 --- @return table
 local function _window_config()
-  return config_store.get("ui.window") or { width = 80, height = 24, border = "rounded" }
+  return config_store.get("ui.window") or { w_ratio = 0.85, h_ratio = 0.85, border = "rounded" }
 end
 
 --- 统一配置 NeoAI 窗口（避免继承全局 number/signcolumn 等导致渲染杂乱）
@@ -51,24 +52,33 @@ end
 --- @return number win_id, number buf_id
 local function _open_float(opts)
   local cfg = _window_config()
-  local width = opts.width or cfg.width or 80
-  local height = opts.height or cfg.height or 24
   local border = opts.border or cfg.border or "rounded"
   local buf = opts.buf or vim.api.nvim_create_buf(false, true)
   vim.bo[buf].filetype = opts.filetype or "neoai"
   _disable_lsp(buf)
+  -- 按屏幕比例计算尺寸（大屏更大、小屏更小），并受全局最小尺寸兜底；
+  -- 用户若显式配置 ui.window.width/height，则作为比例尺寸的上限（向后兼容）。
+  local geom_opts = {
+    w_ratio = cfg.w_ratio or 0.85,
+    h_ratio = cfg.h_ratio or 0.85,
+    max_w = opts.width or cfg.width,
+    max_h = opts.height or cfg.height,
+  }
+  local geom = geometry.compute(geom_opts)
   local win = vim.api.nvim_open_win(buf, true, {
     relative = "editor",
-    width = math.min(width, vim.o.columns - 4),
-    height = math.min(height, vim.o.lines - 4),
-    col = math.floor((vim.o.columns - math.min(width, vim.o.columns - 4)) / 2),
-    row = math.floor((vim.o.lines - math.min(height, vim.o.lines - 4)) / 2),
+    width = geom.width,
+    height = geom.height,
+    col = geom.col,
+    row = geom.row,
     style = "minimal",
     border = border,
     title = opts.title,
     title_pos = "center",
   })
   _configure_window(win)
+  -- 登记：编辑器窗口 resize 时按比例重算跟随。
+  geometry.track(win, geom_opts)
   return win, buf
 end
 
@@ -144,6 +154,7 @@ end
 --- @param win_id number
 function M.close(win_id)
   local info = state.windows[win_id]
+  geometry.untrack(win_id)
   if not info then
     -- 可能是外部创建的窗口
     if vim.api.nvim_win_is_valid(win_id) then
@@ -160,6 +171,7 @@ end
 function M.close_all()
   for win_id, info in pairs(state.windows) do
     event_bus.emit(events.WINDOW_CLOSED, { win_id = win_id, type = info.type })
+    geometry.untrack(win_id)
     if vim.api.nvim_win_is_valid(win_id) then
       pcall(vim.api.nvim_win_close, win_id, true)
     end

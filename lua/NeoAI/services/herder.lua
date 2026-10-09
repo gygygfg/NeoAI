@@ -33,7 +33,7 @@ local state = {
   auto_install = true, -- 启动时是否异步自动安装 Herder 展示增强片段（幂等）
   metadata_sent = false, -- 本次权威生命周期内是否已上报过展示元数据
   agents = {}, -- agent_id -> { state, blocked, ask_user_waiting }
-  seq = 0, -- 单调递增信号序号
+  seq = 0, -- 单调递增信号序号（init/reset 时用挂钟基数 _seq_base() 起始，见下）
   last_reported = nil, -- 上次已上报的 pane 状态；nil = 尚未接管权威
 }
 
@@ -58,6 +58,21 @@ end
 -- job 运行器（测试可覆盖）
 local job = _job_default
 
+--- 信号序号的挂钟基数（微秒级）。
+--- herdr 按 (pane, source) 记住已见的最大 --seq，并丢弃更小的（视为过期包）；
+--- release-agent 不会清除该记忆。若 seq 每次从 1 开始，插件 reload（:NeoAIReloadAll）
+--- 或同一 pane 内重开 nvim 后，新报告会因序号更小而**全部被丢弃**，表现为
+--- 「herdr 不再跟随 NeoAI 生命周期」。故用挂钟时间做基数，保证跨进程单调不回退
+--- （与 Herdr 官方集成一致：opencode 脚本用 `Date.now() * 1000` 做基数）。
+--- @return number
+local function _seq_base()
+  local ok, sec, usec = pcall(vim.uv.gettimeofday)
+  if ok and sec then
+    return sec * 1000000 + usec
+  end
+  return os.time() * 1000000
+end
+
 --- 运行上报命令（仅在可上报状态下）
 --- @param argv table
 local function _run(argv)
@@ -75,7 +90,9 @@ local function _run_report(command, extra_argv)
     "pane", command, state.pane_id,
     "--source", state.source,
     "--agent", state.agent,
-    "--seq", tostring(state.seq),
+    -- 显式整数格式：seq 基数为 ~1.8e15，缺省 tostring 会输出科学计数法（"1.8e+15"），
+    -- herdr 无法解析为整数序号。
+    "--seq", string.format("%d", state.seq),
   }
   for _, a in ipairs(extra_argv or {}) do
     argv[#argv + 1] = a
@@ -342,15 +359,23 @@ function M.init()
   if os.getenv("HERDR_ENV") ~= "1" then
     return
   end
+  -- Herdr 在 pane 内只注入 HERDR_ENV / HERDR_PANE_ID / HERDR_SOCKET_PATH，**不注入**
+  -- HERDER_BIN_PATH / HERDR_BIN_PATH（实测 pane 内 `env | grep BIN_PATH` 为空）。
+  -- 因此缺省必须回退到 PATH 上的 `herdr`（与独立脚本 herdr-agent-state.sh、
+  -- 安装器 herder_install._bin() 及 Herdr 官方集成一致），否则本集成为永久 no-op、
+  -- Herdr 永远收不到上报。
   local bin = os.getenv("HERDER_BIN_PATH") or os.getenv("HERDR_BIN_PATH")
+  if not bin or bin == "" then bin = "herdr" end
   local pane_id = os.getenv("HERDR_PANE_ID")
-  if not bin or bin == "" or not pane_id or pane_id == "" then
+  if not pane_id or pane_id == "" then
     return
   end
 
   state.available = true
   state.bin = bin
   state.pane_id = pane_id
+  -- 用挂钟基数起始：保证 reload / 重开 nvim 后 seq 不回退（否则 herdr 丢弃所有新报告）
+  state.seq = _seq_base()
   state.source = config_store.get("herder.source") or "custom:neoai"
   state.agent = config_store.get("herder.agent") or "neoai"
   state.display_agent = config_store.get("herder.display_agent") or "NeoAI"
@@ -450,7 +475,7 @@ function M.reset()
     auto_install = true,
     metadata_sent = false,
     agents = {},
-    seq = 0,
+    seq = _seq_base(),
     last_reported = nil,
   }
   job = _job_default

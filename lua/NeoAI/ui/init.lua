@@ -119,6 +119,7 @@ end
 --- 重置（测试用/插件卸载）：关闭窗口并释放 UI 注入与事件监听
 function M.reset()
   M.close_all()
+  pcall(function() require("NeoAI.ui.geometry").reset() end)
   pcall(function() require("NeoAI.ui.lsp_guard").uninstall() end)
   pcall(function() require("NeoAI.ui.components.tool_approval").reset() end)
   pcall(function() require("NeoAI.ui.components.ask_user").reset() end)

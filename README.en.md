@@ -245,7 +245,8 @@ require("NeoAI").setup({
   ui = {
     default_view = "chat",               -- default view: tree / chat
     window_mode = "tab",                 -- window mode: float / tab / split
-    window = { width = 80, height = 24, border = "rounded" },
+    window = { w_ratio = 0.85, h_ratio = 0.85, border = "rounded" }, -- float window sized by screen ratio; follows resizes; explicit width/height act as caps
+    float = { min_width = 24, min_height = 4 }, -- minimum size floor for all floating windows
     split = { size = 80, direction = "right" },
     colors = {                           -- highlight group linked by each element
       background = "Normal", border = "FloatBorder",
@@ -567,8 +568,9 @@ Herder semantics and reports it; recognition/parsing on the Herder side is handl
 
 **Prerequisites** (all are required):
 
-1. Running inside a pane with the Herder-injected environment (the environment variables `HERDR_ENV=1`,
-   `HERDR_PANE_ID`, and `HERDER_BIN_PATH` are present);
+1. Running inside a pane with the Herder-injected environment (the environment variables `HERDR_ENV=1`
+   and `HERDR_PANE_ID` are present; the `herdr` binary is resolved from `HERDER_BIN_PATH`/`HERDR_BIN_PATH`,
+   falling back to `herdr` on `PATH`);
 2. `herder.enabled = true` (enabled by default).
 
 Outside a Herder environment, this module is a complete no-op: it subscribes to no events and produces no side effects.
@@ -633,7 +635,7 @@ require("NeoAI").setup({
 **Display-enhancement snippet (auto-installed)**: on startup, inside a Herder environment, NeoAI
 **asynchronously, silently and idempotently** writes a Herdr config snippet (enabling
 `show_agent_labels_on_pane_borders` under `[ui]`, so split-pane borders show the reported agent label)
-into `~/.config/herdr/config.toml`; if the file already has a `[ui]` section the block is inserted into
+into the Herdr config (`$XDG_CONFIG_HOME/herdr/config.toml`, default `~/.config/herdr/config.toml`; or `HERDR_CONFIG_PATH` verbatim when set); if the file already has a `[ui]` section the block is inserted into
 it (avoiding a duplicate `[ui]` TOML conflict). If already installed or the key already exists it is
 skipped, it backs up first, and rolls back if `herdr config check` fails. It never blocks startup and
 shows no prompt. Set `auto_install = false` to disable; manual commands are also available.
@@ -643,7 +645,7 @@ shows no prompt. Set `auto_install = false` to disable; manual commands are also
 | Command | Description |
 |---|---|
 | `:NeoAIHerderStatus` | Show integration status (environment / report identity / whether the display-enhancement snippet is installed) |
-| `:NeoAIHerderConfig [show\|install\|uninstall]` | Preview / install / uninstall the Herder display-enhancement config snippet (writes `~/.config/herdr/config.toml`, marker-idempotent, backs up first, rolls back if `herdr config check` fails) |
+| `:NeoAIHerderConfig [show\|install\|uninstall]` | Preview / install / uninstall the Herder display-enhancement config snippet (writes the Herdr config `$XDG_CONFIG_HOME/herdr/config.toml`, default `~/.config/herdr/config.toml`, marker-idempotent, backs up first, rolls back if `herdr config check` fails) |
 | `herdr agent list` / `herdr pane get "$HERDR_PANE_ID"` | Inspect `agent=neoai`, `display_agent`, `state_labels` on the Herder side |
 | `herdr agent explain <pane-id>` | View the status source (a reporting-only agent reports no detection label) |
 

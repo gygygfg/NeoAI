@@ -127,7 +127,8 @@ context_cache = {
 | --- | --- | --- |
 | `default_view` | `"chat"` | 默认界面（chat/tree） |
 | `window_mode` | `"tab"` | 窗口模式（float/tab/split） |
-| `window` | `{width=80, height=24, border="rounded"}` | float 窗口 |
+| `window` | `{w_ratio=0.85, h_ratio=0.85, border="rounded"}` | float 窗口：按屏幕比例计算尺寸（大屏更大、小屏更小），并随窗口 resize 实时跟随；如需固定尺寸可显式配置 `width`/`height`，此时作为比例尺寸的**上限**（向后兼容） |
+| `float` | `{min_width=24, min_height=4}` | 所有悬浮窗的最小尺寸兜底（避免小窗口下浮窗渲染糟糕）；单个 `compute` 调用可用显式 `min_w`/`min_h` 覆盖，传 0 解除默认下限 |
 | `split` | `{size=80, direction="right"}` | split 窗口 |
 | `colors` | 各段高亮 | 用户/AI/推理/标题色 |
 | `tree` | `{foldenable=false, ...auto_close_on_select=true}` | 会话树折叠/自动关闭 |

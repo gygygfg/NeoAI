@@ -93,7 +93,8 @@ function M.open(session, title)
   local ok, res = pcall(function()
     local buf = vim.api.nvim_create_buf(false, true)
     vim.bo[buf].filetype = "neoai_terminal"
-    local geom = geometry.compute({ w_ratio = 0.80, h_ratio = 0.70, min_h = 5 })
+    local geom_opts = { w_ratio = 0.80, h_ratio = 0.70, min_h = 5 }
+    local geom = geometry.compute(geom_opts)
     local win = vim.api.nvim_open_win(buf, false, {
       relative = "editor",
       width = geom.width,
@@ -105,6 +106,7 @@ function M.open(session, title)
       title = title or ("命令终端 · " .. id),
       title_pos = "center",
     })
+    geometry.track(win, geom_opts)
     local chan = vim.api.nvim_open_term(buf, {})
     vim.w[win].neoai_pty_id = id
     -- Normal 模式 <C-q> 关闭悬浮窗（不结束命令）
@@ -142,6 +144,7 @@ function M.close(id)
   local it = state.items[id]
   if not it then return end
   state.items[id] = nil
+  geometry.untrack(it.win)
   if it.win and vim.api.nvim_win_is_valid(it.win) then
     pcall(vim.api.nvim_win_close, it.win, true)
   end

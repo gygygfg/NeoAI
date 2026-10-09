@@ -56,6 +56,27 @@ local function _maybe_grow()
   })
 end
 
+--- 本窗的 compute 参数（宽度按屏宽比例，高度取内容自适应上限）——供开窗与 resize 跟随共用。
+--- @return table
+local function _geom_opts()
+  return { w_ratio = 0.70, h_ratio = 0.60, fit_h = state.max_height or 6, anchor = "top", row = 2 }
+end
+
+--- resize 跟随的自定义 apply：先按新屏宽重算 width/col/row（及高度兜底），
+--- 再复用内容自适应逻辑重算高度，避免固定高度覆盖流式内容的自适应结果。
+--- @param win number
+--- @param g table { width, height, col, row }
+local function _apply_resize(win, g)
+  pcall(vim.api.nvim_win_set_config, win, {
+    relative = "editor",
+    width = g.width,
+    height = g.height,
+    col = g.col,
+    row = g.row,
+  })
+  _maybe_grow()
+end
+
 --- 把光标移到内容末尾（末行末列）并让末行贴到窗口底部。
 --- 仅 set_cursor 到最后一行首列时，wrap 开启下长单行只显示开头（光标在行首，
 --- nvim 不会滚动到行尾），必须把光标移到末行末列（内容末尾），光标可见性才能驱动
@@ -96,6 +117,8 @@ function M.open(title, opts)
       if state.buf and vim.api.nvim_buf_is_valid(state.buf) then
         vim.bo[state.buf].filetype = opts.filetype
       end
+      -- 高度上限随消费者变化，同步更新 resize 跟随参数。
+      geometry.track(state.win_id, _geom_opts(), _apply_resize)
     end
     if title then
       pcall(vim.api.nvim_win_set_config, state.win_id, { title = title })
@@ -109,13 +132,8 @@ function M.open(title, opts)
     vim.bo[state.buf].filetype = opts.filetype
   end
   -- 初始高度：消费者上限（或默认 6）与屏高比例上限取小；宽度按屏宽比例。
-  local geom = geometry.compute({
-    w_ratio = 0.70,
-    h_ratio = 0.60,
-    fit_h = state.max_height or 6,
-    anchor = "top",
-    row = 2,
-  })
+  local geom_opts = _geom_opts()
+  local geom = geometry.compute(geom_opts)
   state.win_id = vim.api.nvim_open_win(state.buf, false, {
     relative = "editor",
     width = geom.width,
@@ -127,6 +145,7 @@ function M.open(title, opts)
     title = title or "",
     title_pos = "center",
   })
+  geometry.track(state.win_id, geom_opts, _apply_resize)
   vim.wo[state.win_id].wrap = true
   -- 开启平滑滚动：wrap 下长行会折成多个屏幕行，光标停在逻辑行首位时无法把折行的尾部
   -- 滚入视口（末行会停在窗口中部以下无内容可滚）。smoothscroll 让 <C-e>/zb 能按屏幕行
@@ -181,6 +200,7 @@ function M.close()
   if state.win_id and vim.api.nvim_win_is_valid(state.win_id) then
     pcall(vim.api.nvim_win_close, state.win_id, true)
   end
+  geometry.untrack(state.win_id)
   state.win_id = nil
   state.buf = nil
   state.filetype = nil

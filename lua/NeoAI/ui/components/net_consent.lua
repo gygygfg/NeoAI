@@ -21,6 +21,7 @@ local function _close()
   if state.win_id and vim.api.nvim_win_is_valid(state.win_id) then
     pcall(vim.api.nvim_win_close, state.win_id, true)
   end
+  geometry.untrack(state.win_id)
   state.win_id = nil
   state.buf = nil
   state.decide = nil
@@ -119,7 +120,8 @@ function M.show(ctx, decide)
   vim.bo[state.buf].filetype = "neoai_net_consent"
   local lines = _text(ctx)
   vim.api.nvim_buf_set_lines(state.buf, 0, -1, false, lines)
-  local geom = geometry.compute({ w_ratio = 0.60, h_ratio = 0.40, fit_h = #lines + 2 })
+  local geom_opts = { w_ratio = 0.60, h_ratio = 0.40, fit_h = #lines + 2 }
+  local geom = geometry.compute(geom_opts)
   local ok, wid = pcall(vim.api.nvim_open_win, state.buf, true, {
     relative = "editor",
     width = geom.width,
@@ -137,6 +139,7 @@ function M.show(ctx, decide)
     return
   end
   state.win_id = wid
+  geometry.track(state.win_id, geom_opts)
   vim.wo[state.win_id].wrap = true
   pcall(vim.cmd, "stopinsert")
   vim.bo[state.buf].modifiable = false

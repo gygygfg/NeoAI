@@ -206,7 +206,11 @@ local DEFAULT_CONFIG = {
   ui = {
     default_view = "chat",
     window_mode = "tab",
-    window = { width = 80, height = 24, border = "rounded" },
+    -- float 模式下按屏幕比例计算主浮窗尺寸（大屏更大、小屏更小），随窗口 resize 实时跟随；
+    -- 如需固定尺寸，可显式配置 width/height，此时作为比例尺寸的**上限**生效（向后兼容）。
+    window = { w_ratio = 0.85, h_ratio = 0.85, border = "rounded" },
+    -- 所有悬浮窗的最小尺寸兜底，避免小窗口下浮窗过窄过矮导致渲染糟糕。
+    float = { min_width = 24, min_height = 4 },
     split = { size = 80, direction = "right" },
     colors = {
       background = "Normal",

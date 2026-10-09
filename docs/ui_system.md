@@ -15,7 +15,7 @@
 | `ui/window/chat_view.lua` | 聊天视图：绑定事件、流式更新、折叠、悬浮窗调度、输入框联动、后台收起/恢复、显示模式宿主。 |
 | `ui/window/tree_view.lua` | 会话树视图：分支树展示与 CRUD。 |
 | `ui/components/*` | 可复用组件（见下）。 |
-| `ui/geometry.lua` | 浮窗几何计算：按屏幕**相对比例**推导浮窗宽高与居中/贴边位置，避免硬编码像素尺寸。`compute{ w_ratio, h_ratio, fit_h, min_w, max_w, min_h, max_h, margin, anchor, row }` → `{ width, height, col, row }`。 |
+| `ui/geometry.lua` | 浮窗几何计算：按屏幕**相对比例**推导浮窗宽高与居中/贴边位置，避免硬编码像素尺寸。`compute{ w_ratio, h_ratio, fit_h, min_w, max_w, min_h, max_h, margin, anchor, row }` → `{ width, height, col, row }`。内置全局最小尺寸兜底（`ui.float.min_width/min_height`，默认 24/4），并提供 `track/untrack/refresh/reset`：已登记的浮窗在编辑器窗口 resize（`VimResized`）时实时重算尺寸与位置跟随（流式窗可用自定义 `apply` 保留内容自适应高度）。 |
 | `ui/keymap.lua` | 键位注册（`register_context`）与展示。 |
 
 ## 2. 窗口管理（manager.lua）
