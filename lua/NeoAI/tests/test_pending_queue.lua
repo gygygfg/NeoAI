@@ -90,6 +90,36 @@ tests.suite("pending_queue", function(_, it)
     t.false_(chat.has_pending_work(), "注入且空闲后无工作")
   end)
 
+  it("按 agent 取消息/工作状态（多实例隔离）", function(t)
+    local chat = init_chat()
+    local a = chat.new_session({})
+    local b = chat.new_session({})
+    t.true_(a.id ~= b.id, "两次 new_session 应为不同 Agent")
+
+    a.messages = { { role = "assistant", content = "A" } }
+    b.messages = { { role = "assistant", content = "B" } }
+    t.eq("A", chat.get_messages_for_agent(a.id)[1].content, "按 agent 取到各自消息")
+    t.eq("B", chat.get_messages_for_agent(b.id)[1].content)
+
+    -- 只让 a 忙碌：b 不应受影响
+    a:set_state("generating")
+    t.true_(chat.has_pending_work_for_agent(a.id), "a 忙碌→有工作")
+    t.false_(chat.has_pending_work_for_agent(b.id), "b 不受 a 忙碌影响")
+
+    -- 只给 b 排队（先让 a 空闲）：a 不应受影响
+    a:set_state("idle")
+    b:set_state("tool_running")
+    chat.send_message("排队B")
+    t.true_(chat.has_pending_work_for_agent(b.id), "b 排队→有工作")
+    t.false_(chat.has_pending_work_for_agent(a.id), "a 不受 b 排队影响")
+    t.eq(1, chat.pending_count_for_agent(b.id))
+    t.eq(0, chat.pending_count_for_agent(a.id))
+
+    -- 无 agent_id：显式返回空/false，不回落全局当前 Agent
+    t.eq(0, #chat.get_messages_for_agent(nil), "无 agent_id 时消息为空表")
+    t.false_(chat.has_pending_work_for_agent(nil), "无 agent_id 时无工作")
+  end)
+
   it("入队触发 MESSAGE_QUEUED，注入触发 MESSAGE_SENT（驱动状态栏刷新）", function(t)
     local chat = init_chat()
     local event_bus = require("NeoAI.kernel.event_bus")

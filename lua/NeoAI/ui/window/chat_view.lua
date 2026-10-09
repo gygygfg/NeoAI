@@ -251,15 +251,21 @@ local function _render(keep_view)
   if not state.following or keep_view then
     open_folds = _open_fold_start_lines()
   end
-  local messages = chat_service.get_messages and chat_service.get_messages()
+  -- 按**本实例自身 Agent** 取消息（多实例：绝不取全局「当前 Agent」，否则后台实例会把
+  -- 聚焦实例的内容写进自己的 buffer，自身流式更新反而丢失）。
+  local get_messages = chat_service.get_messages_for_agent
   -- 服务不可用（插件停止/热重载期间已注销 services.chat_service）：跳过渲染而非报错。
   -- 典型触发：:NeoAIReloadAll → plugins.stop_all 停止沙箱（cgroup.release 的 vim.wait 处理事件循环）
   -- 时，先前调度的渲染回调执行，而此时 chat_service 已注销（get_messages 为 nil）。
+  if type(get_messages) ~= "function" then return false end
+  local messages = get_messages(state.agent_id)
   if messages == nil then return false end
   -- 还在生成（agent 忙碌 / 暂存队列非空）时，仅对末尾消息做流式渲染：
   -- 表格在生成期间原样输出，生成结束后才做对齐填充，避免列宽随流式跳动。
   -- table_width 随聊天窗口宽度自适应：窄窗把表收紧（更多折行），宽窗放宽表，避免整表超出屏幕。
-  local render_opts = { streaming = chat_service.has_pending_work() }
+  local has_pending = chat_service.has_pending_work_for_agent
+  local streaming = type(has_pending) == "function" and has_pending(state.agent_id) or false
+  local render_opts = { streaming = streaming }
   state.last_table_width = _current_table_width()
   if state.last_table_width then
     render_opts.table_width = state.last_table_width
@@ -442,8 +448,8 @@ local function _schedule_render(keep_view)
     _do_render()
   end
   local now = vim.uv.hrtime() / 1e6
-  local has_pending = chat_service.has_pending_work
-  local streaming = type(has_pending) == "function" and has_pending() or false
+  local has_pending = chat_service.has_pending_work_for_agent
+  local streaming = type(has_pending) == "function" and has_pending(state.agent_id) or false
   local wait_ms = RENDER_MIN_INTERVAL_MS - (now - last_render_ms)
   if streaming and wait_ms > 0 then
     vim.defer_fn(_run, math.ceil(wait_ms))
@@ -633,11 +639,11 @@ local function _on_reasoning_chunk(payload)
   else
     reasoning_active = true
     if not _focused() or not _cursor_within_follow_margin() then return end
-    -- 事件不再随分片携带完整 reasoning；缺失时从当前 Agent 消息队列取末条正文兜底。
+    -- 事件不再随分片携带完整 reasoning；缺失时从本实例 Agent 消息队列取末条正文兜底。
     local text = payload.reasoning
     if not text then
-      local get_messages = chat_service.get_messages
-      local msgs = type(get_messages) == "function" and get_messages() or nil
+      local get_messages = chat_service.get_messages_for_agent
+      local msgs = type(get_messages) == "function" and get_messages(state.agent_id) or nil
       local last = msgs and msgs[#msgs]
       text = last and last.reasoning or ""
     end
@@ -666,7 +672,8 @@ local function _tool_tick()
   -- 继续刷新需同时满足「有工具在执行」且「agent 确实忙碌」：若某工具漏发结束事件，
   -- has_running() 会长期为真；仅凭它会每 1s 重渲染整个聊天 buffer（历史很长时占满
   -- 主线程，agent loop 结束后仍在跑）。agent 空闲即停，杜绝这种空转。
-  if fold.has_running() and chat_service.has_pending_work and chat_service.has_pending_work() then
+  if fold.has_running() and type(chat_service.has_pending_work_for_agent) == "function"
+    and chat_service.has_pending_work_for_agent(state.agent_id) then
     state.tool_tick = vim.fn.timer_start(TOOL_TICK_MS, _tool_tick, vim.empty_dict())
   end
 end
@@ -831,11 +838,11 @@ local function _reshow_floats()
     return
   end
   if reasoning_active then
-    -- 优先用隐藏时捕获的文本；否则从当前 Agent 消息队列取末条正文兜底。
+    -- 优先用隐藏时捕获的文本；否则从本实例 Agent 消息队列取末条正文兜底。
     local text = reasoning_last_text
     if text == "" then
-      local get_messages = chat_service.get_messages
-      local msgs = type(get_messages) == "function" and get_messages() or nil
+      local get_messages = chat_service.get_messages_for_agent
+      local msgs = type(get_messages) == "function" and get_messages(state.agent_id) or nil
       local last = msgs and msgs[#msgs]
       text = last and last.reasoning or ""
     end
@@ -913,10 +920,12 @@ local function _on_agent_end(payload)
   _on_generation_finished(payload)
   -- 仅主 Agent 结束才把光标移回输入框：子 Agent 完成/失败/取消也会携带
   -- 自己的 agent_id 发射 GENERATION_COMPLETED 等事件，不能触发主界面的焦点动作。
-  -- 且仅在当前 Agent 真正完成（空闲且暂存队列为空）时才移回输入框；
+  -- 且仅在本实例 Agent 真正完成（空闲且暂存队列为空）时才移回输入框；
   -- 若仍有工作（正忙/暂存消息正逐条刷新、继续生成），保持光标在主窗口观看流式输出，
   -- 避免每个刷新 turn 都触发一次进入插入模式。
-  if payload and payload.agent_id == state.agent_id and not chat_service.has_pending_work() then
+  local has_pending_work = chat_service.has_pending_work_for_agent
+  local pending = type(has_pending_work) == "function" and has_pending_work(state.agent_id) or false
+  if payload and payload.agent_id == state.agent_id and not pending then
     -- 生成真正结束：立即停掉工具耗时刷新定时器，避免残留的 running 记录让它空转。
     _stop_tool_tick()
     -- 回收已完成工具的计时记录：耗时已落库到结果消息，fold 表无需继续持有（避免长会话膨胀）。
@@ -967,7 +976,11 @@ end
 local function _build_host()
   return {
     get_buf = function() return state.buf end,
-    get_messages = function() return chat_service.get_messages() end,
+    -- 按本实例 Agent 取消息（多实例：宿主随焦点在各实例间重挂，取数必须落到本实例）。
+    get_messages = function()
+      local get = chat_service.get_messages_for_agent
+      return type(get) == "function" and get(state.agent_id) or {}
+    end,
     set_foldexpr = function(fn) fold.set_foldexpr_override(fn) end,
     set_foldtext = function(fn) fold.set_foldtext_override(fn) end,
     refresh = function() M.refresh() end,

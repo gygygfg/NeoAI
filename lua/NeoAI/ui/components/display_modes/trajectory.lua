@@ -877,7 +877,10 @@ function M.install_save_hook(buf, opts)
     callback = function()
       local ok, chat_service = pcall(require, "NeoAI.services.chat_service")
       if ok then
-        local agent = chat_service.get_current_agent()
+        -- 按该 buffer 绑定的聊天实例取 Agent（多实例：后台实例 :w 不应保存聚焦实例会话）。
+        local agent = (type(chat_service.get_agent_for_buffer) == "function"
+          and chat_service.get_agent_for_buffer(buf))
+          or chat_service.get_current_agent()
         if agent and agent.messages and #agent.messages > 0 then
           local messages = agent.messages
           -- 默认位置 = 目录 + 会话文件名（完整路径），用户可改

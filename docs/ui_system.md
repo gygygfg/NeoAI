@@ -99,6 +99,12 @@
   显示不影响别的实例。
 - augroup 名按实例唯一（`NeoAIChatFocus_<id>` / `NeoAIChatResize_<id>` / `NeoAIInputHeight_<id>`），
   避免多实例互相 `clear`。
+- **渲染取数按实例 Agent**：`chat_view` 一切「取消息 / 是否仍有工作」的读取都走
+  `chat_service.get_messages_for_agent(state.agent_id)` / `has_pending_work_for_agent(state.agent_id)`，
+  **绝不**用全局 `get_messages()` / `has_pending_work()`（那取的是聚焦实例）。否则后台实例收到自身
+  流式事件后会读到聚焦实例的消息、把自己的 buffer 覆盖成别人的内容，表现为「chat 界面无法更新
+  buffer」。相应新增 `pending_count_for_agent` / `get_agent_for_buffer`（供 `trajectory` 的 `:w`
+  按 buffer 绑定的实例保存会话）。
 - 保护复用语义：`reload_all` / 树选会话 / `toggle_ui` 走默认 `open()`（复用当前实例，不新建）。
 
 ### 4.1 布局

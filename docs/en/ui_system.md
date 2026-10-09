@@ -106,6 +106,14 @@ instance); the module table at the end is the **instance manager**:
   does not affect another.
 - Augroup names are per-instance (`NeoAIChatFocus_<id>` / `NeoAIChatResize_<id>` /
   `NeoAIInputHeight_<id>`), so instances never `clear` each other.
+- **Render reads are scoped to the instance's own agent**: every "get messages / any pending work"
+  read in `chat_view` goes through `chat_service.get_messages_for_agent(state.agent_id)` /
+  `has_pending_work_for_agent(state.agent_id)`, **never** the global `get_messages()` /
+  `has_pending_work()` (those resolve to the focused instance). Otherwise a background instance,
+  on receiving its own streaming event, would read the focused instance's messages and overwrite
+  its own buffer with someone else's content — surfacing as "the chat view cannot update its
+  buffer". New `pending_count_for_agent` / `get_agent_for_buffer` accompany this (the latter lets
+  `trajectory`'s `:w` save the session bound to the buffer's instance).
 - Reuse semantics preserved: `reload_all` / tree session selection / `toggle_ui` use the default
   `open()` (reuse the current instance, never create).
 

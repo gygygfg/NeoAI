@@ -616,12 +616,30 @@ function M.set_current_agent(agent_id)
   state.current_agent_id = agent_id
 end
 
+--- 指定 Agent 暂存队列中的消息数（agent 正忙时入队的待发消息）。
+--- @param agent_id string|nil
+--- @return number
+function M.pending_count_for_agent(agent_id)
+  if not agent_id then return 0 end
+  local q = pending_queue[agent_id]
+  return (q and #q) or 0
+end
+
 --- 当前 Agent 暂存队列中的消息数（agent 正忙时入队的待发消息）
 --- @return number
 function M.pending_count()
-  if not state.current_agent_id then return 0 end
-  local q = pending_queue[state.current_agent_id]
-  return (q and #q) or 0
+  return M.pending_count_for_agent(state.current_agent_id)
+end
+
+--- 指定 Agent 是否仍有未完成的工作（正忙，或暂存队列里还有待发消息）。
+--- 多聊天实例：按 agent_id 判定，避免后台实例误用聚焦实例的忙碌/排队状态。
+--- @param agent_id string|nil
+--- @return boolean
+function M.has_pending_work_for_agent(agent_id)
+  if not agent_id then return false end
+  local agent = runtime.get(agent_id)
+  if agent and _is_busy(agent) then return true end
+  return M.pending_count_for_agent(agent_id) > 0
 end
 
 --- 当前 Agent 是否仍有未完成的工作（正忙，或暂存队列里还有待发消息）。
@@ -630,17 +648,42 @@ end
 --- 避免反复进入插入模式、且让光标停留在主窗口以观看继续进行的流式输出。
 --- @return boolean
 function M.has_pending_work()
-  local agent = M.get_current_agent()
-  if agent and _is_busy(agent) then return true end
-  return M.pending_count() > 0
+  return M.has_pending_work_for_agent(state.current_agent_id)
+end
+
+--- 获取指定 Agent 的消息（多实例：按 agent_id 取，避免后台实例读到聚焦实例的内容）。
+--- @param agent_id string|nil
+--- @return table
+function M.get_messages_for_agent(agent_id)
+  if not agent_id then return {} end
+  local agent = runtime.get(agent_id)
+  if not agent then return {} end
+  return agent.messages
 end
 
 --- 获取当前 Agent 的消息
 --- @return table
 function M.get_messages()
-  local agent = M.get_current_agent()
-  if not agent then return {} end
-  return agent.messages
+  return M.get_messages_for_agent(state.current_agent_id)
+end
+
+--- 获取某 buffer 所在聊天窗口绑定的 Agent（多实例：按 buffer 的窗口反查）。
+--- 找不到绑定的实时窗口时回退到当前 Agent，兼顾单实例/普通调用。
+--- @param buf number|nil
+--- @return table|nil
+function M.get_agent_for_buffer(buf)
+  if buf and buf ~= 0 then
+    for win_id, agent_id in pairs(state.windows) do
+      if vim.api.nvim_win_is_valid(win_id) then
+        local ok, b = pcall(vim.api.nvim_win_get_buf, win_id)
+        if ok and b == buf then
+          local agent = runtime.get(agent_id)
+          if agent then return agent end
+        end
+      end
+    end
+  end
+  return M.get_current_agent()
 end
 
 --- 获取当前会话 id

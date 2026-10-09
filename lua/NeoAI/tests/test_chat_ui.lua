@@ -2596,6 +2596,48 @@ tests.suite("chat_ui", function(_, it)
     chat_service.reset()
   end)
 
+  it("多实例：后台实例流式更新写入自身 buffer，不污染/不被污染", function(t)
+    local chat_view = require("NeoAI.ui.window.chat_view")
+    local chat_service = require("NeoAI.services.chat_service")
+    local event_bus = require("NeoAI.kernel.event_bus")
+    local events = require("NeoAI.kernel.events")
+    chat_view.reset()
+    chat_service.reset()
+
+    local a = chat_view.open({ new_window = true })
+    local agent_a = chat_service.get_current_agent()
+    local b = chat_view.open({ new_window = true })
+    local agent_b = chat_service.get_current_agent()
+    t.true_(agent_a.id ~= agent_b.id, "两实例应为不同会话")
+
+    -- B（聚焦）：写入并渲染自身内容
+    agent_b.messages = { { role = "assistant", content = "BBBB-from-B" } }
+    chat_view.refresh()
+
+    -- A（后台）：自身流式内容到达；渲染必须取 A 自身消息而非全局当前 Agent(B)
+    agent_a.messages = { { role = "assistant", content = "FROM-A" } }
+    local msg = { role = "assistant", content = "A-extra-stream" }
+    agent_a.messages[#agent_a.messages + 1] = msg
+    event_bus.emit(events.MESSAGE_UPDATED, { agent_id = agent_a.id, message = msg })
+    -- flush() 只作用于聚焦实例 B，这里让事件循环跑掉 A 已调度的渲染
+    vim.wait(200, function() return false end)
+
+    local function read(buf)
+      return table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n")
+    end
+    local ta = read(a.buf)
+    t.true_(ta:find("A%-extra%-stream") ~= nil, "后台实例 buffer 应更新自身流式内容")
+    t.true_(ta:find("FROM%-A") ~= nil, "后台实例 buffer 应含自身消息")
+    t.false_(ta:find("from%-B") ~= nil, "后台实例 buffer 不应出现聚焦实例内容")
+
+    local tb = read(b.buf)
+    t.true_(tb:find("from%-B") ~= nil, "聚焦实例 buffer 保持自身内容")
+    t.false_(tb:find("A%-extra%-stream") ~= nil, "聚焦实例 buffer 不应出现后台实例内容")
+
+    chat_view.close_all()
+    chat_service.reset()
+  end)
+
   it("多实例：先开历史会话再 new_window 会新开 buffer（用户流程回归）", function(t)
     local chat_view = require("NeoAI.ui.window.chat_view")
     local chat_service = require("NeoAI.services.chat_service")
