@@ -427,7 +427,7 @@
   （如 `uv sync` 生成的 `.venv/bin/python`）不会因解析到 uv 的 Python 安装目录而误报整个变更单元。
   命中宿主敏感遮蔽路径（`is_masked_path`，仍完整解析并跟随叶子软链）→ `FAILED/SANDBOX_MASKED_TARGET`。
   候选内容即便被本地进程改写也无法写出到未经验证的真实位置。
-- **冻结时剔除不可发布文件**：`candidate.finish` 在生成候选前剔除两类文件，避免个别文件
+- **冻结时剔除不可发布文件**：`candidate.finish` 在生成候选前剔除多类文件，避免个别文件
   让**整个**变更单元发布失败（如包安装因 apt 索引基线变化而整体回滚）：
   1. **有效遮蔽路径**——按本次 attempt 的 `effective_unmask`（档位提权 + 审批放行 + 可写根）
      判定 `is_masked_path`，命中即剔除（与运行时挂载遮蔽一致；被 unmask 放行的路径保留）；
@@ -435,6 +435,11 @@
      `/var/cache/apt` 等），仅对包安装候选生效。这些文件由包管理器随时重新生成，应用时基线
      往往已变化，会触发 `CONFLICT/BASELINE_CHANGED`；剔除不影响安装效果
      （`/var/lib/dpkg/status`、包文件等仍应用），宿主可自行 `apt update` 重建索引。
+  3. **NeoAI 自身运行时/状态路径**——`<stdpath cache>/NeoAI`、`<stdpath state>/NeoAI`、
+     `<stdpath data>/NeoAI`，以及可配置的 `log.path`、`tools.sandbox.workspace_root`（涵盖日志、
+     会话、缓存、沙箱 store 等）。这些位于用户工作区之外且由插件**持续写入**（日志实时增长），
+     在整机根 overlay 下会被捕获为候选，应用时基线必然已变（`BASELINE_CHANGED`）；故在捕获遍历
+     与冻结阶段整棵子树跳过（不读盘、不入候选、不发布）。
   剔除数量记录在候选 `dropped` 字段并在审批界面提示；发布时的遮蔽硬拒绝仍保留为纵深防御。
 - **同文件取代（按文件粒度 + 增量）**：同一文件被再次编辑（新候选入队）或直接发布时，覆盖该路径的
   旧 `PENDING` 变更单元**只登记被覆盖的路径为「已取代」增量**，同单元其余文件保留为待审

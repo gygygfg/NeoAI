@@ -623,13 +623,33 @@ web_fetch = {
 
 ### 2.6 `herder`
 
+NeoAI 可在 Herder pane 内向 Herder 上报 Agent 生命周期（`working`/`idle`/`blocked`），
+并附带展示元数据（展示名 + 本地化状态文案）。非 Herder 环境（`HERDR_ENV != 1`）为 no-op。
+
 ```lua
 herder = {
   enabled = true,          -- 是否启用上报（还需 HERDR_ENV=1 才真正生效）
   source = "custom:neoai", -- 稳定且全局唯一的生命周期权威标识
   agent = "neoai",         -- agent 名称（Herder 侧识别用）
+  display_agent = "NeoAI", -- 侧边栏/边框展示名（report-metadata --display-agent）
+  report_metadata = true,  -- 接管权威时是否上报展示元数据（展示名/状态文案/标题）
+  auto_install = true,     -- 启动时在 Herder 环境下自动（异步/静默/幂等）安装展示增强片段
+  state_labels = {         -- 覆盖 Herder 状态文案（report-metadata --state-label）；false = 不覆盖
+    working = "生成中",
+    blocked = "等待确认",
+    idle = "就绪",
+  },
+  title = nil,             -- 可选展示标题；nil = 不设置
 }
 ```
+
+- 识别走 Herdr 的**主动上报**通道（`pane report-agent` / `pane report-metadata`）：Herdr 的 agent 身份为
+  编译期固定集合，本地检测清单只能**覆盖已有** agent、无法新增。
+- 多会话聚合优先级 `blocked > working > idle`，`--seq` 严格递增防旧包回退。
+- 展示增强片段：`auto_install = true` 时启动即**异步、静默、幂等**写入 `~/.config/herdr/config.toml`
+  （已安装跳过、写入前备份、`herdr config check` 失败回滚），无需手动执行。
+- 详见 [README 的 Herder 章节](../README.md) 与 [`integrations/herdr/`](../integrations/herdr/README.md)。
+- 命令：`:NeoAIHerderStatus`、`:NeoAIHerderConfig [show|install|uninstall]`。
 
 ### 2.7 `log`
 

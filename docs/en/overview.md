@@ -214,6 +214,11 @@ and reports it; the Herder-side recognition/parsing is handled by Herder itself.
 Outside a Herder environment the module is a strict no-op: it subscribes to no events and
 has no side effects.
 
+**Recognition**: Herdr's agent identities are a compile-time fixed set, and a local detection manifest can only
+**override an existing** agent, never add a new one; NeoAI therefore uses Herdr's **proactive reporting** channel
+(`pane report-agent` / `pane report-metadata`). On authority takeover it also sends one `report-metadata`, so the
+sidebar shows `display_agent = "NeoAI"` with localized state labels.
+
 **State mapping**:
 
 | NeoAI Agent state | Herder reported |
@@ -251,6 +256,11 @@ require('NeoAI').setup({
     enabled = true,           -- enable reporting (also requires HERDR_ENV=1)
     source = 'custom:neoai',  -- stable, globally unique lifecycle authority identifier
     agent = 'neoai',          -- agent name (recognized by Herder)
+    display_agent = 'NeoAI',  -- sidebar/border display name (report-metadata)
+    report_metadata = true,   -- report display metadata on authority takeover
+    auto_install = true,      -- auto-install the display-enhancement snippet on startup inside Herder (async/silent/idempotent)
+    state_labels = { working = '生成中', blocked = '等待确认', idle = '就绪' }, -- false = no override
+    title = nil,              -- optional display title
   },
 })
 ```

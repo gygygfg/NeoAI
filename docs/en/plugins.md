@@ -111,6 +111,7 @@ placeholders. On first trigger (command, keymap or active API), startup is drive
 | `services.mcp` | `NeoAI.services.mcp` | — |
 | `services.status` | `NeoAI.services.status` | — |
 | `services.herder` | `NeoAI.services.herder` | — |
+| `services.herder_install` | `NeoAI.services.herder_install` | — |
 
 ### 3.2 Side-effect plugins
 

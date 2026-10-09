@@ -419,6 +419,15 @@ require("NeoAI").setup({
     enabled = true,                      -- 是否启用上报（还需 HERDR_ENV=1 才生效；非 Herder 环境为 no-op）
     source = "custom:neoai",             -- 稳定且全局唯一的生命周期权威标识
     agent = "neoai",                     -- agent 名称（Herder 侧识别用）
+    display_agent = "NeoAI",             -- 侧边栏/边框展示名（report-metadata）
+    report_metadata = true,              -- 接管权威时是否上报展示元数据（展示名/状态文案/标题）
+    auto_install = true,                 -- 启动时若处于 Herder 环境，自动（异步/静默/幂等）安装展示增强片段
+    state_labels = {                     -- 覆盖 Herder 状态文案；false = 不覆盖
+      working = "生成中",
+      blocked = "等待确认",
+      idle = "就绪",
+    },
+    title = nil,                         -- 可选展示标题；nil = 不设置
   },
 
   -- ===== 插件系统（可替换服务 / 禁用副作用）=====
@@ -560,6 +569,12 @@ NeoAI 可以在 **Herder** 管理的 pane 内向 Herder 上报 AI Agent 的真�
 
 非 Herder 环境下本模块完全 no-op：不订阅事件、不产生任何副作用。
 
+**识别方式（为什么用上报而不是检测清单）**：Herdr 的 agent 身份是**编译期固定集合**，
+本地检测清单（`~/.config/herdr/agent-detection/<id>.toml`）只能**覆盖已有** agent、**无法新增**
+（实测：新增 `neoai` 清单会被忽略，`herdr agent explain --file … --agent neoai` → `unknown_agent`）。
+因此 NeoAI 走 Herdr 的**主动上报**通道（`herdr pane report-agent` / `pane report-metadata`）——
+这条路径不要求 agent 先被检测，是外部 agent 接入的正道。
+
 **状态映射**：
 
 | NeoAI Agent 状态 | Herder 上报 |
@@ -572,18 +587,23 @@ NeoAI 可以在 **Herder** 管理的 pane 内向 Herder 上报 AI Agent 的真�
 `source`（默认 `custom:neoai`）统一上报，聚合优先级为 `blocked > working > idle`。所有上报带
 严格递增的 `--seq`，令 Herder 忽略同一 `source` 的旧包，避免并发/异步回调导致状态回退。
 
+**展示识别**：接管权威时会附带一次 `report-metadata`，令 Herder 侧边栏/边框显示
+`display_agent = "NeoAI"` 与本地化状态文案（`生成中` / `等待确认` / `就绪`），而非裸 `neoai` 标签；
+最后一个 Agent 退出时先清除展示元数据再 `release-agent`，避免残留。
+
 **上报流程示例**：
 
 ```
-# 用户发送消息，Agent 进入生成
-herdr pane report-agent w1:p1 --source custom:neoai --agent neoai --state working --seq 1
+# 用户发送消息，Agent 进入生成（接管权威时附带展示元数据）
+herdr pane report-agent    w1:p1 --source custom:neoai --agent neoai --state working --seq 1
+herdr pane report-metadata w1:p1 --source custom:neoai --agent neoai --display-agent NeoAI --state-label working=生成中 --seq 1
 # 工具需要审批 / 向用户提问等待回答（阻塞）
 herdr pane report-agent w1:p1 --source custom:neoai --agent neoai --state blocked --seq 2
 # 审批通过、仍在生成
 herdr pane report-agent w1:p1 --source custom:neoai --agent neoai --state working --seq 3
 # 本轮生成完成、等待输入
 herdr pane report-agent w1:p1 --source custom:neoai --agent neoai --state idle --seq 4
-# 关闭聊天窗口、最后一个 Agent 销毁（释放生命周期权威）
+# 关闭聊天窗口、最后一个 Agent 销毁（清除展示元数据 + 释放生命周期权威）
 herdr pane release-agent w1:p1 --source custom:neoai --agent neoai --seq 5
 ```
 
@@ -592,14 +612,35 @@ herdr pane release-agent w1:p1 --source custom:neoai --agent neoai --seq 5
 ```lua
 require("NeoAI").setup({
   herder = {
-    enabled = true,           -- 是否启用上报（还需 HERDR_ENV=1 才真正生效）
-    source = "custom:neoai",  -- 稳定且全局唯一的生命周期权威标识
-    agent = "neoai",          -- agent 名称（Herder 侧识别用）
+    enabled = true,              -- 是否启用上报（还需 HERDR_ENV=1 才真正生效）
+    source = "custom:neoai",     -- 稳定且全局唯一的生命周期权威标识
+    agent = "neoai",             -- agent 名称（Herder 侧识别用）
+    display_agent = "NeoAI",     -- 侧边栏/边框展示名（report-metadata --display-agent）
+    report_metadata = true,      -- 接管权威时是否上报展示元数据
+    auto_install = true,         -- 启动时在 Herder 环境下自动安装展示增强片段（异步/静默/幂等）
+    state_labels = { working = "生成中", blocked = "等待确认", idle = "就绪" }, -- false = 不覆盖
+    title = nil,                 -- 可选展示标题
   },
 })
 ```
 
-> 诊断：在 Herder pane 内用 `herdr agent explain <pane-id>` 可查看当前 Agent 状态来源与最近上报。
+**展示增强片段（自动安装）**：启动时若处于 Herder 环境，NeoAI 会**异步、静默、幂等**地把
+一段 Herdr 配置片段（在 `[ui]` 下开启 `show_agent_labels_on_pane_borders`，让分屏边框显示上报的
+agent 标签）写入 `~/.config/herdr/config.toml`；若文件已有 `[ui]` 段则插入其内（避免重复定义 `[ui]`
+的 TOML 冲突）。已安装或该键已存在则跳过、不重复写入；写入前备份、写入后 `herdr config check`
+校验失败自动回滚。整个流程不阻塞启动、不弹提示。设 `auto_install = false` 可关闭；也可用手动命令控制。
+
+**命令与诊断**：
+
+| 命令 | 说明 |
+|---|---|
+| `:NeoAIHerderStatus` | 显示集成状态（环境/上报标识/是否已写入展示增强片段） |
+| `:NeoAIHerderConfig [show\|install\|uninstall]` | 预览 / 安装 / 卸载 Herder 展示增强配置片段（写 `~/.config/herdr/config.toml`，marker 幂等、写入前备份、`herdr config check` 校验失败自动回滚） |
+| `herdr agent list` / `herdr pane get "$HERDR_PANE_ID"` | Herdr 侧查看 `agent=neoai`、`display_agent`、`state_labels` |
+| `herdr agent explain <pane-id>` | 查看状态来源（上报型 agent 会提示无检测标签） |
+
+> 集成资产（独立上报脚本 `herdr-agent-state.sh`、可复制配置片段、Herdr 上游接入材料）见
+> [`integrations/herdr/`](integrations/herdr/README.md)。
 
 </details>
 

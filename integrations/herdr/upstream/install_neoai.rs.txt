@@ -1,0 +1,89 @@
+// 提案骨架：Herdr 上游 `install_neoai`（照现有 `install_pi` 改写）。
+//
+// 说明：
+// - 这是**草案**，符号名（InstallContext / IntegrationInstallResult / *_path() 等）
+//   需对照 Herdr 源码树核对。
+// - NeoAI 自身会通过 `herdr pane report-agent` / `pane report-metadata` 上报，
+//   因此本 target 建议为「发现型」：不改动 NeoAI，仅落地可选的展示增强片段。
+//
+// 参考：现有各 target 的 install 文件形态（claude/codex 落 herdr-agent-state.sh，
+// opencode 落 herdr-agent-state.js，pi 落 herdr-agent-state.ts）。
+
+/// NeoAI integration target.
+pub const NEOAI_ID: &str = "neoai";
+pub const NEOAI_INTEGRATION_VERSION: u32 = 1;
+
+/// Install the NeoAI integration.
+///
+/// NeoAI is a Neovim plugin that reports to Herdr by itself, so installation
+/// does not add a lifecycle hook. It (optionally) drops a display-enhancement
+/// snippet into the Herdr config with a managed marker block.
+pub fn install_neoai(ctx: &InstallContext) -> Result<IntegrationInstallResult, IntegrationError> {
+    // 1) 目标文件：Herdr 配置
+    let config_path = ctx.config_path(); // ~/.config/herdr/config.toml (or HERDR_CONFIG_PATH)
+    let existing = read_to_string_opt(&config_path)?;
+
+    // 2) marker 幂等
+    const BEGIN: &str = "# >>> NeoAI herder integration (managed by NeoAI; do not edit) >>>";
+    const END: &str = "# <<< NeoAI herder integration <<<";
+    if existing.as_deref().is_some_and(|c| c.contains(BEGIN)) {
+        return Ok(IntegrationInstallResult { changed: false, path: config_path, .. });
+    }
+
+    // 3) 备份原文件（存在时）
+    let backup = existing.as_ref().map(|c| write_backup(&config_path, c)).transpose()?;
+
+    // 4) 追加片段（与 NeoAI 仓库 integrations/herdr/config.snippet.toml 等价）。
+    //    注意：Herdr 只接受已知 canonical agent id，[ui.sidebar.agents.rows_by_agent] 无法用于 neoai；
+    //    这里使用合法且低冲突的 [ui] 展示设置。若已有 [ui] 段，应把键插入该段内。
+    let snippet = format!(
+        "{BEGIN}\n\
+         # 展示增强：NeoAI 生命周期由 report-agent/report-metadata 主动上报驱动。\n\
+         show_agent_labels_on_pane_borders = true\n\
+         {END}\n"
+    );
+    let content = append_or_merge_ui_block(existing.as_deref().unwrap_or(""), &snippet);
+    atomic_write(&config_path, &content)?;
+
+    // 5) 校验配置，失败回滚
+    if run_config_check(ctx).is_err() {
+        match backup {
+            Some(b) => atomic_write(&config_path, &b)?,
+            None => let _ = fs::remove_file(&config_path),
+        }
+        return Err(IntegrationError::ConfigInvalid(config_path));
+    }
+
+    // 6) 提示重载（可选：调用 server reload-config）
+    ctx.request_reload_config();
+
+    Ok(IntegrationInstallResult {
+        changed: true,
+        path: config_path,
+        version: NEOAI_INTEGRATION_VERSION,
+        ..Default::default()
+    })
+}
+
+/// Uninstall: remove the managed marker block.
+pub fn uninstall_neoai(ctx: &InstallContext) -> Result<IntegrationUninstallResult, IntegrationError> {
+    let config_path = ctx.config_path();
+    let Some(existing) = read_to_string_opt(&config_path)? else {
+        return Ok(IntegrationUninstallResult { changed: false, ..Default::default() });
+    };
+    let Some(stripped) = remove_marker_block(&existing, BEGIN, END) else {
+        return Ok(IntegrationUninstallResult { changed: false, ..Default::default() });
+    };
+    atomic_write(&config_path, &stripped)?;
+    Ok(IntegrationUninstallResult { changed: true, path: config_path, ..Default::default() })
+}
+
+/// Status: report installed state for `herdr integration status`.
+pub fn status_neoai(ctx: &InstallContext) -> IntegrationStatus {
+    let config_path = ctx.config_path();
+    let installed = read_to_string_opt(&config_path)
+        .ok()
+        .flatten()
+        .is_some_and(|c| c.contains(BEGIN));
+    IntegrationStatus { path: config_path, installed, current: true, ..Default::default() }
+}

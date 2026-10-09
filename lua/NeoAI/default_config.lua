@@ -1382,6 +1382,15 @@ local DEFAULT_CONFIG = {
     enabled = true, -- 是否启用 Herder 终端状态信号上报（还需 HERDR_ENV=1 才真正生效；非 Herder 环境为 no-op）
     source = "custom:neoai", -- 稳定且全局唯一的生命周期权威标识
     agent = "neoai", -- agent 名称（Herder 侧识别用）
+    display_agent = "NeoAI", -- 侧边栏/边框展示名（report-metadata --display-agent）
+    report_metadata = true, -- 接管权威时是否上报展示元数据（display_agent/state_labels/title）
+    auto_install = true, -- 启动时是否在 Herder 环境下异步、静默、幂等地安装展示增强片段
+    state_labels = { -- 覆盖 Herder 状态文案（report-metadata --state-label STATUS=TEXT）；false = 不覆盖
+      working = "生成中",
+      blocked = "等待确认",
+      idle = "就绪",
+    },
+    title = nil, -- 可选展示标题（report-metadata --title）；nil = 不设置
   },
 
   -- ===== 插件系统（kernel/plugins.lua + plugins/catalog.lua）=====

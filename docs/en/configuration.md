@@ -698,13 +698,35 @@ web_fetch = {
 
 ### 2.6 `herder`
 
+NeoAI can report the Agent lifecycle (`working`/`idle`/`blocked`) to Herder inside a Herder pane, together with
+display metadata (display name + localized state labels). Outside a Herder environment (`HERDR_ENV != 1`) it is a no-op.
+
 ```lua
 herder = {
   enabled = true,          -- Whether to enable reporting (also requires HERDR_ENV=1 to take effect)
   source = "custom:neoai", -- Stable and globally unique lifecycle authority identifier
   agent = "neoai",         -- Agent name (used for identification on the Herder side)
+  display_agent = "NeoAI", -- Sidebar/border display name (report-metadata --display-agent)
+  report_metadata = true,  -- Whether to report display metadata (display name / state labels / title) on takeover
+  auto_install = true,     -- Auto-install the display-enhancement snippet on startup inside Herder (async/silent/idempotent)
+  state_labels = {         -- Override Herder state labels (report-metadata --state-label); false = no override
+    working = "生成中",
+    blocked = "等待确认",
+    idle = "就绪",
+  },
+  title = nil,             -- Optional display title; nil = unset
 }
 ```
+
+- Recognition uses Herdr's **proactive reporting** channel (`pane report-agent` / `pane report-metadata`): Herdr's
+  agent identities are a compile-time fixed set, and a local detection manifest can only **override an existing**
+  agent, never add a new one.
+- Multi-session aggregation priority `blocked > working > idle`, with a strictly increasing `--seq` to avoid rollback.
+- Display-enhancement snippet: with `auto_install = true` it is written **asynchronously, silently and idempotently**
+  into `~/.config/herdr/config.toml` on startup (skipped if already installed, backs up first, rolls back if
+  `herdr config check` fails) — no manual action required.
+- See the [README Herder section](../README.en.md) and [`integrations/herdr/`](../../integrations/herdr/README.md).
+- Commands: `:NeoAIHerderStatus`, `:NeoAIHerderConfig [show|install|uninstall]`.
 
 ### 2.7 `log`
 

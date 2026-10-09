@@ -1830,6 +1830,7 @@ function M.capture_overlay(attempt_id, real_root, upper_root)
   end
   real_root = _abs(real_root):gsub("/$", "")
   local cap = _max_file_bytes()
+  local runtime = require("NeoAI.sandbox.runtime")
   local function walk(dir, rel)
     local handle = vim.uv.fs_scandir(dir)
     if not handle then return end
@@ -1841,18 +1842,19 @@ function M.capture_overlay(attempt_id, real_root, upper_root)
       if name ~= ".wh..wh..opq" and name ~= require("NeoAI.sandbox.conceal").session_basename() then
         -- opaque 目录标记（.wh..wh..opq）仅表示上层目录内容被替换，跳过不产生候选
         local whiteout, real_name = _is_whiteout(name, t)
-        if whiteout then
-          local child_rel = rel == "" and real_name or (rel .. "/" .. real_name)
-          _capture_entry(attempt, real_root, dir .. "/" .. name, child_rel, nil, cap)
-        elseif t == "directory" then
-          local child_rel = rel == "" and name or (rel .. "/" .. name)
-          walk(dir .. "/" .. name, child_rel)
-        elseif t == "file" then
-          local child_rel = rel == "" and name or (rel .. "/" .. name)
-          _capture_entry(attempt, real_root, dir .. "/" .. name, child_rel, nil, cap)
-        elseif t == "link" then
-          local child_rel = rel == "" and name or (rel .. "/" .. name)
-          _capture_entry(attempt, real_root, dir .. "/" .. name, child_rel, nil, cap)
+        local child_rel = rel == "" and real_name or (rel .. "/" .. real_name)
+        -- NeoAI 自身运行时/状态目录（日志/会话/缓存等）整棵子树不捕获：插件持续写入，冻结为候选后
+        -- 应用时基线必变（BASELINE_CHANGED），会否决**整个**变更单元。
+        if not runtime.is_self_runtime_path(real_root .. "/" .. child_rel) then
+          if whiteout then
+            _capture_entry(attempt, real_root, dir .. "/" .. name, child_rel, nil, cap)
+          elseif t == "directory" then
+            walk(dir .. "/" .. name, child_rel)
+          elseif t == "file" then
+            _capture_entry(attempt, real_root, dir .. "/" .. name, child_rel, nil, cap)
+          elseif t == "link" then
+            _capture_entry(attempt, real_root, dir .. "/" .. name, child_rel, nil, cap)
+          end
         end
       end
     end
@@ -1881,7 +1883,7 @@ end
 --- @param package boolean 包/生成内容（`uv sync` 等）：现有 base 文件用 stat 签名代替内容哈希，
 ---   避免逐文件读取+纯 Lua SHA（主线程/线程池的 CPU 热点）。
 --- @return string 编码记录
-local function _capture_worker(upper_root, real_root, session_basename, expected_encoded, ws_encoded, cap, paths_encoded, package)
+local function _capture_worker(upper_root, real_root, session_basename, expected_encoded, ws_encoded, cap, paths_encoded, package, self_encoded)
   --- 解码路径集（`<n>\n<len>:<path>...`），返回 set 或 nil。
   local function decode_set(encoded)
     if type(encoded) ~= "string" then return nil end
@@ -1956,6 +1958,31 @@ local function _capture_worker(upper_root, real_root, session_basename, expected
         end
       end
     end
+  end
+  -- 自身运行时/状态根目录（整棵子树不捕获）：解码后按前缀跳过。
+  local self_roots = {}
+  do
+    local nl = type(self_encoded) == "string" and self_encoded:find("\n", 1, true)
+    if nl then
+      local n = tonumber(self_encoded:sub(1, nl - 1)) or 0
+      local pos = nl + 1
+      for _ = 1, n do
+        local colon = self_encoded:find(":", pos, true)
+        if not colon then break end
+        local len = tonumber(self_encoded:sub(pos, colon - 1)) or 0
+        self_roots[#self_roots + 1] = self_encoded:sub(colon + 1, colon + len)
+        pos = colon + len + 1
+      end
+    end
+  end
+  --- 路径是否位于某个自身运行时/状态根之下（含根本身）。
+  --- @param real string
+  --- @return boolean
+  local function is_self(real)
+    for _, r in ipairs(self_roots) do
+      if real == r or real:sub(1, #r + 1) == r .. "/" then return true end
+    end
+    return false
   end
   local function read_all(path)
     local f = io.open(path, "rb")
@@ -2113,7 +2140,7 @@ local function _capture_worker(upper_root, real_root, session_basename, expected
     -- 写日志按路径驱动：只处理本轮真正写入/删除的绝对路径（O(改动)），不再遍历累积 upper。
     for real in pairs(paths) do
       local rel = (real_root == "") and real:sub(2) or real:sub(#real_root + 2)
-      if rel ~= "" then
+      if rel ~= "" and not is_self(real) then
         local dest = upper_root .. "/" .. rel
         local st = vim.uv.fs_lstat(dest)
         if st == nil then
@@ -2143,20 +2170,25 @@ local function _capture_worker(upper_root, real_root, session_basename, expected
           local child_rel = rel == "" and real_name or (rel .. "/" .. real_name)
           local real = real_root .. "/" .. child_rel
           local dest = dir .. "/" .. name
-          if whiteout then
-            handle_whiteout(child_rel, real, dest)
-          elseif t == "directory" then
-            walk(dest, child_rel)
-          elseif t == "file" then
-            handle_file(child_rel, real, dest)
-          elseif t == "link" then
-            handle_file(child_rel, real, dest)
+          -- 自身运行时/状态目录整棵子树不捕获（日志/会话持续增长，冻结为候选必致 CAS 冲突）。
+          if not is_self(real) then
+            if whiteout then
+              handle_whiteout(child_rel, real, dest)
+            elseif t == "directory" then
+              walk(dest, child_rel)
+            elseif t == "file" then
+              handle_file(child_rel, real, dest)
+            elseif t == "link" then
+              handle_file(child_rel, real, dest)
+            end
           end
         end
       end
     end
     walk(upper_root, "")
-    for real, exp in pairs(expected) do reconcile_one(real, exp) end
+    for real, exp in pairs(expected) do
+      if not is_self(real) then reconcile_one(real, exp) end
+    end
   end
   return tostring(count) .. "\n" .. table.concat(out)
 end
@@ -2440,6 +2472,7 @@ function M.capture_overlay_async(attempt_id, real_root, upper_root, hint, opts)
   end
   local root = _abs(real_root):gsub("/$", "")
   local session_basename = require("NeoAI.sandbox.conceal").session_basename()
+  local runtime = require("NeoAI.sandbox.runtime")
   local sha_src = require("NeoAI.utils.sha256").source
   local cap = _max_file_bytes()
   -- 写日志 → 本轮写入/删除的绝对路径集（仅本根子树）。hint 存在时 worker 按精确路径处理
@@ -2453,10 +2486,14 @@ function M.capture_overlay_async(attempt_id, real_root, upper_root, hint, opts)
     local list = {}
     paths_set = {}
     for p in pairs(hint.writes or {}) do
-      if under(p) and not paths_set[p] then paths_set[p] = true; list[#list + 1] = p end
+      if under(p) and not paths_set[p] and not runtime.is_self_runtime_path(p) then
+        paths_set[p] = true; list[#list + 1] = p
+      end
     end
     for p in pairs(hint.deletes or {}) do
-      if under(p) and not paths_set[p] then paths_set[p] = true; list[#list + 1] = p end
+      if under(p) and not paths_set[p] and not runtime.is_self_runtime_path(p) then
+        paths_set[p] = true; list[#list + 1] = p
+      end
     end
     paths_encoded = _encode_paths(list)
     -- B1：`.git` 保守——若本轮可能触及 `.git`（写/删路径命中、`.git` 锁/内容新鲜），
@@ -2471,8 +2508,10 @@ function M.capture_overlay_async(attempt_id, real_root, upper_root, hint, opts)
   end
   local expected_encoded = _encode_expected(state.materialized[upper_root], paths_set)
   local ws_encoded = _encode_ws(state.workspace, root, paths_set)
+  -- 自身运行时/状态根目录：传入 worker 以在遍历/按路径处理时整棵子树跳过。
+  local self_encoded = _encode_paths(runtime.self_runtime_roots())
   return work.run(_capture_worker, upper_root, root, session_basename, expected_encoded, ws_encoded, cap,
-    paths_encoded, package):then_(function(encoded)
+    paths_encoded, package, self_encoded):then_(function(encoded)
     local records = _decode_records(encoded, 12)
     -- 需要 base 内容哈希的记录（base 为文件，且非超大 blob 文件）：由分块并行 job 补算。
     -- 包/生成内容已被 worker 以 stat 签名（rec[6] 前缀 `sig:`）填充，无需内容哈希；
@@ -2670,14 +2709,14 @@ end
 --- @param attempt table|nil 控制层 attempt（含 effective_unmask / package）
 --- @param classify table|nil 工作线程预分类结果：path -> { masked, git_class, level }（包候选专用）
 --- @return table files 过滤后的文件
---- @return table dropped { masked=number, volatile=number, masked_paths=table, volatile_paths=table }
+--- @return table dropped { masked=number, volatile=number, git=number, self=number, *_paths=table }
 local function _filter_unpublishable(files, attempt, classify)
   local runtime = require("NeoAI.sandbox.runtime")
   local unmask = attempt and attempt.effective_unmask or nil
   local is_pkg = _is_package_candidate(files, attempt)
   local volatile = is_pkg and _volatile_matcher() or nil
   local out = {}
-  local dropped = { masked = 0, volatile = 0, git = 0, masked_paths = {}, volatile_paths = {}, git_paths = {} }
+  local dropped = { masked = 0, volatile = 0, git = 0, self = 0, masked_paths = {}, volatile_paths = {}, git_paths = {}, self_paths = {} }
   for _, f in ipairs(files) do
     local c = classify and classify[f.path]
     local gc, masked
@@ -2702,16 +2741,21 @@ local function _filter_unpublishable(files, attempt, classify)
     elseif volatile and volatile(f.path) then
       dropped.volatile = dropped.volatile + 1
       if #dropped.volatile_paths < 20 then dropped.volatile_paths[#dropped.volatile_paths + 1] = f.path end
+    elseif runtime.is_self_runtime_path(f.path) then
+      -- NeoAI 自身运行时/状态（日志、会话、缓存、沙箱 store 等）：插件持续写入、位于用户工作区
+      -- 之外，冻结为候选后应用时基线必变（BASELINE_CHANGED），必须剔除。
+      dropped.self = dropped.self + 1
+      if #dropped.self_paths < 20 then dropped.self_paths[#dropped.self_paths + 1] = f.path end
     else
       f.git_class = gc -- nil 表示普通文件；object/pointer 供原子排序与发布语义
       out[#out + 1] = f
     end
   end
-  if dropped.masked > 0 or dropped.volatile > 0 or dropped.git > 0 then
+  if dropped.masked > 0 or dropped.volatile > 0 or dropped.git > 0 or dropped.self > 0 then
     pcall(function()
       require("NeoAI.kernel.logger").warn(
-        "[sandbox] 冻结时跳过不可发布文件：遮蔽 %d、易变缓存 %d、.git 内部 %d",
-        dropped.masked, dropped.volatile, dropped.git)
+        "[sandbox] 冻结时跳过不可发布文件：遮蔽 %d、易变缓存 %d、.git 内部 %d、自身运行时 %d",
+        dropped.masked, dropped.volatile, dropped.git, dropped.self)
     end)
   end
   return out, dropped
@@ -2897,7 +2941,7 @@ function M.finish(attempt_id, prefetch, classify)
     command_id = attempt.attempt.command_id,
     attempt_id = attempt_id,
     effect = attempt.attempt.effect,
-    dropped = (dropped and (dropped.masked > 0 or dropped.volatile > 0 or dropped.git > 0)) and dropped or nil,
+    dropped = (dropped and (dropped.masked > 0 or dropped.volatile > 0 or dropped.git > 0 or dropped.self > 0)) and dropped or nil,
   }
   -- 工作线程分类结果（风险级别）接力给结算阶段，免主线程再对每个路径 resolve。单槽即可：
   -- 捕获/冻结/合并/落盘/结算经 `_serialize_capture` 串行，同一时刻至多一个 in-flight 候选。
@@ -3442,6 +3486,10 @@ local function _publish_validate(candidate)
     if masked then
       return { ok = false, state = "FAILED", reason = "SANDBOX_MASKED_TARGET: " .. tostring(masked) }
     end
+    -- NeoAI 自身运行时/状态（日志/会话/缓存/沙箱 store）：绝不发布（否则应用时基线必变）。
+    if runtime.is_self_runtime_path(resolved) then
+      return { ok = false, state = "FAILED", reason = "SANDBOX_SELF_TARGET: " .. tostring(resolved) }
+    end
     -- `.git` 瞬态/配置类绝不发布（对象/指针按原子顺序发布，见 _apply_order）。
     local gc = runtime.git_path_class(resolved)
     if gc == "transient" or gc == "other" then
@@ -3645,6 +3693,31 @@ local function _publish_worker(payload, sha_src)
     if not (st and st.type == "file" and st.mtime) then return nil end
     return string.format("sig:%s:%s:%s",
       tostring(st.mtime.sec), tostring(st.mtime.nsec), tostring(st.size))
+  end
+  -- 自身运行时/状态根目录（整棵子树不捕获）：解码后按前缀跳过。
+  local self_roots = {}
+  do
+    local nl = type(self_encoded) == "string" and self_encoded:find("\n", 1, true)
+    if nl then
+      local n = tonumber(self_encoded:sub(1, nl - 1)) or 0
+      local pos = nl + 1
+      for _ = 1, n do
+        local colon = self_encoded:find(":", pos, true)
+        if not colon then break end
+        local len = tonumber(self_encoded:sub(pos, colon - 1)) or 0
+        self_roots[#self_roots + 1] = self_encoded:sub(colon + 1, colon + len)
+        pos = colon + len + 1
+      end
+    end
+  end
+  --- 路径是否位于某个自身运行时/状态根之下（含根本身）。
+  --- @param real string
+  --- @return boolean
+  local function is_self(real)
+    for _, r in ipairs(self_roots) do
+      if real == r or real:sub(1, #r + 1) == r .. "/" then return true end
+    end
+    return false
   end
   local function read_all(path)
     local f = io.open(path, "rb")

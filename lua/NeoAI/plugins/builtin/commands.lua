@@ -17,6 +17,7 @@ local COMMANDS = {
   "NeoAISandboxApply", "NeoAISandboxApplyAll",
   "NeoAISandboxGrant", "NeoAISandboxRevoke", "NeoAISandboxPrune", "NeoAISandboxMetrics",
   "NeoAISandboxPublish", "NeoAISandboxReplay", "NeoAISandboxAudit", "NeoAISandboxAutoApprove",
+  "NeoAIHerderStatus", "NeoAIHerderConfig",
 }
 
 -- ========== 私有函数 ==========
@@ -514,6 +515,60 @@ function M.start()
       report(result)
     end
   end, { desc = "确认计划并转入 CHAT 执行" })
+
+  --- Herder 集成状态：环境/上报/是否已写入展示增强片段
+  _cmd("NeoAIHerderStatus", function()
+    local install = _svc("services.herder_install")
+    local herder = _svc("services.herder")
+    if not install or not herder then
+      vim.notify("[NeoAI] Herder 服务未加载", vim.log.levels.WARN)
+      return
+    end
+    local st = install.status()
+    local lines = {
+      ("Herder 环境: %s"):format(st.herdr_env and "是" or "否（非 Herder 环境，集成 no-op）"),
+      ("当前 pane: %s"):format(tostring(st.pane_id)),
+      ("上报状态: %s"):format(st.reporting and "进行中" or "未接管（无活跃 agent 或未启用）"),
+      ("上报标识: source=%s agent=%s display_agent=%s"):format(
+        tostring(st.source), tostring(st.agent), tostring(st.display_agent)),
+      ("配置文件: %s%s"):format(st.config_path, st.config_exists and "" or "（不存在）"),
+      ("展示增强片段: %s"):format(st.installed and "已安装" or "未安装"),
+    }
+    vim.notify("[NeoAI] Herder 集成状态：\n" .. table.concat(lines, "\n"), vim.log.levels.INFO)
+  end, { desc = "显示 Herder 集成状态" })
+
+  --- Herder 配置片段：打印 / 安装 / 卸载展示增强（写入前备份，写入后 herdr config check 校验）
+  _cmd("NeoAIHerderConfig", function(opts)
+    local install = _svc("services.herder_install")
+    if not install then
+      vim.notify("[NeoAI] Herder 安装服务未加载", vim.log.levels.WARN)
+      return
+    end
+    local sub = (opts.args or ""):match("%S+")
+    if sub == nil or sub == "show" then
+      vim.notify("[NeoAI] 推荐 Herdr 配置片段（:NeoAIHerderConfig install 写入）：\n" .. install.snippet(), vim.log.levels.INFO)
+      return
+    end
+    if sub == "install" then
+      local res = install.install()
+      if res.ok then
+        vim.notify(("[NeoAI] Herder 配置片段：%s（%s）"):format(res.changed and "已写入" or "已存在，跳过", res.path), vim.log.levels.INFO)
+      else
+        vim.notify("[NeoAI] 写入失败（已回滚）: " .. tostring(res.error), vim.log.levels.ERROR)
+      end
+      return
+    end
+    if sub == "uninstall" then
+      local res = install.uninstall()
+      if res.ok then
+        vim.notify(("[NeoAI] Herder 配置片段：%s（%s）"):format(res.changed and "已移除" or "未安装，跳过", res.path), vim.log.levels.INFO)
+      else
+        vim.notify("[NeoAI] 移除失败（已回滚）: " .. tostring(res.error), vim.log.levels.ERROR)
+      end
+      return
+    end
+    vim.notify("[NeoAI] 用法: :NeoAIHerderConfig [show|install|uninstall]", vim.log.levels.WARN)
+  end, { nargs = "?", desc = "查看/安装/卸载 Herder 展示增强配置片段" })
 
   return function()
     for _, name in ipairs(COMMANDS) do

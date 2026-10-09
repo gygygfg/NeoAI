@@ -573,6 +573,13 @@ Herder semantics and reports it; recognition/parsing on the Herder side is handl
 
 Outside a Herder environment, this module is a complete no-op: it subscribes to no events and produces no side effects.
 
+**How recognition works (why reporting, not a detection manifest)**: Herdr's agent identities are a
+**compile-time fixed set**; a local detection manifest (`~/.config/herdr/agent-detection/<id>.toml`) can only
+**override an existing** agent, never **add** a new one (measured: adding a `neoai` manifest is ignored, and
+`herdr agent explain --file … --agent neoai` returns `unknown_agent`). NeoAI therefore uses Herdr's **proactive
+reporting** channel (`herdr pane report-agent` / `pane report-metadata`), which does not require the agent to be
+detected first.
+
 **State mapping**:
 
 | NeoAI Agent state | Herder report |
@@ -586,18 +593,23 @@ aggregates them into one fixed `source` (default `custom:neoai`) and reports the
 priority of `blocked > working > idle`. Every report carries a strictly increasing `--seq`, so Herder ignores stale
 packets from the same `source`, preventing status regressions caused by concurrent/asynchronous callbacks.
 
+**Display recognition**: when it takes over authority, NeoAI sends one `report-metadata`, so the Herder sidebar/border
+shows `display_agent = "NeoAI"` with localized state labels (`生成中` / `等待确认` / `就绪`) instead of the bare `neoai`
+tag; when the last Agent exits it clears the display metadata before `release-agent`.
+
 **Example reporting flow**:
 
 ```
-# The user sends a message, the Agent starts generating
-herdr pane report-agent w1:p1 --source custom:neoai --agent neoai --state working --seq 1
+# The user sends a message, the Agent starts generating (display metadata accompanies authority takeover)
+herdr pane report-agent    w1:p1 --source custom:neoai --agent neoai --state working --seq 1
+herdr pane report-metadata w1:p1 --source custom:neoai --agent neoai --display-agent NeoAI --state-label working=生成中 --seq 1
 # A tool needs approval / the user is asked a question and we wait for an answer (blocked)
 herdr pane report-agent w1:p1 --source custom:neoai --agent neoai --state blocked --seq 2
 # Approval granted, still generating
 herdr pane report-agent w1:p1 --source custom:neoai --agent neoai --state working --seq 3
 # This round of generation is done, waiting for input
 herdr pane report-agent w1:p1 --source custom:neoai --agent neoai --state idle --seq 4
-# The chat window is closed and the last Agent is destroyed (releasing lifecycle authority)
+# The chat window is closed and the last Agent is destroyed (clear display metadata + release lifecycle authority)
 herdr pane release-agent w1:p1 --source custom:neoai --agent neoai --seq 5
 ```
 
@@ -606,15 +618,37 @@ herdr pane release-agent w1:p1 --source custom:neoai --agent neoai --seq 5
 ```lua
 require("NeoAI").setup({
   herder = {
-    enabled = true,           -- whether reporting is enabled (still requires HERDR_ENV=1 to actually take effect)
-    source = "custom:neoai",  -- a stable, globally unique lifecycle authority identifier
-    agent = "neoai",          -- agent name (used by Herder for identification)
+    enabled = true,              -- whether reporting is enabled (still requires HERDR_ENV=1 to actually take effect)
+    source = "custom:neoai",     -- a stable, globally unique lifecycle authority identifier
+    agent = "neoai",             -- agent name (used by Herder for identification)
+    display_agent = "NeoAI",     -- sidebar/border display name (report-metadata --display-agent)
+    report_metadata = true,      -- whether to report display metadata on authority takeover
+    auto_install = true,         -- auto-install the display-enhancement snippet on startup (async/silent/idempotent)
+    state_labels = { working = "生成中", blocked = "等待确认", idle = "就绪" }, -- false = no override
+    title = nil,                 -- optional display title
   },
 })
 ```
 
-> Diagnostics: inside a Herder pane, use `herdr agent explain <pane-id>` to view the current Agent status source and
-> recent reports.
+**Display-enhancement snippet (auto-installed)**: on startup, inside a Herder environment, NeoAI
+**asynchronously, silently and idempotently** writes a Herdr config snippet (enabling
+`show_agent_labels_on_pane_borders` under `[ui]`, so split-pane borders show the reported agent label)
+into `~/.config/herdr/config.toml`; if the file already has a `[ui]` section the block is inserted into
+it (avoiding a duplicate `[ui]` TOML conflict). If already installed or the key already exists it is
+skipped, it backs up first, and rolls back if `herdr config check` fails. It never blocks startup and
+shows no prompt. Set `auto_install = false` to disable; manual commands are also available.
+
+**Commands and diagnostics**:
+
+| Command | Description |
+|---|---|
+| `:NeoAIHerderStatus` | Show integration status (environment / report identity / whether the display-enhancement snippet is installed) |
+| `:NeoAIHerderConfig [show\|install\|uninstall]` | Preview / install / uninstall the Herder display-enhancement config snippet (writes `~/.config/herdr/config.toml`, marker-idempotent, backs up first, rolls back if `herdr config check` fails) |
+| `herdr agent list` / `herdr pane get "$HERDR_PANE_ID"` | Inspect `agent=neoai`, `display_agent`, `state_labels` on the Herder side |
+| `herdr agent explain <pane-id>` | View the status source (a reporting-only agent reports no detection label) |
+
+> Integration assets (standalone reporting script `herdr-agent-state.sh`, a copy-paste config snippet, and upstream
+> material for Herdr) live in [`integrations/herdr/`](integrations/herdr/README.md).
 
 </details>
 

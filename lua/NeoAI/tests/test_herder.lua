@@ -13,12 +13,14 @@ local function reset_herder_env()
     HERDER_BIN_PATH = vim.env.HERDER_BIN_PATH,
     HERDR_BIN_PATH = vim.env.HERDR_BIN_PATH,
     HERDR_PANE_ID = vim.env.HERDR_PANE_ID,
+    HERDR_CONFIG_PATH = vim.env.HERDR_CONFIG_PATH,
   }
-  -- 先设置为已知值
+  -- 先设置为已知值（配置路径指向临时目录，避免自动安装误写真实用户配置）
   vim.env.HERDR_ENV = "1"
   vim.env.HERDER_BIN_PATH = "/usr/local/bin/herdr"
   vim.env.HERDR_BIN_PATH = "/usr/local/bin/herdr"
   vim.env.HERDR_PANE_ID = "w1:p1"
+  vim.env.HERDR_CONFIG_PATH = vim.fn.tempname() .. "-neoai-herder-cfg/config.toml"
   return orig
 end
 
@@ -27,12 +29,16 @@ local function restore_env(orig)
   vim.env.HERDER_BIN_PATH = orig.HERDER_BIN_PATH
   vim.env.HERDR_BIN_PATH = orig.HERDR_BIN_PATH
   vim.env.HERDR_PANE_ID = orig.HERDR_PANE_ID
+  vim.env.HERDR_CONFIG_PATH = orig.HERDR_CONFIG_PATH
 end
 
 --- 初始化 herder（加载含默认 herder 配置的 config）
-local function init_herder()
+--- @param override table|nil 覆盖 herder 配置（如 { report_metadata = false }）
+local function init_herder(override)
   local config_store = require("NeoAI.kernel.config_store")
-  config_store.load({}) -- 合并默认配置（含 herder.enabled = true）
+  -- 测试默认关闭自动安装，避免后台写真实配置；需要时由用例显式开启
+  local herder_cfg = vim.tbl_extend("force", { auto_install = false }, override or {})
+  config_store.load({ herder = herder_cfg })
   local herder = require("NeoAI.services.herder")
   herder.reset()
   captured = {}
@@ -49,9 +55,40 @@ local function arg_state(argv)
   return nil
 end
 
+--- 取某条捕获 argv 中某 flag 之后的值
+local function arg_value(argv, flag)
+  for i, a in ipairs(argv) do
+    if a == flag then return argv[i + 1] end
+  end
+  return nil
+end
+
 --- 取某条捕获 argv 中的第 3 个元素（子命令）
 local function arg_command(argv)
   return argv[3]
+end
+
+--- 收集某类子命令的全部 argv
+local function collect(cmd)
+  local out = {}
+  for _, argv in ipairs(captured) do
+    if arg_command(argv) == cmd then out[#out + 1] = argv end
+  end
+  return out
+end
+
+--- report-agent 的 --state 序列
+local function report_states()
+  local out = {}
+  for _, argv in ipairs(collect("report-agent")) do out[#out + 1] = arg_state(argv) end
+  return out
+end
+
+--- 全部捕获 argv 的 --seq 序列
+local function seqs()
+  local out = {}
+  for _, argv in ipairs(captured) do out[#out + 1] = tonumber(arg_value(argv, "--seq")) end
+  return out
 end
 
 --- 模拟 agent 创建
@@ -66,6 +103,15 @@ local function emit_state(agent_id, new_state)
   local eb = require("NeoAI.kernel.event_bus")
   local ev = require("NeoAI.kernel.events")
   eb.emit(ev.AGENT_STATE_CHANGED, { agent_id = agent_id, new = new_state })
+end
+
+--- 读取文件内容（不存在返回 nil）
+local function read_file(path)
+  local f = io.open(path, "r")
+  if not f then return nil end
+  local c = f:read("*a")
+  f:close()
+  return c
 end
 
 tests.suite("herder", function(_, it)
@@ -91,13 +137,73 @@ tests.suite("herder", function(_, it)
     t.false_(herder.has_authority())
 
     emit_state("a1", "generating")
-    t.eq(1, #captured)
-    t.eq("working", arg_state(captured[1]))
+    t.eq(1, #collect("report-agent"))
+    t.eq("working", arg_state(collect("report-agent")[1]))
     t.true_(herder.has_authority(), "进入 working 后接管权威")
 
     emit_state("a1", "idle")
-    t.eq(2, #captured)
-    t.eq("idle", arg_state(captured[2]))
+    t.eq(2, #collect("report-agent"))
+    t.eq("idle", arg_state(collect("report-agent")[2]))
+    restore_env(orig)
+  end)
+
+  it("接管权威时附带一次 report-metadata（display_agent/状态文案），且不重复", function(t)
+    local orig = reset_herder_env()
+    local herder = init_herder()
+
+    emit_created("a1")
+    emit_state("a1", "generating")
+    local md = collect("report-metadata")
+    t.eq(1, #md, "接管权威时应上报一次展示元数据")
+    t.eq("NeoAI", arg_value(md[1], "--display-agent"))
+    -- state_labels 按确定性顺序输出
+    local labels = {}
+    local argv = md[1]
+    for i, a in ipairs(argv) do
+      if a == "--state-label" then labels[#labels + 1] = argv[i + 1] end
+    end
+    t.deep_eq({ "working=生成中", "blocked=等待确认", "idle=就绪" }, labels)
+
+    emit_state("a1", "idle")
+    emit_state("a1", "generating")
+    t.eq(1, #collect("report-metadata"), "同一权威生命周期内元数据只上报一次")
+    restore_env(orig)
+  end)
+
+  it("report_metadata=false 时不上报元数据", function(t)
+    local orig = reset_herder_env()
+    local herder = init_herder({ report_metadata = false })
+
+    emit_created("a1")
+    emit_state("a1", "generating")
+    t.eq(1, #collect("report-agent"))
+    t.eq(0, #collect("report-metadata"), "关闭后不应上报元数据")
+    restore_env(orig)
+  end)
+
+  it("所有上报 --seq 严格递增", function(t)
+    local orig = reset_herder_env()
+    local herder = init_herder()
+
+    emit_created("a1")
+    emit_state("a1", "generating") -- metadata + report
+    emit_state("a1", "idle")
+    local s = seqs()
+    t.ok(#s >= 3)
+    for i = 2, #s do
+      t.ok(s[i] > s[i - 1], "seq 应严格递增")
+    end
+    t.eq(herder.get_seq(), s[#s])
+    restore_env(orig)
+  end)
+
+  it("公开 API 透出 source/agent/display_agent/pane_id", function(t)
+    local orig = reset_herder_env()
+    local herder = init_herder()
+    t.eq("custom:neoai", herder.get_source())
+    t.eq("neoai", herder.get_agent())
+    t.eq("NeoAI", herder.get_display_agent())
+    t.eq("w1:p1", herder.get_pane_id())
     restore_env(orig)
   end)
 
@@ -110,13 +216,13 @@ tests.suite("herder", function(_, it)
     emit_created("a1")
     emit_created("a2")
     emit_state("a1", "generating")
-    t.eq("working", arg_state(captured[1]))
+    t.eq("working", report_states()[1])
 
     eb.emit(ev.TOOL_APPROVAL_REQUESTED, { agent_id = "a1", tool_name = "edit_file", args = {} })
-    t.eq("blocked", arg_state(captured[2]), "审批中应上报 blocked")
+    t.eq("blocked", report_states()[2], "审批中应上报 blocked")
 
     eb.emit(ev.TOOL_APPROVED, { agent_id = "a1", tool_name = "edit_file" })
-    t.eq("working", arg_state(captured[3]), "审批通过且仍 working 应回落 working")
+    t.eq("working", report_states()[3], "审批通过且仍 working 应回落 working")
     restore_env(orig)
   end)
 
@@ -128,14 +234,14 @@ tests.suite("herder", function(_, it)
 
     emit_created("a1")
     eb.emit(ev.ASK_USER_WAITING, { agent_id = "a1" })
-    t.eq("blocked", arg_state(captured[1]), "等待用户回答应上报 blocked")
+    t.eq("blocked", report_states()[1], "等待用户回答应上报 blocked")
 
     eb.emit(ev.ASK_USER_ANSWERED, { agent_id = "a1" })
-    t.eq("idle", arg_state(captured[2]), "回答后应回到 idle")
+    t.eq("idle", report_states()[2], "回答后应回到 idle")
     restore_env(orig)
   end)
 
-  it("最后一个 agent 移除时释放权威", function(t)
+  it("最后一个 agent 移除时清除元数据并释放权威", function(t)
     local orig = reset_herder_env()
     local herder = init_herder()
     local eb = require("NeoAI.kernel.event_bus")
@@ -146,13 +252,22 @@ tests.suite("herder", function(_, it)
     t.true_(herder.has_authority())
 
     eb.emit(ev.AGENT_DISPOSED, { agent_id = "a1" })
-    t.eq(2, #captured)
-    t.eq("release-agent", arg_command(captured[2]), "最后一个 agent 移除应调用 release-agent")
+    t.eq(1, #collect("release-agent"), "最后一个 agent 移除应调用 release-agent")
+    -- 释放前应清除展示元数据
+    local md = collect("report-metadata")
+    local cleared = false
+    for _, argv in ipairs(md) do
+      for _, a in ipairs(argv) do
+        if a == "--clear-display-agent" then cleared = true end
+      end
+    end
+    t.true_(cleared, "释放前应发送 --clear-display-agent")
     t.false_(herder.has_authority(), "释放后不再持有权威")
 
     -- 释放后再创建 idle agent 不应重新上报
+    local n = #captured
     emit_created("a2")
-    t.eq(2, #captured)
+    t.eq(n, #captured)
     restore_env(orig)
   end)
 
@@ -165,13 +280,43 @@ tests.suite("herder", function(_, it)
     emit_created("a1")
     emit_created("a2")
     emit_state("a1", "generating")
-    t.eq("working", arg_state(captured[1]))
+    t.eq("working", report_states()[1])
 
     eb.emit(ev.ASK_USER_WAITING, { agent_id = "a2" })
-    t.eq("blocked", arg_state(captured[2]), "只要任一会话阻塞就上报 blocked")
+    t.eq("blocked", report_states()[2], "只要任一会话阻塞就上报 blocked")
 
     eb.emit(ev.ASK_USER_ANSWERED, { agent_id = "a2" })
-    t.eq("working", arg_state(captured[3]), "阻塞解除后回落 working")
+    t.eq("working", report_states()[3], "阻塞解除后回落 working")
+    restore_env(orig)
+  end)
+
+  it("auto_install：启动时异步静默安装展示片段，且不重复写入", function(t)
+    local orig = reset_herder_env()
+    -- 指向临时配置路径 + 假 herdr（config check 退出 0）
+    local dir = vim.fn.tempname() .. "-neoai-herder-auto"
+    vim.fn.mkdir(dir, "p")
+    local cfg = dir .. "/config.toml"
+    vim.env.HERDR_CONFIG_PATH = cfg
+    local bin = vim.fn.tempname() .. "-fakeherdr0"
+    vim.fn.writefile({ "#!/bin/sh", "exit 0" }, bin)
+    vim.fn.setfperm(bin, "rwxr-xr-x")
+    vim.env.HERDER_BIN_PATH = bin
+    vim.env.HERDR_BIN_PATH = bin
+
+    init_herder({ auto_install = true })
+    -- 等待异步安装落盘
+    vim.wait(3000, function()
+      local c = read_file(cfg)
+      return c ~= nil and c:find("# >>> NeoAI herder integration", 1, true) ~= nil
+    end, 50)
+    local content = read_file(cfg)
+    t.ok(content and content:find("# >>> NeoAI herder integration", 1, true) ~= nil, "应已异步写入展示片段")
+
+    -- 幂等：再次（模拟二次启动）不应重复写入
+    local install = require("NeoAI.services.herder_install")
+    local started = install.install_async()
+    t.false_(started, "已安装时不应再次写入")
+    t.eq(content, read_file(cfg), "重复安装不应改变文件")
     restore_env(orig)
   end)
 end)

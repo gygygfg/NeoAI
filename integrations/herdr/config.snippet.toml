@@ -1,0 +1,29 @@
+# NeoAI — Herdr display enhancement snippet
+#
+# Optional. NeoAI reports its lifecycle to Herdr on its own
+# (see lua/NeoAI/services/herder.lua); the lifecycle state in Herdr's sidebar
+# works without this file. This snippet only tunes how the reported agent is
+# *displayed*.
+#
+# Note: Herdr only accepts *known canonical* agent ids in
+# [ui.sidebar.agents.rows_by_agent], so `neoai` cannot be targeted there. The
+# snippet below is the valid, low-conflict enhancement NeoAI installs.
+#
+# NeoAI installs this automatically on startup inside a Herder environment
+# (async, silent, idempotent; see herder.auto_install). To do it by hand,
+# append the block to ~/.config/herdr/config.toml (if you already have a [ui]
+# section, put the two lines inside it instead of adding a second [ui] header),
+# then run: herdr server reload-config
+#
+# Or use marker-guarded commands from Neovim:
+#     :NeoAIHerderConfig show
+#     :NeoAIHerderConfig install
+#     :NeoAIHerderConfig uninstall
+#     :NeoAIHerderStatus
+
+[ui]
+# >>> NeoAI herder integration (managed by NeoAI; do not edit) >>>
+# 展示增强：NeoAI 生命周期由 report-agent/report-metadata 主动上报驱动。
+# 在分屏边框显示上报的 agent 标签（如 NeoAI，来自 display_agent）。
+show_agent_labels_on_pane_borders = true
+# <<< NeoAI herder integration <<<

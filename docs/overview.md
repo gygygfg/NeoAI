@@ -204,6 +204,10 @@ Herder 侧的识别/解析由 Herder 自身处理。
 在非 Herder 环境下，该模块是严格的空操作：不订阅任何事件，
 且无副作用。
 
+**识别方式**：Herdr 的 agent 身份为编译期固定集合，本地检测清单只能**覆盖已有** agent、**无法新增**，
+故 NeoAI 走 Herdr 的**主动上报**通道（`pane report-agent` / `pane report-metadata`）。接管权威时会附带一次
+`report-metadata`，令侧边栏显示 `display_agent = "NeoAI"` 与本地化状态文案。
+
 **状态映射**：
 
 | NeoAI Agent 状态 | Herder 上报状态 |
@@ -241,6 +245,11 @@ require('NeoAI').setup({
     enabled = true,           -- 启用上报（同时需要 HERDR_ENV=1）
     source = 'custom:neoai',  -- 稳定、全局唯一的生命周期权威标识符
     agent = 'neoai',          -- agent 名称（由 Herder 识别）
+    display_agent = 'NeoAI',  -- 侧边栏/边框展示名（report-metadata）
+    report_metadata = true,   -- 接管权威时上报展示元数据
+    auto_install = true,      -- 启动时在 Herder 环境下自动（异步/静默/幂等）安装展示增强片段
+    state_labels = { working = '生成中', blocked = '等待确认', idle = '就绪' }, -- false = 不覆盖
+    title = nil,              -- 可选展示标题
   },
 })
 ```

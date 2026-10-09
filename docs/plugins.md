@@ -109,6 +109,7 @@ stop：逆序执行清理 → 注销服务 → stopped
 | `services.mcp` | `NeoAI.services.mcp` | — |
 | `services.status` | `NeoAI.services.status` | — |
 | `services.herder` | `NeoAI.services.herder` | — |
+| `services.herder_install` | `NeoAI.services.herder_install` | — |
 
 ### 3.2 副作用插件
 

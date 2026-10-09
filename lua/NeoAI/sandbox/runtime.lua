@@ -31,6 +31,7 @@ local state = {
   store_root_raw = nil, -- 已缓存的 store 根原始串
   store_root_canon = nil, -- store 根的规范化形式（避免逐文件 resolve）
   self_paths_cache = nil, -- { key = string, paths = string[] } 沙箱自有作用域路径（越界留痕排除用）
+  self_runtime_cache = nil, -- { key = string, fn = function, roots = string[] } NeoAI 自身运行时/状态目录匹配器缓存
 }
 
 -- 默认遮蔽的宿主敏感路径（安全默认，可经 tools.sandbox.mask_paths 覆盖）：
@@ -2031,6 +2032,73 @@ end
 --- @return string|nil mask_entry
 function M.mask_entry(path, cwd)
   return _mask_entry(path, cwd)
+end
+
+--- 系统目录（stdpath）值；缺失/空串返回 nil。
+--- @param kind string "cache"|"state"|"data" 等
+--- @return string|nil
+local function _stdpath(kind)
+  local ok, r = pcall(vim.fn.stdpath, kind)
+  if ok and type(r) == "string" and r ~= "" then return r end
+  return nil
+end
+
+--- NeoAI 自身运行时/状态目录匹配器。这些目录位于用户工作区之外、属于插件自身的持续写入
+--- （日志实时增长、会话/缓存/chromium/包等），不应被整机根 overlay 捕获为候选。
+--- 组成：`<cache>/NeoAI`、`<state>/NeoAI`、`<data>/NeoAI`，以及可配置的 `log.path`、
+--- `tools.sandbox.workspace_root`（沙箱 store 基根）。结果按相关配置缓存。
+--- @return function(path:string)->boolean
+local function _self_runtime_matcher()
+  local log_cfg = config_store.get("log")
+  local log_path = type(log_cfg) == "table" and log_cfg.path or nil
+  local ws_root = config_store.get("tools.sandbox.workspace_root")
+  local cache, statep, data = _stdpath("cache"), _stdpath("state"), _stdpath("data")
+  local key = table.concat({ cache or "", statep or "", data or "",
+    tostring(log_path or ""), tostring(ws_root or "") }, "\1")
+  local cached = state.self_runtime_cache
+  if cached and cached.key == key then return cached.fn end
+  local roots, seen = {}, {}
+  local function add(r)
+    if type(r) ~= "string" or r == "" then return end
+    local ok, e = pcall(vim.fn.expand, r)
+    if ok and type(e) == "string" and e ~= "" then r = e end
+    r = r:gsub("/+$", "")
+    if r == "" or r == "/" or seen[r] then return end
+    seen[r] = true
+    roots[#roots + 1] = r
+  end
+  if cache and cache ~= "" then add(cache .. "/NeoAI") end
+  if statep and statep ~= "" then add(statep .. "/NeoAI") end
+  if data and data ~= "" then add(data .. "/NeoAI") end
+  add(log_path)
+  add(ws_root)
+  local fn = function(path)
+    if type(path) ~= "string" or path == "" then return false end
+    for _, r in ipairs(roots) do
+      if path == r or path:sub(1, #r + 1) == r .. "/" then return true end
+    end
+    return false
+  end
+  state.self_runtime_cache = { key = key, fn = fn, roots = roots }
+  return fn
+end
+
+--- 路径是否属于 NeoAI 自身运行时/状态（日志、会话、缓存、沙箱 store 等）。
+--- 这些路径绝不纳入沙箱候选：整机根 overlay 会捕获会话期间写入它们的内容，而日志/会话在持续
+--- 增长，应用时 CAS 基线必然已变（CONFLICT/BASELINE_CHANGED），会否决**整个**变更单元。
+--- @param path string|nil 绝对路径
+--- @return boolean
+function M.is_self_runtime_path(path)
+  if type(path) ~= "string" or path == "" then return false end
+  return _self_runtime_matcher()(path)
+end
+
+--- NeoAI 自身运行时/状态根目录列表（供捕获阶段裁剪整棵子树）。
+--- @return string[]
+function M.self_runtime_roots()
+  _self_runtime_matcher()
+  local cached = state.self_runtime_cache
+  return (cached and cached.roots) or {}
 end
 
 --- 目标路径是否命中宿主敏感遮蔽路径（`tools.sandbox.mask_paths` + 沙箱自身存储）。

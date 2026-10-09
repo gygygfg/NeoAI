@@ -102,6 +102,11 @@ local function _service_specs()
       deps = { "services.chat_service" },
     },
     { id = "services.herder", module = "NeoAI.services.herder", service = "services.herder", phase = 2 },
+    {
+      -- Herdr 侧展示增强片段安装器（可选；仅由用户命令触发，不自动写入）
+      id = "services.herder_install", module = "NeoAI.services.herder_install",
+      service = "services.herder_install", phase = 2,
+    },
   }
 end
 

@@ -3335,6 +3335,26 @@ tests.suite("sandbox", function(_, it)
     vim.fn.delete(dir, "rf")
   end)
 
+  it("加固：NeoAI 自身运行时/状态路径被识别（不计入候选，避免日志增长致 CAS 冲突）", function(t)
+    local runtime = require("NeoAI.sandbox.runtime")
+    local fs = require("NeoAI.utils.fs")
+    local cache = vim.fn.stdpath("cache") .. "/NeoAI"
+    t.true_(runtime.is_self_runtime_path(cache), "缓存根应命中")
+    t.true_(runtime.is_self_runtime_path(cache .. "/neoai.log"), "日志应命中")
+    t.true_(runtime.is_self_runtime_path(cache .. "/sessions.jsonl"), "会话文件应命中")
+    t.true_(runtime.is_self_runtime_path(cache .. "/sandbox/instances/1_2/upper/x"), "沙箱 store 后代应命中")
+    t.false_(runtime.is_self_runtime_path(cache .. "_other/x"), "前缀边界不应命中")
+    t.false_(runtime.is_self_runtime_path("/tmp/neoai_project_file.lua"), "工作区普通文件不应命中")
+    -- 可配置的 log.path 也纳入识别
+    local dir = vim.fn.tempname()
+    fs.ensure_dir(dir)
+    with_config({ log = { path = dir .. "/my.log" } }, function()
+      t.true_(runtime.is_self_runtime_path(dir .. "/my.log"), "自定义日志路径应命中")
+      t.false_(runtime.is_self_runtime_path(dir .. "/other.log"), "自定义日志的兄弟文件不应命中")
+    end)
+    vim.fn.delete(dir, "rf")
+  end)
+
   it("性能回归：遮蔽路径 glob/规范化按配置缓存，不随逐文件判定重算", function(t)
     local runtime = require("NeoAI.sandbox.runtime")
     local glob = vim.fn.glob

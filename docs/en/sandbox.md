@@ -535,7 +535,7 @@ is only kept for other `approval.mode` values (`prompt`/`strict`).
   still resolves fully and follows leaf symlinks) it returns `FAILED/SANDBOX_MASKED_TARGET`. Even a
   locally-rewritten candidate cannot write to an unvalidated real location.
 - **Unpublishable files dropped at freeze**: before building the candidate, `candidate.finish`
-  drops two kinds of files so a single one cannot fail the **whole** change set (e.g. a package
+  drops several kinds of files so a single one cannot fail the **whole** change set (e.g. a package
   install rolling back because an apt index baseline changed):
   1. **effectively masked paths** — decided via the attempt's `effective_unmask` (tier escalation +
      approval unmask + writable roots); paths lifted by unmask are kept;
@@ -545,6 +545,12 @@ is only kept for other `approval.mode` values (`prompt`/`strict`).
      and would trigger `CONFLICT/BASELINE_CHANGED`; dropping them does not affect the install
      (`/var/lib/dpkg/status`, package files, etc. still apply) and the host can rebuild indexes with
      `apt update`.
+  3. **NeoAI's own runtime/state paths** — `<stdpath cache>/NeoAI`, `<stdpath state>/NeoAI`,
+     `<stdpath data>/NeoAI`, plus the configured `log.path` and `tools.sandbox.workspace_root`
+     (covering logs, sessions, caches, the sandbox store, ...). These live outside the user
+     workspace and are written continuously by the plugin (the log grows in real time); under the
+     root overlay they get captured as candidates whose baseline always changed by apply time
+     (`BASELINE_CHANGED`), so the whole subtree is skipped during capture traversal and at freeze.
   The dropped count is recorded on the candidate's `dropped` field and surfaced in the review UI;
   the publish-time masked hard reject remains as defense in depth.
 - **Same-file supersede (per-file granularity + incremental)**: when the same file is edited again
