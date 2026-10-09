@@ -63,6 +63,8 @@ local function _open_float(opts)
     h_ratio = cfg.h_ratio or 0.85,
     max_w = opts.width or cfg.width,
     max_h = opts.height or cfg.height,
+    -- 主界面窗口（chat/tree）本身不套用窄屏留白规则：它是浮窗的基准，不是浮窗。
+    narrow = false,
   }
   local geom = geometry.compute(geom_opts)
   local win = vim.api.nvim_open_win(buf, true, {
@@ -219,6 +221,123 @@ end
 --- @return boolean
 function M.has_windows()
   return next(state.windows) ~= nil
+end
+
+--- 判断某 buffer 是否为「NeoAI 界面孤儿」——即由 :mksession/:restart 恢复出来、
+--- 但当前进程没有任何真实 NeoAI 窗口接管它的残留 buffer。
+--- 识别依据（二者任一）：
+---   1. filetype 恰为 `neoai`（聊天主消息 buffer）；
+---   2. basename 命中固定界面名 `NeoAI Chat` / `NeoAI Sessions` / `NeoAI Input`（含编号变体）
+---      或轨迹命名 `NeoAI-<数字>`。
+--- 说明：:restart 恢复出的残留 buffer 往往 filetype 为空（按文件名无法触发文件类型检测），
+--- 因此必须结合名字判断，不能只看 filetype。
+--- 注意：**不可**用 `filetype` 前缀匹配 `neoai`——那会把浮窗（`neoai_reasoning` /
+--- `neoai_tool_args` / `neoai_context_op` / `neoai_sandbox_review` 等）也当成孤儿删除，
+--- 从而在多聊天实例并开时误关其它实例正在展示的浮窗。
+--- @param buf number
+--- @return boolean
+local function _is_neoai_orphan(buf)
+  if not buf or not vim.api.nvim_buf_is_valid(buf) then return false end
+  local ok, ft = pcall(function() return vim.bo[buf].filetype end)
+  if ok and ft == "neoai" then return true end
+  local name = ""
+  pcall(function() name = vim.api.nvim_buf_get_name(buf) end)
+  if not name or name == "" then return false end
+  local base = vim.fn.fnamemodify(name, ":t")
+  if base == "NeoAI Chat" or base == "NeoAI Sessions" or base == "NeoAI Input" then return true end
+  -- 多实例：聊天 buffer 用编号区分（`NeoAI Chat 2` / `NeoAI Input 3`），一并识别。
+  if base:match("^NeoAI Chat %d+$") or base:match("^NeoAI Input %d+$") then return true end
+  if base:match("^NeoAI %d+$") or base:match("^NeoAI%-%d+$") then return true end
+  return false
+end
+
+--- 为窗口挑一个「干净」的替代 buffer（非孤儿、已列入、非特殊 buftype）。
+--- 找不到时返回 nil，由调用方创建新的空 buffer。
+--- @param orphan_set table<number, boolean>
+--- @return number|nil
+local function _find_replacement_buf(orphan_set)
+  for _, b in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_is_valid(b) and not orphan_set[b] and vim.bo[b].buflisted then
+      local bt = vim.bo[b].buftype
+      if bt == "" then return b end
+    end
+  end
+  return nil
+end
+
+--- 清理会话恢复残留的 NeoAI 界面 buffer/窗口（:restart / :mksession 恢复后调用）。
+--- 目标：:restart 后不再出现「空的 NeoAI Chat buffer + 输入框 buffer」这类孤儿，
+--- 聊天界面完全关闭，用户需显式 `:NeoAIChat` 重开（新会话）。
+--- 做法（全程 pcall、幂等，不触碰非 NeoAI buffer）：
+---   1. 关闭显示孤儿 buffer 的**非末窗口**（末窗口留待第 2 步替换，避免整标签页被关掉）；
+---   2. 对仍显示孤儿 buffer 的末窗口，切换到干净 buffer（无则新建空 buffer）；
+---   3. 删除全部孤儿 buffer。
+--- @return number 删除的孤儿 buffer 数
+function M.cleanup_session_orphans()
+  local registered = {}
+  local has_live_chat = false
+  for win_id, info in pairs(state.windows) do
+    -- 只统计仍有效的窗口：state.windows 可能残留已失效（被外部关闭）的条目。
+    if vim.api.nvim_win_is_valid(win_id) then
+      if info.buf then registered[info.buf] = true end
+      if info.type == "chat" then has_live_chat = true end
+    end
+  end
+
+  local orphans = {}
+  local orphan_set = {}
+  for _, buf in ipairs(vim.api.nvim_list_bufs()) do
+    if not registered[buf] and _is_neoai_orphan(buf) then
+      -- 有实时聊天窗口时，"NeoAI Input"/"NeoAI Input N" 属于某个实例的输入框
+      -- （未登记在 state.windows），不得当孤儿删除。
+      local base = vim.fn.fnamemodify(vim.api.nvim_buf_get_name(buf), ":t")
+      local is_input = base == "NeoAI Input" or base:match("^NeoAI Input %d+$") ~= nil
+      if not (has_live_chat and is_input) then
+        orphans[#orphans + 1] = buf
+        orphan_set[buf] = true
+      end
+    end
+  end
+  if #orphans == 0 then return 0 end
+
+  -- 1) 关闭显示孤儿 buffer 的窗口：窗口所在标签页还有别的窗口，或存在其它标签页时
+  --    （后者关掉末窗口会连带关掉整个标签页），安全关闭；否则留待第 2 步替换 buffer。
+  local n_tabs = vim.fn.tabpagenr("$")
+  for _, buf in ipairs(orphans) do
+    for _, win in ipairs(vim.api.nvim_list_wins()) do
+      if vim.api.nvim_win_is_valid(win) and vim.api.nvim_win_get_buf(win) == buf then
+        local tab = vim.api.nvim_win_get_tabpage(win)
+        local multi_win = #vim.api.nvim_tabpage_list_wins(tab) > 1
+        if multi_win or n_tabs > 1 then
+          pcall(vim.api.nvim_win_close, win, true)
+        end
+      end
+    end
+  end
+
+  -- 2) 末窗口仍显示孤儿 buffer：换成干净 buffer（避免关掉标签页/退出 nvim）
+  for _, buf in ipairs(orphans) do
+    if vim.api.nvim_buf_is_valid(buf) then
+      for _, win in ipairs(vim.api.nvim_list_wins()) do
+        if vim.api.nvim_win_is_valid(win) and vim.api.nvim_win_get_buf(win) == buf then
+          if vim.fn.exists("&winfixbuf") == 1 then
+            pcall(function() vim.wo[win].winfixbuf = false end)
+          end
+          local repl = _find_replacement_buf(orphan_set) or vim.api.nvim_create_buf(true, false)
+          pcall(vim.api.nvim_win_set_buf, win, repl)
+        end
+      end
+    end
+  end
+
+  -- 3) 删除孤儿 buffer
+  local n = 0
+  for _, buf in ipairs(orphans) do
+    if vim.api.nvim_buf_is_valid(buf) then
+      if pcall(vim.api.nvim_buf_delete, buf, { force = true }) then n = n + 1 end
+    end
+  end
+  return n
 end
 
 --- 重置（测试用）

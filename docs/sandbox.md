@@ -127,11 +127,14 @@
     目录下成千上万文件）只解析一次「最近存在祖先」，不再逐文件 `fnamemodify`/`isdirectory`。
     冻结结果本身已由 `state.materialized` 的签名/版本增量跳过，故「读取+哈希+冻结」过的文件
     在后续命令中不再重复参与计算（实测 3000 暂存文件时该步由 ~16ms 降至 <1ms）。
-    **例外：`.git` 内部路径永不套用「未变快速跳过」**——`.git` 是索引↔对象库↔refs 强耦合数据库，
-    已捕获对象可能因 git 原子组候选被同路径新候选**整组取代**而失去唯一承载候选（旧候选连同其
-    对象一并丢弃）；若此时沿用「未变跳过」，新候选便不再包含该对象，而 index/HEAD 仍引用它 →
-    发布闸门以 `GIT_REFERENTIAL_INTEGRITY` fail-closed 拒绝。故 `.git` 内部每次捕获都重新登记其
-    内容（git 写工具本已强制全量遍历，此处只是不再省去内容读取）。
+    **例外：`.git` 内部路径永不套用任何「未变快速跳过」**——`.git` 是索引↔对象库↔refs 强耦合
+    数据库，已捕获对象可能因 git 原子组候选被同路径新候选**整组取代**而失去唯一承载候选（旧候选
+    连同其对象一并丢弃）；若此时沿用跳过，新候选便不再包含该对象，而 index/HEAD 仍引用它 →
+    发布闸门以 `GIT_REFERENTIAL_INTEGRITY` fail-closed 拒绝。这里的「跳过」含两处：
+    `expected`/dsig 物化签名快速跳过，**以及 `ws_skip`**（overlay 内容等于工作区暂存内容即跳过——
+    前序 git 候选经 `merge_candidate` 写入暂存后，后续 overlay 会从暂存物化出同一对象，二者内容
+    必然相等）。故 `.git` 内部每次捕获都重新登记其内容（git 写工具本已强制全量遍历，此处只是
+    不再省去内容读取）。
   - **写日志增量捕获**（`tools.sandbox.journal_capture`，默认 auto）：用 eBPF 观测到的「本轮
     写入/删除路径」驱动 capture，**只处理这些路径**（`_capture_worker` 路径驱动分支），不再
     全量遍历会话累积的 overlay upper；`_encode_expected`/`_encode_ws` 也按这些路径增量编码。
@@ -541,6 +544,11 @@
       头行与各文件行都映射到**整组**——`<CR>` 通过、`d` 丢弃均作用于整组，禁止逐文件选择性
       应用/丢弃（`apply`/`reject_file` 也强制整组），避免只写索引或只写对象导致损坏。
     - 文件写入工具（`edit_file` 等）以 `.git` 为目标仍直接拒绝（AI 不应直接改仓库内部）。
+    - **只有 git 写类工具可发布 `.git` 指针**：`git_add`/`git_commit`/`git_stash`/`git_restore`/
+      `git_rollback` 之外的任何工具，其候选即使因 `.git` mtime 新鲜被「全量遍历捕获」而看到
+      `.git/index` 等指针变化，那也只是**前置 git 工具遗留在 overlay 的残留**，冻结时一律剔除
+      （仅保留对象库）。否则该候选会写出「引用了尚未物化对象」的悬空指针，被发布闸门以
+      `GIT_REFERENTIAL_INTEGRITY: index -> <oid>` fail-closed 拒绝，令本无问题的工具整单失败。
 - **buffer 写盘工具**（`delete_node` / `lsp_rename` / `lsp_format`）：
   `tool_helpers.persist_buffer` 在沙箱激活时把 `:write!` 重定向到暂存层。**只读不改盘**：
   仅当写类工具**显式**修改过 buffer（`mark_edited`）时才回写；`ensure_buffer` 加载、

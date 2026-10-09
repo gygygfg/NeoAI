@@ -24,8 +24,11 @@ local ROLE_LABELS = {
 
 -- ========== 私有状态 ==========
 
+-- 推理显示开关**按 buffer 独立**（多聊天实例各自独立，互不影响）：
+--   show_by_buf[buf] 显式设置过的取值；缺省回退 default_show（未指定 buffer 的调用/测试）。
 local state = {
-  show_reasoning = true,
+  default_show = true,
+  show_by_buf = {},
 }
 
 --- 取指定 buffer 的共享块缓存（对话模式块键前缀 c:，避免与轨迹模式互相命中）
@@ -33,6 +36,14 @@ local state = {
 --- @return table
 local function _cache_for(buf)
   return incremental.cache_for(buf)
+end
+
+--- 指定 buffer 当前是否显示推理（未显式设置时回退 default_show）。
+--- @param buf number|nil
+--- @return boolean
+local function _show_for(buf)
+  if buf ~= nil and state.show_by_buf[buf] ~= nil then return state.show_by_buf[buf] end
+  return state.default_show
 end
 
 -- ========== 私有函数 ==========
@@ -808,8 +819,10 @@ end
 --- @param marks table 与 lines 并行的元数据数组
 --- @param message table
 --- @param opts table|nil 渲染选项（流式表格）
-local function _append_reasoning(lines, marks, message, opts)
-  local has_reasoning = message.reasoning ~= nil and message.reasoning ~= "" and state.show_reasoning
+--- @param show boolean|nil 是否显示推理（缺省回退全局默认）
+local function _append_reasoning(lines, marks, message, opts, show)
+  if show == nil then show = _show_for(nil) end
+  local has_reasoning = message.reasoning ~= nil and message.reasoning ~= "" and show
   if not has_reasoning then return end
   local rl = markdown_view.render(message.reasoning, opts)
   local rows = {}
@@ -1194,11 +1207,12 @@ end
 --- @param is_turn_end boolean
 --- @param opts table|nil 渲染选项（流式表格）
 --- @param show_header boolean|nil 是否绘制角色头（false 时省略；缺省绘制）
-local function _format_message(lines, marks, message, is_turn_end, opts, show_header)
+--- @param show boolean|nil 是否显示推理（缺省回退全局默认）
+local function _format_message(lines, marks, message, is_turn_end, opts, show_header, show)
   if show_header ~= false then
     _append_role_header(lines, marks, message)
   end
-  _append_reasoning(lines, marks, message, opts)
+  _append_reasoning(lines, marks, message, opts, show)
   _append_content(lines, marks, message, opts)
   if is_turn_end then
     _append_turn_sep(lines, marks)
@@ -1255,10 +1269,12 @@ end
 --- @param opts table|nil
 --- @param turn_end boolean
 --- @param extra table|nil
+--- @param show boolean|nil 推理开关（缺省回退全局默认）
 --- @return string
-local function _sig(opts, turn_end, extra)
+local function _sig(opts, turn_end, extra, show)
+  if show == nil then show = _show_for(nil) end
   local p = {
-    state.show_reasoning and "R" or "-",
+    show and "R" or "-",
     (opts and opts.streaming) and "S" or "-",
     (opts and opts.table_width) or "-",
     turn_end and "T" or "-",
@@ -1279,13 +1295,14 @@ end
 --- @param msgs table
 --- @param opts table|nil
 --- @param prev table|nil 上一轮返回的块数组
+--- @param show boolean|nil 推理开关（缺省回退全局默认）
 --- @return table 块数组 { { key, sig, build } }
-local function _blocks(msgs, opts, prev)
+local function _blocks(msgs, opts, prev, show)
   local blocks = {}
   local n = 0
   local i = 1
   local tw = opts and opts.table_width
-  local show = state.show_reasoning
+  if show == nil then show = _show_for(nil) end
   local streaming = opts and opts.streaming
   -- Agent loop 内同一用户轮次会连续产生多条 assistant 消息（工具调用 → 结果 → 再调用…）。
   -- 角色头 "🤖 AI" 只在本轮第一条 assistant 消息上展示，后续条省略；遇真实用户消息重置。
@@ -1366,7 +1383,7 @@ local function _blocks(msgs, opts, prev)
           in_reslen[k] = pp.res and #(pp.res.content or "") or 0
           in_resdur[k] = pp.res and pp.res.duration_ms or nil
         end
-        local sig = _sig(eopts, turn_end, extra)
+        local sig = _sig(eopts, turn_end, extra, show)
         blocks[n] = {
           key = key,
           sig = sig,
@@ -1378,7 +1395,7 @@ local function _blocks(msgs, opts, prev)
           build = function()
             local lines, marks = {}, {}
             if show_header then _append_role_header(lines, marks, snap) end
-            _append_reasoning(lines, marks, snap, eopts)
+            _append_reasoning(lines, marks, snap, eopts, show)
             _append_content(lines, marks, snap, eopts)
             for _, pp in ipairs(paired) do
               _append_tool_block(lines, marks, pp.tc, pp.res)
@@ -1416,7 +1433,7 @@ local function _blocks(msgs, opts, prev)
         blocks[n] = p
       else
         local sig = _sig(eopts, turn_end, { role, _fingerprint(snap.content), _fingerprint(snap.reasoning),
-          show_header and "H" or "-" })
+          show_header and "H" or "-" }, show)
         blocks[n] = {
           key = key,
           sig = sig,
@@ -1425,7 +1442,7 @@ local function _blocks(msgs, opts, prev)
           in_header = show_header,
           build = function()
             local lines, marks = {}, {}
-            _format_message(lines, marks, snap, turn_end, eopts, show_header)
+            _format_message(lines, marks, snap, turn_end, eopts, show_header, show)
             return { lines = lines, marks = marks }
           end,
         }
@@ -1446,10 +1463,11 @@ end
 --- @param buf number
 --- @param msgs table
 --- @param opts table|nil
+--- @param show boolean|nil 推理开关
 --- @return table
-local function _render_chat_full(buf, msgs, opts)
+local function _render_chat_full(buf, msgs, opts, show)
   local lines, marks = {}, {}
-  for _, b in ipairs(_blocks(msgs, opts)) do
+  for _, b in ipairs(_blocks(msgs, opts, nil, show)) do
     local built = b.build() or {}
     local bl = built.lines or {}
     local bm = built.marks or {}
@@ -1511,12 +1529,13 @@ end
 --- @return table 增量写入结果 { changed, start, removed, inserted, full }
 function M.render_chat(buf, messages, opts)
   local msgs = messages or {}
+  local show = _show_for(buf)
   if not _incremental_enabled() then
-    return _render_chat_full(buf, msgs, opts)
+    return _render_chat_full(buf, msgs, opts, show)
   end
   local cache = _cache_for(buf)
   -- 复用上一轮未变化块的描述符（含 build 闭包），只重算变化块的签名与构建。
-  local blocks = _blocks(msgs, opts, cache.blocks)
+  local blocks = _blocks(msgs, opts, cache.blocks, show)
   cache.blocks = blocks
   local lines, marks = cache:render(blocks)
   if #lines == 0 then
@@ -1556,7 +1575,7 @@ end
 function M.append(buf, message)
   local lines = {}
   local marks = {}
-  _format_message(lines, marks, message, true)
+  _format_message(lines, marks, message, true, nil, nil, _show_for(buf))
   local line_count = vim.api.nvim_buf_line_count(buf)
   vim.api.nvim_buf_set_lines(buf, line_count - 1, -1, false, lines)
   _apply_table_hl(buf, marks, line_count)
@@ -1566,23 +1585,34 @@ function M.append(buf, message)
   M.invalidate(buf)
 end
 
---- 切换推理显示
+--- 切换推理显示（按 buffer 独立；省略 buf 时作用于全局默认，供不涉及具体 buffer 的调用）。
+--- @param buf number|nil
 --- @return boolean 新状态
-function M.toggle_reasoning()
-  state.show_reasoning = not state.show_reasoning
-  return state.show_reasoning
+function M.toggle_reasoning(buf)
+  if buf ~= nil then
+    state.show_by_buf[buf] = not _show_for(buf)
+    return state.show_by_buf[buf]
+  end
+  state.default_show = not state.default_show
+  return state.default_show
 end
 
---- 当前是否显示推理（显示模式插件渲染时读取）
+--- 指定 buffer 当前是否显示推理（显示模式插件渲染时读取；省略 buf 时返回全局默认）。
+--- @param buf number|nil
 --- @return boolean
-function M.is_show_reasoning()
-  return state.show_reasoning
+function M.is_show_reasoning(buf)
+  return _show_for(buf)
 end
 
---- 设置推理显示
+--- 设置推理显示（按 buffer 独立；省略 buf 时设置全局默认）。
 --- @param show boolean
-function M.set_show_reasoning(show)
-  state.show_reasoning = show
+--- @param buf number|nil
+function M.set_show_reasoning(show, buf)
+  if buf ~= nil then
+    state.show_by_buf[buf] = show == true
+  else
+    state.default_show = show == true
+  end
 end
 
 -- ========== 显示模式插件共享工具 ==========
@@ -1614,7 +1644,8 @@ M.helpers = {
 
 --- 重置（测试用）
 function M.reset()
-  state.show_reasoning = true
+  state.default_show = true
+  state.show_by_buf = {}
   incremental.reset()
 end
 

@@ -14,6 +14,7 @@
 - **Scenario-based model configuration** — assign a different AI model and parameters to each scenario (chat, coding, thinking, tool execution, sub-Agent, window naming)
 - **Streaming responses** — display AI output in real time as a stream, including reasoning traces
 - **Tree-based session management** — manage multiple chat sessions as a branch tree, with branch creation, switching, and deletion
+- **Multiple chat instances** — `<leader>ac` / `:NeoAIChat` opens an **independent chat instance in a new tab** (unique buffer name); run several chats at once, each with its own session, streaming output, **its own reasoning / tool-args floats, and its own reasoning-visibility toggle**, while existing instances stay alive
 - **A rich set of built-in tools** — the AI can call 40+ tools for file operations, code analysis, LSP, Shell commands, and more
 - **Tool approval system** — fine-grained control over tool execution permissions, supporting auto-allow / manual approval / argument-level allowlists
 - **Plan mode (PLAN) and plan distillation** — toggle with `m` or `:NeoAIPlan`; the tool context retains only read-only / informational queries plus `run_command` (read-only research) and `ask_user` (no mutating tools are exposed, and no mode-switching tool is given to the AI); after the AI researches and clarifies, it emits a formatted change plan and ends the turn; once the user confirms (`:NeoAIApprovePlan` or manually toggling the mode), NeoAI switches to CHAT and executes the plan automatically, **distilling** the research context gathered during planning into a checkpoint that replaces the compacted range
@@ -116,7 +117,7 @@ require("NeoAI").setup({
 | Command            | Description                                      |
 | ------------------ | ------------------------------------------------ |
 | `:NeoAIOpen`       | Open the main NeoAI UI                           |
-| `:NeoAIChat`       | Open the chat UI                                 |
+| `:NeoAIChat`       | Open an **independent chat instance in a new tab** (new session, unique buffer name; existing instances stay alive) |
 | `:NeoAITree`       | Open the session tree UI                         |
 | `:NeoAIClose`      | Close all NeoAI windows                          |
 | `:NeoAIKeymaps`    | Show the current keymap configuration            |
@@ -144,7 +145,7 @@ require("NeoAI").setup({
 | Keymap       | Description    |
 | ------------ | -------------- |
 | `<leader>aa` | Toggle UI visibility |
-| `<leader>ac` | Open the chat UI   |
+| `<leader>ac` | Open an independent chat instance in a new tab |
 | `<leader>at` | Open the session tree UI |
 | `<leader>aq` | Close all windows  |
 
@@ -247,6 +248,9 @@ require("NeoAI").setup({
     window_mode = "tab",                 -- window mode: float / tab / split
     window = { w_ratio = 0.85, h_ratio = 0.85, border = "rounded" }, -- float window sized by screen ratio; follows resizes; explicit width/height act as caps
     float = { min_width = 24, min_height = 4 }, -- minimum size floor for all floating windows
+    -- Narrow-screen padding (hard-coded, no config): based on the chat main window width, a floating
+    -- window fills the window when width < 40, keeps 5 cols on each side when 40 <= width < 100,
+    -- and stays screen-ratio centered when >= 100.
     split = { size = 80, direction = "right" },
     colors = {                           -- highlight group linked by each element
       background = "Normal", border = "FloatBorder",
@@ -598,6 +602,11 @@ packets from the same `source`, preventing status regressions caused by concurre
 **Display recognition**: when it takes over authority, NeoAI sends one `report-metadata`, so the Herder sidebar/border
 shows `display_agent = "NeoAI"` with localized state labels (`生成中` / `等待确认` / `就绪`) instead of the bare `neoai`
 tag; when the last Agent exits it clears the display metadata before `release-agent`.
+
+**Releasing authority on quit/restart/reload**: besides "last Agent exits", every unload path — **quitting Neovim**,
+`:restart`, `:NeoAIReloadAll` — clears the display metadata and sends `release-agent` before unloading, so Herder
+immediately falls back to screen heuristics and does not retain this session's `working`/`blocked` state. It only
+releases when authority was actually taken over (a non-idle signal was reported), avoiding redundant reports.
 
 **Example reporting flow**:
 

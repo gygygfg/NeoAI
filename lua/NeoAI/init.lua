@@ -140,6 +140,16 @@ function M.setup(user_config)
   -- 关闭时统一卸载插件（释放服务/工具/命令/事件订阅/MCP/UI 注入）
   _register_shutdown_hooks()
 
+  -- 会话恢复残留清理：:restart / -S 载入会话后清掉界面孤儿 buffer。
+  -- 必须在 setup 注册（after/plugin 在部分挂载方式下不会被自动 source）。
+  local ok_cleanup, session_cleanup = pcall(require, "NeoAI.ui.session_cleanup")
+  if ok_cleanup and session_cleanup then
+    local uninstall = session_cleanup.install()
+    if type(uninstall) == "function" then
+      kernel.lifecycle.on_shutdown(uninstall)
+    end
+  end
+
   -- 注册命令/键位占位：首次触发才异步启动插件图
   local lazy = require("NeoAI.plugins.builtin.lazy")
   local lazy_cleanup = lazy.register({

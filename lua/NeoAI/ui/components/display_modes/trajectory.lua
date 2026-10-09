@@ -254,7 +254,8 @@ end
 --- @param marks table 与 lines 并行的元数据数组
 --- @param turn table
 --- @param full boolean|nil true=保存日志：不截断 wire 数据
-local function _append_turn(lines, marks, turn, full)
+--- @param show boolean|nil 是否显示推理（按 buffer 独立；缺省回退全局默认）
+local function _append_turn(lines, marks, turn, full, show)
   lines[#lines + 1] = _header(turn)
   if turn.user then
     lines[#lines + 1] = "  ▸ 用户请求"
@@ -263,6 +264,7 @@ local function _append_turn(lines, marks, turn, full)
     end
   end
   local message_list = require("NeoAI.ui.components.message_list")
+  if show == nil then show = message_list.is_show_reasoning(nil) end
   local entries = turn.entries
   local i, req_seq = 1, 0
   while i <= #entries do
@@ -270,7 +272,7 @@ local function _append_turn(lines, marks, turn, full)
     if msg.role == "assistant" then
       req_seq = req_seq + 1
       lines[#lines + 1] = "  ▸ 请求 #" .. req_seq .. " · ASSISTANT"
-      if message_list.is_show_reasoning() and msg.reasoning and msg.reasoning ~= "" then
+      if show and msg.reasoning and msg.reasoning ~= "" then
         lines[#lines + 1] = "    ▸ 推理"
         _append_raw(lines, msg.reasoning, 3)
       end
@@ -402,13 +404,15 @@ end
 --- 角色/正文/推理/工具调用/耗时、请求与响应元数据、推理开关与 full 标志）。
 --- @param turn table
 --- @param full boolean|nil
+--- @param show boolean|nil 推理开关（按 buffer 独立；缺省回退全局默认）
 --- @return string
-local function _turn_sig(turn, full)
+local function _turn_sig(turn, full, show)
   local message_list = require("NeoAI.ui.components.message_list")
   local fold = require("NeoAI.ui.components.fold")
+  if show == nil then show = message_list.is_show_reasoning(nil) end
   local p = {
     tostring(turn.kind), tostring(turn.index), full and "F" or "-",
-    message_list.is_show_reasoning() and "R" or "-",
+    show and "R" or "-",
   }
   if turn.kind == "system" then
     for _, m in ipairs(turn.sys_msgs or {}) do
@@ -442,12 +446,13 @@ end
 --- 把消息分组为可缓存的渲染块（系统提示词块 + 每个 turn 一块）
 --- @param messages table
 --- @param full boolean|nil
+--- @param show boolean|nil 推理开关（按 buffer 独立）
 --- @return table 块数组 { { key, sig, build } }
-local function _render_blocks(messages, full)
+local function _render_blocks(messages, full, show)
   local blocks = {}
   for _, turn in ipairs(_group_turns(messages)) do
     local snap = turn
-    local sig = _turn_sig(snap, full)
+    local sig = _turn_sig(snap, full, show)
     blocks[#blocks + 1] = {
       key = "t:" .. tostring(snap.index) .. ":" .. tostring(snap.kind),
       sig = sig,
@@ -456,7 +461,7 @@ local function _render_blocks(messages, full)
         if snap.kind == "system" then
           _append_system(lines, snap)
         else
-          _append_turn(lines, marks, snap, full)
+          _append_turn(lines, marks, snap, full, show)
         end
         return { lines = lines, marks = marks }
       end,
@@ -530,7 +535,8 @@ end
 --- @return table 增量写入结果 { changed, start, removed, inserted, full }
 function M.render(buf, messages)
   local cache = incremental.cache_for(buf)
-  local lines = cache:render(_render_blocks(messages, nil))
+  local message_list = require("NeoAI.ui.components.message_list")
+  local lines = cache:render(_render_blocks(messages, nil, message_list.is_show_reasoning(buf)))
   if #lines == 0 then
     -- 空对话占位（与全量渲染一致）
     lines = { "NeoAI 聊天（轨迹模式）", "", "输入消息开始对话。", "" }

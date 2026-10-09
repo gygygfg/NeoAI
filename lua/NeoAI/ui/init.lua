@@ -53,11 +53,12 @@ function M.open_default()
 end
 
 --- 打开聊天界面
+--- @param opts table|nil { session_id?, round?, new_session? } 透传给 chat_view.open
 --- @return table
-function M.open_chat()
+function M.open_chat(opts)
   M.init()
   -- 树窗口保持打开，不自动关闭（可同时浏览会话）
-  return chat_view.open()
+  return chat_view.open(opts)
 end
 
 --- 打开会话树界面

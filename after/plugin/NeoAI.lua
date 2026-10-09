@@ -14,3 +14,8 @@ vim.api.nvim_create_autocmd("VimLeavePre", {
   end,
   desc = "NeoAI: 退出时保存会话并清理资源",
 })
+
+-- ========== 会话恢复残留清理（:restart / -S 载入会话） ==========
+-- 真正的注册在 `NeoAI.ui.session_cleanup.install()`（由 NeoAI.setup() 保证调用）。
+-- 此处仅在 after/plugin 确实被 source 的挂载方式下补一次（幂等，clear=true）。
+pcall(function() require("NeoAI.ui.session_cleanup").install() end)

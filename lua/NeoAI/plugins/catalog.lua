@@ -195,7 +195,9 @@ local function _side_effect_specs()
       end,
       stop = function()
         local herder = services.use("services.herder")
-        if herder then herder.reset() end
+        -- shutdown（而非 reset）：卸载前主动 release-agent，避免退出/重启/热重载后
+        -- Herdr 侧残留 NeoAI 的 working/blocked 状态。
+        if herder then herder.shutdown() end
       end,
     },
   }

@@ -14,6 +14,7 @@
 - **场景化模型配置** — 按场景（聊天、编程、思考、工具执行、子 Agent、窗口命名）分配不同的 AI 模型和参数
 - **流式响应** — 实时流式显示 AI 生成内容，支持推理过程（reasoning）展示
 - **树形会话管理** — 基于分支树管理多个对话会话，支持分支创建、切换、删除
+- **多聊天实例** — `<leader>ac` / `:NeoAIChat` 每次在**新标签页**开一个独立聊天实例（唯一 buffer 名），可同时开多个聊天、各自独立会话与流式输出、**各自独立的思考/接收参数浮窗与推理显示开关**，旧实例保留继续运行、互不顶替
 - **丰富的内置工具** — AI 可调用文件操作、代码分析、LSP、Shell 命令等 40+ 工具
 - **工具审批系统** — 细粒度的工具执行权限控制，支持自动允许/手动审批/参数级别白名单
 - **计划模式（PLAN）与计划蒸馏** — 按 `m` 或 `:NeoAIPlan` 切换，工具上下文只保留只读/信息查询 + `run_command`（只读调研）+ `ask_user`（不暴露任何修改类工具，也不向 AI 提供切换模式的工具）；AI 调研澄清后输出格式化修改计划并结束本轮，由用户确认（`:NeoAIApprovePlan` 或手动切换模式）后转入 CHAT 并按任务清单自动执行，并把计划阶段调研上下文**蒸馏**为检查点替换压缩
@@ -114,7 +115,7 @@ require("NeoAI").setup({
 | 命令               | 描述                                             |
 | ------------------ | ------------------------------------------------ |
 | `:NeoAIOpen`       | 打开 NeoAI 主界面                                |
-| `:NeoAIChat`       | 打开聊天界面                                     |
+| `:NeoAIChat`       | 在**新标签页**打开一个**独立聊天实例**（新会话、唯一 buffer 名；旧实例保留继续运行） |
 | `:NeoAITree`       | 打开会话树界面                                   |
 | `:NeoAIClose`      | 关闭所有 NeoAI 窗口                              |
 | `:NeoAIKeymaps`    | 显示当前键位配置                                 |
@@ -142,7 +143,7 @@ require("NeoAI").setup({
 | 快捷键       | 描述           |
 | ------------ | -------------- |
 | `<leader>aa` | 切换 UI 显示   |
-| `<leader>ac` | 打开聊天界面   |
+| `<leader>ac` | 在新标签页打开独立聊天实例 |
 | `<leader>at` | 打开会话树界面 |
 | `<leader>aq` | 关闭所有窗口   |
 
@@ -244,6 +245,8 @@ require("NeoAI").setup({
     window_mode = "tab",                 -- 窗口模式：float / tab / split
     window = { w_ratio = 0.85, h_ratio = 0.85, border = "rounded" }, -- float 窗口按屏幕比例；resize 实时跟随；显式 width/height 作为上限
     float = { min_width = 24, min_height = 4 }, -- 所有悬浮窗最小尺寸兜底
+    -- 窄屏留白（硬编码，无需配置）：以「聊天主窗口宽度」为基准，宽度 < 40 时浮窗左右占满
+    -- 该窗口；40 ≤ 宽度 < 100 时左右各留 5 格；≥ 100 时维持按屏幕比例居中。
     split = { size = 80, direction = "right" },
     colors = {                           -- 各元素链接的高亮组
       background = "Normal", border = "FloatBorder",
@@ -591,6 +594,12 @@ NeoAI 可以在 **Herder** 管理的 pane 内向 Herder 上报 AI Agent 的真�
 **展示识别**：接管权威时会附带一次 `report-metadata`，令 Herder 侧边栏/边框显示
 `display_agent = "NeoAI"` 与本地化状态文案（`生成中` / `等待确认` / `就绪`），而非裸 `neoai` 标签；
 最后一个 Agent 退出时先清除展示元数据再 `release-agent`，避免残留。
+
+**退出 / 重启 / 热重载释放权威**：除「最后一个 Agent 退出」外，**退出 Neovim**、`:restart`、
+`:NeoAIReloadAll` 等一切卸载路径都会在卸载前主动 `report-metadata --clear-*` +
+`release-agent`，令 Herder 立即回退到屏幕启发式绘制，不再残留本次会话的
+`working`/`blocked` 状态（否则退出后 Herder 侧仍显示「生成中」）。仅在**确实接管过权威**
+（上报过非 idle 信号）时才释放，避免多余上报。
 
 **上报流程示例**：
 

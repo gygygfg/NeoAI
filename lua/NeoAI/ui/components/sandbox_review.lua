@@ -2330,12 +2330,18 @@ function M.open()
   local row = base_geom.row
   local g = state.geom
   if g and type(g.col) == "number" and type(g.row) == "number" then
-    local max_col = math.max(0, vim.o.columns - (g.width or width))
-    local max_row = math.max(0, vim.o.lines - (g.height or height) - 2)
-    col = math.max(0, math.min(g.col, max_col))
-    row = math.max(0, math.min(g.row, max_row))
-    width = math.min(g.width or width, vim.o.columns - 4)
-    height = math.min(g.height or height, vim.o.lines - 4)
+    if geometry.narrow_active() then
+      -- 窄屏留白：宽度/列由基准窗口（聊天主窗口）规则决定，不用旧几何覆盖，
+      -- 否则会「还是原来的大小」；仅恢复纵向位置。
+      row = math.max(0, math.min(g.row, math.max(0, vim.o.lines - height - 2)))
+    else
+      local max_col = math.max(0, vim.o.columns - (g.width or width))
+      local max_row = math.max(0, vim.o.lines - (g.height or height) - 2)
+      col = math.max(0, math.min(g.col, max_col))
+      row = math.max(0, math.min(g.row, max_row))
+      width = math.min(g.width or width, vim.o.columns - 4)
+      height = math.min(g.height or height, vim.o.lines - 4)
+    end
   end
   state.win_id = vim.api.nvim_open_win(state.buf, true, {
     relative = "editor",

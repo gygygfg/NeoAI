@@ -4,12 +4,19 @@
 
 local config_store = require("NeoAI.kernel.config_store")
 
-local M = {}
+-- 多实例：每个聊天实例持有**独立**输入框（各自 buffer/窗口/回调）。由 _make() 闭包工厂构造；
+-- 模块表是「当前输入框」代理（缺省作用于最近创建/聚焦的实例），保持既有 API 与测试兼容。
+local _current = nil
 
--- ========== 私有状态 ==========
+--- 构造一个独立输入框实例。
+--- @return table
+local function _make()
+  local M = {}
 
-local state = {
-  buf = nil, -- 输入 buffer
+  -- ========== 私有状态 ==========
+
+  local state = {
+    buf = nil, -- 输入 buffer
   win_id = nil, -- 输入窗口
   on_submit = nil,
   on_cancel = nil,
@@ -213,6 +220,10 @@ function M.create(opts)
   state.chat_actions = opts.chat_actions
 
   state.buf = opts.buf or vim.api.nvim_create_buf(false, true)
+  -- 给输入 buffer 一个稳定名字，便于会话恢复（:mksession）后识别/清理残留，
+  -- 并在 :ls 中可辨识。nofile + buftype 下改名不会触发 E37/E162。
+  -- pcall 容错：极端情况下重名（如上次会话遗留的孤儿 buffer）失败也不影响输入功能。
+  pcall(vim.api.nvim_buf_set_name, state.buf, "NeoAI Input")
   -- 注意：不设置 buftype=prompt。之前用 prompt buffer 是为了显示 "> " 前缀，但 prompt buffer
   -- 与 nvim-cmp 存在冲突（nvim-cmp 默认 enabled 排除 buftype=prompt，导致插入补全不生效；
   -- 且 prompt 回车回调与插件自定义 <CR> 语义冲突）。这里改成普通可编辑 buffer，用 virt_text
@@ -366,6 +377,30 @@ function M.clear()
   end
 end
 
+--- 销毁输入框：删除输入 buffer 并清空状态（比 reset 更进一步）。
+--- 用于聊天窗口关闭这类「真正结束」场景，避免 nofile 命名 buffer 泄漏到 :ls / 会话恢复。
+--- 单纯收起（collapsed）不要调用本函数——收起必须保留 buffer 内容。
+function M.destroy()
+  local buf = state.buf
+  if buf and vim.api.nvim_buf_is_valid(buf) then
+    -- 若仍被某窗口显示：先解锁 winfixbuf 并切到临时 buffer，避免删除时连带关闭窗口。
+    for _, win in ipairs(vim.api.nvim_list_wins()) do
+      if vim.api.nvim_win_is_valid(win) and vim.api.nvim_win_get_buf(win) == buf then
+        if vim.fn.exists("&winfixbuf") == 1 then
+          pcall(function() vim.wo[win].winfixbuf = false end)
+        end
+        local tmp = vim.api.nvim_create_buf(false, true)
+        pcall(vim.api.nvim_win_set_buf, win, tmp)
+        pcall(vim.api.nvim_buf_delete, tmp, { force = true })
+      end
+    end
+  end
+  M.reset()
+  if buf and vim.api.nvim_buf_is_valid(buf) then
+    pcall(vim.api.nvim_buf_delete, buf, { force = true })
+  end
+end
+
 --- 重置（测试用）
 function M.reset()
   for _, unsub in ipairs(state.unsubs) do
@@ -387,6 +422,52 @@ function M.reset()
   state.on_quit = nil
   state.chat_actions = nil
   state.submitting = false
+end
+
+  return M
+end
+
+-- ========== 模块级：当前输入框代理（兼容既有调用 / 测试） ==========
+
+local M = {}
+
+--- 新建一个独立输入框实例，并设为「当前」。
+--- @return table
+function M.new()
+  local inst = _make()
+  _current = inst
+  return inst
+end
+
+--- 直接指定「当前」输入框实例（由聚焦聊天实例调用）。
+--- @param inst table
+function M._set_current(inst)
+  if inst then _current = inst end
+end
+
+--- 获取当前输入框实例（缺省惰性建一个默认实例，兼容不涉及多实例的既有调用/测试）。
+--- @return table
+local function _cur()
+  if not _current then _current = _make() end
+  return _current
+end
+
+--- 获取当前输入框实例。
+--- @return table|nil
+function M._instance()
+  return _current
+end
+
+-- 透传方法：作用于「当前」输入框实例（无则惰性建默认实例，保持既有 API 与测试兼容）。
+for _, name in ipairs({
+  "create", "attach_window", "get_buf", "get_win", "get_enter_callback",
+  "focus", "set_on_submit", "set_on_cancel", "submit", "on_submitted",
+  "cancel", "clear", "destroy", "reset",
+}) do
+  M[name] = function(...)
+    local cur = _cur()
+    if cur and type(cur[name]) == "function" then return cur[name](...) end
+  end
 end
 
 return M

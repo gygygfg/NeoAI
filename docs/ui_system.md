@@ -12,10 +12,11 @@
 | --- | --- |
 | `ui/init.lua` | UI 入口：初始化（注册审批/提问/子Agent监控 UI）、`open_default`/`open_chat`/`open_tree`/`close_all`、键位显示。 |
 | `ui/window/manager.lua` | 窗口管理器：`float` / `tab` / `split` 三种模式创建/关闭/聚焦；禁用 LSP 挂载与行号/符号列。 |
-| `ui/window/chat_view.lua` | 聊天视图：绑定事件、流式更新、折叠、悬浮窗调度、输入框联动、后台收起/恢复、显示模式宿主。 |
+| `ui/window/chat_view.lua` | 聊天视图（**支持多实例**，见 §4.0）：绑定事件、流式更新、折叠、悬浮窗调度、输入框联动、后台收起/恢复、显示模式宿主。 |
 | `ui/window/tree_view.lua` | 会话树视图：分支树展示与 CRUD。 |
 | `ui/components/*` | 可复用组件（见下）。 |
-| `ui/geometry.lua` | 浮窗几何计算：按屏幕**相对比例**推导浮窗宽高与居中/贴边位置，避免硬编码像素尺寸。`compute{ w_ratio, h_ratio, fit_h, min_w, max_w, min_h, max_h, margin, anchor, row }` → `{ width, height, col, row }`。内置全局最小尺寸兜底（`ui.float.min_width/min_height`，默认 24/4），并提供 `track/untrack/refresh/reset`：已登记的浮窗在编辑器窗口 resize（`VimResized`）时实时重算尺寸与位置跟随（流式窗可用自定义 `apply` 保留内容自适应高度）。 |
+| `ui/geometry.lua` | 浮窗几何计算：按屏幕**相对比例**推导浮窗宽高与居中/贴边位置，避免硬编码像素尺寸。`compute{ w_ratio, h_ratio, fit_h, min_w, max_w, min_h, max_h, margin, anchor, row, narrow }` → `{ width, height, col, row }`。内置全局最小尺寸兜底（`ui.float.min_width/min_height`，默认 24/4），并提供 `track/untrack/refresh/reset`：已登记的浮窗在编辑器窗口 resize（`VimResized`）时实时重算尺寸与位置跟随（流式窗可用自定义 `apply` 保留内容自适应高度）。另支持**窄屏留白**（见 §2.1）。 |
+| `ui/session_cleanup.lua` | 会话恢复残留清理：`:restart`/`-S` 后清掉界面孤儿 buffer（见 §4.9）。 |
 | `ui/keymap.lua` | 键位注册（`register_context`）与展示。 |
 
 ## 2. 窗口管理（manager.lua）
@@ -23,10 +24,32 @@
 支持三种窗口模式（`ui.window_mode`）：`float` / `tab` / `split`。
 
 - `create(window_type, opts)`：创建窗口，设置 `filetype`（`neoai`），命名 buffer（`NeoAI Chat` / `NeoAI Sessions`），
-  触发 `WINDOW_OPENED`。
+  触发 `WINDOW_OPENED`。（输入框 buffer 由 `input_box` 命名为 `NeoAI Input`。）
+- `cleanup_session_orphans()`：清理 `:restart` / `-S` 会话恢复带入的**界面孤儿 buffer**（详见 §4.9）。
 - **禁用 LSP**：`_disable_lsp` 把 buffer 设为 `buftype=nofile`、设 `b:copilot_disabled`/`b:copilot_disable`，
   并通过 `LspAttach` 兜底拦截（打 `b:neoai_ui` 标记），任何 LSP 客户端（含 Copilot）试图挂载时立即解绑。
 - **统一窗口配置**：关闭 `number`/`relativenumber`/`signcolumn`/`foldcolumn`/`list`/`colorcolumn`/`spell`。
+
+### 2.1 浮窗窄屏留白（geometry.lua）
+
+浮窗默认按整屏比例居中，窗口较窄时会显得贴边、左右比例失衡。为此 `geometry` 引入**基准窗口**
+（`set_narrow_base(win)` / `clear_narrow_base()`，由 `chat_view` 在 open/close 登记/清除聊天主窗口）。
+`compute` 依基准窗口宽度 `base_w`（屏幕坐标左列 `base_col`）分档（阈值/留白先硬编码）：
+
+| 基准窗口宽度 | 浮窗宽度 | 浮窗左列 |
+| --- | --- | --- |
+| `< 40` | `base_w`（左右占满窗口） | `base_col` |
+| `40 ≤ base_w < 100` | `base_w - 10`（左右各留 5 格） | `base_col + 5` |
+| `≥ 100` | 维持现状：`floor(cols * w_ratio)` 居中 | 相对**屏幕**居中 |
+
+- 仅当存在有效基准窗口且 `base_w < 100` 时生效；否则维持原「相对屏幕」逻辑（无回归）。
+- 窄屏两档**跳过全局 `min_w`**（否则 `base_w-10` 可能被抬超基准窗口），仍受 `max_w` 与
+  `base_w` 约束，并把 `col` 钳到窗口/屏幕范围内。
+- `compute` 新增 `opts.narrow`（默认 true）；NeoAI 主界面窗口（`manager._open_float` 的 chat/tree）
+  传 `narrow = false`，不受该规则影响。
+- `refresh()`（`VimResized`）重算时会重新解析基准窗口宽度，实时跟随。
+- 各浮窗组件（流式窗/推理面板/审批/提问/模型选择/网络同意/密钥告警/子 Agent 坞/终端/轨迹弹窗等）
+  经 `geometry.compute` 统一生效，无需逐个改动。
 
 ## 3. UI 初始化（ui/init.lua）
 
@@ -39,6 +62,39 @@
 `open_default()` 按 `ui.default_view`（chat/tree）打开对应界面。
 
 ## 4. 聊天视图（chat_view.lua）
+
+### 4.0 多聊天实例
+
+同一 nvim 内可并存**多个独立聊天实例**：`<leader>ac` / `:NeoAIChat` 每次在**新标签页**开一个
+新实例，使用唯一 buffer 名（`NeoAI Chat`、`NeoAI Chat 2`…；输入框 `NeoAI Input`、`NeoAI Input 2`…），
+旧实例**保留并继续运行**（各自事件订阅/会话/流式输出），互不顶替、不共享名称。
+
+实现：`chat_view.lua` 的整个函数体是一个**闭包工厂** `_make_instance()`（工厂内的 `M` 是**实例 API**，
+既有 `M.xxx` 自引用天然指向实例）；文件末尾的模块表是**实例管理器**：
+
+- `open(opts)`：默认复用**当前聚焦**实例；`opts.new_window=true` 时新建实例（新标签页）。
+- `open_new(opts)`：直接新建实例（分配唯一 id 与唯一 buffer 名）。
+- `close()` / `close_all()`：关闭当前实例 / 全部实例。
+- `has_window()`：任一实例存活即为真；`refresh`/`flush`/`set_display` 等透传方法作用于当前实例。
+- **焦点路由** `_note_focus(id)`：`WinEnter`/`BufEnter` 命中某实例窗口时，登记
+  `input_box._set_current(inst)`、`geometry.set_narrow_base(win)`、`display_modes.attach(host)`，
+  并 `chat_service.set_current_agent(agent_id)`，使既有 `get_current_agent()` / 状态栏 / 审批
+  自动落到聚焦实例。
+- `input_box.lua` 同法工厂化；模块表是「当前输入框」代理（无实例时惰性建默认实例，
+  兼容不涉及多实例的既有调用与单测）。关联单体（`reasoning_panel`/`tool_args_panel`/
+  `float_stream_window`/`display_modes`/`geometry` 基准）为**共享单例**，只服务当前聚焦实例。
+- **每实例独立流式浮窗**：`float_stream_window` / `reasoning_panel` / `tool_args_panel` 均已
+  工厂化（`.new()`）；chat_view 在每个实例内建一套（三者共享该实例的一个浮动窗口，互斥复用），
+  各实例的思考/接收参数/上下文压缩浮窗**互不干扰**（关闭一个不影响另一个）。`tool_args_panel`
+  的增量进度 `seen` 亦为每实例独立。模块表是「当前」代理（缺省惰性建一个默认实例），
+  `_on_focus` 同步其 current；关闭实例**总是**关掉其自身浮窗（避免泄漏）。
+- **推理显示开关按 buffer 独立**：`message_list` 的 `show_reasoning` 由全局改为
+  `state.show_by_buf[buf]`（缺省回退 `default_show`）；`toggle/is/set_show_reasoning` 接可选
+  `buf`，渲染按目标 buffer 解析，`trajectory` 显示模式按 host buffer 读取。一个实例切换推理
+  显示不影响别的实例。
+- augroup 名按实例唯一（`NeoAIChatFocus_<id>` / `NeoAIChatResize_<id>` / `NeoAIInputHeight_<id>`），
+  避免多实例互相 `clear`。
+- 保护复用语义：`reload_all` / 树选会话 / `toggle_ui` 走默认 `open()`（复用当前实例，不新建）。
 
 ### 4.1 布局
 
@@ -160,7 +216,8 @@
 主体与输入框共用一套 chat 上下文键位（`_build_chat_actions`）。`input_box` 用 `virt_text` 渲染 `> `
 前缀（不用 `buftype=prompt`，避免与 nvim-cmp 冲突），并放开 `neoai_input` filetype 的补全。
 `attach_window` 会用 `'winfixbuf'`（Neovim 0.10+，`pcall` 兼容旧版）**锁定输入窗口**：输入 buffer 是
-无名 `nofile` 暂存 buffer，若允许在输入窗口执行 `:e <file>` / `:bnext` 等，该窗口会**复用输入 buffer**
+`nofile` 暂存 buffer（命名为 `NeoAI Input`，便于会话恢复识别/清理），若允许在输入窗口执行
+`:e <file>` / `:bnext` 等，该窗口会**复用输入 buffer**
 （`buftype` 变空、内容被文件名替换），此后输入落进用户文件、`:wq` 误保存。
 
 为避免把底层的 `E1513`（Cannot switch buffer）直接抛给用户，`chat_view` 另在高层用 `CmdlineLeave`
@@ -218,6 +275,34 @@ NeoAI 的聊天/输入框/悬浮窗等都是纯 UI 文本，若 LSP 客户端（
 - `LspAttach` 兜底：对 NeoAI buffer 上延迟/异步挂载的客户端 schedule 解绑。
 
 由 `ui.init` 安装、`ui.reset` 卸载（幂等，可热重载）。
+
+### 4.9 会话恢复残留清理（ui/session_cleanup.lua）
+
+`:restart` 会先 `:mksession` 存会话、`:qall` 退出、再以同 argv 重启并恢复会话；`sessionoptions`
+默认含 `blank,buffers`，于是聊天主 buffer / 输入框 buffer 会作为 `nofile` 暂存 buffer 被一起保存、
+恢复。但恢复出来的只是「壳」：Lua 侧窗口句柄与状态都随进程丢失，形成**界面孤儿 buffer**——
+既占用 `NeoAI Chat` / `NeoAI Input` 等名字（导致新建聊天 buffer 的 `nvim_buf_set_name` 静默失败、
+跳到该 buffer 时输入框不打开），又让界面看起来「没关干净」。手动 `nvim -S session.vim` 同理。
+
+`ui/session_cleanup.install()`（由 `NeoAI.setup()` 调用）在：
+
+- **`SessionLoadPost`**（会话载入后）与
+- **`VimEnter` 且 `v:startreason ~= "normal"`**（`:restart` / `-S` 兜底）
+
+两个时机 `vim.schedule` 延迟一拍调用 `manager.cleanup_session_orphans()`：识别 `filetype` 以
+`neoai` 开头、或 basename 命中 `NeoAI Chat` / `NeoAI Sessions` / `NeoAI Input` / `NeoAI-<数字>`
+的**无主** buffer（跳过 `state.windows` 登记的有效窗口 buffer，以及有实时聊天窗口时的
+`NeoAI Input`），安全关窗 + `nvim_buf_delete(force)`，全程 `pcall`、幂等、不触碰非 NeoAI buffer。
+效果：重启后聊天界面完全关闭，用户需显式 `:NeoAIChat` 重开（新会话）。
+
+同时定义 `_G.NeoAIFoldExpr` 兜底桩（返回 0），避免恢复出的窗口 `foldexpr=v:lua.NeoAIFoldExpr()`
+在重绘首帧报错（`chat_view.open` 会用真实实现覆盖）。
+
+> 注册点必须在 `NeoAI.setup()`：实测（Neovim 0.12 + `vim.opt.rtp:prepend` 挂载）`after/plugin`
+> 目录不会被自动 source，`after/plugin/NeoAI.lua` 只作幂等补充。
+
+`chat_view.open()` 在新建窗口分支也会先做一次清理（兜底同名冲突），`close()` 连带删除输入 buffer
+（`input_box.destroy()`），避免 `nofile` 命名 buffer 泄漏。
 
 ## 5. 显示模式（display_modes）
 

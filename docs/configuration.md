@@ -137,6 +137,10 @@ context_cache = {
 | `trajectory` | `{log_dir=".../NeoAI/logs"}` | 轨迹显示模式的日志保存目录 |
 | `statusline` | `{enabled=true, winbar=true, parts={mode,model,usage,cache,capacity,sandbox}, separator=" ", colors=...}` | lualine 状态栏；`sandbox` 段在沙箱待审数 > 0 时显示 `待审N`（`N` 为待审**文件**总数，审批单位为单个文件），默认链接醒目高亮组 `NeoAISandboxPending`（黄底加粗，可在 `colors.sandbox` 覆盖）；待审队列含 **L3（高危）** 时该段追加 `⚠危险` 并切换为红色危险高亮组 `NeoAISandboxDanger`（可在 `colors.sandbox_danger` 覆盖）；存在**越界访问留痕**时该段追加 `越界N`（`N` 为去重文件数，两者都有时并列显示，如 `待审2 越界3`） |
 
+> **窄屏浮窗留白（无需配置）**：以「聊天主窗口宽度」为基准，宽度 `< 40` 时浮窗左右占满该窗口、
+> `40 ≤ 宽度 < 100` 时左右各留 5 格、`≥ 100` 时维持按屏幕比例居中。阈值 `40/100` 与留白 `5`
+> 目前硬编码在 `ui/geometry.lua`；如需自定义可后续暴露为 `ui.float.narrow_*`。
+
 ### 2.3 `keymaps`
 
 | 分区 | 说明 |

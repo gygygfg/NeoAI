@@ -17,7 +17,8 @@ function M.run(action)
   local ui = services.use("services.ui")
   if not ui then return nil end
   if action == "open_chat" then
-    return ui.open_chat()
+    -- 每次显式打开都另起新会话（与 :NeoAIChat 行为一致）。
+    return ui.open_chat({ new_session = true })
   elseif action == "open_tree" then
     return ui.open_tree()
   elseif action == "close_all" then

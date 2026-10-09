@@ -13,10 +13,11 @@
 | --- | --- |
 | `ui/init.lua` | UI entry point: initialization (registers approval/questioning/sub-agent monitoring UIs), `open_default`/`open_chat`/`open_tree`/`close_all`, keymap display. |
 | `ui/window/manager.lua` | Window manager: create/close/focus for the three modes `float` / `tab` / `split`; disables LSP attachment and line numbers/sign columns. |
-| `ui/window/chat_view.lua` | Chat view: binds events, streaming updates, folds, floating window scheduling, input box linkage, background collapse/restore, display mode host. |
+| `ui/window/chat_view.lua` | Chat view (**supports multiple instances**, see §4.0): binds events, streaming updates, folds, floating window scheduling, input box linkage, background collapse/restore, display mode host. |
 | `ui/window/tree_view.lua` | Session tree view: branch tree display and CRUD. |
 | `ui/components/*` | Reusable components (see below). |
-| `ui/geometry.lua` | Floating-window geometry: derives width/height and centering/anchoring from **screen-relative ratios**, avoiding hard-coded pixel sizes. `compute{ w_ratio, h_ratio, fit_h, min_w, max_w, min_h, max_h, margin, anchor, row }` → `{ width, height, col, row }`. |
+| `ui/geometry.lua` | Floating-window geometry: derives width/height and centering/anchoring from **screen-relative ratios**, avoiding hard-coded pixel sizes. `compute{ w_ratio, h_ratio, fit_h, min_w, max_w, min_h, max_h, margin, anchor, row, narrow }` → `{ width, height, col, row }`. Also supports **narrow-screen padding** (see §2.1). |
+| `ui/session_cleanup.lua` | Session-restore residue cleanup: clears orphan UI buffers after `:restart`/`-S` (see §4.9). |
 | `ui/keymap.lua` | Keymap registration (`register_context`) and display. |
 
 ## 2. Window Management (manager.lua)
@@ -29,6 +30,24 @@ Supports three window modes (`ui.window_mode`): `float` / `tab` / `split`.
   and applies a catch-all interception via `LspAttach` (tagging with `b:neoai_ui`), so any LSP client (including Copilot) is immediately detached when it tries to attach.
 - **Unified window config**: disables `number`/`relativenumber`/`signcolumn`/`foldcolumn`/`list`/`colorcolumn`/`spell`.
 
+### 2.1 Narrow-screen padding (geometry.lua)
+
+Floating windows are screen-ratio centered by default; on a narrow window they look edge-hugging and unbalanced.
+`geometry` therefore supports a **base window** (`set_narrow_base(win)` / `clear_narrow_base()`, registered/cleared by
+`chat_view` on open/close using the chat main window). `compute` branches on the base width `base_w` (screen-coord left
+column `base_col`); thresholds/padding are currently hard-coded:
+
+| base width | float width | float col |
+| --- | --- | --- |
+| `< 40` | `base_w` (fills the window) | `base_col` |
+| `40 ≤ base_w < 100` | `base_w - 10` (5 cols each side) | `base_col + 5` |
+| `≥ 100` | current behavior: `floor(cols * w_ratio)`, centered | centered on the **screen** |
+
+- Applies only when a valid base window exists and `base_w < 100`; otherwise the original screen-relative logic is used.
+- The two narrow branches **skip the global `min_w`**, remain bounded by `max_w`/`base_w`, and clamp `col` into range.
+- `compute` gains `opts.narrow` (default true); NeoAI main windows (`manager._open_float` chat/tree) pass `narrow = false`.
+- `refresh()` (`VimResized`) re-reads the base window width, tracking live.
+
 ## 3. UI Initialization (ui/init.lua)
 
 `M.init()` is idempotent and registers three kinds of UI implementations:
@@ -40,6 +59,48 @@ Supports three window modes (`ui.window_mode`): `float` / `tab` / `split`.
 `open_default()` opens the corresponding view according to `ui.default_view` (chat/tree).
 
 ## 4. Chat View (chat_view.lua)
+
+### 4.0 Multiple chat instances
+
+A single nvim can host **multiple independent chat instances**: `<leader>ac` / `:NeoAIChat` opens a
+new instance **in a new tab** with a unique buffer name (`NeoAI Chat`, `NeoAI Chat 2`, …; the input
+box `NeoAI Input`, `NeoAI Input 2`, …). Existing instances **stay alive** (their own event
+subscriptions / sessions / streaming output) — nothing is replaced and no names are shared.
+
+Implementation: the whole body of `chat_view.lua` is a **closure factory** `_make_instance()` (the
+`M` inside the factory is the **instance API**, so existing `M.xxx` self-references point at the
+instance); the module table at the end is the **instance manager**:
+
+- `open(opts)`: reuses the **current focused** instance by default; `opts.new_window=true` creates a
+  new instance (new tab).
+- `open_new(opts)`: creates an instance directly (unique id + unique buffer name).
+- `close()` / `close_all()`: close the current instance / all instances.
+- `has_window()`: true if any instance is alive; passthrough methods (`refresh`/`flush`/`set_display`,
+  …) act on the current instance.
+- **Focus routing** `_note_focus(id)`: when `WinEnter`/`BufEnter` hits an instance's window, it
+  registers `input_box._set_current(inst)`, `geometry.set_narrow_base(win)`,
+  `display_modes.attach(host)`, and `chat_service.set_current_agent(agent_id)`, so existing
+  `get_current_agent()` / statusline / approval automatically follow the focused instance.
+- `input_box.lua` is factory-ized the same way; its module table is a "current input box" proxy
+  (lazily creating a default instance when none exists, for compatibility with existing callers and
+  unit tests). Shared singletons (`reasoning_panel`/`tool_args_panel`/`float_stream_window`/
+  `display_modes`/the `geometry` base) serve only the focused instance.
+- **Per-instance streaming floats**: `float_stream_window` / `reasoning_panel` / `tool_args_panel`
+  are factory-ized (`.new()`); chat_view builds one set per instance (the three share that
+  instance's single float window, reused mutually exclusively), so each instance's reasoning /
+  tool-args / context-op floats are fully independent (closing one never affects another).
+  `tool_args_panel`'s incremental `seen` progress is per-instance too. The module table is a
+  "current" proxy (lazily creating a default instance); `_on_focus` syncs its current; closing an
+  instance **always** closes its own floats (no leak).
+- **Reasoning-visibility toggle is per-buffer**: `message_list`'s `show_reasoning` moved from a
+  global flag to `state.show_by_buf[buf]` (falling back to `default_show`);
+  `toggle/is/set_show_reasoning` take an optional `buf`, rendering resolves it for the target
+  buffer, and the `trajectory` display mode reads it for its host buffer. Toggling in one instance
+  does not affect another.
+- Augroup names are per-instance (`NeoAIChatFocus_<id>` / `NeoAIChatResize_<id>` /
+  `NeoAIInputHeight_<id>`), so instances never `clear` each other.
+- Reuse semantics preserved: `reload_all` / tree session selection / `toggle_ui` use the default
+  `open()` (reuse the current instance, never create).
 
 ### 4.1 Layout
 
@@ -254,6 +315,32 @@ Copilot). `ui/lsp_guard` intercepts uniformly:
 - `LspAttach` fallback: schedules detach for clients that attach to a NeoAI buffer late/asynchronously.
 
 Installed by `ui.init` and removed by `ui.reset` (idempotent, hot-reload friendly).
+
+### 4.9 Session-restore residue cleanup (ui/session_cleanup.lua)
+
+`:restart` runs `:mksession`, `:qall`, then restarts with the same argv and restores the session; `sessionoptions`
+includes `blank,buffers` by default, so the chat main buffer / input buffer are saved and restored as `nofile` scratch
+buffers. But the restored ones are mere shells — the Lua-side window handles/state are gone with the process, leaving
+**orphan UI buffers** that occupy names like `NeoAI Chat` / `NeoAI Input` (making the new chat buffer's
+`nvim_buf_set_name` silently fail, and the input box not open when jumping to that buffer) and make the UI look
+"not closed". Manual `nvim -S session.vim` behaves the same.
+
+`ui/session_cleanup.install()` (called by `NeoAI.setup()`) schedules, on **`SessionLoadPost`** and on
+**`VimEnter` with `v:startreason ~= "normal"`**, a `vim.schedule` call to `manager.cleanup_session_orphans()`: it
+recognizes **ownerless** buffers whose `filetype` starts with `neoai` or whose basename is `NeoAI Chat` /
+`NeoAI Sessions` / `NeoAI Input` / `NeoAI-<n>` (skipping buffers of valid windows in `state.windows`, and
+`NeoAI Input` while a live chat window exists), safely closes their windows and `nvim_buf_delete(force)` — all
+`pcall`-wrapped, idempotent, never touching non-NeoAI buffers. Result: after a restart the chat UI is fully closed and
+the user must explicitly `:NeoAIChat` (new session).
+
+It also defines the `_G.NeoAIFoldExpr` fallback stub (returns 0) so a restored window's
+`foldexpr=v:lua.NeoAIFoldExpr()` does not error on the first repaint (overwritten by `chat_view.open`).
+
+> Registration must live in `NeoAI.setup()`: measured on Neovim 0.12 + `vim.opt.rtp:prepend`, `after/plugin` is NOT
+> auto-sourced; `after/plugin/NeoAI.lua` only adds an idempotent supplement.
+
+`chat_view.open()` also cleans up first in its create branch (to guard against name clashes), and `close()` deletes the
+input buffer (`input_box.destroy()`) to avoid leaking the named `nofile` buffer.
 
 ## 5. Display Modes (display_modes)
 

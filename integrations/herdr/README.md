@@ -18,6 +18,11 @@ NeoAI 走的是第 2 条：Neovim 插件内的
 pane 级状态（`blocked > working > idle`），带严格递增 `--seq` 上报（seq 以挂钟微秒为基数，插件热重载 / 重开 nvim 后不回退）；并在接管权威时附带一次
 `report-metadata`（`--display-agent NeoAI` + 中文状态文案），让 Herdr 侧边栏显示 **NeoAI** 而非裸 `neoai` 标签。
 
+**释放权威**：最后一个 Agent 退出、或**退出 Neovim / `:restart` / `:NeoAIReloadAll`** 等卸载路径，
+都会先 `report-metadata --clear-*` 再 `release-agent`，令 Herdr 立即回退到屏幕启发式绘制，
+不残留本次会话的 `working`/`blocked` 状态（实现见 `herder.shutdown()`，由 `plugins` 卸载时调用）。
+仅当**确实接管过权威**时才释放，避免多余上报。
+
 ### 为什么没有「检测清单（manifest）」
 
 Herdr 支持本地清单覆盖：`~/.config/herdr/agent-detection/<id>.toml`。实测结论：

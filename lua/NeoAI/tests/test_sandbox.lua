@@ -520,6 +520,53 @@ tests.suite("sandbox", function(_, it)
     vim.fn.delete(dir, "rf")
   end)
 
+  it("git 变更：git_add 未应用即被 git_commit 取代，应用 commit 不悬空（回归）", function(t)
+    -- 回归：git_add 候选被 git_commit 整组取代（对象随旧候选丢弃），但 commit 的 index 仍引用
+    -- git_add 产生的 blob。若捕获从暂存物化的对象时走 ws_skip 漏登记，发布闸门会以
+    -- GIT_REFERENTIAL_INTEGRITY 拒绝整单（用户报告的应用失败）。
+    local runtime = require("NeoAI.sandbox.runtime")
+    if runtime.backend() ~= "bwrap" then return end
+    if vim.fn.executable("git") ~= 1 then return end
+    local fs = require("NeoAI.utils.fs")
+    local sandbox = require("NeoAI.sandbox")
+    local dir = vim.fn.tempname()
+    fs.ensure_dir(dir)
+    fs.write_file(dir .. "/a.txt", "hello\n")
+    vim.fn.system({ "git", "-C", dir, "init", "-q" })
+    vim.fn.system({ "git", "-C", dir, "config", "user.email", "t@t" })
+    vim.fn.system({ "git", "-C", dir, "config", "user.name", "t" })
+    local prev = vim.fn.getcwd()
+    vim.fn.chdir(dir)
+    with_config({ tools = { approval = { mode = "async" }, sandbox = { mode = "dry_run", review = { enabled = true } } } }, function()
+      sandbox.reset()
+      local function run(tool, args)
+        local done = false
+        require("NeoAI.tools").execute(tool, args, {}):then_(function() done = true end, function() done = true end)
+        t.true_(vim.wait(30000, function() return done end, 50), tool .. " 应完成")
+        t.true_(vim.wait(30000, function() return not sandbox.postprocess_pending() end, 50), "后处理应完成")
+      end
+      -- git_add 只入待审、不应用；git_commit 整组取代 git_add（其对象随之被丢弃）。
+      run("git_add", { all = true, description = "t" })
+      run("git_commit", { message = "c1", description = "t" })
+      local applied = false
+      for _, item in ipairs(sandbox.list_reviews({ review_state = "PENDING" })) do
+        if item.tool == "git_commit" then
+          local res = sandbox.apply(item.change_set_id, { auto_approve = true })
+          t.true_(res.ok, "应用 git_commit 应成功: " .. tostring(res and res.reason))
+          t.eq("COMMITTED", res.state, "应提交成功")
+          applied = true
+        end
+      end
+      t.true_(applied, "应存在待审的 git_commit")
+      -- 真实 .git 应保持一致：fsck 不报告缺失对象/无法读取。
+      local out = vim.fn.system({ "git", "-C", dir, "fsck", "--no-progress", "--strict" })
+      t.true_(out:find("missing") == nil, "fsck 不应报告 missing: " .. tostring(out))
+      t.true_(out:find("unable to read") == nil, "fsck 不应报告 unable to read: " .. tostring(out))
+    end)
+    vim.fn.chdir(prev)
+    vim.fn.delete(dir, "rf")
+  end)
+
   it("git 原子发布顺序：对象先于指针（对象已存在时幂等跳过）", function(t)
     local candidate = require("NeoAI.sandbox.candidate")
     local dir = vim.fn.tempname()
@@ -2168,7 +2215,8 @@ tests.suite("sandbox", function(_, it)
     local exec = require("NeoAI.sandbox.exec")
     with_config({ tools = { sandbox = { mode = "dry_run", review = { enabled = true } } } }, function()
       sandbox.reset()
-      local dir = (vim.fn.stdpath("cache") .. "/NeoAI/tests_exec_stage"):gsub("/+$", "")
+      -- 暂存根必须可被捕获：不能位于 `<cache>/NeoAI`（自身运行时，捕获阶段整棵排除）。
+      local dir = vim.fn.tempname()
       vim.fn.mkdir(dir, "p")
       local real_file = dir .. "/out.txt"
       pcall(os.remove, real_file)
@@ -2326,7 +2374,8 @@ tests.suite("sandbox", function(_, it)
     local exec = require("NeoAI.sandbox.exec")
     with_config({ tools = { sandbox = { mode = "dry_run", review = { enabled = true }, max_file_bytes = 1024 } } }, function()
       sandbox.reset()
-      local dir = (vim.fn.stdpath("cache") .. "/NeoAI/tests_exec_big"):gsub("/+$", "")
+      -- 暂存根必须可被捕获：不能位于 `<cache>/NeoAI`（自身运行时，捕获阶段整棵排除）。
+      local dir = vim.fn.tempname()
       vim.fn.mkdir(dir, "p")
       local small = dir .. "/small.txt"
       local big = dir .. "/big.bin"
@@ -2574,6 +2623,108 @@ tests.suite("sandbox", function(_, it)
       candidate.cleanup(a2.attempt_id)
       vim.fn.delete(dir, "rf")
       vim.fn.delete(base, "rf")
+    end)
+  end)
+
+  it("捕获：从暂存物化的 .git 对象仍重登记（防 ws_skip 丢对象→悬空引用）", function(t)
+    -- 回归：git_add 候选冻结后 merge 进工作区暂存；后续 git_commit 从暂存物化出同一对象，
+    -- 此时 overlay 内容与暂存内容相等。若走 ws_skip（内容一致即跳过）会漏登记该对象——而
+    -- git_add 候选已被 git_commit 整组取代（对象随旧候选一并丢弃），新候选的 index 仍引用它，
+    -- 发布闸门以 GIT_REFERENTIAL_INTEGRITY 拒绝。故 `.git` 内部路径也必须绕过 ws_skip。
+    local fs = require("NeoAI.utils.fs")
+    local sandbox = require("NeoAI.sandbox")
+    local candidate = require("NeoAI.sandbox.candidate")
+    local control = require("NeoAI.sandbox.control")
+    local store = require("NeoAI.sandbox.store")
+    with_config({ tools = { sandbox = { workspace_root = vim.fn.tempname() .. "/sb" } } }, function()
+      sandbox.reset()
+      local dir = fs.canonical(vim.fn.tempname())
+      fs.ensure_dir(dir)
+      local base = vim.fn.tempname()
+      local obj_rel = ".git/objects/ab/" .. string.rep("c", 38)
+
+      -- attempt 1（git_add）：overlay 新写对象 → 捕获 → 候选 → merge 进工作区暂存。
+      local upper1 = base .. "/upper1"
+      fs.ensure_dir(vim.fn.fnamemodify(upper1 .. "/" .. obj_rel, ":h"))
+      fs.write_file(upper1 .. "/" .. obj_rel, "blob-bytes")
+      local a1 = control.new_attempt("git_add", {}, {}, { effect = "process" })
+      candidate.begin(a1, store.root())
+      local d1 = false
+      candidate.capture_overlay_async(a1.attempt_id, dir, upper1):then_(function() d1 = true end, function() d1 = true end)
+      t.true_(vim.wait(10000, function() return d1 end, 20), "第一次捕获应完成")
+      local cand1 = candidate.finish(a1.attempt_id)
+      t.not_nil(cand1, "第一次应冻结出候选")
+      candidate.merge_candidate(cand1)
+
+      -- attempt 2（git_commit）：新 overlay 从暂存物化该对象，捕获必须重登记（不走 ws_skip）。
+      local upper2, work2 = base .. "/upper2", base .. "/work2"
+      fs.ensure_dir(upper2); fs.ensure_dir(work2)
+      local a2 = control.new_attempt("git_commit", {}, {}, { effect = "process" })
+      candidate.begin(a2, store.root())
+      candidate.materialize_overlay({ { root = dir, upper = upper2, work = work2, mode = "overlay" } })
+      t.true_(fs.exists(upper2 .. "/" .. obj_rel), "暂存对象应物化进新 overlay")
+      local d2 = false
+      candidate.capture_overlay_async(a2.attempt_id, dir, upper2):then_(function() d2 = true end, function() d2 = true end)
+      t.true_(vim.wait(10000, function() return d2 end, 20), "第二次捕获应完成")
+      t.not_nil(candidate.mapping(a2.attempt_id)[dir .. "/" .. obj_rel],
+        "从暂存物化的 .git 对象必须重登记（不走 ws_skip）")
+      candidate.cleanup(a1.attempt_id)
+      candidate.cleanup(a2.attempt_id)
+      vim.fn.delete(dir, "rf")
+      vim.fn.delete(base, "rf")
+    end)
+  end)
+
+  it("冻结：非 git 写类工具不发布 .git 指针（防悬空引用回归）", function(t)
+    -- 回归：git_add/git_commit 会在 overlay 里留下 `.git/index` 指针；其后的非 git 工具
+    -- （如 run_command）若因 `.git` mtime 新鲜被「全量遍历捕获」，会把该残留指针一并收入
+    -- 自己的候选——但该候选通常不含它引用的对象，发布时被 `_git_publish_gate` 拒绝
+    -- （GIT_REFERENTIAL_INTEGRITY: index -> <oid>），整单失败。
+    -- 修复：非 git 写类工具剔除 `.git` 指针（保留对象库）。
+    local fs = require("NeoAI.utils.fs")
+    local sandbox = require("NeoAI.sandbox")
+    local candidate = require("NeoAI.sandbox.candidate")
+    local control = require("NeoAI.sandbox.control")
+    local store = require("NeoAI.sandbox.store")
+    with_config({ tools = { sandbox = { workspace_root = vim.fn.tempname() .. "/sb" } } }, function()
+      sandbox.reset()
+      local dir = fs.canonical(vim.fn.tempname())
+      fs.ensure_dir(dir .. "/.git/objects/c2")
+      local obj_rel = ".git/objects/c2/" .. string.rep("a", 38)
+
+      -- 非 git 工具：残留指针 + 对象 + 普通文件都在 overlay 里。
+      local a = control.new_attempt("run_command", {}, {}, { effect = "process" })
+      candidate.begin(a, store.root())
+      local function stage(rel, content)
+        local staged = candidate.stage_path(a.attempt_id, dir .. "/" .. rel)
+        fs.write_file(staged, content)
+      end
+      stage(".git/index", "DIRC\0\0\0\2")
+      stage(".git/HEAD", "ref: refs/heads/main\n")
+      stage(obj_rel, "blob-bytes")
+      stage("f.txt", "cmd\n")
+      local cand = candidate.finish(a.attempt_id)
+      local have = {}
+      for _, f in ipairs(cand.files) do have[f.path] = true end
+      t.eq(nil, have[dir .. "/.git/index"], "非 git 工具不应发布 .git 指针（index）")
+      t.eq(nil, have[dir .. "/.git/HEAD"], "非 git 工具不应发布 .git 指针（HEAD）")
+      t.not_nil(have[dir .. "/" .. obj_rel], "对象库仍应保留（内容寻址、携带无害）")
+      t.not_nil(have[dir .. "/f.txt"], "普通文件应保留")
+      candidate.cleanup(a.attempt_id)
+
+      -- 对照：git 写类工具仍应携带 `.git` 指针（其对象/指针须原子发布）。
+      local b = control.new_attempt("git_commit", {}, {}, { effect = "process" })
+      candidate.begin(b, store.root())
+      local staged_idx = candidate.stage_path(b.attempt_id, dir .. "/.git/index")
+      fs.write_file(staged_idx, "DIRC\0\0\0\2")
+      local cand2 = candidate.finish(b.attempt_id)
+      local have2 = {}
+      for _, f in ipairs(cand2.files) do have2[f.path] = true end
+      t.not_nil(have2[dir .. "/.git/index"], "git 写类工具应携带 .git 指针")
+      candidate.cleanup(b.attempt_id)
+
+      vim.fn.delete(dir, "rf")
+      vim.fn.delete(store.root(), "rf")
     end)
   end)
 
@@ -2993,7 +3144,8 @@ tests.suite("sandbox", function(_, it)
     local exec = require("NeoAI.sandbox.exec")
     with_config({ tools = { sandbox = { mode = "dry_run", review = { enabled = true } } } }, function()
       sandbox.reset()
-      local dir = (vim.fn.stdpath("cache") .. "/NeoAI/tests_exec_persist"):gsub("/+$", "")
+      -- 暂存根必须可被捕获：不能位于 `<cache>/NeoAI`（自身运行时，捕获阶段整棵排除）。
+      local dir = vim.fn.tempname()
       vim.fn.mkdir(dir, "p")
       local real_file = dir .. "/node_modules/pkg/index.js"
       vim.fn.mkdir(vim.fn.fnamemodify(real_file, ":h"), "p")

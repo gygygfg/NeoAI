@@ -455,6 +455,24 @@ function M.set_job(fn)
   job = fn or _job_default
 end
 
+--- 关闭：在取消订阅前**主动释放**已接管的 pane 生命周期权威。
+--- 用于退出 / `:restart` / 热重载卸载等「进程即将不再跟踪」的场景：
+--- 若不释放，Herdr 侧会一直显示 NeoAI 的 working/blocked 状态（皮肤残留），
+--- 直到下一个权威信号覆盖，造成「退出后 Herdr 状态不更新」的错觉。
+--- 语义：仅在确实处于可用环境且**曾接管权威**（last_reported ~= nil）时，
+--- 先清除展示元数据再发送 `release-agent`；随后清空内存状态（等价 reset）。
+--- 未接管权威时为 no-op（不产生多余上报），幂等可重复调用。
+function M.shutdown()
+  if state.available and state.last_reported ~= nil then
+    -- 释放前先清除展示标签（display_agent/状态文案/标题），避免 Herdr 侧残留 NeoAI 描述
+    _clear_metadata()
+    _release()
+    state.last_reported = nil
+    state.metadata_sent = false
+  end
+  M.reset()
+end
+
 --- 重置（测试用）：取消订阅并清空状态
 function M.reset()
   for _, u in ipairs(subs) do

@@ -4,14 +4,15 @@
 --- 布局：主消息区（上） + 输入框（下，split）。
 
 local window_manager = require("NeoAI.ui.window.manager")
+local geometry = require("NeoAI.ui.geometry")
 local config_store = require("NeoAI.kernel.config_store")
 local message_list = require("NeoAI.ui.components.message_list")
 local incremental = require("NeoAI.ui.components.incremental")
-local input_box = require("NeoAI.ui.components.input_box")
+local inputbox_module = require("NeoAI.ui.components.input_box")
 local model_picker = require("NeoAI.ui.components.model_picker")
-local reasoning_panel = require("NeoAI.ui.components.reasoning_panel")
-local tool_args_panel = require("NeoAI.ui.components.tool_args_panel")
-local float_stream_window = require("NeoAI.ui.components.float_stream_window")
+local reasoning_module = require("NeoAI.ui.components.reasoning_panel")
+local toolargs_module = require("NeoAI.ui.components.tool_args_panel")
+local float_module = require("NeoAI.ui.components.float_stream_window")
 local fold = require("NeoAI.ui.components.fold")
 local display_modes = require("NeoAI.ui.components.display_modes")
 local services = require("NeoAI.kernel.services")
@@ -26,18 +27,72 @@ local chat_service = setmetatable({}, {
   end,
 })
 
-local M = {}
+-- ========== 多实例管理器状态 ==========
+-- chat_view 支持同一 nvim 内并存多个**独立聊天实例**（各自 buffer/窗口/会话/事件订阅）。
+-- 每个实例由 _make_instance() 闭包工厂构造；本文件末尾的模块表是「实例管理器」，
+-- 对外 API（open/close/refresh/…）缺省作用于当前聚焦实例。
+local _instances = {}   -- inst_id -> 实例 API 表
+local _order = {}       -- inst_id 顺序（挑选回退的当前实例）
+local _current_id = nil -- 当前聚焦实例 id（浮窗/输入框/current agent 据此路由）
+local _title_used = {}  -- 已占用的聊天 buffer 名
+local _seq = 0
+local _note_focus -- 前向声明：工厂内 _on_win_enter / open 引用
 
--- 折叠占位文本统一由 NeoAI.ui.components.fold 提供（推理 / 工具调用 / 工具结果共用同一份实现）。
+--- 分配唯一实例 id
+--- @return number
+local function _next_id()
+  _seq = _seq + 1
+  return _seq
+end
 
--- ========== 私有状态 ==========
+--- 分配唯一聊天 buffer 名：`NeoAI Chat`、`NeoAI Chat 2`、…
+--- @return string
+local function _alloc_title()
+  local n = 1
+  while true do
+    local name = (n == 1) and "NeoAI Chat" or ("NeoAI Chat " .. n)
+    if not _title_used[name] then return name end
+    n = n + 1
+  end
+end
 
-local state = {
-  win_id = nil, -- 主窗口
-  buf = nil, -- 主 buffer（消息列表）
-  input_win_id = nil, -- 输入窗口
-  unsubs = {},
-  agent_id = nil,
+--- 当前实例是否为 id（浮窗门控用）
+--- @param id number|nil
+--- @return boolean
+local function _is_current(id)
+  return id ~= nil and _current_id == id
+end
+
+--- 构造一个独立聊天实例（闭包工厂）。返回实例 API 表。
+--- @return table
+local function _make_instance()
+  local M = {}
+  -- 每实例独立输入框（遮蔽模块级 inputbox_module；既有 input_box.xxx 调用自动指向本实例）。
+  local input_box = inputbox_module.new()
+  -- 每实例独立流式浮窗（思考过程/接收参数/上下文压缩共享本实例的一个窗口，互斥复用）。
+  local float_stream_window = float_module.new()
+  local reasoning_panel = reasoning_module.new(float_stream_window)
+  local tool_args_panel = toolargs_module.new(float_stream_window)
+  local inst_id = _next_id()
+
+  --- 本实例是否为**当前聚焦**实例。流式浮窗（思考过程/接收参数/上下文压缩）为**单例**，
+  --- 只服务聚焦实例：后台实例仍照常把内容写入自己的 buffer，但不弹/不关这些浮窗，
+  --- 避免后台实例的流式事件误关/误盖聚焦实例正在看的浮窗。
+  --- @return boolean
+  local function _focused() return _is_current(inst_id) end
+
+  -- 折叠占位文本统一由 NeoAI.ui.components.fold 提供（推理 / 工具调用 / 工具结果共用同一份实现）。
+
+  -- ========== 私有状态 ==========
+
+  local state = {
+    instance_id = inst_id,
+    title = nil, -- 本实例聊天 buffer 名（唯一）
+    win_id = nil, -- 主窗口
+    buf = nil, -- 主 buffer（消息列表）
+    input_win_id = nil, -- 输入窗口
+    unsubs = {},
+    agent_id = nil,
   tool_tick = nil, -- 工具执行中折叠文本定时刷新句柄
   following = true, -- 流式更新时光标是否跟随（不跟随时不弹思考悬浮窗、不重新折叠已有折叠）
   collapsed = false, -- 聊天窗口进入后台后是否已收起（输入框）
@@ -419,7 +474,7 @@ local function _flush_tool_args()
   end
   if tool_args_pending == "" then return end
   -- 冲刷时若光标已不跟随，作废本次冲刷：不重新弹出接收参数悬浮窗，避免干扰当前查看。
-  if not _cursor_within_follow_margin() then
+  if not _focused() or not _cursor_within_follow_margin() then
     tool_args_pending = ""
     return
   end
@@ -444,7 +499,7 @@ local function _flush_reasoning()
   if reasoning_pending == "" then return end
   -- 冲刷时若光标已不跟随（用户回看上方内容 / 切走），作废本次冲刷：
   -- 不重新弹出思考悬浮窗，避免干扰用户当前查看的位置。
-  if not _cursor_within_follow_margin() then
+  if not _focused() or not _cursor_within_follow_margin() then
     reasoning_pending = ""
     return
   end
@@ -498,7 +553,7 @@ local function _flush_ctxop()
   if ctxop_pending == "" then return end
   -- 冲刷时若光标已不跟随（用户回看上方内容 / 切走），作废本次冲刷：
   -- 不弹出上下文操作悬浮窗，避免干扰用户当前查看的位置。
-  if not _cursor_within_follow_margin() then
+  if not _focused() or not _cursor_within_follow_margin() then
     ctxop_pending = ""
     return
   end
@@ -563,7 +618,7 @@ local function _on_reasoning_chunk(payload)
     reasoning_active = true
     -- 光标不跟随时抑制思考悬浮窗：既不缓存分片也不调度冲刷，避免弹出悬浮窗干扰查看。
     -- 用实时光标位置判断（而非缓存的 state.following），用户切回底部后下一分片即可恢复。
-    if not _cursor_within_follow_margin() then return end
+    if not _focused() or not _cursor_within_follow_margin() then return end
     reasoning_pending = reasoning_pending .. payload.chunk
     if not reasoning_flush_scheduled then
       reasoning_flush_scheduled = true
@@ -571,7 +626,7 @@ local function _on_reasoning_chunk(payload)
     end
   else
     reasoning_active = true
-    if not _cursor_within_follow_margin() then return end
+    if not _focused() or not _cursor_within_follow_margin() then return end
     -- 事件不再随分片携带完整 reasoning；缺失时从当前 Agent 消息队列取末条正文兜底。
     local text = payload.reasoning
     if not text then
@@ -647,7 +702,8 @@ local function _close_reasoning_panel(payload)
   -- 推理结束：取消尚未冲刷的分片（避免已排队的 flush 回调重新打开悬浮窗），再关闭。
   _cancel_pending_reasoning()
   reasoning_active = false
-  reasoning_panel.close()
+  -- 仅聚焦实例可关共享浮窗（后台实例的结束事件不应误关聚焦实例正在看的浮窗）。
+  if _focused() then reasoning_panel.close() end
 end
 
 --- 工具参数流分片：打开/更新"接收参数"悬浮窗（与思考过程悬浮窗一致，光标不跟随时不弹）
@@ -660,7 +716,7 @@ local function _on_tool_arg_chunk(payload)
   tool_args_active = true
   last_tool_calls = payload.tool_calls
   -- 光标不跟随时抑制接收参数悬浮窗，避免弹出悬浮窗干扰用户查看。
-  if not _cursor_within_follow_margin() then return end
+  if not _focused() or not _cursor_within_follow_margin() then return end
   -- 参数接收阶段收起思考过程悬浮窗（含作废其已排队的冲刷），避免两窗重叠遮挡。
   _close_reasoning_panel(payload)
   tool_args_pending = payload.tool_calls
@@ -670,6 +726,7 @@ local function _on_tool_arg_chunk(payload)
   end
 end
 
+
 --- 工具参数流结束：关闭接收参数悬浮窗
 --- @param payload table
 local function _close_tool_args_panel(payload)
@@ -677,7 +734,7 @@ local function _close_tool_args_panel(payload)
   _cancel_pending_tool_args()
   tool_args_active = false
   last_tool_calls = nil
-  tool_args_panel.close()
+  if _focused() then tool_args_panel.close() end
 end
 
 -- ========== 上下文压缩 / 计划蒸馏悬浮窗 ==========
@@ -694,7 +751,7 @@ local function _on_ctxop_started(payload, kind)
   local placeholder = kind == "distill" and "正在计划蒸馏…" or "正在压缩上下文…"
   ctxop_last_text = placeholder
   -- 光标不跟随时抑制悬浮窗：既不缓存分片也不调度冲刷，避免弹出悬浮窗干扰查看。
-  if not _cursor_within_follow_margin() then return end
+  if not _focused() or not _cursor_within_follow_margin() then return end
   ctxop_pending = placeholder
   if not ctxop_flush_scheduled then
     ctxop_flush_scheduled = true
@@ -709,7 +766,7 @@ local function _on_ctxop_chunk(payload)
   ctxop_cancelled = false
   ctxop_active = true
   ctxop_last_text = _format_ctxop(payload.reasoning, payload.content)
-  if not _cursor_within_follow_margin() then return end
+  if not _focused() or not _cursor_within_follow_margin() then return end
   ctxop_pending = ctxop_last_text
   if not ctxop_flush_scheduled then
     ctxop_flush_scheduled = true
@@ -724,7 +781,7 @@ local function _close_ctxop_panel(payload)
   _cancel_ctxop()
   ctxop_active = false
   ctxop_last_text = ""
-  float_stream_window.close()
+  if _focused() then float_stream_window.close() end
 end
 
 -- ========== 光标跟随跳变 → 自动浮窗隐藏 / 重弹 ==========
@@ -858,7 +915,8 @@ local function _on_agent_end(payload)
     _stop_tool_tick()
     -- 回收已完成工具的计时记录：耗时已落库到结果消息，fold 表无需继续持有（避免长会话膨胀）。
     fold.prune_finished()
-    _focus_input_insert()
+    -- 仅当本实例是当前聚焦实例时才把光标移回输入框：后台实例结束不应抢走焦点。
+    if _focused() then _focus_input_insert() end
   end
 end
 
@@ -918,7 +976,7 @@ local function _build_chat_actions()
     quit = function() M.close() end,
     cancel = _on_cancel,
     toggle_reasoning = function()
-      message_list.toggle_reasoning()
+      message_list.toggle_reasoning(state.buf)
       _render()
     end,
     switch_model = _switch_model,
@@ -1090,11 +1148,25 @@ end
 --- @return boolean
 local function _is_chat_affiliated(win)
   if not win or not vim.api.nvim_win_is_valid(win) then return false end
+  -- 严格：只认「本实例」的主窗口/输入窗口（多实例焦点路由/恢复用；不得把别的实例误判为本实例）。
+  if state.input_win_id and win == state.input_win_id then return true end
+  local ok, buf = pcall(vim.api.nvim_win_get_buf, win)
+  if ok and buf and vim.api.nvim_buf_is_valid(buf) then
+    if state.buf and buf == state.buf then return true end
+  end
+  return false
+end
+
+--- 窗口是否显示任意 NeoAI 界面 buffer（本实例以外的聊天实例 / 浮窗 / 输入框）。
+--- 仅用于「是否收起本实例输入框」的宽松判定：焦点落在别的 NeoAI 窗口时保持本实例输入框不变，
+--- 避免与其它实例互相误收起；但**绝不**用于焦点归属（否则会把别的实例误设为本实例）。
+--- @param win number|nil
+--- @return boolean
+local function _is_any_neoai_window(win)
+  if not win or not vim.api.nvim_win_is_valid(win) then return false end
   local ok, buf = pcall(vim.api.nvim_win_get_buf, win)
   if not ok or not buf or not vim.api.nvim_buf_is_valid(buf) then return false end
-  if state.buf and buf == state.buf then return true end
-  if vim.bo[buf] and vim.bo[buf].filetype:sub(1, 5) == "neoai" then return true end
-  return false
+  return vim.bo[buf] and vim.bo[buf].filetype:sub(1, 5) == "neoai"
 end
 
 --- 收起绑定的输入框（聊天窗口进入后台 / 主窗口被切到别的 buffer）
@@ -1160,8 +1232,11 @@ local function _on_win_enter()
   if not M.has_window() then return end
   local cur_win = vim.api.nvim_get_current_win()
   if _is_chat_affiliated(cur_win) then
+    if _note_focus then _note_focus(inst_id) end
     _restore_aux()
     _resize_input_for_focus()
+  elseif _is_any_neoai_window(cur_win) then
+    -- 别的聊天实例 / 浮窗 / 输入框：保持本实例输入框不动（避免与其它实例互相误收起）。
   else
     _collapse_aux()
   end
@@ -1227,6 +1302,7 @@ local function _on_buf_enter()
   if vim.api.nvim_get_current_win() ~= state.win_id then return end
   local shown = vim.api.nvim_win_get_buf(state.win_id)
   if state.buf and shown == state.buf then
+    if _note_focus then _note_focus(inst_id) end
     _restore_aux()
     _set_input_height(_input_idle_height())
     -- 用户 :bnext 切走再切回聊天 buffer：按实时光标重同步跟随（切走时视为不跟随并隐藏了
@@ -1271,7 +1347,7 @@ local function _register_focus_tracking()
   if state.focus_augroup then
     pcall(vim.api.nvim_del_augroup_by_id, state.focus_augroup)
   end
-  state.focus_augroup = vim.api.nvim_create_augroup("NeoAIChatFocus", { clear = true })
+  state.focus_augroup = vim.api.nvim_create_augroup("NeoAIChatFocus_" .. inst_id, { clear = true })
   vim.api.nvim_create_autocmd("WinEnter", {
     group = state.focus_augroup,
     callback = _on_win_enter,
@@ -1325,7 +1401,7 @@ local function _register_resize_reflow()
   if state.resize_augroup then
     pcall(vim.api.nvim_del_augroup_by_id, state.resize_augroup)
   end
-  state.resize_augroup = vim.api.nvim_create_augroup("NeoAIChatResize", { clear = true })
+  state.resize_augroup = vim.api.nvim_create_augroup("NeoAIChatResize_" .. inst_id, { clear = true })
   vim.api.nvim_create_autocmd("VimResized", {
     group = state.resize_augroup,
     callback = function()
@@ -1472,25 +1548,37 @@ end
 
 -- ========== 公开 API ==========
 
+--- 切换聊天窗口到新的 Agent：解绑并持久化旧 Agent，绑定新 Agent 并整体重绘。
+--- 供「从会话树切换」与「新建会话」共用（两者都需替换当前会话而非复用）。
+--- @param agent table 新 Agent（调用方已创建/加载）
+local function _switch_agent(agent)
+  if not state.win_id or not vim.api.nvim_win_is_valid(state.win_id) then return end
+  -- 先解绑旧 Agent（持久化 + 销毁），再绑定新 Agent（原实现顺序，语义不变）
+  chat_service.detach_window(state.win_id)
+  state.agent_id = agent.id
+  chat_service.attach_window(state.win_id, agent)
+  reasoning_panel.close()
+  _cancel_ctxop()
+  float_stream_window.close()
+  -- 会话切换：历史全变，块缓存与内容镜像失效（下次渲染走全量替换）
+  message_list.invalidate(state.buf)
+  _render()
+  _scroll_to_end()
+end
+
 --- 打开聊天窗口
---- @param opts table|nil { session_id?, round? }
+--- @param opts table|nil { session_id?, round?, new_session? }
+---   session_id: 加载指定会话；new_session（且未给 session_id）: 强制新建会话而非复用当前会话。
 --- @return table { win_id, buf }
 function M.open(opts)
   opts = opts or {}
   if state.win_id and vim.api.nvim_win_is_valid(state.win_id) then
     if opts.session_id and opts.session_id ~= chat_service.get_current_session_id() then
       -- Tree selection must replace the active conversation, not reuse its buffer.
-      chat_service.detach_window(state.win_id)
-      local agent = chat_service.load_session(opts.session_id, { round = opts.round })
-      state.agent_id = agent.id
-      chat_service.attach_window(state.win_id, agent)
-      reasoning_panel.close()
-      _cancel_ctxop()
-      float_stream_window.close()
-      -- 会话切换：历史全变，块缓存与内容镜像失效（下次渲染走全量替换）
-      message_list.invalidate(state.buf)
-      _render()
-      _scroll_to_end()
+      _switch_agent(chat_service.load_session(opts.session_id, { round = opts.round }))
+    elseif opts.new_session and not opts.session_id then
+      -- 显式要求新会话（:NeoAIChat / <leader>ac）：不复用当前会话，另起一段对话。
+      _switch_agent(chat_service.new_session({}))
     end
     -- 再次打开/从会话树选择时也可能遇到聊天窗口已被切到别的 buffer 的情况，
     -- 先恢复聊天 buffer 再聚焦，确保看到的是当前会话内容。
@@ -1501,11 +1589,20 @@ function M.open(opts)
       end
     end
     vim.api.nvim_set_current_win(state.win_id)
+    geometry.set_narrow_base(state.win_id)
+    if _note_focus then _note_focus(inst_id) end
     return { win_id = state.win_id, buf = state.buf }
   end
 
-  local created = window_manager.create("chat", { title = "NeoAI Chat" })
+  -- 新建前先清理会话恢复遗留的孤儿界面 buffer：:restart 恢复出的无主 `NeoAI Chat`
+  -- 会占用同名，导致新聊天 buffer 的 nvim_buf_set_name 静默失败（新 buffer 无名）。
+  -- 幂等、全程 pcall；已登记的实时窗口 buffer 不会被误删。
+  pcall(window_manager.cleanup_session_orphans)
+
+  local created = window_manager.create("chat", { title = state.title or "NeoAI Chat" })
   state.win_id = created.win_id
+  -- 登记浮窗窄屏留白的基准窗口（聊天主窗口）：<100 列时浮窗相对本窗口留白/占满。
+  geometry.set_narrow_base(state.win_id)
   state.buf = created.buf
   state.following = true
   vim.bo[state.buf].modifiable = true
@@ -1596,6 +1693,9 @@ function M.open(opts)
   local status = services.use("services.status")
   if status then status.ensure_lualine_extension() end
 
+  -- 登记本实例为当前焦点（更新 current/输入框模块宿主/显示模式/chat_service 当前 Agent）。
+  if _note_focus then _note_focus(inst_id) end
+
   return { win_id = state.win_id, buf = state.buf }
 end
 
@@ -1603,12 +1703,16 @@ end
 function M.close()
   _stop_tool_tick()
   fold.clear_timing()
+  -- 本实例拥有**自己的**流式浮窗（思考/接收参数/上下文压缩）：无论是否聚焦都必须关闭，
+  -- 否则后台实例被关闭时其浮窗会泄漏（窗口/buffer 残留）。
   reasoning_panel.close()
   tool_args_panel.close()
-  _cancel_ctxop()
   float_stream_window.close()
-  -- 卸载当前显示模式插件（还原折叠覆盖）
-  display_modes.detach()
+  _cancel_ctxop()
+  -- 显示模式插件与窄屏基准是**跨实例共享**的单例：仅当本实例为当前聚焦实例时才卸载/清除，
+  -- 避免关闭后台实例时误动聚焦实例的视图。
+  local was_focused = _focused()
+  if was_focused then display_modes.detach() end
   -- 清理缓存中的推理分片与待调度渲染，避免窗口重开后残留
   reasoning_pending = ""
   reasoning_flush_scheduled = false
@@ -1633,6 +1737,10 @@ function M.close()
   if state.buf and vim.api.nvim_buf_is_valid(state.buf) then
     pcall(vim.api.nvim_buf_delete, state.buf, { force = true })
   end
+  -- 连带销毁输入 buffer（nofile 命名 buffer 不会被 :e 复用，必须显式删除，否则泄漏）。
+  input_box.destroy()
+  -- 释放浮窗窄屏留白基准（仅当本实例是当前聚焦实例；否则会误清聚焦实例的基准）
+  if was_focused then geometry.clear_narrow_base() end
   for _, unsub in ipairs(state.unsubs) do
     unsub()
   end
@@ -1734,9 +1842,161 @@ function M.reload_display(name)
   return display_modes.reload(name)
 end
 
---- 重置（测试用）
-function M.reset()
-  M.close()
+  -- ========== 实例元信息（供管理器路由） ==========
+  --- @return number
+  function M._instance_id() return inst_id end
+  --- @return boolean
+  function M._is_alive() return state.win_id ~= nil and vim.api.nvim_win_is_valid(state.win_id) end
+  --- @return number|nil
+  function M._win_id() return state.win_id end
+  --- @return number|nil
+  function M._input_win_id() return state.input_win_id end
+  --- @return string|nil
+  function M._agent_id() return state.agent_id end
+  --- @return string|nil
+  function M._title() return state.title end
+  --- @param t string
+  function M._set_title(t) state.title = t end
+  --- @return boolean
+  function M._focused() return _is_current(inst_id) end
+
+  --- 焦点落到本实例：登记输入框/浮窗面板 current、重挂显示模式宿主、更新窄屏基准。
+  function M._on_focus()
+    inputbox_module._set_current(input_box)
+    -- 浮窗面板模块代理同步指向本实例（供状态栏/测试等经模块 API 观察聚焦实例的浮窗）。
+    reasoning_module._set_current(reasoning_panel)
+    toolargs_module._set_current(tool_args_panel)
+    float_module._set_current(float_stream_window)
+    if state.win_id and vim.api.nvim_win_is_valid(state.win_id) then
+      geometry.set_narrow_base(state.win_id)
+    end
+    display_modes.attach(_build_host())
+  end
+
+  --- 重置（测试用）
+  function M.reset()
+    M.close()
+  end
+
+  return M
 end
 
-return M
+-- ========== 模块级：聊天实例管理器 ==========
+
+--- 挑选当前实例（当前 id 有效则用之，否则回退到任一存活实例）。
+--- @return table|nil
+local function _current_inst()
+  local inst = _current_id and _instances[_current_id] or nil
+  if inst and inst._is_alive() then return inst end
+  for i = #_order, 1, -1 do
+    local it = _instances[_order[i]]
+    if it and it._is_alive() then
+      _current_id = _order[i]
+      return it
+    end
+  end
+  _current_id = nil
+  return nil
+end
+
+--- 清理已关闭实例的登记（并释放其占用的 buffer 名）。
+local function _prune()
+  for i = #_order, 1, -1 do
+    local it = _instances[_order[i]]
+    if not it or not it._is_alive() then
+      local id = _order[i]
+      if it then
+        local t = it._title()
+        if t then _title_used[t] = nil end
+      end
+      table.remove(_order, i)
+      _instances[id] = nil
+    end
+  end
+end
+
+--- 焦点路由：把 current 指向 id 对应实例，并同步 chat_service 当前 Agent。
+_note_focus = function(id)
+  local inst = id and _instances[id] or nil
+  if not inst then return end
+  _current_id = id
+  inst._on_focus()
+  local aid = inst._agent_id()
+  if aid and chat_service.set_current_agent then chat_service.set_current_agent(aid) end
+end
+
+local ChatView = {}
+
+--- 打开聊天界面（默认复用当前实例；new_window 时新建独立实例）。
+--- @param opts table|nil { session_id?, round?, new_session?, new_window? }
+--- @return table { win_id, buf }
+function ChatView.open(opts)
+  opts = opts or {}
+  if opts.new_window then
+    return ChatView.open_new(opts)
+  end
+  local cur = _current_inst()
+  if cur then return cur.open(opts) end
+  return ChatView.open_new(opts)
+end
+
+--- 在**新标签页**打开一个独立聊天实例（唯一 buffer 名；旧实例保留并继续运行）。
+--- @param opts table|nil
+--- @return table { win_id, buf }
+function ChatView.open_new(opts)
+  opts = opts or {}
+  local inst = _make_instance()
+  local id = inst._instance_id()
+  _instances[id] = inst
+  _order[#_order + 1] = id
+  local title = _alloc_title()
+  _title_used[title] = true
+  inst._set_title(title)
+  _current_id = id
+  local res = inst.open(opts)
+  _note_focus(id)
+  return res
+end
+
+--- 关闭当前聊天实例。
+function ChatView.close()
+  local cur = _current_inst()
+  if cur then cur.close() end
+  _prune()
+  local nxt = _current_inst()
+  if nxt then _note_focus(nxt._instance_id()) end
+end
+
+--- 关闭全部聊天实例。
+function ChatView.close_all()
+  for i = #_order, 1, -1 do
+    local inst = _instances[_order[i]]
+    if inst then pcall(inst.close) end
+  end
+  _instances, _order, _title_used = {}, {}, {}
+  _current_id = nil
+end
+
+--- 是否有任一聊天窗口打开。
+--- @return boolean
+function ChatView.has_window()
+  return _current_inst() ~= nil
+end
+
+--- 重置（测试用）：关闭全部实例。
+function ChatView.reset()
+  ChatView.close_all()
+end
+
+-- 透传方法：缺省作用于当前实例（保持既有 API 与测试兼容）。
+for _, name in ipairs({
+  "refresh", "flush", "_sync_follow", "show_status", "cycle_display", "set_display",
+  "reload_display", "_recompute_folds", "_mark_folds_dirty", "_is_folds_dirty", "is_following",
+}) do
+  ChatView[name] = function(...)
+    local cur = _current_inst()
+    if cur and type(cur[name]) == "function" then return cur[name](...) end
+  end
+end
+
+return ChatView

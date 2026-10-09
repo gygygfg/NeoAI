@@ -36,6 +36,48 @@ local function _screen()
   return vim.o.columns, vim.o.lines
 end
 
+-- ========== 窄屏浮窗留白基准 ==========
+-- 当浮窗所在上下文（通常为 NeoAI 聊天主窗口）较窄时，浮窗若仍相对整屏按比例居中，
+-- 会在窄窗口里显得贴边或左右比例失衡。为此引入「基准窗口」：浮窗宽度小于阈值时，
+-- 改为相对该窗口定位——窗口很窄时浮窗左右占满窗口，中等窄时左右各留固定列数。
+-- 阈值/留白先硬编码（如需再暴露为 ui.float 配置）。
+local NARROW_MAX = 100 -- 基准窗口宽度 >= 该值：保持现状（相对屏幕按比例居中）
+local NARROW_MIN = 40  -- 基准窗口宽度 < 该值：浮窗左右占满基准窗口
+local NARROW_GAP = 5    -- [NARROW_MIN, NARROW_MAX) 时左右各留的列数
+
+--- 基准窗口句柄（聊天主窗口打开时登记；不用反向 require 以免循环依赖）
+local narrow_base = nil
+
+--- 登记浮窗窄屏留白的基准窗口。
+--- @param win number 窗口句柄（通常为聊天主窗口）
+function M.set_narrow_base(win)
+  narrow_base = win
+end
+
+--- 清除基准窗口（聊天窗口关闭时调用）。
+function M.clear_narrow_base()
+  narrow_base = nil
+end
+
+--- 读取基准窗口几何（宽 / 左列，屏幕坐标）；无效时返回 nil。
+--- @return table|nil { w, col }
+local function _narrow_base_geom()
+  if not narrow_base or not vim.api.nvim_win_is_valid(narrow_base) then return nil end
+  local ok_w, w = pcall(vim.api.nvim_win_get_width, narrow_base)
+  local ok_p, pos = pcall(vim.api.nvim_win_get_position, narrow_base)
+  if not ok_w or not ok_p or type(w) ~= "number" or type(pos) ~= "table" then return nil end
+  return { w = w, col = pos[2] or 0 }
+end
+
+--- 当前是否处于窄屏留白模式（存在有效基准窗口且其宽度小于阈值）。
+--- 供浮窗在「恢复上次几何」等场景判断：窄屏下宽度/列由基准窗口规则决定，
+--- 不应再用此前保存的（可能来自宽屏的）几何覆盖。
+--- @return boolean
+function M.narrow_active()
+  local base = _narrow_base_geom()
+  return base ~= nil and base.w < NARROW_MAX
+end
+
 --- 计算浮窗几何。
 --- @param opts table|nil {
 ---   w_ratio? number 宽度占屏幕列比例（如 0.7）
@@ -48,6 +90,7 @@ end
 ---   margin? number  距屏幕边缘最小留白（默认 2），保证不贴边/不越界
 ---   anchor? string  "center"（默认）| "top" | "bottom"，决定纵向位置
 ---   row? number     显式指定顶部行号（0-based），覆盖 anchor
+---   narrow? boolean 是否套用窄屏留白（默认 true）；传 false 用于 NeoAI 主界面窗口本身
 --- }
 --- @return table { width, height, col, row }
 function M.compute(opts)
@@ -65,13 +108,28 @@ function M.compute(opts)
   local def_min_w = _resolve_min("min_width", M.MIN_WIDTH)
   local def_min_h = _resolve_min("min_height", M.MIN_HEIGHT)
 
+  -- 窄屏留白：基准窗口存在且足够窄时，浮窗改相对基准窗口定位（否则维持原相对屏幕逻辑）。
+  local narrow = opts.narrow
+  if narrow == nil then narrow = true end
+  local base = narrow and _narrow_base_geom() or nil
+  local narrow_mode = base ~= nil and base.w < NARROW_MAX
+
   -- 宽度：比例 → 屏幕可用宽 → 全局最小 → max_w → min_w → 夹紧
-  local width = math.floor(cols * (tonumber(opts.w_ratio) or 0.6))
-  width = math.min(width, avail_w)
-  if type(opts.max_w) == "number" then width = math.min(width, opts.max_w) end
-  local min_w = type(opts.min_w) == "number" and opts.min_w or def_min_w
-  if min_w > 0 then width = math.max(width, min_w) end
-  width = math.max(1, math.min(width, avail_w))
+  local width
+  if narrow_mode then
+    -- 相对基准窗口：很窄占满整宽，中等窄左右各留 NARROW_GAP；
+    -- 跳过全局 min_w（否则会被抬超基准窗口），仍受 max_w 与基准窗口宽度约束。
+    width = (base.w < NARROW_MIN) and base.w or (base.w - NARROW_GAP * 2)
+    if type(opts.max_w) == "number" then width = math.min(width, opts.max_w) end
+    width = math.max(1, math.min(width, base.w))
+  else
+    width = math.floor(cols * (tonumber(opts.w_ratio) or 0.6))
+    width = math.min(width, avail_w)
+    if type(opts.max_w) == "number" then width = math.min(width, opts.max_w) end
+    local min_w = type(opts.min_w) == "number" and opts.min_w or def_min_w
+    if min_w > 0 then width = math.max(width, min_w) end
+    width = math.max(1, math.min(width, avail_w))
+  end
 
   -- 高度：比例 → fit_h（内容自适应，仅压不撑）→ 屏幕可用高 → 全局最小 → max_h → min_h → 夹紧
   local height = math.floor(lines * (tonumber(opts.h_ratio) or 0.6))
@@ -82,8 +140,15 @@ function M.compute(opts)
   if min_h > 0 then height = math.max(height, min_h) end
   height = math.max(1, math.min(height, avail_h))
 
-  local col = math.floor((cols - width) / 2)
-  col = math.max(0, math.min(col, cols - width))
+  local col
+  if narrow_mode then
+    -- 相对基准窗口左列定位（屏幕坐标）；占满时左对齐窗口，留白时右移 NARROW_GAP。
+    local c = (base.w < NARROW_MIN) and base.col or (base.col + NARROW_GAP)
+    col = math.max(0, math.min(c, math.max(0, cols - width)))
+  else
+    col = math.floor((cols - width) / 2)
+    col = math.max(0, math.min(col, cols - width))
+  end
 
   local row
   if type(opts.row) == "number" then
@@ -170,6 +235,7 @@ end
 --- 清空登记并卸载 VimResized 自动命令（测试/卸载用）。
 function M.reset()
   tracked = {}
+  narrow_base = nil
   if resize_augroup then
     pcall(vim.api.nvim_del_augroup_by_id, resize_augroup)
     resize_augroup = nil

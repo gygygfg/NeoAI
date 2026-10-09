@@ -11,22 +11,26 @@
 --- 上下排列的，若同时增长会把某工具的增量错位追加到另一工具行上。多工具（或名字变化、
 --- 参数被替换等不连续变化）一律回退为整段重建（set_text），保证显示与快照一致。
 
-local float_window = require("NeoAI.ui.components.float_stream_window")
-
-local M = {}
+local float_module = require("NeoAI.ui.components.float_stream_window")
 
 local FILETYPE = "neoai_tool_args"
 local TITLE = "🔧 接收参数"
 -- 高度上限：接收参数悬浮窗最多 5 行。
 local MAX_HEIGHT = 5
 
--- ========== 私有状态 ==========
+-- 多实例：每个聊天实例持有独立的面板（各自的 seen 进度与独立悬浮窗）。见 _make(float_win)。
+--- @param float_win table|nil 绑定的悬浮窗实例（缺省自建一个）
+--- @return table
+local function _make(float_win)
+  local M = {}
+  local float_window = float_win or float_module.new()
 
--- 上次已追加到窗口的工具调用进度：pos -> { name = 工具名, args = 已追加的原始参数字符串 }。
--- 用于把累积快照差分出「新增分片」，只 append 增量而不整段重排。
-local state = {
-  seen = {},
-}
+  -- ---------- 私有状态 ----------
+  -- 上次已追加到窗口的工具调用进度：pos -> { name = 工具名, args = 已追加的原始参数字符串 }。
+  -- 用于把累积快照差分出「新增分片」，只 append 增量而不整段重排。
+  local state = {
+    seen = {},
+  }
 
 -- ========== 私有函数 ==========
 
@@ -148,10 +152,49 @@ function M.is_open()
   return float_window.is_open()
 end
 
---- 重置（测试用）
-function M.reset()
-  state.seen = {}
-  float_window.reset()
+  --- 绑定的悬浮窗实例
+  --- @return table
+  function M._float() return float_window end
+
+  --- 重置（测试用）
+  function M.reset()
+    state.seen = {}
+    float_window.reset()
+  end
+
+  return M
+end
+
+-- ========== 模块级：当前面板代理（兼容既有调用 / 测试） ==========
+
+local M = {}
+local _current = nil
+
+--- 新建一个独立面板实例，并设为「当前」。
+--- @param float_win table|nil 绑定的悬浮窗实例
+--- @return table
+function M.new(float_win)
+  local inst = _make(float_win)
+  _current = inst
+  return inst
+end
+
+--- 直接指定「当前」面板实例。
+--- @param inst table
+function M._set_current(inst)
+  if inst then _current = inst end
+end
+
+local function _cur()
+  if not _current then _current = _make() end
+  return _current
+end
+
+for _, name in ipairs({ "open", "show", "get_content", "close", "is_open", "reset" }) do
+  M[name] = function(...)
+    local cur = _cur()
+    if cur and type(cur[name]) == "function" then return cur[name](...) end
+  end
 end
 
 return M

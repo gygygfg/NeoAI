@@ -79,6 +79,11 @@ ensure_started() -- 阶段 2：tools/sandbox/tool_service/skills/mcp/herder + �
 
 `lifecycle.shutdown()` 逆序执行清理函数，保存未持久化的会话、关闭异步任务。随后 `event_bus.emit(PLUGIN_SHUTDOWN)`。
 
+退出清理会 `plugins.stop_all()` → 各副作用插件 `stop`。其中 **herder 插件的 `stop` 调用
+`herder.shutdown()`**：若当前处于 Herder 环境且接管过权威，先 `report-metadata --clear-*` 再
+`release-agent`，令 Herder 立即回退屏幕启发式绘制、不残留 `working`/`blocked` 状态。
+`:restart` 与 `:NeoAIReloadAll` 走同一条卸载路径，因此同样即时释放。
+
 ### 5.2 窗口关闭
 
 `chat_view.close()` → `chat_service.detach_window(win_id)`：

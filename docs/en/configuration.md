@@ -132,6 +132,7 @@ context_cache = {
 | `default_view` | `"chat"` | Default view (chat/tree) |
 | `window_mode` | `"tab"` | Window mode (float/tab/split) |
 | `window` | `{width=80, height=24, border="rounded"}` | float window |
+| `float` | `{min_width=24, min_height=4}` | Minimum size floor for all floating windows; a single `compute` call can override with explicit `min_w`/`min_h`, and 0 removes the floor |
 | `split` | `{size=80, direction="right"}` | split window |
 | `colors` | Per-segment highlights | User/AI/reasoning/title colors |
 | `tree` | `{foldenable=false, ...auto_close_on_select=true}` | Session tree folding/auto-close |
@@ -139,6 +140,11 @@ context_cache = {
 | `chat` | `{mousescroll_max_blank=3, incremental=true}` | Max blank lines allowed below the last line when the wheel reaches the bottom (0 = strictly bottom-aligned); `incremental` enables incremental refresh (re-render only changed message blocks and write only the diff lines). Set to `false` to fall back to a full buffer rewrite |
 | `trajectory` | `{log_dir=".../NeoAI/logs"}` | Log directory for the trajectory display mode |
 | `statusline` | `{enabled=true, winbar=true, parts={mode,model,usage,cache,capacity,sandbox}, separator=" ", colors=...}` | lualine statusline; the `sandbox` part shows `待审N` when pending reviews > 0 (`N` is the total number of pending **files**, since the approval unit is a single file), linked to the prominent `NeoAISandboxPending` highlight group by default (bold yellow, override via `colors.sandbox`); when the pending queue contains an **L3 (high-risk)** item, the part appends `⚠危险` and switches to the red `NeoAISandboxDanger` group (override via `colors.sandbox_danger`); when **outside-workspace traces** exist, the part appends `越界N` (`N` = distinct file count; both shown side by side, e.g. `待审2 越界3`) |
+
+> **Narrow-screen padding (no config)**: based on the chat main window width, a floating window fills that window
+> when width `< 40`, keeps 5 cols on each side when `40 ≤ width < 100`, and stays screen-ratio centered when
+> `≥ 100`. Thresholds `40/100` and padding `5` are hard-coded in `ui/geometry.lua` (may later be exposed as
+> `ui.float.narrow_*`).
 
 ### 2.3 `keymaps`
 

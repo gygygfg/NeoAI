@@ -323,6 +323,43 @@ tests.suite("herder", function(_, it)
     restore_env(orig)
   end)
 
+  it("shutdown：已接管权威时发 release-agent 并清元数据（退出/重启/卸载）", function(t)
+    local orig = reset_herder_env()
+    local herder = init_herder()
+    emit_created("a1")
+    emit_state("a1", "generating")
+    t.true_(herder.has_authority(), "进入 working 后应已接管权威")
+
+    captured = {}
+    herder.shutdown()
+    t.eq(1, #collect("release-agent"), "shutdown 应发送 release-agent 释放 pane 权威")
+    -- 释放前应清除展示元数据
+    local cleared = false
+    for _, argv in ipairs(collect("report-metadata")) do
+      for _, a in ipairs(argv) do
+        if a == "--clear-display-agent" then cleared = true end
+      end
+    end
+    t.true_(cleared, "释放前应发送 --clear-display-agent")
+    t.false_(herder.has_authority(), "shutdown 后不应再持有权威")
+    t.false_(herder.is_available(), "shutdown 后应复位为不可用")
+    restore_env(orig)
+  end)
+
+  it("shutdown：未接管权威时不产生任何多余上报", function(t)
+    local orig = reset_herder_env()
+    local herder = init_herder()
+    -- 仅创建 idle agent：从未接管权威
+    emit_created("a1")
+    t.false_(herder.has_authority())
+
+    captured = {}
+    herder.shutdown()
+    t.eq(0, #captured, "未接管权威时 shutdown 不应发任何上报")
+    t.false_(herder.is_available())
+    restore_env(orig)
+  end)
+
   it("多会话聚合：任一 blocked 即上报 blocked", function(t)
     local orig = reset_herder_env()
     local herder = init_herder()

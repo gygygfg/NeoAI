@@ -8,17 +8,20 @@
 
 local geometry = require("NeoAI.ui.geometry")
 
-local M = {}
+-- 多实例：每个聊天实例持有**独立**的流式悬浮窗（各自 win/buf/filetype），互不干扰。
+-- 由 _make() 闭包工厂构造；模块表是「当前悬浮窗」代理（兼容既有调用与测试）。
+local function _make()
+  local M = {}
 
--- ========== 私有状态 ==========
+  -- ========== 私有状态 ==========
 
-local state = {
-  win_id = nil,
-  buf = nil,
-  filetype = nil,
-  -- 当前消费者的高度上限（nil = 使用默认上限）；由 open 传入 max_height 时按 filetype 更新。
-  max_height = nil,
-}
+  local state = {
+    win_id = nil,
+    buf = nil,
+    filetype = nil,
+    -- 当前消费者的高度上限（nil = 使用默认上限）；由 open 传入 max_height 时按 filetype 更新。
+    max_height = nil,
+  }
 
 -- ========== 私有函数 ==========
 
@@ -216,6 +219,44 @@ end
 --- 重置（测试用）
 function M.reset()
   M.close()
+end
+
+  return M
+end
+
+-- ========== 模块级：当前悬浮窗代理（兼容既有调用 / 测试） ==========
+
+local M = {}
+local _current = nil
+
+--- 新建一个独立悬浮窗实例，并设为「当前」。
+--- @return table
+function M.new()
+  local inst = _make()
+  _current = inst
+  return inst
+end
+
+--- 直接指定「当前」悬浮窗实例。
+--- @param inst table
+function M._set_current(inst)
+  if inst then _current = inst end
+end
+
+--- 当前悬浮窗实例。
+--- @return table
+local function _cur()
+  if not _current then _current = _make() end
+  return _current
+end
+
+for _, name in ipairs({
+  "open", "set_text", "append", "get_text", "get_filetype", "close", "is_open", "reset",
+}) do
+  M[name] = function(...)
+    local cur = _cur()
+    if cur and type(cur[name]) == "function" then return cur[name](...) end
+  end
 end
 
 return M

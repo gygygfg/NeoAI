@@ -150,14 +150,17 @@ is only kept for other `approval.mode` values (`prompt`/`strict`).
     staged copy and target (mtime/size/mode) are both unchanged it also avoids re-read + detokenize +
     write. Only when the upper is externally cleared (e.g. `_wipe_upper` before an LSP overlay
     refresh) is `materialize_overlay(specs, { force = true })` used to force a full rewrite.
-  - **`.git`-internal paths never take the "unchanged" fast-path** on capture: `.git` is a tightly
+  - **`.git`-internal paths never take any "unchanged" fast-path** on capture: `.git` is a tightly
     coupled index↔object-store↔refs database, and an already-captured object may lose its only
     carrying candidate when a git atomic-group candidate is wholly superseded by a newer candidate on
     the same paths (the old candidate, and thus its objects, are discarded). If the object then took
     the unchanged skip, the new candidate would omit it while its `index`/`HEAD` still reference it,
-    and the publish gate would fail-closed with `GIT_REFERENTIAL_INTEGRITY`. So `.git`-internal paths
-    are re-registered on every capture (git write tools already force a full walk; this only stops
-    skipping the content read).
+    and the publish gate would fail-closed with `GIT_REFERENTIAL_INTEGRITY`. This covers both skips:
+    the `expected`/dsig materialize-signature fast-path **and `ws_skip`** (skip when the overlay
+    content equals the workspace-staged content — after a prior git candidate is written to staging by
+    `merge_candidate`, the next overlay materializes that same object from staging, so the two are
+    necessarily equal). So `.git`-internal paths are re-registered on every capture (git write tools
+    already force a full walk; this only stops skipping the content read).
   - **No fsync for overlay scratch**: the per-session overlay upper is ephemeral scratch (rotated on
     agentEnd), so `write_file_atomic(..., { sync = false })` drops the per-file fsync; real workspace
     publishing still fsyncs for durability.
@@ -684,6 +687,13 @@ detection) and `risk.classify` (security level), so `pip install`, `sudo modprob
       object can never be written alone and corrupt the repository.
     - File-writing tools (`edit_file`, …) targeting `.git` are still refused outright (the AI should
       not edit repository internals directly).
+    - **Only git-write tools may publish `.git` pointers**: any tool other than `git_add`/`git_commit`/
+      `git_stash`/`git_restore`/`git_rollback` whose candidate happens to contain `.git/index`
+      (e.g. because a fresh `.git` mtime forced a full traversal) is only seeing a **leftover pointer
+      from a preceding git tool**; it is dropped at freeze time (only the object store is kept).
+      Otherwise the candidate would publish a dangling pointer to a not-yet-materialized object, which
+      the publish gate rejects fail-closed with `GIT_REFERENTIAL_INTEGRITY: index -> <oid>` — failing
+      the whole (otherwise fine) tool call.
 - **Buffer-persist tools** (`delete_node`/`lsp_rename`/`lsp_format`): `tool_helpers.persist_buffer`
   redirects `:write!` to staging while the sandbox is active. **Reads never write back**: a buffer is
   saved only when a write tool explicitly modified it (`mark_edited`); read-only paths such as

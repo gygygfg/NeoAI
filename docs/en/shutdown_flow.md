@@ -80,6 +80,11 @@ The cancellation mechanism is based on the AbortSignal from `async.create_signal
 
 `lifecycle.shutdown()` runs the cleanup functions in reverse order, saving unpersisted sessions and shutting down async tasks. It then calls `event_bus.emit(PLUGIN_SHUTDOWN)`.
 
+The exit cleanup triggers `plugins.stop_all()` → each side-effect plugin's `stop`. In particular the **herder plugin's
+`stop` calls `herder.shutdown()`**: if running under Herder and authority was taken over, it clears the display metadata
+and sends `release-agent`, so Herder immediately falls back to screen heuristics and does not retain this session's
+`working`/`blocked` state. `:restart` and `:NeoAIReloadAll` share the same unload path, so they release just as promptly.
+
 ### 5.2 Window Close
 
 `chat_view.close()` → `chat_service.detach_window(win_id)`:

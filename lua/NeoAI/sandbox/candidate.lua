@@ -2044,8 +2044,10 @@ local function _capture_worker(upper_root, real_root, session_basename, expected
   --- `.git` 是「索引↔对象库↔refs」强耦合数据库：若某个已捕获对象因「未变快速跳过」而不进入
   --- 本次候选，而它的**承载候选**又因 git 原子组「整组取代」被丢弃（见 review.supersede_by_paths），
   --- 则该对象在所有候选与宿主中均不可得 → 新候选的 index/HEAD 会引用缺失对象，发布闸门
-  --- 必然拒绝（GIT_REFERENTIAL_INTEGRITY）。故 `.git` 内部路径**永不**走未变快速跳过：
-  --- 每次捕获都重新登记其内容（git 写工具本已强制全量遍历，此处只是不再省去内容读取）。
+  --- 必然拒绝（GIT_REFERENTIAL_INTEGRITY）。故 `.git` 内部路径**永不**走任何未变跳过：
+  --- 既不走 `expected`/dsig 快速跳过，也不走 `ws_skip`（前序 git 候选 merge 进暂存后，
+  --- 后续 overlay 会从暂存物化出同一对象，overlay 内容与暂存内容相等——若据此跳过，该对象
+  --- 便随被取代的旧候选一起丢失，新候选的 index 仍引用它 → 悬空）。每次捕获都重新登记其内容。
   --- @param rel string 相对捕获根路径
   --- @return boolean
   local function is_git_internal_rel(rel)
@@ -2074,7 +2076,8 @@ local function _capture_worker(upper_root, real_root, session_basename, expected
     -- 未变快速判定：物化时记录的目标签名（mtime/size/mode）未变即视为命令未改动，
     -- 直接跳过——不读文件、不做纯 Lua SHA。`.git` 内部路径例外（见上）：其对象可能因原子组
     -- 整组取代而失去唯一承载候选，必须每次重新登记，否则产生悬空引用。
-    if exp and exp.hash and exp.dsig and not is_git_internal_rel(child_rel) then
+    local git_internal = is_git_internal_rel(child_rel)
+    if exp and exp.hash and exp.dsig and not git_internal then
       local dsig = dsig_of(vim.uv.fs_stat(dest))
       if dsig ~= "" and dsig == exp.dsig then return end
     end
@@ -2090,7 +2093,7 @@ local function _capture_worker(upper_root, real_root, session_basename, expected
       enc((stat and stat.type == "file" and ("sig:" .. sig_of(real))) or "")
       enc(tostring(stat and stat.mode or 0))
       count = count + 1
-    elseif not ws_skip(real, dest, sstat) then
+    elseif git_internal or not ws_skip(real, dest, sstat) then
       -- 包/生成内容：base 为文件时用 stat 签名代替内容哈希（不读真实盘内容）。
       local base_field = ""
       if package and stat and stat.type == "file" then base_field = "sig:" .. sig_of(real) end
@@ -2704,6 +2707,27 @@ local function _is_package_candidate(files, attempt)
   return false
 end
 
+-- 仅有这些「git 写类工具」可以在沙箱内改写 `.git`（见 wrapper.GIT_WRITE_TOOLS 的设计说明）。
+-- 其余工具（run_command / edit_file / write_file / 只读 git 工具等）**绝不**会合法地改动 `.git`：
+-- 一旦本次捕获里出现 `.git` 指针（index/HEAD/refs），它只可能是**前置 git 写类工具遗留在 overlay
+-- 里的残留**（例如 `.git` mtime 新鲜触发了全量遍历），并非本工具所为。若据此发布，就会写出
+-- 「引用了尚未物化对象」的悬空指针，被 `_git_publish_gate` 拒绝
+-- （GIT_REFERENTIAL_INTEGRITY: index -> <oid>）——即使本工具自身毫无问题也会整单失败。
+-- 因此对非 git 写类工具，**只保留对象库（内容寻址、不可变、可累加，携带无害且有助于完整性），
+-- 剔除指针**：指针只能由其真正的产出工具（git 写类工具）随其对象一起发布。
+local GIT_WRITE_TOOLS = {
+  git_add = true, git_commit = true, git_stash = true,
+  git_restore = true, git_rollback = true,
+}
+
+--- 本次 attempt 是否为 git 写类工具。
+--- @param attempt table|nil
+--- @return boolean
+local function _is_git_write_tool(attempt)
+  local name = attempt and attempt.tool_name
+  return type(name) == "string" and GIT_WRITE_TOOLS[name] == true
+end
+
 --- 剔除命中「有效遮蔽」与「易变包索引/缓存」的文件。
 --- @param files table
 --- @param attempt table|nil 控制层 attempt（含 effective_unmask / package）
@@ -2733,6 +2757,12 @@ local function _filter_unpublishable(files, attempt, classify)
     if gc == "transient" or gc == "other" or is_obj_del then
       -- `.git` 瞬态（*.lock/gc.log）、配置类（config/hooks/info）与对象删除（gc/prune 的
       -- 剪枝）不纳入候选：对象删除绝不应用（保留多余对象无害，删除被引用的对象才会悬空）。
+      dropped.git = dropped.git + 1
+      if #dropped.git_paths < 20 then dropped.git_paths[#dropped.git_paths + 1] = f.path end
+    elseif gc == "pointer" and not _is_git_write_tool(attempt) then
+      -- 非 git 写类工具绝不发布 `.git` 指针：它只会是前置 git 写类工具遗留在 overlay 的残留，
+      -- 若随本单发布，会写出引用未物化对象的悬空指针（GIT_REFERENTIAL_INTEGRITY）。
+      -- 保留对象库（下一分支/默认分支）以便 completeness；指针交由其真正的产出工具发布。
       dropped.git = dropped.git + 1
       if #dropped.git_paths < 20 then dropped.git_paths[#dropped.git_paths + 1] = f.path end
     elseif masked then
