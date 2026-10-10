@@ -80,6 +80,11 @@ bridge** when the overlay is available and the target is not under a private tmp
 fast path / existence check); the other read-only tools (`list_files`/`search_files`) read the
 overlay-mirrored staged copy (equivalent to the overlay merged view). LSP/treesitter writes still use
 their existing staging path (`persist_target` → staged copy, the real disk untouched before publish).
+In addition, `persist_buffer` performs a fail-closed check before writing to the **real disk** (when no
+sandbox is active): if the buffer content contains secret tokens (`NEOKEY_…`) or registered
+format-preserving fake keys, the write is **refused** (`SECRET_TOKEN_SKIP`), so content faked by the
+secret layer is never written back to a real file (a past bug replaced a source file's contents with
+random fake values).
 
 ## 3. Enforcement points (loader + executor)
 

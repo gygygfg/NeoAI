@@ -1094,6 +1094,371 @@ lsp_tools.lsp_service_info = helpers.define_tool(
   { category = "lsp" }
 )
 
+-- ========== lsp_check（项目级全量诊断，server CLI 检查） ==========
+
+--- 严重级别名 → 数值（1=Error … 4=Hint）。
+local _SEV_NUM = {
+  error = 1, warning = 2, warn = 2,
+  information = 3, info = 3, hint = 4,
+}
+--- 严重级别数值 → LuaLS `--checklevel` 字面量。
+local _SEV_LEVEL = { [1] = "Error", [2] = "Warning", [3] = "Information", [4] = "Hint" }
+--- 严重级别数值 → 显示名。
+local _SEV_NAME = { [1] = "Error", [2] = "Warning", [3] = "Information", [4] = "Hint" }
+
+--- 把「逗号分隔串或数组」归一化为字符串数组。
+local function _as_list(v)
+  if type(v) == "table" then return v end
+  if type(v) == "string" and v ~= "" then
+    local out = {}
+    for item in v:gmatch("[^,]+") do out[#out + 1] = (item:gsub("^%s+", ""):gsub("%s+$", "")) end
+    return out
+  end
+  return {}
+end
+
+--- @return table
+local function _check_cfg()
+  return config_store.get("tools.lsp.check") or {}
+end
+
+--- 默认 server 名（配置键排序后的第一个）。
+local function _default_check_server(servers)
+  local names = {}
+  for k in pairs(servers or {}) do names[#names + 1] = k end
+  table.sort(names)
+  return names[1]
+end
+
+--- 向上查找项目根（含任一 root_files 的目录）；找不到时回退 target（目录）或其父目录。
+local function _check_root(target, spec)
+  local root_files = (spec and spec.root_files) or {}
+  local start = vim.fn.isdirectory(target) == 1 and target or vim.fn.fnamemodify(target, ":h")
+  local d = start
+  while d and d ~= "/" and d ~= "" do
+    for _, rf in ipairs(root_files) do
+      if vim.fn.filereadable(d .. "/" .. rf) == 1 then return d end
+    end
+    local parent = vim.fn.fnamemodify(d, ":h")
+    if parent == d then break end
+    d = parent
+  end
+  return start
+end
+
+--- 项目根是否已有配置（任一 root_files 存在）。
+local function _check_configured(root, spec)
+  for _, rf in ipairs((spec and spec.root_files) or {}) do
+    if vim.fn.filereadable(root .. "/" .. rf) == 1 then return true end
+  end
+  return false
+end
+
+--- 展开 argv 占位符（{path}/{root}/{level}/{server}/{out}）。
+local function _expand_argv(argv, subs)
+  local out = {}
+  for _, a in ipairs(argv or {}) do
+    out[#out + 1] = (tostring(a):gsub("{([%w_]+)}", function(k)
+      local v = subs[k]
+      return v ~= nil and tostring(v) or ("{" .. k .. "}")
+    end))
+  end
+  return out
+end
+
+--- POSIX 单引号转义。
+local function _shquote(s)
+  return "'" .. tostring(s):gsub("'", "'\\''") .. "'"
+end
+
+--- 解析 LuaLS `--check_out_path` JSON：{ uri: [ {range, severity, message, code} ] }。
+local function _parse_luals(text)
+  local ok, decoded = pcall(require("NeoAI.utils.json").decode, text)
+  if not ok or type(decoded) ~= "table" then return nil end
+  local out = {}
+  for uri, diags in pairs(decoded) do
+    if type(diags) == "table" then
+      local path = type(uri) == "string" and uri:match("^file://") and vim.uri_to_fname(uri) or uri
+      for _, d in ipairs(diags) do
+        if type(d) == "table" then
+          local range = d.range or {}
+          local start = range.start or {}
+          out[#out + 1] = {
+            path = path,
+            line = (tonumber(start.line) or 0) + 1,
+            col = (tonumber(start.character) or 0) + 1,
+            severity = tonumber(d.severity) or 1,
+            code = d.code,
+            message = tostring(d.message or ""),
+          }
+        end
+      end
+    end
+  end
+  return out
+end
+
+--- 过滤/排序/限流诊断。
+--- @return table diags, number total
+local function _filter_diags(diags, args)
+  local min_sev = _SEV_NUM[tostring(args.severity or ""):lower()]
+  local codes = {}
+  for _, c in ipairs(_as_list(args.codes)) do codes[tostring(c)] = true end
+  local ex_codes = {}
+  for _, c in ipairs(_as_list(args.exclude_codes)) do ex_codes[tostring(c)] = true end
+  local inc_paths = _as_list(args.paths)
+  local exc_paths = _as_list(args.exclude_paths)
+  local function path_match(p, pats)
+    for _, pat in ipairs(pats) do
+      if type(p) == "string" and p:find(pat, 1, true) then return true end
+    end
+    return false
+  end
+  local out = {}
+  for _, d in ipairs(diags) do
+    local keep = true
+    if min_sev and (d.severity or 1) > min_sev then keep = false end
+    if keep and next(codes) and not codes[tostring(d.code)] then keep = false end
+    if keep and next(ex_codes) and ex_codes[tostring(d.code)] then keep = false end
+    if keep and #inc_paths > 0 and not path_match(d.path, inc_paths) then keep = false end
+    if keep and #exc_paths > 0 and path_match(d.path, exc_paths) then keep = false end
+    if keep then out[#out + 1] = d end
+  end
+  table.sort(out, function(a, b)
+    if a.path ~= b.path then return tostring(a.path) < tostring(b.path) end
+    if a.line ~= b.line then return a.line < b.line end
+    return (a.col or 0) < (b.col or 0)
+  end)
+  local total = #out
+  local before = #diags
+  local limit = tonumber(args.limit)
+  if limit and limit > 0 and #out > limit then
+    local trimmed = {}
+    for i = 1, limit do trimmed[i] = out[i] end
+    return trimmed, total, before
+  end
+  return out, total, before
+end
+
+--- 渲染诊断。
+local function _format_diags(diags, fmt, total)
+  fmt = fmt or "text"
+  if fmt == "json" then
+    return require("NeoAI.utils.json").encode({ count = #diags, total = total, diagnostics = diags })
+  end
+  if fmt == "summary" then
+    local c = { Error = 0, Warning = 0, Information = 0, Hint = 0 }
+    for _, d in ipairs(diags) do
+      local name = _SEV_NAME[d.severity or 1] or "Error"
+      c[name] = (c[name] or 0) + 1
+    end
+    return ("诊断汇总：共 %d 条（显示 %d）：Error=%d Warning=%d Information=%d Hint=%d")
+      :format(total, #diags, c.Error, c.Warning, c.Information, c.Hint)
+  end
+  local lines = {}
+  for _, d in ipairs(diags) do
+    lines[#lines + 1] = ("%s:%d:%d [%s] %s%s"):format(
+      tostring(d.path), d.line, d.col, _SEV_NAME[d.severity or 1] or "Error",
+      d.message, d.code and (" (" .. tostring(d.code) .. ")") or "")
+  end
+  if #lines == 0 then return "无诊断" end
+  return table.concat(lines, "\n")
+end
+
+--- 读取 baseline（本工具先前的 JSON 输出）→ 诊断键集合。
+local function _baseline_keys(path)
+  local f = io.open(path, "r")
+  if not f then return nil end
+  local text = f:read("*a"); f:close()
+  local ok, decoded = pcall(require("NeoAI.utils.json").decode, text or "")
+  if not ok or type(decoded) ~= "table" or type(decoded.diagnostics) ~= "table" then return nil end
+  local keys = {}
+  for _, d in ipairs(decoded.diagnostics) do
+    keys[("%s:%s:%s:%s"):format(tostring(d.path), tostring(d.line), tostring(d.code), tostring(d.message))] = true
+  end
+  return keys
+end
+local function _diag_key(d)
+  return ("%s:%s:%s:%s"):format(tostring(d.path), tostring(d.line), tostring(d.code), tostring(d.message))
+end
+
+--- 沙箱内/宿主的结果文件路径对（`{out}` 与回读路径）。
+--- 仅当命令确实经沙箱前缀运行时，guest `/tmp` 才映射到宿主会话私有目录；直接运行（无前缀）
+--- 时 guest `/tmp` 就是真实 `/tmp`，回读也用真实路径（否则会与写入位置不一致）。
+--- @param uniq string
+--- @param in_sandbox boolean
+--- @return string guest, string host
+local function _out_paths(uniq, in_sandbox)
+  local guest = "/tmp/neoai-lsp-check/" .. uniq .. ".json"
+  local host = guest
+  if in_sandbox then
+    local ok, guest_fs = pcall(require, "NeoAI.sandbox.execution.guest_fs")
+    if ok and guest_fs and type(guest_fs.tmp_host) == "function" then
+      local host_dir = guest_fs.tmp_host("/tmp")
+      if host_dir then host = host_dir .. "/neoai-lsp-check/" .. uniq .. ".json" end
+    end
+  end
+  pcall(vim.fn.mkdir, vim.fn.fnamemodify(host, ":h"), "p")
+  return guest, host
+end
+
+--- 在沙箱内执行 argv（可选超时 kill），回调 (code, stdout, stderr)。
+local function _spawn(full, ctx, timeout_ms, on_done)
+  local out, errb = {}, {}
+  local job = vim.fn.jobstart(full, {
+    cwd = (ctx and ctx.sandbox_cwd) or nil,
+    env = (ctx and ctx.sandbox_env) or nil,
+    stdout_buffered = false,
+    stderr_buffered = false,
+    on_stdout = function(_, d) for i = 1, #d do if d[i] ~= "" then out[#out + 1] = d[i] end end end,
+    on_stderr = function(_, d) for i = 1, #d do if d[i] ~= "" then errb[#errb + 1] = d[i] end end end,
+    on_exit = function(_, code) on_done(code, table.concat(out, "\n"), table.concat(errb, "\n")) end,
+  })
+  if job <= 0 then return nil end
+  if timeout_ms and timeout_ms > 0 then
+    local t = vim.uv.new_timer()
+    t:start(timeout_ms, 0, function()
+      vim.schedule(function()
+        if ctx and type(ctx.sandbox_kill) == "function" then pcall(ctx.sandbox_kill) end
+        pcall(vim.fn.jobstop, job)
+      end)
+      pcall(function() t:stop(); t:close() end)
+    end)
+  end
+  return job
+end
+
+--- 项目级全量诊断：运行 server CLI 检查命令（沙箱内、只读、读暂存视图）。
+lsp_tools.lsp_check = helpers.define_tool(
+  "lsp_check",
+  "项目级全量诊断：运行 LSP server 的 CLI 检查命令（如 lua-language-server --check），"
+    .. "对文件/目录/glob 全量重算，支持严重级别与 code/路径过滤、summary/text/json、基线比对。"
+    .. "不依赖 buffer 是否打开，读沙箱暂存视图。",
+  {
+    type = "object",
+    properties = {
+      path = { type = "string" },
+      server = { type = "string" },
+      severity = { type = "string" },
+      format = { type = "string" },
+      codes = { type = "string" },
+      exclude_codes = { type = "string" },
+      paths = { type = "string" },
+      exclude_paths = { type = "string" },
+      limit = { type = "integer" },
+      baseline = { type = "string" },
+    },
+    required = {},
+  },
+  function(args, on_success, on_error, ctx)
+    local cfg = _check_cfg()
+    if cfg.enabled == false then
+      on_error("lsp_check 未启用（tools.lsp.check.enabled=false）")
+      return
+    end
+    local servers = cfg.servers or {}
+    local cwd = (ctx and ctx.cwd) or vim.fn.getcwd()
+    local target = args.path and vim.fn.fnamemodify(args.path, ":p"):gsub("/+$", "") or cwd
+    local server_name = args.server or _default_check_server(servers)
+    local spec = server_name and servers[server_name]
+    if type(spec) ~= "table" or type(spec.argv) ~= "table" then
+      on_error("lsp_check：未配置可用的 server（tools.lsp.check.servers）"
+        .. (server_name and ("：" .. tostring(server_name)) or ""))
+      return
+    end
+    local root = _check_root(target, spec)
+    local uniq = vim.fn.tempname():gsub(".*/", ""):gsub("[^%w_]", "")
+    local prefix = (ctx and ctx.sandbox_prefix) or {}
+    local in_sandbox = #prefix > 0
+    local out_guest, out_host = _out_paths(uniq, in_sandbox)
+    local sev_num = _SEV_NUM[tostring(args.severity or ""):lower()]
+    local level = sev_num and _SEV_LEVEL[sev_num] or "Warning"
+    local subs = {
+      path = target, root = root, level = level,
+      server = server_name, out = out_guest,
+    }
+    local argv = _expand_argv(spec.argv, subs)
+    -- 根缺少项目配置（声明了 root_files 但不存在）：结果顶部强警示（按沙箱视图检测）。
+    local missing_cfg = #(spec.root_files or {}) > 0 and not _check_configured(root, spec)
+    -- 根缺少项目配置且 auto_config：在沙箱内写入默认配置（overlay 暂存、不落工作区真实盘）。
+    local need_auto = type(spec.auto_config) == "table" and spec.auto_config.enabled ~= false
+      or spec.auto_config == true
+    if need_auto and not _check_configured(root, spec) then
+      local cfg_file = spec.auto_config_file or ".luarc.json"
+      local auto = type(spec.auto_config) == "table" and spec.auto_config.content
+        or '{\n  "runtime": { "version": "LuaJIT" },\n  "workspace": { "checkThirdParty": false }\n}\n'
+      local parts = {}
+      for _, a in ipairs(argv) do parts[#parts + 1] = _shquote(a) end
+      local script = "printf %s " .. _shquote(auto) .. " > " .. _shquote(root .. "/" .. cfg_file)
+        .. " && exec " .. table.concat(parts, " ")
+      argv = { "/bin/sh", "-c", script }
+    end
+    local full = {}
+    for _, v in ipairs(prefix) do full[#full + 1] = v end
+    for _, v in ipairs(argv) do full[#full + 1] = v end
+
+    local timeout_ms = tonumber(cfg.timeout_ms) or 60000
+    local fmt = args.format or "text"
+    local job = _spawn(full, ctx, timeout_ms, function(code, stdout, stderr)
+      local raw_out
+      local f = io.open(out_host, "r")
+      if f then raw_out = f:read("*a"); f:close() end
+      local diags
+      if (spec.format == "lua-ls") and raw_out and raw_out ~= "" then
+        diags = _parse_luals(raw_out)
+      end
+      if not diags then
+        -- text/未知：stdout 直接回传（附退出码），不解析。
+        local body = stdout
+        if (not body or body == "") and stderr and stderr ~= "" then body = stderr end
+        if (not body or body == "") then body = raw_out or "" end
+        local out = body ~= "" and body or ("（无输出，退出码 " .. tostring(code) .. "）")
+        on_success(require("NeoAI.tools.builtin.output_guard").cap(out, { tool = "lsp_check" }))
+        return
+      end
+      local filtered, total, before = _filter_diags(diags, args)
+      local body
+      if #filtered == 0 then
+        -- 空结果准确归因：区分「本无诊断」与「被过滤掉」。
+        body = (before > 0)
+          and ("无匹配诊断（已应用过滤：severity/codes/paths/limit；原有 " .. before .. " 条）")
+          or "无诊断"
+      else
+        body = _format_diags(filtered, fmt, total)
+      end
+      if missing_cfg then
+        body = ("⚠ 项目根缺少 " .. table.concat(spec.root_files or {}, "/")
+          .. "（按沙箱视图检测；AI 刚暂存的配置也算存在）。结果可能含大批 undefined-global 噪声。\n")
+          .. body
+      end
+      -- 基线比对：只标出相对基线「新增」的诊断。
+      if args.baseline then
+        local base = _baseline_keys(args.baseline)
+        if base then
+          local fresh = {}
+          for _, d in ipairs(filtered) do
+            if not base[_diag_key(d)] then fresh[#fresh + 1] = d end
+          end
+          local header = ("基线比对：当前 %d 条，其中新增 %d 条（已修复 %d 条）\n")
+            :format(total, #fresh, 0)
+          body = header .. _format_diags(fresh, fmt, #fresh)
+        else
+          body = "（基线文件不可读，忽略 baseline：" .. tostring(args.baseline) .. "）\n" .. body
+        end
+      end
+      if code and code ~= 0 and (not body or body == "") then
+        body = ("检查命令退出码 %d\n%s"):format(code, stderr or "")
+      end
+      on_success(require("NeoAI.tools.builtin.output_guard").cap(body, { tool = "lsp_check" }))
+    end)
+    if not job then
+      on_error("lsp_check：无法启动检查命令（binary 不存在？）：" .. tostring(argv[1]))
+      return
+    end
+  end,
+  { category = "lsp" }
+)
+
 --- 获取工具列表
 --- @return table 数组
 function M.get_tools()

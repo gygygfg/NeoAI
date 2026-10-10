@@ -25,6 +25,8 @@ local M = {}
 
 -- 克隆客户端缓存：key = "<editor_name>\0<root_dir>" -> client_id
 local clones = {}
+-- 空闲保活：每个克隆最后一次取用的单调时刻（ms）。超过 idle_timeout_ms 未再取用即回收。
+local last_used = {}
 
 -- ========== 私有函数 ==========
 
@@ -32,6 +34,64 @@ local clones = {}
 --- @return table
 local function _cfg()
   return config_store.get("tools.sandbox.lsp_overlay") or {}
+end
+
+--- 空闲保活时长（ms）。默认 10 分钟；0/负数 = 永不空闲回收。
+--- @return number
+local function _idle_timeout()
+  local v = tonumber(_cfg().idle_timeout_ms)
+  if v == nil then return 600000 end
+  return v
+end
+
+-- 空闲回收定时器（单个，unref 以免阻止 nvim 退出）。
+local reaper = nil
+
+local function _stop_reaper()
+  if reaper then
+    pcall(function() reaper:stop() end)
+    pcall(function() reaper:close() end)
+    reaper = nil
+  end
+end
+
+--- 回收超过 idle_timeout 未取用的克隆；无剩余克隆时停表。
+local function _reap()
+  local timeout = _idle_timeout()
+  if timeout <= 0 then _stop_reaper(); return end
+  local now = vim.uv.now()
+  local any = false
+  for key, id in pairs(clones) do
+    local c = vim.lsp.get_client_by_id(id)
+    if (not c) or c:is_stopped() then
+      clones[key] = nil
+      last_used[key] = nil
+    elseif (now - (last_used[key] or now)) >= timeout then
+      pcall(function() c:stop() end)
+      clones[key] = nil
+      last_used[key] = nil
+    else
+      any = true
+    end
+  end
+  if not any then _stop_reaper() end
+end
+
+local function _ensure_reaper()
+  local timeout = _idle_timeout()
+  if timeout <= 0 or reaper then return end
+  local interval = math.min(math.max(math.floor(timeout / 4), 1000), 60000)
+  reaper = vim.uv.new_timer()
+  if not reaper then return end
+  if reaper.unref then reaper:unref() end
+  reaper:start(interval, interval, function() vim.schedule(_reap) end)
+end
+
+--- 记录某克隆被取用（刷新保活计时并按需启动回收定时器）。
+--- @param key string
+local function _touch(key)
+  last_used[key] = vim.uv.now()
+  _ensure_reaper()
 end
 
 --- overlay upper/work 宿主目录：位于暂存基目录（`conceal.base_host`，默认磁盘）之下，
@@ -305,7 +365,39 @@ local function _clone_of(ec, bufnr)
   elseif bufnr and not clone.attached_buffers[bufnr] then
     pcall(vim.lsp.buf_attach_client, bufnr, clone.id)
   end
+  if clone then _touch(key) end
   return clone
+end
+
+--- 复用兜底：目标 buffer **无编辑器客户端**（后台加载 / 用户 buffer 已 detach）时，
+--- 从已保活的克隆里按 root_dir 匹配一个复用它（attach + 推送暂存内容），而不是重报
+--- 「无 LSP 客户端」。root 为空/不匹配则不复用，避免张冠李戴。
+--- @param method string
+--- @param bufnr number
+--- @return table|nil clone
+local function _warm_clone_for(method, bufnr)
+  local name = vim.api.nvim_buf_get_name(bufnr)
+  if type(name) ~= "string" or name == "" then return nil end
+  local real = vim.fn.fnamemodify(name, ":p")
+  for key, id in pairs(clones) do
+    local c = vim.lsp.get_client_by_id(id)
+    if c and not c:is_stopped() then
+      local root = (c.config or {}).root_dir or ""
+      local rp = tostring(root):gsub("/+$", "")
+      -- 路径边界匹配：real 等于 root 或位于 root/ 之下（避免 /tmp/foo 误配 /tmp/foobar）。
+      if rp ~= "" and (real == rp or real:sub(1, #rp + 1) == rp .. "/") then
+        if not c.attached_buffers[bufnr] then
+          pcall(vim.lsp.buf_attach_client, bufnr, c.id)
+        end
+        if c:supports_method(method, bufnr) then
+          _push_staged_text(c, bufnr, name)
+          _touch(key)
+          return c
+        end
+      end
+    end
+  end
+  return nil
 end
 
 --- 取得某 buffer 上所有编辑器 LSP 的沙箱克隆（按需启动）。
@@ -344,10 +436,19 @@ function M.client_supporting(method, bufnr)
   local list = {}
   if bufnr then
     list = M.clients_for(bufnr)
+    if #list == 0 then
+      -- 复用兜底：buffer 无编辑器客户端（后台加载 / 用户 buffer 已 detach）时，复用同一
+      -- root 下已保活的克隆，而不是重报「无 LSP 客户端」。
+      local warm = _warm_clone_for(method, bufnr)
+      if warm then return warm end
+    end
   else
-    for _, id in pairs(clones) do
+    for key, id in pairs(clones) do
       local c = vim.lsp.get_client_by_id(id)
-      if c and not c:is_stopped() then list[#list + 1] = c end
+      if c and not c:is_stopped() then
+        list[#list + 1] = c
+        _touch(key)
+      end
     end
   end
   for _, c in ipairs(list) do
@@ -358,11 +459,13 @@ end
 
 --- 停止全部沙箱克隆并清空缓存。
 function M.stop_all()
+  _stop_reaper()
   for key, id in pairs(clones) do
     local c = vim.lsp.get_client_by_id(id)
     if c then pcall(function() c:stop() end) end
     clones[key] = nil
   end
+  last_used = {}
   pushed_text = {}
   pushed_version = {}
 end
@@ -370,6 +473,43 @@ end
 --- 重置（测试用）
 function M.reset()
   M.stop_all()
+end
+
+-- ========== 测试钩子（内部状态访问；仅测试使用） ==========
+
+--- 立即执行一次空闲回收（不等待定时器）。
+function M._reap_now()
+  _reap()
+end
+
+--- 登记一个克隆 id（测试用；模拟已启动的克隆）。
+--- @param key string
+--- @param id number
+function M._test_register(key, id)
+  clones[key] = id
+  _touch(key)
+end
+
+--- 设置某克隆的最后取用时刻（测试用；模拟空闲）。
+--- @param key string
+--- @param ms number
+function M._test_set_last_used(key, ms)
+  last_used[key] = ms
+end
+
+--- 读取某克隆的最后取用时刻（测试用）。
+--- @param key string
+--- @return number|nil
+function M._test_last_used(key)
+  return last_used[key]
+end
+
+--- 当前克隆缓存副本（测试用）。
+--- @return table
+function M._test_clones()
+  local out = {}
+  for k, v in pairs(clones) do out[k] = v end
+  return out
 end
 
 return M

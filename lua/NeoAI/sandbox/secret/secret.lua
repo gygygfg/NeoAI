@@ -714,6 +714,20 @@ function M.enabled()
   return _cfg().enabled ~= false
 end
 
+--- 文本是否含插件密钥 token（`NEOKEY_…`）或已登记的格式保真假密钥。
+--- 写**真实盘**路径据此 fail-closed：绝不把 token/假密钥写入真实文件（曾发生「假化后写回」
+--- 把源码文件内容替换为随机假密钥的静默损坏）。
+--- @param text string
+--- @return boolean
+function M.has_token_or_fake(text)
+  if type(text) ~= "string" or text == "" then return false end
+  if text:find("NEOKEY_", 1, true) then return true end
+  for f in pairs(state.fake_set) do
+    if type(f) == "string" and #f >= 8 and text:find(f, 1, true) then return true end
+  end
+  return false
+end
+
 --- 计算字符串香农熵（导出供测试）
 --- @param s string
 --- @return number

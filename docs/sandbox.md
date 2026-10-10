@@ -78,6 +78,9 @@ overlay 成为权威暂存层；随后 `candidate.mirror_overlay` 把 overlay �
 不在私有 tmpfs 根下时**经桥读取 overlay 合并视图**（小文件快路径/存在性判定），其余只读工具
 （`list_files`/`search_files`）读取的是 overlay 镜像后的暂存副本（与 overlay 合并视图一致）；
 LSP/treesitter 的写盘仍走各自既有的暂存路径（`persist_target` → 暂存副本，发布前不改真实盘）。
+另外，`persist_buffer` 回写**真实盘**（无沙箱激活时）前做 fail-closed 检查：buffer 内容含密钥
+token（`NEOKEY_…`）或格式保真假密钥时**拒绝写盘**（`SECRET_TOKEN_SKIP`），避免把密钥层假化后的
+内容写回真实文件（曾发生把含 PEM 样式文字的源码文件内容替换为随机假值的静默损坏）。
 
 ## 3. 强制入口（加载器 + 执行器）
 

@@ -60,6 +60,9 @@ local state = {
   -- 其内存由 `rejected_max` 单独约束：超限时删除最旧项副本并移出内存。
   rejected_order = {},
   rejected_set = {},
+  -- 正在发布中的路径 → change_set_id。同一路径的并发发布必须串行化，否则两次发布都以
+  -- 同一基线通过 CAS 后互相覆盖，静默丢一个（「已允许的修改被回滚」）。
+  applying_paths = {},
 }
 
 -- ========== 候选内容按需读取（内存 item 已剥离 content） ==========
@@ -1187,6 +1190,10 @@ local function _apply_begin(id, opts)
   if item.apply_state == M.APPLY.APPLIED then
     return nil, { ok = true, state = "ALREADY_APPLIED", receipt = item.receipt }
   end
+  -- 已有一次（异步）发布在途：拒绝二次应用，避免同一变更单元的两次发布重叠写入。
+  if item.apply_state == M.APPLY.APPLYING then
+    return nil, { ok = false, state = "APPLYING", reason = "CHANGE_SET_APPLYING: " .. tostring(id) }
+  end
   -- 自动批准是为「应用」服务的瞬时状态：一旦应用失败必须回退为待审，
   -- 否则条目停留在 APPROVED 而从待审悬浮窗（只列 PENDING）中消失，用户无法重试/拒绝。
   local auto_approved = false
@@ -1308,10 +1315,32 @@ local function _apply_begin(id, opts)
     copy.candidate_digest = cand.candidate_digest .. ":subset" .. tostring(#filtered)
     cand = copy
   end
+  -- 同一路径的并发发布串行化：若该路径正被另一变更单元发布，拒绝本次（否则两次发布都以
+  -- 同一基线通过 CAS 后互相覆盖，静默丢一个）。用户待其完成后可重试。
+  local busy = nil
+  for _, f in ipairs(cand.files or {}) do
+    local owner = state.applying_paths[f.path]
+    if owner and owner ~= id then busy = f.path break end
+  end
+  if busy then
+    _restore_pending()
+    return nil, { ok = false, state = "CONFLICT", reason = "PATH_APPLYING: " .. tostring(busy) }
+  end
+  for _, f in ipairs(cand.files or {}) do state.applying_paths[f.path] = id end
   return {
     id = id, item = item, cand = cand, remaining = remaining,
     restore_pending = _restore_pending, opts = opts,
   }
+end
+
+--- 释放 `_apply_begin` 登记的发布中路径（成功/失败/异常都须调用，避免路径长期占用）。
+--- @param ctx table
+local function _release_paths(ctx)
+  if not ctx or not ctx.cand then return end
+  local id = ctx.id
+  for _, f in ipairs(ctx.cand.files or {}) do
+    if state.applying_paths[f.path] == id then state.applying_paths[f.path] = nil end
+  end
 end
 
 --- 应用收尾：根据发布结果更新条目状态、落盘快照、删除候选、回执与事件。
@@ -1320,6 +1349,7 @@ end
 --- @return table pub
 local function _apply_settle(ctx, pub)
   local item, id = ctx.item, ctx.id
+  _release_paths(ctx)
   -- 部分应用（非原子单元）：成功子集按「已应用」结算，失败文件回队重试。
   -- 快照只覆盖成功落盘的文件，未写入的文件不纳入撤销；失败文件成为新的待审单元。
   local partial = (pub.state == "PARTIAL")
@@ -1437,9 +1467,13 @@ function M.apply(id, opts)
   local ctx, early = _apply_begin(id, opts)
   if early then return early end
   ctx = assert(ctx)
-  local pub_opts = _apply_publish_begin(ctx)
-  local pub = candidate.publish(ctx.cand, pub_opts)
-  return _apply_settle(ctx, pub)
+  local ok, res = pcall(function()
+    local pub_opts = _apply_publish_begin(ctx)
+    local pub = candidate.publish(ctx.cand, pub_opts)
+    return _apply_settle(ctx, pub)
+  end)
+  if not ok then _release_paths(ctx); error(res, 0) end
+  return res
 end
 
 --- 应用变更单元（异步）：CAS + 写入在线程池分块执行，主线程不被大候选落盘阻塞。
@@ -1454,9 +1488,12 @@ function M.apply_async(id, opts)
   if early then return async.resolve(early) end
   ctx = assert(ctx)
   local pub_opts = _apply_publish_begin(ctx)
-  return candidate.publish_async(ctx.cand, pub_opts):then_(function(pub)
+  local d = candidate.publish_async(ctx.cand, pub_opts):then_(function(pub)
     return _apply_settle(ctx, pub)
   end)
+  -- 发布异常/被拒时同样释放路径占用，避免路径长期「发布中」而无法重试。
+  d:then_(nil, function() _release_paths(ctx) end)
+  return d
 end
 
 --- 开始一次批量应用会话：会话内 `apply` 把候选删除推迟到 `end_batch` 统一对账。
@@ -1877,6 +1914,7 @@ function M.reset()
   state.terminal_set = {}
   state.rejected_order = {}
   state.rejected_set = {}
+  state.applying_paths = {}
   _clear_content_cache()
 end
 

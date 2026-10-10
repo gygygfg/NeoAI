@@ -317,4 +317,80 @@ tests.suite("sandbox_lsp", function(_, it)
       t.nil_(lsp.client_supporting("textDocument/hover", vim.api.nvim_get_current_buf()), "关闭时应返回 nil")
     end)
   end)
+
+  -- ---- 空闲保活 / 复用兜底（mock 客户端，无需真实 server） ----
+
+  local function fake_client(id, root)
+    return {
+      id = id,
+      config = { root_dir = root },
+      attached_buffers = {},
+      _stopped = false,
+      is_stopped = function(self) return self._stopped end,
+      stop = function(self) self._stopped = true end,
+      supports_method = function() return true end,
+      notify = function() end,
+    }
+  end
+
+  it("空闲超过 idle_timeout_ms 后克隆被回收", function(t)
+    local lsp = require("NeoAI.sandbox.execution.lsp")
+    with_config({ tools = { sandbox = { lsp_overlay = { enabled = true, idle_timeout_ms = 100000 } } },
+      }, function()
+      lsp.reset()
+      local client = fake_client(4242, "/tmp/neoai_reap_root")
+      local orig = vim.lsp.get_client_by_id
+      vim.lsp.get_client_by_id = function(id) if id == 4242 then return client end end
+      lsp._test_register("k", 4242)
+      lsp._test_set_last_used("k", vim.uv.now() - 200000)
+      lsp._reap_now()
+      t.true_(client:is_stopped(), "空闲超时应停止克隆")
+      t.true_(next(lsp._test_clones()) == nil, "回收后应清空克隆缓存")
+      vim.lsp.get_client_by_id = orig
+      lsp.reset()
+    end)
+  end)
+
+  it("未超时的克隆不被回收，且取用刷新保活计时", function(t)
+    local lsp = require("NeoAI.sandbox.execution.lsp")
+    with_config({ tools = { sandbox = { lsp_overlay = { enabled = true, idle_timeout_ms = 100000 } } },
+      }, function()
+      lsp.reset()
+      local client = fake_client(555, "/tmp/neoai_keep_root")
+      local orig = vim.lsp.get_client_by_id
+      vim.lsp.get_client_by_id = function(id) if id == 555 then return client end end
+      lsp._test_register("k", 555)
+      local before = lsp._test_last_used("k")
+      t.not_nil(before, "登记时应记录取用时刻")
+      vim.wait(5)
+      lsp._test_register("k", 555)
+      t.true_((lsp._test_last_used("k") or 0) >= before, "再次取用应刷新保活计时")
+      lsp._reap_now()
+      t.false_(client:is_stopped(), "未超时不应回收")
+      vim.lsp.get_client_by_id = orig
+      lsp.reset()
+    end)
+  end)
+
+  it("复用兜底：buffer 无编辑器客户端时复用同 root 的已保活克隆", function(t)
+    local lsp = require("NeoAI.sandbox.execution.lsp")
+    with_config({ tools = { sandbox = { lsp_overlay = { enabled = true, idle_timeout_ms = 100000 } } },
+      }, function()
+      lsp.reset()
+      local root = "/tmp/neoai_reuse_root"
+      local bufnr = vim.api.nvim_create_buf(false, true)
+      vim.api.nvim_buf_set_name(bufnr, root .. "/a.lua")
+      local client = fake_client(777, root)
+      local oid, ocl, oat = vim.lsp.get_client_by_id, vim.lsp.get_clients, vim.lsp.buf_attach_client
+      vim.lsp.get_client_by_id = function(id) if id == 777 then return client end end
+      vim.lsp.get_clients = function() return {} end
+      vim.lsp.buf_attach_client = function(b) client.attached_buffers[b] = true end
+      lsp._test_register("k", 777)
+      local c = lsp.client_supporting("textDocument/diagnostic", bufnr)
+      t.true_(c == client, "无编辑器客户端时应复用同 root 的已保活克隆")
+      vim.lsp.get_client_by_id, vim.lsp.get_clients, vim.lsp.buf_attach_client = oid, ocl, oat
+      pcall(vim.api.nvim_buf_delete, bufnr, { force = true })
+      lsp.reset()
+    end)
+  end)
 end)

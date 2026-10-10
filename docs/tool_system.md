@@ -287,8 +287,7 @@ M.execute(agent, name, args, tool_call_id, opts)
 > （**按沙箱视图检测**：AI 刚暂存的 `.luarc.json` 也算存在），结果顶部给出**强警示**；
 > 若同时配置了 `auto_config`（默认对 lua-language-server 开启），则用**内置默认配置**执行本次检查
 > （LuaJIT + vim globals），消除大批 `undefined-global` 噪声——该临时配置**只在沙箱内生效、不写入
-> 工作区**，故 `file_exists(.luarc.json)` 为 false 属正常；如需生成真实文件，设
-> `auto_config_persist=true`（暂存为待审改动，read 工具可见，审批后发布）。
+> 工作区**，故 `file_exists(.luarc.json)` 为 false 属正常。
 > 空结果时**准确归因**：区分「严重级别过滤」「不在 scope 内」「code/path 过滤」并给出对应提示。
 > `lsp_service_info`/`lsp_client_info` 会显示每个客户端的**工作区根与启动命令**；工作区根为空时明确
 > 警示「跨文件/类型解析会大量误报（如 undefined-global）」并给出修复建议。

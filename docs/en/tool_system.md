@@ -323,8 +323,7 @@ dedicated tools above.
 > **strong warning** is prepended; if `auto_config` is also set (on by default for lua-language-server),
 > the check runs with **built-in defaults** (LuaJIT + vim globals), removing the bulk of `undefined-global`
 > noise. That temporary config **only affects this sandboxed check and is never written to the workspace**,
-> so `file_exists(.luarc.json)` being false is normal; set `auto_config_persist=true` to generate a real,
-> pending (staged) file visible to read tools and publishable on approval. On empty results the tool
+> so `file_exists(.luarc.json)` being false is normal. On empty results the tool
 > **attributes the filter correctly** (severity vs out-of-scope vs code/path).
 > `lsp_service_info`/`lsp_client_info` show each client's **workspace root and launch command**; an empty
 > root is flagged with "cross-file/type resolution will produce heavy false positives (e.g.

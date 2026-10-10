@@ -328,6 +328,18 @@ function M.persist_buffer(bufnr)
       target = sandbox.candidate.persist_target(filepath)
     end
   end
+  -- 真实盘写入前 fail-closed：绝不把密钥 token（NEOKEY_…）或格式保真假密钥写入真实文件。
+  -- 曾发生「密钥假化后写回」把（含 PEM/密钥样式文字的）源码文件内容替换为同长度随机假值，
+  -- 造成静默的代码损坏；非暂存目标一律拒绝。
+  if not target then
+    local ok_s, secret = pcall(require, "NeoAI.sandbox.secret.secret")
+    if ok_s and secret and type(secret.has_token_or_fake) == "function" then
+      local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+      if secret.has_token_or_fake(table.concat(lines, "\n")) then
+        return false, "SECRET_TOKEN_SKIP"
+      end
+    end
+  end
   local write_cmd = "silent write!"
   if target then
     write_cmd = "silent write! " .. vim.fn.fnameescape(target)

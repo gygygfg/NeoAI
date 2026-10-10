@@ -75,6 +75,8 @@ local SPECS = {
   lsp_declaration = { effect = "read" },
   lsp_implementation = { effect = "read" },
   lsp_service_info = { effect = "read" },
+  -- 项目级全量诊断：运行 server CLI 检查命令（沙箱内、只读、不捕获候选/不外溢）。
+  lsp_check = { effect = "process", read_only = true },
   lsp_rename = { effect = "fs_write" },
   lsp_format = { effect = "fs_write" },
   -- 长驻服务（service_*）：start/stop 为进程效果（门禁预检+脚本扫描+硬拒绝），但隔离与候选

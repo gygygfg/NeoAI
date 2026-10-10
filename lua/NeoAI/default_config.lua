@@ -392,6 +392,30 @@ local DEFAULT_CONFIG = {
       -- 等待 LSP 客户端附加的超时（ms）：后台加载 buffer / 服务器启动或重启期间客户端尚未
       -- 附加时，lsp_diagnostics 会等待其就绪再取诊断，而不是立即报「无 LSP 客户端」。
       attach_timeout_ms = 3000,
+      -- `lsp_check` 工具（项目级全量诊断）：在沙箱内运行 server 的 CLI 检查命令（只读、读暂存
+      -- 视图）。`servers` 按 server 名映射检查命令，argv 占位符：`{path}` 目标文件/目录、
+      -- `{root}` 项目根、`{level}` 严重级别、`{server}` server 名、`{out}` 结果文件（沙箱可写/
+      -- 宿主可读；LuaLS 写 JSON 到文件而非 stdout）。`format=lua-ls|text`。`root_files` 判定项目根；
+      -- 根缺少项目配置且 `auto_config=true` 时用内置默认配置执行本次检查（沙箱内，不写工作区）。
+      check = {
+        enabled = true, -- 总开关
+        timeout_ms = 60000, -- 检查命令超时（ms）
+        servers = {
+          ["lua-language-server"] = {
+            argv = {
+              "lua-language-server",
+              "--check={path}",
+              "--check_out_path={out}",
+              "--checklevel={level}",
+              "--logpath={out}.log",
+            },
+            format = "lua-ls",
+            root_files = { ".luarc.json", ".luarc.lua" },
+            auto_config = true,
+            auto_config_file = ".luarc.json",
+          },
+        },
+      },
     },
     guard = {
       repeat_tool = {
@@ -1335,6 +1359,9 @@ local DEFAULT_CONFIG = {
       -- 工作区）时自动跳过，AI 工具回退编辑器客户端。
       lsp_overlay = {
         enabled = true,
+        -- 克隆体在最后一次取用后保活 idle_timeout_ms（默认 10 分钟）再自动关闭，期间后续
+        -- 诊断/查询直接复用、无需等待 server 重启；设 0/负数则永不空闲回收。
+        idle_timeout_ms = 600000,
       },
       -- 密钥防护（常开）：基于熵检测高熵密钥，进沙箱替换为**格式保真假密钥**（同长度/同字符类/
       -- 熵不低于原始；进程内映射表，不落盘），仅在 commit 落盘、沙箱执行、私有视图物化时还原为

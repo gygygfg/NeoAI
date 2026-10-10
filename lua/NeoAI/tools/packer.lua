@@ -60,7 +60,7 @@ function M.get_pack_for_tool(tool_name)
     lsp_code_action = "lsp", lsp_rename = "lsp", lsp_format = "lsp",
     lsp_diagnostics = "lsp", lsp_client_info = "lsp",
     lsp_signature_help = "lsp", lsp_completion = "lsp",
-    lsp_type_definition = "lsp", lsp_service_info = "lsp",
+    lsp_type_definition = "lsp", lsp_service_info = "lsp", lsp_check = "lsp",
     log_message = "log", get_log_levels = "log",
     create_sub_agent = "agent", get_sub_agent_status = "agent",
     cancel_sub_agent = "agent",
