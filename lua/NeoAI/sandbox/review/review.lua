@@ -10,6 +10,10 @@
 local store = require("NeoAI.sandbox.state.store")
 local candidate = require("NeoAI.sandbox.execution.candidate")
 local logger = require("NeoAI.kernel.logger")
+local review_util = require("NeoAI.sandbox.review.review_util")
+-- 纯助手（自 review_util 引入，保持原局部名以零改调用点）
+local _content_limit, _emit, _strip_content, _superseded_count, _stat_sig, _read_file, _snapshot_cap, _snapshot_cas_mode, _write_set, _union =
+  review_util.content_limit, review_util.emit, review_util.strip_content, review_util.superseded_count, review_util.stat_sig, review_util.read_file, review_util.snapshot_cap, review_util.snapshot_cas_mode, review_util.write_set, review_util.union
 
 local M = {}
 
@@ -66,12 +70,6 @@ local content_lru = {}
 local content_lru_order = {}
 local content_lru_set = {}
 
-local function _content_limit()
-  local n = tonumber(require("NeoAI.kernel.config_store").get(
-    "tools.sandbox.review.content_cache_max"))
-  if n == nil then n = 64 end
-  return math.max(0, n)
-end
 
 local function _content_touch(key)
   for i = 1, #content_lru_order do
@@ -160,10 +158,6 @@ local function _pending_items()
   return out
 end
 
-local function _emit(event, payload)
-  local event_bus = require("NeoAI.kernel.event_bus")
-  event_bus.emit(event, payload or {})
-end
 
 --- 变更单元是否为「可淘汰的终态」（已拒绝/已被取代，撤销列表不依赖它们）。
 --- APPLIED/REVERTED 保留：`list_saved` 需要据此展示撤销/重做。
@@ -265,15 +259,6 @@ local function _maybe_evict()
   end
 end
 
---- 落盘后剥离内存 item 的文件内容：候选已单独落盘（`read_candidate` 可读回），
---- 长期持有 content 会让暂存上千文件时内存翻倍。diff 预览经 `M.content_for` 按需读取。
---- @param item table
-local function _strip_content(item)
-  if type(item) ~= "table" or type(item.files) ~= "table" then return end
-  for _, f in ipairs(item.files) do
-    if type(f) == "table" and f.content ~= nil then f.content = nil end
-  end
-end
 
 local function _persist(item)
   -- 写盘即视为状态变更：失效待审摘要缓存（pending_summary 会重算并缓存）与待审项缓存。
@@ -294,16 +279,6 @@ local function _persist(item)
   _maybe_evict_rejected()
 end
 
---- 部分取代增量中被覆盖的路径数量。
---- @param item table
---- @return number
-local function _superseded_count(item)
-  local sup = item and item.superseded_paths
-  if type(sup) ~= "table" then return 0 end
-  local n = 0
-  for _ in pairs(sup) do n = n + 1 end
-  return n
-end
 
 --- 候选是否仍被某个「可应用」变更单元引用。
 --- 候选按内容寻址（摘要 = manifest 哈希），同一内容被再次编辑会产生相同摘要，
@@ -367,43 +342,11 @@ local function _sha(content)
   return ok and ("sha256:" .. hex) or "sha256:?"
 end
 
---- 大文件 stat 签名（与 candidate 同口径）：不读取内容做 CAS，避免读取数百 MB。
---- @param st table|nil
---- @return string|nil
-local function _stat_sig(st)
-  if not (st and st.type == "file" and st.mtime) then return nil end
-  return string.format("sig:%s:%s:%s",
-    tostring(st.mtime.sec), tostring(st.mtime.nsec), tostring(st.size))
-end
 
---- 读取文件内容（不存在返回 nil）
---- @param path string
---- @return string|nil
-local function _read_file(path)
-  local f = io.open(path, "rb")
-  if not f then return nil end
-  local c = f:read("*a")
-  f:close()
-  return c
-end
 
 -- ========== 应用快照（保存 / 撤销保存交换原文件与快照）==========
 
---- 快照单文件内容上限（与候选同源配置，避免删除大文件时读入/落盘巨量内容）
---- @return number
-local function _snapshot_cap()
-  local n = tonumber(require("NeoAI.kernel.config_store").get("tools.sandbox.max_file_bytes"))
-  if n == nil then return 8 * 1024 * 1024 end
-  return n
-end
 
---- 快照撤销 CAS 模式："sig"（默认，mtime/size 签名，省去逐文件读取+哈希）| "hash"（最强一致性）。
---- @return string
-local function _snapshot_cas_mode()
-  local m = require("NeoAI.kernel.config_store").get("tools.sandbox.review.snapshot_cas")
-  if m == "hash" then return "hash" end
-  return "sig"
-end
 
 --- 应用前捕获「原文件」快照侧（真实文件当前内容），用于撤销保存时交换。
 --- 内容按文件复制到 blob（不读入 Lua 内存、不嵌入快照 JSON），撤销时按文件复制回写。
@@ -685,28 +628,7 @@ function M.undo(id, opts)
   return { ok = true, state = rec.state, snapshot = rec }
 end
 
---- 从候选构造写集合（供展示与选择性应用）
---- @param cand table
---- @return table 数组
-local function _write_set(cand)
-  local out = {}
-  for _, f in ipairs(cand.files or {}) do out[#out + 1] = f.path end
-  return out
-end
 
---- 去重合并两个字符串数组（保留首次出现顺序）
---- @param a table|nil
---- @param b table|nil
---- @return table
-local function _union(a, b)
-  local out, seen = {}, {}
-  for _, list in ipairs({ a or {}, b or {} }) do
-    for _, v in ipairs(list) do
-      if type(v) == "string" and not seen[v] then seen[v] = true; out[#out + 1] = v end
-    end
-  end
-  return out
-end
 
 --- 合并同一「安装命令」（package_key）的待审候选为一个审批单元。
 --- 包安装命令（apt/pip/npm 等）常产生多个候选（索引、元数据、包文件），按安装命令键合并后，
