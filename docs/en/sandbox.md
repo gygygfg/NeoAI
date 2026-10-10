@@ -329,7 +329,10 @@ is only kept for other `approval.mode` values (`prompt`/`strict`).
     avoiding a synchronous for-loop + per-item O(n) full scan + per-file writes freezing the UI
     ("approving too many at once hangs"); pressing `A` again while running is refused; `d` rejects that file (on the header, the
     whole unit), `i` temporarily closes the review window and opens a **diff preview** of that
-    item (`q`/`<Esc>` closes it and returns to the review window with the cursor restored); on an
+    item (`q`/`<Esc>` closes it and returns to the review window with the cursor restored;
+    **binary files** — containing NUL/invalid UTF-8/`NEOAI_BINARY:` markers or a high control-byte
+    ratio — skip the text diff and show a byte-count placeholder with control chars escaped, avoiding
+    mojibake; the same applies to the high-risk re-confirm diff); on an
     **out-of-bounds access trace** line, `i` opens the **access details** for that path (each access's
     tool / kind / command / time; not an approval target),
     `u` **undoes the save (back to pending)** / **restores a rejected entry (back to pending)**,

@@ -115,6 +115,29 @@ local function _text_of(content)
   return nil
 end
 
+--- 内容是否为二进制（含 NUL、非法 UTF-8、`NEOAI_BINARY:` 标记）：不喂给 `vim.diff`/模型，
+--- 避免审计文本出现乱码。大文件采样判断控制字节占比。
+--- @param s string|nil
+--- @return boolean
+local function _looks_binary(s)
+  if type(s) ~= "string" or s == "" then return false end
+  if s:sub(1, 13) == "NEOAI_BINARY:" then return true end
+  if s:find("\0", 1, true) then return true end
+  local n = #s
+  local limit = 65536
+  if n <= limit and stringx.is_valid_utf8(s) == false then return true end
+  local ctrl, sampled = 0, 0
+  local step = n > limit and math.max(1, math.floor(n / limit)) or 1
+  for i = 1, n, step do
+    local b = s:byte(i)
+    if (b < 32 and b ~= 9 and b ~= 10 and b ~= 12 and b ~= 13 and b ~= 27) or b == 127 then
+      ctrl = ctrl + 1
+    end
+    sampled = sampled + 1
+  end
+  return sampled > 0 and ctrl * 10 > sampled
+end
+
 --- 构造单个文件的修改文本（unified diff；create 无差异时回退为内容）
 --- @param f table 文件条目
 --- @param cfg table 配置
@@ -125,6 +148,9 @@ local function _file_diff(f, cfg)
   local before = action == "create" and "" or _read_file(f.path)
   local after = action == "delete" and "" or tostring(f.content or "")
   if before == "" and after == "" then return nil end
+  if _looks_binary(before) or _looks_binary(after) then
+    return ("（二进制文件 %s：%d -> %d 字节，不展示文本 diff）"):format(action, #before, #after)
+  end
   local ok, diff = pcall(vim.diff, before, after, {
     result_type = "unified", ctxlen = 3, algorithm = "histogram",
   })

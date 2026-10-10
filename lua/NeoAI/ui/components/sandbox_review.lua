@@ -1415,14 +1415,31 @@ local function _diff_lines(before, after)
   return vim.split(diff, "\n", { plain = true })
 end
 
---- 内容是否为二进制（含 NUL 或非法 UTF-8）：绝不喂给 vim.diff，否则界面显示乱码。
+--- 内容是否为二进制（含 NUL、非法 UTF-8、`NEOAI_BINARY:` 标记，或控制字节占比过高）：
+--- 绝不喂给 `vim.diff`，否则界面显示乱码；二进制文件改为显示占位说明。
 --- @param s string|nil
 --- @return boolean
 local function _looks_binary(s)
   if type(s) ~= "string" or s == "" then return false end
+  if s:sub(1, 13) == "NEOAI_BINARY:" then return true end
   if s:find("\0", 1, true) then return true end
-  local ok, valid = pcall(require("NeoAI.utils.stringx").is_valid_utf8, s)
-  return ok and valid == false
+  local n = #s
+  local limit = 65536
+  if n <= limit then
+    local ok, valid = pcall(require("NeoAI.utils.stringx").is_valid_utf8, s)
+    if not ok or valid == false then return true end
+  end
+  -- 无 NUL 但控制字节占比过高（>10%）：同样视为二进制（大文件采样，避免逐字节全扫）。
+  local ctrl, sampled = 0, 0
+  local step = n > limit and math.max(1, math.floor(n / limit)) or 1
+  for i = 1, n, step do
+    local b = s:byte(i)
+    if (b < 32 and b ~= 9 and b ~= 10 and b ~= 12 and b ~= 13 and b ~= 27) or b == 127 then
+      ctrl = ctrl + 1
+    end
+    sampled = sampled + 1
+  end
+  return sampled > 0 and ctrl * 10 > sampled
 end
 
 --- 清洗 diff 行中的控制字符（保留制表），避免终端把 C0/C1 控制序列渲染为乱码。
@@ -1520,11 +1537,15 @@ local function _warning_lines(text, pending, width, meta)
   if type(text) ~= "string" or text:gsub("%s", "") == "" then
     out[#out + 1] = "（无警告内容）"
   else
+    -- 防御：模型/兜底文本若含非法 UTF-8 字节，先修复，避免 _wrap 逐字符切分产生乱码。
+    local sm = require("NeoAI.utils.stringx")
+    text = sm.sanitize_utf8(text) or text
+    if text:find("\0", 1, true) then text = text:gsub("%z", "") end
     for _, para in ipairs(vim.split(text, "\n", { plain = true })) do
       if para == "" then
         out[#out + 1] = ""
       else
-        for _, l in ipairs(_wrap(para, width)) do out[#out + 1] = l end
+        for _, l in ipairs(_wrap(para, width)) do out[#out + 1] = _sanitize_line(l) end
       end
     end
   end

@@ -949,6 +949,52 @@ tests.suite("sandbox_review", function(_, it)
     services.provide("services.sandbox", saved)
   end)
 
+  it("L3 二进制文件 diff 显示占位而非乱码", function(t)
+    local services = require("NeoAI.kernel.services")
+    local sr = require("NeoAI.ui.components.sandbox_review")
+    local l3 = require("NeoAI.sandbox.review.l3_warning")
+    sr.reset()
+    l3.reset()
+    l3.set_generator(function(_, _, on_done) on_done("警告") end)
+    local saved = services.use("services.sandbox")
+    local cwd = vim.fn.getcwd()
+    local path = cwd .. "/l3bin.shada"
+    local fs = require("NeoAI.utils.fs")
+    fs.write_file(path, "abc\0\1\2old")
+    _provide_sandbox({
+      list_reviews = function()
+        return {
+          {
+            change_set_id = "csL3bin", tool = "run_command", risk_level = 3,
+            risk_name = "critical", risk_reasons = { "SECRET_OPERATION_OUTSIDE_WORKSPACE" },
+            files = { { path = path, action = "modify", content = "xyz\0\3new" } },
+          },
+        }
+      end,
+      apply = function() return { ok = true } end,
+      reject = function() end, reject_file = function() end,
+    })
+    sr.open()
+    local buf = sr.get_buf()
+    local file_line
+    for ln, target in pairs(sr.get_line_map()) do
+      if target.path == path then file_line = ln end
+    end
+    vim.api.nvim_win_set_cursor(0, { file_line, 0 })
+    for _, m in ipairs(vim.api.nvim_buf_get_keymap(buf, "n")) do
+      if m.lhs == "<CR>" then m.callback() end
+    end
+    local dbuf = sr.get_diff_buf()
+    t.not_nil(dbuf, "L3 应打开 diff")
+    local dtext = table.concat(vim.api.nvim_buf_get_lines(dbuf, 0, -1, false), "\n")
+    t.matches("二进制文件", dtext, "二进制应显示占位而非文本 diff")
+    t.eq(nil, dtext:find("\0", 1, true), "diff 不应含 NUL 乱码")
+    sr.close()
+    l3.reset()
+    fs.delete_file(path)
+    services.provide("services.sandbox", saved)
+  end)
+
   it("L3 条目首次 <CR> 打开 AI 警告 diff，二次确认后才应用", function(t)
     local services = require("NeoAI.kernel.services")
     local sr = require("NeoAI.ui.components.sandbox_review")
