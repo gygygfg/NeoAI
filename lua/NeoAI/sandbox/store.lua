@@ -115,6 +115,12 @@ local function _removed_dir()
   return state.root .. "/reviews_removed"
 end
 
+--- 「可恢复的已拒绝」候选副本目录：显式拒绝时把候选原样另存到此处，供审批界面「已拒绝」区
+--- 展示与 `u` 恢复；`rejected_max` 约束淘汰时删除对应副本。副本在存储根（通常是 /tmp）下。
+local function _rejected_dir()
+  return state.root .. "/rejected"
+end
+
 --- 大文件内容 blob 目录：超过 `tools.sandbox.max_file_bytes` 的候选文件不再把内容嵌入候选
 --- JSON，而是把暂存副本复制到此处，候选条目仅记录 blob 路径（发布/物化时按文件复制）。
 local function _blobs_dir()
@@ -133,9 +139,10 @@ local function _ensure_dirs()
   fs.ensure_dir(_snapshots_meta_dir())
   fs.ensure_dir(_blobs_dir())
   fs.ensure_dir(_removed_dir())
+  fs.ensure_dir(_rejected_dir())
   -- 存储根与子目录收紧到 0700：候选/证据含未发布内容与命令详情，避免同机其他用户枚举/读取。
   -- （同 uid 的本地进程属信任边界之外，无法靠权限或摘要防住——见 docs/sandbox.md。）
-  for _, d in ipairs({ state.root, _candidates_dir(), _receipts_dir(), _reviews_dir(), _evidence_dir(), _host_ops_dir(), _snapshots_dir(), _snapshots_meta_dir(), _blobs_dir(), _removed_dir() }) do
+  for _, d in ipairs({ state.root, _candidates_dir(), _receipts_dir(), _reviews_dir(), _evidence_dir(), _host_ops_dir(), _snapshots_dir(), _snapshots_meta_dir(), _blobs_dir(), _removed_dir(), _rejected_dir() }) do
     pcall(vim.uv.fs_chmod, d, 448) -- 0700
   end
   return true
@@ -147,6 +154,15 @@ end
 --- @return string 安全文件名
 local function _safe_name(digest)
   return (digest or "unknown"):gsub("[^%w_%-]", "_")
+end
+
+--- 拒绝副本文件名：同一 change_set 的候选摘要唯一（摘要即内容寻址）；host_op 无候选时用
+--- `hostop` 占位摘要。同时编码 change_set_id 与 digest，支持按 (id, digest) 精确读写/删除。
+--- @param change_set_id string
+--- @param digest string|nil
+--- @return string
+local function _rejected_path(change_set_id, digest)
+  return _rejected_dir() .. "/" .. _safe_name(change_set_id) .. "." .. _safe_name(digest or "hostop") .. ".raw"
 end
 
 -- ========== 异步落盘（write-behind） ==========
@@ -479,6 +495,38 @@ function M.read_candidate(digest)
   return _read_json(_candidates_dir() .. "/" .. _safe_name(digest) .. ".json")
 end
 
+--- 读取候选原始编码（未解码的 JSON 文本）。用于「拒绝时原样另存」——避免 decode→encode
+--- 往返损坏大/二进制候选。优先命中异步写缓存（刚写入即可读回），其次读盘。
+--- @param digest string
+--- @return string|nil
+function M.read_candidate_raw(digest)
+  if not state.root or not digest then return nil end
+  local path = _candidates_dir() .. "/" .. _safe_name(digest) .. ".json"
+  local encoded = write_state.mem[path]
+  if encoded == nil then encoded = fs.read_file(path) end
+  return encoded
+end
+
+--- 用原始编码（未解码的 JSON 文本）写回候选文件，用于从拒绝副本恢复候选。
+--- 走异步写队列（与 write_candidate_async 同机制，刚写入即可同步读回），并登记为已写入。
+--- @param digest string
+--- @param raw string
+--- @return boolean ok, string|nil err
+function M.write_candidate_raw(digest, raw)
+  if type(raw) ~= "string" then return false, "raw must be string" end
+  if not digest then return false, "missing digest" end
+  if not _ensure_dirs() then return false, "no store root" end
+  local path = _candidates_dir() .. "/" .. _safe_name(digest) .. ".json"
+  -- 该路径此前可能因 discard 被标记取消（在途写入完成后会删除文件）；恢复写入须清除该标记，
+  -- 否则迟到的取消回调会删掉刚恢复的候选。
+  write_state.cancelled[path] = nil
+  write_state.mem[path] = raw
+  write_state.pending[path] = raw
+  written_candidates[digest] = true
+  _drain(path)
+  return true
+end
+
 --- 列出候选（按创建时间倒序）
 --- @return table 数组
 function M.list_candidates()
@@ -626,6 +674,38 @@ function M.delete_review_removed(change_set_id)
   local path = _removed_dir() .. "/" .. _safe_name(change_set_id) .. ".json"
   _cancel_write(path)
   return fs.delete_file(path)
+end
+
+--- 保存「可恢复的已拒绝」候选副本（原样字节）。`raw` 为空（host_op 无候选/读取失败）时
+--- 写空占位，使条目仍可登记为可恢复（host_op 的恢复依赖 hostop.restore）。
+--- @param change_set_id string
+--- @param digest string|nil
+--- @param raw string|nil
+--- @return boolean ok
+function M.write_rejected_copy(change_set_id, digest, raw)
+  if not change_set_id then return false end
+  if not _ensure_dirs() then return false end
+  local path = _rejected_path(change_set_id, digest)
+  local ok = fs.write_file_atomic(path, raw or "")
+  return ok == true
+end
+
+--- 读取「可恢复的已拒绝」候选副本（原样字节）。不存在返回 nil。
+--- @param change_set_id string
+--- @param digest string|nil
+--- @return string|nil
+function M.read_rejected_copy(change_set_id, digest)
+  if not state.root or not change_set_id then return nil end
+  return fs.read_file(_rejected_path(change_set_id, digest))
+end
+
+--- 删除「可恢复的已拒绝」候选副本。
+--- @param change_set_id string
+--- @param digest string|nil
+--- @return boolean
+function M.delete_rejected_copy(change_set_id, digest)
+  if not state.root or not change_set_id then return false end
+  return fs.delete_file(_rejected_path(change_set_id, digest))
 end
 
 --- 写入证据记录
@@ -895,6 +975,7 @@ function M.reset()
     pcall(vim.fn.delete, _snapshots_meta_dir(), "rf")
     pcall(vim.fn.delete, _blobs_dir(), "rf")
     pcall(vim.fn.delete, _removed_dir(), "rf")
+    pcall(vim.fn.delete, _rejected_dir(), "rf")
     -- 常驻实例的稳定 overlay/shell 目录（<root>/resident）：实例已由 resident.reset 停止，
     -- 此处清理其磁盘残留，避免跨 reset/跨套件复用过期 overlay 视图。
     pcall(vim.fn.delete, state.root:gsub("/+$", "") .. "/resident", "rf")

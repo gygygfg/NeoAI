@@ -258,6 +258,14 @@ local function _install_test_defaults()
     if uc.tools.sandbox.fuse_root_overlay == nil then
       uc.tools.sandbox.fuse_root_overlay = false
     end
+    -- 测试默认关闭 Herder 自动安装：测试进程常运行在真实 Herdr pane 内（HERDR_ENV=1），
+    -- 否则插件启动会异步把展示增强片段写入用户真实的 ~/.config/herdr/config.toml；
+    -- 并行/隔离子进程各自启动一次 → 表现为「nvim 重复安装 herder 配置」的副作用。
+    -- herder_install / herder 专项用例需要时显式开启 auto_install。
+    uc.herder = uc.herder or {}
+    if uc.herder.auto_install == nil then
+      uc.herder.auto_install = false
+    end
     return orig_config_load(uc)
   end
   pcall(function()
@@ -281,6 +289,10 @@ local function _install_test_defaults()
       if cur.tools.sandbox.fuse_root_overlay == nil then
         cur.tools.sandbox.fuse_root_overlay = false
       end
+      cur.herder = cur.herder or {}
+      -- 当前（已合并）配置里默认值为 true，必须强制关闭（不代表用户显式开启）；
+      -- 需要自动安装的用例通过 config_store.load({ herder = { auto_install = true } }) 显式开启。
+      cur.herder.auto_install = false
       orig_config_load(cur)
     end
   end)

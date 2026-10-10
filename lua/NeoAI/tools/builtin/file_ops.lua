@@ -28,21 +28,15 @@ local DEFAULT_READ_GUARD = {
 
 -- ========== 私有函数 ==========
 
---- 把可能指向沙箱访客临时根（/tmp 等）的路径还原为宿主路径，便于读取沙箱内工具落盘的输出
---- 文件（output_guard 写入 /tmp/neoai-out/…）。未启用沙箱或非访客路径时原样返回。
+--- 路径解析**委派给沙箱**（策略：`NeoAI.sandbox.guest_fs.resolve_read_path`）。
+--- 工具层不实现「暂存命名空间 → 真实命名空间 → 访客临时根」的映射逻辑（那是沙箱职责）；
+--- 此处仅调用沙箱 API，保证直接调用工具句柄（不经沙箱 wrapper）时也能正确回读访客路径。
 --- @param p string
 --- @return string
 local function _resolve_guest_path(p)
-  if type(p) ~= "string" or p == "" then
-    return p
-  end
   local ok, g = pcall(require, "NeoAI.sandbox.guest_fs")
-  if not ok or not g or type(g.to_host) ~= "function" then
-    return p
-  end
-  local ok2, mapped = pcall(g.to_host, p)
-  if ok2 and type(mapped) == "string" then
-    return mapped
+  if ok and g and type(g.resolve_read_path) == "function" then
+    return g.resolve_read_path(p)
   end
   return p
 end
@@ -551,6 +545,7 @@ file_tools.read_file = helpers.define_tool(
   },
   function(args, on_success, on_error)
     -- 沙箱访客路径（/tmp/…，如 output_guard 落盘的输出）还原为宿主路径，使 read_file 能回读。
+    -- 映射策略由沙箱负责（guest_fs.resolve_read_path），工具仅调用。
     local filepath = _resolve_guest_path(args.file_path)
     local guard = _read_guard_opts()
     local max_bytes = guard.max_read_bytes
@@ -794,6 +789,7 @@ file_tools.list_files = helpers.define_tool(
     required = {},
   },
   function(args, on_success, on_error)
+    -- 目录参数经沙箱解析（保持命名空间路径，暂存叠加由本工具完成）。
     local dir = _resolve_guest_path(args.path or ".")
     local max = args.max_results or 0
     -- 安全默认：递归默认最多 2000 条、非递归单层最多 5000 条。否则对 home/ 等超大目录
@@ -876,6 +872,7 @@ file_tools.search_files = helpers.define_tool(
     required = { "query" },
   },
   function(args, on_success, on_error)
+    -- 目录参数经沙箱解析（保持命名空间路径，暂存叠加由本工具完成）。
     local dir = _resolve_guest_path(args.path or ".")
     local search_cfg = config_store.get("tools.search_files") or {}
     local max_file_bytes = type(search_cfg.max_file_bytes) == "number" and search_cfg.max_file_bytes or nil

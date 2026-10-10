@@ -429,4 +429,30 @@ tests.suite("herder", function(_, it)
     t.eq(content, read_file(cfg), "重复安装不应改变文件")
     restore_env(orig)
   end)
+
+  it("测试运行器默认关闭 herder 自动安装（不写真实配置）", function(t)
+    local config_store = require("NeoAI.kernel.config_store")
+    -- 运行器在每个套件前 config_store.load({})，应命中测试默认 auto_install=false，
+    -- 避免启动 herder 服务时把展示增强片段写入用户真实配置。
+    config_store.load({})
+    t.false_(config_store.get("herder.auto_install"), "测试默认应关闭 herder.auto_install")
+  end)
+
+  it("auto_install=false 时启动 herder 不创建配置文件", function(t)
+    local orig = reset_herder_env()
+    local dir = vim.fn.tempname() .. "-neoai-herder-noauto"
+    vim.fn.mkdir(dir, "p")
+    local cfg = dir .. "/config.toml"
+    vim.env.HERDR_CONFIG_PATH = cfg
+    local bin = vim.fn.tempname() .. "-fakeherdr0"
+    vim.fn.writefile({ "#!/bin/sh", "exit 0" }, bin)
+    vim.fn.setfperm(bin, "rwxr-xr-x")
+    vim.env.HERDER_BIN_PATH = bin
+    vim.env.HERDR_BIN_PATH = bin
+
+    init_herder({ auto_install = false })
+    vim.wait(400)
+    t.nil_(read_file(cfg), "auto_install=false 不应写任何 herder 配置")
+    restore_env(orig)
+  end)
 end)

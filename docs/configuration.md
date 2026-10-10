@@ -176,7 +176,7 @@ session = {
 | `guard.repeat_tool` | `{enabled=true, thresholds={3,5,8}, messages=...}` | 连续重复工具调用提醒 |
 | `todo.enabled` | `true` | 待办工具 + 系统提示注入 |
 | `web_fetch` | 见下（默认 `enabled=false`） | 网页抓取：无头浏览器渲染动态页面并转 Markdown |
-| `plan_mode` | `{enabled=true, auto_execute_on_approve=true, extra_safe_tools={}, mutating_tools=...}` | 计划模式 |
+| `plan_mode` | `{enabled=true, auto_execute_on_approve=true, distill_on_execute=true, extract_max_tokens=nil, extra_safe_tools={}, mutating_tools=...}` | 计划模式 |
 | `approval` | 见下 | 工具审批 |
 | `sandbox` | 见下 | 工具执行沙箱（dry-run/commit、隔离后端、策略） |
 
@@ -735,6 +735,17 @@ plugins = {
 **计划确认**：AI 输出计划后本轮结束，由用户执行 `:NeoAIApprovePlan`（或手动切换模式）确认，
 经 `chat_service.approve_plan` 解析计划为任务清单（todo）→ 退出计划模式（转入 CHAT）
 → 按 `auto_execute_on_approve`（默认开启）自动开始执行。
+
+**XML 计划提取（`distill_on_execute`）**：计划确认、转入非计划模式发送前，会先做一轮
+「XML 结构化提取」——复用现有前缀缓存回放历史后追加提取指令，让 AI 输出
+`<target>` / `<stepN>` / `<files>` 等标签（详见 `core/session/plan_distill.lua`）。
+提取指令与 AI 的回复都不进入 `agent.messages`，仅作为发往模型的请求覆盖层（`agent.plan_extract`）。
+关键字段（`<target>` + 至少一个 `<stepN>`）缺失时最多重试 3 次。
+
+- `extract_max_tokens`：单次提取请求的输出 token 上限；`nil`（默认）＝不下发 `max_tokens`，
+  由模型/厂商默认最大输出决定。推理型模型在提取时先产生大段思维链，过小的固定上限会被
+  `finish_reason=length` 截断、关键字段缺失后触发整轮重试（重复回放前缀，额外延迟与 token）；
+  设为正整数（如 `16384`）可主动约束提取输出与成本。
 
 状态持久化在 `session.metadata.plan`，恢复会话时还原（`plan_mode.restore`）。
 

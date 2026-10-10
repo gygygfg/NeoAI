@@ -181,7 +181,7 @@ session = {
 | `guard.repeat_tool` | `{enabled=true, thresholds={3,5,8}, messages=...}` | Reminder for consecutive repeated tool calls |
 | `todo.enabled` | `true` | Todo tool + system prompt injection |
 | `web_fetch` | See below (`enabled=false` by default) | Web fetch: render dynamic pages in a headless browser and convert to Markdown |
-| `plan_mode` | `{enabled=true, auto_execute_on_approve=true, extra_safe_tools={}, mutating_tools=...}` | Plan mode |
+| `plan_mode` | `{enabled=true, auto_execute_on_approve=true, distill_on_execute=true, extract_max_tokens=nil, extra_safe_tools={}, mutating_tools=...}` | Plan mode |
 | `approval` | See below | Tool approval |
 | `sandbox` | See below | Tool execution sandbox (dry-run/commit, isolation backend, policy) |
 
@@ -815,6 +815,18 @@ Plan mode is a **per-agent state** (`agent.plan_mode`); when active:
 **Plan confirmation**: after the AI emits the plan the turn ends; the user confirms by running `:NeoAIApprovePlan` (or toggling the mode manually);
 `chat_service.approve_plan` then parses the plan into a task list (todo) → exits plan mode (switching to CHAT)
 → automatically starts execution according to `auto_execute_on_approve` (enabled by default).
+
+**XML plan extraction (`distill_on_execute`)**: before sending in a non-plan mode after the plan is confirmed,
+one "XML structured extraction" round runs first — it replays the history (reusing the prefix cache) and appends an
+extraction instruction, asking the AI to emit `<target>` / `<stepN>` / `<files>` tags (see `core/session/plan_distill.lua`).
+Neither the extraction instruction nor the AI's reply enters `agent.messages`; they only form a request overlay
+(`agent.plan_extract`). If the key fields (`<target>` + at least one `<stepN>`) are missing it retries up to 3 times.
+
+- `extract_max_tokens`: output token cap for a single extraction request; `nil` (default) = do not send `max_tokens`,
+  letting the model/provider default maximum apply. Reasoning models produce a large chain of thought first during
+  extraction, so a small fixed cap gets truncated with `finish_reason=length`, and the missing key fields then trigger
+  a full retry (replaying the prefix, extra latency and tokens); set a positive integer (e.g. `16384`) to bound
+  extraction output/cost explicitly.
 
 The state is persisted in `session.metadata.plan` and restored when the session is resumed (`plan_mode.restore`).
 

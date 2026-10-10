@@ -200,4 +200,187 @@ lua/b.lua</Files>
     t.eq("user", view[4].role)
     t.true_(view[4].content:find("步骤一", 1, true) ~= nil)
   end)
+
+  -- ===== 解析器健壮性矩阵（确定性，无网络；固化 plan_extract 基准） =====
+
+  it("_parse 大小写不敏感且 step 按编号升序归一", function(t)
+    local p = require("NeoAI.core.session.plan_distill")
+    local f = p._parse("<TARGET>T</TARGET>\n<sTeP3>c</sTeP3><STEP1>a</STEP1><Step2>b</Step2>")
+    t.eq("T", f.target)
+    t.eq(3, #f.steps)
+    t.eq("a", f.steps[1]); t.eq("b", f.steps[2]); t.eq("c", f.steps[3])
+  end)
+
+  it("_parse 缺闭合标签视为缺失、重复标签取首个、空 step 跳过", function(t)
+    local p = require("NeoAI.core.session.plan_distill")
+    local f1 = p._parse("<target>没有闭合\n<step1>s</step1>")
+    t.nil_(f1.target, "未闭合的 target 应视为缺失")
+    local f2 = p._parse("<target>第一</target><target>第二</target><step1>s</step1>")
+    t.eq("第一", f2.target, "重复标签应取首个")
+    local f3 = p._parse("<target>T</target><step1>  </step1><step2>real</step2>")
+    t.eq(1, #f3.steps)
+    t.eq("real", f3.steps[1], "空值 step 应跳过")
+  end)
+
+  it("_parse 非连续/起始大于 1 的 stepN 保留并按编号升序", function(t)
+    local p = require("NeoAI.core.session.plan_distill")
+    local f = p._parse("<target>T</target><step2>b</step2><step5>e</step5>")
+    t.eq(2, #f.steps)
+    t.eq("b", f.steps[1]); t.eq("e", f.steps[2])
+  end)
+
+  it("_parse 解析全部可选节标签（多行/首尾空白裁剪）", function(t)
+    local p = require("NeoAI.core.session.plan_distill")
+    local f = p._parse(table.concat({
+      "<target>\n  目标  \n</target><step1>\n 步骤\n</step1>",
+      "<Context>c</Context><Scope>sc</Scope><OutOfScope>oos</OutOfScope>",
+      "<Constraints>con</Constraints><Commands>cmd</Commands><Dependencies>dep</Dependencies>",
+      "<Environment>env</Environment><Verify>ver</Verify><Risks>risk</Risks>",
+      "<Questions>q</Questions><Information>info</Information><Rollback>rb</Rollback>",
+    }, "\n"))
+    t.eq("目标", f.target)
+    t.eq("步骤", f.steps[1])
+    for _, k in ipairs({ "context", "scope", "outofscope", "constraints", "commands", "dependencies", "environment", "verify", "risks", "questions", "information", "rollback" }) do
+      t.not_nil(f[k], "应解析出 " .. k)
+    end
+  end)
+
+  it("_parse 容忍 Markdown 围栏，且回显的示例标签不覆盖真实值", function(t)
+    local p = require("NeoAI.core.session.plan_distill")
+    local f1 = p._parse("```xml\n<target>T</target>\n<step1>s</step1>\n```")
+    t.eq("T", f1.target)
+    t.eq(1, #f1.steps)
+    local f2 = p._parse("<target>真目标</target><step1>s1</step1>\n输出示例：<target>...</target>")
+    t.eq("真目标", f2.target, "首个 target 应优先于回显示例")
+  end)
+
+  it("_file_candidates 过滤噪声 token，保留路径形态", function(t)
+    local p = require("NeoAI.core.session.plan_distill")
+    local c = p._file_candidates("lua/a.lua\n./src/b.lua\nab\n!!\ndir/c")
+    local has_a, has_c, has_ab = false, false, false
+    for _, x in ipairs(c) do
+      if x == "lua/a.lua" then has_a = true end
+      if x == "dir/c" then has_c = true end
+      if x == "ab" then has_ab = true end
+    end
+    t.true_(has_a, "应保留 lua/a.lua")
+    t.true_(has_c, "应保留 dir/c")
+    t.false_(has_ab, "过短/无路径特征的 token 应被过滤")
+  end)
+
+  -- ===== 提取参数下发 =====
+
+  it("_send_extract 下发 extract_max_tokens；默认（nil）不下发 max_tokens", function(t)
+    local p = require("NeoAI.core.session.plan_distill")
+    local request = require("NeoAI.core.agent.request")
+    local async = require("NeoAI.utils.async")
+    local orig = request.send_stream
+    local captured = {}
+    request.send_stream = function(_, opts)
+      captured[#captured + 1] = opts
+      return async.resolve({ content = "<target>T</target><step1>s</step1>" })
+    end
+    local ok, err = pcall(function()
+      local agent = { id = "a", config = {}, model = "m", tools = {} }
+      t.await(p._send_extract(agent, { { role = "user", content = "x" } }, { extract_max_tokens = 4096 }))
+      t.await(p._send_extract(agent, { { role = "user", content = "x" } }, {}))
+      t.eq(4096, captured[1].max_tokens, "显式 extract_max_tokens 应下发")
+      t.nil_(captured[2].max_tokens, "默认 extract_max_tokens=nil 时不下发 max_tokens（避免截断）")
+    end)
+    request.send_stream = orig
+    if not ok then error(err, 0) end
+  end)
+
+  -- ===== 端到端（mock SSE 服务器，离线） =====
+
+  it("run 端到端（mock SSE）：解析 XML → 请求覆盖层，不改动历史、默认不发 max_tokens", function(t)
+    local hs = require("NeoAI.tests.http_server")
+    local xml = "<target>实现功能</target>\n<step1>读代码</step1>\n<step2>改代码</step2>\n<files>lua/a.lua</files>"
+    local bodies = {}
+    local function handler(client, request)
+      local he = request:find("\r\n\r\n", 1, true)
+      bodies[#bodies + 1] = request:sub(he + 4)
+      local ev = function(o) return "data: " .. vim.json.encode(o) .. "\n\n" end
+      local resp = ev({ choices = { { delta = { content = xml } } } })
+        .. ev({ choices = { { delta = {}, finish_reason = "stop" } }, usage = { prompt_tokens = 12, completion_tokens = 8 } })
+        .. "data: [DONE]\n\n"
+      hs.respond(client, resp)
+    end
+    hs.with_server(handler, function(base_url)
+      local config_store = require("NeoAI.kernel.config_store")
+      config_store.load({
+        ai = {
+          providers = { mockpe = { api_type = "openai", base_url = base_url, api_key = "test" } },
+          model_refresh = { on_startup = false },
+        },
+        tools = { plan_mode = { distill_on_execute = true } },
+      })
+      local p = require("NeoAI.core.session.plan_distill")
+      local msgs = {
+        { role = "user", content = "给 lua/a.lua 加功能" },
+        { role = "assistant", content = "", tool_calls = { { id = "c1", type = "function", ["function"] = { name = "read_file", arguments = '{"file_path":"lua/a.lua"}' } } } },
+        { role = "tool", tool_call_id = "c1", name = "read_file", content = "content of lua/a.lua" },
+      }
+      local agent = {
+        id = "mockpe", model = "test",
+        config = { provider = "mockpe", model = "test", temperature = 0.3, system_prompt = "你是助手" },
+        messages = msgs, tools = {}, _plan_enter_index = 1,
+      }
+      local res = t.await(p.run(agent))
+      t.not_nil(res, "提取应成功")
+      t.eq("实现功能", res.fields.target)
+      t.eq(2, #res.fields.steps)
+      local pe = agent.plan_extract
+      t.not_nil(pe)
+      t.eq(1, pe.front_count)
+      t.eq(3, #pe.inject, "覆盖层 = 文件工具对(2) + 新上下文(1)")
+      t.eq(msgs[2], pe.inject[1], "文件工具对应原样引用")
+      t.eq(msgs[3], pe.inject[2])
+      t.eq(3, #agent.messages, "覆盖层不改动 agent.messages")
+      t.eq(1, #bodies, "关键字段齐全应一次通过")
+      local body = vim.json.decode(bodies[1])
+      t.nil_(body.max_tokens, "默认 extract_max_tokens=nil → 请求体不含 max_tokens")
+      t.true_(body.stream == true, "提取请求应为流式")
+    end)
+  end)
+
+  it("run 端到端（mock SSE）：首次输出缺 target → 自动重试至成功", function(t)
+    local hs = require("NeoAI.tests.http_server")
+    local n = 0
+    local function handler(client, request)
+      n = n + 1
+      local content = (n == 1) and "<step1>只有步骤没有目标</step1>"
+        or "<target>补全后的目标</target><step1>步骤一</step1>"
+      local ev = function(o) return "data: " .. vim.json.encode(o) .. "\n\n" end
+      local resp = ev({ choices = { { delta = { content = content } } } })
+        .. ev({ choices = { { delta = {}, finish_reason = "stop" } }, usage = { prompt_tokens = 10, completion_tokens = 4 } })
+        .. "data: [DONE]\n\n"
+      hs.respond(client, resp)
+    end
+    hs.with_server(handler, function(base_url)
+      local config_store = require("NeoAI.kernel.config_store")
+      config_store.load({
+        ai = {
+          providers = { mockpe2 = { api_type = "openai", base_url = base_url, api_key = "test" } },
+          model_refresh = { on_startup = false },
+        },
+        tools = { plan_mode = { distill_on_execute = true } },
+      })
+      local p = require("NeoAI.core.session.plan_distill")
+      local agent = {
+        id = "mockpe2", model = "test",
+        config = { provider = "mockpe2", model = "test", temperature = 0.3, system_prompt = "你是助手" },
+        messages = {
+          { role = "user", content = "调研后出计划" },
+          { role = "assistant", content = "计划正文" },
+        },
+        tools = {}, _plan_enter_index = 0,
+      }
+      local res = t.await(p.run(agent))
+      t.not_nil(res)
+      t.eq("补全后的目标", res.fields.target)
+      t.eq(1, #res.fields.steps)
+      t.eq(2, n, "首轮缺 target 应触发一次重试")
+    end)
+  end)
 end)

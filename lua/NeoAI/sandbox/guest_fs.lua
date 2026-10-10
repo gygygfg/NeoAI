@@ -62,6 +62,31 @@ function M.to_host(path)
   return best_host .. rest
 end
 
+--- 解析「工具看到的路径」→ 宿主实际可读路径（沙箱内聚，工具层不感知映射细节）。
+--- 优先级（高 → 低）：
+---   1. 沙箱暂存（staged）命名空间路径：工作区内已暂存的文件（编辑/命令产物）读其副本，
+---      使 AI 看到与 git_diff/命令视图一致的未发布内容；
+---   2. 真实/命名空间路径：原路径在宿主存在时原样返回——工作区可能恰在宿主 `/tmp` 下（测试
+---      临时目录、把 /tmp 当项目目录的用户），其字符串与访客 `/tmp` 同前缀，不可误映射；
+---   3. 访客临时根映射：`/tmp`、`/var/tmp` 等被 bind 到会话私有目录，output_guard 落盘的输出
+---      文件即在此；仅当原路径在宿主不存在时才映射。
+--- 注：目录级只读工具（search_files/list_files）的目录参数须保持命名空间路径，暂存叠加由工具
+--- 自身完成（`_merge_search`/`_merge_list`），误映射进私有 /tmp 会导致匹配不到覆盖而漏改动。
+--- @param path string
+--- @return string
+function M.resolve_read_path(path)
+  if type(path) ~= "string" or path == "" then return path end
+  local okc, cand = pcall(require, "NeoAI.sandbox.candidate")
+  if okc and cand and type(cand.read_path) == "function" then
+    local staged = cand.read_path(path)
+    if staged then return staged end
+  end
+  local mapped = M.to_host(path)
+  if mapped == path then return path end
+  if vim.uv.fs_stat(path) ~= nil then return path end
+  return mapped
+end
+
 --- 现存的访客根列表（诊断/测试用）。
 --- @return table 字符串数组
 function M.roots()

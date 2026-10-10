@@ -1654,16 +1654,20 @@ local function _gate_inner(tool, args, ctx, call_original)
     local rev = {}
     local read_proc = false -- 读 /proc/* 时结果需经 conceal 脱敏（防沙箱指纹/宿主路径泄露）
     if spec.effect == "read" then
+      -- 路径解析由沙箱统一负责（guest_fs.resolve_read_path）：优先暂存命名空间路径 → 真实/
+      -- 命名空间路径 → 访客临时根映射。工具层不再自行解析，避免把宿主 /tmp 下的工作区误映射
+      -- 进沙箱私有 /tmp（search_files/list_files 的目录参数须保持命名空间路径）。
+      local guest_fs = require("NeoAI.sandbox.guest_fs")
       for _, key in ipairs(spec.paths or {}) do
         local v = args[key]
         if type(v) == "string" then
           if v:match("^/proc/") then read_proc = true end
-          local staged = candidate.read_path(v)
-          if staged then
+          local resolved = guest_fs.resolve_read_path(v)
+          if resolved ~= v then
             -- 还原用规范化真实路径（与 candidate 的暂存键一致：resolve 符号链接 + 折叠 ..）。
             -- 否则同一文件经不同写法（符号链接/`..`）会还原成不同字符串，模型看到不一致路径。
-            rev[staged] = fs.canonical(v)
-            args[key] = staged
+            rev[resolved] = fs.canonical(v)
+            args[key] = resolved
           end
         end
       end

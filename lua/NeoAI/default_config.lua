@@ -452,6 +452,12 @@ local DEFAULT_CONFIG = {
       enabled = true, -- 计划模式
       auto_execute_on_approve = true, -- 计划经用户确认后自动转入 CHAT 并按任务清单开始执行
       distill_on_execute = true, -- 计划完成、用户以任何非计划模式确认开始时，先做一轮 XML 计划提取（组装执行上下文 + 按步骤调用 todo_write），再开始执行
+      -- XML 计划提取（distill）单次请求的输出 token 上限：
+      --   nil（默认）= 不下发 max_tokens，由模型/厂商默认最大输出决定。推理型模型（如 deepseek-flash）
+      --   在提取时会先产生大段思维链，固定小上限（旧实现硬编码 8192）会先被 finish_reason=length 截断、
+      --   关键字段缺失后触发整轮重试（重复回放前缀，额外延迟与 token）。不设上限可避免该截断。
+      --   显式设为正整数（如 16384）可主动约束提取输出/成本。
+      extract_max_tokens = nil,
       extra_safe_tools = {}, -- 计划模式白名单扩展（只读/信息查询类之外的工具需显式加入）
       mutating_tools = { -- 兼容保留（计划模式可见集已覆盖此语义）
         "edit_file",
