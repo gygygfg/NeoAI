@@ -118,42 +118,76 @@ function M.require_string(args, key, tool_name)
   return v, nil
 end
 
+--- 补齐后台加载 buffer 的 filetype（-u NONE / 纯 headless 不触发默认检测）。
+--- treesitter / LSP 依赖 filetype 匹配语言或客户端，这里显式补齐。
+--- 部分 Neovim 版本对未知类型文件用 { buf = ... } 形式匹配会抛错
+--- （detect.lua: bad argument to 'find'），回退为仅按文件名匹配并忽略失败。
+--- @param buf number
+--- @param filepath string
+local function _apply_filetype(buf, filepath)
+  if vim.bo[buf].filetype ~= nil and vim.bo[buf].filetype ~= "" then return end
+  local ok_ft, ft = pcall(vim.filetype.match, { buf = buf, filename = filepath })
+  if not ok_ft or ft == nil or ft == "" then
+    local ok_name, ft2 = pcall(vim.filetype.match, { filename = filepath })
+    ft = ok_name and ft2 or nil
+  end
+  if ft and ft ~= "" then
+    pcall(vim.api.nvim_set_option_value, "filetype", ft, { buf = buf })
+  end
+end
+
+--- 该真实路径是否存在可读的沙箱暂存副本（AI 新建 / 尚未落盘的文件）。
+--- 这类文件在真实磁盘上不可读，但应能被 LSP/treesitter 以暂存内容后台打开。
+--- @param filepath string
+--- @return boolean
+local function _has_sandbox_copy(filepath)
+  local ok, cand = pcall(require, "NeoAI.sandbox.execution.candidate")
+  if not ok or not cand or type(cand.read_path) ~= "function" then return false end
+  local ok2, staged = pcall(cand.read_path, filepath)
+  return ok2 and staged ~= nil
+end
+
 --- 获取文件的 buffer；若尚未加载则后台加载（不切换窗口、不改布局）。
 --- LSP / treesitter 等依赖 buffer 的工具在文件未打开时用此函数自动加载。
+--- 路径先展开 `~` 并绝对化，避免相对/绝对路径各建一个重复 buffer 而 LSP 附加到另一个。
+--- 已登记但**未加载**的 buffer 会被真正加载（否则 LSP 无法附加，工具误报「不在 buffer」）。
+--- 真实磁盘不可读但沙箱内存在暂存副本（AI 新建未落盘）的文件同样会建 buffer，
+--- 由调用方 `sync_buffer_from_sandbox` 填入暂存内容。
 --- @param filepath string|nil 空/缺省时返回当前 buffer
 --- @return number|nil bufnr
+--- @return boolean 本次是否执行了后台加载（供 LSP 等待客户端 attach）
 function M.ensure_buffer(filepath)
   if not filepath or filepath == "" then
     return vim.api.nvim_get_current_buf()
   end
-  local bufnr = vim.fn.bufnr(filepath)
-  if bufnr >= 0 then return bufnr end
-  if vim.fn.filereadable(filepath) ~= 1 then return nil end
+  local abs = vim.fn.fnamemodify(vim.fn.expand(filepath), ":p")
+  -- 按绝对路径匹配；命中失败再按原样匹配（兼容以相对名登记的 buffer）
+  local bufnr = vim.fn.bufnr(abs)
+  if bufnr < 0 then bufnr = vim.fn.bufnr(filepath) end
+  if bufnr >= 0 then
+    if vim.api.nvim_buf_is_loaded(bufnr) then return bufnr end
+    -- 已登记但未加载：后台加载，使其可被 LSP / treesitter 使用（不切窗口）
+    if _is_binary_file(abs) then return bufnr end
+    if pcall(vim.fn.bufload, bufnr) then
+      bg_loaded[bufnr] = true
+      _apply_filetype(bufnr, abs)
+      return bufnr, true
+    end
+    return bufnr
+  end
+  -- 未登记：真实文件可读，或存在沙箱暂存副本（AI 新建、尚未落盘）时才载入
+  local on_disk = vim.fn.filereadable(abs) == 1
+  if not on_disk and not _has_sandbox_copy(abs) then return nil end
   -- 二进制文件不载入文本 buffer：避免 buffer/回写按文本重新编码而损坏内容。
-  if _is_binary_file(filepath) then return nil end
+  if on_disk and _is_binary_file(abs) then return nil end
   -- bufload 不能创建不存在的 buffer，须先 bufadd 注册再加载
-  local add_ok = pcall(vim.fn.bufadd, filepath)
-  if not add_ok then return nil end
-  local load_ok = pcall(vim.fn.bufload, filepath)
-  if not load_ok then return nil end
-  local buf = vim.fn.bufnr(filepath)
+  if not pcall(vim.fn.bufadd, abs) then return nil end
+  if not pcall(vim.fn.bufload, abs) then return nil end
+  local buf = vim.fn.bufnr(abs)
   if buf < 0 then return nil end
   bg_loaded[buf] = true
-  -- 后台加载不触发默认的 filetype 检测（-u NONE / 纯 headless 环境）
-  -- treesitter / LSP 依赖 filetype 匹配语言或客户端，这里显式补齐。
-  -- 部分 Neovim 版本对未知类型文件用 { buf = ... } 形式匹配会抛错
-  -- （detect.lua: bad argument to 'find'），回退为仅按文件名匹配并忽略失败。
-  if vim.bo[buf].filetype == nil or vim.bo[buf].filetype == "" then
-    local ok_ft, ft = pcall(vim.filetype.match, { buf = buf, filename = filepath })
-    if not ok_ft or ft == nil or ft == "" then
-      local ok_name, ft2 = pcall(vim.filetype.match, { filename = filepath })
-      ft = ok_name and ft2 or nil
-    end
-    if ft and ft ~= "" then
-      pcall(vim.api.nvim_set_option_value, "filetype", ft, { buf = buf })
-    end
-  end
-  return buf
+  _apply_filetype(buf, abs)
+  return buf, true
 end
 
 --- 该 buffer 是否由 ensure_buffer 在后台加载（而非用户已打开的窗口 buffer）。

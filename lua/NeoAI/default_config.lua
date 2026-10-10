@@ -897,6 +897,11 @@ local DEFAULT_CONFIG = {
         -- 使更多大文件走复制、缩小每次物化帧。0 = 回退 tools.sandbox.max_file_bytes。
         max_embed_bytes = 262144,
       },
+      -- 进程内文件工具的命名空间 I/O（默认开）：常驻实例在运行时，进程内文件工具可经
+      -- 沙箱 mount 命名空间内的文件桥（`sandbox/execution/file_bridge.lua`，`F` 帧）读写——
+      -- 读取为 overlay 合并视图、写入落在 overlay 暂存层（真实工作区在用户确认发布前不受影响）。
+      -- 常驻实例未运行（尚未执行任何命令）时回退既有工作区暂存副本，不静默写真实盘。
+      inproc_namespace = true,
       -- systemctl 门面（方案 A）：**所有**解析与实现都在 Lua（`sandbox/systemd`），沙箱内
       -- `/usr/bin/systemctl`、`/usr/bin/journalctl` 是极薄入口（bash 文件 IPC 客户端），把 argv
       -- 转发给宿主门面后按真实 stdout/stderr/退出码返回。独立调用由门禁直接路由；脚本/管道调用
@@ -970,6 +975,14 @@ local DEFAULT_CONFIG = {
         -- "auto"（超大文件/blob 用 mtime/size 签名，其余哈希）| "sig"（全部用签名，最快）。
         -- 非默认值放宽了「同尺寸同 mtime 内容变化」的检出，仅在明确知晓影响时使用。
         cas_mode = "hash",
+        -- 三方合并（默认开）：发布时若真实文件已被外部改动，按 base（冻结时真实内容）/
+        -- ours（候选）/ theirs（当前真实内容）做行级 diff3 合并——无冲突则写合并结果（保留
+        -- 外部改动），冲突则不写盘、变更单元保持待审并标记 MERGE_CONFLICT（可由用户交给 AI
+        -- 基于当前真实内容重做）。仅对普通文本 modify 文件生效；二进制/大文件/软链/目录
+        -- 创建删除/包签名内容仍走严格 CAS。`false` 关闭即回退原「基线变了就整体拒绝」。
+        merge = true,
+        -- 参与三方合并的单文件大小上限（字节）：超过则回退 CAS。默认沿用 max_file_bytes。
+        merge_max_bytes = nil,
         -- 撤销保存的快照 CAS 模式："sig"（默认，用真实文件 mtime/size 签名，省去应用后逐文件
         -- 读取+哈希的 CPU 开销）| "hash"（逐文件内容哈希，最强一致性）。
         snapshot_cas = "sig",

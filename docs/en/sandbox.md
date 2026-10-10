@@ -51,6 +51,35 @@ Invariants:
 | `sandbox/observe/script_scan.lua` | Static scan of indirect script execution (shell bodies + embedded shell in high-level languages, recursion, opaque detection) |
 | `sandbox/observe/audit.lua` | AI read/call behavior monitoring, risk score and anomaly events |
 | `sandbox/execution/container.lua` | Controlled container runtimes: same namespace as sandbox (podman) or controlled socket (docker) |
+| `sandbox/execution/file_bridge.lua` | Namespaced file bridge: in-process tools read/write inside the mount namespace via the resident instance (`F` frame); writes land in the overlay staging layer, reads are the merged view |
+| `sandbox/execution/ns_fs.lua` | Namespaced view I/O adapter: detokenize before write, tokenize after read, so wired in-process file tools operate on the overlay-canonical staging layer |
+
+### 2.1 Namespaced file bridge (in-process tool I/O)
+
+The resident command server (`resident.lua`) adds an `F` frame (`r` read / `w` write / `e` exists /
+`s` stat / `m` mkdir / `u` delete / `l` list) that performs file operations inside the resident
+instance's **mount namespace**: writes land in the session overlay's upper staging layer (the real
+workspace is untouched until the user confirms publishing), reads are the overlay merged view
+(staged if present, real lower otherwise). `sandbox/execution/file_bridge.lua` is the synchronous
+wrapper; when no resident instance is running `available()` is false and every operation returns
+`nil, "RESIDENT_UNAVAILABLE"` so callers **fall back** (never silently write the real disk).
+
+`tools.sandbox.inproc_namespace` (on by default) gates this. When a resident instance is running, the
+**wired write tools** (`edit_file`/`create_directory`/`ensure_dir`/`delete_file`) read/write through
+the bridge directly onto the overlay (`sandbox/execution/ns_fs.lua` detokenizes on write and tokenizes
+on read, so the model/LSP view keeps the same secret masking), making the overlay the canonical
+staging layer; then `candidate.mirror_overlay` mirrors the overlay content back into the workspace
+staged copy (cache) for `candidate.finish`/review publishing and LSP/treesitter (both still need a
+host-visible staged file). **The resident instance is started eagerly on the first file operation**
+(`wrapper._ensure_fileop_resident`, no prior command needed). When a target path falls under a private
+tmpfs root (`/tmp`, `/var/tmp`, `/run`) the overlay view diverges from the host path, so that call
+falls back to the existing staged-copy rewrite. Writes are limited to an `NS_AWARE` allowlist; tools
+not wired always fall back to the existing staged-copy rewrite, never writing a non-bridged tool
+straight to the real disk. `read_file`/`file_exists` **read the overlay merged view through the
+bridge** when the overlay is available and the target is not under a private tmpfs root (small-file
+fast path / existence check); the other read-only tools (`list_files`/`search_files`) read the
+overlay-mirrored staged copy (equivalent to the overlay merged view). LSP/treesitter writes still use
+their existing staging path (`persist_target` → staged copy, the real disk untouched before publish).
 
 ## 3. Enforcement points (loader + executor)
 
@@ -563,6 +592,23 @@ is only kept for other `approval.mode` values (`prompt`/`strict`).
   content as a `/tmp` copy); `sandbox.list_rejected()` lists **restorable rejected** items (the review
   UI's "Rejected" section), and `sandbox.restore(id)` **restores one to pending** from the copy (host
   ops restore the proposal instead). See "Restorable rejected entries" above.
+- **Three-way merge on publish (`tools.sandbox.review.merge`, on by default)**: if the real file was
+  **changed externally** (no longer the frozen baseline), instead of rejecting the whole unit it does a
+  **line-level three-way merge (diff3)** over `base` (real content at freeze time, captured as a blob
+  during freeze) / `ours` (candidate content) / `theirs` (current real content) (`utils/merge3.lua`,
+  pure Lua, runnable in the thread pool):
+  - Clean merge → writes the merged result, **preserving the external changes** (e.g. the AI edits one
+    line while an external editor edits another);
+  - Conflict (both sides change the same region differently) → **writes nothing**, keeps the whole unit
+    `CONFLICT`, leaves the entry pending and records `merge_conflict`; the review UI marks it
+    "⚠ merge conflict" and pressing **`R`** hands it to the AI (`review.notify_conflict_ai` injects an
+    explanatory message). The AI re-reads the real file (already containing the external changes) and
+    redoes the edit; the new candidate supersedes the old unit via `supersede_by_paths` and applies
+    normally;
+  - External content already equals the candidate result → idempotent skip;
+  - Only plain-text `modify` files participate (bounded by `merge_max_bytes`, default `max_file_bytes`);
+    binary/large/symlink/dir create-delete/git atomic groups still use strict CAS. `merge=false` falls
+    back to "reject the whole unit if the baseline changed".
 - **Re-validation before publish (defense in depth)**: `candidate.publish` re-canonicalizes every
   file path — it resolves **ancestor** symlinks and collapses `..`, but treats the **final component
   literally** (it does not follow a leaf symlink); if the result differs from the recorded path

@@ -198,8 +198,12 @@ end)
 | `test_sandbox_instance` | 沙箱进程实例隔离：实例 store 根互不可见、热重载保留本实例待审、`init` 不阻塞探测运行时能力（懒加载）、过期实例目录回收 |
 | `test_sandbox_service` | 长驻服务/镜像/诊断：service 启动/日志/状态/停止与注册表清理、停止时捕获服务改动回暂存、优雅停止（SIGTERM 优雅退出/超时 SIGKILL/`stop_all`）、`long_lived` 门禁分支、pip/npm/maven 镜像注入（含 settings.xml）、cgroup 事件快照与 OOM 判定 |
 | `test_sandbox_background` | 后台进程/会话级常驻实例：`&`/nohup/setsid 识别（排除 `&&`/重定向/中段 `&`）、开启 `resident` 后 `run_command` 的后台进程跨工具调用存活（同一命名空间内 `ps` 可见）、非后台命令正常返回 |
+| `test_sandbox_namespace` | 命名空间文件桥（`file_bridge`）：常驻实例运行时命名空间内读/写/存在/stat/建目录/删除/列目录，写入落 overlay 暂存层（真实盘零改动）、读取为合并视图；常驻实例未运行时不可用且不静默降级 |
 | `test_sandbox_systemd_user` | 伪造 `systemd --user` 解析器：`systemctl --user` 由门面处理（start/stop/is-active），用户单元在沙箱内运行且单元文件/运行态不落宿主机；`--user` 解析为 facade+scope=user |
 | `test_sandbox_symlink` | 符号链接候选：`stage_link` → finish → merge → publish 在真实盘创建软链；`systemctl --user enable` 与系统级门面 `systemctl enable` 的软链被捕获为候选且不落宿主机（返回真实 `Created symlink …` 文本） |
+| `test_merge3` | 三方合并纯 Lua diff3：单侧改动取该侧、同区间同结果去重、同区间异结果冲突、非重叠改动合并、删除/插入/空文件、无尾换行、超大文件 `too_large` 回退 |
+| `test_sandbox_merge` | 发布三方合并：无外部改动直写、外部非重叠改动合并保留、外部重叠冲突 `MERGE_CONFLICT` 且真实文件零改动、外部已是候选结果幂等跳过、无 base_blob 回退严格 CAS、`merge=false` 回退、同步与异步语义一致 |
+| `test_sandbox_conflict_ai` | 合并冲突留待审：apply 返回 CONFLICT 且条目保持 PENDING/记录 `merge_conflict`、真实文件零改动、`has_merge_conflict`、`notify_conflict_ai` 组装冲突说明并经 `chat_service` 注入会话 |
 | `test_sandbox_systemd` | systemctl 门面（方案 A）：独立调用解析与路由、unit 解析与类型门禁、依赖闭包（Requires/Wants/After、缺失依赖）、start 静默成功、status/is-active/is-system-running/is-failed 真实风格输出与退出码、不支持动词返回真实错误（不暴露沙箱）、门禁拦截不调用宿主 systemctl；Service 属性解析与 `show --property`、pending enable 虚拟视图、`reset-failed` 清除 degraded、`kill`+`Restart=always` 自动重启与 NRestarts、`.timer` 调度与 `systemd-run --on-active` 瞬态定时器 |
 | `test_sandbox_maintscript` | systemd 门面入口：`process_prefix` 把极薄入口覆盖绑定真实二进制路径（不再 PATH 前置 `/tmp/.dynbin`）、包安装注入 policy-rc.d、入口经文件 IPC 转发到 Lua 门面（stdout/stderr/退出码与真实 systemctl 一致） |
 | `test_net_consent` | 沙箱网络访问同意：策略 ask/allow/deny、内部端口登记免权限、headless 失败关闭、弹窗 allow_once/deny/allow_session 记忆、外部目标按策略处理 |

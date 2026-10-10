@@ -242,6 +242,12 @@ M.execute(agent, name, args, tool_call_id, opts)
 > `lsp_ops` 有**请求级超时**兜底（`tools.lsp.timeout_ms` 默认 10s）：服务器无响应时快速失败，
 > 避免工具循环挂到 executor 超时。
 >
+> 文件不在任何 buffer 时**自动后台打开**（不切窗口/不改布局）：路径展开 `~` 并绝对化，已登记
+> 但未加载的 buffer 会被真正加载，沙箱内存在暂存副本（AI 新建未落盘）的文件也可打开。LSP 客户端
+> attach 是异步的，工具会**在请求前等待其 attach**（`tools.lsp.attach_timeout_ms` 默认 3s，超时后
+> 仍发一次请求以给出准确错误）：本次后台新加载的 buffer、以及本会话已有其它 LSP 客户端（该 buffer
+> 的服务器可能正在启动/重启）都会等待；已等待超时放弃过的 buffer 不重复等待。避免误报「无 LSP 客户端」。
+>
 > `lsp_diagnostics` **每次调用都重新获取**：pull 客户端（`textDocument/diagnostic`，优先 AI 沙箱克隆）
 > 直接请求最新诊断；仅 push 客户端时强制触发一次 didChange（内容不变、不产生撤销项）让服务器重新
 > lint，等其 `publishDiagnostics` 后再读缓存（超时兜底），不返回陈旧缓存。

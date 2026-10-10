@@ -705,6 +705,72 @@ function M.read_path(real_path)
   return nil
 end
 
+--- 把命名空间 overlay 中某真实路径的当前内容镜像回工作区暂存副本（缓存）。
+--- 用于「overlay 为权威暂存层」模式：进程内文件工具经 `file_bridge` 直接改 overlay，
+--- 之后调用本函数使 `candidate.finish`/`read_path`/LSP 仍能从暂存副本读回一致的（token 化）视图。
+--- 需该路径已有暂存条目（由 `stage_path` 建立基线）；缺失时按新建登记。
+--- @param real_path string
+function M.mirror_overlay(real_path)
+  local ok, bridge = pcall(require, "NeoAI.sandbox.execution.file_bridge")
+  if not ok or not bridge or type(bridge.available) ~= "function" or not bridge.available() then
+    return
+  end
+  _await_rotation()
+  local real = _abs(real_path)
+  local entry = state.workspace[real]
+  local staged = entry and entry.staged
+  -- 先 stat（目录 cat 会失败，若先 read 会把新建目录误判为删除）。
+  local st = bridge.stat(real)
+  if not st then
+    -- overlay 中已删除（delete_file）：标记暂存删除态。
+    if entry then
+      if staged then pcall(vim.fn.delete, staged, "rf") end
+      entry.deleted = true
+      entry.version = _bump_version()
+    end
+    return
+  end
+  if not staged then
+    staged = _workspace_path(real)
+  end
+  if st.type == "directory" then
+    fs.ensure_dir(staged)
+    if entry then
+      entry.deleted = false
+      entry.version = _bump_version()
+    else
+      state.workspace[real] = { staged = staged, deleted = false, version = _bump_version() }
+    end
+    return
+  end
+  local raw = bridge.read(real)
+  if raw == nil then
+    if entry then
+      if staged then pcall(vim.fn.delete, staged, "rf") end
+      entry.deleted = true
+      entry.version = _bump_version()
+    end
+    return
+  end
+  fs.ensure_dir(vim.fn.fnamemodify(staged, ":h"))
+  _chown_payload(vim.fn.fnamemodify(staged, ":h"))
+  -- 暂存副本保持 token 化「视图」内容（与只读工具/LSP/审批一致）；发布时再 detokenize。
+  local tok = raw
+  if _is_text_content(raw) then
+    local secret = require("NeoAI.sandbox.secret.secret")
+    tok = secret.tokenize(raw, { entropy = secret.is_secret_path(real) })
+  end
+  fs.write_file(staged, tok)
+  if entry then
+    entry.deleted = false
+    entry.version = _bump_version()
+  else
+    state.workspace[real] = {
+      staged = staged, base_hash = nil, deleted = false, version = _bump_version(),
+    }
+  end
+end
+
 --- 沙箱视图/真实盘中该路径是否为目录（供文件写入工具拒绝目录目标，避免把目录覆盖成文件）。
 --- @param real_path string
 --- @return boolean
@@ -1622,6 +1688,45 @@ local function _max_file_bytes()
   local n = tonumber(require("NeoAI.kernel.config_store").get("tools.sandbox.max_file_bytes"))
   if n == nil then return 8 * 1024 * 1024 end
   return n
+end
+
+--- 发布是否需要三方合并（`tools.sandbox.review.merge`，默认开）。
+--- @return boolean
+local function _merge_enabled()
+  return require("NeoAI.kernel.config_store").get("tools.sandbox.review.merge") ~= false
+end
+
+--- 可合并文本文件的大小上限（字节）：超过即回退 CAS（不读 base、不合并）。0 = 不限制。
+--- @return number
+local function _merge_max_bytes()
+  local n = tonumber(require("NeoAI.kernel.config_store").get("tools.sandbox.review.merge_max_bytes"))
+  if n == nil then return _max_file_bytes() end
+  return n
+end
+
+--- 冻结期捕获「可三方合并」候选的真实基线内容（token 化后存 blob）：发布时若真实文件
+--- 被外部改动，用 base/ours/theirs 做行级三方合并而非整文件替换。仅对 `modify` 的普通文本
+--- 文件生效（大文件/blob/包签名/二进制不捕获，回退 CAS）。
+--- @param files table 候选文件数组（原地写入 `base_blob`）
+local function _capture_base_blobs(files)
+  if not _merge_enabled() then return end
+  local mcap = _merge_max_bytes()
+  local store = require("NeoAI.sandbox.state.store")
+  local secret = require("NeoAI.sandbox.secret.secret")
+  for _, f in ipairs(files) do
+    if f.action == "modify" and f.base_exists and f.base_type == "file"
+      and not f.large and not f.blob and not f.before_sig and f.before_hash then
+      local raw = _read(f.path)
+      if raw ~= nil and _is_text_content(raw) and (mcap <= 0 or #raw <= mcap) then
+        local tok = secret.tokenize(raw, { entropy = secret.is_secret_path(f.path) })
+        local key = "mergebase:" .. tostring(f.path) .. ":" .. tostring(f.before_hash)
+        local path = store.blob_path(key)
+        if path and store.blobs_dir() and fs.write_file_atomic(path, tok, { mode = 384, sync = false }) then
+          f.base_blob = path
+        end
+      end
+    end
+  end
 end
 
 --- 登记 overlay upper 中一条路径为候选条目（相对 real_root）
@@ -2917,6 +3022,8 @@ function M.finish(attempt_id, prefetch, classify)
   -- 剔除运行时遮蔽（发布硬拒绝）与易变包缓存（CAS 冲突）文件，避免整单元失败。
   local dropped
   files, dropped = _filter_unpublishable(files, attempt.attempt, classify)
+  -- 三方合并基线捕获（发布时间检测到外部改动时使用），须在过滤后避免为被剔除文件做无用读取。
+  _capture_base_blobs(files)
   local manifest = {}
   for _, f in ipairs(files) do
     manifest[#manifest + 1] = { path = f.path, action = f.action, after_hash = f.after_hash }
@@ -3498,7 +3605,18 @@ function M.publish(candidate, opts)
   local invalid = _publish_validate(candidate)
   if invalid then return invalid end
   local runtime = require("NeoAI.sandbox.execution.runtime")
-  -- 冲突预检：任一文件真实状态偏离基线则整体拒绝。
+  local secret = require("NeoAI.sandbox.secret.secret")
+  local merge_mod = require("NeoAI.utils.merge3")
+  -- 三方合并决策：skip_paths（幂等，真实内容已是候选结果，无需写）；
+  -- merged_paths（外部已改动，写入 base/ours/theirs 行级合并结果，内容为真实文本）。
+  local skip_paths = {}
+  local merged_paths = {}
+  --- 是否对某候选文件启用三方合并（仅普通文本 modify，且冻结期已捕获基线 blob）。
+  local function _mergeable(f)
+    return _merge_enabled() and f.action == "modify" and f.base_exists
+      and f.base_type == "file" and f.base_blob and not f.large and not f.link
+  end
+  -- 冲突预检：任一文件真实状态偏离基线则整体拒绝（可合并者例外，做三方合并）。
   -- 例外：git 对象库（内容寻址、不可变、可累加）不做 CAS——写前已存在即幂等满足。
   for _, f in ipairs(candidate.files or {}) do
     local gc = f.git_class or runtime.git_path_class(f.path)
@@ -3506,7 +3624,40 @@ function M.publish(candidate, opts)
       local lstat = vim.uv.fs_lstat(f.path)
       local stat = vim.uv.fs_stat(f.path)
       local exists = lstat ~= nil
-      if f.link then
+      if _mergeable(f) and exists and stat and stat.type == "file" then
+        local cur = _read(f.path)
+        local cur_hash = cur and _sha(cur) or nil
+        if cur_hash == f.before_hash then
+          -- 真实文件未变：直接写候选内容（快路径）。
+        elseif f.after_hash and cur_hash == f.after_hash then
+          skip_paths[f.path] = true -- 幂等：真实内容已是候选结果
+        else
+          local base_tok = _read(f.base_blob)
+          local base_raw, b_unres = nil, 0
+          if base_tok ~= nil then base_raw, b_unres = secret.detokenize(base_tok) end
+          local ours_tok = _candidate_content(f)
+          local ours, o_unres = nil, 0
+          if ours_tok ~= nil then ours, o_unres = secret.detokenize(ours_tok) end
+          if (b_unres or 0) > 0 or (o_unres or 0) > 0 then
+            return { ok = false, state = "FAILED", reason = "SECRET_UNRESOLVED: " .. f.path }
+          end
+          if base_raw == nil or ours == nil then
+            return { ok = false, state = "CONFLICT", reason = "BASELINE_CHANGED: " .. f.path }
+          end
+          local res = merge_mod.merge(base_raw, ours, cur)
+          if res.ok then
+            merged_paths[f.path] = res.merged
+          elseif res.too_large then
+            -- 文件过大无法合并：回退 CAS 拒绝（保持整单元不部分写入）。
+            return { ok = false, state = "CONFLICT", reason = "BASELINE_CHANGED: " .. f.path }
+          else
+            return {
+              ok = false, state = "CONFLICT", reason = "MERGE_CONFLICT: " .. f.path,
+              conflicts = { { path = f.path, base = base_raw, ours = ours, theirs = cur } },
+            }
+          end
+        end
+      elseif f.link then
         -- 符号链接：以 lstat/readlink 做 CAS（fs_stat 会跟随链接）。
         if f.action == "create" then
           if exists then
@@ -3550,10 +3701,10 @@ function M.publish(candidate, opts)
     end
   end
   -- 出沙箱解密预检：任何未解析的 token（映射缺失，如热重载后）都拒绝发布，
-  -- 绝不把 token 当内容写进真实文件（fail-closed）。大文件 blob 跳过（不做 token 化）。
-  local secret = require("NeoAI.sandbox.secret.secret")
+  -- 绝不把 token 当内容写进真实文件（fail-closed）。大文件 blob / 合并结果 / 跳过项不受此限。
   for _, f in ipairs(candidate.files or {}) do
-    if (f.action == "create" or f.action == "modify") and not f.link and not f.large then
+    if (f.action == "create" or f.action == "modify") and not f.link and not f.large
+      and not skip_paths[f.path] and merged_paths[f.path] == nil then
       local raw = _candidate_content(f)
       if raw ~= nil then
         local _, unresolved = secret.detokenize(raw)
@@ -3571,13 +3722,22 @@ function M.publish(candidate, opts)
       action = "symlink"
       content = f.link
     elseif f.action == "create" or f.action == "modify" then
-      action = "write"
-      -- 非大文件 blob：从 blob 读取（token 化内容）后解密；内嵌内容直接解密；大文件按文件复制。
-      content = secret.detokenize(_candidate_content(f) or "")
+      if skip_paths[f.path] then
+        action = nil
+      elseif merged_paths[f.path] ~= nil then
+        action = "write"
+        content = merged_paths[f.path]
+      else
+        action = "write"
+        -- 非大文件 blob：从 blob 读取（token 化内容）后解密；内嵌内容直接解密；大文件按文件复制。
+        content = secret.detokenize(_candidate_content(f) or "")
+      end
       -- 数据流账本：记录假密钥在宿主落盘路径的汇聚点。
-      pcall(function()
-        require("NeoAI.sandbox.secret.secret_flow").record("commit", { path = f.path })
-      end)
+      if action then
+        pcall(function()
+          require("NeoAI.sandbox.secret.secret_flow").record("commit", { path = f.path })
+        end)
+      end
     elseif f.action == "mkdir" then
       action = "mkdir"
     elseif f.action == "delete" then
@@ -3771,8 +3931,8 @@ local function _publish_worker(payload, sha_src)
     local before_hash = nn(op.before_hash)
     local before_sig = nn(op.before_sig)
     local gc = nn(op.git_class)
-    -- ---- CAS（git 对象库内容寻址，不做 CAS）----
-    if phase == "cas" and gc ~= "object" then
+    -- ---- CAS（git 对象库内容寻址，不做 CAS；合并/跳过项已在主线程解析，跳过 CAS）----
+    if phase == "cas" and gc ~= "object" and not nn(op.skip_cas) then
       local lstat = uv.fs_lstat(path)
       local stat = uv.fs_stat(path)
       local exists = lstat ~= nil
@@ -3912,6 +4072,7 @@ function M.publish_async(candidate, opts)
       blob = f.blob, large = f.large, content = (not f.blob) and f.content or nil,
       git_class = f.git_class or runtime.git_path_class(f.path),
       base_type = f.base_type, before_hash = f.before_hash, before_sig = f.before_sig,
+      base_blob = f.base_blob, after_hash = f.after_hash,
     }
     if (f.action == "create" or f.action == "modify") and not f.link and not f.large
       and not f.blob and spec.content ~= nil then
@@ -3921,6 +4082,55 @@ function M.publish_async(candidate, opts)
       end
     end
     specs[i] = spec
+  end
+  -- 三方合并预解析（主线程，纯 Lua 合并）：仅对冻结期捕获了基线的普通文本 modify 文件。
+  -- 依据当前真实文件与基线的关系决定：未变（走 CAS 直写）/ 已应用（`_skip` 跳过）/
+  -- 外部已改（`_merged` 写合并结果或 `MERGE_CONFLICT` 中止整单元）。
+  if _merge_enabled() then
+    local merge_mod = require("NeoAI.utils.merge3")
+    for _, spec in ipairs(specs) do
+      if spec.action == "modify" and spec.base_type == "file" and spec.base_blob
+        and not spec.large and not spec.link then
+        local stat = vim.uv.fs_stat(spec.path)
+        if stat and stat.type == "file" then
+          local cur = _read(spec.path)
+          local cur_hash = cur and _sha(cur) or nil
+          if cur_hash == spec.before_hash then
+            -- 真实文件未变：留给 CAS 直写。
+          elseif spec.after_hash and cur_hash == spec.after_hash then
+            spec._skip = true
+          else
+            local base_tok = _read(spec.base_blob)
+            local base_raw, b_unres = nil, 0
+            if base_tok ~= nil then base_raw, b_unres = secret.detokenize(base_tok) end
+            local ours, o_unres = nil, 0
+            if spec.blob then
+              local raw = _read(spec.blob)
+              if raw ~= nil then ours, o_unres = secret.detokenize(raw) end
+            elseif spec.content ~= nil then
+              ours, o_unres = secret.detokenize(spec.content)
+            end
+            if (b_unres or 0) > 0 or (o_unres or 0) > 0 then
+              return async.resolve({ ok = false, state = "FAILED", reason = "SECRET_UNRESOLVED: " .. spec.path })
+            end
+            if base_raw == nil or ours == nil then
+              return async.resolve({ ok = false, state = "CONFLICT", reason = "BASELINE_CHANGED: " .. spec.path })
+            end
+            local res = merge_mod.merge(base_raw, ours, cur)
+            if res.ok then
+              spec._merged = res.merged
+            elseif res.too_large then
+              return async.resolve({ ok = false, state = "CONFLICT", reason = "BASELINE_CHANGED: " .. spec.path })
+            else
+              return async.resolve({
+                ok = false, state = "CONFLICT", reason = "MERGE_CONFLICT: " .. spec.path,
+                conflicts = { { path = spec.path, base = base_raw, ours = ours, theirs = cur } },
+              })
+            end
+          end
+        end
+      end
+    end
   end
   local cas_mode = require("NeoAI.kernel.config_store").get("tools.sandbox.review.cas_mode") or "hash"
   local cap = _max_file_bytes()
@@ -3937,9 +4147,18 @@ function M.publish_async(candidate, opts)
       git_class = spec.git_class, base_type = spec.base_type,
       before_hash = spec.before_hash, before_sig = spec.before_sig,
     }
+    if spec._skip then
+      -- 外部内容已是候选结果（幂等）：两阶段均跳过写入与 CAS。
+      op.action = nil
+      op.skip_cas = true
+      return { op = op }
+    end
     if phase == "write" and spec.link == nil
       and (spec.action == "create" or spec.action == "modify") then
-      if spec.large then
+      if spec._merged ~= nil then
+        op.action = "write"
+        op.content = spec._merged
+      elseif spec.large then
         op.blob = spec.blob -- 大文件按文件复制，不做 token 化
       elseif spec.blob then
         local raw = _read(spec.blob) or ""
@@ -3949,6 +4168,10 @@ function M.publish_async(candidate, opts)
       else
         op.content = secret.detokenize(spec.content or "")
       end
+    end
+    if phase == "cas" and spec._merged ~= nil then
+      -- 合并结果已是真实文本：跳过 CAS 读取（内容非候选 token 化内容）。
+      op.skip_cas = true
     end
     return { op = op }
   end

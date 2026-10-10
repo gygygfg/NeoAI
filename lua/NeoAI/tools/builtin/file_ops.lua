@@ -5,6 +5,7 @@
 --- 不占用 nvim 主线程，避免工具调用时主界面卡住。
 
 local fs = require("NeoAI.utils.fs")
+local async = require("NeoAI.utils.async")
 local lock = require("NeoAI.utils.lock")
 local helpers = require("NeoAI.tools.builtin.tool_helpers")
 local config_store = require("NeoAI.kernel.config_store")
@@ -40,6 +41,15 @@ local function _resolve_guest_path(p)
     return g.resolve_read_path(p)
   end
   return p
+end
+
+--- 沙箱命名空间视图 I/O（overlay 权威暂存层）适配器；未启用/实例未运行时返回 nil，
+--- 调用方回退既有宿主暂存副本路径。
+--- @return table|nil
+local function _ns_fs()
+  local ok, ns = pcall(require, "NeoAI.sandbox.execution.ns_fs")
+  if ok and ns and type(ns.active) == "function" then return ns end
+  return nil
 end
 
 --- 读取 read_file 保护参数（配置缺省时用默认值兜底）
@@ -562,6 +572,22 @@ file_tools.read_file = helpers.define_tool(
     required = { "file_path" },
   },
   function(args, on_success, on_error)
+    -- 命名空间视图读取（快路径：小文件且无行范围）：overlay 权威暂存层下读取与暂存视图一致。
+    -- overlay 不可用/路径落在私有 tmpfs 根/大文件或指定行范围时回退既有解析路径。
+    do
+      local ns = _ns_fs()
+      if ns and ns.eligible(args.file_path) and not (args.start_line or args.end_line) then
+        local st = ns.stat(args.file_path)
+        if st and st.type == "file" then
+          local guard0 = _read_guard_opts()
+          local content = ns.read(args.file_path)
+          if content ~= nil and _char_count(content) <= guard0.outline_threshold_chars then
+            on_success(output_guard.cap(content, { tool = "read_file" }))
+            return
+          end
+        end
+      end
+    end
     -- 沙箱访客路径（/tmp/…，如 output_guard 落盘的输出）还原为宿主路径，使 read_file 能回读。
     -- 映射策略由沙箱负责（guest_fs.resolve_read_path），工具仅调用。
     local filepath = _resolve_guest_path(args.file_path)
@@ -711,6 +737,18 @@ file_tools.edit_file = helpers.define_tool(
     end
 
     if mode == "write" then
+      local ns = _ns_fs()
+      if ns and ns.active() then
+        _pipe(_with_file_lock(filepath, function()
+          local ok, werr = ns.write(filepath, args.content or "")
+          if not ok then return async.reject({ kind = "sandbox", message = "写入失败: " .. tostring(werr) }) end
+          return async.resolve(true)
+        end), function()
+          helpers.reload_buffers_for(filepath)
+          on_success(("文件已写入: %s (%d 字节)"):format(filepath, #(args.content or "")))
+        end, on_error)
+        return
+      end
       _pipe(_with_file_lock(filepath, function()
         return fs.write_file_async(filepath, args.content or "")
       end), function()
@@ -720,6 +758,18 @@ file_tools.edit_file = helpers.define_tool(
       return
     end
     if mode == "append" then
+      local ns = _ns_fs()
+      if ns and ns.active() then
+        _pipe(_with_file_lock(filepath, function()
+          local ok, werr = ns.append(filepath, args.content or "")
+          if not ok then return async.reject({ kind = "sandbox", message = "追加失败: " .. tostring(werr) }) end
+          return async.resolve(true)
+        end), function()
+          helpers.reload_buffers_for(filepath)
+          on_success("已追加到: " .. filepath)
+        end, on_error)
+        return
+      end
       _pipe(_with_file_lock(filepath, function()
         return fs.append_file_async(filepath, args.content or "")
       end), function()
@@ -751,6 +801,31 @@ file_tools.edit_file = helpers.define_tool(
     end
     if #packed == 0 then
       on_error("edits 需要包含有效的 old_text/new_text")
+      return
+    end
+    -- overlay 权威模式：在命名空间 overlay 内「读→改→写」（同一文件锁内串行化）。
+    local ns = _ns_fs()
+    if ns and ns.active() then
+      _pipe(_with_file_lock(filepath, function()
+        local content, rerr = ns.read(filepath)
+        if content == nil then
+          return async.reject({ kind = "sandbox", message = "无法读取文件: " .. tostring(rerr) })
+        end
+        for _, edit in ipairs(edits) do
+          if edit.old_text and edit.new_text then
+            local escaped = edit.old_text:gsub("([%(%)%.%%%+%-%*%?%[%]%^%$])", "%%%1")
+            content = content:gsub(escaped, function()
+              return edit.new_text
+            end)
+          end
+        end
+        local ok, werr = ns.write(filepath, content)
+        if not ok then return async.reject({ kind = "sandbox", message = "写入失败: " .. tostring(werr) }) end
+        return async.resolve(true)
+      end), function()
+        helpers.reload_buffers_for(filepath)
+        on_success("文件已编辑: " .. filepath)
+      end, on_error)
       return
     end
     -- 整条「读→改→写」链在文件锁内执行：并发发起的两处替换会串行化，避免二者
@@ -925,6 +1000,15 @@ file_tools.file_exists = helpers.define_tool(
     required = { "file_path" },
   },
   function(args, on_success)
+    -- 命名空间视图存在性（overlay 权威暂存层）。
+    local ns = _ns_fs()
+    if ns and ns.eligible(args.file_path) then
+      local e = ns.exists(args.file_path)
+      if e ~= nil then
+        on_success(tostring(e))
+        return
+      end
+    end
     local fp = _resolve_guest_path(args.file_path)
     local sv = _sandbox_path_exists(fp)
     if sv ~= nil then
@@ -946,6 +1030,11 @@ file_tools.create_directory = helpers.define_tool(
     required = { "file_path" },
   },
   function(args, on_success, on_error)
+    local ns = _ns_fs()
+    if ns and ns.active() and ns.mkdir(args.file_path) then
+      on_success("目录已创建: " .. args.file_path)
+      return
+    end
     local ok, err = fs.ensure_dir(args.file_path)
     if not ok then
       on_error("创建目录失败: " .. tostring(err))
@@ -966,6 +1055,11 @@ file_tools.ensure_dir = helpers.define_tool(
     required = { "file_path" },
   },
   function(args, on_success, on_error)
+    local ns = _ns_fs()
+    if ns and ns.active() and ns.mkdir(args.file_path) then
+      on_success("目录已就绪: " .. args.file_path)
+      return
+    end
     local ok, err = fs.ensure_dir(args.file_path)
     if not ok then
       on_error("创建目录失败: " .. tostring(err))
@@ -982,6 +1076,18 @@ file_tools.delete_file = helpers.define_tool("delete_file", "删除文件。file
   properties = { file_path = { type = "string" } },
   required = { "file_path" },
 }, function(args, on_success, on_error)
+  local ns = _ns_fs()
+  if ns and ns.active() then
+    if ns.exists(args.file_path) == false then
+      on_error("文件不存在: " .. args.file_path)
+      return
+    end
+    if ns.unlink(args.file_path) then
+      helpers.reload_buffers_for(args.file_path)
+      on_success("文件已删除: " .. args.file_path)
+      return
+    end
+  end
   if not fs.exists(args.file_path) then
     on_error("文件不存在: " .. args.file_path)
     return

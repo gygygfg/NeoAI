@@ -268,6 +268,15 @@ dedicated tools above.
 > `lsp_ops` has a **request-level timeout** fallback (`tools.lsp.timeout_ms`, default 10s): it fails fast when the
 > server does not respond, preventing the tool loop from hanging until the executor timeout.
 >
+> Files not in any buffer are **auto-opened in a background buffer** (no window switch / layout change): the
+> path is `~`-expanded and made absolute, registered-but-unloaded buffers are actually loaded, and files that
+> exist only as a sandbox staged copy (AI-created, not yet written to disk) can be opened too. LSP client
+> attach is asynchronous, so the tools **wait for it before requesting** (`tools.lsp.attach_timeout_ms`,
+> default 3s; on timeout they still issue one request to return an accurate error): this covers both a
+> buffer just background-loaded and a buffer whose server may still be starting/restarting (another LSP
+> client already exists in the session); a buffer that already timed out once is not waited on again,
+> avoiding a false "no LSP client" report.
+>
 > `lsp_diagnostics` **re-fetches on every call**: pull clients (`textDocument/diagnostic`, sandbox clone
 > preferred) are queried directly for the latest diagnostics; when only push clients exist, it forces a
 > didChange (content unchanged, no undo entry) so the server re-lints, then waits for `publishDiagnostics`

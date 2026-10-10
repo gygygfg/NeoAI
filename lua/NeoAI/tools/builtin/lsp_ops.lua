@@ -10,11 +10,27 @@ local M = {}
 
 -- ========== 私有函数 ==========
 
+--- 后台新加载、尚在等待 LSP 客户端 attach 的 buffer（缓冲 attach 是异步的，立即请求会
+--- 误报「无 LSP 客户端（文件可能在后台加载，客户端未附加）」）。
+local _pending_attach = {}
+--- 已等待 attach 超时的 buffer：不再重复等待（避免每次调用都白等；attach 后清除）。
+local _no_wait = {}
+
 --- 通过文件路径获取 buffer；未打开时后台加载
 --- @param filepath string
 --- @return number|nil bufnr
 local function _bufnr(filepath)
-  local bufnr = helpers.ensure_buffer(filepath)
+  local bufnr, loaded_now = helpers.ensure_buffer(filepath)
+  if bufnr and loaded_now then
+    -- 本次后台加载（含 bufnr 复用）：重置该 buffer 的等待状态
+    _pending_attach[bufnr] = true
+    _no_wait[bufnr] = nil
+  end
+  -- 已 attach 则不再需要等待
+  if bufnr and #vim.lsp.get_clients({ bufnr = bufnr }) > 0 then
+    _pending_attach[bufnr] = nil
+    _no_wait[bufnr] = nil
+  end
   if bufnr then
     -- 磁盘直写工具（edit_file 等）只改磁盘不改已加载 buffer，导致内存与磁盘不一致；
     -- 这里把磁盘最新内容同步进 buffer，避免 LSP 基于过期内容（读错位置 / 重命名写回旧内容）。
@@ -90,11 +106,12 @@ end
 --- buf_request 本身无超时，若一直等待会让工具循环挂到 executor 超时（默认 30s）
 --- 才报"工具执行超时"，并拖累同一轮并行执行的所有工具（async.all 等最慢的）。
 --- 这里加请求级超时：超时即拒绝，工具快速失败并给出明确错误。
+--- （对后台新加载的 buffer，外部 `_request` 会先等待客户端 attach 再进入本函数。）
 --- @param method string
 --- @param params table
 --- @param target number|table bufnr 或 LSP 客户端（client:request）
 --- @return Deferred
-local function _request(method, params, target)
+local function _request_inner(method, params, target)
   -- 优先走 AI 专用沙箱 LSP 克隆（独立进程，读暂存内容，诊断不外溢）。
   -- 未启用 / overlay 不可用 / 无克隆时回退到编辑器客户端（原行为）。
   local sandbox_blocked = false
@@ -356,6 +373,50 @@ local function _await_client(bufnr, attempt, on_timeout)
       end
     end)
   end)
+end
+
+--- 是否应先等待 LSP 客户端 attach 再发请求（有界，`tools.lsp.attach_timeout_ms`）：
+--- - 已有客户端：否；
+--- - 本次后台新加载但尚未 attach：是；
+--- - 本会话已有其它 LSP 客户端（该 buffer 的服务器可能正在启动/重启）：是；
+--- - 之前已等待超时放弃过的 buffer：否（避免每次调用都白等）。
+--- @param target number
+--- @return boolean
+local function _should_wait(target)
+  if #vim.lsp.get_clients({ bufnr = target }) > 0 then return false end
+  if _no_wait[target] then return false end
+  if _pending_attach[target] then return true end
+  return #vim.lsp.get_clients() > 0
+end
+
+--- 请求包装（对外）：对尚无客户端、且可能即将 attach 的 buffer，先等待 LSP 客户端 attach
+--- 再发请求——后台加载/服务器启动/重启触发的 attach 是异步的，立即请求会误报「无客户端」。
+--- 等待有界（tools.lsp.attach_timeout_ms），超时后仍发起一次请求以给出准确错误（绝不永久挂起）。
+--- @param method string
+--- @param params table
+--- @param target number|table bufnr 或 LSP 客户端
+--- @return Deferred
+local function _request(method, params, target)
+  if type(target) == "number" and _should_wait(target) then
+    local outer = async.Deferred.new()
+    local function proceed(timed_out)
+      _pending_attach[target] = nil
+      if timed_out then _no_wait[target] = true end
+      _request_inner(method, params, target):then_(
+        function(v) outer:resolve(v) end,
+        function(e) outer:reject(e) end
+      )
+    end
+    _await_client(target, function()
+      if #vim.lsp.get_clients({ bufnr = target }) > 0 then
+        proceed(false)
+        return true
+      end
+      return false
+    end, function() proceed(true) end)
+    return outer
+  end
+  return _request_inner(method, params, target)
 end
 
 -- ========== 工具定义 ==========

@@ -172,7 +172,7 @@ session = {
 | `output_guard` | `{enabled=true, max_chars=20000, head_chars=14000, tail_chars=4000, spill=true, spill_dir="neoai-out"}` | 工具输出「AI 上下文限流」：`run_command` + 只读 `git_*` + `read_file` 回传文本超过 `max_chars`（字符数）时，只回传「头 `head_chars` + 截断标记 + 尾 `tail_chars`」，并把完整输出写入沙箱私有 `/tmp/<spill_dir>/`（默认 `/tmp/neoai-out/…`，提示中给出路径，可用 `read_file` 的 `start_line/end_line` 分段回读）。`head_chars+tail_chars` 须 `< max_chars`（否则自动按比例钳制）。`spill=false` 只截断不落盘；未启用沙箱（无 `/tmp` 映射）时自动降级为仅截断。`enabled=false` 一键停止限流（仅保留 `run_command.max_output_bytes` 等硬限）。与 `max_output_bytes`（16 MiB 防冻结硬杀限，保护主线程）职责分离 |
 | `search_files` | `{max_file_bytes=8388608}` | 搜索时单文件扫描上限（字节），超过则跳过；二进制文件（含 NUL）跳过，避免大文件 OOM |
 | `run_command` | `{max_output_bytes=16777216, max_wall_ms=0, interactive={enabled=true, engine="auto", poll_ms=80, show_window="on_wait", show_window_delay_ms=2000, judge={enabled=true, model=nil, max_rounds=12, timeout_ms=120000, output_tail_lines=80}}}` | 命令 stdout/stderr 合计上限（字节）：超出则截断并终止命令，避免超大输出逐行处理冻结主线程；0 = 不限制。`max_wall_ms>0` 为墙钟安全网：命令最长运行该毫秒数（同样约束 `timeout_ms=-1` 的「不限」命令），到时经沙箱资源域真正终止进程树；0 = 不限制。`interactive`（**默认开启**）：`run_command` 以 **PTY** 运行，轮询 `/proc` 检测「进程阻塞读终端 = 等待输入」（OS 级判据，非文字匹配；用 `/proc/<pid>/io` 的 `rchar` 增长区分连续两次读取），每轮等待由**判官**（**单轮大模型请求**：模型返回 `{"action":"text"|"keys"|"kill"|"none",...}` JSON 决策，直接注入文本/按键/结束进程；非子 agent、无工具循环）或用户在悬浮终端手动输入作答；`poll_ms` 轮询间隔，`show_window` 控制悬浮终端弹出时机（always=会话启动即开 / on_wait=命令运行超过 `show_window_delay_ms`（默认 2000ms）仍未结束才开，短命令一闪而过的窗口不打扰 / never=不开；**均要求聊天光标跟随，不跟随时不弹**），`engine="off"` 等价不启用。悬浮终端以**折叠态**（屏幕右上角小窗）打开，焦点进入终端窗时自动展开为全尺寸、移出时回落到折叠态。普通前台命令走**一次性**沙箱路径（常驻命令服务器 stdin 为 /dev/null 无法交互）；但带后台意图（`&`/nohup/setsid）的命令、以及**已有常驻实例在运行时**的后续命令仍走常驻实例，保证后台进程跨调用存活且同命名空间内 `ps`/`kill`/日志可见可管。`enabled=false` 则所有命令都走常驻实例 |
-| `lsp` | `{timeout_ms=10000, attach_timeout_ms=3000}` | LSP 请求超时（服务器无响应快速失败）；`attach_timeout_ms` 为等待客户端附加的超时：后台加载 buffer / 服务器启动或重启期间客户端尚未附加时，`lsp_diagnostics` 等待其就绪再取诊断，而非立即报「无 LSP 客户端」 |
+| `lsp` | `{timeout_ms=10000, attach_timeout_ms=3000}` | LSP 请求超时（服务器无响应快速失败）；`attach_timeout_ms` 为等待客户端附加的超时：文件不在 buffer 时自动后台打开、或服务器启动/重启期间客户端尚未附加时，LSP 工具等待其 attach 再发请求（超时后仍发一次以给出准确错误），而非立即报「无 LSP 客户端」 |
 | `guard.repeat_tool` | `{enabled=true, thresholds={3,5,8}, messages=...}` | 连续重复工具调用提醒 |
 | `todo.enabled` | `true` | 待办工具 + 系统提示注入 |
 | `web_fetch` | 见下（默认 `enabled=false`） | 网页抓取：无头浏览器渲染动态页面并转 Markdown |
@@ -359,6 +359,13 @@ sandbox = {
     -- 0 = 回退 tools.sandbox.max_file_bytes。
     max_embed_bytes = 262144,
   },
+  -- 进程内文件工具的命名空间 I/O（默认开）：常驻实例运行时（首个文件操作会主动建立实例），
+  -- 已接入的进程内文件写入工具（edit_file/create_directory/ensure_dir/delete_file）经命名空间
+  -- overlay 读写——读取为 overlay 合并视图、写入落 overlay 暂存层（真实工作区在确认发布前不受
+  -- 影响），并把 overlay 内容镜像回工作区暂存副本（缓存）供 LSP/审批/发布；read_file/file_exists
+  -- 亦经桥读取 overlay 合并视图。目标落在私有 tmpfs 根（/tmp、/var/tmp、/run）下或实例不可用时
+  -- 回退既有工作区暂存副本。
+  inproc_namespace = true,
   -- 内部长驻服务（sandbox.service）：不再注册 service_* 工具（AI 不可见），仅由 systemctl
   -- 门面复用在沙箱内启停单元进程（独立 overlay + 资源域，停止时捕获改动为候选）。
   service = {
@@ -516,11 +523,17 @@ sandbox = {
   --     按 u 恢复为待审。这些可恢复项不参与 terminal_cache_max 淘汰，改由 rejected_max
   --     （默认 50）约束：超限删除最旧项副本并移出内存（磁盘记录仍在）；0 = 不保留。
   --   cas_mode：发布 CAS 校验模式 "hash"（默认，最严）|"auto"|"sig"；非默认放宽一致性检出。
+  --   merge / merge_max_bytes：发布三方合并（默认开）。真实文件被外部改动时，按 base（冻结时
+  --     真实内容）/ ours（候选）/ theirs（当前真实内容）做行级 diff3——无冲突写合并结果（保留
+  --     外部改动），冲突则不写盘、条目保持待审并标记 MERGE_CONFLICT（审批界面按 R 交给 AI 基于
+  --     最新内容重做）。仅普通文本 modify 文件生效；二进制/大文件/软链/目录创建删除仍走 CAS。
+  --     merge=false 回退原「基线变了即整体拒绝」。merge_max_bytes=null 沿用 max_file_bytes。
   --   snapshot_cas：撤销保存的快照 CAS "sig"（默认，签名，省 CPU）|"hash"（内容哈希，最严）。
   review = { enabled = true, auto_apply = false, session_auto_approve = false,
              max_display_files = 200, refresh_debounce_ms = 80,
              content_cache_max = 64, terminal_cache_max = 200, rejected_max = 50,
              rejected_dir = "/tmp/neoai-rejected", cas_mode = "hash",
+             merge = true, merge_max_bytes = nil,
              snapshot_cas = "sig",
              l3_warning = { enabled = true, package_confirm = true, max_tokens = 256, timeout_ms = 15000 },
              ai_audit = { enabled = true, auto = false, key = "a", max_concurrent = 10,

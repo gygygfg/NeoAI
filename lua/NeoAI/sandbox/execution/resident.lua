@@ -221,6 +221,31 @@ local function _server_script(boot)
     "      done < \"$__p/m\"",
     "      printf '\\036MAT %s\\037' \"$__id\"",
     "      ;;",
+    -- F：命名空间内文件操作（读/写/存在/stat/建目录/删除/列目录）。载荷为一行
+    -- `<op>\t<pb64>\t<cb64>`（path/content 以 base64 承载）。结果以 BEGIN/base64/END 块返回，
+    -- 使内容经 base64 安全穿越帧定界（客户端 `_decode_chunks` 解码）。全程在沙箱 mount
+    -- 命名空间内执行，故写入落在 overlay 暂存层（真实工作区不受影响），读取为 overlay 合并视图。
+    "    F*)",
+    "      __rest=${__line#F$'\\t'}",
+    "      __id=${__rest%%$'\\t'*}",
+    "      __len=${__rest#*$'\\t'}",
+    "      " .. head_cmd("f"),
+    "      IFS=$'\\t' read -r __op __pb __cb < \"$__p/f\"",
+    "      __path=$(printf '%s' \"$__pb\" | base64 -d 2>/dev/null)",
+    "      __of=\"$__p/fout.$__id\"",
+    "      __rc=0",
+    "      case \"$__op\" in",
+    "        r) cat -- \"$__path\" > \"$__of\" 2>/dev/null || __rc=1 ;;",
+    "        e) if [ -e \"$__path\" ]; then printf 1 > \"$__of\"; else printf 0 > \"$__of\"; fi ;;",
+    "        s) if [ -d \"$__path\" ]; then printf d > \"$__of\"; elif [ -f \"$__path\" ]; then printf \"f %s\" \"$(wc -c < \"$__path\" 2>/dev/null)\" > \"$__of\"; else __rc=1; fi ;;",
+    "        w) mkdir -p -- \"$(dirname -- \"$__path\")\" 2>/dev/null; printf '%s' \"$__cb\" | base64 -d > \"$__path\" 2>/dev/null || __rc=1 ;;",
+    "        m) mkdir -p -- \"$__path\" 2>/dev/null || __rc=1 ;;",
+    "        u) rm -rf -- \"$__path\" 2>/dev/null; __rc=0 ;;",
+    "        l) ls -A -- \"$__path\" > \"$__of\" 2>/dev/null || __rc=1 ;;",
+    "        *) __rc=2 ;;",
+    "      esac",
+    "      __id=\"$__id\" __rc=\"$__rc\" __of=\"$__of\" flock \"$__p/lock\" sh -c 'printf \"\\036BEGIN %s\\037\" \"$__id\"; base64 \"$__of\" 2>/dev/null; printf \"\\036END %s %s\\037\" \"$__id\" \"$__rc\"; rm -f \"$__of\"'",
+    "      ;;",
     "  esac",
     "done",
   }, "\n")
@@ -826,6 +851,41 @@ function M.exec(command, opts)
     })
   end, function(e) out:reject(e) end)
   return out
+end
+
+--- 在常驻沙箱命名空间内执行一次**文件操作**（同步阻塞，供进程内文件工具的命名空间 I/O 使用）。
+--- 操作在沙箱 mount 命名空间内进行：写入落在 overlay 暂存层（真实工作区不受影响），读取为
+--- overlay 合并视图（有暂存读暂存，否则读真实 lower）。需常驻实例已在运行，否则返回
+--- `nil, "RESIDENT_UNAVAILABLE"`（调用方回退宿主侧 I/O）。
+--- @param op string "r"(读) | "w"(写) | "e"(存在) | "s"(stat) | "m"(mkdir -p) | "u"(删除) | "l"(列目录)
+--- @param path string 目标路径（命名空间内绝对路径）
+--- @param content string|nil 写入内容（op="w"）
+--- @param opts table|nil { timeout_ms? }
+--- @return table|nil { code:number, stdout:string } 成功；op 语义：r→stdout 为文件内容；
+---   e→stdout 为 "1"/"0"；s→stdout 为 "d" 或 "f <size>"；其余 op→stdout 为空
+--- @return string|nil err
+function M.file_op(op, path, content, opts)
+  opts = opts or {}
+  local inst = M.active()
+  if not inst then return nil, "RESIDENT_UNAVAILABLE" end
+  if type(op) ~= "string" or op == "" or type(path) ~= "string" or path == "" then
+    return nil, "BAD_ARGS"
+  end
+  local payload = op .. "\t" .. vim.base64.encode(path) .. "\t" .. vim.base64.encode(content or "")
+  local timeout_ms = tonumber(opts.timeout_ms) or 15000
+  local result
+  local done = false
+  _request(inst, "F", payload, { timeout_ms = timeout_ms }):then_(function(res)
+    result = res
+    done = true
+  end, function()
+    result = false
+    done = true
+  end)
+  vim.wait(timeout_ms + 3000, function() return done end, 5)
+  if not done or result == nil then return nil, "TIMEOUT" end
+  if result == false then return nil, "REQUEST_FAILED" end
+  return { code = result.code or -1, stdout = result.stdout or "" }
 end
 
 --- 发布/拒绝后把真实盘内容同步进常驻 overlay（overlay lower 在挂载后变更不可靠可见，

@@ -469,6 +469,22 @@ function M.apply_async(id, opts)
   return review.apply_async(id, opts)
 end
 
+--- 某变更单元是否因三方合并冲突而待审。
+--- @param id string
+--- @return boolean
+function M.has_merge_conflict(id)
+  return review.has_merge_conflict(id)
+end
+
+--- 把合并冲突的变更单元交给 AI 重做（注入一条说明消息到当前会话）。
+--- @param id string
+--- @param opts table|nil
+--- @return boolean ok
+--- @return string|nil err
+function M.notify_conflict_ai(id, opts)
+  return review.notify_conflict_ai(id, opts)
+end
+
 --- 撤销/重做保存：把真实文件与保存时保留的原文件快照交换（可反复切换）
 --- @param id string change_set_id
 --- @param opts table|nil { allow_root?, prefer_sudo?, force? }

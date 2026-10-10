@@ -177,7 +177,7 @@ session = {
 | `output_guard` | `{enabled=true, max_chars=20000, head_chars=14000, tail_chars=4000, spill=true, spill_dir="neoai-out"}` | Tool-output **AI-context cap**: when the text returned by `run_command` + read-only `git_*` + `read_file` exceeds `max_chars` (characters), only the head `head_chars` + a truncation marker + the tail `tail_chars` are returned, and the full output is written to the sandbox-private `/tmp/<spill_dir>/` (default `/tmp/neoai-out/…`; the marker gives the path, readable back in segments via `read_file` `start_line`/`end_line`). `head_chars+tail_chars` must be `< max_chars` (otherwise auto-rescaled). `spill=false` truncates without spilling; with no sandbox (no `/tmp` mapping) it degrades to truncation only. `enabled=false` disables the cap (only hard limits such as `run_command.max_output_bytes` remain). Separate from `max_output_bytes` (the 16 MiB anti-freeze hard kill protecting the main thread) |
 | `search_files` | `{max_file_bytes=8388608}` | Per-file scan cap (bytes) during search; larger files and binaries (containing NUL) are skipped to avoid OOM |
 | `run_command` | `{max_output_bytes=16777216, max_wall_ms=0, interactive={enabled=true, engine="auto", poll_ms=80, show_window="on_wait", show_window_delay_ms=2000, judge={enabled=true, model=nil, max_rounds=12, timeout_ms=120000, output_tail_lines=80}}}` | Combined stdout/stderr cap (bytes): beyond it the command is truncated and terminated, so huge outputs cannot freeze the main thread with line-by-line processing; 0 = unlimited. `max_wall_ms>0` is a wall-clock safety net: the command may run at most that many milliseconds (also bounding `timeout_ms=-1` "unlimited" commands) and is then truly killed via the sandbox resource domain; 0 = unlimited. `interactive` (**on by default**): `run_command` runs under a **PTY** and polls `/proc` to detect "process blocked reading the terminal = waiting for input" (an OS-level signal, not text matching; consecutive reads are distinguished via `/proc/<pid>/io` `rchar` growth). Each wait is answered by a **judge** (**a single-turn LLM request**: the model returns `{"action":"text"|"keys"|"kill"|"none",...}` JSON, which directly injects text/keys or ends the process; no sub-agent, no tool loop) or by the user (manual input in the floating terminal); `poll_ms` is the poll interval, `show_window` controls when the terminal window pops up (always = at session start / on_wait = only after the command has been running longer than `show_window_delay_ms` (default 2000ms) and has not yet finished, so a fast command never flashes a window / never = no window; **both always/on_wait require the chat cursor to be following — nothing pops while the user is scrolled up**), and `engine="off"` disables it. The floating terminal opens in a **collapsed** state (a small window in the top-right corner) and auto-expands to full size when focus enters the terminal window, collapsing again when focus leaves. Plain foreground commands use the **one-shot** sandbox path (the resident command server's stdin is /dev/null and cannot be interactive); however commands with background intent (`&`/nohup/setsid) and subsequent commands **while a resident instance is already active** still use the resident instance, so background processes survive across calls and stay visible/manageable (`ps`/`kill`/logs) in the same namespace. Setting `enabled=false` sends all commands through the resident instance |
-| `lsp` | `{timeout_ms=10000, attach_timeout_ms=3000}` | LSP request timeout (fail fast when the server does not respond); `attach_timeout_ms` is how long to wait for a client to attach: when a background-loaded buffer or a starting/restarting server has no client yet, `lsp_diagnostics` waits for it instead of failing immediately with "no LSP client" |
+| `lsp` | `{timeout_ms=10000, attach_timeout_ms=3000}` | LSP request timeout (fail fast when the server does not respond); `attach_timeout_ms` is how long to wait for a client to attach: when a file is not in any buffer (auto-opened in the background) or a starting/restarting server has no client yet, LSP tools wait for it before requesting (still issuing one request on timeout to return an accurate error) instead of failing immediately with "no LSP client" |
 | `guard.repeat_tool` | `{enabled=true, thresholds={3,5,8}, messages=...}` | Reminder for consecutive repeated tool calls |
 | `todo.enabled` | `true` | Todo tool + system prompt injection |
 | `web_fetch` | See below (`enabled=false` by default) | Web fetch: render dynamic pages in a headless browser and convert to Markdown |
@@ -393,6 +393,15 @@ sandbox = {
     -- tools.sandbox.max_file_bytes.
     max_embed_bytes = 262144,
   },
+  -- Namespaced I/O for in-process file tools (on by default): while a resident instance is running
+  -- (the first file operation starts one eagerly), the wired in-process write tools
+  -- (edit_file/create_directory/ensure_dir/delete_file) read/write through the namespace overlay —
+  -- reads are the merged view, writes land in the overlay staging layer (the real workspace is
+  -- untouched until publishing), and the overlay content is mirrored back into the workspace staged
+  -- copy (cache) for LSP/review/publish; read_file/file_exists also read the overlay merged view
+  -- through the bridge. Falls back to the workspace staged copy when the target is under a private
+  -- tmpfs root (/tmp, /var/tmp, /run) or no instance is available.
+  inproc_namespace = true,
   -- Internal long-lived services (sandbox.service): the service_* tools are no longer registered
   -- (invisible to the AI); kept only for the systemctl facade to start/stop unit processes in-sandbox
   -- (own overlay + resource domain, changes captured as candidates on stop).
@@ -581,12 +590,21 @@ sandbox = {
   --     remains); 0 = keep none.
   --   cas_mode: publish CAS mode "hash" (default, strictest) | "auto" | "sig"; non-default loosens
   --     consistency detection.
+  --   merge / merge_max_bytes: three-way merge on publish (default on). When the real file was changed
+  --     externally, base (frozen real content) / ours (candidate) / theirs (current real content) are
+  --     line-merged (diff3): a clean merge writes the merged result (external changes preserved); a
+  --     conflict writes nothing, keeps the change set pending and marks it MERGE_CONFLICT (press R in
+  --     the review UI to hand it to the AI to redo against the latest content). Applies to plain-text
+  --     `modify` files only; binary/large/symlink/dir create-delete still use CAS. merge=false falls
+  --     back to the old "reject the whole unit if the baseline changed". merge_max_bytes=null uses
+  --     max_file_bytes.
   --   snapshot_cas: undo-snapshot CAS "sig" (default, signatures, less CPU) | "hash" (content hash,
   --     strictest).
   review = { enabled = true, auto_apply = false, session_auto_approve = false,
              max_display_files = 200, refresh_debounce_ms = 80,
              content_cache_max = 64, terminal_cache_max = 200, rejected_max = 50,
              rejected_dir = "/tmp/neoai-rejected", cas_mode = "hash",
+             merge = true, merge_max_bytes = nil,
              snapshot_cas = "sig",
              l3_warning = { enabled = true, package_confirm = true, max_tokens = 256, timeout_ms = 15000 },
              ai_audit = { enabled = true, auto = false, key = "a", max_concurrent = 10,

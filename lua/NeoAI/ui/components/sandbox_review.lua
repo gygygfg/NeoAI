@@ -599,6 +599,12 @@ function M.build_lines(items, traces, audit, saved, rejected)
       local rb = base:find("%[L%d%]", 1)
       if rb then marks[#marks + 1] = { line = hln, start_col = rb - 1, end_col = rb + 2, level = _risk_hl(item.risk_level) } end
     end
+    -- 三方合并冲突标记：应用时检测到外部改动且无法自动合并，未写入真实文件。
+    if item.merge_conflict then
+      local cp = "  ⚠ 合并冲突（外部改动，未写入真实文件）——按 R 交给 AI 基于最新内容重做"
+      lines[#lines + 1] = cp
+      marks[#marks + 1] = { line = #lines, start_col = 0, end_col = #cp, level = "system" }
+    end
     -- 命令型变更单元（run_command / 包安装等）：展示实际命令，便于用户了解具体操作；
     -- 其后的文件行即该命令影响的文件，按工作区/用户/系统级别高亮。
     if type(item.command) == "string" and item.command ~= "" then
@@ -1217,6 +1223,28 @@ local function _reject_current()
   end
   vim.notify(("[NeoAI] 已拒绝 %s %s"):format(target.change_set_id, target.path), vim.log.levels.INFO)
   M.refresh()
+end
+
+--- 把光标所在「合并冲突」条目交给 AI：基于当前真实内容重新应用修改（外部改动不被覆盖）。
+local function _resolve_conflict_current()
+  local target = state.line_to_target[vim.api.nvim_win_get_cursor(0)[1]]
+  if not target or not target.change_set_id then
+    vim.notify("[NeoAI] 请将光标移到冲突条目行", vim.log.levels.WARN)
+    return
+  end
+  local sandbox = services.use("services.sandbox")
+  if not sandbox or not sandbox.notify_conflict_ai then return end
+  local id = target.change_set_id
+  if sandbox.has_merge_conflict and not sandbox.has_merge_conflict(id) then
+    vim.notify("[NeoAI] 该条目不是合并冲突", vim.log.levels.WARN)
+    return
+  end
+  local ok, err = sandbox.notify_conflict_ai(id)
+  if ok then
+    vim.notify(("[NeoAI] 已把冲突交给 AI 重做 %s"):format(id), vim.log.levels.INFO)
+  else
+    vim.notify(("[NeoAI] 交给 AI 失败(%s)"):format(tostring(err)), vim.log.levels.ERROR)
+  end
 end
 
 --- 撤销保存光标所在条目：把真实文件回滚到保存前，并把该变更单元移回待审队列。
@@ -2573,6 +2601,8 @@ function M.open()
   end, { buffer = state.buf })
   vim.keymap.set("n", "i", _open_diff_current, { buffer = state.buf })
   vim.keymap.set("n", "u", _undo_current, { buffer = state.buf, desc = "NeoAI 撤销保存/恢复已拒绝（回到待审）" })
+  -- R：把合并冲突条目交给 AI（基于当前真实内容重做，不覆盖外部改动）。
+  vim.keymap.set("n", "R", _resolve_conflict_current, { buffer = state.buf, desc = "NeoAI 合并冲突交给 AI 重做" })
   -- E：打开目录设置（工作目录 / 遮蔽目录，仅本会话）；W：资源访问页把光标条目的遮蔽路径加入工作目录。
   vim.keymap.set("n", "E", function() M.open_dirs_editor() end, { buffer = state.buf, desc = "NeoAI 目录设置" })
   vim.keymap.set("n", "W", function() _add_masked_to_workspace() end, { buffer = state.buf, desc = "NeoAI 遮蔽路径加入工作目录" })

@@ -935,6 +935,21 @@ tests.suite("tools", function(_, it)
     t.eq("lua", vim.bo[buf].filetype, "后台加载后应补齐 filetype")
   end)
 
+  it("ensure_buffer 真正加载已登记但未加载的 buffer", function(t)
+    local helpers = require("NeoAI.tools.builtin.tool_helpers")
+    local fs = require("NeoAI.utils.fs")
+    local path = "/tmp/neoai_bg_unloaded.txt"
+    fs.write_file(path, "content\n")
+    local b = vim.fn.bufadd(path) -- 仅登记，未加载
+    t.true_(b >= 1, "bufadd 应返回 bufnr")
+    t.false_(vim.api.nvim_buf_is_loaded(b), "bufadd 后应仍未加载")
+    local got = helpers.ensure_buffer(path)
+    t.eq(b, got, "应复用已登记的 buffer")
+    t.true_(vim.api.nvim_buf_is_loaded(got), "应被真正加载（否则 LSP 无法附加）")
+    pcall(vim.api.nvim_buf_delete, b, { force = true })
+    vim.fn.delete(path)
+  end)
+
   it("二进制：ensure_buffer 不载入，persist_buffer 不回写（不重新保存文件）", function(t)
     local helpers = require("NeoAI.tools.builtin.tool_helpers")
     local fs = require("NeoAI.utils.fs")
@@ -1005,7 +1020,9 @@ tests.suite("tools", function(_, it)
     t.true_(vim.wait(2000, function() return done end), "parse_file 应完成而非挂起")
   end)
 
-  it("lsp_hover 无客户端时立即拒绝而非挂起", function(t)
+  it("lsp_hover 无客户端时有界拒绝而非挂起，且文件被自动后台打开", function(t)
+    local config_store = require("NeoAI.kernel.config_store")
+    config_store.set("tools.lsp.attach_timeout_ms", 300)
     local registry = require("NeoAI.tools.registry")
     registry.reset()
     local executor = require("NeoAI.tools.executor")
@@ -1013,6 +1030,7 @@ tests.suite("tools", function(_, it)
     registry.register_many(lsp_ops.get_tools())
     local fs = require("NeoAI.utils.fs")
     local path = "/tmp/neoai_bg_lsp.txt"
+    if vim.fn.bufnr(path) >= 1 then pcall(vim.api.nvim_buf_delete, vim.fn.bufnr(path), { force = true }) end
     fs.write_file(path, "hello\n")
     local done = false
     executor.execute("lsp_hover", { file_path = path, line = 1, col = 1, description = "测试悬停信息" }):then_(function(r)
@@ -1022,8 +1040,89 @@ tests.suite("tools", function(_, it)
       t.matches("无 LSP 客户端", tostring(e))
       done = true
     end)
-    local waited = vim.wait(2000, function() return done end)
-    t.true_(waited, "lsp_hover 应立刻拒绝（无客户端），不得挂起")
+    local waited = vim.wait(3000, function() return done end)
+    t.true_(waited, "lsp_hover 应有界拒绝（无客户端），不得挂起")
+    local b = vim.fn.bufnr(path)
+    t.true_(b >= 1 and vim.api.nvim_buf_is_loaded(b), "未打开的文件应被自动后台打开")
+    config_store.set("tools.lsp.attach_timeout_ms", nil)
+  end)
+
+  it("LSP：后台新打开的文件等待客户端 attach 后再发请求", function(t)
+    local config_store = require("NeoAI.kernel.config_store")
+    config_store.set("tools.lsp.attach_timeout_ms", 2000)
+    local lsp_ops = require("NeoAI.tools.builtin.lsp_ops")
+    local fs = require("NeoAI.utils.fs")
+    local tool
+    for _, tl in ipairs(lsp_ops.get_tools()) do
+      if tl.name == "lsp_hover" then tool = tl end
+    end
+    t.not_nil(tool, "应暴露 lsp_hover")
+    local path = "/tmp/neoai_lsp_attach_wait.lua"
+    if vim.fn.bufnr(path) >= 1 then pcall(vim.api.nvim_buf_delete, vim.fn.bufnr(path), { force = true }) end
+    fs.write_file(path, "local x = 1\n")
+    -- 模拟：先无客户端，150ms 后异步 attach 一个 fake（支持 hover）
+    local attached = false
+    local fake = { supports_method = function() return true end }
+    local orig_clients = vim.lsp.get_clients
+    vim.lsp.get_clients = function() return attached and { fake } or {} end
+    local orig_buf_request = vim.lsp.buf_request
+    vim.lsp.buf_request = function(_, method, _, handler)
+      if method == "textDocument/hover" then handler(nil, { contents = "HOVER-OK" }) end
+      return { [1] = 1 }
+    end
+    vim.defer_fn(function() attached = true end, 150)
+    local result, done
+    tool.func({ file_path = path, line = 1, col = 1, description = "t" },
+      function(r) result = r; done = true end,
+      function(e) result = "ERR:" .. tostring(e); done = true end)
+    t.true_(vim.wait(3000, function() return done end, 10), "应在客户端 attach 后完成")
+    vim.lsp.get_clients = orig_clients
+    vim.lsp.buf_request = orig_buf_request
+    config_store.set("tools.lsp.attach_timeout_ms", nil)
+    t.matches("HOVER%-OK", tostring(result), "attach 后应正常返回悬停结果")
+  end)
+
+  it("LSP：会话内已有其它客户端时，服务器启动中的 buffer 也等待 attach", function(t)
+    local config_store = require("NeoAI.kernel.config_store")
+    config_store.set("tools.lsp.attach_timeout_ms", 2000)
+    local lsp_ops = require("NeoAI.tools.builtin.lsp_ops")
+    local fs = require("NeoAI.utils.fs")
+    local tool
+    for _, tl in ipairs(lsp_ops.get_tools()) do
+      if tl.name == "lsp_hover" then tool = tl end
+    end
+    local path = "/tmp/neoai_lsp_other_client.lua"
+    if vim.fn.bufnr(path) >= 1 then pcall(vim.api.nvim_buf_delete, vim.fn.bufnr(path), { force = true }) end
+    fs.write_file(path, "local x = 1\n")
+    local buf = vim.fn.bufadd(path)
+    vim.fn.bufload(buf) -- 手动加载（非本次后台加载）
+    vim.bo[buf].filetype = "lua"
+    local attached = false
+    local fake = { supports_method = function() return true end }
+    -- 该 buffer 起初无客户端，但会话内已存在别的客户端（global>0）；~150ms 后该 buffer attach。
+    local orig_clients = vim.lsp.get_clients
+    vim.lsp.get_clients = function(opts)
+      if opts and opts.bufnr then
+        return (opts.bufnr == buf and attached) and { fake } or {}
+      end
+      return { fake }
+    end
+    local orig_buf_request = vim.lsp.buf_request
+    vim.lsp.buf_request = function(_, method, _, handler)
+      if method == "textDocument/hover" then handler(nil, { contents = "RESTART-OK" }) end
+      return { [1] = 1 }
+    end
+    vim.defer_fn(function() attached = true end, 150)
+    local result, done
+    tool.func({ file_path = path, line = 1, col = 1, description = "t" },
+      function(r) result = r; done = true end,
+      function(e) result = "ERR:" .. tostring(e); done = true end)
+    t.true_(vim.wait(3000, function() return done end, 10), "应在该 buffer attach 后完成")
+    vim.lsp.get_clients = orig_clients
+    vim.lsp.buf_request = orig_buf_request
+    config_store.set("tools.lsp.attach_timeout_ms", nil)
+    t.matches("RESTART%-OK", tostring(result), "已有其它客户端时也应等待并在 attach 后返回")
+    pcall(vim.api.nvim_buf_delete, buf, { force = true })
   end)
 
   --- 取出 lsp_ops 的某个工具定义

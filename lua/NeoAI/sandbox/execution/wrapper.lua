@@ -1338,6 +1338,75 @@ end
 
 -- ========== 公开 API ==========
 
+-- 常驻实例启动失败的负缓存到期时刻（hrtime ns）：失败后短时间内不再重试。
+local _fileop_resident_neg_until = 0
+
+--- 在进程内文件写入工具执行前，确保常驻沙箱实例已建立（`tools.sandbox.inproc_namespace` 开启时）。
+--- 复用命令路径的规格/档位构建（T0 最小档 + 工作区暂存根），使 overlay 尽早成为权威暂存层，
+--- 不再依赖「先有一条命令建立常驻实例」。失败静默返回 false——调用方回退既有暂存副本改写，不阻断工具。
+--- @param ctx table
+--- @param tool_name string
+--- @param args table
+--- @param spec table
+--- @return boolean ready
+local function _ensure_fileop_resident(ctx, tool_name, args, spec)
+  if config_store.get("tools.sandbox.inproc_namespace") == false then return false end
+  local ok_r, resident_mod = pcall(require, "NeoAI.sandbox.execution.resident")
+  if not ok_r or not resident_mod or type(resident_mod.ensure) ~= "function" then return false end
+  if type(resident_mod.available) == "function" and not resident_mod.available() then return false end
+  if type(resident_mod.active) == "function" and resident_mod.active() then return true end
+  -- 已存在常驻实例（由命令建立）时直接复用；否则负缓存期内不重试启动。
+  if vim.uv.hrtime() < _fileop_resident_neg_until then return false end
+  pcall(function()
+    local real_cwd = ctx.sandbox_exec_cwd or ctx.cwd or vim.fn.getcwd()
+    local proc_dir = candidate.process_dir()
+    local staging = proc_dir .. "/fallback"
+    fs.ensure_dir(staging)
+    local tmp_base = runtime.stable_tmp_base()
+    local privilege = require("NeoAI.sandbox.execution.privilege")
+    local req = privilege.classify(tool_name, args, spec, {})
+    local resolved = privilege.resolve(req.tier or 0, req)
+    if not (resolved and resolved.ok and resolved.privileges) then return end
+    local priv = resolved.privileges
+    local sroot = store.root() or (vim.fn.stdpath("cache") .. "/NeoAI/sandbox")
+    local resident_base = (sroot:gsub("/+$", "")) .. "/resident"
+    local extra_roots = {}
+    for _, r in ipairs(candidate.staged_roots()) do extra_roots[#extra_roots + 1] = r end
+    do
+      local known_roots = { real_cwd }
+      local pr = config_store.get("tools.sandbox.process_roots")
+      if type(pr) == "table" then
+        for _, r in ipairs(pr) do known_roots[#known_roots + 1] = r end
+      end
+      for _, r in ipairs(candidate.staged_overlay_roots(known_roots)) do
+        extra_roots[#extra_roots + 1] = r
+      end
+    end
+    local specs = M.build_overlay_specs(real_cwd, resident_base, extra_roots, {})
+    for _, s in ipairs(specs) do
+      if s.mode == "fuse" then return end -- fuse 与常驻不兼容
+      if runtime.overlay_writable(s.root, s.upper, s.work) then
+        s.mode = "overlay"
+      else
+        s.mode = "bind"
+      end
+    end
+    local resident_session_dir = resident_base .. "/shell"
+    fs.ensure_dir(resident_session_dir)
+    runtime.chown_payload(resident_session_dir)
+    resident_mod.ensure({
+      specs = specs, cwd = real_cwd, privileges = priv,
+      session_dir = resident_session_dir, session_tmp_dir = tmp_base, tmpfs_base = tmp_base,
+      fallback_cwd = staging, env = runtime.sandbox_env(priv),
+    })
+  end)
+  local ok_a, active = pcall(resident_mod.active)
+  if ok_a and active ~= nil then return true end
+  -- 启动失败：短时间内不再重试（避免每次文件操作都尝试 spawn 常驻实例）。
+  _fileop_resident_neg_until = vim.uv.hrtime() + 60e9
+  return false
+end
+
 --- 执行门禁（内部实现）
 --- @param tool table 工具定义（含 __sandbox_spec）
 --- @param args table
@@ -2373,10 +2442,41 @@ local function _gate_inner(tool, args, ctx, call_original)
       end
     end
   end
+  -- overlay 权威暂存层（进程内工具命名空间 I/O）：常驻实例运行时，**已接入 ns_fs 的**文件写入
+  -- 工具经命名空间 overlay 直接改写（工具路径保持真实路径）；随后把 overlay 内容镜像回工作区
+  -- 暂存副本（缓存）供 LSP/审批/发布。未接入的工具与「实例未运行」时一律回退既有暂存副本改写，
+  -- 避免未走 ns_fs 的工具直接写真实盘。
+  local NS_AWARE = {
+    edit_file = true, create_directory = true, ensure_dir = true, delete_file = true,
+  }
+  -- 私有 tmpfs 根（/tmp、/var/tmp、/run 等）在沙箱内被映射为会话私有目录，overlay 视图
+  -- 与宿主真实路径不一致：这些路径一律回退既有暂存副本改写（否则 overlay 读到私有 /tmp 空文件）。
+  local ns_paths_ok = true
+  do
+    local okr, roots = pcall(runtime.tmpfs_roots)
+    if okr and type(roots) == "table" then
+      for _, key in ipairs(spec.paths or {}) do
+        local p = args[key]
+        if type(p) == "string" and p ~= "" then
+          local ap = fs.canonical(p)
+          for _, root in ipairs(roots) do
+            if ap == root or ap:sub(1, #root + 1) == root .. "/" then ns_paths_ok = false end
+          end
+        end
+      end
+    end
+  end
+  local ns_active = false
+  if NS_AWARE[attempt.tool_name] and ns_paths_ok then
+    -- 首个文件操作即建立常驻实例（不依赖先跑命令），使命名空间 overlay 尽早生效。
+    _ensure_fileop_resident(ctx, attempt.tool_name, args, spec)
+    local okns, ns = pcall(require, "NeoAI.sandbox.execution.ns_fs")
+    ns_active = okns and ns and type(ns.active) == "function" and ns.active()
+  end
   for _, key in ipairs(spec.paths or {}) do
     if type(args[key]) == "string" then
       local staged = candidate.stage_path(attempt.attempt_id, args[key])
-      if staged then args[key] = staged end
+      if staged and not ns_active then args[key] = staged end
     end
   end
   control.transition(attempt, "STAGING")
@@ -2384,6 +2484,14 @@ local function _gate_inner(tool, args, ctx, call_original)
   local d = async.Deferred.new()
   call_original():then_(function(result)
     sandbox._set_active_attempt(previous_active)
+    -- overlay 权威模式：把命名空间 overlay 内的改动镜像回暂存副本，供冻结/审批/发布读取。
+    if ns_active then
+      for _, key in ipairs(spec.paths or {}) do
+        if type(args[key]) == "string" then
+          pcall(candidate.mirror_overlay, args[key])
+        end
+      end
+    end
     -- 单文件写路径（edit_file 等）保持同步冻结：文件数少，线程池往返反而增加延迟；
     -- 大量文件的 run_command 路径见上方 after_capture（capture/finish 经线程池）。
     local cand = candidate.finish(attempt.attempt_id)

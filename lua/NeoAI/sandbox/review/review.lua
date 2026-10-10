@@ -1326,6 +1326,8 @@ local function _apply_settle(ctx, pub)
     item.apply_state = M.APPLY.APPLIED
     item.applied_at = os.time()
     item.receipt = pub.receipt
+    item.merge_conflict = nil
+    item.fail_reason = nil
     store.write_receipt(pub.receipt)
     -- 已应用：部分取代增量已完成使命，清理（被取代路径由新单元持有）。
     item.superseded_paths = nil
@@ -1367,10 +1369,21 @@ local function _apply_settle(ctx, pub)
   else
     item.apply_state = pub.state == "CONFLICT" and M.APPLY.CONFLICT or M.APPLY.FAILED
     item.fail_reason = pub.reason
+    -- 三方合并冲突：记录冲突文件，保持待审（restore_pending 使自动批准项回到 PENDING），
+    -- 用户可经审批界面把冲突交给 AI 基于当前真实内容重做（review.notify_conflict_ai）。
+    local conflict_paths = {}
+    if pub.state == "CONFLICT" and type(pub.conflicts) == "table" then
+      for _, c in ipairs(pub.conflicts) do
+        if type(c) == "table" and type(c.path) == "string" then conflict_paths[#conflict_paths + 1] = c.path end
+      end
+    end
+    item.merge_conflict = (#conflict_paths > 0)
+      and { paths = conflict_paths, at = os.time(), reason = pub.reason }
+      or nil
     _persist(item)
     ctx.restore_pending()
     _emit(require("NeoAI.kernel.events").SANDBOX_CONFLICT, {
-      change_set_id = id, reason = pub.reason,
+      change_set_id = id, reason = pub.reason, paths = conflict_paths,
     })
   end
   return pub
@@ -1459,6 +1472,58 @@ function M.apply_all(opts)
   end
   _discard_candidates(deferred)
   return result
+end
+
+--- 某变更单元是否因三方合并冲突而待审（apply_state=CONFLICT 且记录了冲突文件）。
+--- @param id string
+--- @return boolean
+function M.has_merge_conflict(id)
+  local item = M.get(id)
+  return item ~= nil and item.apply_state == M.APPLY.CONFLICT
+    and type(item.merge_conflict) == "table"
+end
+
+--- 把合并冲突的变更单元交给 AI 重做：组装一条说明消息（冲突文件 + 处理指引）注入当前会话。
+--- 消息经 chat_service.send_message：agent 忙时进入暂存队列，工具循环轮末由注入器插入对话；
+--- 空闲时立即执行。AI 重新读取（已含外部改动的）真实文件后重新编辑，新候选经 supersede 取代本条。
+--- @param id string 变更单元 id
+--- @param opts table|nil 保留
+--- @return boolean ok
+--- @return string|nil err
+function M.notify_conflict_ai(id, opts)
+  opts = opts or {}
+  local item = M.get(id)
+  if not item then return false, "CHANGE_SET_NOT_FOUND" end
+  local mc = type(item.merge_conflict) == "table" and item.merge_conflict or nil
+  local paths = {}
+  if mc and type(mc.paths) == "table" then
+    for _, p in ipairs(mc.paths) do
+      if type(p) == "string" and p ~= "" then paths[#paths + 1] = p end
+    end
+  end
+  if #paths == 0 then
+    for _, f in ipairs(item.files or {}) do
+      if type(f) == "table" and type(f.path) == "string" then paths[#paths + 1] = f.path end
+    end
+  end
+  local lines = {
+    ("沙箱在应用变更单元 `%s` 时检测到与工作区外部改动冲突，自动三方合并失败，"
+      .. "**未写入真实文件**（外部改动未被覆盖）。"):format(tostring(id)),
+    "冲突文件：",
+  }
+  for _, p in ipairs(paths) do lines[#lines + 1] = "- " .. p end
+  lines[#lines + 1] = ""
+  lines[#lines + 1] =
+    "请重新读取这些文件的**当前**内容（已包含外部改动），基于最新内容重新应用你原本的修改"
+    .. "（例如 edit_file），不要覆盖外部改动；完成后交由用户确认落盘。"
+  local ok_chat, chat = pcall(require, "NeoAI.services.chat_service")
+  if not ok_chat or type(chat.send_message) ~= "function" then
+    return false, "CHAT_UNAVAILABLE"
+  end
+  chat.send_message(table.concat(lines, "\n"), {
+    kind = "sandbox_merge_conflict", change_set_id = id,
+  })
+  return true
 end
 
 --- 将某候选摘要对应的待审变更单元标记为已应用（供直接 commit 后对账）

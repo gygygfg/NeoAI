@@ -42,6 +42,8 @@
 | `sandbox/execution/disk.lua` | 沙箱暂存磁盘用量统计与上限门禁（异步缓存，超限拒绝写类/进程工具） |
 | `sandbox/execution/background.lua` | 后台命令识别（`&`/nohup/setsid） |
 | `sandbox/execution/resident.lua` | 会话级常驻沙箱实例（命令服务器，后台进程跨调用存活） |
+| `sandbox/execution/file_bridge.lua` | 命名空间文件桥：进程内工具经常驻实例在 mount 命名空间内读写（`F` 帧），写入落 overlay 暂存、读取为合并视图 |
+| `sandbox/execution/ns_fs.lua` | 命名空间视图 I/O 适配：写入前 detokenize、读取后 tokenize，供已接入的进程内文件工具在 overlay 权威暂存层上读写 |
 | `sandbox/execution/seccomp.lua` | seccomp 能力探测与 require_seccomp 门禁 |
 | `sandbox/execution/privilege.lua` | 权限档位（T0/T1/T2）分类、解析、自动升级检测与留痕 |
 | `sandbox/execution/hostop.lua` | T2 主机效果提案（冻结/审批后 replay/拒绝） |
@@ -53,6 +55,29 @@
 | `sandbox/observe/script_scan.lua` | 脚本间接执行静态扫描（Shell 正文 + 高级语言内嵌 shell、递归、不透明判定） |
 | `sandbox/observe/audit.lua` | AI 读取/调用行为监视、风险分与异常事件 |
 | `sandbox/execution/container.lua` | 容器运行时受控：与沙箱同 namespace（podman）或受控 socket（docker） |
+
+### 2.1 命名空间文件桥（进程内工具 I/O）
+
+`resident.lua` 的命令服务器新增 `F` 帧（`r` 读 / `w` 写 / `e` 存在 / `s` stat / `m` mkdir / `u`
+删除 / `l` 列目录），在常驻实例的 **mount 命名空间内**执行文件操作：写入落在会话 overlay 的
+upper 暂存层（真实工作区在用户确认发布前不受影响），读取为 overlay 合并视图（有暂存读暂存，
+否则读真实 lower）。`sandbox/execution/file_bridge.lua` 是其同步封装（`read/write/exists/stat/
+mkdir/unlink/list`）；常驻实例未运行时 `available()` 为 false，所有操作返回
+`nil, "RESIDENT_UNAVAILABLE"`，调用方**回退**既有路径（不得静默写真实盘）。
+
+配置 `tools.sandbox.inproc_namespace`（默认开）控制是否允许进程内工具经此桥 I/O。当常驻实例
+在运行时，**已接入的文件写入工具**（`edit_file`/`create_directory`/`ensure_dir`/`delete_file`）
+的读写直接经该桥落在命名空间 overlay（`sandbox/execution/ns_fs.lua` 适配：写入先
+`secret.detokenize` 再入 overlay，读取经 `secret.tokenize` 得到与暂存视图一致的遮蔽内容），
+overlay 成为权威暂存层；随后 `candidate.mirror_overlay` 把 overlay 内容镜像回工作区暂存副本
+（缓存），供 `candidate.finish`/审批发布与 LSP/treesitter 读取（二者仍需宿主可见的暂存文件）。
+**已在首个文件操作时主动建立常驻实例**（`wrapper._ensure_fileop_resident`，不依赖先跑命令）；
+目标路径落在私有 tmpfs 根（`/tmp`、`/var/tmp`、`/run`）下时 overlay 视图与宿主路径不一致，
+该次调用自动回退既有暂存副本改写。写入以 `NS_AWARE` 白名单限定，未接入的工具一律回退既有
+暂存副本改写，绝不把未走桥的工具直接写到真实盘。`read_file`/`file_exists` 在 overlay 可用且目标
+不在私有 tmpfs 根下时**经桥读取 overlay 合并视图**（小文件快路径/存在性判定），其余只读工具
+（`list_files`/`search_files`）读取的是 overlay 镜像后的暂存副本（与 overlay 合并视图一致）；
+LSP/treesitter 的写盘仍走各自既有的暂存路径（`persist_target` → 暂存副本，发布前不改真实盘）。
 
 ## 3. 强制入口（加载器 + 执行器）
 
@@ -450,6 +475,18 @@
 - 拒绝与恢复：`sandbox.reject(id, reason)` 拒绝并丢弃（同时把候选内容另存 `/tmp` 副本）；
   `sandbox.list_rejected()` 列出**可恢复的已拒绝**项（审批界面「已拒绝」区）、
   `sandbox.restore(id)` 从副本**恢复为待审**（主机操作恢复提案）。详见上文「可恢复的已拒绝项」。
+- **三方合并发布（`tools.sandbox.review.merge`，默认开）**：发布时若真实文件已被**外部改动**
+  （不再是冻结基线），不再整单元拒绝，而是按 `base`（冻结时真实内容，冻结阶段以 blob 捕获）/
+  `ours`（候选内容）/ `theirs`（当前真实内容）做**行级三方合并（diff3）**（`utils/merge3.lua`，
+  纯 Lua，可在线程池内运行）：
+  - 无冲突 → 写入合并结果，**保留外部改动**（如 AI 改一行、外部改另一行）；
+  - 冲突（同一区间双方不同改动）→ **不写盘**、整单元保持 `CONFLICT`，条目留在待审队列并记录
+    `merge_conflict`；审批界面标注「⚠ 合并冲突」，按 **`R`** 把冲突交给 AI
+    （`review.notify_conflict_ai` 注入一条说明消息），AI 重新读取已含外部改动的真实文件后重做，
+    新候选经 `supersede_by_paths` 取代旧单元后正常应用；
+  - 外部内容已是候选结果 → 幂等跳过；
+  - 仅普通文本 `modify` 文件参与（`merge_max_bytes` 上限，默认沿用 `max_file_bytes`）；
+    二进制/大文件/软链/目录创建删除/git 原子组仍走严格 CAS。`merge=false` 回退「基线变了即整体拒绝」。
 - **发布前重校验（纵深防御）**：`candidate.publish` 对每个文件重新规范化路径——**解析祖先**符号
   链接并折叠 `..`，但**末段按字面**（不跟随叶子软链）；若结果与记录路径不一致（`..` 穿越 / 祖先
   目录被软链替换，如落盘候选被篡改）→ `CONFLICT/PATH_CHANGED`。末段字面处理使合法叶子软链
