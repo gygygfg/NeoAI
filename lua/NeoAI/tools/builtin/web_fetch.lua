@@ -560,7 +560,7 @@ local function _parse_node_output(stdout)
   if type(stdout) ~= "string" or stdout:gsub("%s", "") == "" then
     return { ok = false, error = "Node 无输出" }
   end
-  local trimmed = stdout:gsub("^%s+", ""):gsub("%s+$", "")
+  local trimmed = strx.trim(stdout)
   local ok, decoded = pcall(json.decode, trimmed)
   if not ok or type(decoded) ~= "table" then
     -- 按字节截断可能切断 UTF-8 多字节字符，产生乱码；改用 UTF-8 安全截断。

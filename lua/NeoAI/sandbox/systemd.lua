@@ -12,6 +12,7 @@
 local config_store = require("NeoAI.kernel.config_store")
 local fs = require("NeoAI.utils.fs")
 local async = require("NeoAI.utils.async")
+local stringx = require("NeoAI.utils.stringx")
 
 local M = {}
 
@@ -657,7 +658,7 @@ end
 --- @return number|nil
 local function _parse_sec(s)
   if s == nil then return nil end
-  s = tostring(s):gsub("^%s+", ""):gsub("%s+$", "")
+  s = stringx.trim(tostring(s))
   if s == "" then return nil end
   if s:match("^%d+$") then return tonumber(s) end
   local total, found = 0, false
@@ -1027,7 +1028,7 @@ end
 local function _next_calendar_delay(cal, from)
   if type(cal) ~= "string" or cal == "" then return nil end
   from = tonumber(from) or os.time()
-  local c = cal:lower():gsub("^%s+", ""):gsub("%s+$", "")
+  local c = stringx.trim(cal:lower())
   local function at(day_offset, hh, mm, ss)
     local base = os.date("*t", from)
     base.hour, base.min, base.sec = hh or 0, mm or 0, ss or 0
@@ -2419,7 +2420,7 @@ end
 local function _public_reason(reason)
   local s = tostring(reason or "")
   s = s:gsub("沙箱门面", ""):gsub("沙箱环境", ""):gsub("沙箱内", ""):gsub("沙箱", "")
-  return (s:gsub("^%s+", ""):gsub("%s+$", ""))
+  return stringx.trim(s)
 end
 
 -- systemd-analyze 合成数据：固件/引导/内核/用户空间耗时（秒）。真实 systemd-analyze 依赖
@@ -2813,7 +2814,7 @@ local function _dispatch(plan)
       local k, v = tostring(o):match("^([^=]+)=(.*)$")
       if k == "--property" or k == "-p" then
         for p in tostring(v):gmatch("[^,]+") do
-          p = p:gsub("^%s+", ""):gsub("%s+$", "")
+          p = stringx.trim(p)
           if p ~= "" then props[p] = true end
         end
       end

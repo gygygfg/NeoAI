@@ -162,7 +162,7 @@ local function _build_outline(content, filepath, opts)
       return
     end
     local sr, _, er = node:range()
-    local snippet = _line_at(content, sr + 1):gsub("^%s+", ""):gsub("%s+$", "")
+    local snippet = stringx.trim(_line_at(content, sr + 1))
     -- UTF-8 安全截断：字节截断可能切断多字节字符（显示乱码），故按字符边界回退
     if #snippet > 80 then
       snippet = stringx.safe_truncate(snippet, 80, "…")
@@ -508,7 +508,7 @@ local function _merge_search(base_text, dir, query, include, max)
     end
   end
   local inc_pat = ""
-  local inc = (include or ""):gsub("^%s+", ""):gsub("%s+$", "")
+  local inc = stringx.trim(include or "")
   if inc ~= "" then
     inc_pat = require("NeoAI.utils.stringx").glob_to_pattern(inc)
   end

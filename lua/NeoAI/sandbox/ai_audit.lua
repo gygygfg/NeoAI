@@ -9,6 +9,7 @@
 --- `M.generate(items, user_messages, opts, on_done)` 负责异步请求，失败时回传错误文本。
 
 local config_store = require("NeoAI.kernel.config_store")
+local stringx = require("NeoAI.utils.stringx")
 
 local M = {}
 
@@ -265,7 +266,7 @@ function M.parse_notes(text, max_chars)
   max_chars = max_chars or 50
   local notes = {}
   for _, raw in ipairs(vim.split(tostring(text or ""), "\n", { plain = true })) do
-    local line = raw:gsub("^%s+", ""):gsub("%s+$", "")
+    local line = stringx.trim(raw)
     if line ~= "" then
       local key, note = line:match("^(.-)%s*=>%s*(.+)$")
       if not key then key, note = line:match("^(.-)%s*::%s*(.+)$") end

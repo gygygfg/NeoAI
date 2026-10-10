@@ -10,6 +10,7 @@ local async = require("NeoAI.utils.async")
 local config_store = require("NeoAI.kernel.config_store")
 local fs = require("NeoAI.utils.fs")
 local lock = require("NeoAI.utils.lock")
+local stringx = require("NeoAI.utils.stringx")
 
 local M = {}
 
@@ -679,7 +680,7 @@ local function _apk_repositories(url)
   if not src then return nil end
   local lines = {}
   for line in src:lines() do
-    local t = line:gsub("^%s+", ""):gsub("%s+$", "")
+    local t = stringx.trim(line)
     if t ~= "" and t:sub(1, 1) ~= "#" then
       local path = t:match("^%a+://[^/]+(/.*)$") or t
       if path:sub(1, 1) == "/" then lines[#lines + 1] = url .. path end

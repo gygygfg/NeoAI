@@ -10,6 +10,7 @@
 --- 自动提权只「发起请求」，是否放行由策略/授权/审查决定；不静默降级。
 
 local config_store = require("NeoAI.kernel.config_store")
+local stringx = require("NeoAI.utils.stringx")
 
 local M = {}
 
@@ -275,7 +276,7 @@ end
 local function _segments(command)
   local out = {}
   for seg in _normalize_redirects(command):gmatch("[^;|&\n]+") do
-    local t = seg:gsub("^%s+", ""):gsub("%s+$", "")
+    local t = stringx.trim(seg)
     if t ~= "" then out[#out + 1] = t end
   end
   return out

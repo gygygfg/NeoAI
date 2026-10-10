@@ -6,6 +6,7 @@
 --- 调用 `vim.fn.strwidth/strcharpart/strchars` 的 C 边界开销（表格折行是渲染热点）。
 
 local tm = require("NeoAI.utils.textmetrics")
+local stringx = require("NeoAI.utils.stringx")
 
 local M = {}
 
@@ -178,7 +179,7 @@ local function _render_table(rows, streaming, table_width)
     if not sep_idx and #cells > 0 then
       local is_sep = true
       for _, c in ipairs(cells) do
-        if not _is_sep_cell((c:gsub("^%s+", ""):gsub("%s+$", ""))) then
+        if not _is_sep_cell(stringx.trim(c)) then
           is_sep = false
           break
         end
@@ -187,7 +188,7 @@ local function _render_table(rows, streaming, table_width)
         sep_idx = idx
         -- 提取每列对齐标记（缺省左对齐），用于后续单元格填充
         for ci, c in ipairs(cells) do
-          aligns[ci] = _sep_align(c:gsub("^%s+", ""):gsub("%s+$", ""))
+          aligns[ci] = _sep_align(stringx.trim(c))
         end
       end
     end
@@ -199,7 +200,7 @@ local function _render_table(rows, streaming, table_width)
   for idx, cells in ipairs(split) do
     cleaned[idx] = {}
     for ci, c in ipairs(cells) do
-      local raw = c:gsub("^%s+", ""):gsub("%s+$", "")
+      local raw = stringx.trim(c)
       cleaned[idx][ci] = _clean_inline(raw)
     end
   end

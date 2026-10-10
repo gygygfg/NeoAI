@@ -264,7 +264,7 @@ function M.plan_to_todos(plan_text)
       end
     end
     if content then
-      content = content:gsub("^%s+", ""):gsub("%s+$", "")
+      content = stringx.trim(content)
       if content ~= "" and not seen[content] then
         seen[content] = true
         items[#items + 1] = { content = content, status = "pending" }
@@ -277,7 +277,7 @@ function M.plan_to_todos(plan_text)
     for _, raw in ipairs(lines) do
       local h = raw:match("^%s*#+%s+(.+)$")
       if h then
-        h = h:gsub("^%s+", ""):gsub("%s+$", "")
+        h = stringx.trim(h)
         if h ~= "" then headers[#headers + 1] = h end
       end
     end

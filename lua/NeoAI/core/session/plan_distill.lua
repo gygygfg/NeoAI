@@ -18,6 +18,7 @@ local event_bus = require("NeoAI.kernel.event_bus")
 local events = require("NeoAI.kernel.events")
 local logger = require("NeoAI.kernel.logger")
 local json = require("NeoAI.utils.json")
+local stringx = require("NeoAI.utils.stringx")
 
 local M = {}
 
@@ -97,7 +98,7 @@ end
 --- @return string
 local function _trim(s)
   if type(s) ~= "string" then return "" end
-  return (s:gsub("^%s+", ""):gsub("%s+$", ""))
+  return stringx.trim(s)
 end
 
 --- 渲染消息 content（字符串直出；table/多模态或其它用 JSON；nil 返回 ""）

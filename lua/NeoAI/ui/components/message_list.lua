@@ -321,7 +321,7 @@ local function _secret_paths(args, tool_name)
   local seen, out = {}, {}
   local function add(p)
     if type(p) ~= "string" then return end
-    p = p:gsub("^%s+", ""):gsub("%s+$", "")
+    p = stringx.trim(p)
     if p == "" or seen[p] or not _is_secret_path(p) then return end
     seen[p] = true
     out[#out + 1] = p

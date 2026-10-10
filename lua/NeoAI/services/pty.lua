@@ -519,7 +519,7 @@ local function _default_judge(session)
     local acted = _apply_decision(session, decision)
     if not acted and decision == nil and type(text) == "string" and text:gsub("%s", "") ~= "" then
       -- 模型未按 JSON 返回：把纯文本当输入行兜底
-      acted = M.send_text(session.id, (text:gsub("^%s+", ""):gsub("%s+$", "")))
+      acted = M.send_text(session.id, stringx.trim(text))
     end
     if not acted then _notify_manual(session) end
     pcall(function() runtime.dispose(agent) end)

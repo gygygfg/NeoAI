@@ -750,7 +750,7 @@ end
 local function _dlg_value()
   if dlg.buf and vim.api.nvim_buf_is_valid(dlg.buf) then
     local l = vim.api.nvim_buf_get_lines(dlg.buf, INPUT_LINE - 1, INPUT_LINE, false)
-    return (l[1] or ""):gsub("^%s+", ""):gsub("%s+$", "")
+    return stringx.trim(l[1] or "")
   end
   return ""
 end

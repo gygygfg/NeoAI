@@ -10,6 +10,7 @@ local config_store = require("NeoAI.kernel.config_store")
 local event_bus = require("NeoAI.kernel.event_bus")
 local events = require("NeoAI.kernel.events")
 local logger = require("NeoAI.kernel.logger")
+local stringx = require("NeoAI.utils.stringx")
 
 local M = {}
 
@@ -26,7 +27,7 @@ local state = {
 --- @param v string
 --- @return string
 local function _unquote(v)
-  v = v:gsub("^%s+", ""):gsub("%s+$", "")
+  v = stringx.trim(v)
   if #v >= 2 then
     local a, b = v:sub(1, 1), v:sub(-1)
     if (a == '"' and b == '"') or (a == "'" and b == "'") then
@@ -42,8 +43,8 @@ end
 local function _parse_kv(line)
   local key, value = line:match("^(.-):(.*)$")
   if not key then return nil end
-  key = key:gsub("^%s+", ""):gsub("%s+$", "")
-  value = value and (value:gsub("^%s+", ""):gsub("%s+$", "")) or ""
+  key = stringx.trim(key)
+  value = value and stringx.trim(value) or ""
   return key, value
 end
 

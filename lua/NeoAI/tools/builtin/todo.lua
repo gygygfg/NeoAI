@@ -8,6 +8,7 @@ local async = require("NeoAI.utils.async")
 local event_bus = require("NeoAI.kernel.event_bus")
 local events = require("NeoAI.kernel.events")
 local helpers = require("NeoAI.tools.builtin.tool_helpers")
+local stringx = require("NeoAI.utils.stringx")
 
 local M = {}
 
@@ -31,7 +32,7 @@ end
 --- @return table|nil 规范项
 local function _normalize_item(raw)
   if type(raw) ~= "table" then return nil end
-  local content = type(raw.content) == "string" and raw.content:gsub("^%s+", ""):gsub("%s+$", "") or ""
+  local content = type(raw.content) == "string" and stringx.trim(raw.content) or ""
   if content == "" then return nil end
   local status = raw.status or "pending"
   if status ~= "pending" and status ~= "in_progress" and status ~= "completed" and status ~= "cancelled" then
