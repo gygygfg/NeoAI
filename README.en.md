@@ -350,6 +350,9 @@ require("NeoAI").setup({
       enabled = true,                    -- plan mode
       auto_execute_on_approve = true,    -- after the plan is approved, switch to CHAT automatically and execute it item by item
       distill_on_execute = true,         -- on plan completion run one XML plan extraction (build the execution context + call todo_write per step), then execute
+      distill_parallel = true,           -- multi-round parallel extraction: R1 3 lanes (target/steps/files) + R2 4 lanes (optional sections replaying the R1 echo) + front compaction in parallel; false = single request
+      distill_front = true,              -- distill the pre-plan "front" context into one checkpoint message using the compactor's 8-section instruction (falls back to verbatim front)
+      distill_max_attempts = 2,          -- per-lane max attempts on the parallel path (only target/steps retry when missing)
       extra_safe_tools = {},             -- extensions to the plan mode allowlist
       -- mutating_tools = { ... },       -- mutating tools (the visible set in plan mode already covers this semantics)
     },

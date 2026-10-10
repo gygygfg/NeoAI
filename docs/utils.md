@@ -174,7 +174,7 @@ log = {
 - `source`：同一实现的 Lua 源码字符串，供工作线程 `load(source)()` 使用（线程内是全新
   Lua state，不能 `require` 本模块）。
 
-> 用途：把沙箱候选的 base/after 哈希计算移出主线程（`sandbox/execution/candidate` 经 `utils.work`
+> 用途：把沙箱候选的 base/after 哈希计算移出主线程（`sandbox/candidate` 经 `utils.work`
 > 在独立线程内计算）。`bit` 在 LuaJIT 工作线程可用，故无需 `vim.fn`。一致性由
 > `test_sha256` 与 `vim.fn.sha256` 交叉校验。
 

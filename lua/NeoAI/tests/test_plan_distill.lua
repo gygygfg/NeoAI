@@ -162,43 +162,242 @@ lua/b.lua</Files>
     t.nil_(agent.plan_extract)
   end)
 
-  it("run: 写入请求覆盖层（front + 文件工具对 + 新上下文），不改动 agent.messages", function(t)
-    local config_store = require("NeoAI.kernel.config_store")
-    config_store.load({ tools = { plan_mode = { distill_on_execute = true } } })
-    local p = require("NeoAI.core.session.plan_distill")
-    local async = require("NeoAI.utils.async")
-    local cb = require("NeoAI.core.session.context_builder")
-    local orig = p._send_extract
-    p._send_extract = function()
-      return async.resolve("<target>目标</target><step1>步骤一</step1><files>lua/a.lua</files>")
-    end
+  -- ===== 并行提取编排（mock _send_extract，按通道路由；确定性，无网络） =====
 
-    local msgs = {
+  --- 从「最后一条消息」的指令文本识别通道（与各通道 instruction 的唯一短语对齐）。
+  --- front 用压缩器的 8 段指令（含 "compaction engine"）。
+  local function channel_of(text)
+    if type(text) ~= "string" then return "?" end
+    if text:find("compaction engine", 1, true) then return "front" end
+    if text:find("允许的标签清单", 1, true) then return "?" end -- legacy 单请求指令
+    if text:find("**任务目标**", 1, true) then return "target" end
+    if text:find("**执行步骤**", 1, true) then return "steps" end
+    if text:find("完成目标所涉及的文件", 1, true) then return "files" end
+    if text:find("背景与范围", 1, true) then return "background" end
+    if text:find("约束与技术信息", 1, true) then return "constraints" end
+    if text:find("验证与风险", 1, true) then return "verify" end
+    if text:find("回退与补充信息", 1, true) then return "fallback" end
+    return "?"
+  end
+
+  --- 各通道默认应答文本。
+  local CH_REPLY = {
+    target = "<target>目标</target>",
+    steps = "<step1>步骤一</step1><step2>步骤二</step2>",
+    files = "<files>lua/a.lua</files>",
+    background = "<Context>背景</Context>",
+    constraints = "<Constraints>约束</Constraints>",
+    verify = "<Verify>验证</Verify>",
+    fallback = "<Rollback>回退</Rollback>",
+    front = "front 摘要内容",
+    ["?"] = "<target>T</target><step1>s</step1>",
+  }
+
+  --- 安装按通道路由的 mock（返回 (counts, restore)）。
+  --- opts.overrides: 通道名 -> function(count) -> string|nil|Deferred（nil 表示按默认应答）。
+  local function install_router(p, opts)
+    opts = opts or {}
+    local async = require("NeoAI.utils.async")
+    local orig = p._send_extract
+    local counts = {}
+    p._send_extract = function(_, msgs, _, on_chunk)
+      local last = msgs[#msgs]
+      local text = type(last and last.content) == "string" and last.content or ""
+      local ch = channel_of(text)
+      counts[ch] = (counts[ch] or 0) + 1
+      local ov = opts.overrides and opts.overrides[ch]
+      local reply
+      if ov then reply = ov(counts[ch]) end
+      if reply == nil and not ov then reply = CH_REPLY[ch] or "" end
+      if type(reply) == "table" and reply.then_ then return reply end
+      if on_chunk and reply then on_chunk({ content = reply }) end
+      return async.resolve(reply)
+    end
+    return counts, function() p._send_extract = orig end
+  end
+
+  local function sample_msgs()
+    return {
       { role = "user", content = "front" },
       { role = "assistant", content = "", tool_calls = {
         { id = "c1", ["function"] = { name = "read_file", arguments = '{"file_path":"lua/a.lua"}' } } } },
       { role = "tool", tool_call_id = "c1", name = "read_file", content = "-- 内容 of lua/a.lua" },
     }
+  end
+
+  it("run(并行): 分路 R1=3 / R2=4 / front=1；回显使 R2 前缀含 R1；覆盖层 front_checkpoint 替换 front", function(t)
+    local config_store = require("NeoAI.kernel.config_store")
+    config_store.load({ tools = { plan_mode = { distill_on_execute = true, distill_parallel = true, distill_front = true } } })
+    local p = require("NeoAI.core.session.plan_distill")
+    local cb = require("NeoAI.core.session.context_builder")
+    local counts, restore = install_router(p)
+
+    local msgs = sample_msgs()
     local agent = { id = "a1", config = {}, model = "m", messages = msgs, _plan_enter_index = 1 }
     local res = await(p.run(agent))
-    p._send_extract = orig
+    restore()
 
     t.not_nil(res)
     t.eq("目标", res.fields.target)
-    t.eq(1, #res.steps)
-    t.not_nil(agent.plan_extract)
-    t.eq(1, agent.plan_extract.front_count)
-    t.eq(3, agent.plan_extract.window_end)
+    t.eq(2, #res.steps)
+    t.eq("lua/a.lua", res.fields.files)
+    t.eq("背景", res.fields.context, "R2 应补全可选段")
+    t.eq("回退", res.fields.rollback)
+    t.eq(1, counts.target); t.eq(1, counts.steps); t.eq(1, counts.files)
+    t.eq(1, counts.background); t.eq(1, counts.constraints)
+    t.eq(1, counts.verify); t.eq(1, counts.fallback)
+    t.eq(1, counts.front)
     t.eq(3, #agent.messages, "覆盖层不改动 agent.messages")
 
+    local pe = agent.plan_extract
+    t.not_nil(pe.front_checkpoint, "front 应被压缩为检查点")
+    t.eq(1, pe.front_count)
+    t.eq(3, pe.window_end)
+
     local view = cb.request_view(agent)
-    -- front(1) + 文件工具对(2) + 新上下文 user(1)
+    -- front 检查点(1) + 文件工具对(2) + 新上下文 user(1)
     t.eq(4, #view)
-    t.eq(msgs[1], view[1])
+    t.eq(pe.front_checkpoint, view[1], "front_checkpoint 应替换原 front")
     t.eq(msgs[2], view[2], "文件工具对原样保留")
     t.eq(msgs[3], view[3])
     t.eq("user", view[4].role)
     t.true_(view[4].content:find("步骤一", 1, true) ~= nil)
+  end)
+
+  it("run(并行): distill_front=false 时 front 原样保留、不发 front 请求", function(t)
+    local config_store = require("NeoAI.kernel.config_store")
+    config_store.load({ tools = { plan_mode = { distill_on_execute = true, distill_front = false } } })
+    local p = require("NeoAI.core.session.plan_distill")
+    local cb = require("NeoAI.core.session.context_builder")
+    local counts, restore = install_router(p)
+
+    local msgs = sample_msgs()
+    local agent = { id = "a1", config = {}, model = "m", messages = msgs, _plan_enter_index = 1 }
+    local res = await(p.run(agent))
+    restore()
+
+    t.not_nil(res)
+    t.nil_(counts.front, "关闭 front 压缩时不应发 front 请求")
+    t.nil_(agent.plan_extract.front_checkpoint)
+    local view = cb.request_view(agent)
+    t.eq(msgs[1], view[1], "front 原样保留")
+  end)
+
+  it("run(并行): distill_parallel=false 回退 legacy 单请求路径", function(t)
+    local config_store = require("NeoAI.kernel.config_store")
+    config_store.load({ tools = { plan_mode = { distill_on_execute = true, distill_parallel = false } } })
+    local p = require("NeoAI.core.session.plan_distill")
+    local counts, restore = install_router(p)
+
+    local agent = { id = "a1", config = {}, model = "m", messages = sample_msgs(), _plan_enter_index = 1 }
+    local res = await(p.run(agent))
+    restore()
+
+    t.not_nil(res)
+    t.eq("T", res.fields.target)
+    t.nil_(counts.front, "legacy 路径无 front 压缩")
+    t.eq(1, counts["?"], "legacy 应只发一次请求")
+    t.nil_(agent.plan_extract.front_checkpoint)
+  end)
+
+  it("run(并行): target 缺失仅重试该通道至 distill_max_attempts", function(t)
+    local config_store = require("NeoAI.kernel.config_store")
+    config_store.load({ tools = { plan_mode = { distill_on_execute = true, distill_max_attempts = 2 } } })
+    local p = require("NeoAI.core.session.plan_distill")
+    local counts, restore = install_router(p, {
+      overrides = {
+        target = function(n) if n == 1 then return "" else return "<target>补全目标</target>" end end,
+      },
+    })
+    local agent = { id = "a1", config = {}, model = "m", messages = sample_msgs(), _plan_enter_index = 1 }
+    local res = await(p.run(agent))
+    restore()
+
+    t.not_nil(res)
+    t.eq("补全目标", res.fields.target)
+    t.eq(2, counts.target, "target 应重试一次")
+    t.eq(1, counts.steps, "steps 不应被连带重试")
+  end)
+
+  it("run(并行): R1 全失败（target+steps 均无输出）→ 整体 no-op", function(t)
+    local config_store = require("NeoAI.kernel.config_store")
+    config_store.load({ tools = { plan_mode = { distill_on_execute = true, distill_max_attempts = 1 } } })
+    local p = require("NeoAI.core.session.plan_distill")
+    local counts, restore = install_router(p, {
+      overrides = {
+        target = function() return "" end,
+        steps = function() return "" end,
+      },
+    })
+    local msgs = sample_msgs()
+    local agent = { id = "a1", config = {}, model = "m", messages = msgs, _plan_enter_index = 1 }
+    local res = await(p.run(agent))
+    restore()
+
+    t.false_(res, "R1 全失败应返回 false")
+    t.nil_(agent.plan_extract)
+    t.eq(3, #agent.messages, "历史不改动")
+    t.eq(0, counts.background or 0, "R1 失败不应进入第 2 轮")
+  end)
+
+  it("run(并行): R2 全失败仍用 R1 结果成功", function(t)
+    local config_store = require("NeoAI.kernel.config_store")
+    config_store.load({ tools = { plan_mode = { distill_on_execute = true } } })
+    local p = require("NeoAI.core.session.plan_distill")
+    local async = require("NeoAI.utils.async")
+    local counts, restore = install_router(p, {
+      overrides = {
+        background = function() return async.reject({ message = "boom" }) end,
+        constraints = function() return async.reject({ message = "boom" }) end,
+        verify = function() return async.reject({ message = "boom" }) end,
+        fallback = function() return async.reject({ message = "boom" }) end,
+      },
+    })
+    local agent = { id = "a1", config = {}, model = "m", messages = sample_msgs(), _plan_enter_index = 1 }
+    local res = await(p.run(agent))
+    restore()
+
+    t.not_nil(res, "R2 全失败不应整体失败")
+    t.eq("目标", res.fields.target)
+    t.nil_(res.fields.context, "R2 失败则无可选段")
+    t.true_(counts.background >= 1)
+  end)
+
+  it("run(并行): front 压缩失败退回原样 front", function(t)
+    local config_store = require("NeoAI.kernel.config_store")
+    config_store.load({ tools = { plan_mode = { distill_on_execute = true } } })
+    local p = require("NeoAI.core.session.plan_distill")
+    local async = require("NeoAI.utils.async")
+    local cb = require("NeoAI.core.session.context_builder")
+    local counts, restore = install_router(p, {
+      overrides = { front = function() return async.reject({ message = "boom" }) end },
+    })
+    local msgs = sample_msgs()
+    local agent = { id = "a1", config = {}, model = "m", messages = msgs, _plan_enter_index = 1 }
+    local res = await(p.run(agent))
+    restore()
+
+    t.not_nil(res)
+    t.nil_(agent.plan_extract.front_checkpoint, "front 失败应回退原样")
+    t.eq(msgs[1], cb.request_view(agent)[1])
+  end)
+
+  it("_merge_fields 不覆盖已有非空值", function(t)
+    local p = require("NeoAI.core.session.plan_distill")
+    local dst = { steps = {}, target = "A" }
+    p._merge_fields(dst, { target = "B", steps = { "s1" }, context = "c" })
+    t.eq("A", dst.target, "已有 target 不被覆盖")
+    t.eq(1, #dst.steps)
+    t.eq("c", dst.context)
+  end)
+
+  it("_echo_r1_message 稳定回显 target/steps/files", function(t)
+    local p = require("NeoAI.core.session.plan_distill")
+    local m = p._echo_r1_message({ target = "T", steps = { "a", "b" }, files = "x.lua" })
+    t.eq("user", m.role)
+    t.true_(m.content:find("<target>T</target>", 1, true) ~= nil)
+    t.true_(m.content:find("<step2>b</step2>", 1, true) ~= nil)
+    t.true_(m.content:find("<files>x.lua</files>", 1, true) ~= nil)
   end)
 
   -- ===== 解析器健壮性矩阵（确定性，无网络；固化 plan_extract 基准） =====
@@ -293,15 +492,28 @@ lua/b.lua</Files>
 
   -- ===== 端到端（mock SSE 服务器，离线） =====
 
-  it("run 端到端（mock SSE）：解析 XML → 请求覆盖层，不改动历史、默认不发 max_tokens", function(t)
+  --- 按请求体「末条消息」识别通道，返回通道应答文本。
+  local function route_body(request)
+    local he = request:find("\r\n\r\n", 1, true)
+    local raw = request:sub(he + 4)
+    local ok, decoded = pcall(vim.json.decode, raw)
+    local ch = "?"
+    if ok and decoded and decoded.messages then
+      local last = decoded.messages[#decoded.messages]
+      ch = channel_of(last and last.content)
+    end
+    return raw, decoded, ch
+  end
+
+  it("run 端到端（mock SSE）：并行 8 路（R1=3/R2=4/front=1），前缀一致、默认不发 max_tokens", function(t)
     local hs = require("NeoAI.tests.http_server")
-    local xml = "<target>实现功能</target>\n<step1>读代码</step1>\n<step2>改代码</step2>\n<files>lua/a.lua</files>"
     local bodies = {}
     local function handler(client, request)
-      local he = request:find("\r\n\r\n", 1, true)
-      bodies[#bodies + 1] = request:sub(he + 4)
+      local raw, decoded, ch = route_body(request)
+      bodies[#bodies + 1] = { raw = raw, decoded = decoded, ch = ch }
+      local content = CH_REPLY[ch] or ""
       local ev = function(o) return "data: " .. vim.json.encode(o) .. "\n\n" end
-      local resp = ev({ choices = { { delta = { content = xml } } } })
+      local resp = ev({ choices = { { delta = { content = content } } } })
         .. ev({ choices = { { delta = {}, finish_reason = "stop" } }, usage = { prompt_tokens = 12, completion_tokens = 8 } })
         .. "data: [DONE]\n\n"
       hs.respond(client, resp)
@@ -313,7 +525,7 @@ lua/b.lua</Files>
           providers = { mockpe = { api_type = "openai", base_url = base_url, api_key = "test" } },
           model_refresh = { on_startup = false },
         },
-        tools = { plan_mode = { distill_on_execute = true } },
+        tools = { plan_mode = { distill_on_execute = true, distill_parallel = true, distill_front = true } },
       })
       local p = require("NeoAI.core.session.plan_distill")
       local msgs = {
@@ -326,31 +538,65 @@ lua/b.lua</Files>
         config = { provider = "mockpe", model = "test", temperature = 0.3, system_prompt = "你是助手" },
         messages = msgs, tools = {}, _plan_enter_index = 1,
       }
-      local res = t.await(p.run(agent))
+      local res = t.await(p.run(agent), 8000)
       t.not_nil(res, "提取应成功")
-      t.eq("实现功能", res.fields.target)
+      t.eq("目标", res.fields.target)
       t.eq(2, #res.fields.steps)
+      t.eq("背景", res.fields.context)
+
+      -- 分路计数：R1 3 路 + R2 4 路 + front 1 路 = 8 路并发
+      local by = {}
+      for _, b in ipairs(bodies) do by[b.ch] = (by[b.ch] or 0) + 1 end
+      t.eq(8, #bodies, "应共发 8 路请求")
+      for _, ch in ipairs({ "target", "steps", "files", "background", "constraints", "verify", "fallback", "front" }) do
+        t.eq(1, by[ch] or 0, "通道 " .. ch .. " 应恰好 1 路")
+      end
+
+      -- 前缀缓存前提：所有请求 system 一致；R1/R2 的 system+历史前缀逐字节一致。
+      local sys0
+      local prefix0
+      for _, b in ipairs(bodies) do
+        local m = b.decoded.messages
+        if sys0 == nil then sys0 = m[1].content end
+        t.eq(sys0, m[1].content, "所有请求 system 应一致")
+        t.nil_(b.decoded.max_tokens, "默认 extract_max_tokens=nil → 请求体不含 max_tokens")
+        t.eq(true, b.decoded.stream, "提取请求应为流式")
+        if b.ch ~= "front" then
+          local head = {}
+          for i = 1, 4 do head[i] = m[i] end -- system + 3 条历史
+          if prefix0 == nil then
+            prefix0 = head
+          else
+            t.eq(true, vim.deep_equal(prefix0, head), "R1/R2 的 system+历史前缀应逐字节一致")
+          end
+        end
+      end
+
       local pe = agent.plan_extract
       t.not_nil(pe)
+      t.not_nil(pe.front_checkpoint, "front 应被压缩为检查点")
       t.eq(1, pe.front_count)
       t.eq(3, #pe.inject, "覆盖层 = 文件工具对(2) + 新上下文(1)")
       t.eq(msgs[2], pe.inject[1], "文件工具对应原样引用")
       t.eq(msgs[3], pe.inject[2])
       t.eq(3, #agent.messages, "覆盖层不改动 agent.messages")
-      t.eq(1, #bodies, "关键字段齐全应一次通过")
-      local body = vim.json.decode(bodies[1])
-      t.nil_(body.max_tokens, "默认 extract_max_tokens=nil → 请求体不含 max_tokens")
-      t.true_(body.stream == true, "提取请求应为流式")
     end)
   end)
 
-  it("run 端到端（mock SSE）：首次输出缺 target → 自动重试至成功", function(t)
+  it("run 端到端（mock SSE）：并行下 target 缺失仅重试该通道", function(t)
     local hs = require("NeoAI.tests.http_server")
-    local n = 0
+    local n_target = 0
+    local total = 0
     local function handler(client, request)
-      n = n + 1
-      local content = (n == 1) and "<step1>只有步骤没有目标</step1>"
-        or "<target>补全后的目标</target><step1>步骤一</step1>"
+      local _, _, ch = route_body(request)
+      total = total + 1
+      local content
+      if ch == "target" then
+        n_target = n_target + 1
+        content = (n_target == 1) and "" or "<target>补全后的目标</target>"
+      else
+        content = CH_REPLY[ch] or ""
+      end
       local ev = function(o) return "data: " .. vim.json.encode(o) .. "\n\n" end
       local resp = ev({ choices = { { delta = { content = content } } } })
         .. ev({ choices = { { delta = {}, finish_reason = "stop" } }, usage = { prompt_tokens = 10, completion_tokens = 4 } })
@@ -364,7 +610,7 @@ lua/b.lua</Files>
           providers = { mockpe2 = { api_type = "openai", base_url = base_url, api_key = "test" } },
           model_refresh = { on_startup = false },
         },
-        tools = { plan_mode = { distill_on_execute = true } },
+        tools = { plan_mode = { distill_on_execute = true, distill_max_attempts = 2 } },
       })
       local p = require("NeoAI.core.session.plan_distill")
       local agent = {
@@ -376,11 +622,12 @@ lua/b.lua</Files>
         },
         tools = {}, _plan_enter_index = 0,
       }
-      local res = t.await(p.run(agent))
+      local res = t.await(p.run(agent), 8000)
       t.not_nil(res)
       t.eq("补全后的目标", res.fields.target)
-      t.eq(1, #res.fields.steps)
-      t.eq(2, n, "首轮缺 target 应触发一次重试")
+      t.eq(2, #res.fields.steps)
+      t.eq(2, n_target, "target 通道应重试一次")
+      t.eq(8, total, "无 front（_plan_enter_index=0）：R1(3)+R2(4) 首跑 + target 重试 1 次 = 8")
     end)
   end)
 end)

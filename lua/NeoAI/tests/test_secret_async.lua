@@ -19,7 +19,7 @@ tests.suite("secret_async", function(_, it)
   }
 
   it("tokenize_many_async 与同步 tokenize 结果一致", function(t)
-    local secret = require("NeoAI.sandbox.secret.secret")
+    local secret = require("NeoAI.sandbox.secret")
     secret.reset()
     local sync = {}
     for i, c in ipairs(CASES) do sync[i] = secret.tokenize(c) end
@@ -31,7 +31,7 @@ tests.suite("secret_async", function(_, it)
   end)
 
   it("异步 token 可 detokenize 还原", function(t)
-    local secret = require("NeoAI.sandbox.secret.secret")
+    local secret = require("NeoAI.sandbox.secret")
     secret.reset()
     local text = "key=abcdef1234567890abcdef and AKIAIOSFODNN7EXAMPLE"
     local out = t.await(secret.tokenize_async(text))
@@ -41,7 +41,7 @@ tests.suite("secret_async", function(_, it)
   end)
 
   it("异步批量：entropy_flags 逐项控制高熵扫描", function(t)
-    local secret = require("NeoAI.sandbox.secret.secret")
+    local secret = require("NeoAI.sandbox.secret")
     secret.reset()
     local key = "Zx9Kd-Qm2Lp5Zr8Tv1Wn4Bc"
     local outs = t.await(secret.tokenize_many_async({ key, key }, { entropy_flags = { false, true } }))
@@ -51,7 +51,7 @@ tests.suite("secret_async", function(_, it)
   end)
 
   it("禁用时异步接口原样返回", function(t)
-    local secret = require("NeoAI.sandbox.secret.secret")
+    local secret = require("NeoAI.sandbox.secret")
     local cfg = require("NeoAI.kernel.config_store")
     cfg.set("tools.sandbox.secrets.enabled", false)
     local ok, err = pcall(function()
@@ -63,7 +63,7 @@ tests.suite("secret_async", function(_, it)
   end)
 
   it("分块并行 token 化：跨块相同密钥合并为规范 token 且可无损还原", function(t)
-    local secret = require("NeoAI.sandbox.secret.secret")
+    local secret = require("NeoAI.sandbox.secret")
     local cfg = require("NeoAI.kernel.config_store")
     secret.reset()
     local key_a = "AKIAIOSFODNN7EXAMPLE"

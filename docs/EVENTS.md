@@ -254,11 +254,14 @@ vim.api.nvim_create_autocmd("User", {
 | 常量 | 值 | 触发时机 | payload 关键字段 |
 | --- | --- | --- | --- |
 | `PLAN_DISTILL_STARTED` | `plan_distill:started` | 开始计划阶段 XML 提取 | `{ agent_id }` |
-| `PLAN_DISTILL_CHUNK` | `plan_distill:chunk` | 提取结果流式分片到达 | `{ agent_id, reasoning, content }` |
+| `PLAN_DISTILL_CHUNK` | `plan_distill:chunk` | 提取结果流式分片到达 | `{ agent_id, channel?, reasoning?, content }` |
 | `PLAN_DISTILLED` | `plan_distilled` | 提取完成 | `{ agent_id, fields, steps }` |
 
 > 上下文压缩为**后台异步、不弹窗**：不再发射 `COMPACTION_STARTED` / `COMPACTION_CHUNK`（常量保留），仅发射 `COMPACTION_COMPLETED`。
 > 计划蒸馏仍会打开"🧬 计划蒸馏"悬浮窗并发射 `PLAN_DISTILL_STARTED` / `PLAN_DISTILL_CHUNK`。
+> 并行提取（`distill_parallel`）下 `PLAN_DISTILL_CHUNK` 额外携带 `channel`（本次分片所属通道：`target` / `steps` /
+> `files` / `background` / `constraints` / `verify` / `fallback`），且 `content` 为「各通道带标题合并」后的视图、
+> `reasoning` 已并入 `content`（不再单独给出）；开始/完成仍各发射一次。
 
 ### 沙箱
 

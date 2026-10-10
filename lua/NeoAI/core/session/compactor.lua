@@ -483,4 +483,7 @@ end
 --- 被折叠区间选择（供测试直接使用）
 M._select_shadow_range = _select_shadow_range
 
+--- 压缩指令文本：供 plan_distill 的 front 压缩复用（同一套 8 段检查点结构）。
+M.COMPACTION_INSTRUCTION = COMPACTION_INSTRUCTION
+
 return M

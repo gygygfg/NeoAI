@@ -15,7 +15,6 @@ local fs = require("NeoAI.utils.fs")
 local event_bus = require("NeoAI.kernel.event_bus")
 local events = require("NeoAI.kernel.events")
 local geometry = require("NeoAI.ui.geometry")
-local stringx = require("NeoAI.utils.stringx")
 
 local M = {}
 
@@ -434,7 +433,7 @@ function M.build_lines(items, traces, audit, saved, rejected)
   end
   -- 按路径/命令查审计说明（容忍模型省略前缀、带 [action] 前缀或命令 `$ ` 前缀）
   local function _norm_key(s)
-    s = stringx.trim(tostring(s or ""))
+    s = tostring(s or ""):gsub("^%s+", ""):gsub("%s+$", "")
     s = s:gsub("^%[.-%]%s*", "") -- 去掉 [action] 前缀
     s = s:gsub("^%$%s*", "") -- 去掉命令 `$ ` 前缀
     s = s:gsub("^主机操作命令%s*[:：]%s*", "")

@@ -176,7 +176,7 @@ session = {
 | `guard.repeat_tool` | `{enabled=true, thresholds={3,5,8}, messages=...}` | 连续重复工具调用提醒 |
 | `todo.enabled` | `true` | 待办工具 + 系统提示注入 |
 | `web_fetch` | 见下（默认 `enabled=false`） | 网页抓取：无头浏览器渲染动态页面并转 Markdown |
-| `plan_mode` | `{enabled=true, auto_execute_on_approve=true, distill_on_execute=true, extract_max_tokens=nil, extra_safe_tools={}, mutating_tools=...}` | 计划模式 |
+| `plan_mode` | `{enabled=true, auto_execute_on_approve=true, distill_on_execute=true, distill_parallel=true, distill_front=true, distill_max_attempts=2, extract_max_tokens=nil, extra_safe_tools={}, mutating_tools=...}` | 计划模式 |
 | `approval` | 见下 | 工具审批 |
 | `sandbox` | 见下 | 工具执行沙箱（dry-run/commit、隔离后端、策略） |
 
@@ -740,12 +740,30 @@ plugins = {
 「XML 结构化提取」——复用现有前缀缓存回放历史后追加提取指令，让 AI 输出
 `<target>` / `<stepN>` / `<files>` 等标签（详见 `core/session/plan_distill.lua`）。
 提取指令与 AI 的回复都不进入 `agent.messages`，仅作为发往模型的请求覆盖层（`agent.plan_extract`）。
-关键字段（`<target>` + 至少一个 `<stepN>`）缺失时最多重试 3 次。
 
+- `distill_parallel`（默认 `true`）：把提取从「**单请求串行**输出全部标签」改造为**多路并发**，
+  把墙钟时间压到「最慢一路」：
+  - **第 1 轮**并行发 3 路：`target` / `steps` / `files`（各自只输出自己那组标签）；
+  - **第 2 轮**并行发 4 路：`background`（Context/Scope/OutOfScope）/ `constraints`
+    （Constraints/Commands/Dependencies/Environment）/ `verify`（Verify/Risks）/ `fallback`
+    （Rollback/Questions/Information），前缀回放「历史 + 第 1 轮回显」，既复用缓存又让可选段引用已提炼的目标与步骤；
+  - **front 压缩**（见 `distill_front`）与上述两轮**并行**执行；
+  - 所有请求都先回放 `system + 历史 + 工具 schema`（与上一轮 plan 请求**逐字节一致**）以命中
+    provider **前缀缓存**，多路增量只按「缓存读 + 本路输出」计费 → 降低墙钟时间与 token 花销。
+  - 置为 `false` 回退为旧的单请求串行 legacy 路径。
+- `distill_front`（默认 `true`）：对「**进入 plan 之前**」的 front 上下文（`_plan_enter_index` 之前的消息）
+  用**压缩器同款 8 段指令**蒸馏为一条检查点消息，整体替换请求覆盖层中的 front（不再原样回放）。
+  front 为空时自动跳过；压缩失败自动退回「原样保留 front」。置为 `false` 关闭。
+- `distill_max_attempts`（默认 `2`）：并行路径**单通道**最大尝试次数。仅 `target` / `steps` 两个必需
+  通道缺失时按此重试；`files` 与第 2 轮各可选通道缺失即忽略、不重试。`target` 或 `steps` 两通道
+  均无输出时整体放弃（no-op，不阻塞发送）；第 2 轮全失败时用第 1 轮结果继续。
 - `extract_max_tokens`：单次提取请求的输出 token 上限；`nil`（默认）＝不下发 `max_tokens`，
   由模型/厂商默认最大输出决定。推理型模型在提取时先产生大段思维链，过小的固定上限会被
   `finish_reason=length` 截断、关键字段缺失后触发整轮重试（重复回放前缀，额外延迟与 token）；
   设为正整数（如 `16384`）可主动约束提取输出与成本。
+
+> `distill_parallel=false` 的 legacy 路径下，关键字段（`<target>` + 至少一个 `<stepN>`）缺失时
+> 仍按旧的「最多 3 次整体重试」处理（每次重放整段前缀）。
 
 状态持久化在 `session.metadata.plan`，恢复会话时还原（`plan_mode.restore`）。
 

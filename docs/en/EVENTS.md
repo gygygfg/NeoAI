@@ -241,11 +241,14 @@ All event constants are defined in `NeoAI.kernel.events`. They are listed below 
 | Constant | Value | When it fires | Key payload fields |
 | --- | --- | --- | --- |
 | `PLAN_DISTILL_STARTED` | `plan_distill:started` | Plan-stage XML extraction starts | `{ agent_id }` |
-| `PLAN_DISTILL_CHUNK` | `plan_distill:chunk` | A streamed extraction chunk arrives | `{ agent_id, reasoning, content }` |
+| `PLAN_DISTILL_CHUNK` | `plan_distill:chunk` | A streamed extraction chunk arrives | `{ agent_id, channel?, reasoning?, content }` |
 | `PLAN_DISTILLED` | `plan_distilled` | Extraction completes | `{ agent_id, fields, steps }` |
 
 > Context compaction is **asynchronous in the background and opens no window**: it no longer emits `COMPACTION_STARTED` / `COMPACTION_CHUNK` (constants reserved),
 > only `COMPACTION_COMPLETED`. Plan extraction still opens the "🧬 Plan Distillation" floating window and emits `PLAN_DISTILL_STARTED` / `PLAN_DISTILL_CHUNK` (original event constants reused).
+> On the parallel path (`distill_parallel`), `PLAN_DISTILL_CHUNK` additionally carries `channel` (the lane this chunk belongs to: `target` / `steps` /
+> `files` / `background` / `constraints` / `verify` / `fallback`), and `content` is a "per-channel merged with headings" view with `reasoning` folded into
+> `content` (no longer sent separately); start/complete still fire exactly once each.
 
 ### Sandbox
 

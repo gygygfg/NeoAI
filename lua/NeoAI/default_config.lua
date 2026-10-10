@@ -458,6 +458,20 @@ local DEFAULT_CONFIG = {
       --   关键字段缺失后触发整轮重试（重复回放前缀，额外延迟与 token）。不设上限可避免该截断。
       --   显式设为正整数（如 16384）可主动约束提取输出/成本。
       extract_max_tokens = nil,
+      -- 并行提取（默认开启）：把「XML 计划提取」从「单请求串行输出全部标签」改造为多路并发：
+      --   第 1 轮并行发 3 路（target / steps / files）；第 2 轮并行发 4 路（background / constraints /
+      --   verify / fallback），前缀回放「历史 + 第 1 轮回显」；front 压缩与上述两轮并行。
+      --   所有请求都先回放与上一轮 plan 请求逐字节一致的前缀（system+历史+工具 schema）以命中
+      --   provider 前缀缓存，多路增量只按「缓存读 + 本路输出」计费 → 降低墙钟时间与 token 花销。
+      --   置为 false 回退为旧的单请求串行 legacy 路径。
+      distill_parallel = true,
+      -- front 压缩（默认开启）：对「进入 plan 模式之前」的 front 上下文用压缩器同款 8 段指令
+      --   蒸馏为一条检查点消息，整体替换覆盖层中的 front（不再原样回放）。front 为空时自动跳过；
+      --   压缩失败自动退回「原样保留 front」。置为 false 关闭。
+      distill_front = true,
+      -- 并行路径单通道最大尝试次数（仅 target / steps 两个必需通道缺失时按此重试；files 与
+      --   第 2 轮各可选通道缺失即忽略、不重试）。默认 2（首跑 + 一次带「请补齐」提示的重试）。
+      distill_max_attempts = 2,
       extra_safe_tools = {}, -- 计划模式白名单扩展（只读/信息查询类之外的工具需显式加入）
       mutating_tools = { -- 兼容保留（计划模式可见集已覆盖此语义）
         "edit_file",

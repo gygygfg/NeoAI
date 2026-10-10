@@ -346,6 +346,9 @@ require("NeoAI").setup({
       enabled = true,                    -- 计划模式
       auto_execute_on_approve = true,    -- 计划确认后自动转入 CHAT 并按清单执行
       distill_on_execute = true,         -- 计划完成后先做一轮 XML 计划提取（组装执行上下文 + 按步骤调用 todo_write），再开始执行
+      distill_parallel = true,           -- 多轮并行提取：R1 3 路（target/steps/files）+ R2 4 路（可选段，回放 R1 回显）+ front 压缩并行；false 回退单请求
+      distill_front = true,              -- 用压缩器同款 8 段指令把「进入 plan 前」的 front 蒸馏为一条检查点消息（失败退回原样）
+      distill_max_attempts = 2,          -- 并行路径单通道最大尝试次数（仅 target/steps 缺失时重试）
       extra_safe_tools = {},             -- 计划模式白名单扩展
       -- mutating_tools = { ... },       -- 修改类工具（计划模式可见集已覆盖此语义）
     },

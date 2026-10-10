@@ -66,9 +66,9 @@ end, { a = 1, b = 2 }):then_(function(res) ... end)
 | 工具参数快照 | 仅流结束拼接全量；节流快照只发有界预览（`core/agent/stream.lua`） |
 | 会话持久化 | 浅拷贝外壳（去整会话 `vim.deepcopy`）+ C 实现 `json.encode_fast` + `persist_async` 线程池写盘 + 每会话串行队列（`services/chat_service.lua`、`core/session/session_store.lua`） |
 | 状态栏容量估算 | 按廉价 key 缓存，仅在消息数/用量/模型变化时重算（`services/status.lua`），不再每次 lualine 重绘全量估算 |
-| 工具参数密钥扫描 | 小参数同步快路径（保持审批同步语义）；大参数经 `secret.scan_all_async` 线程池单遍扫描（`sandbox/secret/secret.lua`、`tools/executor.lua`） |
-| 沙箱 canonical 哈希 / 评审 manifest | 改用 C 实现 `json.encode_fast`，去纯 Lua UTF-8 深扫（`sandbox/execution/control.lua`、`sandbox/state/cache.lua`、`sandbox/net/broker.lua`、`sandbox/review/review.lua`、`sandbox/review/evidence.lua`） |
-| 沙箱遮蔽判定 | `runtime.is_masked_path` 的遮蔽路径列表（`vim.fn.glob` 通配展开）与各条目的规范化形式按配置表引用缓存；此前对每个候选文件逐次 glob + `vim.fn.resolve`（约 60 条 × 文件数），数千文件命令的异步后处理会把主线程 CPU 拉满（实测 2000 文件后处理主线程 4.2s → ~0.17s）（`sandbox/execution/runtime.lua`） |
+| 工具参数密钥扫描 | 小参数同步快路径（保持审批同步语义）；大参数经 `secret.scan_all_async` 线程池单遍扫描（`sandbox/secret.lua`、`tools/executor.lua`） |
+| 沙箱 canonical 哈希 / 评审 manifest | 改用 C 实现 `json.encode_fast`，去纯 Lua UTF-8 深扫（`sandbox/control.lua`、`sandbox/cache.lua`、`sandbox/broker.lua`、`sandbox/review.lua`、`sandbox/evidence.lua`） |
+| 沙箱遮蔽判定 | `runtime.is_masked_path` 的遮蔽路径列表（`vim.fn.glob` 通配展开）与各条目的规范化形式按配置表引用缓存；此前对每个候选文件逐次 glob + `vim.fn.resolve`（约 60 条 × 文件数），数千文件命令的异步后处理会把主线程 CPU 拉满（实测 2000 文件后处理主线程 4.2s → ~0.17s）（`sandbox/runtime.lua`） |
 | 历史工具参数解码 | 按 arguments 串有界记忆化（`core/model/adapter.lua`） |
 | 流式 UI 渲染 | 生成中渲染节流（至多每 80ms 一次）+ markdown 渲染结果记忆化（`ui/window/chat_view.lua`、`ui/components/markdown_view.lua`） |
 | 工具结果/参数展示 | 有界美化打印：超过 256KB 的结果/参数跳过全量 JSON 解码，按有界原始前缀渲染（实测 10MB 结果渲染 ~97ms → ~0.1ms）；同一工具块参数/结果只解码一次，供密钥扫描与渲染复用（`ui/components/message_list.lua`） |
@@ -82,9 +82,9 @@ end, { a = 1, b = 2 }):then_(function(res) ... end)
 | `utils/work.lua` | `run_codec`：`vim.mpack` 编解码结构化输入/输出（主线程与 worker 内均可用）。 |
 | `tools/builtin/file_ops.lua` | `read_file` / `edit_file` / `list_files` / `search_files` / `delete_file`（异步变体）。 |
 | `tools/builtin/read_image.lua` | 读二进制文件（`work.run(_read_binary, abs_path)`）。 |
-| `sandbox/execution/candidate.lua` | `capture_overlay_async` / `finish_async`：overlay 递归遍历、文件读取、SHA-256 哈希在线程池内完成，主线程只做状态登记/组装。**未改动的物化文件按 mtime/size 签名（`dsig`）跳过读取与哈希**；`finish_async` 按 `tools.sandbox.work_chunk_files`（默认 128）分块并发投递，使 npm/cargo 等大量文件场景用满多核。 |
-| `sandbox/observe/conceal.lua` | `redact_async`：命令输出的指纹脱敏（十余次 gsub，可能达 MB 级）在线程池内完成。 |
-| `sandbox/secret/secret.lua` | `tokenize_many_async` / `tokenize_async` / `scan_all_async`：密钥全文扫描（具名规则 + 变量名 + 熵检测）在线程池执行，token 生成/映射/事件仍在主线程；文本数超过分块大小时按块并发，合并时把跨块同一密钥的等价 token 统一为规范 token（保证 detokenize 可还原）。 |
+| `sandbox/candidate.lua` | `capture_overlay_async` / `finish_async`：overlay 递归遍历、文件读取、SHA-256 哈希在线程池内完成，主线程只做状态登记/组装。**未改动的物化文件按 mtime/size 签名（`dsig`）跳过读取与哈希**；`finish_async` 按 `tools.sandbox.work_chunk_files`（默认 128）分块并发投递，使 npm/cargo 等大量文件场景用满多核。 |
+| `sandbox/conceal.lua` | `redact_async`：命令输出的指纹脱敏（十余次 gsub，可能达 MB 级）在线程池内完成。 |
+| `sandbox/secret.lua` | `tokenize_many_async` / `tokenize_async` / `scan_all_async`：密钥全文扫描（具名规则 + 变量名 + 熵检测）在线程池执行，token 生成/映射/事件仍在主线程；文本数超过分块大小时按块并发，合并时把跨块同一密钥的等价 token 统一为规范 token（保证 detokenize 可还原）。 |
 | `utils/sha256.lua` | 纯 Lua SHA-256；`source` 源码字符串传入线程内 `load`，供候选哈希与线程内 token 派生在独立核心计算。 |
 | `utils/textmetrics.lua` | 纯 Lua 文本度量（显示宽度/码点切片/折行）；`source` 源码字符串传入线程内 `load`。 |
 | `core/session/tool_result_pruner.lua` | `prune_agent_async`：MB 级工具结果的码点统计/切片经线程池计算（实测 12×3.7MB 从主线程阻塞 330ms → 0ms，4 线程并行约 140ms），仅把裁剪结果传回主线程应用。 |

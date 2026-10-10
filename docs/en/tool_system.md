@@ -56,7 +56,7 @@ Tool definitions support two execution forms (`executor._call_tool`):
 Built-in tool modules: `file_ops` / `shell` / `git_ops` / `lsp_ops` / `tree_ops` / `log_ops` / `plan` (sub-agent) /
 `todo` / `plan_mode` / `ask_user` / `read_image` / `web_fetch` (web fetch, disabled by default) / `skills` (skill tools + system prompt section).
 (The `service` long-lived-service module is no longer registered; background processes are carried by the
-session-resident sandbox instance, see `sandbox/execution/resident.lua`.)
+session-resident sandbox instance, see `sandbox/resident.lua`.)
 MCP remote tools are registered dynamically by `services/mcp/init.lua` (`category = "mcp"`, `source = "mcp"`); see [mcp.md](mcp.md) for details.
 
 ## 4. Execution Flow (tools/executor.lua)

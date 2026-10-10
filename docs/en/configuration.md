@@ -181,7 +181,7 @@ session = {
 | `guard.repeat_tool` | `{enabled=true, thresholds={3,5,8}, messages=...}` | Reminder for consecutive repeated tool calls |
 | `todo.enabled` | `true` | Todo tool + system prompt injection |
 | `web_fetch` | See below (`enabled=false` by default) | Web fetch: render dynamic pages in a headless browser and convert to Markdown |
-| `plan_mode` | `{enabled=true, auto_execute_on_approve=true, distill_on_execute=true, extract_max_tokens=nil, extra_safe_tools={}, mutating_tools=...}` | Plan mode |
+| `plan_mode` | `{enabled=true, auto_execute_on_approve=true, distill_on_execute=true, distill_parallel=true, distill_front=true, distill_max_attempts=2, extract_max_tokens=nil, extra_safe_tools={}, mutating_tools=...}` | Plan mode |
 | `approval` | See below | Tool approval |
 | `sandbox` | See below | Tool execution sandbox (dry-run/commit, isolation backend, policy) |
 
@@ -821,13 +821,36 @@ Plan mode is a **per-agent state** (`agent.plan_mode`); when active:
 one "XML structured extraction" round runs first — it replays the history (reusing the prefix cache) and appends an
 extraction instruction, asking the AI to emit `<target>` / `<stepN>` / `<files>` tags (see `core/session/plan_distill.lua`).
 Neither the extraction instruction nor the AI's reply enters `agent.messages`; they only form a request overlay
-(`agent.plan_extract`). If the key fields (`<target>` + at least one `<stepN>`) are missing it retries up to 3 times.
+(`agent.plan_extract`).
 
+- `distill_parallel` (default `true`): turns extraction from "**one serial request** emitting every tag" into
+  **multiple concurrent requests**, collapsing wall-clock time to "the slowest lane":
+  - **Round 1** fires **3 lanes** concurrently: `target` / `steps` / `files` (each emits only its own tags);
+  - **Round 2** fires **4 lanes** concurrently: `background` (Context/Scope/OutOfScope) / `constraints`
+    (Constraints/Commands/Dependencies/Environment) / `verify` (Verify/Risks) / `fallback`
+    (Rollback/Questions/Information), replaying "history + Round-1 echo" as prefix, so the optional sections both
+    reuse the cache and can reference the already-distilled target/steps;
+  - **front compaction** (see `distill_front`) runs **in parallel** with both rounds;
+  - every request first replays `system + history + tool schema` (**byte-for-byte identical** to the previous plan
+    request) to hit the provider **prefix cache**, so each extra lane is billed only as "cache read + its own output"
+    → lower wall-clock time and token cost.
+  - Set it to `false` to fall back to the old single-request serial legacy path.
+- `distill_front` (default `true`): distills the front context ("before entering plan", i.e. messages before
+  `_plan_enter_index`) into a single checkpoint message using the **compactor's 8-section instruction**, then
+  replaces the front in the request overlay entirely (no longer replayed verbatim). Skipped automatically when front
+  is empty; on failure it falls back to "keep front verbatim". Set it to `false` to disable.
+- `distill_max_attempts` (default `2`): per-lane max attempts on the parallel path. Only the two required lanes
+  `target` / `steps` retry on missing output; `files` and the Round-2 optional lanes are ignored without retrying.
+  If neither `target` nor `steps` produced output, extraction is abandoned (no-op, never blocks sending); if all of
+  Round 2 fails, the Round-1 result is used to continue.
 - `extract_max_tokens`: output token cap for a single extraction request; `nil` (default) = do not send `max_tokens`,
   letting the model/provider default maximum apply. Reasoning models produce a large chain of thought first during
   extraction, so a small fixed cap gets truncated with `finish_reason=length`, and the missing key fields then trigger
   a full retry (replaying the prefix, extra latency and tokens); set a positive integer (e.g. `16384`) to bound
   extraction output/cost explicitly.
+
+> On the `distill_parallel=false` legacy path, missing key fields (`<target>` + at least one `<stepN>`) are still
+> handled by the old "retry up to 3 times as a whole" (each retry replays the whole prefix).
 
 The state is persisted in `session.metadata.plan` and restored when the session is resumed (`plan_mode.restore`).
 

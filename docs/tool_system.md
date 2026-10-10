@@ -52,7 +52,7 @@
 
 内置工具模块：`file_ops` / `shell` / `git_ops` / `lsp_ops` / `tree_ops` / `log_ops` / `plan`（子 Agent）/
 `todo` / `plan_mode` / `ask_user` / `read_image` / `web_fetch`（网页抓取，默认不启用）/ `skills`（技能工具 + 系统提示段）。
-（`service` 长驻服务模块已不再注册；后台进程由会话级常驻沙箱实例承载，见 `sandbox/execution/resident.lua`。）
+（`service` 长驻服务模块已不再注册；后台进程由会话级常驻沙箱实例承载，见 `sandbox/resident.lua`。）
 MCP 远端工具由 `services/mcp/init.lua` 动态注册（`category = "mcp"`，`source = "mcp"`），详见 [mcp.md](mcp.md)。
 
 ## 4. 执行流程（tools/executor.lua）

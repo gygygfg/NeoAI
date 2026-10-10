@@ -773,7 +773,9 @@ local function _on_ctxop_started(payload, kind)
 end
 
 --- 上下文操作分片：更新悬浮窗内容
---- @param payload table { agent_id, reasoning, content }
+--- 计划蒸馏并行路径下，payload 额外带 `channel`（本次分片所属通道），`content` 为
+--- 「各通道带标题合并」后的视图（reasoning 已并入 content），此处默认单栏展示即可。
+--- @param payload table { agent_id, reasoning?, content?, channel? }
 local function _on_ctxop_chunk(payload)
   if not payload or payload.agent_id ~= state.agent_id then return end
   ctxop_cancelled = false

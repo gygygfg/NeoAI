@@ -17,7 +17,7 @@ local function with_config(overrides, fn)
 end
 
 tests.suite("secret_fake", function(_, it)
-  local secret = require("NeoAI.sandbox.secret.secret")
+  local secret = require("NeoAI.sandbox.secret")
 
   local function fake_of(real)
     local _, used = secret.tokenize(real)
@@ -120,8 +120,8 @@ tests.suite("secret_fake", function(_, it)
   end
 
   it("出网守卫：白名单/供应商自动信任放行，非白名单含密钥需确认（headless 拒绝）", function(t)
-    local eg = require("NeoAI.sandbox.secret.secret_egress")
-    local alert = require("NeoAI.sandbox.secret.secret_alert")
+    local eg = require("NeoAI.sandbox.secret_egress")
+    local alert = require("NeoAI.sandbox.secret_alert")
     alert.reset()
     secret.reset()
     local real = "sk-abcdefghijklmnopqrstuvwxyz0123456789ABCD"
@@ -151,8 +151,8 @@ tests.suite("secret_fake", function(_, it)
   end)
 
   it("出网守卫：命令引用环境变量中的密钥才判定（避免误报）", function(t)
-    local eg = require("NeoAI.sandbox.secret.secret_egress")
-    local alert = require("NeoAI.sandbox.secret.secret_alert")
+    local eg = require("NeoAI.sandbox.secret_egress")
+    local alert = require("NeoAI.sandbox.secret_alert")
     alert.set_ui({ show = function(_, decide) decide("stop") end })
     secret.reset()
     local real = "sk-abcdefghijklmnopqrstuvwxyz0123456789ABCD"
@@ -169,7 +169,7 @@ tests.suite("secret_fake", function(_, it)
   end)
 
   it("数据流账本：不透明派生标记", function(t)
-    local flow = require("NeoAI.sandbox.secret.secret_flow")
+    local flow = require("NeoAI.sandbox.secret_flow")
     flow.reset()
     local files = {
       { path = "/tmp/a.txt", action = "create", content = "x" },
@@ -232,11 +232,11 @@ tests.suite("secret_fake", function(_, it)
   end)
 
   it("工具命中真实密钥：选择「替换为假密钥」后参数被假化并继续执行", function(t)
-    local alert = require("NeoAI.sandbox.secret.secret_alert")
+    local alert = require("NeoAI.sandbox.secret_alert")
     local executor = require("NeoAI.tools.executor")
     local registry = require("NeoAI.tools.registry")
     local helpers = require("NeoAI.tools.builtin.tool_helpers")
-    local tool_spec = require("NeoAI.sandbox.execution.tool_spec")
+    local tool_spec = require("NeoAI.sandbox.tool_spec")
     secret.reset()
     local real = "sk-abcdefghijklmnopqrstuvwxyz0123456789ABCD"
     local fake = secret.tokenize(real)
@@ -270,7 +270,7 @@ tests.suite("secret_fake", function(_, it)
   end)
 
   it("AI 上下文命中真实密钥：选择「替换为假密钥」后上下文被脱敏并继续", function(t)
-    local alert = require("NeoAI.sandbox.secret.secret_alert")
+    local alert = require("NeoAI.sandbox.secret_alert")
     local recovery = require("NeoAI.core.agent.recovery")
     secret.reset()
     local real = "sk-abcdefghijklmnopqrstuvwxyz0123456789ABCD"
@@ -294,7 +294,7 @@ tests.suite("secret_fake", function(_, it)
   end)
 
   it("出网守卫：代码标识符不被误判为目标主机", function(t)
-    local eg = require("NeoAI.sandbox.secret.secret_egress")
+    local eg = require("NeoAI.sandbox.secret_egress")
     -- 纯代码标识符 / 方法调用 → 不提取（此前的 os.getenv 误报）
     t.eq(0, #eg._extract_hosts([[v = os.getenv(k)]]), "os.getenv 不应视为主机")
     t.eq(0, #eg._extract_hosts([[k = os.environ.get("OPENAI_API_KEY")]]), "os.environ.get 不应视为主机")
@@ -310,7 +310,7 @@ tests.suite("secret_fake", function(_, it)
   end)
 
   it("密钥告警：无专用 UI 时回退内建确认，仍暂停并询问", function(t)
-    local alert = require("NeoAI.sandbox.secret.secret_alert")
+    local alert = require("NeoAI.sandbox.secret_alert")
     alert.reset()
     local orig_uis = vim.api.nvim_list_uis
     local orig_confirm = vim.fn.confirm

@@ -7,7 +7,7 @@
 local tests = require("NeoAI.tests")
 
 tests.suite("secret_highlight", function(_, it)
-  local secret = require("NeoAI.sandbox.secret.secret")
+  local secret = require("NeoAI.sandbox.secret")
 
   --- 生成并登记一个格式保真假密钥，返回该假密钥字符串。
   --- @param real string

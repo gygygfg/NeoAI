@@ -122,11 +122,12 @@ local function _apply_overlay(messages, comp)
   return out
 end
 
---- 应用「计划提取」覆盖层：保留前置 front，随后注入提取出的上下文（含原样文件工具对），
---- 再拼接 window_end 之后的消息（含用户本轮真实消息与后续回合）。
+--- 应用「计划提取」覆盖层：保留前置 front（或其压缩检查点），随后注入提取出的上下文
+--- （含原样文件工具对），再拼接 window_end 之后的消息（含用户本轮真实消息与后续回合）。
+--- front_checkpoint 存在时用该检查点**整体替换** front；否则退回原样保留 messages[1..front_count]。
 --- 覆盖层不改动原始 messages（渲染/落盘仍为原始上下文），仅用于构建请求视图。
 --- @param messages table 原始内部消息
---- @param pe table { front_count = number, window_end = number, inject = table }
+--- @param pe table { front_count = number, window_end = number, inject = table, front_checkpoint? = table }
 --- @return table 请求视图消息数组
 local function _apply_plan_extract(messages, pe)
   messages = messages or {}
@@ -135,7 +136,12 @@ local function _apply_plan_extract(messages, pe)
   end
   local out = {}
   local k = math.min(math.max(pe.front_count, 0), #messages)
-  for i = 1, k do out[#out + 1] = messages[i] end
+  if type(pe.front_checkpoint) == "table" then
+    -- front 已被压缩为单条检查点消息（原始 front 不再回放）。
+    out[#out + 1] = pe.front_checkpoint
+  else
+    for i = 1, k do out[#out + 1] = messages[i] end
+  end
   for _, m in ipairs(pe.inject or {}) do out[#out + 1] = m end
   local we = math.max(pe.window_end, k)
   for i = we + 1, #messages do out[#out + 1] = messages[i] end
