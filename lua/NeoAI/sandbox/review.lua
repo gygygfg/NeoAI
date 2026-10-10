@@ -9,6 +9,7 @@
 
 local store = require("NeoAI.sandbox.store")
 local candidate = require("NeoAI.sandbox.candidate")
+local logger = require("NeoAI.kernel.logger")
 
 local M = {}
 
@@ -221,7 +222,7 @@ local function _maybe_evict_rejected()
     state.rejected_set[id] = nil
     local item = state.items[id]
     local digest = item and item.candidate_digest
-    if digest then pcall(store.delete_rejected_copy, id, digest) end
+    if digest then logger.try("delete_rejected_copy", store.delete_rejected_copy, id, digest) end
     if item then
       item.rejected_copy = nil
       -- 直接移出内存：副本已删，不再可恢复/展示，内存占用随之下界。
@@ -280,12 +281,12 @@ local function _persist(item)
   state.pending_items = nil
   -- 异步落盘（文件写入移入线程池）：待审项含候选文件内容，大候选时同步 fsync 会卡主线程。
   -- 内存态是权威来源，store 的写缓存保证刚写入即可同步读回；reset/shutdown 前会 flush。
-  pcall(store.write_review_async, item)
+  logger.try("persist_review_async", store.write_review_async, item)
   -- 落盘副本已（同步）编码捕获，剥离内存内容（候选内容仍可经候选读取）。
   _strip_content(item)
   -- 部分取代增量单独落盘（避免重编码整单元）；与 item 同步，防止水合时丢失/陈旧。
   if type(item.superseded_paths) == "table" then
-    pcall(store.write_review_removed, item.change_set_id, item.superseded_paths)
+    logger.try("persist_review_removed", store.write_review_removed, item.change_set_id, item.superseded_paths)
   end
   -- 终态登记与淘汰（仅在状态写入后；淘汰不影响磁盘记录与候选引用统计）。
   if item.change_set_id and _dead_terminal(item) then _mark_terminal(item.change_set_id) end
@@ -662,7 +663,7 @@ function M.undo(id, opts)
   -- 撤销「已应用」变更：重建候选并回到待审（删除快照与已应用记录）。
   if rec.state == M.APPLY.APPLIED and _requeue_after_undo(item, rec) then
     store.delete_snapshot(rec.snapshot_id)
-    pcall(store.delete_review_removed, id)
+    logger.try("delete_review_removed", store.delete_review_removed, id)
     state.items[id] = item
     _persist(item)
     _emit(require("NeoAI.kernel.events").SANDBOX_REVERTED, {
@@ -759,7 +760,7 @@ local function _merge_package_item(item, cand)
   store.write_candidate_async(newcand)
   -- 合并后要丢弃各成员候选：先确保新候选落盘，避免异步写未完成时旧候选被删而新候选尚不存在
   -- （应用时 CANDIDATE_NOT_FOUND）。有界等待（写入已在异步链上，不阻塞 Agent）。
-  pcall(store.flush, 30000)
+  logger.try("store_flush", store.flush, 30000)
   local to_discard = {}
   -- 其余同键成员并入 base：标记取代并丢弃各自候选。
   for i = 2, #members do
@@ -770,7 +771,7 @@ local function _merge_package_item(item, cand)
     state.items[it.change_set_id] = it
     if it.candidate_digest ~= digest then to_discard[it.candidate_digest] = true end
     _persist(it)
-    pcall(store.delete_review_removed, it.change_set_id)
+    logger.try("delete_review_removed", store.delete_review_removed, it.change_set_id)
     _emit(require("NeoAI.kernel.events").SANDBOX_REVIEW_SUPERSEDED, {
       change_set_id = it.change_set_id, superseded_by = base.change_set_id,
     })
@@ -782,7 +783,7 @@ local function _merge_package_item(item, cand)
   -- 合并后的候选已按增量剔除被取代路径，清空增量并删除其落盘记录。
   base.superseded_paths = nil
   base.partial_superseded_by = nil
-  pcall(store.delete_review_removed, base.change_set_id)
+  logger.try("delete_review_removed", store.delete_review_removed, base.change_set_id)
   base.package_names = _union(base.package_names, item.package_names)
   base.command = item.command or base.command
   base.package_manager = item.package_manager or base.package_manager
@@ -803,7 +804,7 @@ local function _merge_package_item(item, cand)
   state.items[item.change_set_id] = item
   if item.candidate_digest ~= digest then to_discard[item.candidate_digest] = true end
   _persist(item)
-  pcall(store.delete_review_removed, item.change_set_id)
+  logger.try("delete_review_removed", store.delete_review_removed, item.change_set_id)
   _discard_candidates(to_discard)
   _emit(require("NeoAI.kernel.events").SANDBOX_REVIEW_SUPERSEDED, {
     change_set_id = item.change_set_id, superseded_by = base.change_set_id,
@@ -1099,7 +1100,7 @@ function M.reject(id, reason)
   -- 拒绝后暂存副本失效：后续编辑应重新以真实文件为基线，不能带上被拒改动。
   candidate.invalidate(item.write_set)
   _persist(item)
-  pcall(store.delete_review_removed, id)
+  logger.try("delete_review_removed", store.delete_review_removed, id)
   _emit(require("NeoAI.kernel.events").SANDBOX_REVIEW_REJECTED, { change_set_id = id, reason = reason })
   return item
 end
@@ -1197,7 +1198,7 @@ function M.restore(id)
   item.apply_state = M.APPLY.NOT_REQUESTED
   state.items[id] = item
   -- 清理副本与 FIFO 登记（恢复后不再属于「已拒绝」）。
-  pcall(store.delete_rejected_copy, id, digest)
+  logger.try("delete_rejected_copy", store.delete_rejected_copy, id, digest)
   _unmark_rejected(id)
   _persist(item)
   _emit(require("NeoAI.kernel.events").SANDBOX_REVIEW_ENQUEUED, {
@@ -1306,7 +1307,7 @@ local function _apply_begin(id, opts)
   local cand = store.read_candidate(item.candidate_digest)
   if not cand then
     -- 大候选的落盘是异步的（线程池）：可能仍在写队列。先冲刷再读，避免误报丢失。
-    pcall(store.flush, 2000)
+    logger.try("store_flush", store.flush, 2000)
     cand = store.read_candidate(item.candidate_digest)
   end
   if not cand and store.was_written and store.was_written(item.candidate_digest) then
@@ -1341,7 +1342,7 @@ local function _apply_begin(id, opts)
         command_id = item.command_id,
         created_at = item.created_at,
       }
-      pcall(store.write_candidate_async, cand)
+      logger.try("persist_candidate_async", store.write_candidate_async, cand)
       require("NeoAI.kernel.logger").warn(
         "[sandbox] 候选文件丢失，已从待审项/暂存重建: %s（%d 文件；store.root=%s）",
         tostring(item.candidate_digest), #rebuilt, tostring(store.root and store.root()))
@@ -1416,7 +1417,7 @@ local function _apply_settle(ctx, pub)
     end
     _store_snapshot(item, ctx.snapshot_entries, pub.receipt.operation_id)
     _persist(item)
-    pcall(store.delete_review_removed, item.change_set_id)
+    logger.try("delete_review_removed", store.delete_review_removed, item.change_set_id)
     -- 仅应用了部分文件：其余文件保留待审，供用户逐个确认
     if #ctx.remaining > 0 then
       local requeued = _requeue_remaining(item, ctx.remaining)
@@ -1614,7 +1615,7 @@ function M.supersede_by_paths(paths, except_id)
           state.items[item.change_set_id] = item
           if item.candidate_digest then to_discard[item.candidate_digest] = true end
           _persist(item)
-          pcall(store.delete_review_removed, item.change_set_id)
+          logger.try("delete_review_removed", store.delete_review_removed, item.change_set_id)
           _emit(require("NeoAI.kernel.events").SANDBOX_REVIEW_SUPERSEDED, {
             change_set_id = item.change_set_id, superseded_by = except_id,
           })
@@ -1631,7 +1632,7 @@ function M.supersede_by_paths(paths, except_id)
           state.items[item.change_set_id] = item
           state.pending_cache = nil
           state.pending_items = nil
-          pcall(store.write_review_removed, item.change_set_id, sup)
+          logger.try("persist_review_removed", store.write_review_removed, item.change_set_id, sup)
           -- 待审项内容已变化：广播入队事件触发审批窗刷新（事件语义为「待审集合变化」）。
           _emit(require("NeoAI.kernel.events").SANDBOX_REVIEW_ENQUEUED, {
             change_set_id = item.change_set_id, candidate_digest = item.candidate_digest,

@@ -5,6 +5,7 @@
 local json = require("NeoAI.utils.json")
 local fs = require("NeoAI.utils.fs")
 local async = require("NeoAI.utils.async")
+local logger = require("NeoAI.kernel.logger")
 
 local M = {}
 
@@ -955,7 +956,7 @@ end
 --- 重置（测试用）：清理落盘候选/回执/变更单元/证据/快照并清空根目录
 function M.reset()
   -- 先等异步写入落盘：否则 reset 后迟到的写入会重建文件、污染后续用例/实例。
-  pcall(M.flush, 5000)
+  logger.try("store_flush", M.flush, 5000)
   write_state.gen = write_state.gen + 1
   write_state.mem = {}
   write_state.pending = {}
@@ -966,6 +967,7 @@ function M.reset()
   _snapshot_cache_clear()
   written_candidates = {}
   if state.root then
+    -- best-effort cleanup：reset 阶段删除各目录属清理型 pcall，失败不影响 reset 语义（目录可能不存在/正被占用），故不升级为告警。
     pcall(vim.fn.delete, _candidates_dir(), "rf")
     pcall(vim.fn.delete, _receipts_dir(), "rf")
     pcall(vim.fn.delete, _reviews_dir(), "rf")

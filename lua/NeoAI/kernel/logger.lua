@@ -116,6 +116,23 @@ function M.warn(message, ...) _log("WARN", message, ...) end
 function M.error(message, ...) _log("ERROR", message, ...) end
 function M.fatal(message, ...) _log("FATAL", message, ...) end
 
+--- 受控调用：执行 fn(...) 并在失败时记录 WARN 日志，把「静默 pcall 吞错」变为可观测告警。
+--- 语义等价于 `pcall(fn, ...)` 的返回值（成功返回被调函数返回值，失败返回 false, err），
+--- 因此可作为裸 pcall 的直接替代；仅额外增加失败路径的告警日志。
+--- 注意：不改变调用方的 fail-closed 判定——调用方仍应据返回的 ok 决定降级/拒绝。
+--- @param label string 定位用短标签（如 "persist_review"）
+--- @param fn function 被调函数
+--- @param ... any 透传参数
+--- @return boolean ok
+--- @return any err|result 失败为 err，成功为 fn 的首个返回值
+function M.try(label, fn, ...)
+  local ok, res = pcall(fn, ...)
+  if not ok then
+    M.warn("best-effort 调用失败 [%s]: %s", tostring(label), tostring(res))
+  end
+  return ok, res
+end
+
 --- 获取当前日志级别名
 --- @return string
 function M.get_level()

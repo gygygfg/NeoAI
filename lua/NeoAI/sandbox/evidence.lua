@@ -5,6 +5,7 @@
 
 local json = require("NeoAI.utils.json")
 local store = require("NeoAI.sandbox.store")
+local logger = require("NeoAI.kernel.logger")
 
 local M = {}
 
@@ -112,7 +113,7 @@ end
 --- @return string evidence_id
 function M.add(kind, payload, meta)
   local record = _build(kind, payload, meta)
-  pcall(store.write_evidence, record)
+  logger.try("persist_evidence", store.write_evidence, record)
   return record.evidence_id
 end
 
@@ -123,7 +124,7 @@ end
 --- @return string evidence_id
 function M.add_async(kind, payload, meta)
   local record = _build(kind, payload, meta)
-  pcall(store.write_evidence_async, record)
+  logger.try("persist_evidence_async", store.write_evidence_async, record)
   return record.evidence_id
 end
 

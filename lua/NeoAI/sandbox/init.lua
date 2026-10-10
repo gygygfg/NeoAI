@@ -10,6 +10,7 @@
 local config_store = require("NeoAI.kernel.config_store")
 local instance = require("NeoAI.sandbox.instance")
 local store = require("NeoAI.sandbox.store")
+local logger = require("NeoAI.kernel.logger")
 local control = require("NeoAI.sandbox.control")
 local candidate = require("NeoAI.sandbox.candidate")
 local runtime = require("NeoAI.sandbox.runtime")
@@ -183,7 +184,7 @@ function M.shutdown()
   if timeout == nil then timeout = 3000 end
   timeout = math.max(0, timeout)
   pcall(function() require("NeoAI.sandbox.wrapper").await_postprocess(timeout) end)
-  pcall(function() require("NeoAI.sandbox.store").flush(timeout) end)
+  logger.try("store_flush", function() require("NeoAI.sandbox.store").flush(timeout) end)
   candidate.reset(timeout)
   state.active = nil
   state.initialized = false

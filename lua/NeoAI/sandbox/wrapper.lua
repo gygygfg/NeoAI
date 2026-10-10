@@ -14,6 +14,7 @@ local policy = require("NeoAI.sandbox.policy")
 local candidate = require("NeoAI.sandbox.candidate")
 local runtime = require("NeoAI.sandbox.runtime")
 local store = require("NeoAI.sandbox.store")
+local logger = require("NeoAI.kernel.logger")
 local impact = require("NeoAI.sandbox.impact")
 local evidence = require("NeoAI.sandbox.evidence")
 local grant = require("NeoAI.sandbox.grant")
@@ -994,7 +995,7 @@ local function _persist_and_settle(cand, attempt, ctx, cfg, spec, result, proces
     -- 前退出/热重载或写入失败都会使待审项指向一个不存在的候选，用户应用时报
     -- `CANDIDATE_NOT_FOUND`。此处有界等待落盘（大候选约百 ms～数百 ms，且在主线程异步链上，
     -- 不阻塞 Agent 拿到命令结果），保证入队即已持久化。
-    pcall(store.flush, 30000)
+    logger.try("store_flush", store.flush, 30000)
     _profile("persist", (vim.uv.hrtime() - _t_persist) / 1e6,
       "files=" .. tostring(#(cand.files or {})))
     return _settle_candidate(cand, attempt, ctx, cfg, spec, result, process_info, pre)
