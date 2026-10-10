@@ -78,10 +78,15 @@ opts.wait / opts.on_done / opts.timings_path / opts.verbose`）；顺序隔离�
 - **headless 回归**：安装 Neovim stable，按 1.1 的并行命令运行，`failed>0` 即红。
 
 回归会**跳过环境能力依赖套件**（无特权 runner 上必然失败，失败源于环境而非代码）：
-`gateway`、`multimodal`、`integration`、`timer`、`pty`、`sandbox`、`sandbox_governance`、
+`gateway`、`multimodal`、`integration`、`timer`、`pty`，以及沙箱专项套件
+`sandbox_{core,session,view,privilege,secret,ops}`、`sandbox_governance`、
 `sandbox_hardening`、`sandbox_service`、`sandbox_systemd`——它们需要 systemd init /
-unshare-userns / netns / 交互式审批 / PTY 等能力。其余套件必须全绿。跳过清单直接写在
+unshare-userns / netns / 交互式审批 / PTY 等能力。其余套件必须全绿（含沙箱中不依赖
+上述能力的子套件，如 `sandbox_ai_audit`、`sandbox_boundary_*` 等）。跳过清单直接写在
 workflow 的 `-c` 内联脚本中；本地等价运行见 1.1（去掉过滤即为本机全量）。
+
+> 原单文件 `test_sandbox.lua` 已按用例主题拆分为 `test_sandbox_{core,session,view,privilege,secret,ops}.lua`
+> 六个套件（用例彼此独立、无跨用例共享状态，总数不变）。
 
 ## 2. 测试组织
 

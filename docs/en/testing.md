@@ -90,10 +90,16 @@ The `.github/workflows/ci.yml` workflow runs two jobs on push / PR:
 
 The regression **skips environment-capability suites** (they inevitably fail on unprivileged
 runners — the failure is environmental, not code): `gateway`, `multimodal`, `integration`,
-`timer`, `pty`, `sandbox`, `sandbox_governance`, `sandbox_hardening`, `sandbox_service`,
-`sandbox_systemd` — these need systemd init / unshare-userns / netns / interactive approval /
-PTY capabilities. All remaining suites must be green. The skip list lives in the workflow's
-inline `-c` script; for the local equivalent see 1.1 (remove the filter to run the full set).
+`timer`, `pty`, plus the sandbox-specific suites `sandbox_{core,session,view,privilege,secret,ops}`,
+`sandbox_governance`, `sandbox_hardening`, `sandbox_service`, `sandbox_systemd` — these need
+systemd init / unshare-userns / netns / interactive approval / PTY capabilities. All remaining
+suites must be green (including the sandbox sub-suites that do not need those capabilities, e.g.
+`sandbox_ai_audit`, `sandbox_boundary_*`). The skip list lives in the workflow's inline `-c`
+script; for the local equivalent see 1.1 (remove the filter to run the full set).
+
+> The former single file `test_sandbox.lua` is split by theme into six suites
+> `test_sandbox_{core,session,view,privilege,secret,ops}.lua` (cases are independent with no
+> cross-case shared state; the total count is unchanged).
 
 ## 2. Test Organization
 
