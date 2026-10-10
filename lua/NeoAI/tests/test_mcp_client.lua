@@ -1,5 +1,5 @@
 --- MCP JSON-RPC 客户端测试
---- @module NeoAI.tests.test_mcp_client
+--- @module 'NeoAI.tests.test_mcp_client'
 --- 用内存假传输验证客户端逻辑：id 关联、通知分发、服务器请求应答、initialize 握手。
 --- （不依赖真实子进程/网络，跨环境可跑。）
 
@@ -39,7 +39,7 @@ tests.suite("mcp_client", function(_, it)
     t.not_nil(id, "请求应带 id")
     ft.on_message({ jsonrpc = "2.0", id = id, result = { tools = { { name = "a" } } } })
     t.true_(_wait(d), "请求应 resolve")
-    local result = d._state == "resolved" and d._value or nil
+    local result = assert(d._state == "resolved" and d._value or nil)
     t.eq(1, #result.tools)
     t.eq("a", result.tools[1].name)
   end)
@@ -59,7 +59,7 @@ tests.suite("mcp_client", function(_, it)
   it("服务器->客户端请求被应答（method not found）", function(t)
     local client_mod = require("NeoAI.services.mcp.client")
     local ft = _fake_transport()
-    local client = client_mod.new(ft, { name = "t" })
+    local _ = client_mod.new(ft, { name = "t" })
     ft:open()
     ft.on_message({ jsonrpc = "2.0", id = 99, method = "ping" })
     -- 未注册处理器 → 回 -32601
@@ -98,7 +98,7 @@ tests.suite("mcp_client", function(_, it)
     local d = client:request("tools/list", {})
     client:close()
     t.true_(_wait(d), "close 后请求应 settle")
-    local err = d._state == "rejected" and d._error or nil
+    local err = assert(d._state == "rejected" and d._error or nil)
     t.not_nil(err, "应 reject")
     t.matches("关闭", tostring(err.message))
   end)
@@ -109,7 +109,7 @@ tests.suite("mcp_client", function(_, it)
     local client = client_mod.new(ft, { name = "t", timeout_ms = 60000 })
     ft:open()
     local captured
-    client.request = function(_, _method, _params, opts)
+    client.request = function(_, _, _, opts)
       captured = opts and opts.timeout_ms
       return async.resolve({ protocolVersion = "2025-06-18", capabilities = {}, serverInfo = {} })
     end
@@ -126,7 +126,7 @@ tests.suite("mcp_client", function(_, it)
     local d = client:request("tools/list", {})
     ft.on_exit(1) -- 模拟 stdio 子进程退出
     t.true_(_wait(d), "传输断开后挂起请求应 settle")
-    local err = d._state == "rejected" and d._error or nil
+    local err = assert(d._state == "rejected" and d._error or nil)
     t.not_nil(err, "应 reject")
     t.eq("disconnected", err.kind)
     t.true_(client.transport_dead, "应标记传输失效，以便上层重连")

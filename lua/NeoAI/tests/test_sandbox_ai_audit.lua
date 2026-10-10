@@ -1,5 +1,5 @@
 --- 待审变更 AI 审计测试
---- @module NeoAI.tests.test_sandbox_ai_audit
+--- @module 'NeoAI.tests.test_sandbox_ai_audit'
 --- 覆盖：结构化审计文本构造（分级/文件/diff/主机操作/截断）与用户消息提取。
 
 local tests = require("NeoAI.tests")
@@ -30,7 +30,7 @@ tests.suite("sandbox_ai_audit", function(_, it)
   it("build_text 含分级、文件与修改 diff", function(t)
     local ai = require("NeoAI.sandbox.observe.ai_audit")
     local path = vim.fn.tempname() .. ".txt"
-    local fh = io.open(path, "w")
+    local fh = assert(io.open(path, "w"))
     fh:write("line1\nline2\n")
     fh:close()
     local items = {

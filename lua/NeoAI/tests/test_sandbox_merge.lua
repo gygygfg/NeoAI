@@ -1,5 +1,5 @@
 --- 三方合并发布回归
---- @module NeoAI.tests.test_sandbox_merge
+--- @module 'NeoAI.tests.test_sandbox_merge'
 --- 覆盖发布阶段的三方合并（base/ours/theirs）：
 --- 1) 无外部改动 → 直写候选（快路径）；
 --- 2) 外部改动非重叠 → 合并写盘，保留外部改动；
@@ -163,7 +163,7 @@ tests.suite("sandbox_merge", function(_, it)
     local p = dir .. "/ac.txt"
     fs.write_file(p, theirs)
     local cand = build_modify(fs, dir, "ac.txt", base, ours)
-    local res = await(require("NeoAI.sandbox.execution.candidate").publish_async(cand))
+    local res = assert(await(require("NeoAI.sandbox.execution.candidate").publish_async(cand)))
     t.true_(res and not res.ok, "异步应冲突")
     t.eq("CONFLICT", res.state)
     t.matches("^MERGE_CONFLICT", res.reason or "", "应为合并冲突")
@@ -219,7 +219,7 @@ tests.suite("sandbox_merge", function(_, it)
     }
     local res = require("NeoAI.sandbox.execution.candidate").publish(cand)
     t.true_(res.ok, "应成功: " .. tostring(res.reason))
-    local got = fs.read_file(p)
+    local got = assert(fs.read_file(p))
     t.true_(got:find(real1, 1, true) ~= nil, "落盘应含真实密钥")
     t.false_(secret.has_token(got), "落盘不应残留 token")
     t.true_(got:find("A=10\n", 1, true) ~= nil, "应保留外部改动 A=10")

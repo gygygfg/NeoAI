@@ -1,5 +1,5 @@
 --- max_tokens 发送策略测试
---- @module NeoAI.tests.test_max_tokens
+--- @module 'NeoAI.tests.test_max_tokens'
 --- 验证：仅用户显式配置 max_tokens 时才下发；未配置则不发送该字段（由模型/厂商默认最大
 --- 输出决定）；协议必填（Anthropic）用能力表 max_output 兜底。
 
@@ -34,6 +34,7 @@ tests.suite("max_tokens_policy", function(_, it)
     local request = require("NeoAI.core.agent.request")
     local captured = nil
     local original = http.request
+    ---@diagnostic disable-next-line: duplicate-set-field
     http.request = function(opts)
       captured = opts.body
       return async.resolve(vim.json.encode({
@@ -49,18 +50,18 @@ tests.suite("max_tokens_policy", function(_, it)
   end
 
   it("未配置 max_tokens 时请求体不发送该字段", function(t)
-    local body = capture_body("deepseek", { provider = "deepseek", model = "m1", temperature = 0.5 })
+    local body = assert(capture_body("deepseek", { provider = "deepseek", model = "m1", temperature = 0.5 }))
     t.not_nil(body, "请求体应被捕获")
     t.nil_(body.max_tokens, "未配置不应发送 max_tokens")
   end)
 
   it("显式配置 max_tokens 时按值发送", function(t)
-    local body = capture_body("deepseek", { provider = "deepseek", model = "m1", temperature = 0.5, max_tokens = 1234 })
+    local body = assert(capture_body("deepseek", { provider = "deepseek", model = "m1", temperature = 0.5, max_tokens = 1234 }))
     t.eq(1234, body.max_tokens, "显式值应原样发送")
   end)
 
   it("Anthropic 必填协议未配置时用能力表兜底", function(t)
-    local body = capture_body("anthropic", { provider = "anthropic", model = "m1", temperature = 0.5 })
+    local body = assert(capture_body("anthropic", { provider = "anthropic", model = "m1", temperature = 0.5 }))
     t.not_nil(body.max_tokens, "Anthropic max_tokens 必填，应有兜底值")
     t.true_(body.max_tokens > 0, "兜底值应为正数")
   end)

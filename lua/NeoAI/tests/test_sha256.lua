@@ -1,5 +1,5 @@
 --- 纯 Lua SHA-256 专项测试
---- @module NeoAI.tests.test_sha256
+--- @module 'NeoAI.tests.test_sha256'
 --- 与 `vim.fn.sha256` 交叉校验（候选 CAS 依赖哈希一致），并覆盖工作线程内 `load(source)` 的等价性。
 
 local tests = require("NeoAI.tests")

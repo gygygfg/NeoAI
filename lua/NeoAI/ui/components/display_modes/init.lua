@@ -1,5 +1,5 @@
 --- 显示模式管理器
---- @module NeoAI.ui.components.display_modes
+--- @module 'NeoAI.ui.components.display_modes'
 --- 参照 deepseek-harness 的 Cordis 插件模型，把聊天界面的不同「显示模式」做成插件：
 --- - 每个模式是一个独立 Lua 模块（本目录下，模块名 = 模式名），模块自行向本管理器注册；
 --- - 每个插件定义 load(host) / unload(host)：激活时挂载折叠行为与渲染，停用时还原；

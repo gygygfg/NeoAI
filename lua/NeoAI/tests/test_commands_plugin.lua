@@ -1,5 +1,5 @@
 --- 命令插件（plugins.builtin.commands）专项测试
---- @module NeoAI.tests.test_commands_plugin
+--- @module 'NeoAI.tests.test_commands_plugin'
 --- 覆盖命令注册/卸载清理契约（AGENTS 约定 2）与服务缺失降级。
 local tests = require("NeoAI.tests")
 

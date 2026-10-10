@@ -1,5 +1,5 @@
 --- 沙箱待审审批界面测试
---- @module NeoAI.tests.test_sandbox_review
+--- @module 'NeoAI.tests.test_sandbox_review'
 --- 覆盖：路径级别分类、按级别高亮标记、按安全等级着色的「待审」标签、渲染与行映射。
 
 local tests = require("NeoAI.tests")
@@ -1386,7 +1386,9 @@ tests.suite("sandbox_review", function(_, it)
 
   it("git 原子组：enqueue 标记，apply 忽略文件子集整组应用，reject_file 整组拒绝", function(t)
     local review = require("NeoAI.sandbox.review.review")
+    ---@type table<string, any>
     local store = require("NeoAI.sandbox.state.store")
+    ---@type table<string, any>
     local candidate = require("NeoAI.sandbox.execution.candidate")
     review.reset()
     local dir = vim.fn.tempname()
@@ -1400,7 +1402,7 @@ tests.suite("sandbox_review", function(_, it)
         },
       }
     end
-    local item = review.enqueue(make_cand(), { tool = "git_add" })
+    local item = assert(review.enqueue(make_cand(), { tool = "git_add" }))
     t.not_nil(item, "应入队")
     t.eq("git", item.atomic_group, "应标记为 git 原子组")
     -- apply 传单文件子集也应整组应用
@@ -1417,9 +1419,9 @@ tests.suite("sandbox_review", function(_, it)
     t.true_(res.ok, "应用应成功: " .. tostring(res and res.reason))
     t.eq(3, #published, "git 原子组应忽略文件子集，整组应用")
     -- reject_file 应整组拒绝
-    local item2 = review.enqueue(make_cand(), { tool = "git_add" })
+    local item2 = assert(review.enqueue(make_cand(), { tool = "git_add" }))
     review.reject_file(item2.change_set_id, dir .. "/work.txt")
-    local after = review.get(item2.change_set_id)
+    local after = assert(review.get(item2.change_set_id))
     t.eq(review.REVIEW.REJECTED, after.review_state, "reject_file 应整组拒绝 git 原子组")
     review.reset()
   end)
@@ -1669,8 +1671,8 @@ tests.suite("sandbox_review", function(_, it)
       list_saved = function() return vim.deepcopy(saved_items) end,
       list_rejected = function() return {} end,
       apply = function(id)
-        for i, it in ipairs(pending) do
-          if it.change_set_id == id then table.remove(pending, i); break end
+        for i, pend_item in ipairs(pending) do
+          if pend_item.change_set_id == id then table.remove(pending, i); break end
         end
         saved_items[#saved_items + 1] = { change_set_id = id, tool = "edit_file",
           apply_state = "APPLIED", saved_files = { { path = cwd .. "/a.lua" } } }

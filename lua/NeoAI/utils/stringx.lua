@@ -1,5 +1,5 @@
 --- 字符串扩展
---- @module NeoAI.utils.stringx
+--- @module 'NeoAI.utils.stringx'
 --- 纯函数，无状态。
 
 local M = {}

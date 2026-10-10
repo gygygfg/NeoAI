@@ -1,5 +1,5 @@
 --- NeoAI utils 工具库入口
---- @module NeoAI.utils
+--- @module 'NeoAI.utils'
 --- 纯工具模块，无业务依赖。
 
 local M = {

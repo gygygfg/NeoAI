@@ -1,5 +1,5 @@
 --- markdown_view 渲染测试
---- @module NeoAI.tests.test_markdown
+--- @module 'NeoAI.tests.test_markdown'
 --- 验证：表格按列宽对齐（带上下边框/对齐标记）、非表格行不误渲染、转义竖线、
 --- 代码块内表格不被解析、超长内容折行、流式期间原样输出结束后对齐。
 

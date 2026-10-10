@@ -1,5 +1,5 @@
 --- 沙箱证据服务
---- @module NeoAI.sandbox.review.evidence
+--- @module 'NeoAI.sandbox.review.evidence'
 --- 保存事实、回执与过程观测；证据与裁决分离，按需分页读取（设计文档 §8/§10）。
 --- 证据只描述观测，不代替裁决；写入前对秘密字段脱敏，限制单条大小。
 
@@ -50,7 +50,7 @@ end
 
 --- 递归脱敏
 --- @param value any
---- @param depth number
+--- @param depth number|nil
 --- @return any
 local function _redact(value, depth)
   depth = depth or 0
@@ -143,7 +143,6 @@ function M.page(opts)
   local limit = opts.limit or 10
   local all = store.list_evidence()
   local items = {}
-  local seen = false
   local start = not opts.after_id
   for _, rec in ipairs(all) do
     if start and (not opts.kind or rec.kind == opts.kind) then

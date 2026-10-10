@@ -1,5 +1,5 @@
 --- 缓存命中计算（按模型机制分派）测试
---- @module NeoAI.tests.test_cache_usage
+--- @module 'NeoAI.tests.test_cache_usage'
 
 local tests = require("NeoAI.tests")
 
@@ -21,20 +21,20 @@ tests.suite("cache_usage", function(_, it)
   it("OpenAI/DeepSeek：prompt_cache_hit_tokens / cached_tokens", function(t)
     load()
     local prefix = require("NeoAI.core.agent.prefix")
-    local cu = prefix.parse_cache_usage({ prompt_tokens = 300, prompt_cache_hit_tokens = 256 }, "deepseek-v4-flash", "deepseek")
+    local cu = assert(prefix.parse_cache_usage({ prompt_tokens = 300, prompt_cache_hit_tokens = 256 }, "deepseek-v4-flash", "deepseek"))
     t.eq(256, cu.cache_read)
     t.eq(44, cu.cache_miss)
     t.true_(math.abs(cu.ratio - 256 / 300) < 1e-6)
-    local cu2 = prefix.parse_cache_usage({ prompt_tokens = 300, prompt_tokens_details = { cached_tokens = 200 } }, "deepseek-v4-flash", "deepseek")
+    local cu2 = assert(prefix.parse_cache_usage({ prompt_tokens = 300, prompt_tokens_details = { cached_tokens = 200 } }, "deepseek-v4-flash", "deepseek"))
     t.eq(200, cu2.cache_read)
   end)
 
   it("Anthropic：cache_read_input_tokens / cache_creation_input_tokens", function(t)
     load()
     local prefix = require("NeoAI.core.agent.prefix")
-    local cu = prefix.parse_cache_usage({
+    local cu = assert(prefix.parse_cache_usage({
       input_tokens = 100, cache_read_input_tokens = 900, cache_creation_input_tokens = 200,
-    }, "claude-sonnet-4", "anthropic")
+    }, "claude-sonnet-4", "anthropic"))
     t.eq(900, cu.cache_read)
     t.eq(200, cu.cache_write)
     -- 总量 = input(100) + read(900) + write(200) = 1200；未命中 = 300
@@ -45,9 +45,9 @@ tests.suite("cache_usage", function(_, it)
   it("Gemini：cachedContentTokenCount / promptTokenCount", function(t)
     load()
     local prefix = require("NeoAI.core.agent.prefix")
-    local cu = prefix.parse_cache_usage({
+    local cu = assert(prefix.parse_cache_usage({
       usageMetadata = { promptTokenCount = 1000, cachedContentTokenCount = 400, candidatesTokenCount = 50 },
-    }, "gemini-2.0-flash", "google")
+    }, "gemini-2.0-flash", "google"))
     t.eq(400, cu.cache_read)
     t.eq(600, cu.cache_miss)
     t.true_(math.abs(cu.ratio - 0.4) < 1e-6)

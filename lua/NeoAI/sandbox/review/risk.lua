@@ -1,5 +1,5 @@
 --- 沙箱安全级别评估与审批分级
---- @module NeoAI.sandbox.review.risk
+--- @module 'NeoAI.sandbox.review.risk'
 --- 把一次工具调用/外部命令的「事实」与「执行结果」映射为安全级别（L0-L3），并据此
 --- 给出审批动作（auto / record / review / block）。集中落地：
 ---   * 审批按安全级别分级（写入保护已覆盖文件改动，进程提权仅记录供异常分析）；
@@ -173,14 +173,14 @@ function M.level_name(level)
 end
 
 --- 级别徽标
---- @param level number
+--- @param level number|nil
 --- @return string
 function M.badge(level)
   return LEVEL_BADGE[level] or "L0"
 end
 
 --- 匹配危险命令模式，返回最高命中级别与原因
---- @param text string
+--- @param text string|nil
 --- @return number level
 --- @return table reasons
 local function _dangerous(text)
@@ -369,7 +369,7 @@ end
 function M.network_evasion_reason(command)
   if type(command) ~= "string" or command == "" then return nil end
   -- 还原 shell 引号拼接 / ANSI-C 引用 / 反斜杠转义（仅用于匹配，不改变实际命令）。
-  local function _norm(tok)
+  local function _norm_tok(tok)
     local s = tostring(tok)
     s = s:gsub("%$'", ""):gsub('%$"', "")
     s = s:gsub("['\"]", ""):gsub("\\", "")
@@ -378,10 +378,10 @@ function M.network_evasion_reason(command)
   -- 收集 `NAME=value`（含行首/分号后），用于展开 `$NAME`/`${NAME}`，防止变量间接绕过。
   local vars = {}
   for name, val in command:gmatch("([%a_][%w_]*)%=([^%s;|&]+)") do
-    vars[name] = _norm(val)
+    vars[name] = _norm_tok(val)
   end
   local function _expand(tok)
-    local s = _norm(tok)
+    local s = _norm_tok(tok)
     s = s:gsub("%${([%a_][%w_]*)}", function(n) return vars[n] or "" end)
     s = s:gsub("%$([%a_][%w_]*)", function(n) return vars[n] or "" end)
     return s
@@ -426,9 +426,9 @@ function M.network_evasion_reason(command)
           -- 仅把「字面空值」或「已知被赋空值的变量」视为清空代理；未展开的 `$var` 不误判
           -- （可能是合法代理变量）。
           local raw = toks[i + 1]
-          local empty = raw == nil or _norm(raw) == ""
+          local empty = raw == nil or _norm_tok(raw) == ""
           if not empty and raw then
-            local name = _norm(raw):match("^%$?{?([%a_][%w_]*)%}?$")
+            local name = _norm_tok(raw):match("^%$?{?([%a_][%w_]*)%}?$")
             if name and vars[name] == "" then empty = true end
           end
           if empty then return "PROXY_EVASION:proxy-empty" end

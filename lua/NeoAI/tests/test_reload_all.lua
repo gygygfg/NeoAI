@@ -1,5 +1,5 @@
 --- reload_all 热重载实现测试（供 :NeoAIReloadAll 命令使用的底层实现）
---- @module NeoAI.tests.test_reload_all
+--- @module 'NeoAI.tests.test_reload_all'
 
 local tests = require("NeoAI.tests")
 

@@ -1,5 +1,5 @@
 --- 沙箱后台进程（会话级常驻实例）测试
---- @module NeoAI.tests.test_sandbox_background
+--- @module 'NeoAI.tests.test_sandbox_background'
 --- 覆盖：`&`/nohup/setsid 识别（保守，避免误判 &&/重定向/中段 &）；会话级常驻沙箱实例使
 --- `run_command` 的后台进程跨工具调用存活（同一命名空间内 `ps` 可见）；非后台命令正常返回。
 
@@ -32,17 +32,17 @@ end
 tests.suite("sandbox_background", function(_, it)
   it("background.parse：识别 & / nohup / setsid，排除 && / 重定向 / 中段 &", function(t)
     local bg = require("NeoAI.sandbox.execution.background")
-    local a = bg.parse("sleep 30 &")
+    local a = assert(bg.parse("sleep 30 &"))
     t.not_nil(a, "终止 & 应识别")
     t.eq("amp", a.kind)
     t.eq("sleep 30", a.command)
 
-    local b = bg.parse("nohup server > /tmp/log 2>&1")
+    local b = assert(bg.parse("nohup server > /tmp/log 2>&1"))
     t.not_nil(b, "前导 nohup 应识别")
     t.eq("nohup", b.kind)
     t.matches("server", b.command)
 
-    local c = bg.parse("setsid /usr/bin/server &")
+    local c = assert(bg.parse("setsid /usr/bin/server &"))
     t.not_nil(c, "setsid + & 应识别")
     t.eq("amp", c.kind)
     t.matches("server", c.command)
@@ -189,7 +189,9 @@ tests.suite("sandbox_background", function(_, it)
       tools = { approval = { mode = "auto_allow" }, sandbox = resident_sandbox_config() },
     }, function()
       require("NeoAI.sandbox").reset()
-      local out, done = nil, false
+      local done = false
+      ---@type any
+      local out = nil
       -- 输出同时包含帧定界控制字节（\x1e/\x1f）、NUL 与伪造 END 标记。
       require("NeoAI.tools").execute("run_command",
         { command = "printf 'A\\036END 1 0\\037B\\000C'", description = "t" }, {})
@@ -217,14 +219,16 @@ tests.suite("sandbox_background", function(_, it)
       tools.execute("run_command", { command = "echo WARM", description = "t" }, {})
         :then_(function() d0 = true end, function() d0 = true end)
       t.true_(vim.wait(20000, function() return d0 end, 50), "预热应返回")
-      local inst = resident.active()
+      local inst = assert(resident.active())
       t.not_nil(inst, "应存在常驻实例")
       -- 直接杀掉服务器（模拟外层 OOM/信号），不调用 stop（保留 ensure_opts）。
       vim.fn.jobstop(inst.job)
       t.true_(vim.wait(5000, function() return not inst.alive end, 20), "服务器应退出")
       t.eq(nil, resident.active(), "已退出的实例不应为 active")
       -- 下一次 exec 应据 ensure_opts 自动重建并成功执行。
-      local out, done = nil, false
+      local done = false
+      ---@type any
+      local out = nil
       resident.exec("echo RECOVERED", {}):then_(
         function(r) out = r; done = true end, function(e) out = { err = e }; done = true end)
       t.true_(vim.wait(20000, function() return done end, 50), "重试应返回")
@@ -250,7 +254,7 @@ tests.suite("sandbox_background", function(_, it)
       tools.execute("run_command", { command = "echo WARM", description = "t" }, {})
         :then_(function() d0 = true end, function() d0 = true end)
       t.true_(vim.wait(20000, function() return d0 end, 50), "预热应返回")
-      local inst = resident.active()
+      local inst = assert(resident.active())
       t.not_nil(inst, "应存在常驻实例")
       -- 制造协议失步：帧头声明超大载荷长度但不发送载荷，使服务器阻塞在 `head -c`，
       -- 读取循环停摆（后续请求全部排队）。

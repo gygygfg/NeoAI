@@ -1,5 +1,5 @@
 --- 沙箱权限档位与自动提权
---- @module NeoAI.sandbox.execution.privilege
+--- @module 'NeoAI.sandbox.execution.privilege'
 --- 为外部进程定义分级权限档位（最小权限 → 提权 → 特权），把「命令所需权限」
 --- 映射为具体隔离参数（cap_add / 额外挂载 / 解除遮蔽 / 网络 / 嵌套 userns）。
 ---
@@ -533,12 +533,12 @@ end
 --- `package`：任一命令段命中包管理器（用于风险封顶、审批合并、可写根，以及按需授予
 --- `packages.cap_add` 窄能力——链式命令如 `apt-get install …; echo; tail` 也需这些能力）。
 --- `package_all`：**所有**段都是包管理器（或 tee 等良性伴随段）；仅作统计/展示标记。
---- @param tool string|nil
+--- @param _ string|nil
 --- @param args table|nil
 --- @param spec table|nil { effect }
 --- @param opts table|nil { effective_command?=string } 折叠脚本间接执行后的命令文本
 --- @return table { tier, reasons, docker, container, network, package, package_all, sysadmin, apt }
-function M.classify(tool, args, spec, opts)
+function M.classify(_, args, spec, opts)
   local cfg = _cfg()
   if cfg.enabled == false then
     return { tier = M.TIER.MINIMAL, reasons = { "PRIVILEGE_DISABLED" }, docker = false, container = false, network = false, package = false, package_all = false, sysadmin = false, apt = false }

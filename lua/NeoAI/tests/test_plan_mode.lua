@@ -1,5 +1,5 @@
 --- 计划模式测试
---- @module NeoAI.tests.test_plan_mode
+--- @module 'NeoAI.tests.test_plan_mode'
 
 local tests = require("NeoAI.tests")
 
@@ -108,6 +108,7 @@ tests.suite("plan_mode", function(_, it)
     local items3 = pm.plan_to_todos("随便一段没有结构的文字")
     t.eq(1, #items3)
     t.eq(0, #pm.plan_to_todos(""))
+    ---@diagnostic disable-next-line: param-type-mismatch
     t.eq(0, #pm.plan_to_todos(nil))
   end)
 
@@ -124,6 +125,7 @@ tests.suite("plan_mode", function(_, it)
     local todo = require("NeoAI.tools.builtin.todo")
     local registry = require("NeoAI.tools.registry")
     local async = require("NeoAI.utils.async")
+    ---@type table<string, any>
     local pd = require("NeoAI.core.session.plan_distill")
     local pm = require("NeoAI.tools.builtin.plan_mode")
     chat_service.reset()
@@ -145,7 +147,9 @@ tests.suite("plan_mode", function(_, it)
     agent:add_message("assistant", plan_message)
 
     local result = chat_service.approve_plan({ auto_execute = false })
-    local done, val = false, nil
+    local done = false
+    ---@type any
+    local val = nil
     result:then_(function(v) done = true; val = v end, function(e) done = true; val = e end)
     vim.wait(2000, function() return done end, 5)
     pd.run = orig_run
@@ -158,7 +162,7 @@ tests.suite("plan_mode", function(_, it)
     t.eq("chat", chat_service.get_mode())
     t.eq(plan_message, agent.plan)
     -- 任务清单已建立（由计划提取的步骤经 todo_write 写入）
-    local items = todo.get(agent.session_id)
+    local items = assert(todo.get(agent.session_id))
     t.not_nil(items)
     t.eq(3, #items)
     t.eq("pending", items[1].status)
@@ -217,8 +221,10 @@ tests.suite("plan_mode", function(_, it)
     tool_service.reset()
     t.eq("chat", chat_service.get_mode(), "初始应为 CHAT")
     t.eq("plan", chat_service.cycle_mode(), "第一次切到 PLAN")
+    ---@diagnostic disable-next-line: param-type-mismatch
     t.true_(pm.is_active(chat_service.get_current_agent()))
     t.eq("chat", chat_service.cycle_mode(), "第二次回到 CHAT")
+    ---@diagnostic disable-next-line: param-type-mismatch
     t.false_(pm.is_active(chat_service.get_current_agent()))
     chat_service.reset()
     tool_service.reset()
@@ -283,3 +289,4 @@ tests.suite("plan_mode", function(_, it)
     tool_service.reset()
   end)
 end)
+

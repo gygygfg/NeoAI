@@ -1,5 +1,5 @@
 --- 内置插件目录与默认组合
---- @module NeoAI.plugins.catalog
+--- @module 'NeoAI.plugins.catalog'
 --- 把现有功能登记为可替换服务与副作用插件，并处理配置覆盖：
 ---   plugins.builtin        -- false 时不登记任何内置插件
 ---   plugins.disabled       -- 禁用的插件/服务 id 列表

@@ -1,5 +1,5 @@
 --- 沙箱持久化存储：候选与发布回执
---- @module NeoAI.sandbox.state.store
+--- @module 'NeoAI.sandbox.state.store'
 --- 状态与文件系统不共享事务，通过可查询回执对账（设计文档 §4.5/§6.3）。
 
 local json = require("NeoAI.utils.json")
@@ -154,7 +154,7 @@ end
 --- @param digest string
 --- @return string 安全文件名
 local function _safe_name(digest)
-  return (digest or "unknown"):gsub("[^%w_%-]", "_")
+  return ((digest or "unknown"):gsub("[^%w_%-]", "_"))
 end
 
 --- 拒绝副本文件名：同一 change_set 的候选摘要唯一（摘要即内容寻址）；host_op 无候选时用
@@ -462,6 +462,7 @@ end
 --- 写入候选（冻结）
 --- @param candidate table
 --- @return boolean ok
+--- @return string|nil err
 function M.write_candidate(candidate)
   if require("NeoAI.sandbox.observe.fault").hit("store") then return false, "injected store failure" end
   if not _ensure_dirs() then return false end
@@ -822,8 +823,6 @@ function M.delete_host_op(host_op_id)
   return fs.delete_file(path)
 end
 
---- 写入应用快照（保存时保留原文件版本，供撤销保存时交换）
---- @param record table { snapshot_id }
 --- 快照元数据（剥离 `alt_content`）：审批界面列示已保存项无需原始内容，落盘小文件避免
 --- 每次开窗全量解码含原文件内容的快照。
 --- @param record table
@@ -841,6 +840,8 @@ local function _snapshot_meta(record)
   return meta
 end
 
+--- 写入应用快照（保存时保留原文件版本，供撤销保存时交换）
+--- @param record table { snapshot_id }
 --- @return boolean ok
 function M.write_snapshot(record)
   if not _ensure_dirs() then return false end

@@ -1,5 +1,5 @@
 --- 沙箱运维：run_command 一致性/保留期清理/加固收尾/审批条目
---- @module NeoAI.tests.test_sandbox_ops
+--- @module 'NeoAI.tests.test_sandbox_ops'
 --- 由原 test_sandbox.lua 按用例分片而来（43 个用例，彼此独立、无跨用例共享状态）。
 
 local tests = require("NeoAI.tests")
@@ -82,7 +82,7 @@ tests.suite("sandbox_ops", function(_, it)
       sandbox.reset()
       local evidence = require("NeoAI.sandbox.review.evidence")
       local id = evidence.add("test", { token = "secret", nested = { password = "x", ok = 1 } }, { tool = "t" })
-      local rec = evidence.get(id)
+      local rec = assert(evidence.get(id))
       t.eq("[redacted]", rec.payload.token, "token 应脱敏")
       t.eq("[redacted]", rec.payload.nested.password, "嵌套 password 应脱敏")
       t.eq(1, rec.payload.nested.ok)
@@ -329,8 +329,8 @@ tests.suite("sandbox_ops", function(_, it)
       local done = false
       run(p1, "a2\n", function()
         run(p2, "b2\n", function()
-          for _, it in ipairs(sandbox.list_reviews({ review_state = "PENDING" })) do
-            pending = pending + 1; ids[#ids + 1] = it.change_set_id
+          for _, rev_item in ipairs(sandbox.list_reviews({ review_state = "PENDING" })) do
+            pending = pending + 1; ids[#ids + 1] = rev_item.change_set_id
           end
           t.eq(2, pending, "应有两个待审变更单元")
           local set = sandbox.prepare_publication_set(ids)
@@ -405,7 +405,7 @@ tests.suite("sandbox_ops", function(_, it)
     local cgroup = require("NeoAI.sandbox.execution.cgroup")
     local caps = cgroup.probe()
     if not caps.available then return end
-    local h = cgroup.prepare("test_attempt_cg", { pids = 4, memory_bytes = 64 * 1024 * 1024 })
+    local h = assert(cgroup.prepare("test_attempt_cg", { pids = 4, memory_bytes = 64 * 1024 * 1024 }))
     t.not_nil(h, "应能创建资源域")
     t.eq(1, vim.fn.isdirectory(h.path), "资源域目录应存在")
     local pids = vim.fn.readfile(h.path .. "/pids.max")
@@ -665,7 +665,7 @@ tests.suite("sandbox_ops", function(_, it)
         local s = tostring(r)
         t.true_(not s:find("/.cache-", 1, true), "不应泄露 overlay 私有基目录，实际: " .. s)
         if store.root() and store.root() ~= "" then
-          t.true_(not s:find(store.root(), 1, true), "不应泄露沙箱存储根")
+          t.true_(not s:find(store.root() or "", 1, true), "不应泄露沙箱存储根")
         end
         -- 若存在 lowerdir 行，其路径必须已被替换为 hidden
         if s:find("lowerdir=", 1, true) then
@@ -721,7 +721,7 @@ tests.suite("sandbox_ops", function(_, it)
         done = true
       end, function(e) t.true_(false, tostring(e and e.message or e)); done = true end)
       t.true_(vim.wait(8000, function() return done end), "命令应完成")
-      t.true_(out:find("CapEff:%s*0*[1-9a-f]") ~= nil, "cap_add={ALL} 应持有完整 root 能力")
+      t.true_(assert(out):find("CapEff:%s*0*[1-9a-f]") ~= nil, "cap_add={ALL} 应持有完整 root 能力")
       t.matches("Seccomp:%s*2", out, "应加载 seccomp 过滤器")
     end)
     -- 前缀级（最小权限模式下）：含包管理器的命令（含链式）按需加回窄能力；普通命令不加回。
@@ -731,7 +731,7 @@ tests.suite("sandbox_ops", function(_, it)
       local req = privilege.classify("run_command", { command = cmd }, spec)
       local r = privilege.resolve(req.tier, req)
       t.true_(r.ok, "应可解析: " .. cmd)
-      return table.concat(runtime.process_prefix({ cwd = "/tmp", privileges = r.privileges }), " ")
+      return table.concat(assert(runtime.process_prefix({ cwd = "/tmp", privileges = r.privileges })), " ")
     end
     with_config({ tools = { sandbox = { cap_add = {} } } }, function()
       local pkg = prefix_for("apt-get install -y build-essential")
@@ -849,12 +849,13 @@ tests.suite("sandbox_ops", function(_, it)
           sandbox.approve(parent.change_set_id) -- 旧版已批准但未应用
           local child = sandbox.derive_revision(parent.change_set_id, { contents = { [p] = "v3\n" } })
           t.not_nil(child, "应派生出新 revision")
+          assert(child)
           t.eq(2, child.revision)
           t.eq(parent.change_set_id, child.supersedes)
           -- 原变更单元应标记 SUPERSEDED（不迁移旧批准）
           local parent_state
-          for _, it in ipairs(sandbox.list_reviews()) do
-            if it.change_set_id == parent.change_set_id then parent_state = it.review_state end
+          for _, rev_item in ipairs(sandbox.list_reviews()) do
+            if rev_item.change_set_id == parent.change_set_id then parent_state = rev_item.review_state end
           end
           t.eq("SUPERSEDED", parent_state, "原变更单元应标记 SUPERSEDED")
           local res = sandbox.apply(child.change_set_id, { auto_approve = true })
@@ -1062,7 +1063,7 @@ tests.suite("sandbox_ops", function(_, it)
         candidate_digest = "sha256:missing", created_at = os.time(), effect = "fs_write",
         files = { { path = "/tmp/neoai_missing.txt", action = "create", after_hash = "h", content = "x" } },
       }
-      local item = review.enqueue(missing, { id = "cs_keep_missing", tool = "edit_file" })
+      local item = assert(review.enqueue(missing, { id = "cs_keep_missing", tool = "edit_file" }))
       t.not_nil(item)
       local res = review.apply(item.change_set_id, { auto_approve = true })
       t.false_(res.ok, "候选缺失时应用应失败")
@@ -1080,7 +1081,7 @@ tests.suite("sandbox_ops", function(_, it)
           after_hash = "sha256:new", content = "next\n" } },
       }
       store.write_candidate(cand)
-      local it2 = review.enqueue(cand, { id = "cs_keep_conflict", tool = "edit_file" })
+      local it2 = assert(review.enqueue(cand, { id = "cs_keep_conflict", tool = "edit_file" }))
       local res2 = review.apply(it2.change_set_id, { auto_approve = true })
       t.false_(res2.ok, "基线变化时应用应冲突")
       t.eq("CONFLICT", res2.state)
@@ -1088,5 +1089,59 @@ tests.suite("sandbox_ops", function(_, it)
       t.eq(2, #pending2, "冲突后条目仍应在待审队列中")
       fs.delete_file(p)
     end)
+  end)
+
+  it("发布：rmdir/delete 目标已不存在时幂等成功", function(t)
+    local fs = require("NeoAI.utils.fs")
+    local writer = require("NeoAI.sandbox.execution.writer")
+    local root = fs.canonical(vim.fn.tempname())
+    fs.ensure_dir(root)
+    local r1 = writer.apply("rmdir", root .. "/gone", nil, {})
+    t.true_(r1.ok, "rmdir 不存在的目录应成功: " .. tostring(r1.err or r1.reason))
+    local r2 = writer.apply("delete", root .. "/nofile.txt", nil, {})
+    t.true_(r2.ok, "delete 不存在的文件应成功: " .. tostring(r2.err or r2.reason))
+    fs.delete_file(root)
+  end)
+
+  it("发布：非原子整包部分写入失败仅失败该文件，其余照常应用", function(t)
+    local fs = require("NeoAI.utils.fs")
+    local candidate = require("NeoAI.sandbox.execution.candidate")
+    local root = fs.canonical(vim.fn.tempname())
+    fs.ensure_dir(root)
+    -- blocker 是普通文件；向其下方写子文件必然失败（无法在文件下建目录）。
+    local blocker = root .. "/blocker"
+    fs.write_file(blocker, "x")
+    local ok_file = root .. "/ok.txt"
+    local bad_path = blocker .. "/child.txt"
+    local res = candidate.publish({
+      candidate_digest = "sha256:partial_test",
+      files = {
+        { path = bad_path, action = "create", content = "bad\n" },
+        { path = ok_file, action = "create", content = "ok\n" },
+      },
+    })
+    t.eq("PARTIAL", res.state, "应报告部分应用: " .. tostring(res.reason))
+    t.false_(res.ok, "部分应用 ok 应为 false")
+    t.eq(1, #(res.applied or {}), "应有一个文件应用成功")
+    t.eq(ok_file, res.applied[1], "成功文件应为 ok_file")
+    t.eq(1, #(res.failed or {}), "应有一个文件失败")
+    t.eq(bad_path, res.failed[1].path, "失败文件应为 bad_path")
+    t.true_(fs.exists(ok_file), "ok_file 应已落盘")
+
+    -- 原子整组（如 git）：任一失败即整体失败，不写入其他文件。
+    local nf = root .. "/never.txt"
+    local res2 = candidate.publish({
+      candidate_digest = "sha256:atomic_test",
+      files = {
+        { path = bad_path, action = "create", content = "bad\n" },
+        { path = nf, action = "create", content = "no\n" },
+      },
+    }, { atomic = true })
+    t.eq("FAILED", res2.state, "原子组应整体失败")
+    t.false_(fs.exists(nf), "原子组失败时不应写入其他文件")
+
+    fs.delete_file(blocker)
+    fs.delete_file(ok_file)
+    fs.delete_file(root)
   end)
 end)

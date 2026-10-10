@@ -1,5 +1,5 @@
 --- Git 操作工具
---- @module NeoAI.tools.builtin.git_ops
+--- @module 'NeoAI.tools.builtin.git_ops'
 --- Git 只读操作（diff/log/status/branch）与 rollback/commit。
 
 local async = require("NeoAI.utils.async")
@@ -174,12 +174,11 @@ local git_tools = {}
 
 git_tools.git_status = helpers.define_tool(
   "git_status",
-  "查看 git 状态（--short）。repo 可选（目标仓库目录，缺省=当前会话仓库）。"
-    .. "输出过长时截断为头+尾并把完整输出落盘到沙箱私有 /tmp（结果中给出路径，可用 read_file 回读）。",
+  "查看 git 状态（--short）。同 opencode git status。",
   {
     type = "object",
     properties = {
-      repo = { type = "string", description = "目标 git 仓库目录（缺省=当前会话仓库）" },
+      repo = { type = "string", description = "仓库目录（缺省=会话仓库）" },
     },
     required = {},
   },
@@ -193,13 +192,12 @@ git_tools.git_status = helpers.define_tool(
 
 git_tools.git_diff = helpers.define_tool(
   "git_diff",
-  "查看未提交的改动（git diff）。file_path 可选；repo 可选（目标仓库目录，缺省=当前会话仓库）。"
-    .. "输出过长时截断为头+尾并把完整输出落盘到沙箱私有 /tmp（结果中给出路径，可用 read_file 回读）。",
+  "查看未提交改动（git diff）。file_path 可选。",
   {
     type = "object",
     properties = {
       file_path = { type = "string" },
-      repo = { type = "string", description = "目标 git 仓库目录（缺省=当前会话仓库）" },
+      repo = { type = "string", description = "仓库目录（缺省=会话仓库）" },
     },
     required = {},
   },
@@ -214,14 +212,13 @@ git_tools.git_diff = helpers.define_tool(
 
 git_tools.git_log = helpers.define_tool(
   "git_log",
-  "查看提交历史。max 可选（默认 20）；path 可选（pathspec 文件路径）；repo 可选（目标仓库目录，缺省=当前会话仓库）。"
-    .. "输出过长时截断为头+尾并把完整输出落盘到沙箱私有 /tmp（结果中给出路径，可用 read_file 回读）。",
+  "查看提交历史。max 可选（默认 20）；path 可选（pathspec 文件路径）。",
   {
     type = "object",
     properties = {
       max = { type = "integer" },
       path = { type = "string", description = "pathspec 文件路径（限定历史范围）" },
-      repo = { type = "string", description = "目标 git 仓库目录（缺省=当前会话仓库）" },
+      repo = { type = "string", description = "仓库目录（缺省=会话仓库）" },
     },
     required = {},
   },
@@ -237,13 +234,12 @@ git_tools.git_log = helpers.define_tool(
 
 git_tools.git_commit_detail = helpers.define_tool(
   "git_commit_detail",
-  "查看某次提交详情。ref 必填；repo 可选（目标仓库目录，缺省=当前会话仓库）。"
-    .. "输出过长时截断为头+尾并把完整输出落盘到沙箱私有 /tmp（结果中给出路径，可用 read_file 回读）。",
+  "查看某次提交详情（git show --stat）。ref 必填。",
   {
     type = "object",
     properties = {
       ref = { type = "string" },
-      repo = { type = "string", description = "目标 git 仓库目录（缺省=当前会话仓库）" },
+      repo = { type = "string", description = "仓库目录（缺省=会话仓库）" },
     },
     required = { "ref" },
   },
@@ -257,12 +253,11 @@ git_tools.git_commit_detail = helpers.define_tool(
 
 git_tools.git_branch = helpers.define_tool(
   "git_branch",
-  "查看分支列表（-a）。repo 可选（目标仓库目录，缺省=当前会话仓库）。"
-    .. "输出过长时截断为头+尾并把完整输出落盘到沙箱私有 /tmp（结果中给出路径，可用 read_file 回读）。",
+  "查看分支列表（-a）。",
   {
     type = "object",
     properties = {
-      repo = { type = "string", description = "目标 git 仓库目录（缺省=当前会话仓库）" },
+      repo = { type = "string", description = "仓库目录（缺省=会话仓库）" },
     },
     required = {},
   },
@@ -276,14 +271,13 @@ git_tools.git_branch = helpers.define_tool(
 
 git_tools.git_file_history = helpers.define_tool(
   "git_file_history",
-  "查看文件历史。file_path 必填；max 可选；repo 可选（目标仓库目录，缺省=当前会话仓库）。"
-    .. "输出过长时截断为头+尾并把完整输出落盘到沙箱私有 /tmp（结果中给出路径，可用 read_file 回读）。",
+  "查看文件历史。file_path 必填；max 可选（默认 20）。",
   {
     type = "object",
     properties = {
       file_path = { type = "string" },
       max = { type = "integer" },
-      repo = { type = "string", description = "目标 git 仓库目录（缺省=当前会话仓库）" },
+      repo = { type = "string", description = "仓库目录（缺省=会话仓库）" },
     },
     required = { "file_path" },
   },
@@ -303,13 +297,13 @@ git_tools.git_file_history = helpers.define_tool(
 
 git_tools.git_add = helpers.define_tool(
   "git_add",
-  "暂存文件（git add）。paths 可选（数组）；all=true 暂存全部改动；repo 可选（目标仓库目录，缺省=当前会话仓库）。改动进入审批待确认。",
+  "暂存文件（git add）。paths 数组 或 all=true。改动进入审批。",
   {
     type = "object",
     properties = {
       paths = { type = "array", items = { type = "string" } },
       all = { type = "boolean" },
-      repo = { type = "string", description = "目标 git 仓库目录（缺省=当前会话仓库）" },
+      repo = { type = "string", description = "仓库目录（缺省=会话仓库）" },
     },
     required = {},
   },
@@ -343,13 +337,13 @@ git_tools.git_add = helpers.define_tool(
 
 git_tools.git_commit = helpers.define_tool(
   "git_commit",
-  "提交已暂存改动（git commit）。message 必填；all=true 先暂存已跟踪文件（-a）；repo 可选（目标仓库目录，缺省=当前会话仓库）。改动进入审批待确认。",
+  "提交已暂存改动（git commit）。message 必填；all=true 走 -a。改动进入审批。",
   {
     type = "object",
     properties = {
       message = { type = "string" },
       all = { type = "boolean" },
-      repo = { type = "string", description = "目标 git 仓库目录（缺省=当前会话仓库）" },
+      repo = { type = "string", description = "仓库目录（缺省=会话仓库）" },
     },
     required = { "message" },
   },
@@ -369,14 +363,14 @@ git_tools.git_commit = helpers.define_tool(
 
 git_tools.git_stash = helpers.define_tool(
   "git_stash",
-  "管理 stash（git stash）。action: push|pop|apply|drop|list；message/include_untracked 仅 push 用；repo 可选（目标仓库目录，缺省=当前会话仓库）。改动进入审批待确认。",
+  "管理 stash（push|pop|apply|drop|list）。message/include_untracked 仅 push 用。改动进入审批。",
   {
     type = "object",
     properties = {
       action = { type = "string", enum = { "push", "pop", "apply", "drop", "list" } },
       message = { type = "string" },
       include_untracked = { type = "boolean" },
-      repo = { type = "string", description = "目标 git 仓库目录（缺省=当前会话仓库）" },
+      repo = { type = "string", description = "仓库目录（缺省=会话仓库）" },
     },
     required = { "action" },
   },
@@ -404,21 +398,18 @@ git_tools.git_stash = helpers.define_tool(
 
 git_tools.git_restore = helpers.define_tool(
   "git_restore",
-  "将单个文件回滚/还原到指定提交（git checkout <commit> -- <file_path>）。"
-    .. "file_path 必填；commit 可选（默认 HEAD）：必须是精确的 git 修订（提交哈希 / HEAD / HEAD~N / 标签 / 分支）。"
-    .. "默认 HEAD 仅丢弃该文件在 HEAD 之后尚未提交的工作区改动，是最安全的默认值。"
-    .. "除非用户明确指定目标版本，一律使用默认 HEAD；禁止臆测或用 HEAD~N、旧提交回退多个版本。"
-    .. "若用户要求回退到某历史版本但未给哈希，先用 git_file_history / git_log 查出精确提交，"
-    .. "向用户复述该提交（哈希+信息）并确认，再用 confirm_multi=true 重试。"
-    .. "跨多个版本（落后 HEAD 超过 1 个提交）而未置 confirm_multi=true 会被拒绝。"
-    .. "repo 可选（目标仓库目录，缺省=当前会话仓库）。改动进入审批待确认。",
+  "将单个文件回滚到指定提交（git checkout <commit> -- <file_path>）。"
+    .. "file_path 必填；commit 默认 HEAD（仅丢弃该文件未提交的工作区改动，最安全）。"
+    .. "除用户明确指定外一律用 HEAD；禁止臆测或用 HEAD~N/旧提交回退多个版本。"
+    .. "若需回退到某历史版本，先用 git_file_history/git_log 查出精确提交、向用户复述确认，再置 confirm_multi=true。"
+    .. "跨多个版本而未置 confirm_multi=true 会被拒绝。改动进入审批。",
   {
     type = "object",
     properties = {
       file_path = { type = "string", description = "要还原的文件路径（相对会话仓库或绝对路径）" },
       commit = { type = "string", description = "目标精确修订（默认 HEAD=仅丢弃未提交改动）；禁止臆测旧版本" },
       confirm_multi = { type = "boolean", description = "仅当用户已明确点名目标版本、确认跨多个版本回退时才置 true" },
-      repo = { type = "string", description = "目标 git 仓库目录（缺省=当前会话仓库）" },
+      repo = { type = "string", description = "仓库目录（缺省=会话仓库）" },
     },
     required = { "file_path" },
   },

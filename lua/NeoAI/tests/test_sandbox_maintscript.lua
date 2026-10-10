@@ -1,5 +1,5 @@
 --- 沙箱 systemd 门面入口与维护脚本兼容桩专项测试
---- @module NeoAI.tests.test_sandbox_maintscript
+--- @module 'NeoAI.tests.test_sandbox_maintscript'
 --- 覆盖：process_prefix 把极薄入口覆盖绑定到真实二进制路径、包安装注入 policy-rc.d；
 --- 入口经文件 IPC 转发到 Lua 门面（stdout/stderr/退出码与真实 systemctl 一致）。
 
@@ -52,14 +52,14 @@ tests.suite("sandbox_maintscript", function(_, it)
   it("process_prefix：入口覆盖绑定真实二进制路径（不再前置非标准 PATH）", function(t)
     local runtime = require("NeoAI.sandbox.execution.runtime")
     if runtime.backend() ~= "bwrap" then return end
-    local prefix = runtime.process_prefix({
+    local prefix = assert(runtime.process_prefix({
       cwd = "/tmp",
       privileges = { cap_add = {}, unmask = {}, mounts = {} },
-    })
+    }))
     t.not_nil(prefix, "应能构造前缀")
     local joined = table.concat(prefix, " ")
     t.true_(joined:find("/tmp/.dynbin", 1, true) == nil, "不应再前置 /tmp/.dynbin")
-    local src = src_for(prefix, "/usr/bin/systemctl")
+    local src = assert(src_for(prefix, "/usr/bin/systemctl"))
     t.not_nil(src, "应把入口绑定到 /usr/bin/systemctl")
     t.matches("/sd%-bin/systemctl$", src, "入口源应为生成的 systemctl 桩")
     t.not_nil(src_for(prefix, "/usr/bin/journalctl"), "应绑定 journalctl 入口")
@@ -87,11 +87,11 @@ tests.suite("sandbox_maintscript", function(_, it)
     if runtime.backend() ~= "bwrap" then return end
     local ipc = require("NeoAI.sandbox.systemd.systemd_ipc")
     local hostdir = ipc.ensure()
-    local prefix = runtime.process_prefix({
+    local prefix = assert(runtime.process_prefix({
       cwd = "/tmp",
       privileges = { cap_add = {}, unmask = {}, mounts = {} },
-    })
-    local src = src_for(prefix, "/usr/bin/systemctl")
+    }))
+    local src = assert(src_for(prefix, "/usr/bin/systemctl"))
     t.not_nil(src, "应能定位入口桩")
     -- policy-rc.d 语义
     local policy = src:gsub("/systemctl$", "/policy-rc.d")
@@ -99,14 +99,14 @@ tests.suite("sandbox_maintscript", function(_, it)
     t.eq(101, vim.v.shell_error, "policy-rc.d 应退出 101")
 
     -- 把入口的 guest IPC 目录改写到宿主实际目录后执行，验证完整转发链路。
-    local f = io.open(src, "rb")
+    local f = assert(io.open(src, "rb"))
     t.not_nil(f, "入口桩应可读")
     local raw = f:read("*a")
     f:close()
     raw = raw:gsub("/run/systemd/units", hostdir)
     local copy = vim.fn.tempname() .. "/systemctl"
     vim.fn.mkdir(vim.fn.fnamemodify(copy, ":h"), "p")
-    local w = io.open(copy, "wb")
+    local w = assert(io.open(copy, "wb"))
     w:write(raw)
     w:close()
     vim.uv.fs_chmod(copy, tonumber("0755", 8))

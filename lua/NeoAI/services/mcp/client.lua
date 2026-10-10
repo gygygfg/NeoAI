@@ -1,5 +1,5 @@
 --- MCP JSON-RPC 2.0 客户端（传输无关）
---- @module NeoAI.services.mcp.client
+--- @module 'NeoAI.services.mcp.client'
 --- 管理 id 关联、请求超时与取消（notifications/cancelled）、服务器主动请求/通知分发、
 --- initialize/initialized 握手、断线重连。传输层（stdio/http）见 transports.lua。
 --- 纯异步，基于 utils/async 的 Deferred。
@@ -28,13 +28,6 @@ local ERROR_CODES = {
 --- @return table
 local function _rpc_error(code, message, err_data)
   return { code = code, message = message or "", data = err_data }
-end
-
---- 判断错误是否为「客户端可取消」类（超时/取消，而非协议内部错误）
---- @param err table|nil
---- @return boolean
-local function _is_client_abort(err)
-  return err and (err.kind == "timeout" or err.kind == "cancelled" or err.kind == "aborted")
 end
 
 -- ========== 构造函数 ==========

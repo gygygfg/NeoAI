@@ -1,5 +1,5 @@
 --- 沙箱命名空间视图 I/O（进程内文件工具用）
---- @module NeoAI.sandbox.execution.ns_fs
+--- @module 'NeoAI.sandbox.execution.ns_fs'
 --- 「overlay 为权威暂存层」下的进程内工具 I/O 适配：
 ---   * 写入：工具产出的**视图内容**（可能含密钥 token）→ `secret.detokenize` → 经 `file_bridge`
 ---     在 mount 命名空间内写入 overlay 暂存层（真实工作区在发布前不受影响）。

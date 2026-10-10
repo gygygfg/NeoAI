@@ -1,5 +1,5 @@
 --- 可暂停工具计时器测试
---- @module NeoAI.tests.test_timer
+--- @module 'NeoAI.tests.test_timer'
 --- 覆盖：暂停期间不累计耗时、暂停期间不触发超时（等待审批/ask_user 的场景）、
 --- 恢复后按剩余活跃预算触发超时、stop 后 elapsed 为累计活跃耗时。
 
@@ -83,7 +83,7 @@ tests.suite("timer", function(_, it)
     -- 交互式工具：600ms 后自动"回答"，远超 100ms 超时预算；工具应成功且耗时接近 0
     registry.register(helpers.define_tool(
       "wait_ui_tool", "等待用户", { type = "object", properties = {}, required = {} },
-      function(args, on_success, on_error, ctx)
+      function(_, on_success, _, ctx)
         if ctx and ctx.timer and ctx.timer.pause then pcall(ctx.timer.pause, ctx.timer) end
         vim.defer_fn(function()
           if ctx and ctx.timer and ctx.timer.resume then pcall(ctx.timer.resume, ctx.timer) end

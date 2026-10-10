@@ -1,5 +1,5 @@
 --- 增量渲染基础设施
---- @module NeoAI.ui.components.incremental
+--- @module 'NeoAI.ui.components.incremental'
 --- 聊天界面增量刷新的公共实现：
 --- - 行差异计算（最长公共前缀 / 后缀）与局部写入（无差异时完全不触碰 buffer）；
 --- - 块级渲染缓存：按「块 key + 签名」复用未变化块的渲染结果，避免整段重新渲染；

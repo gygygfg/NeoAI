@@ -1,5 +1,5 @@
 --- 沙箱网络访问同意专项测试
---- @module NeoAI.tests.test_net_consent
+--- @module 'NeoAI.tests.test_net_consent'
 --- 覆盖：沙箱内部进程/端口免权限；访问沙箱外按策略 ask/allow/deny；ask 时弹窗决策；
 --- 本次会话记住同意；headless 无 UI 失败关闭。
 
@@ -79,7 +79,7 @@ tests.suite("net_consent", function(_, it)
     local port, close_srv = echo_server()
     nc.register_internal_port(port)
     t.true_(nc.is_internal_port(port), "登记后应判定为内部端口")
-    local addr = hp.start("127.0.0.1", 0)
+    local addr = assert(hp.start("127.0.0.1", 0))
     local resp = tcp_exchange(addr.host, addr.port,
       ("CONNECT 127.0.0.1:%d HTTP/1.1\r\n\r\n"):format(port))
     t.matches("200 Connection Established", resp, "内部端口应免权限放行")
@@ -95,7 +95,7 @@ tests.suite("net_consent", function(_, it)
     hp.reset()
     nc.reset()
     local port, close_srv = echo_server()
-    local addr = hp.start("127.0.0.1", 0)
+    local addr = assert(hp.start("127.0.0.1", 0))
     local resp = tcp_exchange(addr.host, addr.port,
       ("CONNECT 127.0.0.1:%d HTTP/1.1\r\n\r\n"):format(port))
     t.matches("403", resp, "无 UI 时应失败关闭")
@@ -115,7 +115,7 @@ tests.suite("net_consent", function(_, it)
 
     -- allow_once
     nc.set_ui({ show = function(_, decide) decide("allow_once") end })
-    local a1 = hp.start("127.0.0.1", 0)
+    local a1 = assert(hp.start("127.0.0.1", 0))
     local r1 = tcp_exchange(a1.host, a1.port,
       ("CONNECT 127.0.0.1:%d HTTP/1.1\r\n\r\n"):format(port))
     t.matches("200 Connection Established", r1, "同意后应放行")
@@ -123,7 +123,7 @@ tests.suite("net_consent", function(_, it)
 
     -- deny
     nc.set_ui({ show = function(_, decide) decide("deny") end })
-    local a2 = hp.start("127.0.0.1", 0)
+    local a2 = assert(hp.start("127.0.0.1", 0))
     local r2 = tcp_exchange(a2.host, a2.port,
       ("CONNECT 127.0.0.1:%d HTTP/1.1\r\n\r\n"):format(port))
     t.matches("403", r2, "拒绝后应 403")
@@ -132,14 +132,14 @@ tests.suite("net_consent", function(_, it)
     -- allow_session 记住（随后即使无 UI 也放行）——按 (端口, 服务进程) 颗粒度记忆
     local seen_owner
     nc.set_ui({ show = function(ctx, decide) seen_owner = ctx.owner; decide("allow_session") end })
-    local a3 = hp.start("127.0.0.1", 0)
+    local a3 = assert(hp.start("127.0.0.1", 0))
     local r3 = tcp_exchange(a3.host, a3.port,
       ("CONNECT 127.0.0.1:%d HTTP/1.1\r\n\r\n"):format(port))
     t.matches("200 Connection Established", r3, "会话允许后应放行")
     hp.stop()
     nc.set_ui(nil)
     t.true_(nc.is_session_allowed("127.0.0.1", port, seen_owner), "应记住会话同意（端口+进程）")
-    local a4 = hp.start("127.0.0.1", 0)
+    local a4 = assert(hp.start("127.0.0.1", 0))
     local r4 = tcp_exchange(a4.host, a4.port,
       ("CONNECT 127.0.0.1:%d HTTP/1.1\r\n\r\n"):format(port))
     t.matches("200 Connection Established", r4, "会话内再次访问应免弹窗")
@@ -155,6 +155,7 @@ tests.suite("net_consent", function(_, it)
     local saved = services.use("services.sandbox")
     services.revoke("services.sandbox")
     ui.reset()
+    ---@type any
     local captured = nil
     ui.init() -- 沙箱服务尚未就绪（phase 2 晚于 ui phase 1）
     t.eq(nil, captured, "沙箱未就绪时无目标可注册")
@@ -172,14 +173,14 @@ tests.suite("net_consent", function(_, it)
     nc.reset()
     local port, close_srv = echo_server()
     -- 覆盖判定为外部 + 显式 allow
-    local addr = hp.start("127.0.0.1", 0,
-      { host_local_fn = function() return false end, access = "allow" })
+    local addr = assert(hp.start("127.0.0.1", 0,
+      { host_local_fn = function() return false end, access = "allow" }))
     local resp = tcp_exchange(addr.host, addr.port,
       ("CONNECT 127.0.0.1:%d HTTP/1.1\r\n\r\n"):format(port))
     t.matches("200 Connection Established", resp, "策略 allow 应放行外部")
     hp.stop()
-    local addr2 = hp.start("127.0.0.1", 0,
-      { host_local_fn = function() return false end, access = "deny" })
+    local addr2 = assert(hp.start("127.0.0.1", 0,
+      { host_local_fn = function() return false end, access = "deny" }))
     local resp2 = tcp_exchange(addr2.host, addr2.port,
       ("CONNECT 127.0.0.1:%d HTTP/1.1\r\n\r\n"):format(port))
     t.matches("403", resp2, "策略 deny 应拒绝外部")
@@ -258,7 +259,7 @@ tests.suite("net_consent", function(_, it)
     -- 混合：只回传拦截
     hp._record_for_test("pypi.tuna.tsinghua.edu.cn", 443, "http", "allow_source")
     hp._record_for_test("evil.example.com", 443, "http", "block")
-    local s = hp.summary()
+    local s = assert(hp.summary())
     t.not_nil(s, "有拦截时应返回摘要")
     t.true_(s:find("evil.example.com:443", 1, true) ~= nil, "应含被拦截目标")
     t.true_(s:find("已拦截", 1, true) ~= nil, "应标注已拦截")
@@ -270,7 +271,7 @@ tests.suite("net_consent", function(_, it)
     local nc = require("NeoAI.sandbox.net.net_consent")
     nc.reset()
     local port, close_srv = echo_server()
-    local owner = nc.port_owner(port)
+    local owner = assert(nc.port_owner(port))
     t.not_nil(owner, "应解析出宿主监听进程")
     t.eq(vim.uv.os_getpid(), owner.pid, "监听进程应为本测试进程")
     t.not_nil(owner.comm, "应含进程名")

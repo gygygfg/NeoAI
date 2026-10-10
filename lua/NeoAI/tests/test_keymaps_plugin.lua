@@ -1,5 +1,5 @@
 --- 键位插件（plugins.builtin.keymaps）与 ui.keymap 专项测试
---- @module NeoAI.tests.test_keymaps_plugin
+--- @module 'NeoAI.tests.test_keymaps_plugin'
 local tests = require("NeoAI.tests")
 local config_store = require("NeoAI.kernel.config_store")
 local services = require("NeoAI.kernel.services")

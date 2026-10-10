@@ -1,5 +1,5 @@
 --- 工具子进程统一沙箱化执行
---- @module NeoAI.sandbox.execution.exec
+--- @module 'NeoAI.sandbox.execution.exec'
 --- 为「进程内工具」内部 spawn 的子进程（curl / node / bash / git 等）构造沙箱前缀，
 --- 使其在 bwrap 命名空间内创建（而非宿主），实现「所有工具创建的子进程统一经沙箱」。
 ---

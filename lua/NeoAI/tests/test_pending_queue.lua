@@ -1,5 +1,5 @@
 --- 消息暂存 / 轮末注入测试
---- @module NeoAI.tests.test_pending_queue
+--- @module 'NeoAI.tests.test_pending_queue'
 --- 覆盖：agent 忙碌（tool_running/generating）期间用户发送的消息被 pending_queue
 --- 暂存，不会立刻写进对话；工具循环轮末（工具结果记录后、下次模型调用前）由
 --- chat_service 注册的注入器把暂存消息插入对话，供下一轮模型感知。
@@ -165,9 +165,10 @@ tests.suite("pending_queue", function(_, it)
     session_store.init()
 
     -- stub 网络：立即返回一条简单回复，让被占用的首轮正常结束并清掉 claim
+    ---@type table<string, any>
     local http = require("NeoAI.utils.http")
     local original_http = http.request
-    http.request = function(opts, cb)
+    http.request = function(_, cb)
       local d = async.Deferred.new()
       vim.schedule(function()
         local on_chunk = cb and cb.on_chunk
@@ -182,7 +183,7 @@ tests.suite("pending_queue", function(_, it)
 
     local agent = chat.new_session({})
     -- 首轮：runtime.run 应同步占用生成槽位，即使 agent.state 此刻仍是 idle
-    local d1 = runtime.run(agent, "first")
+    local _ = runtime.run(agent, "first")
     t.true_(agent._turn_claim ~= nil, "首轮运行应同步占用生成槽位")
     t.eq("generating", agent.state, "首轮运行应同步进入 generating（后台压缩不再阻塞状态置位）")
 

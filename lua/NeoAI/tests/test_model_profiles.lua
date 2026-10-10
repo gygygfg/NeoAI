@@ -1,5 +1,5 @@
 --- 协议族 + 厂商方言层测试
---- @module NeoAI.tests.test_model_profiles
+--- @module 'NeoAI.tests.test_model_profiles'
 
 local tests = require("NeoAI.tests")
 

@@ -1,5 +1,5 @@
 --- 折叠组件
---- @module NeoAI.ui.components.fold
+--- @module 'NeoAI.ui.components.fold'
 --- 聊天窗口折叠的共享实现：
 --- - expr 折叠（foldexpr）：推理 / 每个工具块（调用+结果）各自独立成折叠，块间无需分隔行
 --- - 折叠占位文本（foldtext）：推理 / 工具块折叠的摘要标签，按折叠首行区分类型

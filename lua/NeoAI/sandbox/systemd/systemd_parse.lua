@@ -1,5 +1,5 @@
 --- systemd 单元解析助手
---- @module NeoAI.sandbox.systemd.systemd_parse
+--- @module 'NeoAI.sandbox.systemd.systemd_parse'
 --- 从 systemd.lua 抽出的无状态纯函数（不引用模块状态；内部相互调用保持原样）。
 
 --- 归一化 shell 重定向语法（仅用于判断复合命令，不影响真实执行）。

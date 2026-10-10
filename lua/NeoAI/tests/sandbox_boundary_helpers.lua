@@ -1,5 +1,5 @@
 --- 沙箱边界测试共享基建
---- @module NeoAI.tests.sandbox_boundary_helpers
+--- @module 'NeoAI.tests.sandbox_boundary_helpers'
 --- 供 test_sandbox_boundary_* 套件复用的测试工具：配置覆盖、真实 bwrap 前缀直跑（绕开
 --- conceal 脱敏，用于验证内核真实行为）、宿主侧哨兵文件、宿主残留断言、syscall 探测模板。
 
@@ -81,8 +81,6 @@ end
 
 -- ========== 宿主侧哨兵文件 ==========
 
-local sentinel_state = {}
-
 --- 在宿主目录下放置带随机标记的哨兵文件（root、用后即删；不碰真实敏感条目）。
 --- @param dirs table 目录列表
 --- @return table { { path, hash, mode } }
@@ -101,7 +99,6 @@ function M.sentinel_place(dirs)
       end
     end
   end
-  sentinel_state[marker] = placed
   return placed
 end
 

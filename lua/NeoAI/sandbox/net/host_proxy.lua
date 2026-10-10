@@ -1,5 +1,5 @@
 --- 宿主侧请求过滤代理（HTTP CONNECT + 绝对形式 + SOCKS5）
---- @module NeoAI.sandbox.net.host_proxy
+--- @module 'NeoAI.sandbox.net.host_proxy'
 ---
 --- 共享网络命名空间下为沙箱外部命令提供应用层代理：
 ---   * 拦截向宿主本机（回环 127/8、::1、宿主各网卡 IP、链路本地 169.254/16 与 fe80::/10、
@@ -11,6 +11,12 @@
 --- 或无 root 的 slirp4netns/passt）。本模块只覆盖走 HTTP(S)_PROXY / ALL_PROXY 的工具。
 ---
 --- 仅使用 Neovim 内置 luv（无第三方依赖）。
+
+--- vim.uv.new_tcp() 返回的 socket 句柄（此处仅用 write/close/read_start）。
+---@class NeoAIVimSocket
+---@field write fun(self: NeoAIVimSocket, data: string): any
+---@field close fun(self: NeoAIVimSocket): any
+---@field read_start fun(self: NeoAIVimSocket, cb: fun(err: string|nil, data: string|nil)): any
 
 local M = {}
 
@@ -358,7 +364,7 @@ end
 --- @param host string
 --- @param cb function(ips: table)
 local function _resolve_async(host, cb)
-  local ok, req = pcall(vim.uv.getaddrinfo, host, nil, { socktype = "stream" }, function(err, res)
+  local ok = pcall(vim.uv.getaddrinfo, host, nil, { socktype = "stream" }, function(err, res)
     local out = {}
     if not err and type(res) == "table" then
       for _, a in ipairs(res) do
@@ -438,7 +444,7 @@ end
 
 --- 建立双向转发：客户端读回调由调用方主循环处理（ctx.piping），此处只挂上游→客户端方向。
 --- @param ctx table
---- @param client userdata
+--- @param client NeoAIVimSocket
 local function _read_upstream(ctx, client)
   ctx.up:read_start(function(err, data)
     if err or not data then
@@ -480,7 +486,7 @@ end
 -- ========== HTTP 处理 ==========
 
 --- @param ctx table
---- @param client userdata
+--- @param client NeoAIVimSocket
 --- @param header string 请求头（不含结尾 CRLFCRLF）
 --- @param rest string 头之后的余量
 local function _handle_http(ctx, client, header, rest)
@@ -499,7 +505,7 @@ local function _handle_http(ctx, client, header, rest)
       _respond(client, 400, "Bad Request", "bad_connect_target")
       return
     end
-    p = tonumber(p)
+    p = assert(tonumber(p))
     ctx.state = "resolving"
     _classify_async(h, function(local_, ips)
       _gate(local_, h, p, ips, "http", function(allow, reason)
@@ -563,7 +569,7 @@ end
 
 --- 消费 ctx.buf 推进 SOCKS5 状态机
 --- @param ctx table
---- @param client userdata
+--- @param client NeoAIVimSocket
 local function _process_socks(ctx, client)
   local buf = ctx.buf
   local stage = ctx.socks.stage
@@ -652,7 +658,7 @@ end
 -- ========== 连接主循环 ==========
 
 --- @param ctx table
---- @param client userdata
+--- @param client NeoAIVimSocket
 local function _process(ctx, client)
   -- resolving（异步 DNS）或 connecting（建连）期间只累积数据，由回调冲入上游/继续状态机。
   if ctx.state then return end

@@ -1,5 +1,5 @@
 --- 沙箱网络网关的 netns/veth 编排
---- @module NeoAI.sandbox.net.net_gateway
+--- @module 'NeoAI.sandbox.net.net_gateway'
 --- 为「独立 netns + 宿主网关」模式创建网络命名空间与 veth 对，使沙箱进程只能到达宿主网关
 --- （默认路由指向网关），无法直接访问宿主服务或其他网络；网关（`sandbox.gateway`）在宿主侧
 --- 对目标端口做探针并把拦截原因返回给客户端。

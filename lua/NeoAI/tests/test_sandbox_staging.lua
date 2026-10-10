@@ -1,5 +1,5 @@
 --- 沙箱暂存/门禁正确性专项测试
---- @module NeoAI.tests.test_sandbox_staging
+--- @module 'NeoAI.tests.test_sandbox_staging'
 --- 覆盖：目录条目不算实质暂存；has_staged_under/outside；overlay_gate 按根覆盖判定；
 --- T2 无关暂存不误拒；整机根 overlay 目录与 /root 可写根不冲突；
 --- 复合命令中的 systemctl 注入维护脚本桩。
@@ -160,10 +160,10 @@ tests.suite("sandbox_staging", function(_, it)
     if runtime.backend() ~= "bwrap" then return end
     local cwd = vim.fn.tempname()
     fs.ensure_dir(cwd)
-    local prefix = runtime.process_prefix({
+    local prefix = assert(runtime.process_prefix({
       cwd = cwd, overlays = {}, privileges = { network = false },
       session_tmp_dir = base, tmpfs_base = base,
-    })
+    }))
     t.not_nil(prefix, "应能构造前缀")
     local joined = table.concat(prefix, " ")
     t.matches(base, joined, "前缀应引用稳定基目录")

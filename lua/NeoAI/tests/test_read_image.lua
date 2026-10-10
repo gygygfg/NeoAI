@@ -1,5 +1,5 @@
 --- read_image 工具专项测试
---- @module NeoAI.tests.test_read_image
+--- @module 'NeoAI.tests.test_read_image'
 --- 覆盖门禁（模型能力/类型/可读性）与成功摄入路径；附件目录隔离到临时路径。
 local tests = require("NeoAI.tests")
 local config_store = require("NeoAI.kernel.config_store")
@@ -34,6 +34,7 @@ tests.suite("read_image", function(_, it, before_each)
     f:close()
   end
 
+  ---@return any, any
   local function invoke(args, ctx)
     local result, err, done = nil, nil, false
     tool.func(args, function(v) result, done = v, true end, function(e) err, done = e, true end, ctx)

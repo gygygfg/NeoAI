@@ -1,5 +1,5 @@
 --- 沙箱主机操作提案（T2 特权档）
---- @module NeoAI.sandbox.execution.hostop
+--- @module 'NeoAI.sandbox.execution.hostop'
 --- T2 特权命令在嵌套 user namespace 内自动执行（cap 被 userns 作用域限制，够不到宿主），
 --- 其「会落到主机」的效果冻结为提案；用户异步审批后，在主机上 replay 该命令。
 --- 不阻塞工具调用：提案进入待审队列，审批前不产生主机副作用（设计见 docs/sandbox.md §17）。

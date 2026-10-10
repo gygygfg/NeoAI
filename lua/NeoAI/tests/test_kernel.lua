@@ -1,5 +1,5 @@
 --- 内核层测试
---- @module NeoAI.tests.test_kernel
+--- @module 'NeoAI.tests.test_kernel'
 --- 测试 config_store / logger / event_bus / lifecycle。
 
 local tests = require("NeoAI.tests")
@@ -63,7 +63,7 @@ tests.suite("kernel", function(_, it, before_each)
   it("event_bus 发布订阅", function(t)
     local event_bus = require("NeoAI.kernel.event_bus")
     local events = require("NeoAI.kernel.events")
-    local received = nil
+    local received
     local unsub = event_bus.on(events.MODELS_UPDATED, function(data)
       received = data
     end)
@@ -110,8 +110,7 @@ tests.suite("kernel", function(_, it, before_each)
   end)
 
   it("async Promise 基本流程", function(t)
-    local async = require("NeoAI.utils.async")
-    local d = async.new(function(resolve, reject)
+    local d = async.new(function(resolve, _)
       resolve(42)
     end)
     return d:then_(function(v)
@@ -121,7 +120,6 @@ tests.suite("kernel", function(_, it, before_each)
   end)
 
   it("async retry 指数退避", function(t)
-    local async = require("NeoAI.utils.async")
     local attempts = 0
     return async.retry(function()
       attempts = attempts + 1
@@ -136,7 +134,6 @@ tests.suite("kernel", function(_, it, before_each)
   end)
 
   it("async AbortSignal 级联", function(t)
-    local async = require("NeoAI.utils.async")
     local signal = async.create_signal()
     local reason = nil
     signal:subscribe(function(r) reason = r end)

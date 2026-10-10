@@ -1,5 +1,5 @@
 --- Herder 终端状态信号服务
---- @module NeoAI.services.herder
+--- @module 'NeoAI.services.herder'
 --- 本模块只负责"信号生成端"：把 NeoAI agent 的真实作态翻译成 Herder 语义的
 --- working / idle / blocked，并通过 `herdr pane report-agent` 上报。Herder 侧的
 --- 识别/解析不在此处（由别的部分处理）。

@@ -1,5 +1,5 @@
 --- Skills 服务（技能目录 + SKILL.md）
---- @module NeoAI.services.skills
+--- @module 'NeoAI.services.skills'
 --- 扫描配置的 skills 目录，解析每个 SKILL.md 的 YAML frontmatter（name/description/
 --- allowed-tools/env）与正文，构建可检索索引。
 --- 系统提示段（列出可用技能）与 list_skills/load_skill 工具由 tools/builtin/skills.lua

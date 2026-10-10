@@ -1,5 +1,5 @@
 --- LSP 操作工具
---- @module NeoAI.tools.builtin.lsp_ops
+--- @module 'NeoAI.tools.builtin.lsp_ops'
 --- 通过 Neovim 内置 LSP（vim.lsp）提供代码分析工具。
 
 local helpers = require("NeoAI.tools.builtin.tool_helpers")
@@ -45,21 +45,6 @@ local function _bufnr(filepath)
   return bufnr
 end
 
---- 获取文件或当前 buffer 的 LSP 客户端
---- @param filepath string|nil
---- @return table|nil client
-local function _client_for(filepath)
-  local bufnr = _bufnr(filepath)
-  if not bufnr then
-    return nil
-  end
-  local clients = vim.lsp.get_clients({ bufnr = bufnr })
-  if #clients == 0 then
-    return nil
-  end
-  return clients[1]
-end
-
 --- 该 buffer 对应的真实文件是否有未发布的沙箱暂存副本（有则 LSP 必须走沙箱视图，
 --- 不得回退编辑器客户端读真实视图）。按文件判定，避免因其它文件的暂存而误伤。
 --- @param bufnr number|nil
@@ -94,6 +79,8 @@ local function _client_supporting(method, bufnr)
   end
   local clients = bufnr and vim.lsp.get_clients({ bufnr = bufnr }) or vim.lsp.get_clients()
   for _, client in ipairs(clients) do
+    -- Neovim 支持按 bufnr 查询方法支持；LuaLS 按 2 参重载判定，故抑制。
+    ---@diagnostic disable-next-line: redundant-parameter
     if client:supports_method(method, bufnr) then
       return client
     end
@@ -211,7 +198,7 @@ end
 
 --- 位置参数规范化
 --- @param args table
---- @return number bufnr, number line, number col
+--- @return number|nil bufnr, number|nil line, number|nil col
 local function _position(args)
   local bufnr = _bufnr(args.file_path)
   if not bufnr then
@@ -679,9 +666,12 @@ lsp_tools.lsp_diagnostics = helpers.define_tool("lsp_diagnostics", "重新获取
           return { lnum = r.start.line, severity = d.severity, message = d.message }
         end, items))
       else
+        -- LuaLS 的 vim.diagnostic.get 元定义无参数（Neovim 实际支持 bufnr）。
+        ---@diagnostic disable-next-line: redundant-parameter
         _format(vim.diagnostic.get(bufnr))
       end
     end, function()
+      ---@diagnostic disable-next-line: redundant-parameter
       _format(vim.diagnostic.get(bufnr))
     end)
   end
@@ -689,6 +679,7 @@ lsp_tools.lsp_diagnostics = helpers.define_tool("lsp_diagnostics", "重新获取
   local function _push()
     _touch_buffer(bufnr)
     _await_publish(bufnr, function()
+      ---@diagnostic disable-next-line: redundant-parameter
       _format(vim.diagnostic.get(bufnr))
     end)
   end
@@ -1092,7 +1083,7 @@ lsp_tools.lsp_service_info = helpers.define_tool(
     properties = {},
     required = {},
   },
-  function(args, on_success)
+  function(_, on_success)
     local clients = vim.lsp.get_clients()
     local out = {}
     for _, c in ipairs(clients) do

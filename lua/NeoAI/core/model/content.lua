@@ -1,5 +1,5 @@
 --- 多模态内容块与 wire 序列化
---- @module NeoAI.core.model.content
+--- @module 'NeoAI.core.model.content'
 --- 对齐 deepseek-harness：会话消息只存引用，请求期把图像解析为 data URL 注入。
 --- - has_image：是否包含（工具结果中 / content 块中的）图像
 --- - materialize：从逻辑消息构建 wire 消息（文本模式回流式；图像模式转为 part 数组，

@@ -1,5 +1,5 @@
 --- NeoAI 日志系统
---- @module NeoAI.kernel.logger
+--- @module 'NeoAI.kernel.logger'
 --- 分级日志，文件输出 + 轮转。级别：DEBUG < INFO < WARN < ERROR < FATAL
 
 local fs = require("NeoAI.utils.fs")

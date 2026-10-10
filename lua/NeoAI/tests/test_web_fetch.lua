@@ -1,5 +1,5 @@
 --- web_fetch 工具测试
---- @module NeoAI.tests.test_web_fetch
+--- @module 'NeoAI.tests.test_web_fetch'
 --- 纯逻辑测试：不联网、不安装依赖、不启动浏览器。
 --- 覆盖：门控、工具 schema、缓存 key、选项组装、Node 输出解析、信封、缓存淘汰。
 
@@ -34,7 +34,7 @@ local function _seed_cache(entries)
   for _, e in ipairs(entries) do
     local pad = string.rep("x", e.size)
     local ok = pcall(function()
-      local f = io.open(dir .. "/" .. e.key .. ".json", "wb")
+      local f = assert(io.open(dir .. "/" .. e.key .. ".json", "wb"))
       f:write(('{"ts":%d,"content":"%s"}'):format(e.ts, pad))
       f:close()
     end)
@@ -411,6 +411,7 @@ tests.suite("web_fetch", function(_, it, before_each)
 
     local orig_run = sandbox_exec.run
     local sandbox_called = false
+    ---@diagnostic disable-next-line: duplicate-set-field
     sandbox_exec.run = function()
       sandbox_called = true
       return async.resolve({ code = 0 })
@@ -418,6 +419,7 @@ tests.suite("web_fetch", function(_, it, before_each)
 
     local orig_jobstart = vim.fn.jobstart
     local host_called, host_argv = false, nil
+    ---@diagnostic disable-next-line: duplicate-set-field
     vim.fn.jobstart = function(argv, opts)
       -- 仅拦截安装用的 `bash -c`，其余（如后台 curl 抓取）透传原实现。
       if argv and argv[1] == "bash" then

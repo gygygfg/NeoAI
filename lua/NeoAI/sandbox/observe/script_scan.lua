@@ -1,5 +1,5 @@
 --- 脚本间接执行的静态扫描
---- @module NeoAI.sandbox.observe.script_scan
+--- @module 'NeoAI.sandbox.observe.script_scan'
 --- 命令把执行委托给脚本/解释器时（`bash deploy.sh`、`python setup.py`、`node x.js`、
 --- `./run.sh`、`bash -c '…'`、`python -c '…'`），命令字符串本身看不到真正的危险操作。
 --- 本模块在**执行前**读取被引用脚本的内容（优先读沙箱暂存副本，使 AI 新建/修改的脚本
@@ -413,7 +413,7 @@ local function _append(state, text)
 end
 
 --- 处理解释器调用（脚本/代码/不透明）
---- @param inv table
+--- @param inv table|nil
 --- @param state table
 --- @param depth number
 local function _process_invocation(inv, state, depth)
@@ -498,7 +498,7 @@ _process_language = function(text, lang, state, depth)
   local clean = _strip_comments(text, lang)
   local apis = LANG_APIS[lang] or {}
   for _, pat in ipairs(apis) do
-    for s, e in _iter_api(clean, pat) do
+    for _, e in _iter_api(clean, pat) do
       local window = clean:sub(e + 1, e + 600)
       local nl = window:find("\n")
       local seg = nl and window:sub(1, nl + 120) or window

@@ -39,8 +39,11 @@ tests.suite("async_finally", function(_, it)
     local compactor = require("NeoAI.core.session.compactor")
     local send, compact, bg = recovery.send_stream, compactor.maybe_compact, compactor.start_background
     local expected = { kind = "http", status = 401, message = "unauthorized" }
+    ---@diagnostic disable-next-line: duplicate-set-field
     recovery.send_stream = function() return async.reject(expected) end
+    ---@diagnostic disable-next-line: duplicate-set-field
     compactor.maybe_compact = function() return async.resolve(false) end
+    ---@diagnostic disable-next-line: duplicate-set-field
     compactor.start_background = function() end
     local agent = runtime.create({ model = "test" })
     local ok, err = xpcall(function()

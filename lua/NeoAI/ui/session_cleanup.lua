@@ -1,5 +1,5 @@
 --- 会话恢复残留清理
---- @module NeoAI.ui.session_cleanup
+--- @module 'NeoAI.ui.session_cleanup'
 ---
 --- 背景：`:restart` 会先 `:mksession` 存会话、`:qall` 退出、再以同 argv 重启并恢复会话。
 --- `sessionoptions` 默认含 `blank,buffers`，于是 NeoAI 的聊天主 buffer / 输入框 buffer

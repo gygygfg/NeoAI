@@ -1,5 +1,5 @@
 --- web_fetch 工具
---- @module NeoAI.tools.builtin.web_fetch
+--- @module 'NeoAI.tools.builtin.web_fetch'
 --- 把动态网页（React/Vue/SPA）渲染为 Markdown 供模型阅读。
 ---
 --- 管线：Neovim(Lua 编排) → bash → Node(Playwright 渲染 + 注入 JS + 取 DOM)

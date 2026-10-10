@@ -1,5 +1,5 @@
 --- 请求构建 + 发送 + 重试
---- @module NeoAI.core.agent.request
+--- @module 'NeoAI.core.agent.request'
 --- 构建请求体（经 adapter），发送（流式/非流式），指数退避重试。
 --- 依赖：kernel(adapter) + utils(http/async)。
 
@@ -66,6 +66,7 @@ end
 local function _resolve_provider_model(model, agent_config)
   local provider_name = (agent_config and agent_config.provider)
     or config_store.get("ai.default_provider")
+  ---@type string|nil
   local model_id = model or (agent_config and agent_config.model) or nil
   if not model_id then
     local registry = require("NeoAI.core.model.registry")
@@ -91,7 +92,7 @@ local function _build_request(messages, opts)
   local providers = config_store.get("ai.providers") or {}
   local provider = providers[provider_name] or {}
   local api_type = provider.api_type or "openai"
-  local a = adapter.get(api_type) or adapter.get("openai")
+  local a = assert(adapter.get(api_type) or adapter.get("openai"))
 
   local profiles = require("NeoAI.core.model.profiles")
   local capabilities = require("NeoAI.core.model.capabilities")
@@ -220,7 +221,9 @@ end
 --- 上下文溢出判断（供 recovery 模块使用）
 --- @param err table|nil
 --- @return boolean
-M.is_context_overflow = _is_context_overflow
+function M.is_context_overflow(err)
+  return _is_context_overflow(err)
+end
 
 --- 发送请求（非流式）
 --- @param messages table
@@ -277,7 +280,7 @@ end
 --- 发送流式请求
 --- @param messages table
 --- @param opts table { model?, agent_config?, tools?, temperature?, max_tokens?, signal? }
---- @param on_chunk function(chunk: table) chunk = { content?, reasoning?, tool_calls? }
+--- @param on_chunk function|nil function(chunk: table) chunk = { content?, reasoning?, tool_calls? }
 --- @return Deferred resolve({ content, reasoning, tool_calls, finish_reason, usage })
 function M.send_stream(messages, opts, on_chunk)
   opts = opts or {}

@@ -1,5 +1,5 @@
 --- 沙箱控制面入口
---- @module NeoAI.sandbox
+--- @module 'NeoAI.sandbox'
 --- 为工具执行提供受约束的工作区修改、候选冻结、CAS 发布与 dry-run/commit。
 --- 所有工具执行经 wrapper.gate；加载器为工具附加 __sandbox 规格。
 ---
@@ -142,8 +142,8 @@ function M.init()
   vim.schedule(function() pcall(function() require("NeoAI.sandbox.execution.disk").refresh(true) end) end)
   -- 注册出网密钥守卫：向非白名单地址发送密钥时弹窗阻止（utils/http 程序化路径）。
   pcall(function()
-    require("NeoAI.utils.http").set_guard(function(o, c)
-      return require("NeoAI.sandbox.secret.secret_egress").guard_http(o, c)
+    require("NeoAI.utils.http").set_guard(function(o, _)
+      return require("NeoAI.sandbox.secret.secret_egress").guard_http(o)
     end)
   end)
   return M
@@ -197,7 +197,6 @@ end
 function M.watch_sessions()
   if state.session_unsubs then return end
   local event_bus = require("NeoAI.kernel.event_bus")
-  local events = require("NeoAI.kernel.events")
   local unsubs = {}
   local function rotate(payload)
     -- 仅当「当前主 Agent 仍在工作」时才抑制非本 Agent 的轮换。子 Agent / 辅助生成也会
@@ -227,8 +226,8 @@ function M.watch_sessions()
       -- 若在写完前轮换，缺失的暂存副本会被误判为删除并物化成 whiteout（命令产物回退）。
       local busy = resident.busy()
       if not busy then
-        local ok, wrapper = pcall(require, "NeoAI.sandbox.execution.wrapper")
-        busy = ok and type(wrapper.postprocess_pending) == "function" and wrapper.postprocess_pending()
+        local ok, wrapper_mod = pcall(require, "NeoAI.sandbox.execution.wrapper")
+        busy = ok and type(wrapper_mod.postprocess_pending) == "function" and wrapper_mod.postprocess_pending()
       end
       if busy and tries > 0 then
         vim.defer_fn(function() rotate_when_idle(tries - 1) end, 500)
@@ -756,6 +755,7 @@ end
 --- 把文本中的密钥令牌还原为真实值（best-effort；预览展示用）
 --- @param text string
 --- @return string
+--- @return number|nil 未解析的假密钥数
 function M.detokenize(text)
   return secret.detokenize(text)
 end
@@ -763,6 +763,7 @@ end
 --- 脱敏：把文本中的真实密钥替换为占位
 --- @param text string
 --- @return string
+--- @return table|nil 命中的规则名数组
 function M.redact(text)
   return secret.redact(text)
 end
@@ -810,7 +811,7 @@ end
 -- ---------- AI 审计 / L3 警示（异步生成） ----------
 
 --- AI 审计：从审计 notes 文本判定结论（safe/unsafe/nil）
---- @param notes string|nil
+--- @param notes table|nil { [路径或命令]=说明 }
 --- @return string|nil
 function M.audit_verdict(notes)
   return require("NeoAI.sandbox.observe.ai_audit").verdict(notes)

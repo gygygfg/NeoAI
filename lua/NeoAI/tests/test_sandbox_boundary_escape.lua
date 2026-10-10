@@ -1,5 +1,5 @@
 --- 沙箱边界逃逸与拦截矩阵（真实 bwrap）
---- @module NeoAI.tests.test_sandbox_boundary_escape
+--- @module 'NeoAI.tests.test_sandbox_boundary_escape'
 --- 覆盖现有测试未触及的边界：seccomp denylist 全量真实验证、mount/chroot/pivot_root 负向、
 --- pid namespace 隔离、/proc 信息泄露基线、/proc/sys 只读、mask_paths 端到端（哨兵）、
 --- /run 私有写、setuid+NoNewPrivs、宿主敏感路径哨兵。设计边界以「基线断言」固化并标注。

@@ -1,5 +1,5 @@
 --- NeoAI UI 层入口
---- @module NeoAI.ui
+--- @module 'NeoAI.ui'
 --- 编排窗口/组件/键位。对外暴露 open/close 等命令入口。
 
 local window_manager = require("NeoAI.ui.window.manager")

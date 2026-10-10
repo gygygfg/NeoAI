@@ -1,5 +1,5 @@
 --- 沙箱命名空间文件桥
---- @module NeoAI.sandbox.execution.file_bridge
+--- @module 'NeoAI.sandbox.execution.file_bridge'
 --- 让**进程内文件工具**的读写经由常驻沙箱命名空间执行，而非宿主侧直接落盘：
 ---   * 读取为 overlay 合并视图（有暂存读暂存，否则读真实 lower）；
 ---   * 写入落在 overlay 暂存层，真实工作区在用户确认发布前不受影响。

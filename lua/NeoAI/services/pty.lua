@@ -1,5 +1,5 @@
 --- 交互式 PTY 会话服务
---- @module NeoAI.services.pty
+--- @module 'NeoAI.services.pty'
 --- 用 Neovim 分配的 PTY 运行命令（jobstart pty=true），通过轮询 `/proc` 检测
 --- “进程阻塞在读取 fd0（终端）= 正在等待输入”，再由判官子 agent 或用户手动输入注入。
 ---
@@ -725,10 +725,10 @@ function M.open(opts)
   state.sessions[session.id] = session
 
   if opts.signal then
-    session.unsub = opts.signal:subscribe(function(reason)
+    session.unsub = opts.signal:subscribe(function(abort_reason)
       if session.done then return end
       session.aborted = true
-      session.abort_message = reason
+      session.abort_message = abort_reason
       if session.kill then pcall(session.kill) end
       pcall(vim.fn.jobstop, job)
     end)

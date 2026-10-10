@@ -1,5 +1,5 @@
 --- 沙箱密钥与 IO：密钥防护 token 化/存储异步/工作线程/越界留痕
---- @module NeoAI.tests.test_sandbox_secret
+--- @module 'NeoAI.tests.test_sandbox_secret'
 --- 由原 test_sandbox.lua 按用例分片而来（42 个用例，彼此独立、无跨用例共享状态）。
 
 local tests = require("NeoAI.tests")
@@ -45,8 +45,8 @@ tests.suite("sandbox_secret", function(_, it)
     t.eq(true, ctx.secret_operation, "应提级（secret_operation），而非终止")
     t.true_(vim.tbl_contains(ctx.secret_names or {}, "GIT_COMMIT_AI_API_KEY"), "应记录敏感环境变量名")
     local found
-    for _, it in ipairs(sandbox.list_reviews({ review_state = "PENDING" }) or {}) do
-      for _, f in ipairs(it.files or {}) do if f.path == p then found = it end end
+    for _, rev_item in ipairs(sandbox.list_reviews({ review_state = "PENDING" }) or {}) do
+      for _, f in ipairs(rev_item.files or {}) do if f.path == p then found = rev_item end end
     end
     t.not_nil(found, "应产生待审变更单元")
     t.true_(found.secret_warning and (found.secret_warning.count or 0) > 0, "待审项应带密钥警告")
@@ -119,7 +119,7 @@ tests.suite("sandbox_secret", function(_, it)
     local dir = vim.fn.tempname()
     fs.ensure_dir(dir)
     with_config({ tools = { sandbox = { expose_paths = { dir } } } }, function()
-      local prefix = runtime.process_prefix({ cwd = "/tmp" })
+      local prefix = assert(runtime.process_prefix({ cwd = "/tmp" }))
       t.not_nil(prefix, "应能构造进程前缀")
       local joined = table.concat(prefix, " ")
       t.true_(joined:find("--ro-bind " .. dir .. " " .. dir, 1, true) ~= nil, "应只读绑定 expose 路径")
@@ -189,7 +189,9 @@ tests.suite("sandbox_secret", function(_, it)
       -- 模拟容器内 userns 限制：粗粒度能力与真实可写实测均失败。
       runtime.probe().overlayfs = false
       local saved_writable = runtime.overlay_writable
-      runtime.overlay_writable = function() return false end
+      ---@diagnostic disable-next-line: duplicate-set-field
+      ---@diagnostic disable-next-line: duplicate-set-field
+    runtime.overlay_writable = function() return false end
       t.false_(runtime.overlay_available(), "overlay 应被判定为不可用")
       local done, result, rejected = false, nil, nil
       local ctx = {}
@@ -227,7 +229,9 @@ tests.suite("sandbox_secret", function(_, it)
       -- 模拟容器内 userns 限制：粗粒度能力与真实可写实测均失败。
       runtime.probe().overlayfs = false
       local saved_writable = runtime.overlay_writable
-      runtime.overlay_writable = function() return false end
+      ---@diagnostic disable-next-line: duplicate-set-field
+      ---@diagnostic disable-next-line: duplicate-set-field
+    runtime.overlay_writable = function() return false end
       t.false_(runtime.overlay_available(), "overlay 应被判定为不可用")
       local done = false
       local ctx = {}
@@ -324,11 +328,12 @@ tests.suite("sandbox_secret", function(_, it)
     runtime.probe()
     runtime.capabilities().overlayfs = true -- 模拟粗粒度探测假阳性
     local orig = runtime.overlay_writable
+    ---@diagnostic disable-next-line: duplicate-set-field
     runtime.overlay_writable = function() return false end
-    local prefix, err = runtime.process_prefix({
+    local prefix, err = assert(runtime.process_prefix({
       cwd = "/tmp", upper = "/tmp/neoai_ovl_u", work = "/tmp/neoai_ovl_w",
       fallback_cwd = "/tmp/neoai_ovl_f",
-    })
+    }))
     runtime.overlay_writable = orig
     t.not_nil(prefix, err)
     local joined = table.concat(prefix, " ")
@@ -363,6 +368,7 @@ tests.suite("sandbox_secret", function(_, it)
         t.true_(res.ok, tostring(res.reason))
         t.eq("NEW", trim(fs.read_file(p)), "应用后应写入真实工作区")
         fs.delete_file(p)
+        ---@diagnostic disable-next-line: param-type-mismatch
         tool_service.set_approval_ui(nil)
         done = true
       end, function(e)
@@ -413,7 +419,7 @@ tests.suite("sandbox_secret", function(_, it)
         files = { { path = "/tmp/neoai_discard.txt", action = "create", after_hash = "h", content = "x" } },
       }
       store.write_candidate(cand)
-      local item = review.enqueue(cand, { tool = "run_command" })
+      local item = assert(review.enqueue(cand, { tool = "run_command" }))
       t.not_nil(item)
       t.eq(1, sandbox.pending_count(), "入队后应有一个待审文件")
       t.true_(sandbox.discard("sha256:discardme"), "候选应被丢弃")
@@ -446,7 +452,7 @@ tests.suite("sandbox_secret", function(_, it)
         return cand
       end
       local i1 = review.enqueue(mk(), { id = "cs_shared_1", tool = "edit_file" })
-      local i2 = review.enqueue(mk(), { id = "cs_shared_2", tool = "edit_file" })
+      local i2 = assert(review.enqueue(mk(), { id = "cs_shared_2", tool = "edit_file" }))
       t.not_nil(i1)
       t.not_nil(i2)
       -- wrapper 入队后取代同路径旧项（排除新项）：共享摘要不得被删除
@@ -509,7 +515,7 @@ tests.suite("sandbox_secret", function(_, it)
         files = { mk(pa, "A\n"), mk(pb, "B\n") },
       }
       store.write_candidate(cand)
-      local item = review.enqueue(cand, { tool = "edit_file" })
+      local item = assert(review.enqueue(cand, { tool = "edit_file" }))
       t.not_nil(item, "应入队")
       -- 仅应用 a.txt
       local res = review.apply(item.change_set_id, { auto_approve = true, files = { pa } })
@@ -587,8 +593,8 @@ tests.suite("sandbox_secret", function(_, it)
         package_names = { "curl" }, package_key = "apt-get:curl",
         risk_level = 2, command = "apt-get install -y curl",
       }
-      local it1 = review.enqueue(mk("sha256:pk1", "/var/lib/apt/lists/a"), meta)
-      local it2 = review.enqueue(mk("sha256:pk2", "/var/lib/apt/lists/b"), meta)
+      local it1 = assert(review.enqueue(mk("sha256:pk1", "/var/lib/apt/lists/a"), meta))
+      local it2 = assert(review.enqueue(mk("sha256:pk2", "/var/lib/apt/lists/b"), meta))
       t.not_nil(it1)
       t.eq(it1.change_set_id, it2.change_set_id, "同安装命令应合并到同一变更单元")
       local pending = sandbox.list_reviews({ review_state = "PENDING" })
@@ -706,7 +712,7 @@ tests.suite("sandbox_secret", function(_, it)
       local items = sandbox.list_reviews({ review_state = "PENDING" })
       t.eq(1, #items, "只读命令不应额外产生候选")
       t.eq("edit_file", items[1].tool, "待审项应仍为 edit_file 候选（未被只读命令取代）")
-      local staged = candidate.read_path(dir .. "/a.txt")
+      local staged = assert(candidate.read_path(dir .. "/a.txt"))
       t.not_nil(staged, "暂存副本应仍存在")
       t.matches("changed", fs.read_file(staged) or "", "暂存内容应保留编辑结果（未被回滚）")
     end)
@@ -720,12 +726,12 @@ tests.suite("sandbox_secret", function(_, it)
     local candidate = require("NeoAI.sandbox.execution.candidate")
     local control = require("NeoAI.sandbox.execution.control")
     local store = require("NeoAI.sandbox.state.store")
+    local dir = fs.canonical(vim.fn.tempname())
     with_config({ tools = { sandbox = { workspace_root = vim.fn.tempname() .. "/sb" } } }, function()
       sandbox.reset()
-      local dir = fs.canonical(vim.fn.tempname())
       fs.ensure_dir(dir)
       local a = control.new_attempt("run_command", {}, {}, { effect = "process" })
-      candidate.begin(a, store.root())
+      candidate.begin(a, assert(store.root()))
       -- 用 merge_candidate 填充工作区暂存（run_command 的 process 工具不预填 attempt.mapping，
       -- 只能由 capture 从 overlay 捕获，与 stage_path 的 fs_write 路径不同）。
       local N, files = 30, {}
@@ -774,13 +780,13 @@ tests.suite("sandbox_secret", function(_, it)
     local control = require("NeoAI.sandbox.execution.control")
     local store = require("NeoAI.sandbox.state.store")
     local config_store = require("NeoAI.kernel.config_store")
+    local dir = fs.canonical(vim.fn.tempname())
     with_config({ tools = { sandbox = { workspace_root = vim.fn.tempname() .. "/sb" } } }, function()
       sandbox.reset()
-      local dir = fs.canonical(vim.fn.tempname())
       fs.ensure_dir(dir)
       local function build()
         local a = control.new_attempt("edit_file", {}, {}, { effect = "fs_write" })
-        candidate.begin(a, store.root())
+        candidate.begin(a, assert(store.root()))
         for i = 1, 12 do
           local staged = candidate.stage_path(a.attempt_id, dir .. "/g" .. i .. ".txt")
           fs.write_file(staged, "content " .. i .. "\n")
@@ -827,7 +833,7 @@ tests.suite("sandbox_secret", function(_, it)
       local a = control.new_attempt("run_command", {}, {}, { effect = "process" })
       a.package = true
       a.effective_unmask = { unmasked }
-      candidate.begin(a, store.root())
+      candidate.begin(a, assert(store.root()))
       local function stage(p, content)
         local staged = candidate.stage_path(a.attempt_id, p)
         fs.write_file(staged, content)
@@ -857,12 +863,12 @@ tests.suite("sandbox_secret", function(_, it)
     local candidate = require("NeoAI.sandbox.execution.candidate")
     local control = require("NeoAI.sandbox.execution.control")
     local store = require("NeoAI.sandbox.state.store")
+    local dir = fs.canonical(vim.fn.tempname())
     with_config({ tools = { sandbox = { workspace_root = vim.fn.tempname() .. "/sb" } } }, function()
       sandbox.reset()
-      local dir = fs.canonical(vim.fn.tempname())
       fs.ensure_dir(dir)
       local a = control.new_attempt("run_command", {}, {}, { effect = "process" })
-      candidate.begin(a, store.root())
+      candidate.begin(a, assert(store.root()))
       local files = {}
       for i = 1, 20 do
         local p = dir .. "/f" .. i .. ".txt"
@@ -880,6 +886,7 @@ tests.suite("sandbox_secret", function(_, it)
       candidate.materialize_overlay(specs)
       local orig = fs.write_file_atomic
       local calls = 0
+      ---@diagnostic disable-next-line: duplicate-set-field
       fs.write_file_atomic = function(...) calls = calls + 1; return orig(...) end
       candidate.materialize_overlay(specs)
       fs.write_file_atomic = orig
@@ -889,6 +896,7 @@ tests.suite("sandbox_secret", function(_, it)
       fs.write_file(staged, "staged 1 v2\n")
       local orig2 = fs.write_file_atomic
       local calls2 = 0
+      ---@diagnostic disable-next-line: duplicate-set-field
       fs.write_file_atomic = function(...) calls2 = calls2 + 1; return orig2(...) end
       candidate.materialize_overlay(specs)
       fs.write_file_atomic = orig2
@@ -909,7 +917,7 @@ tests.suite("sandbox_secret", function(_, it)
       local dir = fs.canonical(vim.fn.tempname())
       fs.ensure_dir(dir)
       local a = control.new_attempt("run_command", {}, {}, { effect = "process" })
-      candidate.begin(a, store.root())
+      candidate.begin(a, assert(store.root()))
       local files = {}
       for i = 1, 20 do
         local p = dir .. "/f" .. i .. ".txt"
@@ -944,12 +952,12 @@ tests.suite("sandbox_secret", function(_, it)
     local candidate = require("NeoAI.sandbox.execution.candidate")
     local control = require("NeoAI.sandbox.execution.control")
     local store = require("NeoAI.sandbox.state.store")
+    local dir = fs.canonical(vim.fn.tempname())
     with_config({ tools = { sandbox = { workspace_root = vim.fn.tempname() .. "/sb" } } }, function()
       sandbox.reset()
-      local dir = fs.canonical(vim.fn.tempname())
       fs.ensure_dir(dir)
       local a = control.new_attempt("run_command", {}, {}, { effect = "process" })
-      candidate.begin(a, store.root())
+      candidate.begin(a, assert(store.root()))
       local base = vim.fn.tempname()
       local upper, work = base .. "/upper", base .. "/work"
       fs.ensure_dir(upper); fs.ensure_dir(work)
@@ -966,6 +974,7 @@ tests.suite("sandbox_secret", function(_, it)
       local specs = { { root = dir, upper = upper, work = work, mode = "overlay" } }
       local orig = fs.write_file_atomic
       local calls = 0
+      ---@diagnostic disable-next-line: duplicate-set-field
       fs.write_file_atomic = function(...) calls = calls + 1; return orig(...) end
       candidate.materialize_overlay(specs)
       candidate.materialize_overlay(specs)
@@ -976,6 +985,7 @@ tests.suite("sandbox_secret", function(_, it)
       fs.write_file(staged, "edited\n")
       local orig2 = fs.write_file_atomic
       local calls2 = 0
+      ---@diagnostic disable-next-line: duplicate-set-field
       fs.write_file_atomic = function(...) calls2 = calls2 + 1; return orig2(...) end
       candidate.materialize_overlay(specs)
       fs.write_file_atomic = orig2
@@ -991,25 +1001,25 @@ tests.suite("sandbox_secret", function(_, it)
     local candidate = require("NeoAI.sandbox.execution.candidate")
     local control = require("NeoAI.sandbox.execution.control")
     local store = require("NeoAI.sandbox.state.store")
+    local dir = fs.canonical(vim.fn.tempname())
     with_config({ tools = { sandbox = { workspace_root = vim.fn.tempname() .. "/sb" } } }, function()
       sandbox.reset()
-      local dir = fs.canonical(vim.fn.tempname())
       fs.ensure_dir(dir)
       local secret_text = "AWS_ACCESS_KEY=AKIAIOSFODNN7EXAMPLE\n"
       local a1 = control.new_attempt("run_command", {}, {}, { effect = "process" })
-      candidate.begin(a1, store.root())
+      candidate.begin(a1, assert(store.root()))
       candidate.merge_candidate({
         files = { { path = dir .. "/a.txt", action = "create", content = secret_text, mode = 420 } },
       })
-      t.true_(require("NeoAI.sandbox.secret.secret").has_token(fs.read_file(candidate.read_path(dir .. "/a.txt")) or ""),
+      t.true_(require("NeoAI.sandbox.secret.secret").has_token(fs.read_file(assert(candidate.read_path(dir .. "/a.txt"))) or ""),
         "非包内容应假化")
       candidate.cleanup(a1.attempt_id)
       local a2 = control.new_attempt("run_command", {}, {}, { effect = "process" })
-      candidate.begin(a2, store.root())
+      candidate.begin(a2, assert(store.root()))
       candidate.merge_candidate({
         files = { { path = dir .. "/b.txt", action = "create", content = secret_text, mode = 420 } },
       }, { package = true })
-      t.eq(secret_text, fs.read_file(candidate.read_path(dir .. "/b.txt")) or "",
+      t.eq(secret_text, fs.read_file(assert(candidate.read_path(dir .. "/b.txt"))) or "",
         "包内容不应 token 化（与结算阶段跳过密钥检测一致）")
       candidate.cleanup(a2.attempt_id)
     end)
@@ -1022,26 +1032,26 @@ tests.suite("sandbox_secret", function(_, it)
     local candidate = require("NeoAI.sandbox.execution.candidate")
     local control = require("NeoAI.sandbox.execution.control")
     local store = require("NeoAI.sandbox.state.store")
+    local dir = fs.canonical(vim.fn.tempname())
     with_config({ tools = { sandbox = { workspace_root = vim.fn.tempname() .. "/sb" } } }, function()
       sandbox.reset()
-      local dir = fs.canonical(vim.fn.tempname())
       fs.ensure_dir(dir)
       -- 含 NUL 与非法 UTF-8 的二进制（模拟 OpenPGP keyring）
       local bin = "\x99\x01\x0d\x04\x63\x17\x2e\xcf\x98\x1f\x06\x7d\xff\xfe\x00\x80"
       local a = control.new_attempt("run_command", {}, {}, { effect = "process" })
-      candidate.begin(a, store.root())
+      candidate.begin(a, assert(store.root()))
       candidate.merge_candidate({
         files = { { path = dir .. "/key.gpg", action = "create", content = bin, mode = 420 } },
       })
-      t.eq(bin, fs.read_file(candidate.read_path(dir .. "/key.gpg")) or "",
+      t.eq(bin, fs.read_file(assert(candidate.read_path(dir .. "/key.gpg"))) or "",
         "二进制内容不应被 token 化（逐字节保留）")
       candidate.cleanup(a.attempt_id)
       -- stage_path（_base_entry）同样跳过 token 化
       local real = dir .. "/real.gpg"
       fs.write_file(real, bin)
       local a2 = control.new_attempt("edit_file", {}, {}, { effect = "fs_write" })
-      candidate.begin(a2, store.root())
-      local staged = candidate.stage_path(a2.attempt_id, real)
+      candidate.begin(a2, assert(store.root()))
+      local staged = assert(candidate.stage_path(a2.attempt_id, real))
       t.eq(bin, fs.read_file(staged) or "", "stage 的二进制副本应逐字节一致")
       candidate.cleanup(a2.attempt_id)
     end)
@@ -1054,12 +1064,12 @@ tests.suite("sandbox_secret", function(_, it)
     local candidate = require("NeoAI.sandbox.execution.candidate")
     local control = require("NeoAI.sandbox.execution.control")
     local store = require("NeoAI.sandbox.state.store")
+    local dir = fs.canonical(vim.fn.tempname())
     with_config({ tools = { sandbox = { workspace_root = vim.fn.tempname() .. "/sb" } } }, function()
       sandbox.reset()
-      local dir = fs.canonical(vim.fn.tempname())
       fs.ensure_dir(dir)
       local a = control.new_attempt("run_command", {}, {}, { effect = "process" })
-      candidate.begin(a, store.root())
+      candidate.begin(a, assert(store.root()))
       local base = vim.fn.tempname()
       local upper, work = base .. "/upper", base .. "/work"
       fs.ensure_dir(upper); fs.ensure_dir(work)
@@ -1076,6 +1086,7 @@ tests.suite("sandbox_secret", function(_, it)
       local specs = { { root = dir, upper = upper, work = work, mode = "overlay" } }
       local orig = fs.write_file_atomic
       local calls = 0
+      ---@diagnostic disable-next-line: duplicate-set-field
       fs.write_file_atomic = function(...) calls = calls + 1; return orig(...) end
       candidate.materialize_overlay(specs)
       fs.write_file_atomic = orig
@@ -1093,15 +1104,15 @@ tests.suite("sandbox_secret", function(_, it)
     local control = require("NeoAI.sandbox.execution.control")
     local store = require("NeoAI.sandbox.state.store")
     local config_store = require("NeoAI.kernel.config_store")
+    local dir = fs.canonical(vim.fn.tempname())
     with_config({ tools = { sandbox = { workspace_root = vim.fn.tempname() .. "/sb" } } }, function()
       sandbox.reset()
       local saved_chunk = config_store.get("tools.sandbox.work_chunk_files")
       -- 强制分块：文件数 > chunk，覆盖跨块签名聚合与目录创建。
       config_store.set("tools.sandbox.work_chunk_files", 2)
-      local dir = fs.canonical(vim.fn.tempname())
       fs.ensure_dir(dir)
       local a = control.new_attempt("run_command", {}, {}, { effect = "process" })
-      candidate.begin(a, store.root())
+      candidate.begin(a, assert(store.root()))
       local base = vim.fn.tempname()
       local upper, work = base .. "/upper", base .. "/work"
       fs.ensure_dir(upper); fs.ensure_dir(work)
@@ -1120,7 +1131,7 @@ tests.suite("sandbox_secret", function(_, it)
       if not ok then error(err, 0) end
       -- 跨块写入的每个文件都应落到暂存且内容完整（目录需已递归创建）。
       for i = 1, N do
-        local staged = candidate.read_path(files[i].path)
+        local staged = assert(candidate.read_path(files[i].path))
         t.not_nil(staged, "应可解析暂存路径: " .. files[i].path)
         t.eq("content " .. i .. "\n", fs.read_file(staged) or "", "分块写入内容应完整")
       end
@@ -1133,6 +1144,7 @@ tests.suite("sandbox_secret", function(_, it)
       local specs = { { root = dir, upper = upper, work = work, mode = "overlay" } }
       local orig = fs.write_file_atomic
       local calls = 0
+      ---@diagnostic disable-next-line: duplicate-set-field
       fs.write_file_atomic = function(...) calls = calls + 1; return orig(...) end
       candidate.materialize_overlay(specs)
       fs.write_file_atomic = orig
@@ -1155,12 +1167,12 @@ tests.suite("sandbox_secret", function(_, it)
         files = { { path = "/tmp/x.txt", action = "create", content = "hello world", mode = 420 } },
       }
       store.write_candidate(cand)
-      local item = review.enqueue(cand, { tool = "run_command" })
+      local item = assert(review.enqueue(cand, { tool = "run_command" }))
       t.not_nil(item, "应入队")
       -- 内存条目同样剥离 content（否则暂存大量文件时内存翻倍）；按需经 content_for 读取。
       t.nil_(item.files[1].content, "内存项也应剥离内容")
       t.eq("hello world", review.content_for(item.change_set_id, "/tmp/x.txt"), "应可按需读取内容")
-      local on_disk = store.read_review(item.change_set_id)
+      local on_disk = assert(store.read_review(item.change_set_id))
       t.not_nil(on_disk, "应可读回")
       t.nil_(on_disk.files[1].content, "落盘项不应含内容")
     end)
@@ -1171,7 +1183,8 @@ tests.suite("sandbox_secret", function(_, it)
     local config_store = require("NeoAI.kernel.config_store")
     local saved = config_store.get("tools.run_command.max_output_bytes")
     config_store.set("tools.run_command.max_output_bytes", 4096)
-    local ok, err = pcall(function()
+    local err
+    local ok = pcall(function()
       local done, result = false, nil
       tools.execute("run_command", { command = "seq 1 100000", description = "t" }, {}):then_(function(r)
         done = true; result = r
@@ -1344,7 +1357,9 @@ tests.suite("sandbox_secret", function(_, it)
     local prev = vim.fn.getcwd()
     vim.fn.chdir(dir)
     local saved_avail, saved_writable = runtime.overlay_available, runtime.overlay_writable
+    ---@diagnostic disable-next-line: duplicate-set-field
     runtime.overlay_available = function() return false end
+    ---@diagnostic disable-next-line: duplicate-set-field
     runtime.overlay_writable = function() return false end
     local ok, err = pcall(function()
       with_config({ tools = { approval = { mode = "async" }, sandbox = {
@@ -1456,6 +1471,20 @@ tests.suite("sandbox_secret", function(_, it)
     end)
     vim.fn.chdir(prev)
     vim.fn.delete(dir, "rf")
+  end)
+
+  it("密钥告警：非凭据/编辑器状态文件不计入密钥操作", function(t)
+    local secret = require("NeoAI.sandbox.secret.secret")
+    secret.reset()
+    local tok = secret.tokenize("DASHSCOPE_API_KEY=verysecretvalue1234567890abcdef")
+    t.true_(type(tok) == "string" and tok ~= "", "应产生 token 化文本")
+    t.nil_(secret.warn_for_files({
+      { path = "/root/.local/state/nvim/shada/main.shada", content = tok },
+    }), "非凭据/编辑器状态文件不应计入密钥操作")
+    t.not_nil(secret.warn_for_files({
+      { path = "/root/.ssh/config", content = tok },
+    }), "凭据文件应计入密钥操作")
+    secret.reset()
   end)
 
 end)

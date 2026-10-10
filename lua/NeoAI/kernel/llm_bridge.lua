@@ -1,5 +1,5 @@
 --- LLM 调用桥（sandbox ↔ core 解耦）
---- @module NeoAI.kernel.llm_bridge
+--- @module 'NeoAI.kernel.llm_bridge'
 --- 沙箱侧（如审批 AI 审计 ai_audit、L3 警示 l3_warning）需要调用一次模型补全，
 --- 而底层发送能力属 core（`core.agent.request`）。为避免 sandbox 直接依赖 core，由组合根
 --- （plugins/catalog）在启动沙箱服务时把发送函数注入本桥；sandbox 经本桥调用，双方仅依赖 kernel。

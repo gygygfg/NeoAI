@@ -1,5 +1,5 @@
 --- 显式缓存管理器
---- @module NeoAI.core.model.prompt_cache
+--- @module 'NeoAI.core.model.prompt_cache'
 --- 按模型缓存机制（capabilities.cache_kind）在请求体上注入显式缓存指令；任一环节失败
 --- 静默降级为隐式缓存，绝不阻断请求。
 ---   - Anthropic：cache_control 断点（system / 最后一个工具），≤ max_breakpoints
@@ -162,7 +162,7 @@ local function _apply_gemini(spec)
     request_body.tools = spec.tools
   end
 
-  local do_request = transport or function(o) return http.request(o) end
+  local do_request = transport or function(o, _) return http.request(o) end
   local d = do_request({
     base_url = provider.base_url,
     path = "/cachedContents?key=" .. (provider.api_key or ""),

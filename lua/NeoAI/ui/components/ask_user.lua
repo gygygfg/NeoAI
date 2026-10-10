@@ -1,5 +1,5 @@
 --- 向用户提问弹窗
---- @module NeoAI.ui.components.ask_user
+--- @module 'NeoAI.ui.components.ask_user'
 --- 注册到 NeoAI.tools.builtin.ask_user。显示问题 + 可选选项：
 --- 数字键 1-9 直接选择选项；i / 回车进入自由输入（vim.ui.input）；Esc 取消提问。
 

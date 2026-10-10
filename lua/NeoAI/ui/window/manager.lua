@@ -1,5 +1,5 @@
 --- 窗口管理器
---- @module NeoAI.ui.window.manager
+--- @module 'NeoAI.ui.window.manager'
 --- 管理 float/tab/split 三种模式的窗口创建/关闭/聚焦。
 
 local config_store = require("NeoAI.kernel.config_store")

@@ -1,5 +1,5 @@
 --- Agent 层测试
---- @module NeoAI.tests.test_agent
+--- @module 'NeoAI.tests.test_agent'
 
 local tests = require("NeoAI.tests")
 

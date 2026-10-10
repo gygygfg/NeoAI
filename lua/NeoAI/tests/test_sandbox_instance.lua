@@ -1,5 +1,5 @@
 --- 沙箱进程实例隔离与启动路径回归
---- @module NeoAI.tests.test_sandbox_instance
+--- @module 'NeoAI.tests.test_sandbox_instance'
 --- 覆盖：
 ---   1. 每个 nvim 进程使用独立实例 store 根，待审队列跨实例互不可见；
 ---   2. 热重载（同进程 shutdown/init）保留本实例待审队列；
@@ -104,6 +104,7 @@ tests.suite("sandbox_instance", function(_, it)
 
   it("init 不同步探测运行时能力（懒加载）", function(t)
     local sandbox = require("NeoAI.sandbox")
+    ---@type table<string, any>
     local runtime = require("NeoAI.sandbox.execution.runtime")
     local base = vim.fn.tempname()
     with_config({ tools = { sandbox = { workspace_root = base } } }, function()
@@ -126,6 +127,7 @@ tests.suite("sandbox_instance", function(_, it)
   end)
 
   it("runtime.warm 预热能力与 overlay 探测（幂等、可重复调用）", function(t)
+    ---@type table<string, any>
     local runtime = require("NeoAI.sandbox.execution.runtime")
     local out = runtime.warm()
     t.eq("table", type(out))
@@ -152,6 +154,7 @@ tests.suite("sandbox_instance", function(_, it)
   it("异步落盘失败被检测并保留内存缓存（写入失败不被当作成功）", function(t)
     local sandbox = require("NeoAI.sandbox")
     local store = require("NeoAI.sandbox.state.store")
+    ---@type table<string, any>
     local work = require("NeoAI.utils.work")
     local async = require("NeoAI.utils.async")
     local base = vim.fn.tempname()

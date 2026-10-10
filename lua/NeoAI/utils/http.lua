@@ -1,5 +1,5 @@
 --- HTTP 客户端
---- @module NeoAI.utils.http
+--- @module 'NeoAI.utils.http'
 --- 基于 curl + vim.fn.jobstart 的异步 HTTP 客户端。
 --- - 非阻塞：进程在后台运行，回调走 vim.schedule 进入主循环
 --- - 支持流式（SSE）与普通请求
@@ -396,7 +396,7 @@ function M.json_request(opts, callbacks)
   end
   return M.request(req_opts, callbacks):then_(function(body)
     local json = require("NeoAI.utils.json")
-    local decoded, err = json.decode_or_nil(body)
+    local decoded = json.decode_or_nil(body)
     if decoded == nil and body ~= "" then
       return nil
     end

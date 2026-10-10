@@ -1,5 +1,5 @@
 --- 计划阶段上下文提取
---- @module NeoAI.core.session.plan_distill
+--- @module 'NeoAI.core.session.plan_distill'
 --- 在「plan 完成 → 用户以任何非计划模式（chat/auto）确认开始」的边界，**不再**做 8 段蒸馏压缩。
 --- 改为：在**尚未加入用户真实消息**的前提下，内部追加「XML 结构化提取」请求：
 ---   - 回放现有前缀（系统 + 全部历史，复用前缀缓存）后追加提取指令，让 AI 输出结构化计划；
@@ -287,6 +287,7 @@ end
 --- @param text string
 --- @return table { target?, steps={...}, files?, context?, ... }
 local function _parse(text)
+  ---@type table<string, any>
   local fields = { steps = {} }
   if type(text) ~= "string" or text == "" then return fields end
   -- 小写副本：string.lower 只改写 ASCII（字节数不变），可用同一下标切回原文取值。
@@ -347,7 +348,7 @@ end
 --- 匹配规则：工具调用参数或工具结果内容中出现任一候选路径 → 认为是相关调用。
 --- 成对：命中的 assistant(tool_calls) 消息 + 其对应的 tool 结果消息一并取出。
 --- @param window table 计划窗口（原始内部消息）
---- @param files_text string|nil <files> 标签原文
+--- @param files_text string|nil 「files」标签原文
 --- @return table 数组（对相关消息的原始引用，保持顺序）
 local function _collect_file_tool_messages(window, files_text)
   local candidates = _file_candidates(files_text)

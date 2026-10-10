@@ -1,5 +1,5 @@
 --- 格式保真假密钥 / 二进制假化 / 出网白名单 / 数据流账本 专项测试
---- @module NeoAI.tests.test_secret_fake
+--- @module 'NeoAI.tests.test_secret_fake'
 --- 覆盖：假密钥格式保真（前缀/长度/字符类/熵 >= 原始）、往返还原、误还原边界、幂等；
 --- 二进制同长随机字节 + 标记还原；出网白名单/供应商自动信任/headless 失败关闭/弹窗决策；
 --- 数据流账本与不透明派生标记。
@@ -93,7 +93,7 @@ tests.suite("secret_fake", function(_, it)
     secret.reset()
     local real = "sk-abcdefghijklmnopqrstuvwxyz0123456789ABCD"
     local out1, used1 = secret.tokenize("k=" .. real)
-    local out2, used2 = secret.tokenize(out1)
+    local out2, _ = secret.tokenize(out1)
     t.eq(out1, out2, "再次假化应保持原样")
     t.eq(1, #used1, "首次应 1 个假密钥")
     t.true_(secret.has_token(out2), "应仍识别为假密钥")
@@ -220,7 +220,8 @@ tests.suite("secret_fake", function(_, it)
     local saved = services.use("services.sandbox")
     services.revoke("services.sandbox")
     ui.reset()
-    local captured = nil
+    ---@type any
+    local captured
     ui.init() -- 沙箱服务尚未就绪（phase 2 晚于 ui phase 1）
     t.eq(nil, captured, "沙箱未就绪时无目标可注册")
     services.provide("services.sandbox", { set_secret_alert_ui = function(u) captured = u end })
@@ -250,7 +251,9 @@ tests.suite("secret_fake", function(_, it)
     local captured
     alert.set_ui({ show = function(ctx, decide) captured = ctx; decide("fake") end })
     local agent = { id = "a_fake_tool" }
-    local res, done = nil, false
+    ---@type any
+    local res
+    local done = false
     with_config({ tools = { approval = { mode = "auto_allow" } } }, function()
       executor.execute("secret_echo_tool",
         { command = "echo " .. real, note = "x=" .. real, description = "t" },
@@ -314,9 +317,11 @@ tests.suite("secret_fake", function(_, it)
     alert.reset()
     local orig_uis = vim.api.nvim_list_uis
     local orig_confirm = vim.fn.confirm
+    ---@diagnostic disable-next-line: duplicate-set-field
     vim.api.nvim_list_uis = function() return { {} } end
     t.true_(alert.available(), "交互式且无专用 UI 时应可用（回退）")
     local function decide_with(ret)
+      ---@diagnostic disable-next-line: duplicate-set-field
       vim.fn.confirm = function() return ret end
       local got
       alert._confirm_fallback({ kind = "egress", dest = "evil.com" }, function(d) got = d end)

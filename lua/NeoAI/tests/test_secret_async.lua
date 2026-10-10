@@ -1,5 +1,5 @@
 --- 密钥异步 token 化专项测试
---- @module NeoAI.tests.test_secret_async
+--- @module 'NeoAI.tests.test_secret_async'
 --- 覆盖：工作线程 token 化与主线程同步结果一致、token 可往返（detokenize）、批量接口。
 
 local tests = require("NeoAI.tests")

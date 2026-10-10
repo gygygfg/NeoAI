@@ -1,5 +1,5 @@
 --- 待审队列内存缓存回归
---- @module NeoAI.tests.test_review_cache
+--- @module 'NeoAI.tests.test_review_cache'
 --- 验证待审队列水合后不再反复读盘：此前 `review.list` 每次调用都
 --- `store.list_reviews()`（scandir + 逐文件 JSON 解码），待审堆积到数百/上千时，
 --- `supersede_by_paths`（每次工具调用）与状态栏 `pending_summary`（每次重绘多次）
@@ -8,6 +8,7 @@
 local tests = require("NeoAI.tests")
 
 tests.suite("review_cache", function(_, it)
+  ---@return table<string, any>, table<string, any>
   local function setup()
     local store = require("NeoAI.sandbox.state.store")
     local review = require("NeoAI.sandbox.review.review")
@@ -129,6 +130,7 @@ tests.suite("review_cache", function(_, it)
 
   it("apply_all 大量项：候选删除批量对账，不逐项全表扫描（避免 O(n²)）", function(t)
     local store, review = setup()
+    ---@type table<string, any>
     local candidate = require("NeoAI.sandbox.execution.candidate")
     for i = 1, 100 do
       store.write_candidate({
@@ -159,6 +161,7 @@ tests.suite("review_cache", function(_, it)
 
   it("begin_batch/end_batch：逐项应用候选删除一次对账，不逐项全表扫描", function(t)
     local store, review = setup()
+    ---@type table<string, any>
     local candidate = require("NeoAI.sandbox.execution.candidate")
     local ids = {}
     for i = 1, 100 do
@@ -234,6 +237,7 @@ tests.suite("review_cache", function(_, it)
     -- 待审计数应扣除被取代路径：A 剩 2 + B 的 1 = 3
     t.eq(3, review.pending_summary().count, "待审计数应扣除被取代路径")
     -- 应用 A 时不得写入被取代的 .pyc（该路径归新单元），但必须写入 .py/dist-info
+    ---@type table<string, any>
     local candidate = require("NeoAI.sandbox.execution.candidate")
     local orig_pub, orig_receipt = candidate.publish, store.write_receipt
     local published
@@ -277,6 +281,7 @@ tests.suite("review_cache", function(_, it)
 
   it("应用兜底：候选文件外部丢失但曾落盘时，从暂存副本重建并应用", function(t)
     local store, review = setup()
+    ---@type table<string, any>
     local candidate = require("NeoAI.sandbox.execution.candidate")
     local dir = vim.fn.tempname()
     vim.fn.mkdir(dir, "p")
@@ -358,8 +363,8 @@ tests.suite("review_cache", function(_, it)
     t.eq(2, #review.list_rejected(), "超限应只保留 2 个已拒绝项")
     t.nil_(store.read_rejected_copy(ids[1], "sha256:ev1"), "最旧项副本应被删除")
     local found_old = false
-    for _, it in ipairs(review.list_rejected()) do
-      if it.change_set_id == ids[1] then found_old = true end
+    for _, entry in ipairs(review.list_rejected()) do
+      if entry.change_set_id == ids[1] then found_old = true end
     end
     t.true_(not found_old, "最旧项不应出现在已拒绝列表")
     -- 较新的两项仍可恢复
@@ -371,6 +376,7 @@ tests.suite("review_cache", function(_, it)
 
   it("[REPRO] 选择性应用多项后：已应用项全部保留 + 剩余文件回队待审", function(t)
     local store, review = setup()
+    ---@type table<string, any>
     local candidate = require("NeoAI.sandbox.execution.candidate")
     local base = vim.fn.tempname()
     vim.fn.mkdir(base, "p")
@@ -391,7 +397,7 @@ tests.suite("review_cache", function(_, it)
     })
     local ia = review.enqueue(A, { tool = "edit_file" })
     local ib = review.enqueue(B, { tool = "edit_file" })
-    local ic = review.enqueue(C, { tool = "edit_file" })
+    local _ = review.enqueue(C, { tool = "edit_file" })
     local orig = candidate.publish
     candidate.publish = function()
       return { ok = true, state = "COMMITTED", receipt = { operation_id = "op_repro" } }
@@ -400,9 +406,9 @@ tests.suite("review_cache", function(_, it)
     review.apply(ib.change_set_id, { auto_approve = true, files = { base .. "/b.txt" } })
     candidate.publish = orig
     local applied, pending = 0, 0
-    for _, it in ipairs(review.list()) do
-      if it.apply_state == review.APPLY.APPLIED then applied = applied + 1 end
-      if it.review_state == review.REVIEW.PENDING then pending = pending + 1 end
+    for _, entry in ipairs(review.list()) do
+      if entry.apply_state == review.APPLY.APPLIED then applied = applied + 1 end
+      if entry.review_state == review.REVIEW.PENDING then pending = pending + 1 end
     end
     t.eq(2, applied, "应有 2 个已应用项（A、B）")
     t.eq(2, pending, "应剩 2 个待审项（C + A 回队的非工作区文件）")

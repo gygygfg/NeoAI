@@ -1,5 +1,5 @@
 --- 沙箱网络访问同意服务
---- @module NeoAI.sandbox.net.net_consent
+--- @module 'NeoAI.sandbox.net.net_consent'
 --- 沙箱内部创建的进程/绑定的服务端口，在沙箱内访问**免权限**（回环 + 内部端口登记表 +
 --- `allow_localhost_ports` 白名单）；访问沙箱外部（宿主本机其他端口、宿主网卡、外部主机）
 --- 弹窗请求用户同意。

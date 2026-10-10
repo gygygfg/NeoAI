@@ -1,5 +1,5 @@
 --- 沙箱控制面：标识、摘要、状态机、幂等与 fencing
---- @module NeoAI.sandbox.execution.control
+--- @module 'NeoAI.sandbox.execution.control'
 --- 状态机与并发控制的单一事实来源；不直接执行 I/O。
 
 local json = require("NeoAI.utils.json")

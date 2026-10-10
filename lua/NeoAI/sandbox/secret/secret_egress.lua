@@ -1,6 +1,6 @@
 --- 密钥出网守卫：向非白名单地址**发送密钥**时弹窗阻止并警告；白名单地址（含自动信任的
 --- 模型供应商）不弹窗也不警告。headless 无 UI 时失败关闭（拒绝发送）。
---- @module NeoAI.sandbox.secret.secret_egress
+--- @module 'NeoAI.sandbox.secret.secret_egress'
 --- 覆盖：`utils/http`（程序化 HTTP：模型/MCP-HTTP）、沙箱子进程（curl/wget/nc 等）、
 --- run_command。目标主机不可判定时按「非白名单」处理，需用户确认。
 

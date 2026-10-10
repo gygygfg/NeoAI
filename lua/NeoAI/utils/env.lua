@@ -1,5 +1,5 @@
 --- 进程环境探测工具
---- @module NeoAI.utils.env
+--- @module 'NeoAI.utils.env'
 --- 纯工具模块，无业务依赖。
 
 local M = {}

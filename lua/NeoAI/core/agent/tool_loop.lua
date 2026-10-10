@@ -1,5 +1,5 @@
 --- 工具调用循环
---- @module NeoAI.core.agent.tool_loop
+--- @module 'NeoAI.core.agent.tool_loop'
 --- Agent 的工具调用循环：执行工具 → 请求 AI 继续 → 直到无工具调用。
 --- 每轮创建持久流处理器累积 tool_calls 增量。
 --- 工具执行经 tool_service（审批 + 调度 + 执行）。
@@ -167,8 +167,8 @@ local function _execute_single(agent, tool_call, tool_service, opts)
       notice = exec_opts.ui_notice, secret_paths = exec_opts.observed_secret_paths }
   end, function(err)
     local duration_ms = timer:elapsed()
-    local logger = require("NeoAI.kernel.logger")
-    logger.warn("[tool_loop] 工具失败 %s 耗时 %dms err=%s", name, math.floor(duration_ms), tostring(err and err.message or err))
+    local log = require("NeoAI.kernel.logger")
+    log.warn("[tool_loop] 工具失败 %s 耗时 %dms err=%s", name, math.floor(duration_ms), tostring(err and err.message or err))
     local json = require("NeoAI.utils.json")
     local err_msg = type(err) == "table" and (err.message or json.encode(err)) or tostring(err)
     local result_str = json.encode({ error = err_msg, tool = name })
@@ -443,7 +443,7 @@ function M.run(agent, tool_calls, tool_service, opts)
     end
 
     return async.all(promises):then_(function(results)
-      for i, res in ipairs(results) do
+      for _, res in ipairs(results) do
         if res then
           agent:add_tool_result(res.tool_call_id, res.name, res.result_str, {
             duration_ms = res.duration_ms, notice = res.notice, secret_paths = res.secret_paths,

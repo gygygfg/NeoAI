@@ -1,5 +1,5 @@
 --- 前缀管理与缓存身份一致性
---- @module NeoAI.core.agent.prefix
+--- @module 'NeoAI.core.agent.prefix'
 --- 策略对齐 deepseek-harness 的上下文缓存实践：
 --- 1. 系统提示按有序段拼接（身份 -100 / persona 0 / 工具指引 100+），渲染逐字节稳定，
 ---    任何顺序位或文本变化都会使前缀缓存从第一个变更 token 起失效。
@@ -19,7 +19,6 @@ local bit = require("bit")
 
 local ORDER_IDENTITY = -100
 local ORDER_PERSONA = 0
-local ORDER_TOOL_GUIDANCE = 100
 
 -- 全局段注册表 name -> { order = number, text = string, name = string }
 local _sections = {}
@@ -188,7 +187,7 @@ end
 
 --- 计算请求前缀的缓存身份指纹
 --- @param system_text string 系统提示文本（逐字节）
---- @param tool_defs table 工具定义数组（已确定性排序）
+--- @param tool_defs table|nil 工具定义数组（已确定性排序）
 --- @return string 8 位十六进制指纹
 function M.prefix_id(system_text, tool_defs)
   local parts = { "S\n", system_text or "" }
@@ -206,12 +205,14 @@ end
 --- 确定性 JSON 序列化（供 guard 等模块做参数指纹复用）
 --- @param value any
 --- @return string
-M.canonical_json = _canonical_json
+function M.canonical_json(value)
+  return _canonical_json(value)
+end
 
 --- 校验并记录 Agent 的缓存身份
 --- @param agent table
 --- @param messages table API 消息数组（首条为 system）
---- @param tool_defs table 工具定义
+--- @param tool_defs table|nil 工具定义
 --- @return string 当前前缀指纹
 function M.verify_cache_identity(agent, messages, tool_defs)
   local system_text = ""

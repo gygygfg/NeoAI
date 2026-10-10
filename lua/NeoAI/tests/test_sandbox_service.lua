@@ -1,5 +1,5 @@
 --- 沙箱长驻服务 / 镜像 / 诊断专项测试
---- @module NeoAI.tests.test_sandbox_service
+--- @module 'NeoAI.tests.test_sandbox_service'
 --- 覆盖：service_start/logs/status/stop 生命周期与清理、停止时捕获工作区改动、
 --- long_lived 门禁分支、pip/npm/maven 镜像注入、cgroup 事件/OOM 诊断。
 
@@ -34,15 +34,15 @@ tests.suite("sandbox_service", function(_, it)
     with_config({ tools = { sandbox = sandbox_config() } }, function()
       require("NeoAI.sandbox").reset()
       local svc_mod = require("NeoAI.sandbox.execution.service")
-      local svc, err = svc_mod.start("t1",
-        "for i in 1 2 3 4 5; do echo hello-$i; sleep 0.2; done", { cwd = vim.fn.getcwd() })
+      local svc, err = assert(svc_mod.start("t1",
+        "for i in 1 2 3 4 5; do echo hello-$i; sleep 0.2; done", { cwd = vim.fn.getcwd() }))
       t.not_nil(svc, "启动失败: " .. tostring(err))
       t.eq("running", svc.status)
       local got = vim.wait(5000, function()
         return (svc_mod.logs("t1") or ""):find("hello-3", 1, true) ~= nil
       end, 50)
       t.true_(got, "应产生日志")
-      local info = svc_mod.status("t1")
+      local info = assert(svc_mod.status("t1"))
       t.not_nil(info)
       t.eq("t1", info.name)
       local stopped = false
@@ -69,7 +69,7 @@ tests.suite("sandbox_service", function(_, it)
       local stopped = false
       svc_mod.stop("writer", function() stopped = true end)
       t.true_(vim.wait(10000, function() return stopped end, 50), "停止应完成")
-      local staged_path = candidate.read_path(out)
+      local staged_path = assert(candidate.read_path(out))
       t.not_nil(staged_path, "服务写入应被捕获进工作区暂存")
       local content = require("NeoAI.utils.fs").read_file(staged_path)
       t.matches("svcdata", content or "")
@@ -109,7 +109,7 @@ tests.suite("sandbox_service", function(_, it)
       t.matches("/tmp/.mvn%-settings.xml", env.MAVEN_OPTS or "")
       -- settings.xml 生成在宿主私有目录，由 process_prefix 只读绑定到 guest 路径。
       local host = require("NeoAI.sandbox.observe.conceal").base_host() .. "/runtime/mvn-settings.xml"
-      local f = io.open(host, "r")
+      local f = assert(io.open(host, "r"))
       t.not_nil(f, "settings.xml 应存在: " .. host)
       local body = f:read("*a")
       f:close()
@@ -173,7 +173,7 @@ tests.suite("sandbox_service", function(_, it)
       t.true_(vim.wait(10000, function() return stopped end, 50), "停止应完成")
       local dt = (vim.uv.hrtime() - t0) / 1e6
       t.true_(dt < 1800, string.format("优雅退出应在 stop_timeout_ms 内完成（实际 %.0f ms）", dt))
-      local staged = candidate.read_path(term)
+      local staged = assert(candidate.read_path(term))
       t.not_nil(staged, "SIGTERM trap 应写入 term.txt（证 SIGTERM 到达载荷而非立即 SIGKILL）")
       t.matches("GRACEFUL", require("NeoAI.utils.fs").read_file(staged) or "")
     end)
@@ -223,7 +223,7 @@ tests.suite("sandbox_service", function(_, it)
       end, 50), "服务应就绪")
       svc_mod.stop_all({ timeout_ms = 3000 })
       t.eq(0, #svc_mod.list(), "stop_all 后应清空")
-      local staged = candidate.read_path(term)
+      local staged = assert(candidate.read_path(term))
       t.not_nil(staged, "stop_all 也应优雅停止并捕获 trap 写入")
       t.matches("GRACEFUL", require("NeoAI.utils.fs").read_file(staged) or "")
     end)

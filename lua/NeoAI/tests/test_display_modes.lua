@@ -5,7 +5,7 @@ local FIXTURE_NAME = "zz_reload_fixture"
 local FIXTURE_PATH = "/root/NeoAI/lua/NeoAI/ui/components/display_modes/" .. FIXTURE_NAME .. ".lua"
 
 local function _write_fixture(desc)
-  local f = io.open(FIXTURE_PATH, "w")
+  local f = assert(io.open(FIXTURE_PATH, "w"))
   f:write(string.format([[
 _G.__NEOAI_FIXTURE_LOADS = (_G.__NEOAI_FIXTURE_LOADS or 0) + 1
 local manager = require("NeoAI.ui.components.display_modes")
@@ -282,7 +282,7 @@ tests.suite("display_modes", function(_, it)
     t.false_(fold.has_foldexpr_override(), "对话模式不应有 foldexpr 覆盖")
     t.false_(fold.has_foldtext_override(), "对话模式不应有 foldtext 覆盖")
 
-    local plugin = display_modes.get("trajectory")
+    local plugin = assert(display_modes.get("trajectory"))
     t.not_nil(plugin, "应能获取 trajectory 插件")
     t.eq("trajectory", plugin.name, "插件 name 应正确")
     t.eq("轨迹", plugin.label, "插件应带中文 label")
@@ -321,14 +321,14 @@ tests.suite("display_modes", function(_, it)
 
     chat_view.open()
     local ibuf = input_box.get_buf()
-    local cbt = nil
+    local cbt
     for _, m in ipairs(vim.api.nvim_buf_get_keymap(ibuf, "i")) do
       if m.lhs == "<C-T>" then cbt = m.callback break end
     end
     t.not_nil(cbt, "输入框插入模式应注册 <C-t> 切换显示模式映射")
 
     -- 触发 <C-t>：应切到轨迹模式并重渲染（用户停留在输入框也不影响）
-    cbt()
+    assert(cbt)()
     t.eq("trajectory", display_modes.get_current_name(), "插入模式 <C-t> 应切换到轨迹模式")
 
     local buf = require("NeoAI.ui.components.input_box").get_buf()
@@ -336,7 +336,7 @@ tests.suite("display_modes", function(_, it)
     -- 输入框内容不应被破坏（<C-t> 是切换动作而非输入字符）
     t.eq("", joined, "输入框内容应保持为空，不被 <C-t> 写入字符")
 
-    cbt()
+    assert(cbt)()
     t.eq("chat", display_modes.get_current_name(), "再次 <C-t> 应切回对话模式")
 
     chat_view.reset()
@@ -444,8 +444,8 @@ tests.suite("display_modes", function(_, it)
       local last = agent.messages[#agent.messages]
       return last and last.role == "assistant" and last.request ~= nil and last.response ~= nil
     end)
-    local agent = chat_service.get_current_agent()
-    local last = agent and agent.messages[#agent.messages]
+    local agent = assert(chat_service.get_current_agent())
+    local last = assert(agent and agent.messages[#agent.messages])
     t.true_(got, "应完成一轮生成并捕获元数据")
     t.not_nil(last, "应有最后一条消息")
     t.eq("assistant", last.role, "最后一条应为 assistant")
@@ -511,7 +511,7 @@ tests.suite("display_modes", function(_, it)
     chat_service.reset()
 
     local opened = chat_view.open()
-    local agent = chat_service.get_current_agent()
+    local agent = assert(chat_service.get_current_agent())
     -- 超长请求体 / 响应分片，末尾各带唯一标记：展示模式应截断（标记被裁掉），日志应完整保留（标记在）。
     local long_body = string.rep("x", 9000) .. "REQ_TAIL_MARKER"
     local long_chunk = string.rep("y", 7000) .. "CHK_TAIL_MARKER"
@@ -542,10 +542,10 @@ tests.suite("display_modes", function(_, it)
     -- save_log：写入文件并返回路径
     local dir = "/tmp/neoai_traj_log"
     pcall(vim.fn.delete, dir, "rf")
-    local path = trajectory.save_log(agent.messages, { dir = dir })
+    local path = assert(trajectory.save_log(agent.messages, { dir = dir }))
     t.not_nil(path, "save_log 应返回文件路径")
     t.true_(path:find(dir, 1, true) == 1, "保存路径应在指定目录下")
-    local content = fs.read_file(path)
+    local content = assert(fs.read_file(path))
     t.not_nil(content, "日志文件应可读")
     t.true_(content:find("# NeoAI 轨迹日志", 1, true) ~= nil, "日志应有文件头")
     t.true_(content:find("REQ_TAIL_MARKER", 1, true) ~= nil, "日志文件应含完整请求体")
@@ -605,7 +605,7 @@ tests.suite("display_modes", function(_, it)
       return #entries >= 1
     end)
     t.true_(#entries >= 1, "确认后应在目录内写出日志")
-    local content = entries[1] and fs.read_file(fs.join(DIR, entries[1]))
+    local content = assert(entries[1] and fs.read_file(fs.join(DIR, entries[1])))
     t.not_nil(content, "日志文件应可读")
     t.true_(content:find("# NeoAI 轨迹日志", 1, true) ~= nil, "日志应有文件头")
     t.true_(content:find("用户", 1, true) ~= nil, "日志应含会话内容")
@@ -666,7 +666,7 @@ tests.suite("display_modes", function(_, it)
     local chat_view = require("NeoAI.ui.window.chat_view")
     local chat_service = require("NeoAI.services.chat_service")
     local config_store = require("NeoAI.kernel.config_store")
-    local fs = require("NeoAI.utils.fs")
+    local _ = require("NeoAI.utils.fs")
     local DIR = "/tmp/neoai_traj_norm"
     pcall(vim.fn.delete, DIR, "rf")
     config_store.reset()

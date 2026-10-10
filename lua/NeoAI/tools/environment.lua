@@ -1,5 +1,5 @@
 --- 工具环境探测
---- @module NeoAI.tools.environment
+--- @module 'NeoAI.tools.environment'
 --- 拼接工具上下文（tool definitions）前，检测当前会话可用的工作区 / git 环境；
 --- 无法获取 workspace（cwd）或 git 目录时，禁用依赖对应环境的工具，
 --- 避免向模型暴露必然失败的调用。

@@ -1,5 +1,5 @@
 --- 网络访问同意弹窗
---- @module NeoAI.ui.components.net_consent
+--- @module 'NeoAI.ui.components.net_consent'
 --- 沙箱内进程/端口在沙箱内访问免权限；访问沙箱外部（宿主本机其他端口、外部主机）时
 --- 阻塞并请用户确认。注册到 sandbox.net_consent。
 

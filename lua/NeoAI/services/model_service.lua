@@ -1,5 +1,5 @@
 --- 模型服务
---- @module NeoAI.services.model_service
+--- @module 'NeoAI.services.model_service'
 --- 供 UI（model_picker）选择/切换模型。
 --- - list()：异步返回所有可用模型
 --- - set_active(model_id)：切换当前 Agent 模型

@@ -1,5 +1,5 @@
 --- 轨迹 wire 数据有界保留 + 事件轻量 payload 测试
---- @module NeoAI.tests.test_trace_retention
+--- @module 'NeoAI.tests.test_trace_retention'
 
 local tests = require("NeoAI.tests")
 
@@ -95,6 +95,7 @@ tests.suite("trace_retention", function(_, it)
     local events = require("NeoAI.kernel.events")
     local runtime = require("NeoAI.core.agent.runtime")
     local agent = runtime.create({ session_id = "trace4" })
+    ---@type any
     local captured = nil
     local unsub = event_bus.on(events.MESSAGE_UPDATED, function(data) captured = data end)
     agent:append_content("hello world")

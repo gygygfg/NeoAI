@@ -1,5 +1,5 @@
 --- 异步发布 / 审批窗渲染上限 / 内存剥离 回归
---- @module NeoAI.tests.test_sandbox_publish_async
+--- @module 'NeoAI.tests.test_sandbox_publish_async'
 --- 覆盖：
 --- 1) candidate.publish_async 两阶段（CAS 并行 + 写入并行）在顺序无关候选上正确；
 --- 2) 任一 CAS 冲突时不产生任何写入（阶段一为只读）；
@@ -48,7 +48,7 @@ tests.suite("sandbox_publish_async", function(_, it)
         { path = p2, action = "modify", content = "new\n", before_hash = sha("old"), mode = 420 },
       },
     })
-    local res = await(d)
+    local res = assert(await(d))
     t.true_(res and res.ok, "异步发布应成功: " .. tostring(res and res.reason))
     t.eq("one\n", fs.read_file(p1), "新建文件内容应正确")
     t.eq("new\n", fs.read_file(p2), "修改文件内容应正确")
@@ -71,6 +71,7 @@ tests.suite("sandbox_publish_async", function(_, it)
         { path = p2, action = "create", content = "two\n", mode = 420 },
       },
     }))
+    assert(res)
     t.true_(res and not res.ok, "应报告冲突")
     t.eq("CONFLICT", res.state, "应为 CONFLICT")
     t.eq(nil, vim.uv.fs_stat(p1), "冲突时不应部分写入其它文件")
@@ -88,10 +89,11 @@ tests.suite("sandbox_publish_async", function(_, it)
         { path = dir .. "/.git/objects/ab/cd", action = "create", content = "obj", mode = 420 },
       },
     }
+    ---@type table<string, any>
     local writer = require("NeoAI.sandbox.execution.writer")
     local order = {}
     local orig_apply = writer.apply
-    writer.apply = function(action, path, content, opts)
+    writer.apply = function(_, path, _, _)
       order[#order + 1] = path
       return { ok = true, state = writer.STATE.WRITTEN }
     end
@@ -116,11 +118,11 @@ tests.suite("sandbox_publish_async", function(_, it)
       created_at = 1, effect = "fs_write",
     }
     store.write_candidate(cand)
-    local item = review.enqueue(cand, { tool = "edit_file" })
+    local item = assert(review.enqueue(cand, { tool = "edit_file" }))
     local res = await(review.apply_async(item.change_set_id, { auto_approve = true }))
     t.true_(res and res.ok, "异步应用应成功: " .. tostring(res and res.reason))
     t.eq("hi\n", fs.read_file(p), "文件应落盘")
-    local after = review.get(item.change_set_id)
+    local after = assert(review.get(item.change_set_id))
     t.eq(review.APPLY.APPLIED, after.apply_state, "条目应标记已应用")
     store.reset()
     review.reset()
@@ -138,7 +140,7 @@ tests.suite("sandbox_publish_async", function(_, it)
       created_at = 1,
     }
     store.write_candidate(cand)
-    local item = review.enqueue(cand, { tool = "edit_file" })
+    local item = assert(review.enqueue(cand, { tool = "edit_file" }))
     t.eq(nil, (item.files[1] or {}).content, "内存条目应已剥离 content")
     t.eq("lazy-content", review.content_for(item.change_set_id, p), "content_for 应按候选读取")
     t.eq("lazy-content", review.content_for(item.change_set_id, p), "LRU 二次读取应一致")
@@ -159,7 +161,7 @@ tests.suite("sandbox_publish_async", function(_, it)
         created_at = i,
       }
       store.write_candidate(cand)
-      local item = review.enqueue(cand, { tool = "edit_file" })
+      local item = assert(review.enqueue(cand, { tool = "edit_file" }))
       ids[i] = item.change_set_id
     end
     -- 内部丢弃（如候选被显式 discard 后的对账）标记为 REJECTED 但**不**保留可恢复副本，
@@ -167,7 +169,7 @@ tests.suite("sandbox_publish_async", function(_, it)
     for i = 1, 3 do review.discard_by_digest("sha256:term" .. i, "test") end
     -- 5 项中 3 项终态、2 项待审；终态上限 2 → 应淘汰 1 项（最早进入终态者）。
     t.eq(4, review._memory_count(), "超过上限的终态项应从内存淘汰")
-    local back = review.get(ids[1])
+    local back = assert(review.get(ids[1]))
     t.not_nil(back, "淘汰项应可从磁盘回读")
     t.eq(review.REVIEW.REJECTED, back.review_state, "回读状态应正确")
     config_store.set("tools.sandbox.review.terminal_cache_max", saved)

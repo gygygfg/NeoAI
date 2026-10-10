@@ -1,5 +1,5 @@
 --- NeoAI 事件常量注册表
---- @module NeoAI.kernel.events
+--- @module 'NeoAI.kernel.events'
 --- 事件名规范：domain:verb（如 "agent:spawn"、"stream:chunk"）。
 --- 所有模块通过引用常量触发/监听事件，禁止硬编码事件字符串。
 

@@ -1,5 +1,5 @@
 --- 工具执行器
---- @module NeoAI.tools.executor
+--- @module 'NeoAI.tools.executor'
 --- 参数规范化 + 校验 + 审批 + 执行（异步）+ 超时。
 --- 执行结果统一转为字符串（供 Agent 回传）。
 
@@ -25,7 +25,7 @@ local M = {}
 --- @param args table
 --- @param ctx table|nil 会话上下文（`ctx.cwd`/`ctx.sandbox_exec_cwd` 为会话绑定工作目录）
 --- @return string|nil mask_entry
---- @return boolean hard
+--- @return boolean|nil hard
 local function _masked_target(tool_name, args, ctx)
   local runtime = require("NeoAI.sandbox.execution.runtime")
   local cwd = (ctx and (ctx.sandbox_exec_cwd or ctx.cwd)) or vim.fn.getcwd()
@@ -118,8 +118,13 @@ local function _normalize_arguments(tool_name, args)
   local aliases = {
     cmd = "command", file = "file_path", files = "file_path",
     filepath = "file_path", -- 旧参数名兼容：filepath → file_path
+    filePath = "file_path", -- opencode 风格驼峰别名
     start = "start_line", ["end"] = "end_line",
     dir = "dirs", dir_path = "dirs", dirs = "dirs",
+    -- opencode 风格别名（加别名，保持兼容；不改变工具语义）
+    oldString = "old_text", newString = "new_text",
+    pattern = "query", glob = "include",
+    timeout = "timeout_ms",
     -- 注意：不要给 new_text/text 起 content 别名——那会把「局部替换」误判成「整文件覆写」，
     -- 曾导致 edit_file 静默覆写整文件（详见 file_ops.edit_file 的参数契约）。
   }
@@ -343,19 +348,6 @@ local function _entropy_enabled(tool_name, args, ctx)
   return _touches_secret_path(tool_name, args, ctx)
 end
 
---- 出向密钥防护：扫描工具参数。
---- - 命中映射表中已知的**原始密钥**（未加密真实值）→ 硬拦截并终止整个 Agent（明确通知用户）；
---- - 命中 token（加密后的 key）或**敏感环境变量名** → 记录留痕并提级审批
----   （`ctx.secret_operation`），由待审悬浮窗展示 `⚠ 密钥操作`，**不终止**；
---- - fs_write 类工具的内容参数做 token 化，使写入只落 token，commit 时再还原。
---- 另：AI 可见上下文中的原始密钥由 `core/agent/recovery` 在请求前守卫并终止（沙箱上下文
---- 被突破）。
---- @param tool table
---- @param tool_name string
---- @param args table
---- @param ctx table
---- @return boolean ok
---- @return table|nil err
 -- 小参数同步扫描上限：小参数下保持「审批/执行同步可见」的既有语义（状态栏/审批窗立即弹出），
 -- 仅当参数字节数超过该阈值才下放线程池（大参数扫描的线程往返延迟可接受）。
 local SECRET_SCAN_SYNC_BYTES = 65536
@@ -489,10 +481,21 @@ local function _handle_scan_result(scan, tool, tool_name, args, ctx)
   return true
 end
 
---- 出向密钥防护。返回值：
+--- 出向密钥防护：扫描工具参数。
+--- - 命中映射表中已知的**原始密钥**（未加密真实值）→ 硬拦截并终止整个 Agent（明确通知用户）；
+--- - 命中 token（加密后的 key）或**敏感环境变量名** → 记录留痕并提级审批
+---   （`ctx.secret_operation`），由待审悬浮窗展示 `⚠ 密钥操作`，**不终止**；
+--- - fs_write 类工具的内容参数做 token 化，使写入只落 token，commit 时再还原。
+--- 另：AI 可见上下文中的原始密钥由 `core/agent/recovery` 在请求前守卫并终止（沙箱上下文
+--- 被突破）。
+--- 返回值：
 --- - `true`：通过（同步）
 --- - `false, err`：硬拦截（同步）
 --- - `Deferred`：大参数异步扫描（resolve(true) / reject(err)）
+--- @param tool table
+--- @param tool_name string
+--- @param args table
+--- @param ctx table
 --- @return boolean|Deferred
 local function _secret_guard(tool, tool_name, args, ctx)
   if not secret.enabled() then return true end
@@ -674,7 +677,7 @@ end
 --- 执行工具
 --- @param tool_name string
 --- @param raw_args any
---- @param ctx table { agent?, tool_call_id?, signal?, is_sub_agent?, tool_service? }
+--- @param ctx? table { agent?, tool_call_id?, signal?, is_sub_agent?, tool_service? }
 --- @return Deferred resolve(结果), reject(错误)
 function M.execute(tool_name, raw_args, ctx)
   ctx = ctx or {}
@@ -688,7 +691,7 @@ function M.execute(tool_name, raw_args, ctx)
   if not resolved then
     return async.reject({ kind = "tool", message = "工具不存在: " .. tool_name })
   end
-  local tool = registry.get(resolved)
+  local tool = assert(registry.get(resolved))
 
   -- 参数规范化：MCP 工具跳过别名改写与路径展开。
   -- 远端工具的 schema 由服务器权威定义，本地 alias（file→file_path 等）会破坏参数名，
@@ -719,10 +722,13 @@ function M.execute(tool_name, raw_args, ctx)
     return _execute_after_secret_guard(tool, resolved, args, ctx)
   elseif guard == false then
     return async.reject(guard_err)
+  else
+    -- 大参数异步扫描：guard 为 Deferred。
+    ---@cast guard Deferred
+    return guard:then_(function()
+      return _execute_after_secret_guard(tool, resolved, args, ctx)
+    end)
   end
-  return guard:then_(function()
-    return _execute_after_secret_guard(tool, resolved, args, ctx)
-  end)
 end
 
 --- 结果字符串化

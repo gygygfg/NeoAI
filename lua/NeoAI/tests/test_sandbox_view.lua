@@ -1,5 +1,5 @@
 --- 沙箱视图：播种门禁/遮蔽目录/mount 列举/权限受限视图
---- @module NeoAI.tests.test_sandbox_view
+--- @module 'NeoAI.tests.test_sandbox_view'
 --- 由原 test_sandbox.lua 按用例分片而来（43 个用例，彼此独立、无跨用例共享状态）。
 
 local tests = require("NeoAI.tests")
@@ -21,11 +21,6 @@ local function with_config(overrides, fn)
   config_store.load(saved)
   if not ok then error(err, 0) end
 end
-
-local function trim(s)
-  return (tostring(s or ""):gsub("%s+$", ""))
-end
-
 
 tests.suite("sandbox_view", function(_, it)
   it("播种视图门禁：覆盖根内暂存不拒绝、覆盖根外仍 fail-closed", function(t)
@@ -59,6 +54,7 @@ tests.suite("sandbox_view", function(_, it)
   it("无 overlay 播种视图：命令可见真实文件，写入仍冻结为候选", function(t)
     local fs = require("NeoAI.utils.fs")
     local sandbox = require("NeoAI.sandbox")
+    ---@type table<string, any>
     local runtime = require("NeoAI.sandbox.execution.runtime")
     if runtime.backend() ~= "bwrap" then return end
     local dir = vim.fn.tempname()
@@ -67,7 +63,9 @@ tests.suite("sandbox_view", function(_, it)
     local prev = vim.fn.getcwd()
     vim.fn.chdir(dir)
     local saved_avail, saved_writable = runtime.overlay_available, runtime.overlay_writable
+    ---@diagnostic disable-next-line: duplicate-set-field
     runtime.overlay_available = function() return false end
+    ---@diagnostic disable-next-line: duplicate-set-field
     runtime.overlay_writable = function() return false end
     local ok, err = pcall(function()
       with_config({ tools = { approval = { mode = "async" }, sandbox = {
@@ -172,12 +170,12 @@ tests.suite("sandbox_view", function(_, it)
       local upper, work = base .. "/upper", base .. "/work"
       fs.ensure_dir(upper); fs.ensure_dir(work)
       local a = control.new_attempt("run_command", {}, {}, { effect = "process" })
-      candidate.begin(a, store.root())
+      candidate.begin(a, assert(store.root()))
       -- 命令在 overlay 中创建一个小文件和一个超过上限的大文件（base 也放一份大文件，
       -- 验证它不会进入 base 哈希列表被读取/哈希）。
       fs.write_file(dir .. "/big.bin", string.rep("y", 4096))
       fs.write_file(upper .. "/small.txt", "hi\n")
-      local bf = io.open(upper .. "/big.bin", "wb"); bf:write(string.rep("x", 4096)); bf:close()
+      local bf = assert(io.open(upper .. "/big.bin", "wb")); bf:write(string.rep("x", 4096)); bf:close()
       local done, err = false, nil
       candidate.capture_overlay_async(a.attempt_id, dir, upper):then_(function() done = true end, function(e)
         err = e; done = true
@@ -202,14 +200,14 @@ tests.suite("sandbox_view", function(_, it)
     local candidate = require("NeoAI.sandbox.execution.candidate")
     local control = require("NeoAI.sandbox.execution.control")
     local store = require("NeoAI.sandbox.state.store")
+    local dir = fs.canonical(vim.fn.tempname())
     with_config({ tools = { sandbox = {
       workspace_root = vim.fn.tempname() .. "/sb", max_file_bytes = 1024,
     } } }, function()
       sandbox.reset()
-      local dir = fs.canonical(vim.fn.tempname())
       fs.ensure_dir(dir)
       local a = control.new_attempt("run_command", {}, {}, { effect = "process" })
-      candidate.begin(a, store.root())
+      candidate.begin(a, assert(store.root()))
       local target = dir .. "/libtorch_python.so"
       local staged = candidate.stage_path(a.attempt_id, target)
       local content = string.rep("Z", 8192)
@@ -267,7 +265,7 @@ tests.suite("sandbox_view", function(_, it)
     } } }, function()
       sandbox.reset()
       local a = control.new_attempt("run_command", {}, {}, { effect = "process" })
-      candidate.begin(a, store.root())
+      candidate.begin(a, assert(store.root()))
       local target = dir .. "/big.bin"
       local staged = candidate.stage_path(a.attempt_id, target)
       fs.write_file(staged, string.rep("Z", 4096))
@@ -295,7 +293,7 @@ tests.suite("sandbox_view", function(_, it)
     with_config({ tools = { sandbox = { workspace_root = vim.fn.tempname() .. "/sb" } } }, function()
       sandbox.reset()
       local a = control.new_attempt("run_command", {}, {}, { effect = "process" })
-      candidate.begin(a, store.root())
+      candidate.begin(a, assert(store.root()))
       local p = dir .. "/a.txt"
       local staged = candidate.stage_path(a.attempt_id, p)
       fs.write_file(staged, "hello\n")
@@ -325,7 +323,7 @@ tests.suite("sandbox_view", function(_, it)
       local upper, work = base .. "/upper", base .. "/work"
       fs.ensure_dir(upper); fs.ensure_dir(work)
       local a1 = control.new_attempt("run_command", {}, {}, { effect = "process" })
-      candidate.begin(a1, store.root())
+      candidate.begin(a1, assert(store.root()))
       fs.write_file(upper .. "/f.txt", "cmd\n")
       local d1 = false
       candidate.capture_overlay_async(a1.attempt_id, dir, upper):then_(function() d1 = true end, function() d1 = true end)
@@ -333,7 +331,7 @@ tests.suite("sandbox_view", function(_, it)
       t.not_nil(candidate.mapping(a1.attempt_id)[dir .. "/f.txt"], "首次应捕获")
       -- 第二次捕获（新 attempt）：overlay 未变，应整体跳过、不产生任何 mapping 条目。
       local a2 = control.new_attempt("run_command", {}, {}, { effect = "process" })
-      candidate.begin(a2, store.root())
+      candidate.begin(a2, assert(store.root()))
       local d2 = false
       candidate.capture_overlay_async(a2.attempt_id, dir, upper):then_(function() d2 = true end, function() d2 = true end)
       t.true_(vim.wait(10000, function() return d2 end, 20), "第二次捕获应完成")
@@ -365,14 +363,14 @@ tests.suite("sandbox_view", function(_, it)
       local obj_rel = ".git/objects/ab/" .. string.rep("c", 38)
       fs.write_file(upper .. "/" .. obj_rel, "blob-bytes")
       local a1 = control.new_attempt("git_add", {}, {}, { effect = "process" })
-      candidate.begin(a1, store.root())
+      candidate.begin(a1, assert(store.root()))
       local d1 = false
       candidate.capture_overlay_async(a1.attempt_id, dir, upper):then_(function() d1 = true end, function() d1 = true end)
       t.true_(vim.wait(10000, function() return d1 end, 20), "第一次捕获应完成")
       t.not_nil(candidate.mapping(a1.attempt_id)[dir .. "/" .. obj_rel], "首次应捕获 .git 对象")
       -- 第二次捕获（新 attempt）：overlay 内容未变。
       local a2 = control.new_attempt("git_commit", {}, {}, { effect = "process" })
-      candidate.begin(a2, store.root())
+      candidate.begin(a2, assert(store.root()))
       local d2 = false
       candidate.capture_overlay_async(a2.attempt_id, dir, upper):then_(function() d2 = true end, function() d2 = true end)
       t.true_(vim.wait(10000, function() return d2 end, 20), "第二次捕获应完成")
@@ -407,7 +405,7 @@ tests.suite("sandbox_view", function(_, it)
       fs.ensure_dir(vim.fn.fnamemodify(upper1 .. "/" .. obj_rel, ":h"))
       fs.write_file(upper1 .. "/" .. obj_rel, "blob-bytes")
       local a1 = control.new_attempt("git_add", {}, {}, { effect = "process" })
-      candidate.begin(a1, store.root())
+      candidate.begin(a1, assert(store.root()))
       local d1 = false
       candidate.capture_overlay_async(a1.attempt_id, dir, upper1):then_(function() d1 = true end, function() d1 = true end)
       t.true_(vim.wait(10000, function() return d1 end, 20), "第一次捕获应完成")
@@ -419,7 +417,7 @@ tests.suite("sandbox_view", function(_, it)
       local upper2, work2 = base .. "/upper2", base .. "/work2"
       fs.ensure_dir(upper2); fs.ensure_dir(work2)
       local a2 = control.new_attempt("git_commit", {}, {}, { effect = "process" })
-      candidate.begin(a2, store.root())
+      candidate.begin(a2, assert(store.root()))
       candidate.materialize_overlay({ { root = dir, upper = upper2, work = work2, mode = "overlay" } })
       t.true_(fs.exists(upper2 .. "/" .. obj_rel), "暂存对象应物化进新 overlay")
       local d2 = false
@@ -453,7 +451,7 @@ tests.suite("sandbox_view", function(_, it)
 
       -- 非 git 工具：残留指针 + 对象 + 普通文件都在 overlay 里。
       local a = control.new_attempt("run_command", {}, {}, { effect = "process" })
-      candidate.begin(a, store.root())
+      candidate.begin(a, assert(store.root()))
       local function stage(rel, content)
         local staged = candidate.stage_path(a.attempt_id, dir .. "/" .. rel)
         fs.write_file(staged, content)
@@ -473,7 +471,7 @@ tests.suite("sandbox_view", function(_, it)
 
       -- 对照：git 写类工具仍应携带 `.git` 指针（其对象/指针须原子发布）。
       local b = control.new_attempt("git_commit", {}, {}, { effect = "process" })
-      candidate.begin(b, store.root())
+      candidate.begin(b, assert(store.root()))
       local staged_idx = candidate.stage_path(b.attempt_id, dir .. "/.git/index")
       fs.write_file(staged_idx, "DIRC\0\0\0\2")
       local cand2 = candidate.finish(b.attempt_id)
@@ -489,13 +487,13 @@ tests.suite("sandbox_view", function(_, it)
 
   it("run_command：非零退出以结构化 error 返回（UI 显示失败）", function(t)
     local registry = require("NeoAI.tools.registry")
-    local tool = registry.get("run_command")
+    local tool = assert(registry.get("run_command"))
     t.not_nil(tool, "run_command 已注册")
     local res = nil
     tool.func({ command = "sh -c 'echo out; exit 2'", description = "t" },
       function(v) res = v end, function(e) res = e end, {})
     t.true_(vim.wait(5000, function() return res ~= nil end, 50), "命令应返回")
-    local decoded = require("NeoAI.utils.json").decode_or_nil(res)
+    local decoded = require("NeoAI.utils.json").decode_or_nil(assert(res))
     t.true_(type(decoded) == "table" and decoded.error ~= nil, "非零退出应含 error 字段（UI 判失败）")
     t.true_(tostring(decoded.error):find("退出码 2", 1, true) ~= nil, "error 应含退出码")
     t.true_(tostring(decoded.output):find("out", 1, true) ~= nil, "output 应保留终端输出")
@@ -504,7 +502,7 @@ tests.suite("sandbox_view", function(_, it)
     tool.func({ command = "echo fine", description = "t" },
       function(v) ok_res = v end, function(e) ok_res = e end, {})
     t.true_(vim.wait(5000, function() return ok_res ~= nil end, 50), "命令应返回")
-    t.eq(nil, require("NeoAI.utils.json").decode_or_nil(ok_res), "成功应为普通文本")
+    t.eq(nil, require("NeoAI.utils.json").decode_or_nil(assert(ok_res)), "成功应为普通文本")
   end)
 
   it("沙箱内 sudo/doas 被剥离（已是 root，含链式/多行/-u/-i 形式）", function(t)
@@ -524,7 +522,7 @@ tests.suite("sandbox_view", function(_, it)
         "env FOO=1 sudo true && echo E_OK",
         "echo \"x  y\" && sudo true",
       }, "\n")
-      local done, out = false, nil
+      local done, out = false, ""
       require("NeoAI.tools").execute("run_command", { command = cmd, description = "t", timeout_ms = 30000 }, {})
         :then_(function(r) out = tostring(r); done = true end, function(e) out = tostring(e); done = true end)
       t.true_(vim.wait(40000, function() return done end), "命令应完成")
@@ -665,7 +663,7 @@ tests.suite("sandbox_view", function(_, it)
     -- 全部为 max（宿主直跑）：无配额。
     local q2 = cgroup.cgroup_quota({
       rel = "/", base = "/sys/fs/cgroup",
-      reader = function(p) return "max\n" end,
+      reader = function(_) return "max\n" end,
     })
     t.eq(nil, q2.memory_bytes, "无限制时不报告内存配额")
     t.eq(nil, q2.cpu_cores, "无限制时不报告 CPU 配额")
@@ -683,15 +681,15 @@ tests.suite("sandbox_view", function(_, it)
 
   it("包安装：提取管理器与包名（按安装命令合并）", function(t)
     local privilege = require("NeoAI.sandbox.execution.privilege")
-    local info = privilege.package_info("npm install express lodash")
+    local info = assert(privilege.package_info("npm install express lodash"))
     t.not_nil(info, "应识别 npm 安装")
     t.eq("npm", info.manager, "管理器")
     t.eq("npm:express,lodash", info.key, "合并键")
-    local pip = privilege.package_info("pip3 install --user requests flask")
+    local pip = assert(privilege.package_info("pip3 install --user requests flask"))
     t.not_nil(pip, "应识别 pip 安装")
     t.eq("pip3", pip.manager, "管理器")
     t.eq("pip3:requests,flask", pip.key, "应跳过 flag 提取包名")
-    local ci = privilege.package_info("npm ci")
+    local ci = assert(privilege.package_info("npm ci"))
     t.not_nil(ci, "应识别无包名的安装")
     t.eq("npm:*", ci.key, "无显式包名时用通配键")
     t.eq(nil, privilege.package_info("echo hello"), "非包安装返回 nil")
@@ -763,7 +761,7 @@ tests.suite("sandbox_view", function(_, it)
     vim.fn.system({ "chmod", "0700", sub })
     with_config({ tools = { approval = { mode = "async" }, sandbox = { mode = "dry_run", review = { enabled = true } } } }, function()
       sandbox.reset()
-      local done, out = false, nil
+      local done, out = false, ""
       require("NeoAI.tools").execute("run_command", {
         command = "cat " .. sub .. "/secret.txt", description = "t",
       }, {}):then_(function(res) out = tostring(res); done = true end, function(e)
@@ -919,7 +917,7 @@ tests.suite("sandbox_view", function(_, it)
       sandbox.init()
       local staged = require("NeoAI.sandbox.execution.candidate").read_path(real_file)
       t.not_nil(staged, "重启后应能从候选重建暂存副本")
-      local f = io.open(staged)
+      local f = io.open(assert(staged))
       local content = f and f:read("*a") or ""
       if f then f:close() end
       t.matches("PKG", content, "重启后暂存内容应保留")
@@ -942,7 +940,7 @@ tests.suite("sandbox_view", function(_, it)
     local prefix = runtime.process_prefix({ cwd = "/tmp" })
     t.not_nil(prefix, "应能构造前缀")
     local cmd = {}
-    for _, v in ipairs(prefix) do cmd[#cmd + 1] = v end
+    for _, v in ipairs(assert(prefix)) do cmd[#cmd + 1] = v end
     for _, v in ipairs({ "/bin/sh", "-c",
       "echo \"cmdline=[$(cat /proc/cmdline)]\"; echo \"version=[$(cat /proc/version)]\"",
     }) do cmd[#cmd + 1] = v end
@@ -972,7 +970,7 @@ tests.suite("sandbox_view", function(_, it)
     end)
     -- 整个 /proc/sys 只读绑定应出现在 bwrap 前缀中
     if runtime.backend() == "bwrap" then
-      local pre = table.concat(runtime.process_prefix({ cwd = "/tmp" }), " ")
+      local pre = table.concat(assert(runtime.process_prefix({ cwd = "/tmp" })), " ")
       t.true_(pre:find("--ro-bind /proc/sys /proc/sys", 1, true) ~= nil, "前缀应只读绑定 /proc/sys")
     end
   end)
@@ -983,7 +981,7 @@ tests.suite("sandbox_view", function(_, it)
     local prefix = runtime.process_prefix({ cwd = "/tmp" })
     t.not_nil(prefix, "应能构造前缀")
     local cmd = {}
-    for _, v in ipairs(prefix) do cmd[#cmd + 1] = v end
+    for _, v in ipairs(assert(prefix)) do cmd[#cmd + 1] = v end
     -- `: > file` 只做 open(O_WRONLY) 不写内容：可写则无副作用，只读则 EROFS。
     -- 放进子 shell 重定向，避免 dash 因重定向失败而终止整条命令。
     for _, v in ipairs({ "/bin/sh", "-c",
@@ -998,7 +996,7 @@ tests.suite("sandbox_view", function(_, it)
     t.true_(out:find("READONLY", 1, true) ~= nil, "应为只读（EROFS），实际: " .. tostring(out))
     -- 只读绑定不应破坏读取
     local cmd2 = {}
-    for _, v in ipairs(prefix) do cmd2[#cmd2 + 1] = v end
+    for _, v in ipairs(assert(prefix)) do cmd2[#cmd2 + 1] = v end
     for _, v in ipairs({ "/bin/sh", "-c", "cat /proc/sys/kernel/randomize_va_space" }) do cmd2[#cmd2 + 1] = v end
     local out2 = vim.fn.system(cmd2)
     t.matches("%d", out2, "只读后仍应能读取 sysctl，实际: " .. tostring(out2))
@@ -1010,7 +1008,7 @@ tests.suite("sandbox_view", function(_, it)
     local prefix = runtime.process_prefix({ cwd = "/tmp" })
     t.not_nil(prefix, "应能构造前缀")
     local cmd = {}
-    for _, v in ipairs(prefix) do cmd[#cmd + 1] = v end
+    for _, v in ipairs(assert(prefix)) do cmd[#cmd + 1] = v end
     for _, v in ipairs({ "/bin/sh", "-c",
       "if grep -Eq '^(search|domain)[[:space:]]' /etc/resolv.conf 2>/dev/null; then echo LEAK_SEARCH; fi; "
       .. "if grep -q '^nameserver' /etc/resolv.conf 2>/dev/null; then echo HAS_NS; fi; echo DONE",
@@ -1127,7 +1125,7 @@ tests.suite("sandbox_view", function(_, it)
     with_config({ tools = { sandbox = { read_all = false, mask_dirs_enabled = true, mask_dirs = { "/home", "/root" } } } }, function()
       local prefix = runtime.process_prefix({ cwd = proj })
       t.not_nil(prefix, "应能构造前缀")
-      local joined = table.concat(prefix, " ")
+      local joined = table.concat(assert(prefix), " ")
       t.true_(joined:find("--ro-bind /root /root", 1, true) ~= nil, "cwd 所在作用域应只读暴露")
       t.true_(joined:find("--tmpfs " .. home .. "/other", 1, true) ~= nil, "作用域下其他目录应遮蔽")
       t.true_(joined:find("--bind /dev/null " .. home .. "/.bash_history", 1, true) ~= nil, "隐藏文件应遮蔽")
@@ -1137,13 +1135,13 @@ tests.suite("sandbox_view", function(_, it)
       t.nil_(runtime.mask_entry(proj .. "/a.txt", proj), "cwd 子树不应命中")
       t.nil_(runtime.mask_entry(home, proj), "祖先链不应命中")
       -- 审批放行：unmask 该条目后不再遮蔽（含后代）
-      local unmasked = table.concat(runtime.process_prefix({
+      local unmasked = table.concat(assert(runtime.process_prefix({
         cwd = proj, privileges = { tier = 0, unmask = { home .. "/other" } },
-      }), " ")
+      })), " ")
       t.true_(unmasked:find("--tmpfs " .. home .. "/other", 1, true) == nil, "获批条目应解除遮蔽")
     end)
     with_config({ tools = { sandbox = { read_all = false, mask_dirs_enabled = false } } }, function()
-      local joined = table.concat(runtime.process_prefix({ cwd = proj }), " ")
+      local joined = table.concat(assert(runtime.process_prefix({ cwd = proj })), " ")
       t.true_(joined:find("--ro-bind /root /root", 1, true) == nil, "关闭后不应额外暴露 home")
       t.true_(joined:find("--tmpfs " .. home .. "/other", 1, true) == nil, "关闭后不应遮蔽 home")
     end)

@@ -1,5 +1,5 @@
 --- 计划模式
---- @module NeoAI.tools.builtin.plan_mode
+--- @module 'NeoAI.tools.builtin.plan_mode'
 --- 计划模式作为 per-agent 状态（logged），激活时：
 --- 1. 注入 plan-policy 系统提示段（要求输出清晰、格式化的修改计划）；
 --- 2. 工具上下文只保留「只读/信息查询工具 + ask_user（向用户提问）」，不暴露任何修改类工具；
@@ -84,9 +84,8 @@ end
 --- 计划模式状态已改由「运行时上下文快照」注入历史（见 core/session/runtime_context），
 --- 不再注册系统提示段：系统提示必须逐字节稳定，否则计划模式切换会让前缀缓存失效。
 --- 保留 _apply_section 仅为兼容旧调用（no-op）。
---- @param agent table
---- @param active boolean
-local function _apply_section(agent, active)
+--- 保留签名 `(agent, active)`：旧调用方仍以此形式传入，函数本身 no-op。
+local function _apply_section(_, _)
   -- no-op：系统提示段已废弃，改用运行时上下文快照
 end
 
@@ -291,7 +290,7 @@ function M.plan_to_todos(plan_text)
   if #items == 0 then
     -- 最终回退：整段压缩为一项
     local flat = plan_text:gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
-    if #flat > 200 then flat = stringx.safe_truncate(flat, 200, "…") end
+    if #flat > 200 then flat = stringx.safe_truncate(flat, 200, "…") or flat end
     if flat ~= "" then
       items[#items + 1] = { content = flat, status = "pending" }
     end
@@ -305,13 +304,13 @@ local plan_mode_tools = {}
 
 plan_mode_tools.enter_plan_mode = helpers.define_tool(
   "enter_plan_mode",
-  "进入计划模式：工具集立即切换为只读/信息查询 + ask_user（无法修改任何文件），用于调研并制定格式化修改计划。多步骤/涉及改动的任务应先调用本工具。",
+  "进入计划模式：工具集切换为只读/信息查询 + ask_user（不能改文件），用于调研并制定格式化修改计划。多步骤/涉及改动的任务应先调用本工具。",
   {
     type = "object",
     properties = {},
     required = {},
   },
-  function(args, on_success, on_error, ctx)
+  function(_, on_success, on_error, ctx)
     local agent = ctx and ctx.agent
     if not agent then
       on_error("缺少 agent 上下文")

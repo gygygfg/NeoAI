@@ -1,5 +1,5 @@
 --- 沙箱隐匿层
---- @module NeoAI.sandbox.observe.conceal
+--- @module 'NeoAI.sandbox.observe.conceal'
 --- 降低沙箱内运行的 AI 通过外部命令识别「自己处在沙箱」的能力，常开、无配置开关。
 --- 两个层面：
 ---   1. 进程级去特征：overlay 私有层/会话状态目录改用无特征命名（不含 NeoAI/sandbox

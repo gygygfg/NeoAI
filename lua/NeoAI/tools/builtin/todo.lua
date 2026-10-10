@@ -1,10 +1,10 @@
 --- 待办任务工具
---- @module NeoAI.tools.builtin.todo
+--- @module 'NeoAI.tools.builtin.todo'
 --- 对齐 deepseek-harness todo/todo_write：整表替换语义，每次调用提交完整清单。
 --- 清单按 session 维度存储，并注册 agent 级系统提示段把当前状态注入每次请求
 --- （模型无需显式读取即可感知进度，等价于 harness 的 projection）。
 
-local async = require("NeoAI.utils.async")
+local _ = require("NeoAI.utils.async")
 local event_bus = require("NeoAI.kernel.event_bus")
 local events = require("NeoAI.kernel.events")
 local helpers = require("NeoAI.tools.builtin.tool_helpers")
@@ -43,7 +43,7 @@ end
 
 --- 校验并规范化整表
 --- @param todos table 原始数组
---- @return table items, string|nil 错误
+--- @return table|nil items, string|nil 错误
 local function _normalize_list(todos)
   if type(todos) ~= "table" then
     return nil, "todos 必须是数组"
@@ -69,7 +69,7 @@ local function _normalize_list(todos)
 end
 
 --- 渲染待办清单（注入系统提示的文本）
---- @param session_id string
+--- @param session_id string|nil
 --- @return string
 local function _render(session_id)
   local e = state.todos[session_id]
@@ -91,8 +91,7 @@ end
 --- 待办状态已改由「运行时上下文快照」注入历史（见 core/session/runtime_context），
 --- 不再注册系统提示段：系统提示必须逐字节稳定，否则任何待办变化都会让前缀缓存
 --- 从系统提示起失效。此处保留 _ensure_section 仅为兼容旧调用（no-op）。
---- @param agent table
-local function _ensure_section(agent)
+local function _ensure_section(_)
   -- no-op：系统提示段已废弃，改用运行时上下文快照
 end
 
@@ -102,7 +101,7 @@ local todo_tools = {}
 
 todo_tools.todo_write = helpers.define_tool(
   "todo_write",
-  "整表替换当前任务清单。每次调用提交完整清单（不是增量编辑）。todos 为 {content, status} 数组，status ∈ pending/in_progress/completed/cancelled，默认 pending；同一时刻至多一个 in_progress。",
+  "整表替换任务清单（非增量）。todos 为 {content, status} 数组，status∈pending/in_progress/completed/cancelled，默认 pending，同时至多一个 in_progress。",
   {
     type = "object",
     properties = {
@@ -150,7 +149,7 @@ todo_tools.todo_read = helpers.define_tool(
     properties = {},
     required = {},
   },
-  function(args, on_success, on_error, ctx)
+  function(_, on_success, _, ctx)
     local key = _key(ctx and ctx.agent)
     local rendered = _render(key)
     if rendered == "" then
@@ -170,7 +169,7 @@ todo_tools.todo_clear = helpers.define_tool(
     properties = {},
     required = {},
   },
-  function(args, on_success, on_error, ctx)
+  function(_, on_success, _, ctx)
     local key = _key(ctx and ctx.agent)
     state.todos[key] = { items = {}, updated_at = os.time() }
     event_bus.emit(events.TODO_UPDATED, { session_id = key, count = 0 })

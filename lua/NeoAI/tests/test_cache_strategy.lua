@@ -1,5 +1,5 @@
 --- 前缀管理与上下文缓存策略测试
---- @module NeoAI.tests.test_cache_strategy
+--- @module 'NeoAI.tests.test_cache_strategy'
 --- 覆盖 deepseek-harness 对齐的缓存身份一致性、上下文压缩、prompt 排序。
 
 local tests = require("NeoAI.tests")
@@ -112,13 +112,13 @@ tests.suite("cache_strategy", function(_, it)
 
   it("缓存用量解析（prompt_cache_hit_tokens / cached_tokens）", function(t)
     local prefix = require("NeoAI.core.agent.prefix")
-    local cu1 = prefix.parse_cache_usage({ prompt_tokens = 300, prompt_cache_hit_tokens = 256 })
+    local cu1 = assert(prefix.parse_cache_usage({ prompt_tokens = 300, prompt_cache_hit_tokens = 256 }))
     t.eq(256, cu1.cache_read)
     t.eq(44, cu1.cache_miss)
     t.true_(math.abs(cu1.ratio - 256 / 300) < 1e-6)
-    local cu2 = prefix.parse_cache_usage({ prompt_tokens = 300, prompt_tokens_details = { cached_tokens = 200 } })
+    local cu2 = assert(prefix.parse_cache_usage({ prompt_tokens = 300, prompt_tokens_details = { cached_tokens = 200 } }))
     t.eq(200, cu2.cache_read)
-    local cu3 = prefix.parse_cache_usage({ prompt_tokens = 300 })
+    local cu3 = assert(prefix.parse_cache_usage({ prompt_tokens = 300 }))
     t.eq(0, cu3.cache_read)
     t.nil_(prefix.parse_cache_usage(nil))
   end)
@@ -221,8 +221,9 @@ tests.suite("cache_strategy", function(_, it)
       agent_mod_add(agent, "user", content)
     end
 
-    local captured = nil
+    local captured
     local orig_send = request_mod.send_stream
+    ---@diagnostic disable-next-line: duplicate-set-field
     request_mod.send_stream = function(messages, opts, on_chunk)
       captured = { messages = messages, opts = opts }
       -- 模拟流式返回摘要：先吐分片（供 COMPACTION_CHUNK 广播），再整体 resolve

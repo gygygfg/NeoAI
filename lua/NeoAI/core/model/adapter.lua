@@ -1,5 +1,5 @@
 --- 多提供商协议适配
---- @module NeoAI.core.model.adapter
+--- @module 'NeoAI.core.model.adapter'
 --- 统一 openai / anthropic / google 协议的请求构造、消息/工具/图像编码、响应解析、
 --- models 列表解析。不绑定特定 LLM 厂商：协议族内的厂商方言由 core.model.profiles
 --- 提供的 dialect 表注入，本模块只负责「内部规范 ↔ 协议」的编解码。
@@ -48,12 +48,12 @@ end
 --- 解析工具调用 arguments（JSON 字符串）为对象。
 --- 按 arguments 字符串做有界记忆化：历史工具调用参数每轮请求都会被重新解码，
 --- 对长会话是重复的主线程开销；参数串不可变，可安全复用解码结果（调用方只读）。
---- @param arguments string|table|nil
---- @return table
 local _args_cache = {}
 local _args_cache_n = 0
 local ARGS_CACHE_MAX = 512
 
+--- @param arguments string|table|nil
+--- @return table
 local function _args_object(arguments)
   if type(arguments) == "table" then return arguments end
   local key = arguments or "{}"
@@ -174,19 +174,19 @@ end
 
 local openai = { protocol = "openai" }
 
-function openai.chat_path(provider, model, opts)
+function openai.chat_path(_, _, _)
   return "/chat/completions"
 end
 
-function openai.models_path(provider)
+function openai.models_path(_)
   return "/models"
 end
 
 --- 编码消息：内部规范 → OpenAI 形（图像块 → image_url）
 --- @param messages table
---- @param dialect table|nil
+--- @param _ table|nil
 --- @return table { messages = table }
-function openai.encode_messages(messages, dialect)
+function openai.encode_messages(messages, _)
   local out = {}
   for _, m in ipairs(messages or {}) do
     local msg = { role = m.role }
@@ -212,9 +212,9 @@ end
 
 --- 编码工具：OpenAI 形即内部规范，原样透传
 --- @param tools table
---- @param dialect table|nil
+--- @param _ table|nil
 --- @return table
-function openai.encode_tools(tools, dialect)
+function openai.encode_tools(tools, _)
   return tools
 end
 
@@ -297,7 +297,7 @@ function openai.parse_response(body)
 end
 
 --- 解析 OpenAI /models 响应（含实时数值元数据，缺失则为 nil）
---- @return table { { id, context_window?, max_output? }, ... }
+--- @return table|nil { { id, context_window?, max_output? }, ... }
 function openai.parse_models(body)
   local obj = _json().decode_or_nil(body)
   if not obj or not obj.data then return nil end
@@ -327,11 +327,11 @@ end
 
 local anthropic = { protocol = "anthropic" }
 
-function anthropic.chat_path(provider, model, opts)
+function anthropic.chat_path(_, _, _)
   return "/messages"
 end
 
-function anthropic.models_path(provider)
+function anthropic.models_path(_)
   return "/models"
 end
 
@@ -405,9 +405,9 @@ end
 
 --- 编码工具：OpenAI 形 → Anthropic { name, description, input_schema }
 --- @param tools table
---- @param dialect table|nil
+--- @param _ table|nil
 --- @return table
-function anthropic.encode_tools(tools, dialect)
+function anthropic.encode_tools(tools, _)
   local out = {}
   for _, td in ipairs(tools or {}) do
     local fn = td["function"] or {}
@@ -501,7 +501,7 @@ function anthropic.parse_response(body)
 end
 
 --- 解析 Anthropic /models 响应（含实时数值元数据，缺失则为 nil）
---- @return table { { id, context_window?, max_output? }, ... }
+--- @return table|nil { { id, context_window?, max_output? }, ... }
 function anthropic.parse_models(body)
   local obj = _json().decode_or_nil(body)
   if not obj or not obj.data then return nil end
@@ -568,9 +568,9 @@ end
 
 --- 编码消息：内部规范 → Gemini contents + systemInstruction
 --- @param messages table
---- @param dialect table|nil
+--- @param _ table|nil
 --- @return table { system = table(parts), messages = table(contents) }
-function google.encode_messages(messages, dialect)
+function google.encode_messages(messages, _)
   local system_parts = {}
   local contents = {}
   for _, m in ipairs(messages or {}) do
@@ -618,9 +618,9 @@ end
 
 --- 编码工具：OpenAI 形 → Gemini [{ functionDeclarations = [...] }]
 --- @param tools table
---- @param dialect table|nil
+--- @param _ table|nil
 --- @return table
-function google.encode_tools(tools, dialect)
+function google.encode_tools(tools, _)
   local decls = {}
   for _, td in ipairs(tools or {}) do
     local fn = td["function"] or {}
@@ -727,7 +727,7 @@ function google.parse_response(body)
 end
 
 --- 解析 Google /models 响应（inputTokenLimit / outputTokenLimit → 实时元数据）
---- @return table { { id, context_window?, max_output? }, ... }
+--- @return table|nil { { id, context_window?, max_output? }, ... }
 function google.parse_models(body)
   local obj = _json().decode_or_nil(body)
   if not obj or not obj.models then return nil end
@@ -742,7 +742,7 @@ function google.parse_models(body)
   return models
 end
 
-function google.headers(provider, dialect)
+function google.headers(_, dialect)
   local headers = { ["Content-Type"] = "application/json" }
   if dialect and dialect.extra_headers then
     for k, v in pairs(dialect.extra_headers) do headers[k] = v end

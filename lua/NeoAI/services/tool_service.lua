@@ -1,5 +1,5 @@
 --- 工具服务
---- @module NeoAI.services.tool_service
+--- @module 'NeoAI.services.tool_service'
 --- 审批 + 调度 + 执行。Agent 的工具循环通过此服务执行工具。
 --- - execute(agent, name, args, tool_call_id, opts)：执行工具
 --- - approve_and_execute(...)：审批通过后继续执行
@@ -100,8 +100,8 @@ local function _approval_text(tool_name, args, ctx)
       local start = math.max(1, #items - 4)
       for i = start, #items do
         local it = items[i]
-        local tool = table.concat(it.tools or { it.tool or "?" }, ", ")
-        lines[#lines + 1] = string.format("  [%s] %s", tool, tostring(it.path or ""))
+        local tool_label = table.concat(it.tools or { it.tool or "?" }, ", ")
+        lines[#lines + 1] = string.format("  [%s] %s", tool_label, tostring(it.path or ""))
       end
       text = text .. "\n" .. table.concat(lines, "\n")
     end
@@ -313,7 +313,7 @@ end
 --- @param tool_name string
 --- @param args table
 --- @param tool_call_id string|nil
---- @param opts table { is_sub_agent?, signal?, sub_agent_id? }
+--- @param opts? table { is_sub_agent?, signal?, sub_agent_id? }
 --- @return Deferred resolve(结果), reject(错误)
 function M.execute(agent, tool_name, args, tool_call_id, opts)
   opts = opts or {}
@@ -348,13 +348,13 @@ function M.execute(agent, tool_name, args, tool_call_id, opts)
   -- 附加元数据展示，**不进入模型上下文**。
   local d = executor.execute(tool_name, args, ctx)
   local out = async.Deferred.new()
-  local function _settle(ok, v)
+  local function _settle(success, v)
     if opts.ui_notice == nil and ctx.ui_notice ~= nil then opts.ui_notice = ctx.ui_notice end
     -- 内核观测到的密钥文件访问（eBPF/strace/procfs）：仅 UI 展示，不进入模型上下文。
     if opts.observed_secret_paths == nil and ctx.observed_secret_paths ~= nil then
       opts.observed_secret_paths = ctx.observed_secret_paths
     end
-    if ok then out:resolve(v) else out:reject(v) end
+    if success then out:resolve(v) else out:reject(v) end
   end
   d:then_(function(v) _settle(true, v) end, function(e) _settle(false, e) end)
   return out

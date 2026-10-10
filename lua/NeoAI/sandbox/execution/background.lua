@@ -1,5 +1,5 @@
 --- 后台命令识别（& / nohup / setsid）
---- @module NeoAI.sandbox.execution.background
+--- @module 'NeoAI.sandbox.execution.background'
 --- 识别 `run_command` 中「意图后台执行」的命令，供门禁自动转为长驻服务（`sandbox.service`），
 --- 使其跨工具调用存活——每个一次性命令在独立 pid namespace + cgroup 内运行，命令结束时
 --- `cgroup.release` → `cgroup.kill` 会终止整个进程树，后台进程无法存活。

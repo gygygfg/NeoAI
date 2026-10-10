@@ -1,5 +1,5 @@
 --- 沙箱策略回放
---- @module NeoAI.sandbox.review.replay
+--- @module 'NeoAI.sandbox.review.replay'
 --- 用同一版规则与同一事实重放，验证裁决可复现（设计文档 §10）。
 --- 事实来自证据记录，不保存可直接重放的有效授权 bearer token。
 

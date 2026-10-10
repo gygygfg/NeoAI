@@ -1,5 +1,5 @@
 --- NeoAI 内核层入口
---- @module NeoAI.kernel
+--- @module 'NeoAI.kernel'
 --- 依赖：utils（事件总线/日志/配置/生命周期）。
 --- 任何业务模块（core/services/ui/tools）都只依赖本层 + utils。
 

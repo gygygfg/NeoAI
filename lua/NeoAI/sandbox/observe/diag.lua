@@ -1,5 +1,5 @@
 --- 沙箱诊断（合并原 fault + bench）
---- @module NeoAI.sandbox.observe.diag
+--- @module 'NeoAI.sandbox.observe.diag'
 --- 故障注入（验证恢复/回滚路径）与性能基准（关键路径耗时）。仅测试/诊断使用，默认不改变行为。
 --- 原 `sandbox/fault` 与 `sandbox/bench` 保留为兼容 shim（转指本模块）。
 
@@ -126,7 +126,7 @@ function M.bench_capture(opts)
   config_store.set("tools.sandbox.workspace_root", vim.fn.tempname() .. "/sb")
   sandbox.reset()
   local a = control.new_attempt("run_command", {}, {}, { effect = "process" })
-  candidate.begin(a, store.root())
+  candidate.begin(a, assert(store.root()))
   local files = {}
   for i = 1, n do
     local p = dir .. "/f" .. i .. ".txt"

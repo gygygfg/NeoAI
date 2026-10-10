@@ -1,5 +1,5 @@
 --- 沙箱候选纯工具函数
---- @module NeoAI.sandbox.execution.candidate_util
+--- @module 'NeoAI.sandbox.execution.candidate_util'
 --- 从 candidate.lua 抽出的无状态纯函数（权限位/哈希/stat 签名/内容读取/文本判定）。
 --- 仅依赖 stdlib 与 Neovim 内置，不引用模块状态；内部相互调用保持原样。
 

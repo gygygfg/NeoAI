@@ -53,6 +53,7 @@ tests.suite("fs_io", function(_, it)
     for _, fail_at in ipairs({ "write", "close" }) do
       local closed = false
       local open = io.open
+      ---@diagnostic disable-next-line: duplicate-set-field
       io.open = function()
         return {
           write = function() if fail_at == "write" then return nil, "write failed" end; return true end,

@@ -1,5 +1,5 @@
 --- 模式化模型配置测试
---- @module NeoAI.tests.test_modes
+--- @module 'NeoAI.tests.test_modes'
 --- 验证：ai.scenarios / ai.presets 已重构为按模式（CHAT/PLAN）的 ai.modes，
 --- agent 创建与模式切换时按当前模式应用 provider/model/temperature/max_tokens/stream。
 

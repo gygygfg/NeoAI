@@ -1,5 +1,5 @@
 --- 纯 Lua 文本度量专项测试
---- @module NeoAI.tests.test_textmetrics
+--- @module 'NeoAI.tests.test_textmetrics'
 --- 与 vim.fn.strwidth / strchars / strcharpart 交叉校验（合法 UTF-8），
 --- 并覆盖非法字节、折行/切片语义与工作线程内 load(source) 的等价性。
 

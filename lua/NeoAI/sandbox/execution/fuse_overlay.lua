@@ -1,5 +1,5 @@
 --- 用户态 overlay 兜底（fuse-overlayfs）
---- @module NeoAI.sandbox.execution.fuse_overlay
+--- @module 'NeoAI.sandbox.execution.fuse_overlay'
 --- 当内核 overlayfs 不可挂载（容器内「overlay 套 overlay」、lower/upper 跨挂载/userns 归属
 --- 不同等会 `EINVAL`）时，用 root 在**宿主 init 命名空间**里以用户态 `fuse-overlayfs` 建立
 --- 「lower=`/`（或指定根）只读 + upper/work 会话私有可写」的合并视图，再经 bwrap `--bind` 进
@@ -38,8 +38,6 @@ end
 local function _is_mounted(p)
   return _mount_set()[p] == true
 end
-
-local function _esc(s) return (tostring(s):gsub("([^%w])", "%%%1")) end
 
 -- ========== 公开 API ==========
 

@@ -1,5 +1,5 @@
 --- 会话树视图
---- @module NeoAI.ui.window.tree_view
+--- @module 'NeoAI.ui.window.tree_view'
 --- 会话树窗口：展示会话分支，支持选择/新建/删除/展开折叠。
 --- 默认展开根节点，子节点用连接线缩进显示。
 
@@ -219,7 +219,7 @@ local function _render()
   end
   state.flat_items = _build_flat()
   local lines = {}
-  for i, item in ipairs(state.flat_items) do
+  for _, item in ipairs(state.flat_items) do
     lines[#lines + 1] = item.prefix .. item.label
   end
   if #lines == 0 then

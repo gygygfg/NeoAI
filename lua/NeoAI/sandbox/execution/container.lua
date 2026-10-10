@@ -1,5 +1,5 @@
 --- 沙箱容器受控运行（docker/podman 与沙箱同 namespace）
---- @module NeoAI.sandbox.execution.container
+--- @module 'NeoAI.sandbox.execution.container'
 --- AI 调用容器运行时（docker/podman 等）时，尽量让容器进程运行在沙箱自身的命名空间内，
 --- 从而被沙箱的隔离边界（bwrap/unshare 的 pid/net/ipc/uts）一并约束，而不是逃逸到宿主。
 ---
@@ -126,7 +126,7 @@ end
 -- ========== 公开 API ==========
 
 --- 识别命令中的容器运行时
---- @param command string
+--- @param command string|nil
 --- @return string|nil manager
 function M.detect(command)
   if type(command) ~= "string" or command == "" then return nil end
@@ -139,7 +139,7 @@ function M.detect(command)
 end
 
 --- 分析命令并给出受控计划（必要时重写命令）
---- @param command string
+--- @param command string|nil
 --- @return table|nil plan {
 ---   manager, sub?, mode ("namespace"|"controlled"), share_namespace, command, reason?, rewritten?
 --- }
@@ -215,7 +215,7 @@ function M.facade(command)
   local manager = M.detect(command)
   if not manager then return nil end
   local toks, spans = _tokens(command)
-  local i = _manager_index(toks)
+  local i = assert(_manager_index(toks))
   local sub = i and toks[i + 1] or nil
   for idx = i + 1, #toks do
     local t = toks[idx]

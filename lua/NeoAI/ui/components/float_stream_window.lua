@@ -1,5 +1,5 @@
 --- 复用流式悬浮窗
---- @module NeoAI.ui.components.float_stream_window
+--- @module 'NeoAI.ui.components.float_stream_window'
 --- 在独立浮动窗口实时展示流式内容，支持替换 / 追加 / 关闭。
 --- 供思考过程（reasoning_panel）、接收参数（tool_args_panel）、
 --- 上下文压缩 / 计划蒸馏（chat_view 直接使用）等共享同一个窗口实例。

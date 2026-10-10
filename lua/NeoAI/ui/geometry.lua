@@ -1,5 +1,5 @@
 --- 浮窗几何计算：按屏幕相对比例得出尺寸与居中/贴边位置（消除像素硬编码）
---- @module NeoAI.ui.geometry
+--- @module 'NeoAI.ui.geometry'
 ---
 --- 所有弹窗/悬浮窗共用本模块，依当前屏幕（vim.o.columns × vim.o.lines）的相对比例计算
 --- width/height/col/row，保证大小屏表现一致；内容自适应弹窗用 fit_h 把高度压到内容所需
@@ -113,6 +113,8 @@ function M.compute(opts)
   if narrow == nil then narrow = true end
   local base = narrow and _narrow_base_geom() or nil
   local narrow_mode = base ~= nil and base.w < NARROW_MAX
+  -- narrow_mode 为真时 base 必非 nil；下方对 base 的访问都发生在 narrow_mode 分支内。
+  ---@cast base -nil
 
   -- 宽度：比例 → 屏幕可用宽 → 全局最小 → max_w → min_w → 夹紧
   local width

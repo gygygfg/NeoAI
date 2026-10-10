@@ -1,5 +1,5 @@
 --- 沙箱能力桥（core ↔ sandbox 解耦）
---- @module NeoAI.kernel.sandbox_bridge
+--- @module 'NeoAI.kernel.sandbox_bridge'
 --- core 侧（如 Agent 上下文密钥泄漏处理、附件缩放）需要少量沙箱能力，但 core 不得直接依赖
 --- sandbox、sandbox 也不得依赖 core。由组合根（plugins/catalog）在启动沙箱服务时把相关能力
 --- 注入本桥；core 经本桥调用，双方仅依赖 kernel。

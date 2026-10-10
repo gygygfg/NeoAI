@@ -1,5 +1,5 @@
 --- 异步审批纯助手
---- @module NeoAI.sandbox.review.review_util
+--- @module 'NeoAI.sandbox.review.review_util'
 --- 从 review.lua 抽出的无状态纯函数（不引用模块状态；内部相互调用保持原样）。
 
 local function _content_limit()

@@ -1,7 +1,7 @@
 --- 沙箱策略确认：代理规避等「需用户批准」的操作暂停 Agent 并弹窗询问。
 --- 交互式 Neovim 使用内建 `confirm`；真正 headless（无 attached UI）失败关闭（拒绝）。
 --- 会话级「始终允许」按 kind 记忆。策略由 `tools.sandbox.network.block_proxy_evasion` 选择。
---- @module NeoAI.sandbox.review.policy_consent
+--- @module 'NeoAI.sandbox.review.policy_consent'
 
 local M = {}
 
@@ -40,7 +40,8 @@ function M.ask(kind, opts)
     prompt = prompt .. " " .. tostring(opts.detail):gsub("%s+", " ")
   end
   local choices = "仅本次允许\n本次会话始终允许\n拒绝"
-  local ret = vim.fn.confirm(prompt, choices, 3, "Warning")
+  local confirm = vim.fn.confirm --[[@as fun(title: string, choices: string, default: integer, kind: string): integer]]
+  local ret = confirm(prompt, choices, 3, "Warning")
   if ret == 1 then return "once" end
   if ret == 2 then M.allow_session(kind); return "session" end
   return "deny"

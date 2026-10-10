@@ -1,5 +1,5 @@
 --- 交互式 PTY 会话服务测试
---- @module NeoAI.tests.test_pty
+--- @module 'NeoAI.tests.test_pty'
 
 local tests = require("NeoAI.tests")
 local config_store = require("NeoAI.kernel.config_store")
@@ -44,12 +44,12 @@ tests.suite("pty", function(_, it, before_each)
       return async.resolve(true)
     end)
 
-    local session = pty.open({
+    local session = assert(pty.open({
       argv = { "bash", "-c",
         "read -r a; echo GOT1:$a; read -r b; echo GOT2:$b" },
       description = "测试：依次读入两行",
       command = "read a; read b",
-    })
+    }))
     t.not_nil(session, "会话应创建成功")
 
     local result = t.await(pty.await(session), 20000)
@@ -70,10 +70,10 @@ tests.suite("pty", function(_, it, before_each)
     config_store.set("tools.run_command.interactive.judge.enabled", false)
     pty.set_judge(nil)
 
-    local session = pty.open({
+    local session = assert(pty.open({
       argv = { "bash", "-c", "read -r a; echo GOT:$a" },
       description = "测试工具注入",
-    })
+    }))
     t.not_nil(session)
 
     -- 等待检测到等待输入（最多 5s）
@@ -362,7 +362,7 @@ tests.suite("pty", function(_, it, before_each)
     cfg.set("tools.run_command.interactive.show_window", old_sw)
   end)
 
-  it("run_command 工具描述标明可交互并含目标/操作", function(t)
+  it("run_command 工具描述标明可交互并含应答/精确控制指引", function(t)
     local shell = require("NeoAI.tools.builtin.shell")
     local old = config_store.get("tools.run_command.interactive.enabled")
 
@@ -377,12 +377,12 @@ tests.suite("pty", function(_, it, before_each)
     local d_on = desc()
     t.not_nil(d_on)
     t.matches("交互式 PTY", d_on)
-    t.matches("目标", d_on)
-    t.matches("如何操作", d_on)
+    t.matches("自动应答", d_on)
+    t.matches("terminal_send_text", d_on)
     t.matches("description", d_on)
 
     config_store.set("tools.run_command.interactive.enabled", false)
-    local d_off = desc()
+    local d_off = assert(desc())
     t.not_nil(d_off)
     t.true_(d_off:find("交互式 PTY", 1, true) == nil, "非交互时不应标交互式 PTY")
 
@@ -421,10 +421,10 @@ tests.suite("pty", function(_, it, before_each)
       return async.sleep(500):then_(function() return true end)
     end)
 
-    local session = pty.open({
+    local session = assert(pty.open({
       argv = { "bash", "-c", "read -r a; echo GOT1:$a; read -r b; echo GOT2:$b" },
       description = "慢判官两轮",
-    })
+    }))
     t.not_nil(session)
     local result = t.await(pty.await(session), 20000)
     t.eq(0, result.code)
@@ -466,18 +466,18 @@ tests.suite("pty", function(_, it, before_each)
     cfg.set("tools.run_command.interactive.show_window_delay_ms", 300)
 
     -- 短命令（阈值内结束）：不弹
-    local short = pty.open({ argv = { "bash", "-c", "true" }, description = "短命令" })
+    local short = assert(pty.open({ argv = { "bash", "-c", "true" }, description = "短命令" }))
     t.await(async.sleep(800))
     t.nil_(opens[short.id], "阈值内结束不应弹出")
 
     -- 长命令（运行 3s > 0.3s 阈值）且跟随：达阈值后弹出
-    local long = pty.open({ argv = { "bash", "-c", "sleep 3" }, description = "长命令" })
+    local long = assert(pty.open({ argv = { "bash", "-c", "sleep 3" }, description = "长命令" }))
     t.await(async.sleep(800))
     t.true_(opens[long.id] == true, "运行超过阈值且跟随时应弹出")
 
     -- 长命令但不跟随：不弹（用户正在回看上方）
     following = false
-    local idle = pty.open({ argv = { "bash", "-c", "sleep 3" }, description = "长命令不跟随" })
+    local idle = assert(pty.open({ argv = { "bash", "-c", "sleep 3" }, description = "长命令不跟随" }))
     t.await(async.sleep(800))
     t.nil_(opens[idle.id], "不跟随时不应弹出")
 

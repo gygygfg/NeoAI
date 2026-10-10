@@ -1,5 +1,5 @@
 --- Herder 终端状态信号服务测试
---- @module NeoAI.tests.test_herder
+--- @module 'NeoAI.tests.test_herder'
 
 local tests = require("NeoAI.tests")
 
@@ -166,7 +166,7 @@ tests.suite("herder", function(_, it)
 
   it("接管权威时附带一次 report-metadata（display_agent/状态文案），且不重复", function(t)
     local orig = reset_herder_env()
-    local herder = init_herder()
+    init_herder()
 
     emit_created("a1")
     emit_state("a1", "generating")
@@ -189,7 +189,7 @@ tests.suite("herder", function(_, it)
 
   it("report_metadata=false 时不上报元数据", function(t)
     local orig = reset_herder_env()
-    local herder = init_herder({ report_metadata = false })
+    init_herder({ report_metadata = false })
 
     emit_created("a1")
     emit_state("a1", "generating")
@@ -216,7 +216,7 @@ tests.suite("herder", function(_, it)
 
   it("seq 以挂钟为基数（不从 1 开始）", function(t)
     local orig = reset_herder_env()
-    local herder = init_herder()
+    init_herder()
     emit_created("a1")
     emit_state("a1", "generating")
     local s = seqs()
@@ -261,7 +261,7 @@ tests.suite("herder", function(_, it)
 
   it("审批阻塞态优先级高于 working", function(t)
     local orig = reset_herder_env()
-    local herder = init_herder()
+    init_herder()
     local eb = require("NeoAI.kernel.event_bus")
     local ev = require("NeoAI.kernel.events")
 
@@ -280,7 +280,7 @@ tests.suite("herder", function(_, it)
 
   it("ask_user 等待触发 blocked，回答后回到 idle", function(t)
     local orig = reset_herder_env()
-    local herder = init_herder()
+    init_herder()
     local eb = require("NeoAI.kernel.event_bus")
     local ev = require("NeoAI.kernel.events")
 
@@ -389,7 +389,7 @@ tests.suite("herder", function(_, it)
 
   it("多会话聚合：任一 blocked 即上报 blocked", function(t)
     local orig = reset_herder_env()
-    local herder = init_herder()
+    init_herder()
     local eb = require("NeoAI.kernel.event_bus")
     local ev = require("NeoAI.kernel.events")
 

@@ -1,5 +1,5 @@
 --- 沙箱运行时后端
---- @module NeoAI.sandbox.execution.runtime
+--- @module 'NeoAI.sandbox.execution.runtime'
 --- 外部隔离后端探测与进程前缀构造。优先 bwrap，其次 unshare。
 --- 关键能力缺失时返回明确错误，不静默降级（设计文档 §7.1）。
 ---
@@ -942,7 +942,7 @@ local function _append_tmpfs_roots(argv, session_base, base_override)
     -- host 模式：私有目录建在宿主根之下，命名空间映射回该根
     if mode == "host" and session and vim.fn.isdirectory(p) == 1 then
       local base = has_override
-        and (base_override:gsub("/+$", "") .. "/tmp" .. p:gsub("[^%w]", "_"))
+        and (assert(base_override):gsub("/+$", "") .. "/tmp" .. p:gsub("[^%w]", "_"))
         or conceal.tmp_base_host(p)
       local dir = base .. "/" .. session
       pcall(vim.fn.mkdir, dir, "p")
@@ -1294,7 +1294,7 @@ local function _probe()
   caps.bwrap_flags = flags
   -- overlayfs：在选定隔离模式下真实挂载实测
   if caps.bwrap then
-    caps.overlayfs = _overlay_works(flags)
+    caps.overlayfs = _overlay_works(assert(flags))
   end
   -- cgroup v2
   local cf = io.open("/sys/fs/cgroup/cgroup.controllers", "r")
@@ -1441,14 +1441,6 @@ local function _mask_paths_canonical()
   return canon
 end
 
---- 需要在隔离环境内遮蔽的宿主路径，返回 { path, kind } 数组（kind = "dir" | "file"）。
---- 三类：
----   1. 沙箱自身存储（候选/会话/回执）——AI 的外部命令不得看到或篡改内部状态；
----   2. 宿主敏感路径（socket / 凭据 / 容器数据）——见 DEFAULT_MASK_PATHS；
----   3. 遮蔽目录作用域内的兄弟/隐藏条目——见 `_dir_masks`（cwd 子树豁免）。
---- @param unmask table|nil 解除遮蔽的路径数组（档位提权 / 审批放行）
---- @param cwd string|nil 工作目录（用于遮蔽目录）
---- @return table 数组 { path, kind }
 --- 载荷是否持有 CAP_DAC_OVERRIDE（可无视 DAC 遍历任意目录）
 --- 同时计入全局 `cap_add` 与档位 `priv.cap_add`（T0/T1 基线现含该能力）。
 --- @param priv table|nil 档位隔离参数
@@ -1493,6 +1485,15 @@ local function _payload_can_traverse(path, dac_override)
   return true
 end
 
+--- 需要在隔离环境内遮蔽的宿主路径，返回 { path, kind } 数组（kind = "dir" | "file"）。
+--- 三类：
+---   1. 沙箱自身存储（候选/会话/回执）——AI 的外部命令不得看到或篡改内部状态；
+---   2. 宿主敏感路径（socket / 凭据 / 容器数据）——见 DEFAULT_MASK_PATHS；
+---   3. 遮蔽目录作用域内的兄弟/隐藏条目——见 `_dir_masks`（cwd 子树豁免）。
+--- @param unmask table|nil 解除遮蔽的路径数组（档位提权 / 审批放行）
+--- @param cwd string|nil 工作目录（用于遮蔽目录）
+--- @param dac_override boolean|nil 载荷是否持有 CAP_DAC_OVERRIDE
+--- @return table 数组 { path, kind }
 local function _masked_paths(unmask, cwd, dac_override)
   local out, seen = {}, {}
   local skip, skip_list = {}, {}
@@ -1536,7 +1537,7 @@ local function _masked_paths(unmask, cwd, dac_override)
     add(root, true)
     local iok, instance = pcall(require, "NeoAI.sandbox.execution.instance")
     if iok and instance and instance.base_of then
-      local base = instance.base_of(root)
+      local base = root and instance.base_of(root)
       if base then add(base, true) end
     end
   end
@@ -2509,7 +2510,7 @@ end
 
 --- 诊断当前环境的 overlay 可用性（供能力查询）：用真实执行路径（cwd + 沙箱 overlay 基目录）
 --- 实测一次并返回原因，便于排查降级模式为何触发。
---- @param root string|nil（默认当前工作目录）
+--- @param root string|nil 默认当前工作目录
 --- @return table { available, reason?, flags, userns, upper? }
 function M.overlay_diagnosis(root)
   root = root or vim.fn.getcwd()

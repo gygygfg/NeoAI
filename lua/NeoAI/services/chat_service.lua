@@ -1,5 +1,5 @@
 --- 聊天服务
---- @module NeoAI.services.chat_service
+--- @module 'NeoAI.services.chat_service'
 --- 前后端桥梁。UI 通过此服务发送消息、绑定/解绑窗口。
 --- - send_message(content)：创建或复用当前 Agent 并发送
 --- - approve_plan()：用户确认计划 → 任务清单 + 转入 CHAT
@@ -148,7 +148,7 @@ end
 --- @param agent table
 --- @return table|nil session
 --- @return table|nil stored
---- @return table synced
+--- @return table|nil synced
 local function _build_persist_session(agent)
   local info = state.agents[agent.id]
   if not info then return nil end
@@ -325,9 +325,8 @@ end
 --- 实际执行一轮生成（含 MESSAGE_SENT 事件 + 持久化）
 --- @param agent table
 --- @param content string
---- @param opts table|nil
 --- @return Deferred
-local function _do_run(agent, content, opts)
+local function _do_run(agent, content, _)
   _ensure_persist_hook()
   event_bus.emit(events.MESSAGE_SENT, { agent_id = agent.id, content = content })
   local run_d = runtime.run(agent, content)
@@ -1074,8 +1073,11 @@ function M.reset()
   end
   -- 清理暂存队列、状态监听与注入器，避免测试间/重载后残留并重复发送
   local tool_loop = require("NeoAI.core.agent.tool_loop")
+  ---@diagnostic disable-next-line: param-type-mismatch
   tool_loop.set_inject_user(nil)
+  ---@diagnostic disable-next-line: param-type-mismatch
   tool_loop.set_pre_round_refresh(nil)
+  ---@diagnostic disable-next-line: param-type-mismatch
   tool_loop.set_round_persist(nil)
   injector_registered = false
   persist_hook_registered = false

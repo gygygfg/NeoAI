@@ -1,5 +1,5 @@
 --- 沙箱策略服务
---- @module NeoAI.sandbox.review.policy
+--- @module 'NeoAI.sandbox.review.policy'
 --- 规则输入来自控制面验证过的不可变事实；规则在受限环境执行。
 --- 聚合顺序：DENY 高于 NEEDS_CONFIRMATION 高于 ALLOW（设计文档 §9.1）。
 --- 规则异常、超时、结构错误统一产生 DENY（POLICY_EVALUATION_FAILED）。

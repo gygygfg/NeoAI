@@ -1,5 +1,5 @@
 --- 生命周期管理
---- @module NeoAI.kernel.lifecycle
+--- @module 'NeoAI.kernel.lifecycle'
 --- 启动/关闭/信号处理。维护注册的清理函数列表，关闭时按序执行。
 --- 关闭流程：先统一卸载插件（释放服务/工具/事件订阅），再执行剩余清理函数。
 

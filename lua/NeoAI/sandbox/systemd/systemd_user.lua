@@ -1,5 +1,5 @@
 --- 伪造的 systemd 用户解析器（沙箱内无真实 systemd/dbus）
---- @module NeoAI.sandbox.systemd.systemd_user
+--- @module 'NeoAI.sandbox.systemd.systemd_user'
 --- 沙箱环境是临时的：不启动真实 `systemd --user`（依赖 dbus、cgroup 委派与 `/run/systemd` 标记，
 --- 在临时容器/评测环境中不稳定）。`systemctl --user` 改由门面（`sandbox/systemd.lua`）用
 --- **伪造的解析器**处理：

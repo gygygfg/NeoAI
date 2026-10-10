@@ -1,5 +1,5 @@
 --- 工具输出「AI 上下文限流」
---- @module NeoAI.tools.builtin.output_guard
+--- @module 'NeoAI.tools.builtin.output_guard'
 --- 工具回传给模型的文本可能极其庞大（`git log`/`run_command` 数万行、超大文件整读），
 --- 一次性塞给模型会瞬间耗尽上下文、稀释关键信息。本模块提供统一出口护栏 `cap()`：
 ---   - 文本字符数 <= `tools.output_guard.max_chars` 时原样返回；
@@ -97,7 +97,7 @@ local function _spill(content, opts)
   local cap_bytes = 5 * 1024 * 1024
   pcall(function()
     local rc = require("NeoAI.kernel.config_store").get("tools.read_file")
-    if type(rc) == "table" and tonumber(rc.max_read_bytes) then cap_bytes = tonumber(rc.max_read_bytes) end
+    if type(rc) == "table" and tonumber(rc.max_read_bytes) then cap_bytes = assert(tonumber(rc.max_read_bytes)) end
   end)
   local note = nil
   if #content > cap_bytes then

@@ -1,5 +1,5 @@
 --- NeoAI 界面焦点信号
---- @module NeoAI.ui.focus
+--- @module 'NeoAI.ui.focus'
 --- 跟踪「用户当前是否在看 NeoAI 界面」，并在焦点于 NeoAI 界面 / 非 NeoAI 窗口之间跳变时
 --- 广播 `UI_FOCUS_CHANGED`。判定为「当前窗口的 buffer 是 NeoAI 界面 buffer」（filetype 前缀
 --- `neoai*`，或已打 `b:neoai_ui` 标记）**且** nvim 应用本身有焦点（`FocusLost`/`FocusGained`）。

@@ -1,5 +1,5 @@
 --- 流式响应处理
---- @module NeoAI.core.agent.stream
+--- @module 'NeoAI.core.agent.stream'
 --- 处理流式数据块：把增量 tool_calls（OpenAI 分片格式）累积为完整 tool_call。
 --- 同时负责把流式增量同步到 Agent 消息。
 

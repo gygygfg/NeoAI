@@ -1,5 +1,5 @@
---- 沙箱 systemctl 门面（方案 A）
---- @module NeoAI.sandbox.systemd.systemd
+--- 沙箱 systemctl 门面（方案 A）。
+--- @module 'NeoAI.sandbox.systemd.systemd'
 --- AI 在沙箱内调用 `systemctl`/`journalctl` 时，不调用宿主 systemd、也不改宿主机：
 ---   * 解析 unit 文件（优先沙箱暂存副本，使 AI 新建/修改的 unit 可见）；
 ---   * `start`/`restart` 按依赖（Requires/Wants/After/Before）递归，把 ExecStart 交给
@@ -156,7 +156,7 @@ local function _cfg()
   return config_store.get("tools.sandbox.systemd") or {}
 end
 
---- @return table
+--- @return table|nil
 local function _svc()
   local ok, mod = pcall(require, "NeoAI.sandbox.execution.service")
   if ok then return mod end
@@ -214,7 +214,6 @@ local function _tokenize(s)
     elseif c:match("%s") then
       i = i + 1
     else
-      local start = i
       local quote = nil
       local buf = {}
       while i <= n do
@@ -733,7 +732,7 @@ function M.parse_unit(content, name)
   -- 沙箱身份执行（best-effort，不报错），使 `User=root` 等常见单元可正常启动。
   local run_user = _get(sections, "Service", "User")
   local run_group = _get(sections, "Service", "Group")
-  if _get(sections, "Socket") then
+  if _get(sections, "Socket", "") then
     return nil, "沙箱环境不支持 socket 单元"
   end
 
@@ -846,7 +845,7 @@ local function _next_calendar_delay(cal, from)
   from = tonumber(from) or os.time()
   local c = stringx.trim(cal:lower())
   local function at(day_offset, hh, mm, ss)
-    local base = os.date("*t", from)
+    local base = os.date("*t", from) --[[@as osdate]]
     base.hour, base.min, base.sec = hh or 0, mm or 0, ss or 0
     local epoch = os.time(base) + (day_offset or 0) * 86400
     while epoch <= from do epoch = epoch + 86400 end
@@ -902,7 +901,7 @@ local function _next_calendar_delay(cal, from)
     return nil
   end
   if not hh or not mm then return nil end
-  local today = os.date("*t", from)
+  local today = os.date("*t", from) --[[@as osdate]]
   today.hour, today.min, today.sec = hh, mm, ss or 0
   local epoch = os.time(today)
   if epoch <= from then epoch = epoch + 86400 end
@@ -1288,7 +1287,7 @@ end
 
 --- 启动/重新激活一个定时器单元。
 --- @param unit table
---- @param scope string
+--- @param scope string|nil
 --- @return table|nil
 --- @return string|nil err
 _timer_start = function(unit, scope)
@@ -1400,12 +1399,12 @@ function M.stage_install(attempt, plan, ctx, spec)
     return async.resolve(_fail("Failed to " .. tostring(plan.verb) .. " unit: Invalid argument.", 1))
   end
   unit_name = _normalize_unit_name(unit_name)
-  local unit, uerr, upath = _load_unit(unit_name, scope)
+  local unit, _, upath = _load_unit(unit_name, scope)
   if not unit then
     return async.resolve(_fail(
       string.format("Failed to %s unit: Unit file %s does not exist.", tostring(plan.verb), unit_name), 1))
   end
-  local unit_path = unit.path or upath
+  local unit_path = assert(unit.path or upath)
 
   control.transition(attempt, "STAGING")
   candidate.begin(attempt, root)
@@ -1509,7 +1508,7 @@ end
 --- @param epoch number|nil
 --- @return string
 local function _stamp(epoch)
-  return os.date("%a %Y-%m-%d %H:%M:%S", epoch)
+  return os.date("%a %Y-%m-%d %H:%M:%S", epoch) --[[@as string]]
 end
 
 --- @return string
@@ -1545,7 +1544,7 @@ local function _install_targets(path)
       for tok in line:gmatch("%S+") do targets[#targets + 1] = tok end
     end
   end
-  return targets, sections
+  return targets
 end
 
 --- is-enabled 语义：enabled/disabled/static/masked/not-found + LSB 退出码。
@@ -1682,7 +1681,7 @@ local KILL_SIGNALS = {
 local function _signal_number(s)
   if s == nil then return 15 end
   local str = tostring(s):upper()
-  if str:match("^%d+$") then return tonumber(str) end
+  if str:match("^%d+$") then return assert(tonumber(str)) end
   if str:sub(1, 3) ~= "SIG" then str = "SIG" .. str end
   return KILL_SIGNALS[str] or 15
 end
@@ -1771,7 +1770,6 @@ local function _timer_status_block(name, scope, path)
   end
   unit = t and t.unit or unit or { name = name, activates = t and t.activates }
   local active = (t and t.active) and "active" or "inactive"
-  local sub = (t and t.active) and "waiting" or "dead"
   local enabled = select(1, _enabled_state(name, scope, path))
   local dot = active == "active" and "●" or "○"
   local lines = {
@@ -1779,10 +1777,11 @@ local function _timer_status_block(name, scope, path)
     string.format("     Loaded: loaded (%s; %s; preset: enabled)", path or "(builtin)", enabled),
   }
   if active == "active" then
+    local timer = assert(t)
     lines[#lines + 1] = string.format("     Active: active (waiting) since %s; 0s ago", _now_stamp())
     lines[#lines + 1] = string.format("    Trigger: %s",
-      t.next_at and os.date("%a %Y-%m-%d %H:%M:%S", t.next_at) or "n/a")
-    lines[#lines + 1] = string.format("   Triggers: ● %s", tostring(t.activates))
+      timer.next_at and os.date("%a %Y-%m-%d %H:%M:%S", timer.next_at) or "n/a")
+    lines[#lines + 1] = string.format("   Triggers: ● %s", tostring(timer.activates))
     return table.concat(lines, "\n"), nil, 0
   end
   lines[#lines + 1] = "     Active: inactive (dead)"
@@ -1864,7 +1863,7 @@ end
 --- 从单元文件与 sandbox.service 运行态合成；`.timer` 输出 NextElapseUSecRealtime/Unit 等。
 --- @param name string
 --- @param scope string
---- @param props table|nil 请求的属性集合（nil/空 = 全部）
+--- @param props table 请求的属性集合（空 = 全部）
 --- @param value_only boolean|nil 仅输出值
 --- @return string
 local function _show_text(name, scope, props, value_only)
@@ -1946,8 +1945,9 @@ local function _show_text(name, scope, props, value_only)
     local wd = g("Service", "WorkingDirectory")
     if wd then put("WorkingDirectory", tostring(wd)) end
   elseif is_runtime then
-    put("Description", tostring(info.command or norm))
-    put("ExecStart", tostring(info.command or ""))
+    local inf = assert(info)
+    put("Description", tostring(inf.command or norm))
+    put("ExecStart", tostring(inf.command or ""))
   else
     put("Description", norm)
   end
@@ -2366,7 +2366,7 @@ local function _timedatectl_status()
   }, "\n")
 end
 
---- @param name string
+--- @param plan table
 --- @return Deferred
 local function _dispatch_hostnamectl(plan)
   if _has_opt(plan.opts, "--version") then return async.resolve(_ok(_host_version())) end
@@ -2449,14 +2449,15 @@ local function _dispatch_dmesg(plan)
   for _, ln in ipairs(DMESG_LINES) do
     local text = ln[2]
     if text:find("<host>") then text = text:gsub("<host>", _hostname()) end
+    local keep = true
     if strict then
       -- 粗略级别过滤：非 info 级别只保留含错误/警告特征的行。
       if not text:lower():find("error") and not text:lower():find("fail")
         and not text:lower():find("warn") and not text:lower():find("denied") then
-        text = nil
+        keep = false
       end
     end
-    if text then
+    if keep then
       local stamp
       if human then
         stamp = "[" .. os.date("%a %b %d %H:%M:%S %Y", now - math.floor((total - ln[1]) + 0.5)) .. "]"
@@ -2652,7 +2653,7 @@ local function _dispatch(plan)
           "Failed to kill unit %s: Unit %s is not active, cannot kill.", norm, norm)
         code = math.max(code, 1)
       else
-        local ok = svcs.signal(key, signum)
+        local ok = svcs and svcs.signal(key, signum)
         if not ok then
           errs[#errs + 1] = string.format("Failed to kill unit %s: Operation not permitted", norm)
           code = math.max(code, 1)
@@ -2789,6 +2790,7 @@ local function _dispatch(plan)
       if reason == "" then reason = "Unit " .. norm .. " is not loaded properly." end
       return async.resolve(_fail(string.format("Failed to %s %s: %s", verb, norm, reason), 1))
     end
+    unitmap = assert(unitmap)
     if verb == "start" then
       local d = async.Deferred.new()
       _start_ordered(ordered, unitmap, scope):then_(function(r)

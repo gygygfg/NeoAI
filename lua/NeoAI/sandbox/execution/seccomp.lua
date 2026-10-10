@@ -1,5 +1,5 @@
 --- 沙箱 seccomp 基线
---- @module NeoAI.sandbox.execution.seccomp
+--- @module 'NeoAI.sandbox.execution.seccomp'
 --- 生成并施加 seccomp 基线（设计文档 §7.1）：默认 denylist（只拦危险 syscall）+
 --- 设备节点屏障，架构不符直接 KILL。经 `bwrap --seccomp FD` 在沙箱载荷上施加
 --- （bwrap 特权设置不被过滤）。
@@ -133,10 +133,6 @@ local ARCH = {
   },
 }
 
--- ========== 私有状态 ==========
-
-local state = { filter_path = nil }
-
 -- ========== 私有函数 ==========
 
 local function _u16(n)
@@ -252,7 +248,6 @@ function M.ensure_filter()
   --   v5：时钟（adjtimex/settimeofday/clock_settime/clock_adjtime）与裸端口 I/O（iopl/ioperm）拦截）。
   local path = dir .. "/baseline-v5-" .. name .. ".bpf"
   if vim.fn.filereadable(path) == 1 then
-    state.filter_path = path
     return path
   end
   fs.ensure_dir(dir)
@@ -262,7 +257,6 @@ function M.ensure_filter()
   if not f then return nil, "SANDBOX_SECCOMP_WRITE_FAILED: " .. path end
   f:write(bytes)
   f:close()
-  state.filter_path = path
   return path
 end
 
@@ -288,7 +282,6 @@ end
 
 --- 重置（测试用）
 function M.reset()
-  state.filter_path = nil
 end
 
 M._arch = _arch

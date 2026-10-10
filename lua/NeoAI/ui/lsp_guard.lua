@@ -1,5 +1,5 @@
 --- NeoAI 界面 buffer 的 LSP 隔离
---- @module NeoAI.ui.lsp_guard
+--- @module 'NeoAI.ui.lsp_guard'
 --- 阻止 LSP 客户端（native LSP / GitHub Copilot 等）挂载到 NeoAI 界面 buffer。
 --- NeoAI 的聊天/输入框/悬浮窗等都是纯 UI 文本，挂上 LSP 后 `document_color` /
 --- `folding_range` / `semantic_tokens` / `inline_completion`（Copilot）会持续空耗 CPU。

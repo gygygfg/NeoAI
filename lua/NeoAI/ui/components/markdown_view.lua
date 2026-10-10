@@ -1,5 +1,5 @@
 --- Markdown 渲染器
---- @module NeoAI.ui.components.markdown_view
+--- @module 'NeoAI.ui.components.markdown_view'
 --- 轻量 markdown 到纯文本/高亮行转换。用于聊天窗口渲染。
 --- 支持代码块、行内代码、标题、列表、表格。
 --- 文本度量（显示宽度 / 切片）全部走纯 Lua 的 `utils.textmetrics`，避免逐字符

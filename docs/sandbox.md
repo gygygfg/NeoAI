@@ -268,6 +268,13 @@ LSP/treesitter 的写盘仍走各自既有的暂存路径（`persist_target` →
     顺序敏感（git 原子组「对象→普通→指针」、删除「子先于父」）或线程池不可用时，**回落同步
     `candidate.publish`**（语义完全一致）。审批界面（`<CR>`/`A`/L3 二次确认）默认走异步发布，
     并在批量应用会话中逐项让出主循环。
+  - **删除/rmdir 幂等**：发布时目标已不存在（被外部删除）不再视为失败——`delete`/`rmdir` 均
+    以「删除成功或删除后目标已不存在」为成功，避免 `WRITE_FAILED: ... rmdir 失败` 误报。
+  - **非原子整包部分应用**：非原子变更单元（不含 `atomic_group="git"` 的对象/指针）在写入阶段
+    **允许部分写入**——单个文件写入失败不再让整包失败：成功文件照常落盘并结算，失败文件
+    （带原因）由 `review._apply_settle` 的 `PARTIAL` 分支**回队为新的待审单元**供重试。
+    `git` 原子组、`NEEDS_ROOT`、`CONFLICT`、`SECRET_UNRESOLVED`、CAS 预检失败仍即时整体中止
+    （CAS 阶段的一致性保证不变：任一基线偏离仍在写入前整体拒绝）。
   - **CAS 模式**：`tools.sandbox.review.cas_mode`（`hash` 默认，逐文件整读+哈希，最强一致性；
     `auto` 对超大文件/blob 用 mtime/size 签名，其余哈希；`sig` 全部用签名，最快）。非默认值
     放宽了「同尺寸同 mtime 内容变化」的检出，仅在明确知晓影响时使用。
@@ -1083,6 +1090,11 @@ stdout/stderr/退出码返回。宿主侧由 `sandbox/systemd/systemd_ipc.lua` �
 - 诊断：克隆体的 `textDocument/publishDiagnostics` 不外溢到编辑器；`lsp_diagnostics` 优先通过
   pull diagnostics（`textDocument/diagnostic`）读取克隆体诊断（反映暂存内容），服务器不支持时
   回退编辑器诊断。
+- 项目级全量诊断（`lsp_check` 工具）：不同于上述克隆体——它直接运行 server 的 **CLI 检查命令**
+  （`tools.lsp.check.servers`，如 `lua-language-server --check=.`），声明的沙箱规格为
+  `process` + `read_only`，经 `ctx.sandbox_prefix` 在**与 `run_command` 同一命名空间/overlay** 内
+  执行：读取暂存视图（含 AI 未发布改动）、全量重算、写入不捕获候选也不外泄。与编辑器 LSP 的
+  挂载/缓存状态完全解耦，适合大项目批量诊断。
 - **工具侧 buffer 一致性**：`lsp_*` 工具在后台加载文件后，用暂存内容同步该后台 buffer
   （`tool_helpers.sync_buffer_from_sandbox`），使 didOpen/didChange 文本与 overlay 磁盘视图一致；
   用户已打开的 buffer 不覆盖（沙箱改动不外泄到编辑器）。对**用户已打开**的文件，则在取用克隆前
@@ -1098,8 +1110,15 @@ stdout/stderr/退出码返回。宿主侧由 `sandbox/systemd/systemd_ipc.lua` �
   rw bind 之后应用与 `run_command` 一致的 `mask_paths` 遮蔽（如 `~/.config/gh`、`~/.config/gcloud`、
   `~/.config/git/credentials`、`~/.local/share/keyrings`、`~/.cache/keyring-*`），避免随配置/缓存
   目录把凭据暴露给克隆 server。
-- 生命周期：克隆客户端由 `sandbox.lsp.clients_for` / `client_supporting` 按需启动并缓存，
+- 生命周期与保活：克隆客户端由 `sandbox.lsp.clients_for` / `client_supporting` 按需启动并缓存，
   `stop_all()` 统一停止；不注册任何全局 hook，卸载/禁用不影响编辑器 LSP。
+  - **空闲保活**：克隆体在最后一次取用后保活 `tools.sandbox.lsp_overlay.idle_timeout_ms`
+    （默认 600000ms = 10 分钟），期间后续 `lsp_*` 调用直接复用该常驻进程，**无需等待 server
+    重新启动**（避免每次诊断都等 server 冷启动）。超时无调用则由后台回收定时器停止，避免常驻
+    进程泄漏；设 0/负数则永不空闲回收（存活到显式 `stop_all`/退出）。
+  - **复用回退**：`client_supporting` 在目标 buffer 无编辑器客户端附加时（后台加载、或用户
+    buffer 已 detach），仍会回退到**已保活**的克隆体并复用，而不会因缺少编辑器客户端而重新
+    启动或报「无 LSP 客户端」。
 
 ## 6. 运行时后端
 
@@ -1851,6 +1870,12 @@ overlay 会 `EINVAL`），此时命令只能运行在「只读根 + 私有可写
   `is_sensitive_path` 返回 false）：既不做高熵 token 化、也不触发「获取密钥」告警，生成式密钥
   扫描（`detect_generated`）同样跳过其内容。避免把 sha256sum 输出、`.shada` 内的历史/寄存器
   高熵片段误判为密钥。
+- **非凭据文件完全不参与密钥操作**：候选冻结/暂存写入对非凭据路径**跳过全部 token 化**
+  （具名规则、变量名赋值、已知环境变量密钥均不适用），密钥告警计数（`warn_for_files`）也跳过
+  这些路径。此外，密钥操作信号只对「凭据相关写路径」升级——候选仅涉及非凭据/编辑器状态文件
+  （如 `~/.local/state/nvim/shada/main.shada`）时，命令级 `secret_operation` 不再把它推到 L3，
+  由路径级别自然封顶 L1（`USER_PATH_WRITE`）。避免运行无头 nvim 等仅触达编辑器状态目录的命令
+  被误报为工作区外密钥操作。
 
 注：检测前会解析路径/代码语义，`api_key = os.getenv("..._API_KEY")` 这类代码表达式不会被当作
 原始密钥；赋值右侧为**敏感环境变量名引用**（如 `api_key=DASHSCOPE_API_KEY`）时同样不登记。

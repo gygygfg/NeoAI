@@ -1,5 +1,5 @@
 --- 工具审批弹窗
---- @module NeoAI.ui.components.tool_approval
+--- @module 'NeoAI.ui.components.tool_approval'
 --- 工具执行审批 UI。注册到 tool_service。
 
 local services = require("NeoAI.kernel.services")

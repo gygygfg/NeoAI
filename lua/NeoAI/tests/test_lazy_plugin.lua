@@ -1,5 +1,5 @@
 --- 懒加载占位插件（plugins.builtin.lazy）专项测试
---- @module NeoAI.tests.test_lazy_plugin
+--- @module 'NeoAI.tests.test_lazy_plugin'
 --- 覆盖占位命令注册/清理契约与阶段分派（不触发真实命令）。
 local tests = require("NeoAI.tests")
 

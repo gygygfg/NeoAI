@@ -1,5 +1,5 @@
 --- 模型列表异步获取器
---- @module NeoAI.core.model.fetcher
+--- @module 'NeoAI.core.model.fetcher'
 --- 并发拉取所有已配置 provider 的 /models 端点。
 --- 指数退避重试（3 次：1s/2s/4s）。
 --- 成功 → registry.update；失败 → cache；无缓存 → 静态 fallback。

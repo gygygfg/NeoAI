@@ -1,5 +1,5 @@
 --- 沙箱磁盘用量与上限
---- @module NeoAI.sandbox.execution.disk
+--- @module 'NeoAI.sandbox.execution.disk'
 --- 统计沙箱暂存总字节数（进程 overlay / 每会话私有 tmp 的暂存基目录 + 沙箱存储根：候选/待审/
 --- 证据/服务 overlay 等），并按 `tools.sandbox.limits.disk_bytes`（默认 64 GiB，0 = 不限）
 --- 做上限门禁：超限时拒绝新的外部进程/写类工具（`SANDBOX_DISK_LIMIT_EXCEEDED`），避免暂存

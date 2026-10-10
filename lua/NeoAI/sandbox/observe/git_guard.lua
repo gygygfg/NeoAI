@@ -1,5 +1,5 @@
 --- 沙箱 git 变更命令守卫
---- @module NeoAI.sandbox.observe.git_guard
+--- @module 'NeoAI.sandbox.observe.git_guard'
 --- `.git` 是「索引↔对象库↔refs」强耦合的数据库，必须原子化处理（见 `runtime.git_path_class`
 --- 与 `candidate._apply_order`：对象先于指针），否则会「存了索引丢了对象」产生悬空引用。
 --- 因此外部命令中的 git **变更**子命令在此识别并拒绝，改由专用 git 工具

@@ -1,5 +1,5 @@
 --- 文件操作工具
---- @module NeoAI.tools.builtin.file_ops
+--- @module 'NeoAI.tools.builtin.file_ops'
 --- 读/写/列/搜/删/建目录 + confirm_file_change（写入确认）。
 --- 阻塞式文件 I/O（读大文件 / 递归搜索 / 写盘）经 utils.work 在线程池执行，
 --- 不占用 nvim 主线程，避免工具调用时主界面卡住。
@@ -175,7 +175,7 @@ local function _build_outline(content, filepath, opts)
     local snippet = stringx.trim(_line_at(content, sr + 1))
     -- UTF-8 安全截断：字节截断可能切断多字节字符（显示乱码），故按字符边界回退
     if #snippet > 80 then
-      snippet = stringx.safe_truncate(snippet, 80, "…")
+      snippet = stringx.safe_truncate(snippet, 80, "…") or snippet
     end
     count = count + 1
     local seg = string.rep("  ", depth) .. node:type()
@@ -220,22 +220,6 @@ local function _build_outline(content, filepath, opts)
       string.format("  …（节点较多，已省略；可用 start_line/end_line 读取具体区间）")
   end
   return table.concat(lines, "\n")
-end
-
---- @param content string
---- @param n number
---- @return string
-local function _preview_lines(content, n)
-  local out = {}
-  local i = 0
-  for line in (content .. "\n"):gmatch("(.-)\n") do
-    i = i + 1
-    if i > n then
-      break
-    end
-    out[#out + 1] = line
-  end
-  return table.concat(out, "\n")
 end
 
 --- 大文件保护：阈值内返回全文；超阈值优先返回语法树大纲；无 parser/解析失败时改为
@@ -558,20 +542,25 @@ local file_tools = {}
 -- 读取文件（线程池异步）
 file_tools.read_file = helpers.define_tool(
   "read_file",
-  "读取文件内容。file_path 必填；start_line/end_line 可选指定行范围（1-based，含两端）。"
-    .. "未指定行范围且文件较大（默认超 500 字符）时优先返回语法树节点大纲；"
-    .. "无解析器/解析失败时返回「文件首尾 + 完整文件落盘路径（沙箱私有 /tmp，可用 start_line/end_line 回读）」。"
-    .. "任何输出超过上下文阈值（tools.output_guard.max_chars）时会截断为头+尾并提示落盘路径。",
+  "读取文件。同 opencode read（file_path；行范围用 offset/limit 或 start_line/end_line，1-based）。"
+    .. "未指定行范围且文件较大时优先返回语法树节点大纲；输出超限时截断为头+尾并给出落盘路径（可用行范围回读）。",
   {
     type = "object",
     properties = {
       file_path = { type = "string", description = "文件路径" },
-      start_line = { type = "integer", description = "起始行号（可选）" },
-      end_line = { type = "integer", description = "结束行号（可选）" },
+      offset = { type = "integer", description = "起始行（同 start_line，1-based）" },
+      limit = { type = "integer", description = "读取行数（与 offset 搭配；否则用 end_line）" },
+      start_line = { type = "integer", description = "起始行号（可选，1-based）" },
+      end_line = { type = "integer", description = "结束行号（可选，1-based，含两端）" },
     },
     required = { "file_path" },
   },
   function(args, on_success, on_error)
+    -- opencode read 风格：offset/limit 归一为 start_line/end_line。
+    if args.start_line == nil and args.offset ~= nil then args.start_line = args.offset end
+    if args.end_line == nil and args.limit ~= nil and args.start_line ~= nil then
+      args.end_line = args.start_line + args.limit - 1
+    end
     -- 命名空间视图读取（快路径：小文件且无行范围）：overlay 权威暂存层下读取与暂存视图一致。
     -- overlay 不可用/路径落在私有 tmpfs 根/大文件或指定行范围时回退既有解析路径。
     do
@@ -637,10 +626,8 @@ file_tools.read_file = helpers.define_tool(
 -- 编辑文件（线程池异步读写）
 file_tools.edit_file = helpers.define_tool(
   "edit_file",
-  "编辑文件。file_path/description 必填。两种用法互斥："
-    .. "(1) 局部替换——提供 edits 数组，或用顶层 old_text+new_text 简写单条替换，均不得传 mode；"
-    .. "(2) 整文件覆写或追加——必须显式 mode='write'（覆写）/ mode='append'（追加），并提供 content。"
-    .. "替换字段与 mode 同时出现、或提供 content 却省略 mode、或两者皆无，都会直接报错（不静默覆写）。",
+  "编辑文件。同 opencode edit：局部替换用 old_text/new_text（或 edits 数组，别名 oldString/newString）；"
+    .. "整文件覆写/追加用 mode='write'/'append' + content。两组互斥，误传直接报错（不静默覆写）。",
   {
     type = "object",
     properties = {
@@ -670,7 +657,6 @@ file_tools.edit_file = helpers.define_tool(
   },
   function(args, on_success, on_error)
     local filepath = args.file_path
-    local description = args.description
     -- 参数契约（严格互斥，误传即报错，绝不静默降级为覆写）：
     --   · 局部替换：提供 edits（或顶层 old_text/new_text 简写），且不得同时传 mode；
     --   · 整体覆写/追加：显式 mode='write'/'append'，且不得同时传替换字段。
@@ -876,7 +862,7 @@ file_tools.edit_file = helpers.define_tool(
 -- 列出目录（线程池异步）
 file_tools.list_files = helpers.define_tool(
   "list_files",
-  "列出目录内容。path 可选，默认当前目录；recursive 可选。",
+  "列出目录内容。同 opencode list/glob（path 默认当前目录；recursive 递归）。",
   {
     type = "object",
     properties = {
@@ -958,12 +944,14 @@ file_tools.list_files = helpers.define_tool(
 -- 搜索文件内容（线程池异步递归）
 file_tools.search_files = helpers.define_tool(
   "search_files",
-  "在目录中按模式搜索文件内容。query 必填；include 可选 glob。",
+  "在目录中按模式搜索文件内容。同 opencode grep（pattern/query 必填；include/glob 文件过滤；path 目录）。",
   {
     type = "object",
     properties = {
-      query = { type = "string", description = "搜索关键字" },
+      query = { type = "string", description = "搜索关键字/正则" },
+      pattern = { type = "string", description = "同 query（opencode grep 风格）" },
       include = { type = "string", description = "文件 glob，如 '*.lua'" },
+      glob = { type = "string", description = "同 include（opencode grep 风格）" },
       path = { type = "string", description = "搜索目录（默认当前目录）" },
       max_results = { type = "integer", description = "最大返回条数（默认 50）" },
     },

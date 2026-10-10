@@ -1,5 +1,5 @@
 --- 沙箱执行门禁
---- @module NeoAI.sandbox.execution.wrapper
+--- @module 'NeoAI.sandbox.execution.wrapper'
 --- 所有工具执行的唯一强制入口：预检 → 隔离执行 → 冻结候选 → 异步确认 → CAS 发布。
 --- 由 tools/executor 在调用工具前调用；加载器负责为工具附加 __sandbox 规格。
 ---
@@ -22,11 +22,17 @@ local envelope = require("NeoAI.sandbox.observe.envelope")
 local replay = require("NeoAI.sandbox.review.replay")
 local fs = require("NeoAI.utils.fs")
 local wrapper_util = require("NeoAI.sandbox.execution.wrapper_util")
+
 -- 纯助手（自 wrapper_util 引入，保持原局部名以零改调用点）
 local _rewrite_value, _enc_root, _is_sudo_bin, _split_shell, _cand_paths, _package_manager_of, _limits_key =
   wrapper_util.rewrite_value, wrapper_util.enc_root, wrapper_util.is_sudo_bin, wrapper_util.split_shell, wrapper_util.cand_paths, wrapper_util.package_manager_of, wrapper_util.limits_key
 
 local M = {}
+
+--- vim.defer_fn 返回的 libuv 定时器句柄（这里仅用 stop/close）。
+---@class NeoAIPrewarmTimer
+---@field stop fun(self: NeoAIPrewarmTimer, ...): any
+---@field close fun(self: NeoAIPrewarmTimer, ...): any
 
 -- git 变更类工具（沙箱内执行、会改写 `.git`）：这些工具必须**始终全量捕获** overlay 改动，
 -- 绝不启用写日志增量捕获——`.git` 是索引↔对象库↔refs 强耦合数据库，漏捕获任一对象都会
@@ -228,14 +234,6 @@ local function _package_roots()
   return out
 end
 
---- 沙箱内已是 root（完整能力）：剥掉 `sudo`/`doas`（及其选项），使 `sudo apt update`
---- 等价于 `apt update`。沙箱用独立 userns 时仅映射 uid 0，sudo 的 `setresuid(...,1,...)`
---- 会 EINVAL，且 `/etc/sudoers` 被遮蔽，故 sudo 无意义且必然失败（`PERM_SUDOERS`）。
---- 处理**每个命令段**（按未加引号的 `; & | && ||` 换行切分），故 `a && sudo b`、多行脚本、
---- `sudo -u user cmd`、`sudo -i` 等都不再报错；保留包装器（env/command/nohup/…）与其余原文
---- （不改动引号内空白）。
---- @param cmd string|nil
---- @return string|nil
 local SUDO_VALUE_OPTS = {
   ["-u"] = true, ["-g"] = true, ["-p"] = true, ["-C"] = true, ["-h"] = true,
   ["-r"] = true, ["-t"] = true, ["-U"] = true,
@@ -289,6 +287,12 @@ local function _strip_sudo_segment(seg)
 end
 
 
+--- 沙箱内已是 root（完整能力）：剥掉 `sudo`/`doas`（及其选项），使 `sudo apt update`
+--- 等价于 `apt update`。沙箱用独立 userns 时仅映射 uid 0，sudo 的 `setresuid(...,1,...)`
+--- 会 EINVAL，且 `/etc/sudoers` 被遮蔽，故 sudo 无意义且必然失败（`PERM_SUDOERS`）。
+--- 处理**每个命令段**（按未加引号的 `; & | && ||` 换行切分），故 `a && sudo b`、多行脚本、
+--- `sudo -u user cmd`、`sudo -i` 等都不再报错；保留包装器（env/command/nohup/…）与其余原文
+--- （不改动引号内空白）。
 --- @param cmd string|nil
 --- @return string|nil
 local function _strip_sudo(cmd)
@@ -442,7 +446,6 @@ end
 function M.overlay_gate(specs, opts)
   opts = opts or {}
   local cfg = opts.cfg or config_store.get("tools.sandbox") or {}
-  local candidate = require("NeoAI.sandbox.execution.candidate")
   local userns = opts.userns == true
   -- 收集实际可覆盖的根：只有这些根内的暂存内容对命令可见（overlay 物化或播种视图）。
   local covered = {}
@@ -706,6 +709,24 @@ local function _settle_candidate(cand, attempt, ctx, cfg, spec, result, process_
         or (process_info and process_info.command))
     end)
   end
+  -- 密钥操作信号只对「凭据相关写路径」升级：候选若仅涉及非凭据/编辑器状态文件
+  -- （.shada、哈希文件、git 对象、包缓存等），命令级 secret_operation 不再把它推到 L3，
+  -- 由路径级别自然封顶 L1（USER_PATH_WRITE）。
+  local secret_signal = (secret_warning and (secret_warning.count or 0) > 0)
+    or (ctx and ctx.secret_operation == true) or false
+  if secret_signal and #(cand.files or {}) > 0 then
+    -- 有候选写入时：仅当存在凭据相关写路径才升级；候选全为非凭据/编辑器状态文件时降级。
+    local has_cred_path = false
+    local ok_s, s = pcall(require, "NeoAI.sandbox.secret.secret")
+    for _, f in ipairs(cand.files or {}) do
+      local p = type(f) == "table" and f.path or nil
+      if not (ok_s and s and s.is_non_credential_path and s.is_non_credential_path(p)) then
+        has_cred_path = true
+        break
+      end
+    end
+    if not has_cred_path then secret_signal = false end
+  end
   local rf = {
     effect = spec.effect,
     paths = paths,
@@ -716,8 +737,7 @@ local function _settle_candidate(cand, attempt, ctx, cfg, spec, result, process_
     package_sensitive = pkg_sensitive,
     network = attempt.network == true,
     -- 密钥操作：候选文件含 token，或本次调用使用了 KEY 环境变量 token（提级强制待审）。
-    secret = (secret_warning and (secret_warning.count or 0) > 0)
-      or (ctx and ctx.secret_operation == true) or false,
+    secret = secret_signal,
     command = attempt.container_command or (process_info and process_info.command) or nil,
     command_effective = effective,
     script_opaque = (scan and scan.opaque) or false,
@@ -954,7 +974,6 @@ local function _on_observed(attempt, ctx, evt)
     seen[p] = true
     ctx._observed_paths_count = ctx._observed_paths_count + 1
   end
-  local runtime = require("NeoAI.sandbox.execution.runtime")
   -- 每 attempt 缓存一次 read_all/cwd，避免逐事件读取配置与 getcwd。
   if ctx._observed_read_all == nil then ctx._observed_read_all = runtime.read_all() end
   if ctx._observed_read_all then
@@ -1003,6 +1022,7 @@ local function _prewarm_stop_timer()
   if not t then return end
   prewarm.timer = nil
   if type(t) == "userdata" then
+    ---@cast t NeoAIPrewarmTimer
     pcall(function() t:stop() end)
     pcall(function() t:close() end)
   else
@@ -1115,13 +1135,6 @@ local function _start_observe(cg_handle, attempt, ctx, prewarmed)
   return nil
 end
 
---- systemctl/journalctl 门面（方案 A）：把独立调用路由到沙箱内长驻服务，不触碰宿主 systemd。
---- 返回 Deferred（已处理）或 nil（不处理，回退既有 T2/hostop 提案路径）。
---- @param attempt table
---- @param args table
---- @param ctx table
---- @param spec table
---- @return Deferred|nil
 --- 查询类动词：非零退出是**正常语义**（is-active 3=inactive、is-enabled 1=disabled、
 --- is-failed 1=非 failed、is-system-running 1=非 running、status 3=inactive），
 --- 不应被包装成工具失败（ok=false）；否则 AI 会把「服务未运行」误判为工具报错。
@@ -1157,6 +1170,13 @@ local function _systemd_result_text(res, plan)
   return combined
 end
 
+--- systemctl/journalctl 门面（方案 A）：把独立调用路由到沙箱内长驻服务，不触碰宿主 systemd。
+--- 返回 Deferred（已处理）或 nil（不处理，回退既有 T2/hostop 提案路径）。
+--- @param attempt table
+--- @param args table
+--- @param ctx table
+--- @param spec table
+--- @return Deferred|nil
 local function _maybe_systemd(attempt, args, ctx, spec)
   if spec.effect ~= "process" then return nil end
   local cfg = config_store.get("tools.sandbox.systemd") or {}
@@ -1237,10 +1257,10 @@ end
 --- 返回 Deferred（已拒绝）或 nil（放行，交既有 container.plan/rewrite 处理）。
 --- @param attempt table
 --- @param args table
---- @param ctx table
+--- @param _ table
 --- @param spec table
 --- @return Deferred|nil
-local function _maybe_container(attempt, args, ctx, spec)
+local function _maybe_container(attempt, args, _, spec)
   if spec.effect ~= "process" then return nil end
   local cfg = config_store.get("tools.sandbox.container") or {}
   if cfg.enabled == false then return nil end
@@ -1663,7 +1683,7 @@ local function _gate_inner(tool, args, ctx, call_original)
     control.transition(attempt, "CANDIDATE_READY")
     control.transition(attempt, "COMPLETED_READ_ONLY")
     local endpoint = args and (args.url or args.endpoint or args.file_path or args.filepath)
-    local evidence_id = evidence.add("network", {
+    evidence.add("network", {
       endpoint = endpoint, allowed = true, denied = false, source = "observed",
     }, {
       command_id = attempt.command_id, attempt_id = attempt.attempt_id, tool = attempt.tool_name,
@@ -1741,8 +1761,7 @@ local function _gate_inner(tool, args, ctx, call_original)
     end
     -- 已暂存的包安装产物对后续命令可见：把「有暂存改动」的包可写根也加入本次可写根
     -- （非包安装命令默认只覆盖 cwd，否则后续 `python -m build` 看不到刚装的包）。
-    local cand = require("NeoAI.sandbox.execution.candidate")
-    for _, r in ipairs(cand.staged_roots()) do
+    for _, r in ipairs(candidate.staged_roots()) do
       extra_roots[#extra_roots + 1] = r
     end
     -- 补齐所有已暂存路径的覆盖根（不限包安装根）：让命令 overlay 与只读工具看到同一
@@ -1755,7 +1774,7 @@ local function _gate_inner(tool, args, ctx, call_original)
       if type(pr) == "table" then
         for _, r in ipairs(pr) do known_roots[#known_roots + 1] = r end
       end
-      for _, r in ipairs(cand.staged_overlay_roots(known_roots)) do
+      for _, r in ipairs(candidate.staged_overlay_roots(known_roots)) do
         extra_roots[#extra_roots + 1] = r
       end
     end
@@ -1763,15 +1782,15 @@ local function _gate_inner(tool, args, ctx, call_original)
       resident_base or proc_dir, extra_roots,
       { no_root_overlay = ctx.sandbox_cross_mount_approved == true })
     -- 选定每个可写根实际使用的层（overlay / fuse / bind），供物化/捕获/前缀构造一致使用
-    for _, spec in ipairs(specs) do
-      if spec.mode == "fuse" then
+    for _, sp in ipairs(specs) do
+      if sp.mode == "fuse" then
         -- 已由 fuse-overlayfs 建立的用户态合并视图，保持不动。
-      elseif runtime.overlay_writable(spec.root, spec.upper, spec.work) then
-        spec.mode = "overlay"
+      elseif runtime.overlay_writable(sp.root, sp.upper, sp.work) then
+        sp.mode = "overlay"
       else
-        spec.mode = "bind"
+        sp.mode = "bind"
         -- 记录降级原因，供 run_command 结果中说明（便于排查 overlay 为何不可用）
-        spec.overlay_reason = runtime.overlay_reason(spec.root, spec.upper, spec.work)
+        sp.overlay_reason = runtime.overlay_reason(sp.root, sp.upper, sp.work)
       end
     end
     -- 用户态 overlay（fuse）与常驻沙箱不兼容：强制走一次性路径（其物化/捕获已支持 fuse）。
@@ -2343,7 +2362,7 @@ local function _gate_inner(tool, args, ctx, call_original)
 
     --- 执行一次；权限/网络失败时自动发起升级并在隔离内重跑（记录，不静默）。
     --- 全档位生效：T0 失败升 T1，T1 失败升 T2（直到 max_tier），每步写证据/事件/审计。
-    local function run(priv, current_tier)
+    local function run(_, current_tier)
       call_original():then_(function(res)
         if pcfg.auto_escalate ~= false and not attempt.package
           and current_tier < (pcfg.max_tier or 2) then
@@ -2406,8 +2425,8 @@ local function _gate_inner(tool, args, ctx, call_original)
   end
 
   -- 文件系统写：暂存到工作区私有副本，冻结候选，按模式发布/入队
-  local record = candidate.begin(attempt, root)
-  local sandbox = require("NeoAI/sandbox")
+  candidate.begin(attempt, root)
+  local sandbox = require("NeoAI.sandbox")
   local previous_active = sandbox._set_active_attempt(attempt)
   -- 目录工具（创建/确保目录）合法地以目录为目标；其余 fs_write（edit_file 等）写文件，
   -- 若目标在真实盘或沙箱视图中是目录，必须拒绝——否则会把目录覆盖成文件，破坏沙箱视图
@@ -2459,8 +2478,8 @@ local function _gate_inner(tool, args, ctx, call_original)
         local p = args[key]
         if type(p) == "string" and p ~= "" then
           local ap = fs.canonical(p)
-          for _, root in ipairs(roots) do
-            if ap == root or ap:sub(1, #root + 1) == root .. "/" then ns_paths_ok = false end
+          for _, rt in ipairs(roots) do
+            if ap == rt or ap:sub(1, #rt + 1) == rt .. "/" then ns_paths_ok = false end
           end
         end
       end
@@ -2494,6 +2513,7 @@ local function _gate_inner(tool, args, ctx, call_original)
     end
     -- 单文件写路径（edit_file 等）保持同步冻结：文件数少，线程池往返反而增加延迟；
     -- 大量文件的 run_command 路径见上方 after_capture（capture/finish 经线程池）。
+    ---@type table|nil
     local cand = candidate.finish(attempt.attempt_id)
     if require("NeoAI.sandbox.observe.fault").hit("freeze") then cand = nil end
     control.transition(attempt, "CANDIDATE_READY")
@@ -2574,7 +2594,7 @@ function M.await_postprocess(timeout_ms)
   local deadline = vim.uv.hrtime() + (timeout_ms or 60000) * 1e6
   while postprocess.pending do
     if vim.uv.hrtime() > deadline then return false end
-    local p = postprocess.pending
+    local p = assert(postprocess.pending)
     local done = false
     p:then_(function() done = true end, function() done = true end)
     vim.wait(50, function() return done or postprocess.pending ~= p end)

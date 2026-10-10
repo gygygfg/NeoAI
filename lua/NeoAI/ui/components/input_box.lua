@@ -1,5 +1,5 @@
 --- 输入框
---- @module NeoAI.ui.components.input_box
+--- @module 'NeoAI.ui.components.input_box'
 --- 聊天窗口底部的输入框。管理输入 buffer、提交、键位。
 
 local config_store = require("NeoAI.kernel.config_store")

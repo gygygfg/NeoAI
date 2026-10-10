@@ -1,5 +1,5 @@
 --- 沙箱受控网络网关
---- @module NeoAI.sandbox.net.network
+--- @module 'NeoAI.sandbox.net.network'
 --- 默认离线；仅在显式启用并声明允许端点后放行，且仍受字节预算约束。
 --- L3/L4 五元组不能独立证明应用层身份，这里按声明端点做应用层校验（设计文档 §7.3）。
 
@@ -14,7 +14,7 @@ local state = {
 -- ========== 私有函数 ==========
 
 --- 主机名/URL 是否匹配允许模式（精确或 `*.suffix` / 后缀）
---- @param endpoint string
+--- @param endpoint string|nil
 --- @param patterns table
 --- @return boolean
 local function _endpoint_allowed(endpoint, patterns)

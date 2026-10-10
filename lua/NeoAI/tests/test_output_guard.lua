@@ -1,5 +1,5 @@
 --- 工具输出限流（tools.builtin.output_guard）+ 沙箱 /tmp 落盘回读专项测试
---- @module NeoAI.tests.test_output_guard
+--- @module 'NeoAI.tests.test_output_guard'
 --- 覆盖：小输出原样；超限头+尾+标记；有/无沙箱映射（落盘 vs 降级）；enabled=false；
 --- 多字节安全；read_file 经访客路径回读落盘文件。
 local tests = require("NeoAI.tests")

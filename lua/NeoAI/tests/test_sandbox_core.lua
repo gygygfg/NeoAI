@@ -1,5 +1,5 @@
 --- 沙箱核心：加载器规格/策略/fail-closed/状态机/工作区映射/不可见性/git 守卫
---- @module NeoAI.tests.test_sandbox_core
+--- @module 'NeoAI.tests.test_sandbox_core'
 --- 由原 test_sandbox.lua 按用例分片而来（43 个用例，彼此独立、无跨用例共享状态）。
 
 local tests = require("NeoAI.tests")
@@ -179,8 +179,8 @@ tests.suite("sandbox_core", function(_, it)
         -- 内存条目落盘后已剥离 content：按需经 content_for 从候选读取。
         t.eq("X Y\n", sandbox.content_for(items[1].change_set_id, p), "候选内容应为叠加后的 X Y")
         local superseded = 0
-        for _, it in ipairs(sandbox.list_reviews()) do
-          if it.review_state == "SUPERSEDED" then superseded = superseded + 1 end
+        for _, rev_item in ipairs(sandbox.list_reviews()) do
+          if rev_item.review_state == "SUPERSEDED" then superseded = superseded + 1 end
         end
         t.eq(1, superseded, "旧待审项应被标记 SUPERSEDED")
         local res = sandbox.apply(items[1].change_set_id, { auto_approve = true })
@@ -213,10 +213,10 @@ tests.suite("sandbox_core", function(_, it)
         }, {})
       end):then_(function()
         local stale
-        for _, it in ipairs(sandbox.list_reviews()) do
-          if it.review_state == "SUPERSEDED" then
-            for _, f in ipairs(it.files or {}) do
-              if f.path == p then stale = it.change_set_id end
+        for _, rev_item in ipairs(sandbox.list_reviews()) do
+          if rev_item.review_state == "SUPERSEDED" then
+            for _, f in ipairs(rev_item.files or {}) do
+              if f.path == p then stale = rev_item.change_set_id end
             end
           end
         end
@@ -580,9 +580,10 @@ tests.suite("sandbox_core", function(_, it)
     }
     local order = {}
     -- 通过 monkeypatch writer 捕获应用顺序，避免真实写盘失败。
+    ---@type table<string, any>
     local writer = require("NeoAI.sandbox.execution.writer")
     local orig_apply = writer.apply
-    writer.apply = function(action, path, content, opts)
+    writer.apply = function(_, path, _, _)
       order[#order + 1] = path
       return { ok = true, state = "COMMITTED" }
     end
@@ -619,10 +620,11 @@ tests.suite("sandbox_core", function(_, it)
     t.matches("GIT_REFERENTIAL_INTEGRITY", res_ref.reason or "", "应给出完整性拒绝原因")
     -- 对照：候选自带被引用对象 → 闸门放行（写盘经 writer 拦截）。
     local oid = string.rep("a", 40)
+    ---@type table<string, any>
     local writer = require("NeoAI.sandbox.execution.writer")
     local orig_apply = writer.apply
     local applied = {}
-    writer.apply = function(action, path, content, opts)
+    writer.apply = function(_, path, _, _)
       applied[#applied + 1] = path
       return { ok = true, state = "COMMITTED" }
     end
@@ -1016,6 +1018,7 @@ tests.suite("sandbox_core", function(_, it)
   it("无 overlay 且有暂存：staging_uncovered=warn 时降级执行并附提示", function(t)
     local fs = require("NeoAI.utils.fs")
     local sandbox = require("NeoAI.sandbox")
+    ---@type table<string, any>
     local runtime = require("NeoAI.sandbox.execution.runtime")
     if runtime.backend() ~= "bwrap" then return end
     local dir = vim.fn.tempname()
@@ -1058,6 +1061,7 @@ tests.suite("sandbox_core", function(_, it)
   it("无 overlay 时禁止降级：存在未发布暂存改动则拒绝命令", function(t)
     local fs = require("NeoAI.utils.fs")
     local sandbox = require("NeoAI.sandbox")
+    ---@type table<string, any>
     local runtime = require("NeoAI.sandbox.execution.runtime")
     if runtime.backend() ~= "bwrap" then return end
     local dir = vim.fn.tempname()
@@ -1187,8 +1191,8 @@ tests.suite("sandbox_core", function(_, it)
       fs.write_file(p, "base\n")
 
       local a1 = control.new_attempt("edit_file", {}, {}, { effect = "fs_write" })
-      candidate.begin(a1, store.root())
-      local staged1 = candidate.stage_path(a1.attempt_id, p)
+      candidate.begin(a1, assert(store.root()))
+      local staged1 = assert(candidate.stage_path(a1.attempt_id, p))
       fs.write_file(staged1, "edit1\n")
       local sid1 = candidate.session_id()
       t.not_nil(sid1, "首次暂存应建立会话")
@@ -1199,8 +1203,8 @@ tests.suite("sandbox_core", function(_, it)
 
       -- 新会话仍应看到未发布的修改（一致性）
       local a2 = control.new_attempt("edit_file", {}, {}, { effect = "fs_write" })
-      candidate.begin(a2, store.root())
-      local staged2 = candidate.stage_path(a2.attempt_id, p)
+      candidate.begin(a2, assert(store.root()))
+      local staged2 = assert(candidate.stage_path(a2.attempt_id, p))
       t.eq("edit1\n", fs.read_file(staged2), "轮换后应保留未发布的修改")
       t.true_(staged2 ~= staged1, "轮换后应使用新的暂存路径")
 
@@ -1240,12 +1244,12 @@ tests.suite("sandbox_core", function(_, it)
       sandbox.reset()
       local dir = vim.fn.tempname() .. "-d"
       local a1 = control.new_attempt("create_directory", {}, {}, { effect = "fs_write" })
-      candidate.begin(a1, store.root())
-      local staged1 = candidate.stage_path(a1.attempt_id, dir)
+      candidate.begin(a1, assert(store.root()))
+      local staged1 = assert(candidate.stage_path(a1.attempt_id, dir))
       fs.ensure_dir(staged1)
       candidate.rotate_session()
       local a2 = control.new_attempt("create_directory", {}, {}, { effect = "fs_write" })
-      candidate.begin(a2, store.root())
+      candidate.begin(a2, assert(store.root()))
       local staged2 = candidate.stage_path(a2.attempt_id, dir)
       t.eq(1, vim.fn.isdirectory(staged2), "轮换后目录暂存应保留为目录")
       local entry
@@ -1319,7 +1323,7 @@ tests.suite("sandbox_core", function(_, it)
       sandbox.reset()
       sandbox.watch_sessions()
       local a = control.new_attempt("edit_file", {}, {}, { effect = "fs_write" })
-      candidate.begin(a, store.root())
+      candidate.begin(a, assert(store.root()))
       local sid1 = sandbox.session_id()
       t.not_nil(sid1)
       event_bus.emit(events.GENERATION_COMPLETED, { agent_id = "a" })
@@ -1341,7 +1345,7 @@ tests.suite("sandbox_core", function(_, it)
       local agent = chat.new_session({})
       sandbox.watch_sessions()
       local a = control.new_attempt("edit_file", {}, {}, { effect = "fs_write" })
-      candidate.begin(a, store.root())
+      candidate.begin(a, assert(store.root()))
       local sid1 = sandbox.session_id()
       -- 主 Agent 忙碌（tool_running）：子 Agent 完成不应轮换（否则会删主循环在用的暂存目录）
       agent:set_state("tool_running")

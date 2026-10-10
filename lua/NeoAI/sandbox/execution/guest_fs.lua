@@ -1,5 +1,5 @@
 --- 沙箱访客文件系统映射
---- @module NeoAI.sandbox.execution.guest_fs
+--- @module 'NeoAI.sandbox.execution.guest_fs'
 --- 记录沙箱内可为「访客」写入的临时根（`/tmp`、`/var/tmp`、`/run` 等）到宿主侧**会话私有
 --- 目录**的映射。沙箱内 `/tmp` 被 bind 到该私有目录（见 `sandbox.runtime._append_tmpfs_roots`），
 --- 故：

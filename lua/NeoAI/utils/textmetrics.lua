@@ -1,5 +1,5 @@
 --- 纯 Lua 文本度量（显示宽度 / 字符切片 / 折行）
---- @module NeoAI.utils.textmetrics
+--- @module 'NeoAI.utils.textmetrics'
 --- 不依赖 `vim.fn` / `vim.api`，因此既可在主线程直接调用，也可经 `utils.work`
 --- 工作线程内 `load(M.source)()` 后调用（线程内是全新 Lua state，不能 require）。
 --- 语义对齐 `vim.fn.strwidth` / `strchars` / `strcharpart`：
@@ -188,7 +188,11 @@ function M.strwidth(s)
   local i, n, w = 1, #s, 0
   while i <= n do
     local cp, len = _decode(s, i)
-    w = w + ((cp == nil) and 4 or _width(cp))
+    if cp == nil then
+      w = w + 4
+    else
+      w = w + _width(cp)
+    end
     i = i + len
   end
   return w
@@ -274,7 +278,8 @@ function M.each_char(s)
     local cp, len = _decode(str, i)
     local ch = str:sub(i, i + len - 1)
     i = i + len
-    return ch, (cp == nil) and 4 or _width(cp)
+    if cp == nil then return ch, 4 end
+    return ch, _width(cp)
   end
 end
 

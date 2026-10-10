@@ -1,5 +1,5 @@
 --- 工具执行中取消（ESC）后的运行态一致性测试
---- @module NeoAI.tests.test_abort_tools
+--- @module 'NeoAI.tests.test_abort_tools'
 --- 回归：工具在途时取消，Agent 必须回到 idle 并释放生成占用；后续消息直接开启新轮，
 --- 而不是被吞进 pending_queue 永远“待发”。此前的缺陷是工具循环在成功分支里把 abort 的
 --- aborted 状态覆写回 generating，随后发生在本链内部的拒绝绕过了 runtime 的错误回调。
@@ -45,7 +45,7 @@ tests.suite("abort_tools", function(_, it)
     local orig_recovery = package.loaded["NeoAI.core.agent.recovery"]
     local rounds = 0
     package.loaded["NeoAI.core.agent.recovery"] = {
-      send_stream = function(_, _opts, on_chunk)
+      send_stream = function(_, _, on_chunk)
         rounds = rounds + 1
         if rounds == 1 then
           on_chunk({ tool_calls = {

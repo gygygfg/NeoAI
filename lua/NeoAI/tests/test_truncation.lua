@@ -1,5 +1,5 @@
 --- 输出截断续写测试
---- @module NeoAI.tests.test_truncation
+--- @module 'NeoAI.tests.test_truncation'
 --- 验证：模型输出被截断（finish_reason=length/max_tokens/MAX_TOKENS）且本轮无工具调用时，
 --- 自动附加续写提示重发（提示只进请求 wire、不落库），直到获得正文/工具调用或达到次数
 --- 上限；仍被截断则写入可见提示，避免工具循环静默退出。

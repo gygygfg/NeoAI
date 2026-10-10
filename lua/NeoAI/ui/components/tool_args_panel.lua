@@ -1,5 +1,5 @@
 --- 接收工具参数面板
---- @module NeoAI.ui.components.tool_args_panel
+--- @module 'NeoAI.ui.components.tool_args_panel'
 --- 在独立浮动窗口实时展示模型流式生成的工具调用参数，随分片增量追加（与思考面板一致），
 --- 支持关闭。依托复用组件 float_stream_window；保留 open/show/close/is_open/get_content/reset API。
 ---

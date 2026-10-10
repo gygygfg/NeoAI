@@ -169,7 +169,7 @@ tests.suite("incremental", function(_, it)
     chat_service.reset()
 
     local opened = chat_view.open()
-    local agent = chat_service.get_current_agent()
+    local agent = assert(chat_service.get_current_agent())
     agent.messages = _sample_messages()
 
     -- 逐次增量渲染（模拟事件驱动的多次刷新）
@@ -202,7 +202,7 @@ tests.suite("incremental", function(_, it)
     chat_service.reset()
 
     local opened = chat_view.open()
-    local agent = chat_service.get_current_agent()
+    local agent = assert(chat_service.get_current_agent())
     agent.messages = {
       { role = "user", content = "问题" },
       { role = "assistant", content = "答" },
@@ -212,7 +212,7 @@ tests.suite("incremental", function(_, it)
 
     -- 模拟流式：末尾消息正文变长
     agent.messages[2].content = "答" .. string.rep("内容", 8)
-    local diff = message_list.render(opened.buf, agent.messages, { streaming = true, table_width = 80 })
+    local diff = assert(message_list.render(opened.buf, agent.messages, { streaming = true, table_width = 80 }))
     local after = _lines_of(opened.buf)
 
     t.true_(diff.changed, "流式追加应被识别为变化")
@@ -223,7 +223,7 @@ tests.suite("incremental", function(_, it)
 
     -- 无变化时再渲染：不触碰 buffer
     local tick = vim.api.nvim_buf_get_changedtick(opened.buf)
-    diff = message_list.render(opened.buf, agent.messages, { streaming = true, table_width = 80 })
+    diff = assert(message_list.render(opened.buf, agent.messages, { streaming = true, table_width = 80 }))
     t.false_(diff.changed, "内容未变时不应写入")
     t.eq(tick, vim.api.nvim_buf_get_changedtick(opened.buf), "无变化时应保持 changedtick 不变")
 
@@ -240,7 +240,7 @@ tests.suite("incremental", function(_, it)
     chat_service.reset()
 
     local opened = chat_view.open()
-    local agent = chat_service.get_current_agent()
+    local agent = assert(chat_service.get_current_agent())
     agent.messages = _sample_messages()
     chat_view.refresh()
     t.true_(#_lines_of(opened.buf) > 5, "初次渲染应有内容")
@@ -272,7 +272,7 @@ tests.suite("incremental", function(_, it)
     display_modes.reset()
 
     local opened = chat_view.open()
-    local agent = chat_service.get_current_agent()
+    local agent = assert(chat_service.get_current_agent())
     agent.messages = {
       { role = "system", content = "你是助手" },
       { role = "user", content = "查状态" },
@@ -299,7 +299,7 @@ tests.suite("incremental", function(_, it)
     local before_text = _joined(opened.buf)
     t.true_(before_text:find("⏳", 1, true) ~= nil, "未完成工具应显示 ⏳")
     fold.record_end("c1", 1500, "success")
-    local diff = trajectory.render(opened.buf, agent.messages)
+    local diff = assert(trajectory.render(opened.buf, agent.messages))
     t.true_(diff.changed, "工具状态变化应被识别为变化")
     local after_text = _joined(opened.buf)
     t.true_(after_text ~= before_text, "工具状态更新应改变轨迹文本")
@@ -344,7 +344,7 @@ tests.suite("incremental", function(_, it)
 
     -- 只改尾部消息，走增量；表格所在前缀不动，高亮应保持不变
     msgs[3].content = "收尾（已更新）"
-    local diff = message_list.render(buf, msgs, { table_width = 80 })
+    local diff = assert(message_list.render(buf, msgs, { table_width = 80 }))
     t.true_(diff.changed, "尾部变更应有写入")
     local inc_rows = table.concat(table_hl_rows(), ",")
 
@@ -373,7 +373,7 @@ tests.suite("incremental", function(_, it)
     local incremental_text = _joined(buf)
 
     config_store.set("ui.chat.incremental", false)
-    local diff = message_list.render(buf, msgs, { table_width = 80 })
+    local diff = assert(message_list.render(buf, msgs, { table_width = 80 }))
     t.true_(diff.full, "降级路径应走全量替换")
     t.eq(incremental_text, _joined(buf), "全量降级与增量结果应逐行一致")
 
@@ -392,7 +392,7 @@ tests.suite("incremental", function(_, it)
     chat_service.reset()
 
     local opened = chat_view.open()
-    local agent = chat_service.get_current_agent()
+    local agent = assert(chat_service.get_current_agent())
     agent.messages = {
       { role = "user", content = "问题" },
       { role = "assistant", content = "", tool_calls = {
@@ -411,7 +411,7 @@ tests.suite("incremental", function(_, it)
     message_list.render(opened.buf, agent.messages, { table_width = 80 })
     local before_tick = vim.api.nvim_buf_get_changedtick(opened.buf)
     fold.record_end("c1", 1500, "success")
-    local diff = message_list.render(opened.buf, agent.messages, { table_width = 80 })
+    local diff = assert(message_list.render(opened.buf, agent.messages, { table_width = 80 }))
     t.true_(diff.changed, "工具状态变化后应有写入")
     t.true_(vim.api.nvim_buf_get_changedtick(opened.buf) ~= before_tick, "应实际重写 buffer")
     t.matches("1%.5s", _joined(opened.buf), "折叠文本应显示耗时 1.5s")
@@ -475,7 +475,7 @@ tests.suite("incremental", function(_, it)
 
     -- 就地改写同一结果消息的 content（不换表）：廉价输入须检测长度变化并重建
     res.content = "结果行 1\n结果行 2\n结果行 3"
-    local diff = message_list.render(buf, msgs, {})
+    local diff = assert(message_list.render(buf, msgs, {}))
     t.true_(diff.changed, "结果内容增长应触发写入")
     local inc_text = _joined(buf)
     t.true_(inc_text:find("结果行 1", 1, true) ~= nil, "应渲染出新结果内容")

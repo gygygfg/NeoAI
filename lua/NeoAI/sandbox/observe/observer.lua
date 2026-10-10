@@ -1,5 +1,5 @@
 --- 沙箱行为观测（eBPF / strace / procfs）
---- @module NeoAI.sandbox.observe.observer
+--- @module 'NeoAI.sandbox.observe.observer'
 --- 通过内核层观测沙箱进程的**真实行为**（文件打开、网络连接、进程执行），用于：
 ---   * 「越界访问留痕」——以实际打开的路径判定，而非解析命令字符串；
 ---   * 「⚠ 密钥」告警——以实际访问的密钥文件判定；
@@ -13,7 +13,6 @@
 --- 文件打开/执行（无法可靠观测网络），且为轮询采样、可能漏掉瞬时进程。
 
 local config_store = require("NeoAI.kernel.config_store")
-local logger = require("NeoAI.kernel.logger")
 
 local M = {}
 

@@ -1,5 +1,5 @@
 --- 工具定义辅助函数
---- @module NeoAI.tools.builtin.tool_helpers
+--- @module 'NeoAI.tools.builtin.tool_helpers'
 --- 提供 define_tool 便捷构造器，供各内置工具模块使用。
 
 local M = {}
@@ -55,7 +55,7 @@ function M.define_tool(name, description, params, func, opts)
   params.properties = params.properties or {}
   params.required = params.required or {}
   if params.properties.description == nil then
-    params.properties.description = { type = "string", description = "本次调用目的说明（必填，用于审批与折叠展示）" }
+    params.properties.description = { type = "string", description = "本次调用目的（必填）" }
     local has = false
     for _, r in ipairs(params.required) do
       if r == "description" then has = true break end
@@ -155,7 +155,7 @@ end
 --- 由调用方 `sync_buffer_from_sandbox` 填入暂存内容。
 --- @param filepath string|nil 空/缺省时返回当前 buffer
 --- @return number|nil bufnr
---- @return boolean 本次是否执行了后台加载（供 LSP 等待客户端 attach）
+--- @return boolean|nil 本次是否执行了后台加载（供 LSP 等待客户端 attach）
 function M.ensure_buffer(filepath)
   if not filepath or filepath == "" then
     return vim.api.nvim_get_current_buf()

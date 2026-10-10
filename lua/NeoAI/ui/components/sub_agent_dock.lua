@@ -1,5 +1,5 @@
 --- 子 Agent 监控面板
---- @module NeoAI.ui.components.sub_agent_dock
+--- @module 'NeoAI.ui.components.sub_agent_dock'
 --- 展示子 Agent 的运行状态。
 
 local event_bus = require("NeoAI.kernel.event_bus")

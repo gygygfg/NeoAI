@@ -1,5 +1,5 @@
 --- 沙箱兼容 shim 专项测试：fault / bench 转发到 diag
---- @module NeoAI.tests.test_sandbox_shims
+--- @module 'NeoAI.tests.test_sandbox_shims'
 local tests = require("NeoAI.tests")
 
 tests.suite("sandbox_shims", function(_, it)

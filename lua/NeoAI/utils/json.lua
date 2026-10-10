@@ -1,5 +1,5 @@
 --- JSON 编解码
---- @module NeoAI.utils.json
+--- @module 'NeoAI.utils.json'
 --- 优先使用 vim.json（Neovim 内置），回退到轻量纯 Lua 实现。
 
 local M = {}
@@ -41,6 +41,7 @@ local function _pack_binary(v)
     local nv = _pack_binary(val)
     local nk = k
     if type(k) == "string" and not strx.is_valid_utf8(k) then nk = strx.sanitize_utf8(k) end
+    ---@cast nk -nil
     if nv ~= val or nk ~= k then
       if not out then
         out = {}
@@ -174,10 +175,6 @@ end
 
 -- ========== 解码 ==========
 
-local function _trim(s)
-  return (s:gsub("^%s+", ""):gsub("%s+$", ""))
-end
-
 local function _decode_string(s, i)
   local quote = i
   i = i + 1
@@ -194,6 +191,8 @@ local function _decode_string(s, i)
         i = i + 2
       elseif nxt == "u" then
         local hex = s:sub(i + 2, i + 5)
+        -- 运行时（LuaJIT）无全局 utf8；保留动态探测以便有 utf8 库时使用。
+        ---@diagnostic disable-next-line: undefined-global
         out[#out + 1] = utf8 and utf8.char(tonumber(hex, 16)) or ("u" .. hex)
         i = i + 6
       else

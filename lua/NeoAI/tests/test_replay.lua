@@ -1,5 +1,5 @@
 --- 沙箱策略回放（replay）专项测试
---- @module NeoAI.tests.test_replay
+--- @module 'NeoAI.tests.test_replay'
 local tests = require("NeoAI.tests")
 
 tests.suite("replay", function(_, it, before_each)

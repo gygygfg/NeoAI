@@ -1,5 +1,5 @@
 --- 沙箱任务授权（task grant）
---- @module NeoAI.sandbox.review.grant
+--- @module 'NeoAI.sandbox.review.grant'
 --- 窄范围任务授权：资源范围（路径）、操作类型、累计预算、有效期与撤销。
 --- Agent 只能请求匹配，实际匹配与消费由控制面执行（设计文档 §5.2/§15.1）。
 --- 有覆盖授权时，候选可自动应用（等价 TASK_POLICY_MATCH）；否则进入用户异步审批。

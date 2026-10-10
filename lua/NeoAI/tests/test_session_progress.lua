@@ -1,5 +1,5 @@
 --- 会话进度增量持久化测试
---- @module NeoAI.tests.test_session_progress
+--- @module 'NeoAI.tests.test_session_progress'
 --- 覆盖：长回合/工具循环中途的实时进度会被增量落盘，而不是等整个 agent 循环结束才保存。
 --- - 用户消息发送后立即持久化（生成尚未结束也不丢）；
 --- - 工具循环每轮工具结果落库后触发轮末持久化钩子；
@@ -41,11 +41,12 @@ tests.suite("session_progress", function(_, it)
     -- stub 网络：请求一直挂起，模拟生成尚未结束
     local http = require("NeoAI.utils.http")
     local original = http.request
+    ---@diagnostic disable-next-line: duplicate-set-field
     http.request = function() return async.Deferred.new() end
 
-    local agent = chat.new_session({})
+    chat.new_session({})
     chat.send_message("进行中的用户消息")
-    local session_id = chat.get_current_session_id()
+    local session_id = assert(chat.get_current_session_id())
     t.not_nil(session_store.get(session_id), "会话应已持久化")
     -- 发送路径经 _distill_if_needed 的异步微任务后才写入并落盘用户消息，等待该微任务。
     local found = false
@@ -73,6 +74,7 @@ tests.suite("session_progress", function(_, it)
     local agent = agent_mod.create({ config = {}, model = "m1" })
     local tool_service = { execute = function() return async.resolve("ok") end }
     local original = recovery.send_stream
+    ---@diagnostic disable-next-line: duplicate-set-field
     recovery.send_stream = function() return async.resolve({ finish_reason = "stop" }) end
     local persisted = 0
     tool_loop.set_round_persist(function() persisted = persisted + 1 end)
@@ -83,6 +85,7 @@ tests.suite("session_progress", function(_, it)
     t.true_(vim.wait(3000, function() return done end), "工具循环应结束")
     t.eq(1, persisted, "每轮工具结果落库后应触发一次轮末持久化")
     recovery.send_stream = original
+    ---@diagnostic disable-next-line: param-type-mismatch
     tool_loop.set_round_persist(nil)
   end)
 
@@ -108,7 +111,7 @@ tests.suite("session_progress", function(_, it)
       secret_paths = { "/root/.ssh/id_rsa" },
     })
     chat.persist_active_sessions()
-    local sid = chat.get_current_session_id()
+    local sid = assert(chat.get_current_session_id())
     -- 模拟关闭会话再打开：清空运行时后重新载入
     chat.reset()
     local loaded = chat.load_session(sid)

@@ -1,5 +1,5 @@
 --- 状态栏服务测试
---- @module NeoAI.tests.test_status
+--- @module 'NeoAI.tests.test_status'
 
 local tests = require("NeoAI.tests")
 
@@ -224,7 +224,7 @@ tests.suite("status", function(_, it)
     agent.model = "deepseek-v4-flash"
     agent.messages = {}
     agent.usage = { prompt = 100, completion = 10, last_prompt = 120000, last_completion = 20 }
-    local cap = status.capacity_for(agent)
+    local cap = assert(status.capacity_for(agent))
     t.eq(120000, cap.used)
     t.eq("api", cap.source)
     t.eq("warn", cap.level, "120000/131072 ≈ 0.92 应为 warn")
@@ -244,6 +244,7 @@ tests.suite("status", function(_, it)
     agent.usage = { last_prompt = 120000, last_completion = 1 }
     local calls = {}
     local orig = vim.notify
+    ---@diagnostic disable-next-line: duplicate-set-field
     vim.notify = function(msg, lvl) calls[#calls + 1] = { msg = msg, lvl = lvl } end
     local ok, err = pcall(function()
       t.eq("warn", status.check_pressure(agent))

@@ -1,5 +1,5 @@
 --- NeoAI 并行测试运行器
---- @module NeoAI.tests.parallel
+--- @module 'NeoAI.tests.parallel'
 --- 把全部测试套件按均衡策略分片到多个隔离 headless 子进程并发执行，聚合 passed/failed/errors。
 ---
 --- 为什么按「文件（套件）」分片：各测试文件固定监听端口互不重复、文件内固定临时路径仅自用，

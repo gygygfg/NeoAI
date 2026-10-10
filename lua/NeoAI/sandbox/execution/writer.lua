@@ -1,5 +1,5 @@
 --- 沙箱落盘写入器（降权优先 + 按需提权）
---- @module NeoAI.sandbox.execution.writer
+--- @module 'NeoAI.sandbox.execution.writer'
 --- 发布（CAS）阶段的真实写入统一经此：**先以非 root 载荷身份尝试**，失败（EACCES/EPERM/
 --- EROFS）则标记 `NEEDS_ROOT`，由上层进入异步待审；用户批准后才以 root（或 `sudo`，继承 tty）
 --- 写入。写入全暂存在沙箱内完成，本模块只负责「暂存 → 真实盘」的最后一步。
@@ -45,12 +45,16 @@ local function _root_op(action, path, content, mode)
     fs.ensure_dir(vim.fn.fnamemodify(path, ":h"))
     return fs.write_file_atomic(path, content or "", { mode = mode })
   elseif action == "delete" then
+    -- 幂等：目标已不存在视为成功（发布删除了已被外部删除的文件不应失败）。
+    if vim.uv.fs_lstat(path) == nil then return true end
     return fs.delete_file(path)
   elseif action == "mkdir" then
     fs.ensure_dir(path)
     if mode then fs.chmod(path, mode) end
     return true
   elseif action == "rmdir" then
+    -- 幂等：目标不存在即已达成「移除」意图，视为成功。
+    if vim.uv.fs_lstat(path) == nil then return true end
     local r = vim.fn.delete(path, "d")
     return r == 0, r ~= 0 and ("rmdir 失败: " .. path) or nil
   elseif action == "symlink" then
@@ -89,7 +93,8 @@ local function _nonroot_snippet(action, binary)
   elseif action == "mkdir" then
     return 'mkdir -p -- "$1" && { [ -n "$2" ] && chmod "$2" "$1" || true; }'
   elseif action == "rmdir" then
-    return 'rmdir -- "$1"'
+    -- 幂等：删除成功，或删除后目标已不存在，均视为成功；权限错误仍以非 0 退出（→ NEEDS_ROOT）。
+    return 'rmdir -- "$1" 2>/dev/null || [ ! -e "$1" ]'
   elseif action == "symlink" then
     return 'mkdir -p -- "$(dirname -- "$1")" && ln -sfn -- "$2" "$1"'
   end

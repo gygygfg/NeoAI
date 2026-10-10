@@ -1,5 +1,5 @@
 --- 插件热重载实现（供 `:NeoAIReloadAll` 命令使用的底层实现，不暴露为 AI 工具）
---- @module NeoAI.plugins.reload
+--- @module 'NeoAI.plugins.reload'
 --- 热重载整个 NeoAI 插件。安全策略：
 --- 1. 隔离子进程预检：用一个全新的 headless nvim（--clean -u NONE + rtp=插件根）
 ---    加载插件并做冒烟校验。任何报错都只在子进程里发生，绝不影响当前会话。
@@ -36,7 +36,7 @@ local function _trim(s, max)
   s = tostring(s or "")
   max = max or 4000
   if #s > max then
-    return stringx.safe_truncate(s, max, "\n…（输出已截断）")
+    return stringx.safe_truncate(s, max, "\n…（输出已截断）") or s
   end
   return s
 end

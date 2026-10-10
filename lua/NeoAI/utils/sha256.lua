@@ -1,5 +1,5 @@
 --- 纯 Lua SHA-256（LuaJIT bit 库）
---- @module NeoAI.utils.sha256
+--- @module 'NeoAI.utils.sha256'
 --- 主线程与 `utils.work` 工作线程共用的实现：
 --- - `M.hex(s)` 直接在主线程计算；
 --- - `M.source` 是同一实现的 Lua 源码字符串，可经 `work.run(fn, ..., M.source)` 传入

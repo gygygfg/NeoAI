@@ -1,5 +1,5 @@
 --- 沙箱长驻服务工具（tools.builtin.service）专项测试
---- @module NeoAI.tests.test_service_tool
+--- @module 'NeoAI.tests.test_service_tool'
 --- 通过注入假的 sandbox.service 验证工具层的校验/格式化/回调，不启动真实进程。
 local tests = require("NeoAI.tests")
 

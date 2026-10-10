@@ -1,5 +1,5 @@
 --- 沙箱 overlay 视图同步专项测试
---- @module NeoAI.tests.test_sandbox_overlay_invalidate
+--- @module 'NeoAI.tests.test_sandbox_overlay_invalidate'
 --- 覆盖：发布/拒绝后失效 overlay 物化条目，后续命令不再读到旧物化内容（视图分裂修复）；
 --- 权限位变化触发重新物化（执行位不丢失）。
 
@@ -53,7 +53,7 @@ tests.suite("sandbox_overlay_invalidate", function(_, it)
       run("printf OLD > " .. f)
       t.not_nil(resident.active(), "应存在常驻实例")
       -- 真实盘改为 NEW（lower 更新，upper 仍为 OLD）
-      local fh = io.open(f, "w"); fh:write("NEW"); fh:close()
+      local fh = assert(io.open(f, "w")); fh:write("NEW"); fh:close()
       -- 未失效时命令仍读到 OLD（overlay upper 遮蔽 lower）
       local stale = tostring(run("cat " .. f))
       t.matches("OLD", stale, "失效前应读到旧物化内容（复现视图分裂）")

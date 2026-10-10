@@ -1,5 +1,5 @@
 --- 显示模式插件：对话（默认）
---- @module NeoAI.ui.components.display_modes.chat
+--- @module 'NeoAI.ui.components.display_modes.chat'
 --- 默认聊天显示：按角色消息渲染，推理 / 每个工具块（调用+结果）各自独立折叠。
 --- 由 display_modes 管理器懒加载，本模块顶层向管理器自注册。
 

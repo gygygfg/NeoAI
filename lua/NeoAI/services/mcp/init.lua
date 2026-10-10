@@ -1,5 +1,5 @@
 --- MCP 管理器
---- @module NeoAI.services.mcp
+--- @module 'NeoAI.services.mcp'
 --- 连接配置的 MCP 服务器（stdio / streamable http），把 tools/resources/prompts
 --- 桥接进 NeoAI 工具系统；负责预缓存、动态刷新、失败驱动（stale）刷新、生命周期。
 ---
@@ -107,7 +107,7 @@ local function _browse_tools(server)
       name = _name(server, "list_resources"),
       description = ("列出 MCP 服务器 '%s' 的可用资源（只读）。"):format(server),
       parameters = { type = "object", properties = {}, required = {} },
-      func = function(args, on_success, on_error)
+      func = function(_, on_success, on_error)
         M.list_resources(server):then_(on_success, function(e) on_error(e and e.message or tostring(e)) end)
       end,
       category = "mcp", source = "mcp", mcp_server = server, mcp_plan_safe = cfg and cfg.cfg.plan_safe == true,
@@ -133,7 +133,7 @@ local function _browse_tools(server)
       name = _name(server, "list_prompts"),
       description = ("列出 MCP 服务器 '%s' 的可用提示模板（只读）。"):format(server),
       parameters = { type = "object", properties = {}, required = {} },
-      func = function(args, on_success, on_error)
+      func = function(_, on_success, on_error)
         M.list_prompts(server):then_(on_success, function(e) on_error(e and e.message or tostring(e)) end)
       end,
       category = "mcp", source = "mcp", mcp_server = server, mcp_plan_safe = cfg and cfg.cfg.plan_safe == true,
@@ -203,7 +203,7 @@ local function _register_server_tools(server)
 end
 
 --- 错误是否指示「参数/schema 不匹配」（触发 stale 刷新）
---- @param result table tools/call 结果 |nil
+--- @param result table|nil tools/call 结果
 --- @return boolean
 local function _is_schema_error(result)
   if not result then return false end
@@ -220,7 +220,7 @@ local function _is_schema_error(result)
     local patterns = {
       "unknown ", "invalid", "illegal", "not found",
       "unexpected argument", "extra", "unrecognized", "missing required",
-      "does not exist", undefined,
+      "does not exist", nil,
     }
     for _, p in ipairs(patterns) do
       if text:find(p, 1, true) then return true end
@@ -230,7 +230,7 @@ local function _is_schema_error(result)
 end
 
 --- 展平 tools/call 返回 content 为字符串
---- @param result table tools/call result
+--- @param result table|nil tools/call result
 --- @return string
 local function _flatten_content(result)
   local parts = {}
@@ -580,7 +580,7 @@ function M.read_resource(server, uri)
         text = tostring(c)
       end
       if total + #text > max then
-        text = stringx.safe_truncate(text, max - total, "…")
+        text = stringx.safe_truncate(text, max - total, "…") or text
       end
       total = total + #text
       parts[#parts + 1] = ((c and c.uri) or uri) .. ":\n" .. text
@@ -643,7 +643,7 @@ end
 --- @return table 数组
 function M.list_tool_names()
   local out = {}
-  for server, cfg in pairs(state.servers) do
+  for _, cfg in pairs(state.servers) do
     for _, n in ipairs(cfg.toolnames or {}) do
       out[#out + 1] = n
     end

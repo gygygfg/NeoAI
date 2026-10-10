@@ -1,5 +1,5 @@
 --- AI 专用沙箱 LSP 客户端
---- @module NeoAI.sandbox.execution.lsp
+--- @module 'NeoAI.sandbox.execution.lsp'
 --- 为 AI 的 `lsp_*` 工具提供**独立的**沙箱化 LSP 客户端：把 server 启动命令放进
 --- bwrap 挂载命名空间，并在工作区根上挂 overlayfs（lower=真实工作区只读，
 --- upper=沙箱私有可写层）。效果：该 server 读取磁盘时看到 AI 尚未发布的暂存内容

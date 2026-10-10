@@ -1,5 +1,5 @@
 --- 模型能力表测试
---- @module NeoAI.tests.test_model_capabilities
+--- @module 'NeoAI.tests.test_model_capabilities'
 
 local tests = require("NeoAI.tests")
 

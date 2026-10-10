@@ -1,5 +1,5 @@
 --- 向用户提问工具
---- @module NeoAI.tools.builtin.ask_user
+--- @module 'NeoAI.tools.builtin.ask_user'
 --- AI 在生成过程中暂停并向用户提问，等待用户回答后把答案作为工具结果回传。
 --- 计划模式下该工具是少数被允许的工具之一（用于澄清需求）。
 --- UI 经 M.set_ui 注入（ui/components/ask_user 在 UI 初始化时注册）；
@@ -118,7 +118,7 @@ local ask_user_tools = {}
 
 ask_user_tools.ask_user = helpers.define_tool(
   "ask_user",
-  "向用户提问并等待回答。question 必填；可提供 options（选项数组）让用户快速选择。在需要澄清需求、确认意图或缺少关键信息时使用。",
+  "向用户提问并等待回答（澄清需求/确认意图/缺关键信息时）。question 必填；options 可选（供快速选择）。",
   {
     type = "object",
     properties = {

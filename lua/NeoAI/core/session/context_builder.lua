@@ -1,5 +1,5 @@
 --- 上下文构建
---- @module NeoAI.core.session.context_builder
+--- @module 'NeoAI.core.session.context_builder'
 --- 从会话构建发送给模型的消息上下文。
 --- 替代旧 get_context_and_new_parent 复杂路径算法。
 
@@ -223,7 +223,9 @@ end
 --- 将内部消息转换为 API 消息（与请求发送完全一致，压缩回放保证字节一致）
 --- @param message table
 --- @return table
-M.to_api_message = _to_api_message
+function M.to_api_message(message)
+  return _to_api_message(message)
+end
 
 --- 构建压缩回放前缀：系统消息 + 指定区间消息（供压缩辅助调用复用前缀缓存）
 --- @param agent table Agent

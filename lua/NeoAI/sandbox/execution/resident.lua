@@ -1,5 +1,5 @@
 --- 会话级常驻沙箱实例（命令服务器）
---- @module NeoAI.sandbox.execution.resident
+--- @module 'NeoAI.sandbox.execution.resident'
 --- 同一沙箱会话内，`run_command` 的进程命令不再各起一个 bwrap（命令结束即销毁 pid 命名空间、
 --- cgroup.kill 回收整个进程树），而是共享一个**常驻 bwrap 实例**：它在一个持久的
 --- mount+pid+net+ipc+uts+cgroup 命名空间内运行一个命令服务器（bash 从 stdin 读取请求），
@@ -415,7 +415,7 @@ end
 
 --- 停止实例的进程与资源，但**保留 `state.instance`**（`alive=false` + `ensure_opts`），
 --- 使下一次 `exec` 能据 `ensure_opts` 自动重建（与服务器意外退出同一恢复路径）。
---- @param inst table
+--- @param inst table|nil
 --- @param timeout_ms number|nil jobwait 等待上限（默认 2000）
 local function _kill_instance(inst, timeout_ms)
   if not inst then return end

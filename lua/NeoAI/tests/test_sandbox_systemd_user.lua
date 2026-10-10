@@ -1,5 +1,5 @@
 --- 伪造 systemd 用户解析器专项测试
---- @module NeoAI.tests.test_sandbox_systemd_user
+--- @module 'NeoAI.tests.test_sandbox_systemd_user'
 --- 覆盖：`systemctl --user` 由门面内的伪造解析器处理（无需真实 systemd/dbus）；
 --- 简单 start/stop/is-active 在沙箱内生效；单元文件不落宿主机。
 
@@ -87,14 +87,14 @@ tests.suite("sandbox_systemd_user", function(_, it)
 
   it("systemctl --user 由伪造解析器处理（route=facade, scope=user）", function(t)
     local systemd = require("NeoAI.sandbox.systemd.systemd")
-    local plan = systemd.parse_command("systemctl --user status foo")
+    local plan = assert(systemd.parse_command("systemctl --user status foo"))
     t.not_nil(plan, "应解析")
     t.eq("facade", plan.route, "--user 应走伪造门面")
     t.eq("user", plan.scope, "--user 应标记 user scope")
-    local plan2 = systemd.parse_command("systemctl --user start foo.service")
+    local plan2 = assert(systemd.parse_command("systemctl --user start foo.service"))
     t.eq("facade", plan2.route)
     t.eq("user", plan2.scope)
-    local plan3 = systemd.parse_command("systemctl start foo.service")
+    local plan3 = assert(systemd.parse_command("systemctl start foo.service"))
     t.eq("facade", plan3.route)
     t.eq("system", plan3.scope, "系统级应为 system scope")
   end)

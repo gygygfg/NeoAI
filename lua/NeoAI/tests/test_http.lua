@@ -1,5 +1,5 @@
 --- HTTP SSE 解析测试
---- @module NeoAI.tests.test_http
+--- @module 'NeoAI.tests.test_http'
 --- 回归：SSE data 行跨多次 on_stdout 回调拆分时不得丢失事件。
 --- （nvim job on_stdout 元素之间表示换行；首尾可能为跨回调的行片段。
 ---  旧实现把无换行的片段当完整行消费 → 工具调用/内容增量丢失 →
@@ -59,6 +59,7 @@ tests.suite("http", function(_, it)
     local original = vim.fn.jobstart
     local job, header_path, starts = nil, nil, 0
     local ok, err = xpcall(function()
+      ---@diagnostic disable-next-line: duplicate-set-field
       vim.fn.jobstart = function(argv, opts)
         starts = starts + 1
         for i, arg in ipairs(argv) do
@@ -135,7 +136,8 @@ tests.suite("http", function(_, it)
       server.respond(client, "data: first\n\ndata: second\n\n")
     end, function(base)
       local signal = require("NeoAI.utils.async").create_signal()
-      local count, failure = 0, nil
+      local count = 0
+      local failure
       t.await(require("NeoAI.utils.http").request({ base_url = base, stream = true }, {
         signal = signal,
         on_chunk = function() count = count + 1; signal:abort("stop") end,

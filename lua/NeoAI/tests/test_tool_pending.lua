@@ -1,5 +1,5 @@
 --- 工具循环期间用户消息的轮末注入测试（端到端）
---- @module NeoAI.tests.test_tool_pending
+--- @module 'NeoAI.tests.test_tool_pending'
 --- 验证：agent 忙碌期间发送的用户消息被暂存后，在工具循环中途（本轮工具结果记录完、
 --- 下次模型调用之前）被注入对话，供下一轮模型感知；循环结束后不再另开一轮。
 --- 通过桩掉 recovery.send_stream 与 tool_service.execute 控制多轮循环。
@@ -34,7 +34,7 @@ tests.suite("tool_pending", function(_, it)
     local call = 0
     local original_recovery = package.loaded["NeoAI.core.agent.recovery"]
     package.loaded["NeoAI.core.agent.recovery"] = {
-      send_stream = function(ag, _opts, on_chunk)
+      send_stream = function(ag, _, on_chunk)
         call = call + 1
         local roles = {}
         for _, m in ipairs(ag.messages) do

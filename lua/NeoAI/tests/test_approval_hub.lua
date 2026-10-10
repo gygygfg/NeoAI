@@ -1,5 +1,5 @@
 --- 审批分流中心（approval_hub）测试
---- @module NeoAI.tests.test_approval_hub
+--- @module 'NeoAI.tests.test_approval_hub'
 --- 覆盖：阻塞类条目提交/列举/决策/清理；页面计数；观测类 provider；UI 刷新回调与 open_page；
 --- 决策幂等；未知页面拒绝。
 

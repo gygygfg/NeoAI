@@ -1,5 +1,5 @@
 --- 沙箱网络网关测试
---- @module NeoAI.tests.test_gateway
+--- @module 'NeoAI.tests.test_gateway'
 --- 覆盖：代理请求解析、宿主本机地址判定、端口探针 + 服务拦截原因（HTTP 代理响应）。
 --- 不依赖真实外部网络；使用本地 127.0.0.1 监听/关闭端口验证。
 
@@ -99,7 +99,7 @@ tests.suite("gateway", function(_, it)
     local gw = require("NeoAI.sandbox.net.gateway")
     gw.reset()
     local open_port, close_srv = listen_local()
-    local addr = gw.start("127.0.0.1", 0)
+    local addr = assert(gw.start("127.0.0.1", 0))
     t.not_nil(addr, "网关应能启动")
     local resp = proxy_request(addr.host, addr.port,
       ("CONNECT 127.0.0.1:%d HTTP/1.1\r\nHost: 127.0.0.1:%d\r\n\r\n"):format(open_port, open_port))
@@ -113,7 +113,7 @@ tests.suite("gateway", function(_, it)
   it("关闭端口：探针判定关闭", function(t)
     local gw = require("NeoAI.sandbox.net.gateway")
     gw.reset()
-    local addr = gw.start("127.0.0.1", 0)
+    local addr = assert(gw.start("127.0.0.1", 0))
     t.not_nil(addr, "网关应能启动")
     local resp = proxy_request(addr.host, addr.port,
       "CONNECT 127.0.0.1:1 HTTP/1.1\r\nHost: 127.0.0.1:1\r\n\r\n")
@@ -125,7 +125,7 @@ tests.suite("gateway", function(_, it)
   it("外部地址被拒绝并返回原因", function(t)
     local gw = require("NeoAI.sandbox.net.gateway")
     gw.reset()
-    local addr = gw.start("127.0.0.1", 0)
+    local addr = assert(gw.start("127.0.0.1", 0))
     local resp = proxy_request(addr.host, addr.port,
       "CONNECT 8.8.8.8:53 HTTP/1.1\r\nHost: 8.8.8.8:53\r\n\r\n")
     t.matches("403", resp, "外部地址应 403")
@@ -137,7 +137,7 @@ tests.suite("gateway", function(_, it)
     local gw = require("NeoAI.sandbox.net.gateway")
     gw.reset()
     local open_port, close_srv = listen_local()
-    local addr = gw.start("127.0.0.1", 0)
+    local addr = assert(gw.start("127.0.0.1", 0))
     proxy_request(addr.host, addr.port, ("CONNECT 127.0.0.1:%d HTTP/1.1\r\n\r\n"):format(open_port))
     close_srv()
     local s = gw.summary()
@@ -184,7 +184,7 @@ tests.suite("gateway", function(_, it)
 
     local echo_port, close_srv = echo_server()
     -- 把 127.0.0.1 视为外部（覆盖判定），验证转发路径
-    local addr = hp.start("127.0.0.1", 0, { host_local_fn = function() return false end, access = "allow" })
+    local addr = assert(hp.start("127.0.0.1", 0, { host_local_fn = function() return false end, access = "allow" }))
     t.not_nil(addr, "代理应能启动")
     local cli = vim.uv.new_tcp()
     local got, done, phase = {}, false, "header"
@@ -212,7 +212,7 @@ tests.suite("gateway", function(_, it)
     hp.stop()
 
     -- 默认判定：本机目标被拦截
-    local addr2 = hp.start("127.0.0.1", 0)
+    local addr2 = assert(hp.start("127.0.0.1", 0))
     local resp = tcp_exchange(addr2.host, addr2.port,
       ("CONNECT 127.0.0.1:%d HTTP/1.1\r\n\r\n"):format(echo_port))
     t.matches("403", resp, "本机目标应 403")
@@ -226,13 +226,13 @@ tests.suite("gateway", function(_, it)
     hp.reset()
     local echo_port, close_srv = echo_server()
     -- 白名单放行回环上的 echo_port
-    local addr = hp.start("127.0.0.1", 0, { allow_localhost_ports = { echo_port } })
+    local addr = assert(hp.start("127.0.0.1", 0, { allow_localhost_ports = { echo_port } }))
     local ok_resp = tcp_exchange(addr.host, addr.port,
       ("CONNECT 127.0.0.1:%d HTTP/1.1\r\n\r\n"):format(echo_port))
     t.matches("200 Connection Established", ok_resp, "白名单端口应放行")
     hp.stop()
     -- 白名单之外的端口仍拦截
-    local other = hp.start("127.0.0.1", 0, { allow_localhost_ports = { echo_port } })
+    local other = assert(hp.start("127.0.0.1", 0, { allow_localhost_ports = { echo_port } }))
     local blocked = tcp_exchange(other.host, other.port,
       ("CONNECT 127.0.0.1:%d HTTP/1.1\r\n\r\n"):format(echo_port + 1))
     t.matches("403", blocked, "非白名单端口仍应拦截")
@@ -258,7 +258,7 @@ tests.suite("gateway", function(_, it)
     local hp = require("NeoAI.sandbox.net.host_proxy")
     hp.reset()
     local echo_port, close_srv = echo_server()
-    local addr = hp.start("127.0.0.1", 0, { host_local_fn = function() return false end, access = "allow" })
+    local addr = assert(hp.start("127.0.0.1", 0, { host_local_fn = function() return false end, access = "allow" }))
     -- 目标 127.0.0.1（判定覆盖为外部）
     local ip = { 127, 0, 0, 1 }
     local req = string.char(5, 1, 0) -- greeting
@@ -272,7 +272,7 @@ tests.suite("gateway", function(_, it)
     hp.stop()
 
     -- 默认判定：本机目标返回 0x02（ruleset 拒绝）
-    local addr2 = hp.start("127.0.0.1", 0)
+    local addr2 = assert(hp.start("127.0.0.1", 0))
     local resp2 = tcp_exchange(addr2.host, addr2.port, req, 1500)
     t.true_(#resp2 >= 12, "应收到 SOCKS5 应答")
     t.eq(2, resp2:byte(4), "本机目标应返回 0x02")
@@ -291,7 +291,7 @@ tests.suite("gateway", function(_, it)
       t.matches("socks5h://", tostring(env.ALL_PROXY), "应注入 SOCKS5 ALL_PROXY")
       t.eq("", env.NO_PROXY, "NO_PROXY 应为空使本机也走代理")
       -- 代理变量不被清除（走注入的宿主代理），但 SSH agent 变量始终清除。
-      local snip = runtime.proxy_unset_snippet()
+      local snip = assert(runtime.proxy_unset_snippet())
       t.not_nil(snip, "应始终生成 SSH agent 变量清除片段")
       t.matches("SSH_AUTH_SOCK", snip, "应清除 SSH_AUTH_SOCK")
       t.true_(snip:find("HTTP_PROXY", 1, true) == nil, "启用拦截时不应清除代理变量")

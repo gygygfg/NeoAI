@@ -1,5 +1,5 @@
 --- 插件系统测试
---- @module NeoAI.tests.test_plugins
+--- @module 'NeoAI.tests.test_plugins'
 --- 覆盖：依赖等待、替换、禁用、失败回滚、实际消息请求、重复启动、工具重载与热重载。
 --- 使用唯一 id/服务名，测试后清理，避免污染已启动的内置插件。
 
@@ -145,6 +145,7 @@ tests.suite("plugins", function(_, it)
       plugins = { entries = { ["services.model_service"] = { module = "my_model_provider" } } },
     }, function()
       local catalog = require("NeoAI.plugins.catalog")
+      ---@type any
       local target = nil
       for _, spec in ipairs(catalog.build_specs()) do
         if spec.id == "services.model_service" then target = spec end

@@ -1,5 +1,5 @@
 --- 工具注册表
---- @module NeoAI.tools.registry
+--- @module 'NeoAI.tools.registry'
 --- 集中管理工具定义。注册、查询、审批配置。
 
 local M = {}
@@ -97,7 +97,7 @@ end
 --- @return table 数组
 function M.list(category)
   local out = {}
-  for name, tool in pairs(state.tools) do
+  for _, tool in pairs(state.tools) do
     if not category or tool.category == category then
       out[#out + 1] = tool
     end
@@ -140,16 +140,19 @@ end
 --- @return string|nil 规范化工具名
 function M.resolve_name(raw_name)
   if state.tools[raw_name] then return raw_name end
-  -- 别名映射
+  -- 别名映射（含 opencode 风格工具名）
   local aliases = {
     read = "read_file", cat = "read_file",
     write = "edit_file", edit = "edit_file",
-    list = "list_files", ls = "list_files",
+    list = "list_files", ls = "list_files", glob = "list_files",
     search = "search_files", grep = "search_files",
     delete = "delete_file", rm = "delete_file",
     mkdir = "create_directory", cd = "run_command",
-    cmd = "run_command", shell = "run_command",
+    cmd = "run_command", shell = "run_command", bash = "run_command",
     git = "run_command",
+    webfetch = "web_fetch", fetch = "web_fetch",
+    task = "create_sub_agent", agent = "create_sub_agent",
+    todowrite = "todo_write", todoread = "todo_read",
   }
   local alias = aliases[raw_name]
   if alias and state.tools[alias] then return alias end

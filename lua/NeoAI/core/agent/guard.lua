@@ -1,5 +1,5 @@
 --- 工具循环护栏
---- @module NeoAI.core.agent.guard
+--- @module 'NeoAI.core.agent.guard'
 --- 对齐 deepseek-harness guard/repeat-tool-reminder：检测 Agent 连续重复的
 --- 工具调用（相同工具 + 相同参数），达到阈值时注入提醒 user 消息。
 --- observe-and-enrich：只提醒不否决，用户新输入会重置计数链。

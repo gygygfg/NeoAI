@@ -88,7 +88,7 @@ tests.suite("chat_keys", function(_, it)
     local applied = false
     local mock_cmp = {
       setup = {
-        filetype = function(ft, cfg)
+        filetype = function(ft, _)
           vim.api.nvim_create_autocmd("FileType", {
             pattern = ft,
             callback = function()
@@ -161,7 +161,7 @@ tests.suite("chat_keys", function(_, it)
     local send_normal_entry = buf_map("n", "<CR>")
     t.not_nil(send_normal_entry, "普通模式应注册回车发送")
     vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "hello normal" })
-    send_normal_entry.callback()
+    assert(send_normal_entry).callback()
     t.eq("hello normal", submitted, "普通模式回车应发送")
 
     -- 插入模式回车 = 换行（不发送）
@@ -175,7 +175,7 @@ tests.suite("chat_keys", function(_, it)
     t.not_nil(insert_cr_entry, "插入模式应注册回车换行映射")
     -- 在行中间（第 2 个字符后）插入换行，确定性地拆成两行且不丢失内容
     vim.api.nvim_win_set_cursor(win, { 1, 2 })
-    insert_cr_entry.callback()
+    assert(insert_cr_entry).callback()
     local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
     t.eq(2, #lines, "插入回车应拆成两行")
     t.eq("li", lines[1], "第一行为换行点之前的文本")
@@ -198,14 +198,14 @@ tests.suite("chat_keys", function(_, it)
     -- 故用有效字节位 6（"第三" 之后）验证按字节切分不丢字、不复制。
     vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "第三行中文测试" })
     vim.api.nvim_win_set_cursor(win, { 1, 6 })
-    local insert_cr = nil
+    local insert_cr
     for _, m in ipairs(vim.api.nvim_buf_get_keymap(buf, "i")) do
       if m.lhs == "<CR>" then
         insert_cr = m
       end
     end
     t.not_nil(insert_cr, "插入模式应注册回车换行映射")
-    insert_cr.callback()
+    assert(insert_cr).callback()
     local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
     t.eq(2, #lines, "回车应拆成两行")
     t.eq("第三", lines[1], "第一行为光标前的字节内容")
@@ -312,7 +312,7 @@ tests.suite("chat_keys", function(_, it)
 
     local job = vim.fn.jobstart({ "python3", "-c", MOCK_SERVER }, { stdout_buffered = true })
     -- 等待服务器就绪（用 curl 探测）
-    local ready = vim.wait(5000, function()
+    vim.wait(5000, function()
       local code =
         vim.fn.system("curl -sS --max-time 1 -o /dev/null -w '%{http_code}' http://127.0.0.1:8980/ 2>/dev/null")
       return code ~= "" and code ~= "000"
@@ -325,7 +325,7 @@ tests.suite("chat_keys", function(_, it)
       local agent = chat_service.get_current_agent()
       return agent and #agent.messages >= 2
     end)
-    local agent = chat_service.get_current_agent()
+    local agent = assert(chat_service.get_current_agent())
     t.true_(got, "超时未收到回复，消息数=" .. tostring(agent and #agent.messages or 0))
     t.eq("hello there", agent.messages[1].content)
     t.eq("hello from mock", agent.messages[#agent.messages].content)

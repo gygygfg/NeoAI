@@ -1,5 +1,5 @@
 --- 协议族 + 厂商/模型方言层
---- @module NeoAI.core.model.profiles
+--- @module 'NeoAI.core.model.profiles'
 --- 内部规范固定为「OpenAI 形消息 + 统一响应」；本模块把各协议族内的厂商/模型方言
 --- （参数名、推理参数形态、推理回传策略、鉴权头、usage 字段、溢出错误措辞）解析成一张
 --- dialect 表，供 core.model.adapter（协议编解码）与 core.agent.request（发送）消费。

@@ -1,5 +1,5 @@
 --- Herder 侧集成配置安装器
---- @module NeoAI.services.herder_install
+--- @module 'NeoAI.services.herder_install'
 ---
 --- 背景（已实测）：
 --- - Herdr 的 agent 身份是编译期固定集合，本地检测清单（`~/.config/herdr/agent-detection/<id>.toml`）

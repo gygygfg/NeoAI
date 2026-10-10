@@ -1,5 +1,5 @@
 --- LSP 命名空间覆盖测试
---- @module NeoAI.tests.test_sandbox_lsp
+--- @module 'NeoAI.tests.test_sandbox_lsp'
 --- 覆盖：opt-in 开关、bwrap+overlay 命令包装、暂存物化、install/卸载恢复。
 
 local tests = require("NeoAI.tests")
@@ -234,7 +234,7 @@ tests.suite("sandbox_lsp", function(_, it)
     fs.write_file(real, "local x = 1\n")
     with_config({ tools = { approval = { mode = "async" }, sandbox = { mode = "dry_run", review = { enabled = true } } } }, function()
       sandbox.reset()
-      local bufnr = helpers.ensure_buffer(real)
+      local bufnr = assert(helpers.ensure_buffer(real))
       t.not_nil(bufnr, "应能后台加载 buffer")
       local done = false
       require("NeoAI.tools").execute("edit_file", {

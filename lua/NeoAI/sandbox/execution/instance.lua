@@ -1,5 +1,5 @@
 --- 沙箱进程实例身份
---- @module NeoAI.sandbox.execution.instance
+--- @module 'NeoAI.sandbox.execution.instance'
 --- 为并发的多个 nvim 实例提供彼此隔离的沙箱存储根：每个 nvim 进程使用
 --- `<workspace_root>/instances/<pid>_<started_at>` 作为自己的 store 根，
 --- 待审队列、候选、回执、证据均不再跨进程共享（设计文档「环境隔离」原则）。

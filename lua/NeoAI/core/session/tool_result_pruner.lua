@@ -1,5 +1,5 @@
 --- 工具结果裁剪（模型无关）
---- @module NeoAI.core.session.tool_result_pruner
+--- @module 'NeoAI.core.session.tool_result_pruner'
 --- 策略对齐 deepseek-harness 的 compaction-tool-result-pruner：
 --- 在触发摘要压缩之前，先把超预算的工具结果（read_file / run_command 等大输出）
 --- 裁成「头部 + 省略标记 + 尾部」，保留原始消息其余字段（tool_call_id / tool_name）。

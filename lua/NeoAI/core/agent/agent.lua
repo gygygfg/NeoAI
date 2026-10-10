@@ -1,5 +1,5 @@
 --- Agent 对象
---- @module NeoAI.core.agent.agent
+--- @module 'NeoAI.core.agent.agent'
 --- 每次对话 = 全新 Agent 实例。持有私有消息队列、工具集、取消信号。
 --- 状态机：idle → generating → tool_running → idle（或 aborted / error）
 --- 纯净对象，不含 I/O；运行时行为在 runtime.lua。

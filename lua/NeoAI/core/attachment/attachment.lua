@@ -1,5 +1,5 @@
 --- 持久化附件存储
---- @module NeoAI.core.attachment.attachment
+--- @module 'NeoAI.core.attachment.attachment'
 --- 对齐 deepseek-harness 的 durable attachment 语义：
 --- - 不可变、内容寻址（sha256）存储，会话消息只存引用，不存字节；
 --- - 统一的准入限制（媒体类型 / 字节 / 像素 / 数量）；
@@ -152,7 +152,7 @@ function M.supports_image(model_id, provider)
   for _, m in ipairs(cfg.vision_models or {}) do
     if type(m) == "string" then
       if m == model_id or m == full then return true end
-      local p, mid = m:match("^([^:]+):(.+)$")
+      local _, mid = m:match("^([^:]+):(.+)$")
       if mid == model_id then return true end
     end
   end
@@ -221,12 +221,12 @@ end
 --- 用 ImageMagick 缩放到目标像素预算（best-effort；失败返回 nil）
 --- 同步执行：仅在存在 magick/convert 且确需缩放大图时触发，属罕见路径。
 --- @param data string 原始字节
---- @param media_type string
+--- @param _ string 媒体类型（MIME）
 --- @param width number|nil
 --- @param height number|nil
 --- @param max_pixels number
 --- @return string|nil 缩放后的 PNG 字节
-function M.downscale_sync(data, media_type, width, height, max_pixels)
+function M.downscale_sync(data, _, width, height, max_pixels)
   local tool = M.downscale_tool()
   if not tool or not width or not height then return nil end
   if width * height <= max_pixels then return nil end -- 无需缩放
@@ -367,7 +367,7 @@ end
 
 --- 读取/生成某附件的 request-image（带磁盘缓存）
 --- @param ref table { attachmentId, mediaType, bytes, width, height, name? }
---- @param policy table { maxPixels, maxBytes }
+--- @param policy table|nil
 --- @return Deferred resolve(request_image|nil) nil = 因预算无法表示（调用方应降级为文本）
 function M.read_request_image(ref, policy)
   policy = policy or M.request_policy()
@@ -467,7 +467,7 @@ end
 
 --- 生成 data URL
 --- @param request_image table
---- @return string
+--- @return string|nil
 function M.data_url(request_image)
   if not request_image or not request_image.data then return nil end
   return "data:" .. request_image.mediaType .. ";base64," .. image.base64_encode(request_image.data)

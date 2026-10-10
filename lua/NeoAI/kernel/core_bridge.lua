@@ -1,5 +1,5 @@
 --- 核心能力桥（tools ↔ core 解耦）
---- @module NeoAI.kernel.core_bridge
+--- @module 'NeoAI.kernel.core_bridge'
 --- tools/ 层（内置工具、执行器）需要少量核心能力（子 Agent 运行时、提示段注册、附件存储），
 --- 但 tools 不得直接依赖 core。由组合根（plugins/catalog）在启动 Agent 服务时注入所需实现；
 --- tools 经本桥调用，双方仅依赖 kernel。

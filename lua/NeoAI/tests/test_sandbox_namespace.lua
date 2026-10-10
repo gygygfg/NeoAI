@@ -1,5 +1,5 @@
 --- 命名空间文件桥（file_bridge）回归
---- @module NeoAI.tests.test_sandbox_namespace
+--- @module 'NeoAI.tests.test_sandbox_namespace'
 --- 覆盖：常驻实例运行后，`file_bridge` 的读/写/存在/stat/建目录/删除/列目录均在沙箱 mount
 --- 命名空间内执行——**写入落在 overlay 暂存层（真实工作区零改动）**，读取为 overlay 合并视图
 --- （未暂存则读真实 lower）。仅在 bwrap + 常驻实例可用时运行。

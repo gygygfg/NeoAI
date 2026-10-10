@@ -1,5 +1,5 @@
 --- 脚本间接执行静态扫描专项测试
---- @module NeoAI.tests.test_sandbox_script_scan
+--- @module 'NeoAI.tests.test_sandbox_script_scan'
 --- 覆盖：Shell 脚本正文提取、高级语言内嵌 shell 提取、递归/环、注释剥离、
 --- 不透明判定，以及折叠进 risk.deny_reason / privilege.classify / risk.classify 的效果。
 

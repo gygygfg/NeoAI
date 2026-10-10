@@ -1,5 +1,5 @@
 --- 沙箱网络边界（沙箱外视角 + 真实 bwrap）
---- @module NeoAI.tests.test_sandbox_boundary_net
+--- @module 'NeoAI.tests.test_sandbox_boundary_net'
 --- 覆盖：宿主过滤代理本机拦截与服务进程身份；裸 TCP 基线（设计边界）；沙箱内监听端口反向
 --- 暴露；DNS；端口+服务进程粒度弹窗端到端（批准放行 / 拒绝拦截）。全部使用本地 mock，离线。
 
@@ -45,7 +45,7 @@ tests.suite("sandbox_boundary_net", function(_, it)
       seen = ctx.service
       decide("allow_once")
     end })
-    local addr = hp.start("127.0.0.1", 0)
+    local addr = assert(hp.start("127.0.0.1", 0))
     local cli = vim.uv.new_tcp()
     local resp, done = {}, false
     cli:connect(addr.host, addr.port, function(err)

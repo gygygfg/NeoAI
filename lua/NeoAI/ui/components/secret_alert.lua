@@ -1,5 +1,5 @@
 --- 密钥告警弹窗
---- @module NeoAI.ui.components.secret_alert
+--- @module 'NeoAI.ui.components.secret_alert'
 --- 真实密钥出现在 AI 上下文/工具调用，或向非白名单地址发送密钥时，阻塞 Agent 并请用户确认。
 --- 注册到 sandbox.secret_alert。
 

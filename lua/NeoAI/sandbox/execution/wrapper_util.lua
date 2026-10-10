@@ -1,5 +1,5 @@
 --- 沙箱门禁纯助手
---- @module NeoAI.sandbox.execution.wrapper_util
+--- @module 'NeoAI.sandbox.execution.wrapper_util'
 --- 从 wrapper.lua 抽出的无状态纯函数（不引用模块状态；内部相互调用保持原样）。
 
 --- 按「暂存路径 -> 真实路径」映射还原值中的路径（字符串/字符串字段）。

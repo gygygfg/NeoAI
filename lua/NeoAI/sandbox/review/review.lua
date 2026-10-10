@@ -1,5 +1,5 @@
 --- 异步审批：变更单元（change_set）队列
---- @module NeoAI.sandbox.review.review
+--- @module 'NeoAI.sandbox.review.review'
 --- AI 的修改在沙箱中立即执行并冻结为候选，进入待审队列；用户异步确认允许
 --- 哪些文件/配置修改后，才 CAS 发布到真实工作区（设计文档 §15）。
 ---
@@ -354,7 +354,6 @@ end
 --- @return table 数组
 local function _capture_snapshot(cand)
   local cap = _snapshot_cap()
-  local store = require("NeoAI.sandbox.state.store")
   local entries = {}
   for _, f in ipairs(cand.files or {}) do
     local st = vim.uv.fs_stat(f.path)
@@ -532,7 +531,6 @@ function M.undo(id, opts)
     end
   end
   local writer = require("NeoAI.sandbox.execution.writer")
-  local store = require("NeoAI.sandbox.state.store")
   local cas = _snapshot_cas_mode()
   for _, e in ipairs(rec.files or {}) do
     if e.alt_too_large then
@@ -739,7 +737,7 @@ end
 --- 入队一个候选为待审变更单元
 --- @param cand table 冻结候选
 --- @param meta table { tool?, command_id?, attempt_id?, base_version?, read_set? }
---- @return table item
+--- @return table|nil item
 function M.enqueue(cand, meta)
   meta = meta or {}
   -- 空候选（无文件改动）没有审批意义，不入待审队列，避免出现「0 个文件」空项。
@@ -1163,7 +1161,7 @@ end
 --- 应用前置：解析条目、自动批准、读取候选、按选择性应用过滤。
 --- 成功返回 `ctx`（供 `_apply_settle` 收尾）；无需发布时返回 `nil, result`。
 --- @param id string
---- @param opts table
+--- @param opts table|nil
 --- @return table|nil ctx
 --- @return table|nil early_result
 local function _apply_begin(id, opts)
@@ -1322,13 +1320,31 @@ end
 --- @return table pub
 local function _apply_settle(ctx, pub)
   local item, id = ctx.item, ctx.id
-  if pub.ok then
+  -- 部分应用（非原子单元）：成功子集按「已应用」结算，失败文件回队重试。
+  -- 快照只覆盖成功落盘的文件，未写入的文件不纳入撤销；失败文件成为新的待审单元。
+  local partial = (pub.state == "PARTIAL")
+  if partial then
+    local applied_set = {}
+    for _, p in ipairs(pub.applied or {}) do applied_set[p] = true end
+    local kept = {}
+    for _, e in ipairs(ctx.snapshot_entries or {}) do
+      if applied_set[e.path] then kept[#kept + 1] = e end
+    end
+    ctx.snapshot_entries = kept
+    local by_path = {}
+    for _, f in ipairs(ctx.cand.files or {}) do by_path[f.path] = f end
+    for _, x in ipairs(pub.failed or {}) do
+      local f = by_path[x.path]
+      if f then ctx.remaining[#ctx.remaining + 1] = f end
+    end
+  end
+  if pub.ok or partial then
     item.apply_state = M.APPLY.APPLIED
     item.applied_at = os.time()
     item.receipt = pub.receipt
     item.merge_conflict = nil
     item.fail_reason = nil
-    store.write_receipt(pub.receipt)
+    if pub.receipt then store.write_receipt(pub.receipt) end
     -- 已应用：部分取代增量已完成使命，清理（被取代路径由新单元持有）。
     item.superseded_paths = nil
     -- 批量应用（apply_all / begin_batch 会话）时把候选删除推迟到全部应用后一次性对账，
@@ -1339,21 +1355,22 @@ local function _apply_settle(ctx, pub)
     else
       _discard_candidate(item.candidate_digest)
     end
-    _store_snapshot(item, ctx.snapshot_entries, pub.receipt.operation_id)
+    _store_snapshot(item, ctx.snapshot_entries, pub.receipt and pub.receipt.operation_id)
     _persist(item)
     logger.try("delete_review_removed", store.delete_review_removed, item.change_set_id)
-    -- 仅应用了部分文件：其余文件保留待审，供用户逐个确认
+    -- 仅应用了部分文件：其余文件（未选中 + 写入失败）保留待审，供用户逐个确认/重试。
     if #ctx.remaining > 0 then
       local requeued = _requeue_remaining(item, ctx.remaining)
       if not requeued then
         -- 回队异常（例如新建候选落盘失败）：显式告警，避免剩余文件「静默消失」无从排查。
         require("NeoAI.kernel.logger").warn(
-          "[sandbox] 选择性应用后剩余 %d 个文件回队失败（change_set=%s）",
+          "[sandbox] 选择性/部分应用后剩余 %d 个文件回队失败（change_set=%s）",
           #ctx.remaining, tostring(item.change_set_id))
       end
     end
     _emit(require("NeoAI.kernel.events").SANDBOX_APPLIED, {
-      change_set_id = id, operation_id = pub.receipt.operation_id,
+      change_set_id = id, operation_id = pub.receipt and pub.receipt.operation_id,
+      partial = partial,
     })
   elseif pub.state == "NEEDS_ROOT" then
     -- 非 root 写入被拒（目标归 root 所有）：保持待审并标记「需 root」，进入异步审批；
@@ -1405,6 +1422,9 @@ local function _apply_publish_begin(ctx)
     expected_base = item.base_version,
     allow_root = ctx.opts.allow_root == true,
     prefer_sudo = ctx.opts.prefer_sudo == true,
+    -- git 原子组（索引↔对象库↔refs）必须整组应用；其余单元允许部分写入（失败文件回队）。
+    atomic = item.atomic_group == "git",
+    partial = item.atomic_group ~= "git",
   }
 end
 
@@ -1416,6 +1436,7 @@ end
 function M.apply(id, opts)
   local ctx, early = _apply_begin(id, opts)
   if early then return early end
+  ctx = assert(ctx)
   local pub_opts = _apply_publish_begin(ctx)
   local pub = candidate.publish(ctx.cand, pub_opts)
   return _apply_settle(ctx, pub)
@@ -1431,6 +1452,7 @@ function M.apply_async(id, opts)
   local async = require("NeoAI.utils.async")
   local ctx, early = _apply_begin(id, opts)
   if early then return async.resolve(early) end
+  ctx = assert(ctx)
   local pub_opts = _apply_publish_begin(ctx)
   return candidate.publish_async(ctx.cand, pub_opts):then_(function(pub)
     return _apply_settle(ctx, pub)

@@ -1,6 +1,6 @@
 --- 密钥告警服务：AI 上下文/工具调用中出现**真实密钥**（疑似突破沙箱）或向非白名单地址
 --- **发送密钥**时，阻塞式弹窗让用户确认；确认后继续，否则停止 Agent。headless 无 UI 时失败关闭。
---- @module NeoAI.sandbox.secret.secret_alert
+--- @module 'NeoAI.sandbox.secret.secret_alert'
 --- UI 通过 `set_ui({ show = fn })` 注册（见 ui/components/secret_alert）。`request` 返回 Deferred，
 --- resolve 决策字符串：`allow_once`（保留真实密钥，仅本次允许）| `fake`（替换为假密钥并继续）|
 --- `whitelist`（加入发送白名单）| `stop`。
@@ -56,7 +56,8 @@ function M._confirm_fallback(ctx, decide)
   else
     choices = "仅本次允许\n停止 Agent"
   end
-  local choice = vim.fn.confirm(title, choices, 3, "Question")
+  local confirm = vim.fn.confirm --[[@as fun(title: string, choices: string, default: integer, kind: string): integer]]
+  local choice = confirm(title, choices, 3, "Question")
   if has_fake then
     if choice == 1 then decide("allow_once")
     elseif choice == 2 then decide("fake")

@@ -1,5 +1,5 @@
 --- 外部操作 broker
---- @module NeoAI.sandbox.net.broker
+--- @module 'NeoAI.sandbox.net.broker'
 --- 外部副作用走专用适配器协议，不套用本地文件发布的原子性与回滚承诺（设计文档 §3.2/§11）。
 --- 适配器必须声明幂等/查询/事务/补偿/不可逆能力；控制面据声明决定重试与对账策略。
 

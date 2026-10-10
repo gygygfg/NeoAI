@@ -1,5 +1,5 @@
 --- 聊天视图
---- @module NeoAI.ui.window.chat_view
+--- @module 'NeoAI.ui.window.chat_view'
 --- 聊天窗口渲染与交互。绑定事件，流式更新。
 --- 布局：主消息区（上） + 输入框（下，split）。
 
@@ -276,6 +276,8 @@ local function _render(keep_view)
   if diff and diff.changed == false then
     return false
   end
+  -- 下方对 diff 的用法均容忍 nil（written_range 接受 nil；from>0 短路后才访问 diff.full）。
+  ---@cast diff -nil
   -- 插入/替换模式期间 nvim 全局不计算折叠（见 _recompute_folds）：本次写入的新折叠块
   -- 不会被收起。记下 dirty，待 InsertLeave 后由 _recompute_folds 统一补算。
   local mode = vim.api.nvim_get_mode().mode
@@ -1287,8 +1289,8 @@ end
 --- 必须用 vim.cmd("let v:event.abort = v:true") 才能真正中止。
 --- 注：新标签页兜底只在确实撞上 E1513（winfixbuf）时发生；:sp/:vsp/:tabnew 等新开窗口的命令
 --- 由 winfixbuf 直接放行，重放即成功，不会误开标签。
---- @param ev table
-local function _on_input_cmdline_leave(ev) -- luacheck: ignore ev
+local function _on_input_cmdline_leave(_)
+  -- 参数为 CmdlineLeave 事件对象，本实现不使用，故以 `_` 占位。
   if not M.has_window() then return end
   if vim.fn.getcmdtype() ~= ":" then return end
   if not state.input_win_id or not vim.api.nvim_win_is_valid(state.input_win_id) then return end

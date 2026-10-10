@@ -1,5 +1,5 @@
 --- 请求恢复
---- @module NeoAI.core.agent.recovery
+--- @module 'NeoAI.core.agent.recovery'
 --- 上下文溢出恢复：请求返回 context window exceeded 时自动压缩历史后重发。
 --- 对齐 deepseek-harness compaction 的 request-error 触发路径：
 --- 溢出不是直接报错结束，而是先压缩（复用前缀缓存）再重试。
@@ -48,6 +48,7 @@ end
 --- @param agent table
 --- @param messages table wire 消息数组（即将发送给模型）
 --- @return boolean|Deferred true=安全；false,err=停止；Deferred=待用户确认
+--- @return table|nil err 停止原因（停止时给出）
 local function _guard_secret_context(agent, messages)
   local sandbox = services.use("services.sandbox")
   local secret = sandbox and sandbox.secret

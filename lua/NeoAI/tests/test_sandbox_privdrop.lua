@@ -1,5 +1,5 @@
 --- 沙箱降权 / 属主持久 / cgroup 可写 测试
---- @module NeoAI.tests.test_sandbox_privdrop
+--- @module 'NeoAI.tests.test_sandbox_privdrop'
 --- 覆盖：载荷可在沙箱内降权到非 root 用户（runuser/setpriv，供 PostgreSQL 等拒绝 root 的服务）；
 --- chown 等属主改动跨命令持久（sysadmin 命令走常驻实例的持久 overlay）；/sys/fs/cgroup 可写
 --- （委派 cgroup 子树，AI/服务可创建子 cgroup 并写 memory.max）。

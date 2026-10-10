@@ -1,5 +1,5 @@
 --- 会话对象
---- @module NeoAI.core.session.session
+--- @module 'NeoAI.core.session.session'
 --- 纯净数据结构 + 方法，无副作用、无 I/O。
 --- 字段：id, parent_id, root_id, created_at, updated_at, model, messages, metadata
 

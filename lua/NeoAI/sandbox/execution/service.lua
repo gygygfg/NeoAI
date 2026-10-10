@@ -1,5 +1,5 @@
 --- 沙箱长驻服务
---- @module NeoAI.sandbox.execution.service
+--- @module 'NeoAI.sandbox.execution.service'
 --- 后台进程跨工具调用存活，直到显式停止 / 会话结束。每个服务使用**独立 overlay attempt**
 --- （独立 upper/work，不与 run_command 的共享会话暂存竞争）：
 ---   * 启动：把工作区暂存内容物化进服务 overlay（单向快照），使服务看到 AI 尚未发布的编辑；
@@ -225,7 +225,6 @@ end
 --- @return boolean|nil ok
 --- @return string|nil err
 local function _build(svc, opts)
-  local cfg = _cfg()
   local sandbox_cfg = config_store.get("tools.sandbox") or {}
   local base_cwd = opts.workdir or opts.cwd or vim.fn.getcwd()
   local roots = {}
@@ -244,7 +243,7 @@ local function _build(svc, opts)
 
   local attempt = control.new_attempt("service_" .. svc.name, { command = svc.command }, svc.ctx or {}, svc.spec)
   svc.attempt = attempt
-  candidate.begin(attempt, store.root())
+  candidate.begin(attempt, tostring(store.root()))
   -- 覆盖所有已暂存路径：使服务与只读工具看到同一暂存视图（边界同步为单向快照，
   -- 但快照必须包含工作区外的暂存编辑，否则服务读到真实磁盘、视图分裂）。
   local extra = {}
@@ -418,7 +417,7 @@ end
 --- @param cb function|nil cb(err, info)
 --- @param opts table|nil { grace_ms? } 优雅退出窗口（ms），默认 tools.sandbox.service.stop_timeout_ms
 function M.stop(key, cb, opts)
-  cb = cb or function() end
+  cb = cb or function(_, _) end
   opts = opts or {}
   local svc = _find(key)
   if not svc then cb("服务不存在：" .. tostring(key)); return end

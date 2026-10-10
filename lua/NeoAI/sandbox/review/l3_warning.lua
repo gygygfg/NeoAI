@@ -1,5 +1,5 @@
 --- L3 危险操作后果警告生成
---- @module NeoAI.sandbox.review.l3_warning
+--- @module 'NeoAI.sandbox.review.l3_warning'
 --- 待审界面确认高危变更（L3 critical，或 L2 包/敏感安装）时，调用模型生成一条简洁的中文后果警告，
 --- 展示在修改 diff 预览顶部，供用户二次确认。模型不可用/超时/未配置 provider 时，
 --- 由调用方回退到 `M.fallback()` 的确定性规则警告，不阻断流程。

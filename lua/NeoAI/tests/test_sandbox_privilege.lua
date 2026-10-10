@@ -1,5 +1,5 @@
 --- 沙箱权限：加固/最小权限/提权/cap-drop/mount/seccomp 能力
---- @module NeoAI.tests.test_sandbox_privilege
+--- @module 'NeoAI.tests.test_sandbox_privilege'
 --- 由原 test_sandbox.lua 按用例分片而来（42 个用例，彼此独立、无跨用例共享状态）。
 
 local tests = require("NeoAI.tests")
@@ -22,11 +22,6 @@ local function with_config(overrides, fn)
   if not ok then error(err, 0) end
 end
 
-local function trim(s)
-  return (tostring(s or ""):gsub("%s+$", ""))
-end
-
-
 tests.suite("sandbox_privilege", function(_, it)
   it("加固：遮蔽目录命中走审批，批准放行、无界面 fail-closed", function(t)
     local fs = require("NeoAI.utils.fs")
@@ -44,7 +39,7 @@ tests.suite("sandbox_privilege", function(_, it)
       -- 1) 有审批界面：弹窗（stub）批准后放行读取
       local asked = nil
       local stub = {
-        approve_and_execute = function(name, _args, _ctx, continue_fn)
+        approve_and_execute = function(name, _, _, continue_fn)
           asked = name
           return continue_fn()
         end,
@@ -285,18 +280,18 @@ tests.suite("sandbox_privilege", function(_, it)
     local privilege = require("NeoAI.sandbox.execution.privilege")
     if runtime.backend() ~= "bwrap" then return end
     local t0 = privilege.resolve(0, { tier = 0 })
-    local pre0 = table.concat(runtime.process_prefix({ cwd = "/tmp", privileges = t0.privileges }), " ")
+    local pre0 = table.concat(assert(runtime.process_prefix({ cwd = "/tmp", privileges = t0.privileges })), " ")
     t.true_(pre0:find("--unshare-net", 1, true) == nil, "T0 默认不应隔离网络（仅记录）")
     local t1 = privilege.resolve(1, { tier = 1, network = true })
-    local pre1 = table.concat(runtime.process_prefix({ cwd = "/tmp", privileges = t1.privileges }), " ")
+    local pre1 = table.concat(assert(runtime.process_prefix({ cwd = "/tmp", privileges = t1.privileges })), " ")
     t.true_(pre1:find("--unshare-net", 1, true) == nil, "T1 不应隔离网络")
     -- T2 走嵌套 userns
     local t2 = privilege.resolve(2, { tier = 2, network = true })
-    local pre2 = table.concat(runtime.process_prefix({ cwd = "/tmp", privileges = t2.privileges }), " ")
+    local pre2 = table.concat(assert(runtime.process_prefix({ cwd = "/tmp", privileges = t2.privileges })), " ")
     t.true_(pre2:find("--unshare-all", 1, true) ~= nil, "T2 应新建 user namespace")
     -- offline=true 硬隔离，优先于档位
     with_config({ tools = { sandbox = { offline = true } } }, function()
-      local preo = table.concat(runtime.process_prefix({ cwd = "/tmp", privileges = t0.privileges }), " ")
+      local preo = table.concat(assert(runtime.process_prefix({ cwd = "/tmp", privileges = t0.privileges })), " ")
       t.true_(preo:find("--unshare-net", 1, true) ~= nil, "offline=true 应隔离网络")
     end)
   end)
@@ -316,7 +311,7 @@ tests.suite("sandbox_privilege", function(_, it)
       t.eq(sock, res.privileges.mounts[1] and res.privileges.mounts[1].src, "应挂载受控 socket")
       t.eq("/var/run/docker.sock", res.privileges.mounts[1].dst, "应挂载到 docker.sock")
       t.eq("unix:///var/run/docker.sock", res.privileges.env.DOCKER_HOST, "应注入 DOCKER_HOST")
-      local pre = table.concat(runtime.process_prefix({ cwd = "/tmp", privileges = res.privileges }), " ")
+      local pre = table.concat(assert(runtime.process_prefix({ cwd = "/tmp", privileges = res.privileges })), " ")
       t.true_(pre:find("--bind " .. sock .. " /var/run/docker.sock", 1, true) ~= nil, "前缀应绑定受控 socket")
       t.true_(pre:find("--bind /dev/null /var/run/docker.sock", 1, true) == nil, "不应遮蔽受控 socket")
     end)
@@ -343,10 +338,10 @@ tests.suite("sandbox_privilege", function(_, it)
 
   it("权限档位：失败检测与自动升级（记录事件，不静默）", function(t)
     local privilege = require("NeoAI.sandbox.execution.privilege")
-    local esc = privilege.detect_escalation({ code = 6, stderr = "curl: (6) Could not resolve host: x" })
+    local esc = assert(privilege.detect_escalation({ code = 6, stderr = "curl: (6) Could not resolve host: x" }))
     t.not_nil(esc, "网络失败应建议升级")
     t.eq(1, esc.tier, "网络失败应为 T1")
-    local perm = privilege.detect_escalation({ code = 1, stderr = "mount: Operation not permitted" })
+    local perm = assert(privilege.detect_escalation({ code = 1, stderr = "mount: Operation not permitted" }))
     t.eq(2, perm.tier, "权限拒绝应为 T2")
     t.eq(nil, privilege.detect_escalation({ code = 0, stderr = "could not resolve host" }), "成功不应升级")
 
@@ -384,11 +379,11 @@ tests.suite("sandbox_privilege", function(_, it)
       local control = require("NeoAI.sandbox.execution.control")
       control.reset()
       local attempt = control.new_attempt("run_command", { command = "echo HOST_OP_OK" }, {}, { effect = "process" })
-      local rec = hostop.freeze(attempt, { command = "echo HOST_OP_OK" }, { tier = 2 }, { reason = "test" })
+      local rec = assert(hostop.freeze(attempt, { command = "echo HOST_OP_OK" }, { tier = 2 }, { reason = "test" }))
       t.not_nil(rec, "应冻结提案")
       local found
-      for _, it in ipairs(sandbox.list_reviews({ review_state = "PENDING" })) do
-        if it.kind == "host_op" and it.host_op_id == rec.host_op_id then found = it end
+      for _, rev_item in ipairs(sandbox.list_reviews({ review_state = "PENDING" })) do
+        if rev_item.kind == "host_op" and rev_item.host_op_id == rec.host_op_id then found = rev_item end
       end
       t.not_nil(found, "提案应进入待审队列")
       t.false_(sandbox.apply(found.change_set_id).ok, "未审批不应执行")
@@ -397,13 +392,13 @@ tests.suite("sandbox_privilege", function(_, it)
       t.true_(res.ok, "审批后应执行成功")
       t.true_(res.result and tostring(res.result.stdout):find("HOST_OP_OK", 1, true) ~= nil, "应捕获主机输出")
       -- 拒绝不执行
-      local rec2 = hostop.freeze(attempt, { command = "echo SHOULD_NOT_RUN" }, { tier = 2 }, {})
+      local rec2 = assert(hostop.freeze(attempt, { command = "echo SHOULD_NOT_RUN" }, { tier = 2 }, {}))
       local found2
-      for _, it in ipairs(sandbox.list_reviews({ review_state = "PENDING" })) do
-        if it.kind == "host_op" and it.host_op_id == rec2.host_op_id then found2 = it end
+      for _, rev_item in ipairs(sandbox.list_reviews({ review_state = "PENDING" })) do
+        if rev_item.kind == "host_op" and rev_item.host_op_id == rec2.host_op_id then found2 = rev_item end
       end
       sandbox.reject(found2.change_set_id, "no")
-      t.eq("REJECTED", hostop.get(rec2.host_op_id).state, "拒绝后提案应为 REJECTED")
+      t.eq("REJECTED", assert(hostop.get(rec2.host_op_id)).state, "拒绝后提案应为 REJECTED")
     end)
   end)
 
@@ -455,6 +450,7 @@ tests.suite("sandbox_privilege", function(_, it)
     local sandbox = require("NeoAI.sandbox")
     local hostop = require("NeoAI.sandbox.execution.hostop")
     local saved = runtime.payload_nonroot
+    ---@diagnostic disable-next-line: duplicate-set-field
     runtime.payload_nonroot = function() return true end
     with_config({
       tools = {
@@ -488,6 +484,7 @@ tests.suite("sandbox_privilege", function(_, it)
     local sandbox = require("NeoAI.sandbox")
     local hostop = require("NeoAI.sandbox.execution.hostop")
     local saved = runtime.payload_nonroot
+    ---@diagnostic disable-next-line: duplicate-set-field
     runtime.payload_nonroot = function() return false end
     with_config({
       tools = {
@@ -681,9 +678,9 @@ tests.suite("sandbox_privilege", function(_, it)
       t.true_(vim.wait(10000, function() return done end), "read_file 应完成")
       return res
     end
-    local r1 = read(plain)
+    local r1 = assert(read(plain))
     t.true_(r1:find(key, 1, true) ~= nil, "普通文件高熵串应原样返回，实际: " .. tostring(r1))
-    local r2 = read(envf)
+    local r2 = assert(read(envf))
     t.true_(secret.has_token(r2), "疑似密钥文件高熵串应被 token 化，实际: " .. tostring(r2))
     fs.delete_file(plain)
     fs.delete_file(envf)
@@ -890,8 +887,8 @@ tests.suite("sandbox_privilege", function(_, it)
       }, {}):then_(function()
         local items = sandbox.list_reviews({ review_state = "PENDING" })
         local found
-        for _, it in ipairs(items) do
-          for _, f in ipairs(it.files or {}) do if f.path == p then found = it end end
+        for _, rev_item in ipairs(items) do
+          for _, f in ipairs(rev_item.files or {}) do if f.path == p then found = rev_item end end
         end
         t.not_nil(found, "应产生待审变更单元")
         t.true_(found.secret_warning and found.secret_warning.count > 0, "应带密钥操作警告")

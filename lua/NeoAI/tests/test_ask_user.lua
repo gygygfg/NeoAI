@@ -1,5 +1,5 @@
 --- 向用户提问工具测试
---- @module NeoAI.tests.test_ask_user
+--- @module 'NeoAI.tests.test_ask_user'
 
 local tests = require("NeoAI.tests")
 
@@ -21,7 +21,7 @@ tests.suite("ask_user", function(_, it)
       show = function(config) captured.config = config end,
       hide = function() end,
     })
-    local tl = find_tool("ask_user")
+    local tl = assert(find_tool("ask_user"))
     t.not_nil(tl)
     local out = {}
     tl.func(
@@ -44,7 +44,7 @@ tests.suite("ask_user", function(_, it)
     local async = require("NeoAI.utils.async")
     ask.reset()
     ask.set_ui({ show = function() end, hide = function() end })
-    local tl = find_tool("ask_user")
+    local tl = assert(find_tool("ask_user"))
     local out = {}
     tl.func(
       {},
@@ -65,7 +65,7 @@ tests.suite("ask_user", function(_, it)
       show = function(config) captured.config = config end,
       hide = function() end,
     })
-    local tl = find_tool("ask_user")
+    local tl = assert(find_tool("ask_user"))
     local out = {}
     tl.func(
       { question = "继续吗？" },
@@ -85,7 +85,7 @@ tests.suite("ask_user", function(_, it)
     local async = require("NeoAI.utils.async")
     ask.reset()
     ask.set_ui({ show = function() end, hide = function() end })
-    local tl = find_tool("ask_user")
+    local tl = assert(find_tool("ask_user"))
     local sig = async.create_signal()
     local out = {}
     tl.func(
@@ -131,7 +131,7 @@ tests.suite("ask_user", function(_, it)
       end
       return nil
     end
-    local cb_n = esc_cb("n")
+    local cb_n = assert(esc_cb("n"))
     local cb_i = esc_cb("i")
     t.not_nil(cb_n, "NORMAL 模式应存在 <Esc> 映射")
     t.nil_(cb_i, "INSERT 模式不应存在 <Esc> 映射（保留退出插入模式原义）")
@@ -157,7 +157,7 @@ tests.suite("ask_user", function(_, it)
       end,
       hide = function() end,
     })
-    local tl = find_tool("ask_user")
+    local tl = assert(find_tool("ask_user"))
     local out1, out2 = {}, {}
     tl.func({ question = "第一个问题" },
       function(m) out1.msg = m end,
@@ -195,7 +195,7 @@ tests.suite("ask_user", function(_, it)
       show = function(config) shown[#shown + 1] = config end,
       hide = function() end,
     })
-    local tl = find_tool("ask_user")
+    local tl = assert(find_tool("ask_user"))
     local out = {}
     tl.func(
       { question = "怎么生成？", options = {
@@ -227,7 +227,7 @@ tests.suite("ask_user", function(_, it)
       t.matches("问题", opts.prompt or "")
       cb("自由回答内容")
     end
-    local tl = find_tool("ask_user")
+    local tl = assert(find_tool("ask_user"))
     local out = {}
     tl.func(
       { question = "自由输入问题" },

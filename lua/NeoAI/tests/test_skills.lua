@@ -1,5 +1,5 @@
 --- Skills 服务测试（SKILL.md frontmatter 解析 + 发现 + list/load + 系统提示段）
---- @module NeoAI.tests.test_skills
+--- @module 'NeoAI.tests.test_skills'
 
 local tests = require("NeoAI.tests")
 local fs = require("NeoAI.utils.fs")
@@ -34,7 +34,7 @@ tests.suite("skills", function(_, it, before_each)
     skills.reset()
     skills.init()
     t.eq(1, skills.count())
-    local s = skills.get("git-review")
+    local s = assert(skills.get("git-review"))
     t.not_nil(s, "应按 frontmatter name 索引")
     t.eq("评审 Git 变更", s.description)
     t.matches("这里是正文", s.body)
@@ -66,7 +66,7 @@ tests.suite("skills", function(_, it, before_each)
     t.eq(2, #list)
     t.eq("skill-a", list[1].name)
     t.eq("skill-b", list[2].name)
-    local loaded = skills.load("skill-b")
+    local loaded = assert(skills.load("skill-b"))
     t.eq("body-b", loaded.content)
     local summary = skills.summary_text()
     t.true_(summary:find("skill-a: 技能A", 1, true) ~= nil, "摘要应含 skill-a")
@@ -83,7 +83,7 @@ tests.suite("skills", function(_, it, before_each)
     local skills = require("NeoAI.services.skills")
     skills.reset()
     skills.init()
-    local s = skills.get("dup")
+    local s = assert(skills.get("dup"))
     t.true_(s.body:find("first-body", 1, true) ~= nil, "路径在前者优先")
   end)
 

@@ -1,5 +1,5 @@
 --- NeoAI 事件总线
---- @module NeoAI.kernel.event_bus
+--- @module 'NeoAI.kernel.event_bus'
 --- 基于 Neovim 原生 User autocmd 的轻量发布/订阅。
 --- - emit(event, payload)：触发事件，payload 放入 args.data
 --- - on(event, cb)：订阅，返回取消函数
@@ -83,7 +83,7 @@ end
 
 --- 清除所有事件订阅
 function M.clear_all()
-  for pattern, group in pairs(state.groups) do
+  for _, group in pairs(state.groups) do
     pcall(vim.api.nvim_del_augroup_by_id, group)
   end
   state.groups = {}

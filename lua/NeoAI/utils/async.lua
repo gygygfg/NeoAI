@@ -1,5 +1,5 @@
 --- 异步原语库
---- @module NeoAI.utils.async
+--- @module 'NeoAI.utils.async'
 --- 提供 Promise / Deferred / AbortSignal（取消信号）/ 并发 / 重试 / 延迟。
 --- 完全基于 Neovim 主循环（vim.schedule / vim.defer_fn），无第三方依赖。
 
@@ -7,6 +7,21 @@ local M = {}
 
 -- ========== Deferred（可手动 resolve/reject 的 Promise 执行器） ==========
 
+--- 可手动 resolve/reject 的 Promise 执行器（thenable）
+--- @class Deferred
+--- @field _state 'pending'|'resolved'|'rejected'
+--- @field _value any
+--- @field _error any
+--- @field _on_fulfilled function[]
+--- @field _on_rejected function[]
+--- @field _signal Signal|nil
+--- @field resolve fun(self: Deferred, value: any): Deferred
+--- @field reject fun(self: Deferred, err: any): Deferred
+--- @field then_ fun(self: Deferred, on_fulfilled: function|nil, on_rejected: function|nil): Deferred
+--- @field catch fun(self: Deferred, on_rejected: function): Deferred
+--- @field finally fun(self: Deferred, cb: function): Deferred
+--- @field is_pending fun(self: Deferred): boolean
+--- @field is_resolved fun(self: Deferred): boolean
 local Deferred = {}
 Deferred.__index = Deferred
 
@@ -264,7 +279,7 @@ function M.retry(fn, opts)
   local delay_ms = opts.delay_ms or 1000
   local backoff = opts.backoff or 2
   local signal = opts.signal
-  local should_retry = opts.should_retry or function() return true end
+  local should_retry = opts.should_retry or function(_) return true end
 
   local function attempt(n)
     if signal and signal:aborted() then
@@ -286,6 +301,16 @@ end
 
 -- ========== AbortSignal（取消信号） ==========
 
+--- 取消信号（级联取消 / 订阅）
+--- @class Signal
+--- @field _aborted boolean
+--- @field _reason any
+--- @field _listeners function[]
+--- @field abort fun(self: Signal, reason: any|nil): Signal
+--- @field aborted fun(self: Signal): boolean
+--- @field reason fun(self: Signal): any
+--- @field subscribe fun(self: Signal, cb: function): function
+--- @field bind_deferred fun(self: Signal, d: Deferred, reason: any|nil): function
 local Signal = {}
 Signal.__index = Signal
 
@@ -344,7 +369,6 @@ function Signal:subscribe(cb)
 end
 
 --- 把信号绑定到一个 Deferred：abort 时 reject 它
---- @param signal Signal
 --- @param d Deferred
 --- @param reason any|nil
 function Signal:bind_deferred(d, reason)
@@ -403,7 +427,7 @@ function M.promisify(fn)
         d:resolve({ ... })
       end
     end
-    local ok, ferr = pcall(fn, unpack(args, 1, args.n), cb)
+    local ok, ferr = pcall(fn, unpack(args, 1, #args), cb)
     if not ok then
       d:reject(ferr)
     end

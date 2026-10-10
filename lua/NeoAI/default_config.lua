@@ -1,5 +1,5 @@
 --- NeoAI 默认配置
---- @module NeoAI.default_config
+--- @module 'NeoAI.default_config'
 --- 纯数据，零逻辑。仅提供不可变默认配置，供 config_store 合并。
 
 local M = {}
@@ -1137,13 +1137,7 @@ local DEFAULT_CONFIG = {
         -- 约束）；沙箱内无 podman 时明确报错。设为 false 则 docker 直接拒绝（不改写）。
         docker_to_podman = true,
       },
-      docker = {
-        -- 容器门面下 docker/nerdctl 的处理：off（默认，明确拒绝，不碰宿主）|
-        -- controlled（显式受控 socket：rootless / socket-proxy / dind）。
-        mode = "off",
-        socket = "", -- 受控 socket 路径（mode="controlled" 时必填且须存在）
-      },
-      -- 存储基根。每进程实例隔离在 <workspace_root>/instances/<pid>_<启动时间>，
+      -- 存储基根。每进程实例隔离在 workspace_root/instances/<pid>_<启动时间>，
       -- 待审队列/候选/回执/证据不跨 nvim 会话共享（多个会话互不可见对方的审批）。
       workspace_root = vim.fn.stdpath("cache") .. "/NeoAI/sandbox",
       -- 沙箱暂存后端（进程 overlay upper/work、每会话私有临时根 /tmp、LSP overlay 等）：

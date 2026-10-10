@@ -1,5 +1,5 @@
 --- MCP 工具描述本地缓存（services.mcp.cache）专项测试
---- @module NeoAI.tests.test_mcp_cache
+--- @module 'NeoAI.tests.test_mcp_cache'
 local tests = require("NeoAI.tests")
 
 tests.suite("mcp_cache", function(_, it, before_each)

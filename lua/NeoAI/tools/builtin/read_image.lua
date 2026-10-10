@@ -1,5 +1,5 @@
 --- read_image 工具
---- @module NeoAI.tools.builtin.read_image
+--- @module 'NeoAI.tools.builtin.read_image'
 --- 模型侧读图入口：读取 PNG/JPEG/WebP/GIF 文件，持久化进附件存储，
 --- 返回引用（会话只存引用，不存字节）；发送请求时经 core.model.content 解析为
 --- data URL 注入。约治越严——先门禁（当前模型声明图像输入 / 允许的类型 / 像素与字节
@@ -19,7 +19,7 @@ local attachment = setmetatable({}, {
   end,
 })
 local helpers = require("NeoAI.tools.builtin.tool_helpers")
-local async = require("NeoAI.utils.async")
+local _ = require("NeoAI.utils.async")
 local sandbox_exec = require("NeoAI.sandbox.execution.exec")
 
 local M = {}
@@ -202,7 +202,7 @@ end
 
 local read_image = helpers.define_tool(
   "read_image",
-  "读取一张 PNG/JPEG/WebP/GIF 图片，把图像本身（而非路径描述）注入对话，供多模态模型分析图像内容（截图、图表、示意图、OCR 等）。可传本地文件路径或 http(s) 图片 URL（URL 会下载到临时目录，读取完成后自动删除）。需当前模型支持图像输入。可并发读取多个独立文件。",
+  "读取 PNG/JPEG/WebP/GIF 图片并注入对话（供多模态模型看图，非路径描述）。file_path 可为本地路径或 http(s) URL（URL 下载后即用即删）。需当前模型支持图像输入。",
   {
     type = "object",
     properties = {
@@ -240,8 +240,8 @@ local read_image = helpers.define_tool(
           text = _format_envelope(file_path, ref),
           image = ref,
         })
-      end, function(err)
-        on_error(_err_msg(err))
+      end, function(e)
+        on_error(_err_msg(e))
       end):finally(function()
         -- 成功/失败均清理临时文件（成功路径 set 了 tmp_to_clean；失败路径 _download_to_temp 已自清）
         if tmp_to_clean then
@@ -277,8 +277,8 @@ local read_image = helpers.define_tool(
         text = _format_envelope(abs_path, ref),
         image = ref,
       })
-    end, function(err)
-      on_error(_err_msg(err))
+    end, function(e)
+      on_error(_err_msg(e))
     end)
   end,
   { category = "file", approval = { auto_allow = true } }

@@ -1,5 +1,5 @@
 --- 会话层测试
---- @module NeoAI.tests.test_session
+--- @module 'NeoAI.tests.test_session'
 
 local tests = require("NeoAI.tests")
 
@@ -90,7 +90,7 @@ tests.suite("session", function(_, it)
     store.reset()
     store.init()
     local s1 = store.create({ model = "m1" })
-    local s2 = store.create({ parent_id = s1.id })
+    store.create({ parent_id = s1.id })
     store.create({ parent_id = s1.id })
     t.eq(3, store.count())
     t.eq(2, #store.get_children(s1.id))
@@ -99,7 +99,7 @@ tests.suite("session", function(_, it)
     store.reset()
     store.init()
     t.eq(3, store.count())
-    local loaded = store.get(s1.id)
+    local loaded = assert(store.get(s1.id))
     t.eq("m1", loaded.model)
     local deleted = store.delete(s1.id)
     t.eq(3, #deleted)
@@ -122,7 +122,7 @@ tests.suite("session", function(_, it)
   end)
 
   it("context_builder 从 Agent 构建", function(t)
-    local session = require("NeoAI.core.session.session")
+    require("NeoAI.core.session.session")
     local ctx = require("NeoAI.core.session.context_builder")
     local agent = {
       messages = { { role = "user", content = "hello" }, { role = "assistant", content = "world" } },
@@ -147,6 +147,7 @@ tests.suite("session", function(_, it)
     for _, build in ipairs({
       function() return ctx.build({ messages = source }, { include_system = false, max_history = 100 }) end,
       function() return ctx.build_from_agent({ messages = source }, { include_system = false, max_history = 100 }) end,
+      ---@diagnostic disable-next-line: param-type-mismatch
       function() return ctx.build_prefix(nil, source) end,
     }) do
       local msgs = build()
@@ -164,6 +165,7 @@ tests.suite("session", function(_, it)
     t.eq("a", msgs[2].tool_call_id)
     t.eq("b", msgs[3].tool_call_id)
     t.eq("retry", msgs[4].content)
+    ---@diagnostic disable-next-line: param-type-mismatch
     t.eq(3, #ctx.build_prefix(nil, { source[1] }))
   end)
 
@@ -186,7 +188,9 @@ tests.suite("session", function(_, it)
       t.eq("A", msgs[2].content)
       t.eq("B", msgs[3].content)
     end
+    ---@diagnostic disable-next-line: param-type-mismatch
     t.deep_eq(source, ctx.build_prefix(nil, source))
+    ---@diagnostic disable-next-line: param-type-mismatch
     local msgs = ctx.build_prefix(nil, { source[3], source[2], source[4], source[4], source[3], source[5], source[3] })
     t.eq(4, #msgs)
     t.eq("B", msgs[2].content)

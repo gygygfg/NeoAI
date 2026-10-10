@@ -1,5 +1,5 @@
 --- 工具结果裁剪测试
---- @module NeoAI.tests.test_tool_result_pruner
+--- @module 'NeoAI.tests.test_tool_result_pruner'
 
 local tests = require("NeoAI.tests")
 
@@ -25,7 +25,7 @@ tests.suite("tool_result_pruner", function(_, it)
   it("prune_content 字符串：保留头尾 + 省略标记，且更小", function(t)
     local cfg = { threshold_chars = 1000, head_chars = 400, tail_chars = 100 }
     local content = "H" .. string.rep("m", 9800) .. "T"
-    local out = pruner.prune_content(content, cfg)
+    local out = pruner.prune_content(content, cfg) --[[@as string]]
     t.not_nil(out)
     t.true_(#out < #content)
     t.true_(out:find(pruner.PRUNE_MARKER, 1, true) ~= nil)
@@ -41,7 +41,7 @@ tests.suite("tool_result_pruner", function(_, it)
       { type = "text", text = string.rep("a", 500) },
       img,
       { type = "text", text = string.rep("b", 500) },
-    }, cfg)
+    }, cfg) --[[@as table]]
     t.not_nil(out)
     t.eq(3, #out)
     t.eq("image", out[2].type)
@@ -89,7 +89,7 @@ tests.suite("tool_result_pruner", function(_, it)
 
   it("Blob 工具结果跳过且不抛 E976", function(t)
     local tmp = vim.fn.tempname()
-    local f = io.open(tmp, "wb")
+    local f = assert(io.open(tmp, "wb"))
     f:write("bin\0" .. string.rep("x", 20000))
     f:close()
     local blob = vim.fn.readblob(tmp)
@@ -117,7 +117,7 @@ tests.suite("tool_result_pruner", function(_, it)
 
   it("prune_agent_async：卸载线程池，结果与同步一致且幂等", function(t)
     local big, agent = _big_agent()
-    local done, result = false, nil
+    local done, result
     pruner.prune_agent_async(agent, _opts):then_(function(r) result = r; done = true end)
     t.true_(vim.wait(3000, function() return done end), "异步裁剪未完成")
     t.eq(1, result.pruned)
@@ -130,7 +130,7 @@ tests.suite("tool_result_pruner", function(_, it)
     t.nil_(agent.messages[3].pruned, "未超阈值不裁剪")
 
     -- 二次调用幂等
-    local done2, result2 = false, nil
+    local done2, result2
     pruner.prune_agent_async(agent, _opts):then_(function(r) result2 = r; done2 = true end)
     t.true_(vim.wait(2000, function() return done2 end), "二次异步裁剪未完成")
     t.eq(0, result2.pruned)
@@ -144,7 +144,7 @@ tests.suite("tool_result_pruner", function(_, it)
 
   it("prune_agent_async：线程池卸载路径（无同步回退开关）", function(t)
     local _, agent = _big_agent()
-    local done, result = false, nil
+    local done, result
     pruner.prune_agent_async(agent, _opts):then_(function(r) result = r; done = true end)
     t.true_(vim.wait(2000, function() return done end), "线程池卸载路径未完成")
     t.eq(1, result.pruned)
@@ -168,7 +168,7 @@ tests.suite("tool_result_pruner", function(_, it)
       }
     end
     local _, async_agent = nil, mk()
-    local done, result = false, nil
+    local done, result
     pruner.prune_agent_async(async_agent, _opts):then_(function(r) result = r; done = true end)
     t.true_(vim.wait(3000, function() return done end), "块数组异步裁剪未完成")
     t.eq(1, result.pruned)

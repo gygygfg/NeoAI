@@ -1,5 +1,5 @@
 --- 工具系统测试
---- @module NeoAI.tests.test_tools
+--- @module 'NeoAI.tests.test_tools'
 
 local tests = require("NeoAI.tests")
 
@@ -629,7 +629,6 @@ tests.suite("tools", function(_, it)
 
   it("executor 别名 + file_exists", function(t)
     local tools = require("NeoAI.tools")
-    local async = require("NeoAI.utils.async")
     tools.execute("ls", { path = "/tmp", description = "列出临时目录" }, {})
       :then_(function() print("  ls done") end)
     -- 故意使用旧参数名 filepath：验证 executor 的旧名兼容别名仍然生效。
@@ -762,15 +761,13 @@ tests.suite("tools", function(_, it)
     local config_store = require("NeoAI.kernel.config_store")
     config_store.load({ tools = { approval = { mode = "prompt", per_tool = {} } } })
     local tool_service = require("NeoAI.services.tool_service")
-    local async = require("NeoAI.utils.async")
     local agent = { id = "test-agent" }
-    local called = false
     -- 注入简单工具
     local registry = require("NeoAI.tools.registry")
     local helpers = require("NeoAI.tools.builtin.tool_helpers")
     registry.register(helpers.define_tool(
       "simple_echo", "echo", { type = "object", properties = {}, required = {} },
-      function(args, on_success) on_success("echoed") end
+      function(_, on_success) on_success("echoed") end
     ))
     tool_service.set_approval_ui({
       show = function(config)
@@ -825,7 +822,7 @@ tests.suite("tools", function(_, it)
     registry.register(helpers.define_tool(
       "ws_tool", "工作目录工具",
       { type = "object", properties = { file_path = { type = "string" } }, required = { "file_path" } },
-      function(args, on_success) ran = true; on_success("ok") end,
+      function(_, on_success) ran = true; on_success("ok") end,
       { category = "agent" }
     ))
     tool_service.set_approval_ui({
@@ -854,7 +851,7 @@ tests.suite("tools", function(_, it)
     local tool_service = require("NeoAI.services.tool_service")
     local registry = require("NeoAI.tools.registry")
     local helpers = require("NeoAI.tools.builtin.tool_helpers")
-    registry.register(helpers.define_tool("risky_tool", "危险", { type = "object", properties = {}, required = {} }, function(args, on_success) on_success("should not run") end))
+    registry.register(helpers.define_tool("risky_tool", "危险", { type = "object", properties = {}, required = {} }, function(_, on_success) on_success("should not run") end))
     local ran = false
     tool_service.set_approval_ui({
       show = function(config) config.on_cancel("拒绝") end,
@@ -899,7 +896,7 @@ tests.suite("tools", function(_, it)
     local helpers = require("NeoAI.tools.builtin.tool_helpers")
     registry.register(helpers.define_tool(
       "timeout_tool", "超时工具", { type = "object", properties = {}, required = {} },
-      function(args, on_success) on_success("不应执行") end
+      function(_, on_success) on_success("不应执行") end
     ))
     -- 模拟审批 UI 永不回调（弹窗被覆盖/丢失场景）：此前会永久挂起
     tool_service.set_approval_ui({
@@ -962,7 +959,7 @@ tests.suite("tools", function(_, it)
     -- 文本正常载入；磁盘随后被改为二进制时，persist 必须拒绝回写（不重新保存）。
     local txt = dir .. "/a.txt"
     fs.write_file(txt, "hello\n")
-    local buf = helpers.ensure_buffer(txt)
+    local buf = assert(helpers.ensure_buffer(txt))
     t.not_nil(buf, "文本应载入 buffer")
     t.true_(helpers.is_background_loaded(buf), "应为后台加载")
     vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "changed by ai" })
@@ -1033,7 +1030,7 @@ tests.suite("tools", function(_, it)
     if vim.fn.bufnr(path) >= 1 then pcall(vim.api.nvim_buf_delete, vim.fn.bufnr(path), { force = true }) end
     fs.write_file(path, "hello\n")
     local done = false
-    executor.execute("lsp_hover", { file_path = path, line = 1, col = 1, description = "测试悬停信息" }):then_(function(r)
+    executor.execute("lsp_hover", { file_path = path, line = 1, col = 1, description = "测试悬停信息" }, {}):then_(function(r)
       done = true
       t.true_(false, "无客户端不应成功: " .. tostring(r))
     end, function(e)
@@ -1135,7 +1132,7 @@ tests.suite("tools", function(_, it)
   end
 
   it("lsp_diagnostics 每次调用都重新拉取（pull，非缓存）", function(t)
-    local diag = _lsp_tool("lsp_diagnostics")
+    local diag = assert(_lsp_tool("lsp_diagnostics"))
     t.not_nil(diag, "应暴露 lsp_diagnostics")
     local fs = require("NeoAI.utils.fs")
     local path = "/tmp/neoai_diag_pull.lua"
@@ -1175,7 +1172,7 @@ tests.suite("tools", function(_, it)
   end)
 
   it("lsp_diagnostics 无 pull 客户端时强制 didChange 并等待重新发布（push）", function(t)
-    local diag = _lsp_tool("lsp_diagnostics")
+    local diag = assert(_lsp_tool("lsp_diagnostics"))
     t.not_nil(diag, "应暴露 lsp_diagnostics")
     local fs = require("NeoAI.utils.fs")
     local path = "/tmp/neoai_diag_push.lua"
@@ -1233,7 +1230,7 @@ tests.suite("tools", function(_, it)
     -- 后台加载：修改后应落盘
     local bg_path = "/tmp/neoai_bg_persist.txt"
     fs.write_file(bg_path, "bg-original\n")
-    local bg = helpers.ensure_buffer(bg_path)
+    local bg = assert(helpers.ensure_buffer(bg_path))
     t.true_(helpers.is_background_loaded(bg))
     pcall(vim.api.nvim_buf_set_text, bg, 0, 0, 0, -1, { "bg-persisted" })
     -- 未显式标记编辑：只读路径绝不回写（「nvim 读取后重新保存」会损坏文件）
@@ -1270,7 +1267,7 @@ tests.suite("tools", function(_, it)
     local path = "/tmp/neoai_bg_delete.lua"
     fs.write_file(path, "local keep = 1\nlocal remove = 2\n")
     local done = false
-    executor.execute("delete_node", { file_path = path, line = 2, col = 1, description = "删除测试节点" }):then_(function(r)
+    executor.execute("delete_node", { file_path = path, line = 2, col = 1, description = "删除测试节点" }, {}):then_(function(r)
       t.matches("已删除", r)
       done = true
     end, function(e)
@@ -1279,7 +1276,7 @@ tests.suite("tools", function(_, it)
     end)
     local waited = vim.wait(2000, function() return done end)
     t.true_(waited, "delete_node 应成功")
-    local content = fs.read_file(path)
+    local content = assert(fs.read_file(path))
     t.matches("local keep", content or "")
     t.eq(nil, content:find("remove", 1, true), "删除应从磁盘生效")
   end)
@@ -1302,7 +1299,7 @@ tests.suite("tools", function(_, it)
     -- delete_node 定位 removed 节点并删除：此前基于过期 buffer 回写会把 count=100 和
     -- print 行一并覆盖回 42/丢失（编辑全丢）
     local done = false
-    executor.execute("delete_node", { file_path = path, line = 2, col = 1, description = "删除测试节点" }):then_(function()
+    executor.execute("delete_node", { file_path = path, line = 2, col = 1, description = "删除测试节点" }, {}):then_(function()
       done = true
     end, function(e)
       t.true_(false, "不应失败: " .. tostring(e))
@@ -1310,7 +1307,7 @@ tests.suite("tools", function(_, it)
     end)
     local waited = vim.wait(2000, function() return done end)
     t.true_(waited, "delete_node 应成功")
-    local content = fs.read_file(path)
+    local content = assert(fs.read_file(path))
     t.matches("local count = 100", content or "", "edit_file 写入的新值不应被回写覆盖")
     t.matches("appended", content or "", "edit_file 追加的行不应丢失")
     t.eq(nil, content:find("local count = 42", 1, true), "旧值 42 不应被回写覆盖")
@@ -1332,7 +1329,7 @@ tests.suite("tools", function(_, it)
       file_path = path,
       query = "(dot_index_expression table: (identifier) @obj field: (identifier) @field)",
       description = "查询测试语法树",
-    }):then_(function(r)
+    }, {}):then_(function(r)
       t.matches("obj", r)
       t.matches("field", r)
       done = true
@@ -1358,7 +1355,7 @@ tests.suite("tools", function(_, it)
       file_path = path,
       query = "(dot_index_expression object: (identifier) @obj field: (identifier) @field)",
       description = "验证非法字段名纠错",
-    }):then_(function(r)
+    }, {}):then_(function(r)
       t.true_(false, "非法字段名不应成功: " .. tostring(r))
       done = true
     end, function(e)
@@ -1388,11 +1385,11 @@ tests.suite("tools", function(_, it)
     -- 模拟"已附加但永不响应"的服务器：buf_request 返回非空客户端映射但从不回调。
     -- 修复前工具会挂到 executor 超时（默认 30s）；现在应按请求级超时快速失败。
     local orig = vim.lsp.buf_request
-    vim.lsp.buf_request = function(bnr, method, params, cb)
+    vim.lsp.buf_request = function(_, _, _, _)
       return { [1] = 1 }
     end
     local done = false
-    executor.execute("lsp_type_definition", { file_path = path, line = 5, col = 9, description = "测试类型定义" }):then_(function(r)
+    executor.execute("lsp_type_definition", { file_path = path, line = 5, col = 9, description = "测试类型定义" }, {}):then_(function(r)
       t.true_(false, "不应成功: " .. tostring(r))
       done = true
     end, function(e)
@@ -1412,7 +1409,7 @@ tests.suite("tools", function(_, it)
     -- 后台加载后磁盘被 edit_file 直写覆盖：buffer 仍为旧内容
     local path = "/tmp/neoai_sync_bug1.lua"
     fs.write_file(path, "local old_name = 1\n")
-    local buf = helpers.ensure_buffer(path)
+    local buf = assert(helpers.ensure_buffer(path))
     t.true_(vim.deep_equal({ "local old_name = 1" }, vim.api.nvim_buf_get_lines(buf, 0, -1, false)))
     fs.write_file(path, "local new_name = 2\n")
     t.true_(vim.deep_equal({ "local old_name = 1" }, vim.api.nvim_buf_get_lines(buf, 0, -1, false)), "磁盘直写不应更新 buffer")
@@ -1423,7 +1420,7 @@ tests.suite("tools", function(_, it)
     -- 有未保存改动时绝不覆盖
     local p2 = "/tmp/neoai_sync_bug1b.lua"
     fs.write_file(p2, "keep me\n")
-    local b2 = helpers.ensure_buffer(p2)
+    local b2 = assert(helpers.ensure_buffer(p2))
     pcall(vim.api.nvim_buf_set_text, b2, 0, 0, -1, -1, { "user edit" })
     fs.write_file(p2, "disk overwrite\n")
     helpers.sync_buffer_from_disk(b2)
@@ -1431,7 +1428,7 @@ tests.suite("tools", function(_, it)
     -- 无换行的文件 sync 后 eol 保持 false
     local p3 = "/tmp/neoai_sync_bug1c.txt"
     fs.write_file(p3, "a\nb")
-    local b3 = helpers.ensure_buffer(p3)
+    local b3 = assert(helpers.ensure_buffer(p3))
     fs.write_file(p3, "x\ny")
     helpers.sync_buffer_from_disk(b3)
     t.false_(vim.bo[b3].eol, "无末行换行的文件 sync 后 eol 应为 false")
@@ -1484,7 +1481,7 @@ tests.suite("tools", function(_, it)
     -- （targetUri/targetRange，无 uri/range）。修复前 loc.uri 为 nil → 解析抛异常
     -- → 被 then_ 派生 Deferred 吞掉 → 挂到 executor 超时（30s）。
     local orig = vim.lsp.buf_request
-    vim.lsp.buf_request = function(bnr, method, params, cb)
+    vim.lsp.buf_request = function(_, _, _, cb)
       cb(nil, { {
         targetUri = "file:///tmp/x.lua",
         targetRange = { start = { line = 0, character = 6 }, ["end"] = { line = 0, character = 11 } },
@@ -1492,7 +1489,7 @@ tests.suite("tools", function(_, it)
       return { [1] = 1 }
     end
     local done = false
-    executor.execute("lsp_type_definition", { file_path = path, line = 1, col = 1, description = "测试类型定义" }):then_(function(r)
+    executor.execute("lsp_type_definition", { file_path = path, line = 1, col = 1, description = "测试类型定义" }, {}):then_(function(r)
       t.matches("/tmp/x.lua:1:6", r)
       done = true
     end, function(e)
@@ -1521,12 +1518,12 @@ tests.suite("tools", function(_, it)
     -- 返回畸形位置（既非 Location 也非 LocationLink）：处理器抛异常。
     -- 修复前异常被吞 → 工具挂到 executor 超时；现在应快速 on_error。
     local orig = vim.lsp.buf_request
-    vim.lsp.buf_request = function(bnr, method, params, cb)
+    vim.lsp.buf_request = function(_, _, _, cb)
       cb(nil, { { targetUri = nil } })
       return { [1] = 1 }
     end
     local done = false
-    executor.execute("lsp_type_definition", { file_path = path, line = 1, col = 1, description = "测试类型定义" }):then_(function(r)
+    executor.execute("lsp_type_definition", { file_path = path, line = 1, col = 1, description = "测试类型定义" }, {}):then_(function(r)
       t.true_(false, "畸形结果不应成功: " .. tostring(r))
       done = true
     end, function(e)
@@ -1557,9 +1554,10 @@ tests.suite("tools", function(_, it)
     -- 有客户端但不支持该请求（如 Copilot 不支持 textDocument/declaration）：
     -- buf_request 返回 {}，应报"不支持请求"而非误导为"无 LSP 客户端"。
     vim.lsp.buf_request = function() return {} end
+    ---@diagnostic disable-next-line: duplicate-set-field
     vim.lsp.get_clients = function() return { { id = 1, name = "copilot" } } end
     local done = false
-    executor.execute("lsp_declaration", { file_path = path, line = 1, col = 1, description = "测试声明位置" }):then_(function(r)
+    executor.execute("lsp_declaration", { file_path = path, line = 1, col = 1, description = "测试声明位置" }, {}):then_(function(r)
       t.true_(false, "不支持请求不应成功: " .. tostring(r))
       done = true
     end, function(e)
@@ -1570,8 +1568,9 @@ tests.suite("tools", function(_, it)
     t.true_(waited, "不支持请求应快速失败")
     -- 完全无客户端：仍报"无 LSP 客户端"
     done = false
+    ---@diagnostic disable-next-line: duplicate-set-field
     vim.lsp.get_clients = function() return {} end
-    executor.execute("lsp_declaration", { file_path = path, line = 1, col = 1, description = "测试声明位置" }):then_(function(r)
+    executor.execute("lsp_declaration", { file_path = path, line = 1, col = 1, description = "测试声明位置" }, {}):then_(function(r)
       t.true_(false, "无客户端不应成功: " .. tostring(r))
       done = true
     end, function(e)
@@ -1617,5 +1616,40 @@ tests.suite("tools", function(_, it)
     local names_restored = def_names()
     t.eq(env.git_available(), vim.tbl_contains(names_restored, "git_status"),
       "git 工具暴露与否应与 git 环境一致")
+  end)
+
+  it("registry：opencode 风格工具名别名解析", function(t)
+    local registry = require("NeoAI.tools.registry")
+    registry.reset()
+    local helpers = require("NeoAI.tools.builtin.tool_helpers")
+    for _, n in ipairs({ "run_command", "list_files", "search_files", "web_fetch", "create_sub_agent", "todo_write" }) do
+      registry.register(helpers.define_tool(n, "x", nil, function() end))
+    end
+    t.eq("run_command", registry.resolve_name("bash"))
+    t.eq("list_files", registry.resolve_name("glob"))
+    t.eq("search_files", registry.resolve_name("grep"))
+    t.eq("web_fetch", registry.resolve_name("webfetch"))
+    t.eq("create_sub_agent", registry.resolve_name("task"))
+    t.eq("todo_write", registry.resolve_name("todowrite"))
+  end)
+
+  it("executor：opencode 参数别名归一化（filePath/pattern/glob）", function(t)
+    local registry = require("NeoAI.tools.registry")
+    registry.reset()
+    local config_store = require("NeoAI.kernel.config_store")
+    config_store.load({ tools = { approval = { mode = "auto_allow" } } })
+    local executor = require("NeoAI.tools.executor")
+    registry.register_many(require("NeoAI.tools.builtin.file_ops").get_tools())
+    local fs = require("NeoAI.utils.fs")
+    local dir = vim.fn.tempname()
+    vim.fn.mkdir(dir, "p")
+    fs.write_file(dir .. "/a.lua", "needle\n")
+    local s = t.await(executor.execute("search_files",
+      { path = dir, pattern = "needle", glob = "*.lua", description = "别名搜索" }, {}))
+    t.matches("a.lua", tostring(s), "pattern/glob 别名应生效")
+    local c = t.await(executor.execute("read_file",
+      { filePath = dir .. "/a.lua", description = "别名读取" }, {}))
+    t.matches("needle", tostring(c), "filePath 别名应生效")
+    vim.fn.delete(dir, "rf")
   end)
 end)

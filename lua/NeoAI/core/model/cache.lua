@@ -1,5 +1,5 @@
 --- 模型列表本地缓存
---- @module NeoAI.core.model.cache
+--- @module 'NeoAI.core.model.cache'
 --- 将 API 获取的模型列表缓存到磁盘，网络失败时作为 fallback。
 --- 纯文件操作 + 读取，无异步。
 

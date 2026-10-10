@@ -1,5 +1,5 @@
 --- NeoAI lualine 扩展
---- @module lualine.extensions.neoai
+--- @module 'lualine.extensions.neoai'
 --- 在聊天主消息窗口（filetype == 'neoai'）内，用 NeoAI 状态栏代替默认状态栏；
 --- 输入框等其它 NeoAI buffer 保留用户自己的 lualine，不被污染。刻意简洁：
 ---   第 1 行（winbar）：身份 —— 模式 / 模型 / 状态

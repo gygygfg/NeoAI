@@ -1,5 +1,5 @@
 --- 思考过程面板
---- @module NeoAI.ui.components.reasoning_panel
+--- @module 'NeoAI.ui.components.reasoning_panel'
 --- 在独立浮动窗口展示 AI 推理内容，支持实时追加与关闭。
 --- 依托复用组件 float_stream_window；保留 open/show/append/close/is_open/reset API。
 

@@ -1,5 +1,5 @@
 --- 子 Agent 结果回传测试
---- @module NeoAI.tests.test_sub_agent_result
+--- @module 'NeoAI.tests.test_sub_agent_result'
 
 local tests = require("NeoAI.tests")
 
@@ -70,9 +70,11 @@ tests.suite("sub_agent_result", function(_, it)
     plan.reset()
     -- stub runtime.spawn/run 避免真实启动子 Agent
     local orig_spawn, orig_run = runtime.spawn, runtime.run
-    runtime.spawn = function(_, opts)
+    ---@diagnostic disable-next-line: duplicate-set-field
+    runtime.spawn = function(_, _)
       return { id = "fake_sub", tools = {}, messages = {} }
     end
+    ---@diagnostic disable-next-line: duplicate-set-field
     runtime.run = function(_, _)
       return async.resolve({ content = "done" })
     end

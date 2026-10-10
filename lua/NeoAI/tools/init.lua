@@ -1,5 +1,5 @@
 --- 工具系统入口
---- @module NeoAI.tools
+--- @module 'NeoAI.tools'
 --- 初始化工具注册表 + 加载内置工具 + 应用审批配置。
 --- 插件化后：内置工具由各自插件（tool.*）调用 load_module/unload_module 独立加载与释放；
 --- init({ builtin = false }) 仅应用审批配置，供 services.tools 插件使用。
@@ -18,6 +18,30 @@ local state = {
   approval_applied = false,
   loaded = {}, -- module_name -> { tool_name, ... }
 }
+
+--- 工具使用约定的共享系统提示段：只出现一次，替代各工具描述里的重复样板
+--- （description 必填、输出截断回读、git repo 默认、交互式命令应答等），降低提示词规模。
+local TOOL_CONVENTIONS = table.concat({
+  "## 工具约定",
+  "- 每个工具都必填 `description`（一句话说明本次调用目的与预期）。",
+  "- 行号均 1-based；路径参数自动展开 `~`/`$VAR`。",
+  "- 输出超限时截断为「头+尾」，完整内容落盘到沙箱私有 /tmp 并在结果中给出路径，用 `read_file`（offset/limit）回读。",
+  "- `git_*` 的 `repo` 缺省=当前会话仓库。",
+  "- `run_command` 为交互式 PTY：等待输入时由系统按 description 自动应答；需精确控制可调用 `terminal_send_text`/`terminal_send_keys`/`terminal_kill`。",
+}, "\n")
+
+local _conventions_unreg = nil
+
+--- 注册工具约定提示段（经 kernel.core_bridge，tools 不直接依赖 core；幂等）。
+local function _register_conventions()
+  if _conventions_unreg then return end
+  local ok, unreg = pcall(function()
+    local prefix = require("NeoAI.kernel.core_bridge").prefix()
+    if not prefix or type(prefix.register_section) ~= "function" then return nil end
+    return prefix.register_section("tools:conventions", 100, TOOL_CONVENTIONS)
+  end)
+  if ok and type(unreg) == "function" then _conventions_unreg = unreg end
+end
 
 --- 内置工具模块表
 local BUILTIN_MODULES = {
@@ -105,6 +129,7 @@ function M.init(opts)
   if not state.approval_applied then
     M.apply_approval()
   end
+  _register_conventions()
 
   local tools_cfg = config_store.get("tools") or {}
   if opts.builtin ~= false and tools_cfg.builtin ~= false then
@@ -176,6 +201,7 @@ end
 function M.reset()
   state.approval_applied = false
   state.loaded = {}
+  if _conventions_unreg then pcall(_conventions_unreg); _conventions_unreg = nil end
 end
 
 --- 工具系统子模块引用

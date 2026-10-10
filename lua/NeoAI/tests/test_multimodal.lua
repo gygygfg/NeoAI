@@ -1,5 +1,5 @@
 --- 多模态 / 附件测试
---- @module NeoAI.tests.test_multimodal
+--- @module 'NeoAI.tests.test_multimodal'
 
 local tests = require("NeoAI.tests")
 local config_store = require("NeoAI.kernel.config_store")
@@ -244,11 +244,11 @@ tests.suite("multimodal", function(_, it, before_each)
     -- 写入真实测试图像文件
     local path = "/tmp/opencode/neoai_test_img.png"
     os.execute("mkdir -p /tmp/opencode")
-    local f = io.open(path, "wb")
+    local f = assert(io.open(path, "wb"))
     f:write(PNG)
     f:close()
 
-    local image_tool = registry.get("read_image")
+    local image_tool = assert(registry.get("read_image"))
     t.not_nil(image_tool, "read_image 已注册")
 
     -- 非视觉模型：门禁拒绝
@@ -283,13 +283,13 @@ tests.suite("multimodal", function(_, it, before_each)
     if not registry.has("read_image") then
       require("NeoAI.tools").reload_tools()
     end
-    local image_tool = registry.get("read_image")
+    local image_tool = assert(registry.get("read_image"))
     t.not_nil(image_tool, "read_image 已注册")
 
     -- 准备 PNG 文件 + 本地 HTTP 服务（python3 http.server 提供 /tmp 下的静态文件）
     os.execute("mkdir -p /tmp/opencode/neoai_www")
     local spath = "/tmp/opencode/neoai_www/t.png"
-    local f = io.open(spath, "wb")
+    local f = assert(io.open(spath, "wb"))
     f:write(PNG)
     f:close()
 
@@ -360,15 +360,17 @@ tests.suite("multimodal", function(_, it, before_each)
   it("read_image：相对路径 ./ 规范化为无 ./ 的绝对路径", function(t)
     local registry = require("NeoAI.tools.registry")
     if not registry.has("read_image") then require("NeoAI.tools").reload_tools() end
-    local tool = registry.get("read_image")
+    local tool = assert(registry.get("read_image"))
     t.not_nil(tool, "read_image 已注册")
     os.execute("mkdir -p /tmp/opencode/imsub/_crops")
-    local f = io.open("/tmp/opencode/imsub/_crops/ck.png", "wb")
+    local f = assert(io.open("/tmp/opencode/imsub/_crops/ck.png", "wb"))
     f:write(PNG)
     f:close()
     local saved = vim.fn.getcwd()
     vim.fn.chdir("/tmp/opencode/imsub")
-    local ok, res = false, nil
+    local ok = false
+    ---@type any
+    local res = nil
     local err = nil
     tool.func({ file_path = "./_crops/ck.png" }, function(r) res = r; ok = true end,
       function(e) err = e end, { agent = { model = "deepseek-v4-flash-vision-exp" } })

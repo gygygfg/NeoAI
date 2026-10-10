@@ -1,9 +1,10 @@
 --- 三协议编解码测试（messages / tools / image / usage / stream）
---- @module NeoAI.tests.test_protocol_adapter
+--- @module 'NeoAI.tests.test_protocol_adapter'
 
 local tests = require("NeoAI.tests")
 
 tests.suite("protocol_adapter", function(_, it)
+  ---@type table<string, any>
   local adapter = require("NeoAI.core.model.adapter")
 
   local IMG = { type = "image", media_type = "image/png", base64 = "AAAA" }

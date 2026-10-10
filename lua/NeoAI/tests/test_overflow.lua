@@ -1,5 +1,5 @@
 --- 上下文溢出恢复测试
---- @module NeoAI.tests.test_overflow
+--- @module 'NeoAI.tests.test_overflow'
 
 local tests = require("NeoAI.tests")
 
@@ -15,6 +15,7 @@ tests.suite("overflow", function(_, it)
     t.false_(request.is_context_overflow({ kind = "http", status = 401, message = "unauthorized" }))
     t.false_(request.is_context_overflow({ kind = "http", status = 500, message = "server error" }))
     t.false_(request.is_context_overflow({ kind = "aborted" }))
+    ---@diagnostic disable-next-line: param-type-mismatch
     t.false_(request.is_context_overflow("string error"))
   end)
 

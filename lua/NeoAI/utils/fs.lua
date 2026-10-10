@@ -1,5 +1,5 @@
 --- 文件系统操作
---- @module NeoAI.utils.fs
+--- @module 'NeoAI.utils.fs'
 --- 纯工具函数，封装 vim.fn 与 io 的文件操作，含 JSONL 追加/撕裂行恢复。
 --- 同步版本供内部/测试使用；异步版本（*_async）把阻塞式 I/O 移出 nvim 主线程，
 --- 经 utils.work 在线程池执行，避免大文件 / 递归搜索卡住主界面。
@@ -68,7 +68,8 @@ end
 
 --- 读取整个文件
 --- @param path string
---- @return string|nil, string|nil 内容, 错误
+--- @return string|nil 内容
+--- @return string|nil 错误
 function M.read_file(path)
   local ok, data = pcall(function()
     local f = io.open(path, "rb")
@@ -91,6 +92,9 @@ local function _write_file(path, content, mode)
   -- Lua I/O 通常返回 nil, err，而不是抛异常；缓冲写入也可能到 close 才失败。
   local called, written, write_err = pcall(f.write, f, content)
   local closed, close_err = f:close()
+  -- pcall 失败时错误对象位于第 2 个返回值 `written`（LuaLS 按 f.write 的声明类型 file*? 推断，
+  -- 实际为错误文本）；此处保留原样以不改动运行时行为。
+  ---@diagnostic disable-next-line: return-type-mismatch
   if not called then return false, written end
   if not written then return false, write_err end
   if not closed then return false, close_err end
@@ -215,6 +219,7 @@ end
 --- 崩溃时最后一行可能不完整，截断即可
 --- @param path string
 --- @return boolean 是否有撕裂行被截断
+--- @return string|nil 错误信息
 function M.repair_jsonl(path)
   if not M.exists(path) then return false end
   local f = io.open(path, "rb")
@@ -427,12 +432,18 @@ end
 --- 线程内按块逐行读取，避免一次性把超大文件读入内存。
 --- 注意：工作函数经 string.dump 序列化后不携带 upvalue，此函数必须定义在
 --- _read_worker 内部（作为局部函数），不能作为外部 upvalue 引用。
---- @param f file* 已打开的文件
+--- @param filepath string 文件路径
 --- @param start_line number 起始行（1-based）
 --- @param end_line number|0 结束行（0 = 到文件末尾）
---- @param cap number 累计输出字节上限
+--- @param max_bytes number 累计输出字节上限
 --- @return string 选中行拼接
 local function _read_worker(filepath, start_line, end_line, max_bytes)
+  --- @param f file* 已打开的文件
+  --- @param first number 起始行（1-based）
+  --- @param last number|0 结束行（0 = 到文件末尾）
+  --- @param cap number 累计输出字节上限
+  --- @param trailing_nl boolean|nil 文件是否以换行结尾
+  --- @return string 选中行拼接
   local function read_lines_bounded(f, first, last, cap, trailing_nl)
     local chunk_size = 65536
     local finish = (last and last > 0) and last or math.huge

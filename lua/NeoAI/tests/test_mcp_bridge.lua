@@ -1,5 +1,5 @@
 --- MCP 管理器桥接测试（init → 连接 → 注册 → 调用）
---- @module NeoAI.tests.test_mcp_bridge
+--- @module 'NeoAI.tests.test_mcp_bridge'
 --- 用 monkeypatch transports.create 注入内存传输，模拟一次完整 MCP 连接：
 --- 验证工具/资源/提示被注册进 registry，且模型可经工具 func 调用远端 tools/call。
 
@@ -54,6 +54,7 @@ tests.suite("mcp_bridge", function(_, it, before_each)
   end)
 
   it("连接后注册 mcp 工具并可通过 func 调用", function(t)
+    ---@type table<string, any>
     local transports = require("NeoAI.services.mcp.transports")
     local orig_create = transports.create
     transports.create = function() return _fake_transport() end
@@ -69,7 +70,7 @@ tests.suite("mcp_bridge", function(_, it, before_each)
     t.true_(ready, "demo 服务器应连上并就绪")
 
     -- tools/list 已注册为 NeoAI 工具
-    local def = registry.get("mcp__demo__get_time")
+    local def = assert(registry.get("mcp__demo__get_time"))
     t.not_nil(def, "应注册 mcp__demo__get_time")
     t.eq("mcp", def.category)
     t.eq("mcp", def.source)
@@ -77,7 +78,7 @@ tests.suite("mcp_bridge", function(_, it, before_each)
     t.eq("get_time", def.mcp_tool)
 
     -- 通过工具 func 调用 tools/call
-    local got_success, out = nil
+    local got_success, out = nil, nil
     def.func({ fmt = "%H:%M" }, function(v) got_success = true; out = v end, function(e) out = e end)
     t.true_(vim.wait(4000, function() return got_success ~= nil end), "工具调用应 resolve")
     t.matches("12:00", tostring(out))
@@ -89,7 +90,7 @@ tests.suite("mcp_bridge", function(_, it, before_each)
     t.not_nil(registry.get("mcp__demo__get_prompt"))
 
     -- 资源读取
-    local r_ok, r_str = nil
+    local r_ok, r_str = nil, nil
     registry.get("mcp__demo__read_resource").func({ uri = "file:///x" }, function(v) r_ok = true; r_str = v end, function(e) r_str = e end)
     t.true_(vim.wait(4000, function() return r_ok ~= nil end), "资源读取应 resolve")
     t.matches("resource%-body", tostring(r_str))
@@ -116,6 +117,7 @@ tests.suite("mcp_bridge", function(_, it, before_each)
   end)
 
   it("refresh 变更检测：工具名变化才报告 changed", function(t)
+    ---@type table<string, any>
     local transports = require("NeoAI.services.mcp.transports")
     local orig_create = transports.create
     -- 可变工具集的假传输：tools/list 返回 ft.tools
@@ -167,6 +169,7 @@ tests.suite("mcp_bridge", function(_, it, before_each)
   end)
 
   it("refresh 差量更新：移除消失的工具、保留其余", function(t)
+    ---@type table<string, any>
     local transports = require("NeoAI.services.mcp.transports")
     local orig_create = transports.create
     local function tool(n)
@@ -210,6 +213,7 @@ tests.suite("mcp_bridge", function(_, it, before_each)
   end)
 
   it("并发 refresh 合并：同一服务器在途刷新复用同一 Deferred，仅一次 tools/list", function(t)
+    ---@type table<string, any>
     local transports = require("NeoAI.services.mcp.transports")
     local orig_create = transports.create
     local list_calls = 0
@@ -254,6 +258,7 @@ tests.suite("mcp_bridge", function(_, it, before_each)
   end)
 
   it("shutdown 注销本服务器工具，避免幽灵工具残留", function(t)
+    ---@type table<string, any>
     local transports = require("NeoAI.services.mcp.transports")
     local orig_create = transports.create
     transports.create = function() return _fake_transport() end

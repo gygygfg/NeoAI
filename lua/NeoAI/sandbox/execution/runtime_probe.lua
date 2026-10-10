@@ -1,5 +1,5 @@
 --- 沙箱运行时探测助手
---- @module NeoAI.sandbox.execution.runtime_probe
+--- @module 'NeoAI.sandbox.execution.runtime_probe'
 --- 从 runtime.lua 抽出的无状态纯函数（不引用模块状态；内部相互调用保持原样）。
 
 --- 宿主逻辑 CPU 数

@@ -1,5 +1,5 @@
 --- 集成测试
---- @module NeoAI.tests.test_integration
+--- @module 'NeoAI.tests.test_integration'
 --- 完整流程：Agent 生成 → 工具调用 → 工具执行 → 最终回复。
 --- 使用内置 mock LLM server（jobstart），不依赖外部网络。
 
@@ -43,7 +43,7 @@ tests.suite("integration", function(_, it)
       registry.register(helpers.define_tool(
         "mock_add", "adds numbers",
         { type = "object", properties = { a = { type = "number" }, b = { type = "number" } }, required = { "a", "b" } },
-        function(args, on_success) on_success("sum is 3") end,
+        function(_, on_success) on_success("sum is 3") end,
         { category = "system" }
       ))
 
@@ -67,7 +67,7 @@ tests.suite("integration", function(_, it)
   end)
 
   it("取消生成（abort）", function(t)
-    local async = require("NeoAI.utils.async")
+    local _ = require("NeoAI.utils.async")
     local runtime = require("NeoAI.core.agent.runtime")
     runtime.reset()
     local a = runtime.create({})
@@ -128,7 +128,7 @@ http.server.HTTPServer(("127.0.0.1", 8951), H).serve_forever()
     local b_started_before_a_done = false
     registry.register(helpers.define_tool(
       "tool_serial_a", "A", { type = "object", properties = {}, required = {} },
-      function(args, on_success)
+      function(_, on_success)
         order[#order + 1] = "a_start"
         async.sleep(60):then_(function()
           order[#order + 1] = "a_done"
@@ -138,7 +138,7 @@ http.server.HTTPServer(("127.0.0.1", 8951), H).serve_forever()
     ))
     registry.register(helpers.define_tool(
       "tool_serial_b", "B", { type = "object", properties = {}, required = {} },
-      function(args, on_success)
+      function(_, on_success)
         order[#order + 1] = "b_start"
         -- 并行：B 启动时 A 应仍在运行（a_done 尚未出现）
         local a_done_yet = false
@@ -275,11 +275,11 @@ http.server.HTTPServer(("127.0.0.1", 8952), H).serve_forever()
     local helpers = require("NeoAI.tools.builtin.tool_helpers")
     registry.register(helpers.define_tool(
       "tool_turn1", "T1", { type = "object", properties = {}, required = {} },
-      function(args, on_success) on_success("t1 ok") end
+      function(_, on_success) on_success("t1 ok") end
     ))
     registry.register(helpers.define_tool(
       "tool_turn2", "T2", { type = "object", properties = {}, required = {} },
-      function(args, on_success) on_success("t2 ok") end
+      function(_, on_success) on_success("t2 ok") end
     ))
 
     local runtime = require("NeoAI.core.agent.runtime")
@@ -425,7 +425,7 @@ http.server.HTTPServer(("127.0.0.1", 8954), H).serve_forever()
     for i = 1, 3 do
       registry.register(helpers.define_tool(
         "tool_req" .. i, "R" .. i, { type = "object", properties = {}, required = {} },
-        function(args, on_success) on_success("ok " .. i) end
+        function(_, on_success) on_success("ok " .. i) end
       ))
     end
 

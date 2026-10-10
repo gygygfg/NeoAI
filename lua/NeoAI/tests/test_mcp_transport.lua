@@ -1,5 +1,5 @@
 --- MCP 传输层测试（stdio 帧解析 / HTTP SSE body 解析 / header 大小写无关）
---- @module NeoAI.tests.test_mcp_transport
+--- @module 'NeoAI.tests.test_mcp_transport'
 
 local tests = require("NeoAI.tests")
 
@@ -67,10 +67,10 @@ tests.suite("mcp_transport", function(_, it)
 
   it("create 按 transport 字段选择传输", function(t)
     local transports = require("NeoAI.services.mcp.transports")
-    local a = transports.create({ transport = "stdio", command = "x" }, { name = "a" })
+    local a = assert(transports.create({ transport = "stdio", command = "x" }, { name = "a" }))
     t.eq("stdio", a.transport)
     t.eq("x", a.command)
-    local b = transports.create({ transport = "http", url = "http://x" }, { name = "b" })
+    local b = assert(transports.create({ transport = "http", url = "http://x" }, { name = "b" }))
     t.eq("http", b.transport)
     t.eq("http://x", b.url)
     t.eq(false, b:is_open())

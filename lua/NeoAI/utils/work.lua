@@ -1,5 +1,5 @@
 --- 工作线程执行器
---- @module NeoAI.utils.work
+--- @module 'NeoAI.utils.work'
 --- 基于 libuv 线程池（vim.uv.new_work）把纯 Lua 计算移出 nvim 主线程，
 --- 避免 CPU 密集 / 阻塞式文件 I/O（如递归目录搜索、大文件读写）卡住主界面。
 --- 约束（libuv 线程）：

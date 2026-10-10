@@ -1,5 +1,5 @@
 --- 跨挂载点工作区检测 + 兼容模式 overlay 规格测试
---- @module NeoAI.tests.test_sandbox_mountview
+--- @module 'NeoAI.tests.test_sandbox_mountview'
 --- 覆盖：mount_root_of 取最深祖先挂载点；cross_mount_root 仅在独立挂载时返回；
 --- build_overlay_specs 的 no_root_overlay（跨挂载点兼容模式）跳过整机根 overlay 探测。
 
@@ -7,6 +7,7 @@ local tests = require("NeoAI.tests")
 
 tests.suite("sandbox_mountview", function(_, it)
   it("mount_root_of 取最深祖先挂载点，cross_mount_root 仅独立挂载时返回", function(t)
+    ---@type table<string, any>
     local rt = require("NeoAI.sandbox.execution.runtime")
     rt.set_mountinfo_for_test({ "/", "/mnt", "/mnt/uuid-1", "/tmp" })
     t.eq("/mnt/uuid-1", rt.mount_root_of("/mnt/uuid-1/Agent沙箱论文/src"))
@@ -20,6 +21,7 @@ tests.suite("sandbox_mountview", function(_, it)
   end)
 
   it("no_root_overlay 兼容模式跳过整机根 overlay，改为覆盖工作区", function(t)
+    ---@type table<string, any>
     local rt = require("NeoAI.sandbox.execution.runtime")
     local wrapper = require("NeoAI.sandbox.execution.wrapper")
     local orig_read_all = rt.read_all
@@ -51,6 +53,7 @@ tests.suite("sandbox_mountview", function(_, it)
   end)
 
   it("内核 overlay 不可用时按配置回退 fuse-overlayfs 根视图", function(t)
+    ---@type table<string, any>
     local rt = require("NeoAI.sandbox.execution.runtime")
     local wrapper = require("NeoAI.sandbox.execution.wrapper")
     local fo = require("NeoAI.sandbox.execution.fuse_overlay")

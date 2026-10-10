@@ -1,5 +1,5 @@
 --- MCP 传输层（stdio / Streamable HTTP）
---- @module NeoAI.services.mcp.transports
+--- @module 'NeoAI.services.mcp.transports'
 --- 两个传输实现统一接口（供 client.lua 消费）：
 ---   open():       启动连接 / 无操作
 ---   send(msg):    发送一条已编码 JSON-RPC 消息（字符串）
@@ -10,7 +10,7 @@
 --- stdio：jobstart 子进程，按行分隔 JSON 帧（MCP 标准：消息分行为 JSON，内嵌换行需转义）。
 --- http：Streamable HTTP POST，支持 application/json 单响应与 text/event-stream SSE。
 
-local async = require("NeoAI.utils.async")
+local _ = require("NeoAI.utils.async")
 local http = require("NeoAI.utils.http")
 local json = require("NeoAI.utils.json")
 local logger = require("NeoAI.kernel.logger")
@@ -204,8 +204,7 @@ function M.stdio(server, opts)
     _schedule_flush(self)
   end
 
-  self.close = function(_, opts)
-    opts = opts or {}
+  self.close = function(_, _)
     self.open_ = false
     if type(self.job) == "number" and self.job > 0 then
       local ok, status = pcall(vim.fn.job_status, self.job)
@@ -334,9 +333,9 @@ function M.http(server, opts)
     end)
   end
 
-  self.close = function(_, opts)
-    opts = opts or {}
-    local terminate = opts.terminate ~= false
+  self.close = function(_, close_opts)
+    close_opts = close_opts or {}
+    local terminate = close_opts.terminate ~= false
     self.open_ = false
     if terminate and self.session_id and self.url then
       local headers = {}

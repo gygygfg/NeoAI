@@ -722,6 +722,7 @@ NeoAI 内置了 40+ 工具，AI 可在对话中自动调用，涵盖以下类别
 | `lsp_completion`        | 获取补全建议        | `file_path`/`line`/`col`（可选） |
 | `lsp_type_definition`   | 获取类型定义        | `file_path`/`line`/`col`（可选） |
 | `lsp_service_info`      | 获取 LSP 服务信息   | 无参数 |
+| `lsp_check`             | 项目级全量诊断（server CLI 检查；目录/glob、严重级别、按 code/路径过滤、summary/text/json、基线比对；单文件与目录结果一致；不依赖 buffer 是否打开） | `path`、`severity`、`format`、`server`、`codes`/`exclude_codes`、`paths`/`exclude_paths`、`limit`、`baseline`（均可选） |
 
 ### 💻 Shell 工具 支持交互式shell 由AI自动填写
 

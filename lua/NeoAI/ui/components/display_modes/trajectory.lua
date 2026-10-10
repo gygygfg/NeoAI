@@ -1,5 +1,5 @@
 --- 显示模式插件：轨迹
---- @module NeoAI.ui.components.display_modes.trajectory
+--- @module 'NeoAI.ui.components.display_modes.trajectory'
 --- 轨迹显示模式（参考 deepseek-harness 的 trajectory 视图）：
 --- 多级折叠，逐层展开：
 --- - 层级 1（turn）：每个 turn（用户请求 → AI 请求 → 工具调用 → 结果）是一个折叠；

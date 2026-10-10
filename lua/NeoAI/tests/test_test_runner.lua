@@ -5,6 +5,7 @@ tests.suite("test_runner", function(_, it)
     local source = debug.getinfo(tests.run_all, "S").source:sub(2)
     local runner = assert(loadfile(source))()
     local glob = vim.fn.glob
+    ---@diagnostic disable-next-line: duplicate-set-field
     vim.fn.glob = function() return files end
     local ok, err = xpcall(function() fn(runner) end, function(e) return e end)
     vim.fn.glob = glob

@@ -1,5 +1,5 @@
 --- 沙箱密钥防护：熵检测 + **格式保真假密钥**（进沙箱假化 / 出沙箱 commit 时还原）
---- @module NeoAI.sandbox.secret.secret
+--- @module 'NeoAI.sandbox.secret.secret'
 --- 常开（配置 `tools.sandbox.secrets` 可调阈值/关闭）。职责：
 ---   1. 基于香农熵 + 字符集启发式检测高熵密钥候选；
 ---   2. 为每个真实密钥生成**格式保真假密钥**（前缀/长度/字符类一致，熵不低于原始；
@@ -18,7 +18,6 @@ local M = {}
 
 -- ========== 私有常量 ==========
 
-local TOKEN_PREFIX = "NEOKEY_"
 -- 敏感环境变量名段（与 SCAN_SRC 内同名常量保持一致；模块级供工作线程参数传递）
 local NAME_SEGMENTS = {
   "KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL", "CREDENTIALS",
@@ -1002,7 +1001,7 @@ end
 
 --- 解析工作线程结果：seq, new_entries, out_texts
 --- @param enc string
---- @return number seq
+--- @return number|nil seq
 --- @return table new entries { {secret, token, rule?} }
 --- @return table out_texts
 local function _decode_result(enc)
@@ -1193,7 +1192,7 @@ end
 --- @return string 编码结果（每文件：token 数+token 列表，hits 数+各 hit 的 value/entropy/rule）
 local function _analyze_worker(cfg_enc, texts_enc, scan_src, fakes_enc)
   local scan = assert(load(scan_src))()
-  local RUN_PAT = "[%w_%-%+]+"
+  local RUN_PATTERN = "[%w_%-%+]+"
   local function make_reader(s)
     local pos = 1
     return function()
@@ -1243,7 +1242,7 @@ local function _analyze_worker(cfg_enc, texts_enc, scan_src, fakes_enc)
     end
     local pos = 1
     while true do
-      local s, e = text:find(RUN_PAT, pos)
+      local s, e = text:find(RUN_PATTERN, pos)
       if not s then break end
       local run = text:sub(s, e)
       local prefix = text:sub(s > 64 and s - 64 or 1, s - 1)
@@ -1425,7 +1424,7 @@ end
 --- @param counter table { n = number }
 --- @return string
 local function _replace_bounded(text, needle, repl, counter)
-  local out, pos, n = {}, 1, #needle
+  local out, pos = {}, 1
   while true do
     local s, e = text:find(needle, pos, true)
     if not s then break end
@@ -1953,6 +1952,10 @@ function M.tokenize_result(value, opts)
   return value
 end
 
+-- 前向声明：非凭据文件判定（哈希/校验和文件、编辑器状态转储 .shada、包缓存等）。
+-- 定义见文件后部（与 is_secret_path/is_sensitive_path 同处）。
+local is_non_credential_path
+
 --- 扫描候选文件内容中的假密钥，返回警告信息（供待审队列展示）
 --- @param files table 候选文件数组
 --- @return table|nil { count, tokens }
@@ -1963,7 +1966,11 @@ function M.warn_for_files(files)
   for fake in pairs(state.fake_set) do fakes[#fakes + 1] = fake end
   if #fakes == 0 then return nil end
   for _, f in ipairs(files or {}) do
-    if type(f.content) == "string" and f.content ~= "" then
+    -- 非凭据文件（哈希/校验和、编辑器状态转储 .shada、git 对象、包缓存等）不是密钥：
+    -- 不参与「密钥操作」计数，避免把 nvim shada 等文件里的高熵片段误报为密钥操作。
+    if type(f.path) == "string" and f.path ~= "" and is_non_credential_path(f.path) then
+      -- skip
+    elseif type(f.content) == "string" and f.content ~= "" then
       for _, fake in ipairs(fakes) do
         if f.content:find(fake, 1, true) then
           count = count + 1
@@ -1978,10 +1985,6 @@ function M.warn_for_files(files)
   table.sort(list)
   return { count = count, tokens = list }
 end
-
--- 前向声明：非凭据文件判定（哈希/校验和文件、编辑器状态转储 .shada、包缓存等）。
--- 定义见文件后部（与 is_secret_path/is_sensitive_path 同处）；此处前向声明以便 detect_generated 引用。
-local is_non_credential_path
 
 --- 检测 AI **生成/写入**的高熵/结构化敏感内容（候选文件内容）。
 --- 与 `warn_for_files`（只识别已假化的宿主密钥）不同：此函数直接对候选内容做熵/具名规则
@@ -2089,6 +2092,8 @@ local NON_CREDENTIAL_BASENAME_PATS = {
 local NON_CREDENTIAL_PATH_PATS = {
   "/shada/",         -- nvim 的 shada 目录
   "/%.git/objects/", -- git 对象库（哈希命名，非凭据）
+  -- nvim 运行时/状态/缓存目录（历史、shada、日志等；非用户凭据）
+  "/%.local/state/nvim/", "/%.local/share/nvim/", "/%.cache/nvim/",
 }
 
 --- 路径是否为公开 CA 证书包/信任库（非密钥）。
@@ -2129,6 +2134,13 @@ is_non_credential_path = function(path)
     if path:find(pat) then return true end
   end
   return is_non_credential_dir(path)
+end
+
+--- 路径是否为非凭据文件（公开：供候选冻结 / 密钥告警判定跳过非凭据文件）。
+--- @param path string|nil
+--- @return boolean
+function M.is_non_credential_path(path)
+  return is_non_credential_path(path)
 end
 
 --- 路径是否疑似密钥文件（宽口径：用于决定是否做高熵扫描）

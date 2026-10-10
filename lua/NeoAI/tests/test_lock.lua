@@ -1,5 +1,5 @@
 --- 跨进程互斥锁与 overlay 挂载锁解析专项测试
---- @module NeoAI.tests.test_lock
+--- @module 'NeoAI.tests.test_lock'
 local tests = require("NeoAI.tests")
 local lock = require("NeoAI.utils.lock")
 

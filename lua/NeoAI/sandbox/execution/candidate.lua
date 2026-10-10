@@ -1,5 +1,5 @@
 --- 沙箱候选服务：私有暂存、冻结、CAS 发布
---- @module NeoAI.sandbox.execution.candidate
+--- @module 'NeoAI.sandbox.execution.candidate'
 --- 隔离执行只写私有暂存副本（工作区映射）或 overlay upper；冻结后计算 candidate_digest；发布做 CAS。
 --- 每次尝试使用独立可写层，不与其他命令共享（设计文档 §4.2/§4.3/§4.5）。
 
@@ -12,6 +12,17 @@ local _perm, _sha, _stat_sig, _read, _candidate_content, _is_text_content =
   candidate_util.read, candidate_util.candidate_content, candidate_util.is_text_content
 
 local M = {}
+
+--- 非凭据文件（哈希/校验和文件、编辑器状态转储 .shada、git 对象库、包缓存等）不做密钥
+--- token 化：这些文件不是用户凭据，token 化只会产生「密钥操作」误报与无谓开销。
+--- @param secret table secret 模块
+--- @param path string|nil
+--- @return boolean true 表示允许 token 化
+local function _tokenize_ok(secret, path)
+  if type(path) ~= "string" or path == "" then return true end
+  if secret.is_non_credential_path and secret.is_non_credential_path(path) then return false end
+  return true
+end
 
 -- ========== 私有状态 ==========
 
@@ -202,7 +213,7 @@ local function _stage_write_worker(encoded)
       local off = 0
       local ok = true
       while off < #content do
-        local w, werr = uv.fs_write(fd, content:sub(off + 1), off)
+        local w, werr = uv.fs_write(fd, assert(content):sub(off + 1), off)
         if not w or w == 0 then ok = false; err = werr; break end
         off = off + w
       end
@@ -386,7 +397,7 @@ local function _base_entry(attempt, real)
     if stat and stat.type == "file" then
       fs.copy_file(real, staged)
       -- 保留原权限位（copyfile 不保证权限；后续 materialize 会据此恢复可执行位）。
-      if stat.mode then fs.chmod(staged, _perm(stat.mode)) end
+      if stat.mode then fs.chmod(staged, assert(_perm(stat.mode))) end
     end
     state.workspace[real] = {
       staged = staged, base_hash = base_hash, mode = _perm(stat and stat.mode),
@@ -406,7 +417,7 @@ local function _base_entry(attempt, real)
       -- keystore/raw key 等）用同长度随机字节假化（整块映射），物化/发布时精确还原真实字节。
       local tok = c
       if _is_text_content(c) then
-        tok = secret.tokenize(c, { entropy = secret.is_secret_path(real) })
+        tok = _tokenize_ok(secret, real) and secret.tokenize(c, { entropy = secret.is_secret_path(real) }) or c
         if tok ~= c then fs.write_file(staged, tok) end
       else
         local cfg = require("NeoAI.kernel.config_store").get("tools.sandbox.secrets") or {}
@@ -758,7 +769,7 @@ function M.mirror_overlay(real_path)
   local tok = raw
   if _is_text_content(raw) then
     local secret = require("NeoAI.sandbox.secret.secret")
-    tok = secret.tokenize(raw, { entropy = secret.is_secret_path(real) })
+    tok = _tokenize_ok(secret, real) and secret.tokenize(raw, { entropy = secret.is_secret_path(real) }) or raw
   end
   fs.write_file(staged, tok)
   if entry then
@@ -1085,6 +1096,7 @@ function M.materialize_overlay(specs, opts)
                 else
                   -- overlay 私有可写层是会话级临时草稿（agentEnd 轮换即清理），无需 fsync 落盘；
                   -- 逐文件 fsync 在暂存量大时是主要卡顿源。
+                  ---@cast content string
                   ok = fs.write_file_atomic(dest, content, { mode = mode, sync = false })
                   if not ok and vim.fn.isdirectory(dest) == 0 then
                     -- 兜底（rename 不适用等）：退回直接写 + chmod；目标为目录时不删目录。
@@ -1165,11 +1177,12 @@ local function _work_parallelism()
   return require("NeoAI.utils.work").parallelism()
 end
 
---- 把已冻结候选的改动合并进工作区暂存映射，使 read_file/edit_file 能看到
---- run_command 产生的改动（双向互通）。
---- @param cand table 冻结候选
---- @param opts table|nil { from_command?: boolean, package?: boolean 包/生成内容跳过 token 化,
+-- 把已冻结候选的改动合并进工作区暂存映射（见 M.merge_candidate）：使 read_file/edit_file 能看到
+-- run_command 产生的改动（双向互通）。
+-- @param cand table 冻结候选
+-- @param opts table|nil { from_command?: boolean, package?: boolean 包/生成内容跳过 token 化,
 ---   resident?: boolean 命令是否在常驻 overlay 内执行（产物已在该 overlay，常驻物化可跳过回写） }
+
 --- 同步「视图同步条目」到工作区暂存（不产生发布候选）：命令还原暂存编辑后，暂存视图必须
 --- 回到命令结果，并撤销该路径上已存在的待审候选（净效果为无改动）。
 --- @param view_files table|nil
@@ -1183,7 +1196,7 @@ local function _apply_view_files(view_files, opts)
     local ws = state.workspace[f.path]
     if ws and ws.staged and not ws.deleted then
       local content = f.content or ""
-      if not opts.package and _is_text_content(content) then
+      if not opts.package and _is_text_content(content) and _tokenize_ok(secret, f.path) then
         content = secret.tokenize(content, { entropy = secret.is_secret_path(f.path) })
       end
       fs.write_file(ws.staged, content)
@@ -1197,6 +1210,8 @@ local function _apply_view_files(view_files, opts)
   end
 end
 
+-- 把已冻结候选的改动合并进工作区暂存映射（见 M.merge_candidate）：使 read_file/edit_file 能看到
+-- run_command 产生的改动（双向互通）。
 function M.merge_candidate(cand, opts)
   opts = opts or {}
   _apply_view_files(cand.view_files, opts)
@@ -1228,8 +1243,8 @@ function M.merge_candidate(cand, opts)
         -- 包/生成内容（site-packages、node_modules 等）不做 token 化：与结算阶段跳过密钥
         -- 检测一致，避免对 venv/依赖树逐文件多次全文扫描（实测数十 MB 需数秒）。
         local content = f.content or ""
-        if not opts.package and _is_text_content(content) then
-          local secret = require("NeoAI.sandbox.secret.secret")
+        local secret = require("NeoAI.sandbox.secret.secret")
+        if not opts.package and _is_text_content(content) and _tokenize_ok(secret, f.path) then
           content = secret.tokenize(content, { entropy = secret.is_secret_path(f.path) })
         end
         fs.write_file(staged, content)
@@ -1269,7 +1284,7 @@ function M.merge_candidate_async(cand, opts)
   for _, f in ipairs(files) do
     if (f.action == "create" or f.action == "modify") and not f.blob then
       -- 仅文本内容做 token 化；二进制（keyring 等）绝不当文本处理；大文件 blob 不做 token 化。
-      if _is_text_content(f.content) then
+      if _is_text_content(f.content) and _tokenize_ok(secret, f.path) then
         texts[#texts + 1] = f.content or ""
         -- 仅疑似密钥文件做高熵扫描（具名规则始终生效）。
         entropy_flags[#entropy_flags + 1] = secret.is_secret_path(f.path)
@@ -1279,7 +1294,7 @@ function M.merge_candidate_async(cand, opts)
   end
   -- 视图同步条目同样需要 token 化后写入暂存（内容来自命令视图，可能含真实密钥）。
   for _, f in ipairs(cand.view_files or {}) do
-    if _is_text_content(f.content) then
+    if _is_text_content(f.content) and _tokenize_ok(secret, f.path) then
       texts[#texts + 1] = f.content or ""
       entropy_flags[#entropy_flags + 1] = secret.is_secret_path(f.path)
       text_files[#text_files + 1] = f
@@ -1718,7 +1733,7 @@ local function _capture_base_blobs(files)
       and not f.large and not f.blob and not f.before_sig and f.before_hash then
       local raw = _read(f.path)
       if raw ~= nil and _is_text_content(raw) and (mcap <= 0 or #raw <= mcap) then
-        local tok = secret.tokenize(raw, { entropy = secret.is_secret_path(f.path) })
+        local tok = _tokenize_ok(secret, f.path) and secret.tokenize(raw, { entropy = secret.is_secret_path(f.path) }) or raw
         local key = "mergebase:" .. tostring(f.path) .. ":" .. tostring(f.before_hash)
         local path = store.blob_path(key)
         if path and store.blobs_dir() and fs.write_file_atomic(path, tok, { mode = 384, sync = false }) then
@@ -1736,9 +1751,9 @@ end
 --- @param child_rel string 相对 real_root 的路径
 --- @param prefetch table|nil 工作线程预取结果 { base_exists, base_type, base_hash,
 ---   staged_is_file, staged_size }；nil 时在主线程 fs_stat/读取/哈希（同步路径）。
---- @param cap number|nil 单文件纳入上限（字节）；nil 时读取配置（逐条读取配置在暂存上万
+--- @param cap_in number|nil 单文件纳入上限（字节）；nil 时读取配置（逐条读取配置在暂存上万
 ---   文件时是结算主线程的固定开销，故由调用方一次性传入）。
-local function _capture_entry(attempt, real_root, staged, child_rel, prefetch, cap)
+local function _capture_entry(attempt, real_root, staged, child_rel, prefetch, cap_in)
   local real = real_root .. "/" .. child_rel
   -- 符号链接：命令创建/修改了链接（如 `systemctl enable` 的 .wants/*.service）。
   -- 以目标字符串登记（不读取/哈希链接目标内容）；发布时 writer action="symlink"。
@@ -1790,7 +1805,7 @@ local function _capture_entry(attempt, real_root, staged, child_rel, prefetch, c
       end
     end
   end
-  local cap = cap or _max_file_bytes()
+  local cap = cap_in or _max_file_bytes()
   local base_exists, base_type, base_hash, base_sig, staged_is_file, staged_size, staged_mode, base_mode, large
   if prefetch then
     base_exists, base_type, base_hash = prefetch.base_exists, prefetch.base_type, prefetch.base_hash
@@ -1856,10 +1871,8 @@ end
 --- 下一次 materialize 会用旧暂存内容把它「复活」。这里显式检测：materialize 记录过 dest、
 --- 现 upper 中已不存在、且真实文件也不存在 → 标记工作区删除并取消该路径的待审变更
 --- （净效果为「无改动」，不产生针对不存在文件的 delete 候选）。
---- @param attempt table
---- @param real_root string
 --- @param upper_root string
-local function _reconcile_deleted(attempt, real_root, upper_root)
+local function _reconcile_deleted(_, _, upper_root)
   local mat = state.materialized[upper_root]
   if not mat then return end
   local superseded = {}
@@ -2399,7 +2412,7 @@ local function _base_hash_worker(input, sha_src, cap)
     -- 在此哈希会白读数百 MB 并占用线程池（日志中同一批超大文件每条命令重复出现即此因）。
     if st and st.type == "file" and not (cap > 0 and (st.size or 0) > cap) then
       local content = ""
-      local f = io.open(real, "rb")
+      local f = io.open(assert(real), "rb")
       if f then content = f:read("*a") or ""; f:close() end
       h = "sha256:" .. sha(content)
     end
@@ -2460,6 +2473,7 @@ local function _classify_paths_worker(payload)
         end
       end
     end
+    ---@type string|boolean
     local gc = false
     local marker = abs:find("/%.git/")
     local prefix_len
@@ -2864,6 +2878,7 @@ end
 function M.finish(attempt_id, prefetch, classify)
   local attempt = state.attempts[attempt_id]
   if not attempt then
+    ---@diagnostic disable-next-line: return-type-mismatch
     return nil
   end
   local files = {}
@@ -3107,7 +3122,7 @@ local function _finish_worker(input, cap, sha_src, blob_dir, force_blob)
       local within = cap <= 0 or (stat.size or 0) <= cap
       if within and force_blob ~= "1" then
         -- 普通内容（小文件）：读入内容并哈希，供候选内嵌/变更判定。
-        local f = io.open(staged, "rb")
+        local f = io.open(assert(staged), "rb")
         if f then content = f:read("*a") or ""; f:close() end
         after_hash = "sha256:" .. sha(content)
       else
@@ -3124,7 +3139,7 @@ local function _finish_worker(input, cap, sha_src, blob_dir, force_blob)
         end
         if within and force_blob == "1" and blob == "" then
           -- 包内容 blob 复制不可用/失败：回退读取内容，绝不产生「无内容且无 blob」的候选。
-          local f = io.open(staged, "rb")
+          local f = io.open(assert(staged), "rb")
           if f then content = f:read("*a") or ""; f:close() end
           after_hash = "sha256:" .. sha(content)
         else
@@ -3255,6 +3270,19 @@ local function _apply_order(files)
   return out
 end
 
+--- 候选是否为「原子整组」（含 git 对象/指针：索引↔对象库↔refs 强耦合，不可部分应用）。
+--- 非原子单元允许部分写入（成功文件落盘、失败文件由上层回队重试）；原子组仍整体失败。
+--- @param files table
+--- @return boolean
+local function _atomic_group(files)
+  local runtime = require("NeoAI.sandbox.execution.runtime")
+  for _, f in ipairs(files or {}) do
+    local gc = f.git_class or runtime.git_path_class(f.path)
+    if gc == "object" or gc == "pointer" then return true end
+  end
+  return false
+end
+
 -- ========== `.git` 保守捕获与发布闸门（防悬空引用） ==========
 -- 背景：写日志（eBPF 写探针）**无丢事件检测**——高并发/海量 syscall 下事件可能被丢弃。
 -- `.git` 是「索引↔对象库↔refs」强耦合数据库：一旦漏捕获某些对象（尤其 stash/rebase 期间
@@ -3338,10 +3366,10 @@ _journal_definitely_no_git = function(root, hint)
   return true
 end
 
+local _pack_oid_cache = nil
 --- 读取 pack `.idx`（v2）排序 oid 表（N×20 字节原始串）；无法解析返回 nil。单条目缓存。
 --- @param idx_path string
 --- @return string|nil
-local _pack_oid_cache = nil
 local function _pack_oid_table(idx_path)
   local st = vim.uv.fs_stat(idx_path)
   if not st then return nil end
@@ -3644,7 +3672,7 @@ function M.publish(candidate, opts)
           if base_raw == nil or ours == nil then
             return { ok = false, state = "CONFLICT", reason = "BASELINE_CHANGED: " .. f.path }
           end
-          local res = merge_mod.merge(base_raw, ours, cur)
+          local res = merge_mod.merge(base_raw, ours, assert(cur))
           if res.ok then
             merged_paths[f.path] = res.merged
           elseif res.too_large then
@@ -3715,7 +3743,12 @@ function M.publish(candidate, opts)
     end
   end
   -- 应用：统一经 writer（先非 root，权限不足 → NEEDS_ROOT，待用户批准 root 写入）。
+  -- 非原子单元允许部分写入：单个文件写入失败不再让整包失败，成功文件照常落盘，
+  -- 失败文件由上层回队重试（见 review._apply_settle 的 PARTIAL 分支）。
   local writer = require("NeoAI.sandbox.execution.writer")
+  local atomic = opts.atomic == true or _atomic_group(candidate.files or {})
+  local allow_partial = not atomic and opts.partial ~= false
+  local applied, failed = {}, {}
   for _, f in ipairs(_apply_order(candidate.files or {})) do
     local action, content
     if f.link then
@@ -3768,18 +3801,25 @@ function M.publish(candidate, opts)
       end
       if res.state == writer.STATE.NEEDS_ROOT then
         return { ok = false, state = "NEEDS_ROOT",
-          reason = res.reason or ("WRITE_REQUIRES_ROOT: " .. f.path) }
+          reason = res.reason or ("WRITE_REQUIRES_ROOT: " .. f.path), applied = applied, failed = failed }
       end
       if not res.ok then
-        return { ok = false, state = "FAILED",
-          reason = "WRITE_FAILED: " .. f.path .. " " .. tostring(res.err) }
+        local reason = "WRITE_FAILED: " .. f.path .. " " .. tostring(res.err)
+        if allow_partial then
+          failed[#failed + 1] = { path = f.path, reason = reason }
+        else
+          return { ok = false, state = "FAILED", reason = reason, applied = applied, failed = failed }
+        end
+      else
+        applied[#applied + 1] = f.path
       end
+    else
+      applied[#applied + 1] = f.path
     end
   end
   -- 已发布到真实工作区：丢弃对应暂存副本，后续编辑重新以真实文件为基线。
-  for _, f in ipairs(candidate.files or {}) do
-    M.invalidate(f.path)
-  end
+  -- 部分失败时仅失效成功落盘的路径：失败文件的暂存副本保留供回队重试。
+  for _, p in ipairs(applied) do M.invalidate(p) end
   local receipt = {
     operation_id = "op_" .. (candidate.candidate_digest or ""):gsub("[^%w]", ""),
     candidate_digest = candidate.candidate_digest,
@@ -3787,9 +3827,15 @@ function M.publish(candidate, opts)
     new_version = candidate.candidate_digest,
     target = "workspace",
     published_at = os.time(),
-    file_count = #(candidate.files or {}),
+    file_count = #applied,
   }
-  return { ok = true, state = "COMMITTED", receipt = receipt }
+  if #failed > 0 then
+    return {
+      ok = false, state = "PARTIAL", reason = ("PARTIAL_WRITE: %d 个文件失败"):format(#failed),
+      applied = applied, failed = failed, receipt = receipt,
+    }
+  end
+  return { ok = true, state = "COMMITTED", receipt = receipt, applied = applied }
 end
 
 --- 候选是否与顺序无关（无删除、无 git 对象/指针）：其写入可并行而无需保序。
@@ -3826,6 +3872,8 @@ local function _publish_worker(payload, sha_src)
   local cas_mode = payload.cas_mode or "hash"
   local cap = tonumber(payload.max_file_bytes) or 0
   local phase = payload.phase or "write"
+  local partial = payload.partial == true
+  local out_applied, out_failed = {}, {}
   local function nn(v) if v == vim.NIL then return nil end; return v end
 
   local function perm_error(err)
@@ -3842,31 +3890,6 @@ local function _publish_worker(payload, sha_src)
     if not (st and st.type == "file" and st.mtime) then return nil end
     return string.format("sig:%s:%s:%s",
       tostring(st.mtime.sec), tostring(st.mtime.nsec), tostring(st.size))
-  end
-  -- 自身运行时/状态根目录（整棵子树不捕获）：解码后按前缀跳过。
-  local self_roots = {}
-  do
-    local nl = type(self_encoded) == "string" and self_encoded:find("\n", 1, true)
-    if nl then
-      local n = tonumber(self_encoded:sub(1, nl - 1)) or 0
-      local pos = nl + 1
-      for _ = 1, n do
-        local colon = self_encoded:find(":", pos, true)
-        if not colon then break end
-        local len = tonumber(self_encoded:sub(pos, colon - 1)) or 0
-        self_roots[#self_roots + 1] = self_encoded:sub(colon + 1, colon + len)
-        pos = colon + len + 1
-      end
-    end
-  end
-  --- 路径是否位于某个自身运行时/状态根之下（含根本身）。
-  --- @param real string
-  --- @return boolean
-  local function is_self(real)
-    for _, r in ipairs(self_roots) do
-      if real == r or real:sub(1, #r + 1) == r .. "/" then return true end
-    end
-    return false
   end
   local function read_all(path)
     local f = io.open(path, "rb")
@@ -3981,14 +4004,17 @@ local function _publish_worker(payload, sha_src)
         local st = uv.fs_lstat(path)
         if st then
           if st.type == "directory" then
-            return { status = "error", reason = "SYMLINK_TARGET_IS_DIR: " .. path, path = path }
+            stage, werr = "symlink", "SYMLINK_TARGET_IS_DIR"
+          else
+            uv.fs_unlink(path)
           end
-          uv.fs_unlink(path)
         end
-        local dir = path:match("^(.*)/[^/]*$")
-        mkdirp(dir)
-        local ok, e = uv.fs_symlink(link or "", path)
-        if not ok then stage, werr = "symlink", e end
+        if not stage then
+          local dir = path:match("^(.*)/[^/]*$")
+          mkdirp(dir)
+          local ok, e = uv.fs_symlink(link or "", path)
+          if not ok then stage, werr = "symlink", e end
+        end
       elseif action == "write" or action == "create" or action == "modify" then
         local mode = nn(op.mode)
         -- git 对象库：目标已存在即内容相同（幂等），跳过写入。
@@ -4008,9 +4034,10 @@ local function _publish_worker(payload, sha_src)
       elseif action == "delete" then
         uv.fs_unlink(path) -- 不存在视为成功
       elseif action == "rmdir" then
-        local ok, e = uv.fs_rmdir(path)
-        if not ok and not tostring(e or ""):lower():find("not found", 1, true) then
-          stage, werr = "rmdir", e
+        -- 幂等：目标已不存在即视为成功，绝不因「已被外部删除」而失败。
+        if uv.fs_lstat(path) ~= nil then
+          local ok, e = uv.fs_rmdir(path)
+          if not ok then stage, werr = "rmdir", e end
         end
       elseif action == "mkdir" then
         mkdirp(path)
@@ -4022,9 +4049,22 @@ local function _publish_worker(payload, sha_src)
           return { status = "needs_root", reason = "WRITE_REQUIRES_ROOT: " .. path, path = path }
         end
         local pref = (stage == "write") and "WRITE_FAILED: " or (stage .. "_FAILED: ")
-        return { status = "error", reason = pref .. path .. " " .. tostring(werr), path = path }
+        local reason = pref .. path .. " " .. tostring(werr)
+        if partial then
+          out_failed[#out_failed + 1] = { path = path, reason = reason }
+        else
+          return { status = "error", reason = reason, path = path }
+        end
+      else
+        out_applied[#out_applied + 1] = path
       end
     end
+  end
+  if phase == "write" then
+    if #out_failed > 0 then
+      return { status = "partial", applied = out_applied, failed = out_failed }
+    end
+    return { status = "ok", applied = out_applied }
   end
   return { status = "ok" }
 end
@@ -4040,6 +4080,9 @@ local function _worker_pub(res)
     return { ok = false, state = "NEEDS_ROOT", reason = res.reason }
   elseif res.status == "secret_unresolved" then
     return { ok = false, state = "FAILED", reason = res.reason }
+  elseif res.status == "partial" then
+    return { ok = false, state = "PARTIAL", reason = res.reason or "PARTIAL_WRITE",
+      applied = res.applied, failed = res.failed }
   end
   return { ok = false, state = "FAILED", reason = res.reason or "PUBLISH_FAILED" }
 end
@@ -4053,10 +4096,12 @@ end
 --- @return Deferred resolve(table { ok, state, reason?, receipt? })
 function M.publish_async(candidate, opts)
   opts = opts or {}
-  local async = require("NeoAI.utils.async")
   local invalid = _publish_validate(candidate)
   if invalid then return async.resolve(invalid) end
   local files = _apply_order(candidate.files or {})
+  -- 非原子单元允许部分写入（成功文件落盘、失败文件由 review 层回队重试）；git 原子组仍整体失败。
+  local atomic = opts.atomic == true or _atomic_group(candidate.files or {})
+  local allow_partial = not atomic and opts.partial ~= false
   local work = require("NeoAI.utils.work")
   if not work.available() or opts.allow_root == true or _needs_privileged_writer()
     or not _order_insensitive(files) then
@@ -4116,7 +4161,7 @@ function M.publish_async(candidate, opts)
             if base_raw == nil or ours == nil then
               return async.resolve({ ok = false, state = "CONFLICT", reason = "BASELINE_CHANGED: " .. spec.path })
             end
-            local res = merge_mod.merge(base_raw, ours, cur)
+            local res = merge_mod.merge(base_raw, ours, assert(cur))
             if res.ok then
               spec._merged = res.merged
             elseif res.too_large then
@@ -4187,6 +4232,7 @@ function M.publish_async(candidate, opts)
       end
       return work.run_codec(_publish_worker, {
         ops = payload_ops, phase = phase, cas_mode = cas_mode, max_file_bytes = cap,
+        partial = allow_partial,
       }, sha_src)
     end)
   end
@@ -4197,14 +4243,26 @@ function M.publish_async(candidate, opts)
     end
     -- 阶段二：写入（并行；CAS 已在阶段一通过，不再重复读取）。
     return run_phase("write"):then_(function(results2)
+      local applied, failed = {}, {}
       for _, r in ipairs(results2 or {}) do
-        if not (r and r.status == "ok") then return _worker_pub(r) end
+        if r and r.status == "ok" then
+          for _, a in ipairs(r.applied or {}) do applied[#applied + 1] = a end
+        elseif r and r.status == "partial" then
+          for _, a in ipairs(r.applied or {}) do applied[#applied + 1] = a end
+          for _, x in ipairs(r.failed or {}) do failed[#failed + 1] = x end
+        else
+          return _worker_pub(r)
+        end
       end
-      -- 已发布：失效暂存副本 + 数据流账本（主线程维护状态）。
+      -- 已发布：失效暂存副本 + 数据流账本（主线程维护状态）。部分失败时仅处理成功落盘的路径。
+      local written = {}
       for _, f in ipairs(candidate.files or {}) do
-        M.invalidate(f.path)
-        if f.action == "create" or f.action == "modify" then
-          pcall(function() require("NeoAI.sandbox.secret.secret_flow").record("commit", { path = f.path }) end)
+        if f.action == "create" or f.action == "modify" then written[f.path] = true end
+      end
+      for _, p in ipairs(applied) do
+        M.invalidate(p)
+        if written[p] then
+          pcall(function() require("NeoAI.sandbox.secret.secret_flow").record("commit", { path = p }) end)
         end
       end
       local receipt = {
@@ -4214,9 +4272,14 @@ function M.publish_async(candidate, opts)
         new_version = candidate.candidate_digest,
         target = "workspace",
         published_at = os.time(),
-        file_count = #(candidate.files or {}),
+        file_count = #applied,
       }
-      return { ok = true, state = "COMMITTED", receipt = receipt }
+      if #failed > 0 then
+        return { ok = false, state = "PARTIAL",
+          reason = ("PARTIAL_WRITE: %d 个文件失败"):format(#failed),
+          applied = applied, failed = failed, receipt = receipt }
+      end
+      return { ok = true, state = "COMMITTED", receipt = receipt, applied = applied }
     end, function(e)
       -- 写入阶段基础设施错误：可能已有部分写入，如实报失败，不重跑（避免 create 冲突）。
       return { ok = false, state = "FAILED",
@@ -4263,7 +4326,6 @@ end
 --- @param cand table
 --- @return table cand
 function M.blobify(cand)
-  local fs = require("NeoAI.utils.fs")
   for _, j in ipairs(_blobify_jobs(cand)) do
     fs.ensure_dir(vim.fn.fnamemodify(j.blob, ":h"))
     local ok
@@ -4282,7 +4344,6 @@ end
 --- @param cand table
 --- @return Deferred resolve(cand)
 function M.blobify_async(cand)
-  local async = require("NeoAI.utils.async")
   local jobs = _blobify_jobs(cand)
   if #jobs == 0 then return async.resolve(cand) end
   local function finalize()
@@ -4304,7 +4365,6 @@ function M.blobify_async(cand)
   end
   local work = require("NeoAI.utils.work")
   if not work.available() then
-    local fs = require("NeoAI.utils.fs")
     for _, j in ipairs(copy_jobs) do
       fs.ensure_dir(vim.fn.fnamemodify(j.dst, ":h"))
       fs.copy_file(j.src, j.dst)

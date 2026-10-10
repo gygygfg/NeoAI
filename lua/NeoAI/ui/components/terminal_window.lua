@@ -1,5 +1,5 @@
 --- 交互式终端悬浮窗
---- @module NeoAI.ui.components.terminal_window
+--- @module 'NeoAI.ui.components.terminal_window'
 --- 用 `nvim_open_term` 在浮动窗口里渲染交互式命令的终端画面（真实 VT 模拟），
 --- 并支持手动键入转发给会话。多会话按 id 独立窗口。
 ---
@@ -63,7 +63,6 @@ local function _on_key(key)
     end
     return ""
   end
-  return
 end
 
 local function _install_on_key()

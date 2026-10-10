@@ -1,6 +1,6 @@
 --- 密钥数据流账本：记录每个假密钥的来源与所有流经点（工具参数、命令、环境变量、
 --- 落盘路径、commit），并对「经命令/脚本加密后无法逐字还原」的派生文件打不透明标记。
---- @module NeoAI.sandbox.secret.secret_flow
+--- @module 'NeoAI.sandbox.secret.secret_flow'
 --- 边界：不存储明文密钥到磁盘（内存中仅保留假密钥与来源元数据）；账本经 evidence 落盘时
 --- 只写假密钥/路径/工具名。通用加密变换不可逆，故派生文件以 `opaque=true` 标记，发布前强制人工确认。
 

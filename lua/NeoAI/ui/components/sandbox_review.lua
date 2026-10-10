@@ -1,5 +1,5 @@
 --- 沙箱待审审批界面
---- @module NeoAI.ui.components.sandbox_review
+--- @module 'NeoAI.ui.components.sandbox_review'
 --- 列出待审变更单元，按文件路径级别高亮：
 ---   工作区文件=绿色 / 用户目录=黄色 / 系统路径=红色；「待审」状态标签按安全等级着色
 ---   （L0 灰 / L1 黄 / L2 橙 / L3 红）。
@@ -172,7 +172,8 @@ local state = {
   line_to_cmd = {}, -- 行号 -> { command = string|nil } 越界命令（`i` 查看该命令涉及的文件）
   fold_levels = {}, -- 行号 -> 折叠级别（仅「已应用」区 > 0）：区标题=1，条目及其文件行=2
   last_cursor = nil, -- { line, col } 关闭时记录，重开时恢复
-  last_target = nil, -- { change_set_id, path? } 关闭时光标所在条目（优先恢复）
+  --- @type table<string, any>|nil 关闭时光标所在条目（优先恢复）
+  last_target = nil,
   geom = nil, -- { col, row, width, height } 窗口几何，重开时恢复
   suspended = false, -- 是否因查看 diff 临时关闭（关闭 diff 后自动重开审批窗）
   diff = nil, -- { win, buf, ns, mode, warn_start, warn_end, diff_start, width } 当前 diff 预览窗口
@@ -950,8 +951,8 @@ local function _show_root_prompt(res, target, retry, retry_op)
   local function confirm()
     close_then(function()
       local r = retry_op(prefer_sudo)
-      if _is_deferred(r) then
-        r:then_(function(res) retry(res) end, function()
+      if _is_deferred(r) and r then
+        r:then_(function(result) retry(result) end, function()
           retry({ ok = false, state = "FAILED", reason = "提权应用失败" })
         end)
       else
@@ -977,13 +978,17 @@ local function _apply_target(target, ok_msg, fail_msg)
   local function report(res)
     if res and res.ok then
       vim.notify(ok_msg(res), vim.log.levels.INFO)
+    elseif res and res.state == "PARTIAL" then
+      vim.notify(("[NeoAI] 部分应用：成功 %d 个文件，%d 个失败已回队待审（%s）")
+        :format(#(res.applied or {}), #(res.failed or {}), tostring(res.reason or "")),
+        vim.log.levels.WARN)
     elseif res and res.state == "CANCELLED" then
       vim.notify("[NeoAI] 已取消（需要 root 权限）", vim.log.levels.WARN)
     else
       vim.notify(fail_msg(res), vim.log.levels.ERROR)
     end
     M.refresh()
-    if res and res.ok then M.fold_all() end
+    if res and (res.ok or res.state == "PARTIAL") then M.fold_all() end
   end
   local res = _do_apply_async(target)
   if _is_deferred(res) then
@@ -1080,6 +1085,11 @@ local function _apply_all_workspace()
       if res and res.ok then
         files_n = files_n + #job.files
         items_n = items_n + 1
+      elseif res and res.state == "PARTIAL" then
+        -- 部分应用：成功文件计入，失败文件回队，记为一次失败（但整批继续）。
+        files_n = files_n + #(res.applied or {})
+        items_n = items_n + 1
+        if #(res.failed or {}) > 0 then failed_n = failed_n + 1 end
       else
         failed_n = failed_n + 1
         if res and res.state == "NEEDS_ROOT" then root_n = root_n + 1 end
@@ -1405,6 +1415,27 @@ local function _diff_lines(before, after)
   return vim.split(diff, "\n", { plain = true })
 end
 
+--- 内容是否为二进制（含 NUL 或非法 UTF-8）：绝不喂给 vim.diff，否则界面显示乱码。
+--- @param s string|nil
+--- @return boolean
+local function _looks_binary(s)
+  if type(s) ~= "string" or s == "" then return false end
+  if s:find("\0", 1, true) then return true end
+  local ok, valid = pcall(require("NeoAI.utils.stringx").is_valid_utf8, s)
+  return ok and valid == false
+end
+
+--- 清洗 diff 行中的控制字符（保留制表），避免终端把 C0/C1 控制序列渲染为乱码。
+--- @param s string
+--- @return string
+local function _sanitize_line(s)
+  if type(s) ~= "string" or s == "" then return s end
+  if not s:find("[%z\1-\8\11\12\14-\31\127]") then return s end
+  return (s:gsub("[%z\1-\8\11\12\14-\31\127]", function(c)
+    return string.format("\\x%02x", c:byte())
+  end))
+end
+
 --- 为 diff 文本着色（+ 增 / - 删 / @@ 段）
 --- @param buf number
 --- @param ns number
@@ -1609,7 +1640,14 @@ local function _open_diff(target, item, opts)
     lines[#lines + 1] = ""
   end
   local diff_start = #lines + 1
-  for _, l in ipairs(_diff_lines(before, after)) do lines[#lines + 1] = l end
+  local diff_lines
+  if _looks_binary(before) or _looks_binary(after) then
+    -- 二进制文件（keyring/shada/可执行文件等）：不做文本 diff，避免界面乱码。
+    diff_lines = { ("（二进制文件：%d → %d 字节，不显示文本 diff）"):format(#before, #after) }
+  else
+    diff_lines = _diff_lines(before, after)
+  end
+  for _, l in ipairs(diff_lines) do lines[#lines + 1] = _sanitize_line(l) end
 
   local buf = vim.api.nvim_create_buf(false, true)
   vim.bo[buf].filetype = "neoai_sandbox_diff"
@@ -2685,8 +2723,8 @@ function M.refresh()
   _set_review_title(("🗂 沙箱审批 · %s"):format(_page_label(state.page) or ""))
   -- 恢复光标：仅「待修改」页按目标条目恢复；其余页回到顶部。
   local restore = nil
-  if state.page == "files" and state.last_target then
-    local lt = state.last_target
+  local lt = state.last_target
+  if state.page == "files" and lt then
     for ln, tgt in pairs(state.line_to_target) do
       -- 匹配需包含全部目标类型标志（whole/saved/rejected/host_op）：应用/拒绝后条目会移入
       -- 「已应用」/「已拒绝」区，目标类型随之变化，此处的严格匹配会失败（见下方回退）。

@@ -1,5 +1,5 @@
 --- UI 组件专项测试：net_consent / sub_agent_dock / terminal_window / display_modes.chat
---- @module NeoAI.tests.test_ui_components
+--- @module 'NeoAI.tests.test_ui_components'
 local tests = require("NeoAI.tests")
 local event_bus = require("NeoAI.kernel.event_bus")
 local events = require("NeoAI.kernel.events")
@@ -218,10 +218,10 @@ tests.suite("ui_components", function(_, it)
     t.eq(math.max(0, math.min(2, lines - g.height)), g.row, "折叠行应为 2（带上界兜底）")
 
     tw._set_force_ui(true)
-    local it = tw.open({ id = "s1" }, "T1")
-    t.not_nil(it, "有 UI 时 open 应返回句柄")
+    local handle = assert(tw.open({ id = "s1" }, "T1"))
+    t.not_nil(handle, "有 UI 时 open 应返回句柄")
     t.true_(tw.is_collapsed("s1"), "open 应默认折叠（缩在右上角）")
-    local cfg = vim.api.nvim_win_get_config(it.win)
+    local cfg = vim.api.nvim_win_get_config(handle.win)
     t.eq(g.width, cfg.width, "开窗应为折叠宽")
     t.eq(g.height, cfg.height, "开窗应为折叠高")
     t.eq(g.col, cfg.col, "开窗应在右上角（列）")
@@ -229,12 +229,12 @@ tests.suite("ui_components", function(_, it)
 
     tw.expand("s1")
     t.false_(tw.is_collapsed("s1"), "expand 后应展开")
-    local ce = vim.api.nvim_win_get_config(it.win)
+    local ce = vim.api.nvim_win_get_config(handle.win)
     t.true_(ce.width > g.width, "展开应比折叠更宽")
 
     tw.collapse("s1")
     t.true_(tw.is_collapsed("s1"), "collapse 后应折叠")
-    local cc = vim.api.nvim_win_get_config(it.win)
+    local cc = vim.api.nvim_win_get_config(handle.win)
     t.eq(g.width, cc.width, "折叠应回到右上角小窗宽")
     tw.reset()
   end)
@@ -243,11 +243,11 @@ tests.suite("ui_components", function(_, it)
     local tw = require("NeoAI.ui.components.terminal_window")
     tw.reset()
     tw._set_force_ui(true)
-    local it = tw.open({ id = "s1" }, "T1")
-    t.not_nil(it)
+    local handle = assert(tw.open({ id = "s1" }, "T1"))
+    t.not_nil(handle)
     t.true_(tw.is_collapsed("s1"), "初始应折叠")
     local orig = vim.api.nvim_get_current_win()
-    vim.api.nvim_set_current_win(it.win) -- WinEnter（终端窗）→ 展开
+    vim.api.nvim_set_current_win(handle.win) -- WinEnter（终端窗）→ 展开
     t.false_(tw.is_collapsed("s1"), "焦点进入终端窗应展开")
     vim.api.nvim_set_current_win(orig) -- WinEnter（非终端窗）→ 折叠其余终端窗
     t.true_(tw.is_collapsed("s1"), "焦点移出应折叠")

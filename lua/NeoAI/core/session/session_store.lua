@@ -1,5 +1,5 @@
 --- 会话持久化
---- @module NeoAI.core.session.session_store
+--- @module 'NeoAI.core.session.session_store'
 --- 追加式 JSONL 存储。CRUD + 序列化 + 撕裂行恢复 + .bak 备份。
 --- 追加写入无需解析整个文件；崩溃恢复截断最后不完整行即可。
 
@@ -149,6 +149,7 @@ end
 --- 创建新会话（内存 + 持久化）
 --- @param opts table|nil
 --- @return table 会话
+--- @return string|nil err
 function M.create(opts)
   M.init()
   opts = vim.deepcopy(opts or {})
@@ -230,9 +231,10 @@ end
 --- 追加式持久化单个会话
 --- @param session table
 --- @return boolean
+--- @return string|nil err
 function M.persist(session)
   local path, line, log, err = _prepare_persist(session)
-  if not path then return false, err end
+  if not path or not line or not log then return false, err end
   local ok
   ok, err = fs.append_file(path, line)
   if not ok then
@@ -249,7 +251,7 @@ end
 --- @return Deferred resolve(true), reject(err)
 function M.persist_async(session)
   local path, line, log, err = _prepare_persist(session)
-  if not path then return async.reject(err) end
+  if not path or not line or not log then return async.reject(err) end
   return fs.append_file_async(path, line):then_(function()
     return _finish_persist(path, line, log, session)
   end, function(e)
@@ -296,7 +298,8 @@ end
 --- 默认删除目标及直接子会话；opts.recursive 删除完整分支。
 --- @param session_id string
 --- @param opts table|nil { recursive?: boolean }
---- @return table 删除的 id 列表（保存失败为空）, string|nil 错误
+--- @return table 删除的 id 列表（保存失败为空）
+--- @return string|nil 错误
 function M.delete(session_id, opts)
   M.init()
   local target = state.sessions[session_id]
@@ -356,7 +359,7 @@ end
 --- @return table 数组
 function M.get_children(session_id)
   local out = {}
-  for id, s in pairs(state.sessions) do
+  for _, s in pairs(state.sessions) do
     if s.parent_id == session_id then
       out[#out + 1] = s
     end
@@ -373,7 +376,7 @@ end
 --- @return table 数组
 function M.get_roots()
   local out = {}
-  for id, s in pairs(state.sessions) do
+  for _, s in pairs(state.sessions) do
     if session_mod.is_root(s) then
       out[#out + 1] = s
     end

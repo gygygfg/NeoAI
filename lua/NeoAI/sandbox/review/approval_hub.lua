@@ -1,5 +1,5 @@
 --- 审批分流中心
---- @module NeoAI.sandbox.review.approval_hub
+--- @module 'NeoAI.sandbox.review.approval_hub'
 ---
 --- 汇聚所有「需用户批准 / 需用户关注」的请求与观测，按**页面（page）**分类，供多级页面
 --- 审批悬浮窗（`ui/components/sandbox_review`）统一渲染与决策。分流机制：

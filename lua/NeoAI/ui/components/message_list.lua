@@ -1,5 +1,5 @@
 --- 消息列表渲染
---- @module NeoAI.ui.components.message_list
+--- @module 'NeoAI.ui.components.message_list'
 --- 将 Agent 消息渲染到 buffer。支持流式更新、推理折叠、工具结果展示。
 
 local markdown_view = require("NeoAI.ui.components.markdown_view")
@@ -103,14 +103,6 @@ local function _ensure_table_hl()
   vim.api.nvim_set_hl(0, "NeoAITableEven", { default = true, bg = even })
 end
 
---- 对 buffer 应用表格斑马纹高亮。
---- 传入 range_from/range_to 时只重贴该区间（增量）：前缀区域的高亮保持不动，
---- 由调用方保证区间外的内容与高亮未变化；缺省时清空整个命名空间后全量重加。
---- @param buf number
---- @param marks table|nil 与行并行的元数据数组（每元素 nil 或 { tbl = "border"|"odd"|"even" }）
---- @param start_line number|nil marks[1] 对应的 1-based buffer 行号（默认 1）
---- @param range_from number|nil 增量重贴起始行（1-based，含）
---- @param range_to number|nil 增量重贴结束行（1-based，含）
 --- 整行高亮：必须用 set_extmark 把 end_row 限定在本行（`hl_eol=true`）。
 --- 不能用 `nvim_buf_add_highlight(..., row, 0, -1)`：其 end_col=-1 会被内部解释为
 --- 下一行行首（end_row=row+1），导致后续增量 `clear_namespace(range_from, ...)`
@@ -125,9 +117,18 @@ local function _set_line_hl(b, ns, group, row)
   })
 end
 
+--- 对 buffer 应用表格斑马纹高亮。
+--- 传入 range_from/range_to 时只重贴该区间（增量）：前缀区域的高亮保持不动，
+--- 由调用方保证区间外的内容与高亮未变化；缺省时清空整个命名空间后全量重加。
+--- @param buf number
+--- @param marks table|nil 与行并行的元数据数组（每元素 nil 或 { tbl = "border"|"odd"|"even" }）
+--- @param start_line number|nil marks[1] 对应的 1-based buffer 行号（默认 1）
+--- @param range_from number|nil 增量重贴起始行（1-based，含）
+--- @param range_to number|nil 增量重贴结束行（1-based，含）
 local function _apply_table_hl(buf, marks, start_line, range_from, range_to)
   if not buf or not vim.api.nvim_buf_is_valid(buf) then return end
   start_line = start_line or 1
+  marks = marks or {}
   local paint = function(b, ns, m, row)
     local group = m and TABLE_HL_GROUP[m.tbl]
     if group then
@@ -405,7 +406,7 @@ local function _secret_warning_data(fn, result_msg, provided)
   -- 仅保留**真正的凭据文件**（严口径）：`/etc/ld.so.cache`、`/etc/passwd`、`go.env`、历史文件等
   -- 被普通命令频繁打开，不是密钥，不应触发告警。
   local observed = {}
-  if type(result_msg and result_msg.secret_paths) == "table" then
+  if result_msg and type(result_msg.secret_paths) == "table" then
     local seen = {}
     for _, p in ipairs(result_msg.secret_paths) do
       if type(p) == "string" and p ~= "" and _is_secret_path(p) and not seen[p] then
@@ -628,8 +629,8 @@ end
 local function _apply_secret_hl(buf, marks, start_line, range_from, range_to)
   if not buf or not vim.api.nvim_buf_is_valid(buf) then return end
   start_line = start_line or 1
-  local incremental = range_from and range_to and range_to >= range_from
-  if incremental then
+  local is_incremental = range_from and range_to and range_to >= range_from
+  if is_incremental then
     pcall(vim.api.nvim_buf_clear_namespace, buf, SECRET_HL_NS, range_from - 1, range_to)
   else
     pcall(vim.api.nvim_buf_clear_namespace, buf, SECRET_HL_NS, 0, -1)
@@ -649,7 +650,7 @@ local function _apply_secret_hl(buf, marks, start_line, range_from, range_to)
       pcall(vim.api.nvim_buf_add_highlight, buf, SECRET_HL_NS, sp[3] or SECRET_HL_GROUP, row, sp[1], sp[2])
     end
   end
-  if incremental then
+  if is_incremental then
     -- 只扫描差异区间，避免每次渲染全量 O(总行数) 扫描。
     local mfrom = math.max(1, range_from - start_line + 1)
     local mto = range_to - start_line + 1
@@ -675,8 +676,8 @@ end
 local function _apply_ansi_hl(buf, marks, start_line, range_from, range_to)
   if not buf or not vim.api.nvim_buf_is_valid(buf) then return end
   start_line = start_line or 1
-  local incremental = range_from and range_to and range_to >= range_from
-  if incremental then
+  local is_incremental = range_from and range_to and range_to >= range_from
+  if is_incremental then
     pcall(vim.api.nvim_buf_clear_namespace, buf, ANSI_HL_NS, range_from - 1, range_to)
   else
     pcall(vim.api.nvim_buf_clear_namespace, buf, ANSI_HL_NS, 0, -1)
@@ -687,7 +688,7 @@ local function _apply_ansi_hl(buf, marks, start_line, range_from, range_to)
       pcall(vim.api.nvim_buf_add_highlight, buf, ANSI_HL_NS, sp[3], row, sp[1], sp[2])
     end
   end
-  if incremental then
+  if is_incremental then
     -- 只扫描差异区间，避免每次渲染全量 O(总行数) 扫描。
     local mfrom = math.max(1, range_from - start_line + 1)
     local mto = range_to - start_line + 1
@@ -867,8 +868,8 @@ local function _tool_result_failed(content)
     -- 超大结果不做全量解码：错误对象通常以 {"error"... 开头，用有界前缀启发式判定。
     return content:match('^%s*{%s*"error"') ~= nil
   end
-  local json = require("NeoAI.utils.json")
-  local decoded = json.decode_or_nil(content)
+  local json_mod = require("NeoAI.utils.json")
+  local decoded = json_mod.decode_or_nil(content)
   if type(decoded) ~= "table" then return false end
   return decoded.error ~= nil
 end
@@ -880,8 +881,8 @@ local function _tool_description(fn)
   if not fn or type(fn.arguments) ~= "string" or fn.arguments == "" then return nil end
   -- 超大参数不做全量解码：description 只是折叠标题的装饰，不值得为它解析 MB 级参数。
   if #fn.arguments > RESULT_DECODE_MAX_BYTES then return nil end
-  local json = require("NeoAI.utils.json")
-  local decoded = json.decode_or_nil(fn.arguments)
+  local json_mod = require("NeoAI.utils.json")
+  local decoded = json_mod.decode_or_nil(fn.arguments)
   if type(decoded) ~= "table" then return nil end
   local desc = decoded.description
   if type(desc) ~= "string" or desc == "" then return nil end
@@ -893,7 +894,7 @@ end
 
 --- 递归将 JSON 值格式化为带缩进的多行文本（数组/对象均结构化展示）。
 --- @param value any
---- @param indent number
+--- @param indent? number
 --- @return string
 local function _pretty_json(value, indent)
   indent = indent or 0
@@ -1132,15 +1133,6 @@ local function _result_lines(content, opts)
   return _styled_lines(stringx.truncate(content, 500))
 end
 
---- 追加单个工具块（调用 + 结果合并成一个折叠块）。
---- 块首行即状态标记：执行中显示 ⏳（无结果），结果到达后更新为 ✅（成功）或 ❌（失败），
---- 折叠文本（foldtext）按首行 emoji 自动切换图标。结果未到达时只显示首行（仍可折叠）。
---- 首行在工具名后展示目的说明（" · 修改配置"），随后追加耗时（" · 1.2s"）：
---- 执行中显示已执行时长，完成后显示总时长（由 fold 计时提供）。
---- @param lines table
---- @param marks table 与 lines 并行的元数据数组
---- @param tool_call table
---- @param result_msg table|nil 对应的工具结果消息
 --- 工具块首行文本（不含缩进）：状态 emoji + 工具名 + 目的 + 耗时。
 --- 供整块构建与「执行中耗时」轻量刷新共用（避免为更新时间重建整块）。
 --- @param tool_call table
@@ -1170,6 +1162,15 @@ local function _tool_header_text(tool_call, result_msg)
   return string.format("⏳ 调用工具: %s%s%s", name, desc_str, time_str)
 end
 
+--- 追加单个工具块（调用 + 结果合并成一个折叠块）。
+--- 块首行即状态标记：执行中显示 ⏳（无结果），结果到达后更新为 ✅（成功）或 ❌（失败），
+--- 折叠文本（foldtext）按首行 emoji 自动切换图标。结果未到达时只显示首行（仍可折叠）。
+--- 首行在工具名后展示目的说明（" · 修改配置"），随后追加耗时（" · 1.2s"）：
+--- 执行中显示已执行时长，完成后显示总时长（由 fold 计时提供）。
+--- @param lines table
+--- @param marks table 与 lines 并行的元数据数组
+--- @param tool_call table
+--- @param result_msg table|nil 对应的工具结果消息
 local function _append_tool_block(lines, marks, tool_call, result_msg)
   local fn = tool_call["function"]
   -- 同一工具块的参数/结果只 JSON 解码一次：结果同时供密钥扫描与结果渲染，参数同时供
@@ -1348,7 +1349,7 @@ end
 --- 流式渲染的主线程与 GC 开销主要来自这里。廉价输入任一变化才重算签名并重建描述符。
 --- @param msgs table
 --- @param opts table|nil
---- @param prev table|nil 上一轮返回的块数组
+--- @param prev table<number, any>|nil 上一轮返回的块数组
 --- @param show boolean|nil 推理开关（缺省回退全局默认）
 --- @return table 块数组 { { key, sig, build } }
 local function _blocks(msgs, opts, prev, show)

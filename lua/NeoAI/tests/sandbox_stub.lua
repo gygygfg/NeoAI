@@ -1,5 +1,5 @@
 --- 沙箱审批 UI 相关测试的 services.sandbox 桩辅助（非测试套件）
---- @module NeoAI.tests.sandbox_stub
+--- @module 'NeoAI.tests.sandbox_stub'
 --- 沙箱审批 UI 经 `services.sandbox` 门面访问沙箱能力（不再直接 require 沙箱内部模块）。
 --- 测试桩通常只覆盖数据/行为方法（list_reviews / list_traces / apply / reject ...）；
 --- 而「渲染与查询辅助」（risk_badge / hub_pages / audit_verdict / group_traces ...）此前是 UI

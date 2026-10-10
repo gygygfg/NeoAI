@@ -1,5 +1,5 @@
 --- 沙箱边界加固测试
---- @module NeoAI.tests.test_sandbox_hardening
+--- @module 'NeoAI.tests.test_sandbox_hardening'
 --- 覆盖：
 --- 1. 底层网络命令按能力门禁（有 CAP_NET_ADMIN 放行，缺失拒绝），而非按命令名一刀切；
 --- 2. 代理规避门禁（unset/env -u/--noproxy/--proxy "" 等）；
@@ -110,12 +110,16 @@ tests.suite("sandbox_hardening", function(_, it)
     -- headless（无 attached UI）→ 失败关闭
     t.eq("deny", pc.ask("proxy_evasion", { title = "t" }), "headless 应拒绝")
     -- 交互式：伪造 UI 与 confirm
+    ---@diagnostic disable-next-line: duplicate-set-field
     vim.api.nvim_list_uis = function() return { {} } end
+    ---@diagnostic disable-next-line: duplicate-set-field
     vim.fn.confirm = function() return 1 end
     t.eq("once", pc.ask("proxy_evasion", {}), "选项1=仅本次允许")
+    ---@diagnostic disable-next-line: duplicate-set-field
     vim.fn.confirm = function() return 2 end
     t.eq("session", pc.ask("proxy_evasion", {}), "选项2=本次会话始终允许")
     t.true_(pc.is_session_allowed("proxy_evasion"), "应记住会话允许")
+    ---@diagnostic disable-next-line: duplicate-set-field
     vim.fn.confirm = function() return 3 end
     t.eq("session", pc.ask("proxy_evasion", {}), "已会话允许时不再弹窗")
     t.eq("deny", pc.ask("other", {}), "其它策略选项3=拒绝")
@@ -126,6 +130,7 @@ tests.suite("sandbox_hardening", function(_, it)
 
   it("代理规避：默认弹窗拒绝（headless）；批准后放行；可配置 deny/allow", function(t)
     local tools = require("NeoAI.tools")
+    ---@type table<string, any>
     local pc = require("NeoAI.sandbox.review.policy_consent")
     local function run(cmd)
       local done, out = false, nil
@@ -159,6 +164,7 @@ tests.suite("sandbox_hardening", function(_, it)
     local cgroup = require("NeoAI.sandbox.execution.cgroup")
     t.eq("function", type(cgroup.applied), "应导出 applied")
     t.eq("function", type(cgroup.unavailable), "应导出 unavailable")
+    ---@diagnostic disable-next-line: param-type-mismatch
     t.eq("table", type(cgroup.applied(nil)), "applied(nil) 应返回表")
     local caps = cgroup.capabilities()
     t.eq("table", type(caps.controllers), "应暴露 cgroup.controllers")
@@ -176,7 +182,7 @@ tests.suite("sandbox_hardening", function(_, it)
   it("systemd 门面：daemon-reload 静默成功（真实 systemctl 行为）", function(t)
     local sd = require("NeoAI.sandbox.systemd.systemd")
     with_config({ tools = { sandbox = { systemd = { enabled = true } } } }, function()
-      local plan = sd.parse_command("systemctl daemon-reload")
+      local plan = assert(sd.parse_command("systemctl daemon-reload"))
       t.not_nil(plan, "应识别 daemon-reload")
       local res
       sd.handle(plan):then_(function(v) res = v end, function(e) res = { err = e } end)
@@ -214,6 +220,7 @@ tests.suite("sandbox_hardening", function(_, it)
     if not cgroup.capabilities().available then return end
     local h, err = cgroup.prepare_delegated("test_hardening", cgroup.resolve_limits())
     t.not_nil(h, tostring(err))
+    assert(h)
     t.not_nil(h.limit_path, "应有不可写的限额层 limit_path")
     t.true_(h.limit_path ~= h.path, "限额层与暴露叶子应不同")
     t.true_(tostring(h.path):match("/leaf$") ~= nil, "暴露路径应为 leaf")
@@ -225,6 +232,7 @@ tests.suite("sandbox_hardening", function(_, it)
     if not cgroup.capabilities().available then return end
     local h, err = cgroup.prepare_delegated("test_join_internal", cgroup.resolve_limits())
     t.not_nil(h, tostring(err))
+    assert(h)
     -- 委派叶子启用了 subtree_control（内部节点），直接写其 cgroup.procs 会 EBUSY；
     -- join_prefix 应下沉到 payload 子域，使进程可入组（限额仍由层级封顶）。
     local prefix = cgroup.join_prefix(h)

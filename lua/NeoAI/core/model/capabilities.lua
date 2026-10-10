@@ -1,5 +1,5 @@
 --- 模型能力表
---- @module NeoAI.core.model.capabilities
+--- @module 'NeoAI.core.model.capabilities'
 --- 按模型 / 提供商标注「数值能力」：上下文窗口、最大输出、缓存机制类型与阈值、
 --- 每 token 字符估算系数等。整条链路（压缩阈值、容量显示、缓存命中解析、请求参数）
 --- 据此按模型自动选择，未知模型回退到保守默认值。

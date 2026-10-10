@@ -737,6 +737,7 @@ one does). For risk levels and allowlists see the `approval` config and [docs/en
 | `lsp_completion`        | Get completion suggestions        | `file_path`/`line`/`col` (optional) |
 | `lsp_type_definition`   | Get type definitions        | `file_path`/`line`/`col` (optional) |
 | `lsp_service_info`      | Get LSP service information   | no parameters |
+| `lsp_check`             | Project-wide diagnostics (server CLI check; directory/glob, severity, code/path filters, summary/text/json, baseline diff; single-file == directory results for the same file; independent of open buffers) | `path`, `severity`, `format`, `server`, `codes`/`exclude_codes`, `paths`/`exclude_paths`, `limit`, `baseline` (all optional) |
 
 ### 💻 Shell Tools — interactive shells are filled in automatically by the AI
 

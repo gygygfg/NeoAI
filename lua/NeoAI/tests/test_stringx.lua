@@ -1,12 +1,12 @@
 --- stringx 工具测试
---- @module NeoAI.tests.test_stringx
+--- @module 'NeoAI.tests.test_stringx'
 --- 重点回归 UTF-8 安全截断：字节截断不得切断多字节字符（否则显示为乱码，
 --- 并可能让下游严格 JSON 解析器报 invalid unicode code point）。
 
 local tests = require("NeoAI.tests")
 
 --- 字符串是否为合法 UTF-8
---- @param s string
+--- @param s string|nil
 --- @return boolean
 local function _valid_utf8(s)
   return (pcall(vim.str_utfindex, s))
@@ -43,6 +43,7 @@ tests.suite("stringx", function(_, it)
     local sx = require("NeoAI.utils.stringx")
     t.eq("abc", sx.safe_truncate("abc", 10, "…"), "未超预算应原样返回")
     t.nil_(sx.safe_truncate(nil, 5, "…"), "nil 入参返回 nil")
+    ---@diagnostic disable-next-line: param-type-mismatch
     local r = sx.safe_truncate(12345, 3, "…")
     t.true_(_valid_utf8(r), "非字符串入参不应崩溃")
   end)

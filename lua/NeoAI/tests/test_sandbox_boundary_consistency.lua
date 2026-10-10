@@ -1,5 +1,5 @@
 --- 沙箱一致性与故障（真实 bwrap）
---- @module NeoAI.tests.test_sandbox_boundary_consistency
+--- @module 'NeoAI.tests.test_sandbox_boundary_consistency'
 --- 覆盖：并发写同一文件（无丢失/撕裂）、命令超时被终止后的恢复、祖先目录 TOCTOU 符号链接
 --- 替换不落宿主、read_all 普通命令写系统路径的候选冻结与发布落盘。重资源用例 opt-in
 --- （NEOAI_TEST_HEAVY=1）避免常规回归不稳定。
@@ -53,13 +53,13 @@ tests.suite("sandbox_boundary_consistency", function(_, it)
     fs.write_file(f, "")
     with_config(BWRAP_CFG, function()
       sandbox.reset()
-      local a, b, da, db = nil, nil, false, false
+      local _, _, da, db = nil, nil, false, false
       require("NeoAI.tools").execute("run_command",
         { command = "for i in $(seq 1 20); do echo AAAA >> " .. f .. "; done", description = "t" }, {})
-        :then_(function(v) a = v; da = true end, function() da = true end)
+        :then_(function(v) _ = v; da = true end, function() da = true end)
       require("NeoAI.tools").execute("run_command",
         { command = "for i in $(seq 1 20); do echo BBBB >> " .. f .. "; done", description = "t" }, {})
-        :then_(function(v) b = v; db = true end, function() db = true end)
+        :then_(function(v) _ = v; db = true end, function() db = true end)
       t.true_(vim.wait(40000, function() return da and db end, 50), "两条命令应完成")
       local content = read_via_tool(f)
       local na, nb = 0, 0
@@ -126,12 +126,14 @@ tests.suite("sandbox_boundary_consistency", function(_, it)
     with_config(BWRAP_CFG, function()
       sandbox.reset()
       run("echo neoai_syswrite > " .. target, nil, 20000)
-      local item = find_pending(target)
+      local item = assert(find_pending(target))
       t.not_nil(item, "写系统路径应冻结为待审候选")
       t.true_(vim.uv.fs_stat(target) == nil, "dry_run 不应写真实系统路径")
       local res = sandbox.apply(item.change_set_id, { auto_approve = true })
       if res and res.then_ then
-        local done, r = false, nil
+        local done = false
+        ---@type any
+        local r = nil
         res:then_(function(v) r = v; done = true end, function() done = true end)
         vim.wait(20000, function() return done end, 50)
         res = r
@@ -203,6 +205,7 @@ tests.suite("sandbox_boundary_consistency", function(_, it)
     local saved_cfg = config_store.get_all()
     local saved_sandbox = services.use("services.sandbox")
     local saved_pty = services.use("services.pty")
+    ---@type table<string, any>
     local cg = require("NeoAI.sandbox.execution.cgroup")
     local oa, ob = cg.oom_attribution, cg.oom_baseline
     config_store.load({ tools = { approval = { mode = "auto_allow" },

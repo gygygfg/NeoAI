@@ -1,5 +1,5 @@
 --- 运行时上下文快照测试
---- @module NeoAI.tests.test_runtime_context
+--- @module 'NeoAI.tests.test_runtime_context'
 --- 对齐 deepseek-harness：易变运行态（todos/计划模式）不以系统提示段注入（否则系统提示
 --- 变化会让整段前缀缓存失效），而是以 user 角色「运行时上下文快照」消息追加进历史；
 --- 仅在内容变化时追加（newer supersedes older），系统提示保持逐字节稳定。
@@ -31,7 +31,7 @@ tests.suite("runtime_context", function(_, it)
     todo.reset()
     todo.seed("s-1", { { content = "任务A", status = "pending" } })
     local agent = fresh_agent()
-    local snap = rc.ensure(agent)
+    local snap = assert(rc.ensure(agent))
     t.not_nil(snap)
     t.eq(1, #agent.messages)
     t.eq("user", snap.role)
@@ -54,7 +54,7 @@ tests.suite("runtime_context", function(_, it)
     local old = agent.messages[1]
     -- 变化任务清单
     todo.seed("s-1", { { content = "任务A", status = "completed" }, { content = "任务B", status = "pending" } })
-    local snap2 = rc.ensure(agent)
+    local snap2 = assert(rc.ensure(agent))
     t.not_nil(snap2)
     t.eq(2, #agent.messages)
     t.eq(agent.messages[1], old, "旧快照不应被改写")
@@ -90,12 +90,12 @@ tests.suite("runtime_context", function(_, it)
     local pm = require("NeoAI.tools.builtin.plan_mode")
     local agent = fresh_agent()
     pm.enter(agent)
-    local snap = rc.ensure(agent)
+    local snap = assert(rc.ensure(agent))
     t.not_nil(snap)
     t.true_(snap.content:find("计划模式", 1, true) ~= nil)
     pm.exit(agent)
     -- 退出计划模式：快照内容变化（不再含计划策略），应追加新快照
-    local snap2 = rc.ensure(agent)
+    local snap2 = assert(rc.ensure(agent))
     t.not_nil(snap2)
     t.nil_(snap2.content:find("计划模式", 1, true))
     pm.cleanup(agent)

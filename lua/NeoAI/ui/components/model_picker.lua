@@ -1,5 +1,5 @@
 --- 模型选择器
---- @module NeoAI.ui.components.model_picker
+--- @module 'NeoAI.ui.components.model_picker'
 --- 异步加载模型列表并弹出选择窗口。
 --- - 无 api_key 的提供商不展示
 --- - 按提供商分组折叠（expr 折叠，默认展开，可用 zc/za/zo 折叠/展开）

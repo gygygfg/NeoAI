@@ -1,5 +1,5 @@
 --- 图像基础工具
---- @module NeoAI.utils.image
+--- @module 'NeoAI.utils.image'
 --- 纯 Lua，零外部依赖（可选 ImageMagick 缩略见 core/attachment）。提供：
 --- - base64 编码（多模态 data URL 用）
 --- - 图像媒体类型识别（magic bytes + 扩展名）
@@ -148,7 +148,7 @@ end
 
 --- 解析 PNG 尺寸（IHDR）
 --- @param bytes string
---- @return number, number|nil
+--- @return number|nil, number|nil
 local function _png_dim(bytes)
   if #bytes < 24 then return nil end
   -- 签名 8 字节；IHDR: length(4)+type(4)+width(4)+height(4)
@@ -167,7 +167,7 @@ end
 
 --- 解析 WebP 尺寸
 --- RIFF[1-4]/size[5-8]/WEBP[9-12]/chunk4cc[13-16]/size[17-20]/payload[21..]
---- @return number, number|nil
+--- @return number|nil, number|nil
 local function _webp_dim(bytes)
   if #bytes < 27 then return nil end
   local chunk = bytes:sub(13, 16)
@@ -229,7 +229,7 @@ end
 --- 解析图像尺寸（按媒体类型）
 --- @param bytes string
 --- @param media_type string|nil 缺省时按 magic 自动识别
---- @return number width, number height, string|nil detected_media_type
+--- @return number|nil width, number|nil height, string|nil detected_media_type
 function M.parse_dimensions(bytes, media_type)
   if not bytes or #bytes == 0 then return nil, nil, nil end
   media_type = media_type or M.detect_media_type(bytes)

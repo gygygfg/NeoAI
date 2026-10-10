@@ -1,5 +1,5 @@
 --- 并行测试运行器专项测试
---- @module NeoAI.tests.test_parallel_runner
+--- @module 'NeoAI.tests.test_parallel_runner'
 --- 通过注入假 spawner 验证分片均衡、聚合、失败与发现路径，不启动真实子进程。
 
 local tests = require("NeoAI.tests")

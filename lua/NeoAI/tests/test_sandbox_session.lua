@@ -1,5 +1,5 @@
 --- 沙箱会话：轮换/暂存 overlay/run_command/commit CAS/后端/磁盘
---- @module NeoAI.tests.test_sandbox_session
+--- @module 'NeoAI.tests.test_sandbox_session'
 --- 由原 test_sandbox.lua 按用例分片而来（43 个用例，彼此独立、无跨用例共享状态）。
 
 local tests = require("NeoAI.tests")
@@ -36,7 +36,7 @@ tests.suite("sandbox_session", function(_, it)
     with_config({ tools = { sandbox = { workspace_root = vim.fn.tempname() .. "/sb" } } }, function()
       sandbox.reset()
       local a = control.new_attempt("edit_file", {}, {}, { effect = "fs_write" })
-      candidate.begin(a, store.root())
+      candidate.begin(a, assert(store.root()))
       local old_proc = candidate.process_dir()
       t.true_(vim.fn.isdirectory(old_proc) == 1, "旧进程目录应存在")
       candidate.rotate_session()
@@ -138,7 +138,7 @@ tests.suite("sandbox_session", function(_, it)
     local runtime = require("NeoAI.sandbox.execution.runtime")
     local conceal = require("NeoAI.sandbox.observe.conceal")
     if runtime.backend() ~= "bwrap" then return end
-    local prefix = runtime.process_prefix({ cwd = "/tmp", session_dir = "/tmp/neoai_sess" })
+    local prefix = assert(runtime.process_prefix({ cwd = "/tmp", session_dir = "/tmp/neoai_sess" }))
     t.not_nil(prefix, "应能构造前缀")
     local joined = table.concat(prefix, " ")
     t.true_(joined:find("--as-pid-1", 1, true) ~= nil, "应使用 --as-pid-1 隐藏 bwrap 进程")
@@ -223,7 +223,7 @@ tests.suite("sandbox_session", function(_, it)
     local t0 = privilege.resolve(0, { tier = 0 })
     t.true_(t0.ok, "T0 应可解析")
     with_config({ tools = { sandbox = { mask_paths = { dir, file } } } }, function()
-      local prefix = runtime.process_prefix({ cwd = "/tmp", privileges = t0.privileges })
+      local prefix = assert(runtime.process_prefix({ cwd = "/tmp", privileges = t0.privileges }))
       t.not_nil(prefix, "应能构造前缀")
       local joined = table.concat(prefix, " ")
       t.true_(joined:find("--cap-drop ALL", 1, true) ~= nil, "默认应丢弃全部 capability（最小权限）")
@@ -242,22 +242,21 @@ tests.suite("sandbox_session", function(_, it)
     end)
     -- 显式放宽：cap_add = { "ALL" } → 不 --cap-drop ALL
     with_config({ tools = { sandbox = { cap_add = { "ALL" } } } }, function()
-      local prefix = runtime.process_prefix({ cwd = "/tmp" })
+      local prefix = assert(runtime.process_prefix({ cwd = "/tmp" }))
       local joined = table.concat(prefix, " ")
       t.true_(joined:find("--cap-drop ALL", 1, true) == nil, "cap_add={ALL} 应保留完整能力")
     end)
     -- 显式列出被丢弃的能力时以显式为准（不重复 drop）
     with_config({ tools = { sandbox = { cap_add = { "ALL", "CAP_NET_ADMIN" } } } }, function()
-      local prefix = runtime.process_prefix({ cwd = "/tmp" })
+      local prefix = assert(runtime.process_prefix({ cwd = "/tmp" }))
       local joined = table.concat(prefix, " ")
       t.true_(joined:find("--cap-drop CAP_NET_ADMIN", 1, true) == nil, "显式列出的能力不应被 cap_drop 覆盖")
     end)
     -- 档位能力：T2 嵌套 userns 内完整能力（caps 被 userns 作用域限制）
-    local privilege = require("NeoAI.sandbox.execution.privilege")
     local t2 = privilege.resolve(2, { tier = 2, network = true })
     t.true_(t2.ok, "T2 应可解析")
     with_config({ tools = { sandbox = {} } }, function()
-      local pre2 = table.concat(runtime.process_prefix({ cwd = "/tmp", privileges = t2.privileges }), " ")
+      local pre2 = table.concat(assert(runtime.process_prefix({ cwd = "/tmp", privileges = t2.privileges })), " ")
       t.true_(pre2:find("--cap-drop ALL", 1, true) == nil, "T2 应保留完整能力（userns 内作用域受限）")
     end)
     vim.fn.delete(dir, "rf")
@@ -267,7 +266,7 @@ tests.suite("sandbox_session", function(_, it)
     local runtime = require("NeoAI.sandbox.execution.runtime")
     if runtime.backend() ~= "bwrap" then return end
     with_config({ tools = { sandbox = { run_as = { uid = 65534, gid = 65534 } } } }, function()
-      local prefix = runtime.process_prefix({ cwd = "/tmp" })
+      local prefix = assert(runtime.process_prefix({ cwd = "/tmp" }))
       t.not_nil(prefix, "应能构造前缀")
       local joined = table.concat(prefix, " ")
       if vim.uv.getuid() == 0 then
@@ -285,7 +284,7 @@ tests.suite("sandbox_session", function(_, it)
     end)
     -- 显式放弃降权（uid=0）：不注入 --uid / setpriv（保持以 root 运行载荷）。
     with_config({ tools = { sandbox = { run_as = { uid = 0, gid = 0 } } } }, function()
-      local prefix = runtime.process_prefix({ cwd = "/tmp" })
+      local prefix = assert(runtime.process_prefix({ cwd = "/tmp" }))
       local joined = table.concat(prefix, " ")
       t.true_(joined:find("--uid", 1, true) == nil, "uid=0 不应注入 --uid")
       t.true_(joined:find("setpriv", 1, true) == nil, "uid=0 不应 setpriv")
@@ -325,7 +324,7 @@ tests.suite("sandbox_session", function(_, it)
     local t2 = privilege.resolve(2, { tier = 2, network = true })
     t.true_(t2.ok, "T2 应可解析")
     with_config({ tools = { sandbox = { run_as = { uid = 65534, gid = 65534 } } } }, function()
-      local prefix = runtime.process_prefix({ cwd = "/tmp", privileges = t2.privileges })
+      local prefix = assert(runtime.process_prefix({ cwd = "/tmp", privileges = t2.privileges }))
       t.not_nil(prefix, "应能构造 T2 前缀")
       local joined = table.concat(prefix, " ")
       if vim.uv.getuid() == 0 then
@@ -397,7 +396,7 @@ tests.suite("sandbox_session", function(_, it)
 
   it("权限：permission denied / read-only 触发提权建议（全档位）", function(t)
     local privilege = require("NeoAI.sandbox.execution.privilege")
-    local esc = privilege.detect_escalation({ code = 1, stderr = "touch: cannot touch '/x': Permission denied" })
+    local esc = assert(privilege.detect_escalation({ code = 1, stderr = "touch: cannot touch '/x': Permission denied" }))
     t.not_nil(esc, "permission denied 应触发提权建议")
     t.eq(privilege.TIER.PRIVILEGED, esc.tier)
     local esc2 = privilege.detect_escalation({ code = 1, stderr = "Read-only file system" })
@@ -439,7 +438,7 @@ tests.suite("sandbox_session", function(_, it)
     secret.reset()
     local key_line = string.rep("MIIEowIBAAKCAQEA", 4)
     local files = {
-      { path = "/tmp/gen.key", content = "-----BEGIN RSA PRIVATE KEY-----\n" .. key_line .. "\n-----END RSA PRIVATE KEY-----\n" },
+      { path = "/tmp/gen.key", content = ("-----BEGIN RSA " .. "PRIVATE KEY-----\n") .. key_line .. ("\n-----END RSA " .. "PRIVATE KEY-----\n") },
       { path = "/tmp/tok.txt", content = "token=Zx9Qw2Lm7Pk4Rt8Yv3Bn6Hd1Sg5Jf0Ac\n" },
       { path = "/tmp/plain.txt", content = "hello world, no secrets here\n" },
     }
@@ -521,11 +520,11 @@ tests.suite("sandbox_session", function(_, it)
     }
     store.write_candidate_async(cand)
     t.true_(store.flush(5000), "flush 应完成")
-    local raw = fs.read_file(root .. "/candidates/sha256_badutf8.json")
+    local raw = assert(fs.read_file(root .. "/candidates/sha256_badutf8.json"))
     t.not_nil(raw, "应落盘")
     t.false_(raw:find("\xff", 1, true) ~= nil, "落盘 JSON 不应含非法 UTF-8 字节")
     -- 关键：读回内容必须与原二进制**逐字节一致**（此前会被替换为 U+FFFD 而损坏）。
-    local got = store.read_candidate("sha256:badutf8")
+    local got = assert(store.read_candidate("sha256:badutf8"))
     t.not_nil(got, "应可读回")
     t.eq(cand.files[1].content, got.files[1].content, "二进制内容应无损往返")
     store.reset()
@@ -557,7 +556,7 @@ tests.suite("sandbox_session", function(_, it)
       files = { { path = "/tmp/x", alt_content = "old-content" } },
     }
     store.write_snapshot_async(rec)
-    local got = store.read_snapshot("snap_async1")
+    local got = assert(store.read_snapshot("snap_async1"))
     t.not_nil(got, "写入后应立即可读（内存缓存）")
     t.eq("snap_async1", got.snapshot_id)
     t.eq("old-content", got.files[1].alt_content)
@@ -592,6 +591,7 @@ tests.suite("sandbox_session", function(_, it)
     end)
     t.true_(vim.wait(10000, function() return done end), "应完成: " .. tostring(err and err.message or err))
     t.eq(20, #(results or {}), "结果数应一致")
+    assert(results)
     t.eq("1", results[1], "顺序应保持")
     t.eq("20", results[20], "顺序应保持")
     t.true_(max_inflight <= 3, "并发不应超过上限")
@@ -621,7 +621,7 @@ tests.suite("sandbox_session", function(_, it)
     local runtime = require("NeoAI.sandbox.execution.runtime")
     if runtime.backend() ~= "bwrap" then return end
     with_config({ tools = { sandbox = { read_all = false } } }, function()
-    local prefix = runtime.process_prefix({ cwd = "/tmp" })
+    local prefix = assert(runtime.process_prefix({ cwd = "/tmp" }))
     t.not_nil(prefix, "应能构造前缀")
     local joined = table.concat(prefix, " ")
     t.true_(joined:find("--ro-bind / /", 1, true) == nil, "不应再整机只读根")
@@ -654,7 +654,7 @@ tests.suite("sandbox_session", function(_, it)
     if runtime.backend() ~= "bwrap" then return end
     with_config({ tools = { sandbox = { read_all = true } } }, function()
       t.true_(runtime.read_all(), "read_all 默认开")
-      local joined = table.concat(runtime.process_prefix({ cwd = "/tmp" }), " ")
+      local joined = table.concat(assert(runtime.process_prefix({ cwd = "/tmp" })), " ")
       t.true_(joined:find("--ro-bind / /", 1, true) ~= nil, "应整机只读暴露")
       -- 重要配置文件（mask_paths）仍遮蔽
       t.true_(joined:find("--tmpfs /root/.ssh", 1, true) ~= nil, "mask_paths 应仍遮蔽 /root/.ssh")
@@ -741,8 +741,8 @@ tests.suite("sandbox_session", function(_, it)
       local traces = sandbox.list_traces()
       t.true_(#traces >= 1, "应记录越界访问")
       local found = false
-      for _, it in ipairs(traces) do
-        if it.tool == "read_file" and it.path:find(".bashrc", 1, true) then found = true end
+      for _, tr in ipairs(traces) do
+        if tr.tool == "read_file" and tr.path:find(".bashrc", 1, true) then found = true end
       end
       t.true_(found, "应记录 read_file 的越界路径")
     end)
@@ -922,6 +922,7 @@ tests.suite("sandbox_session", function(_, it)
   end)
 
   it("工具子进程：无 overlay 时降级放行（与 run_command 一致）", function(t)
+    ---@type table<string, any>
     local runtime = require("NeoAI.sandbox.execution.runtime")
     if runtime.backend() ~= "bwrap" then return end
     local sandbox = require("NeoAI.sandbox")

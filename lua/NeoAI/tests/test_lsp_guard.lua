@@ -1,5 +1,5 @@
 --- NeoAI 界面 buffer 的 LSP 隔离专项测试
---- @module NeoAI.tests.test_lsp_guard
+--- @module 'NeoAI.tests.test_lsp_guard'
 --- 覆盖：neoai* filetype 自动关闭 LSP/Copilot 标记、acwrite 不被改写、安装/卸载幂等。
 
 local tests = require("NeoAI.tests")

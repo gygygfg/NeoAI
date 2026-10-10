@@ -1,5 +1,5 @@
 --- 服务定位器
---- @module NeoAI.kernel.services
+--- @module 'NeoAI.kernel.services'
 --- 业务代码通过 use(name) 获取「当前配置下生效」的服务实现，而非直接 require 具体模块。
 --- - provide(name, impl)：由插件宿主在插件启动时登记服务实现。
 --- - use(name)：返回当前实现；未提供/被禁用时返回 nil（绝不回退到默认 require）。

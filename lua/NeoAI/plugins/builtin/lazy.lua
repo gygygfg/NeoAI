@@ -1,5 +1,5 @@
 --- 懒加载占位插件
---- @module NeoAI.plugins.builtin.lazy
+--- @module 'NeoAI.plugins.builtin.lazy'
 --- setup() 时注册全部 NeoAI 命令与全局键位的「占位符」：首次触发才异步启动插件图。
 --- 分两阶段：UI/打开类命令在阶段 1（UI 就绪）后执行；其余命令等全量启动完成后再执行，
 --- 避免访问尚未就绪的沙箱/工具服务。真实命令与键位注册时会 force 覆盖占位符。

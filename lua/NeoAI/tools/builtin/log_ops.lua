@@ -1,5 +1,5 @@
 --- 日志工具
---- @module NeoAI.tools.builtin.log_ops
+--- @module 'NeoAI.tools.builtin.log_ops'
 --- 供 AI 记录日志消息与查询日志级别。
 
 local helpers = require("NeoAI.tools.builtin.tool_helpers")
@@ -40,7 +40,7 @@ log_tools.get_log_levels = helpers.define_tool(
     properties = {},
     required = {},
   },
-  function(args, on_success)
+  function(_, on_success)
     on_success("DEBUG, INFO, WARN, ERROR, FATAL")
   end,
   { category = "log" }

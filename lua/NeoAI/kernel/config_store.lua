@@ -1,5 +1,5 @@
 --- 配置存储
---- @module NeoAI.kernel.config_store
+--- @module 'NeoAI.kernel.config_store'
 --- load(): 纯函数，merge + validate，返回不可变配置。
 --- get(path): 按点分路径读取（如 "ui.window.width"）。
 --- watch(path, cb): 监听配置变更。

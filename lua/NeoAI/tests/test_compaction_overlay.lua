@@ -1,5 +1,5 @@
 --- 上下文压缩覆盖层测试
---- @module NeoAI.tests.test_compaction_overlay
+--- @module 'NeoAI.tests.test_compaction_overlay'
 --- 覆盖：
 --- 1. 压缩覆盖层只影响请求视图，不改动 agent.messages（渲染仍原始）；
 --- 2. 被替换前缀内的运行态快照一并折叠；
@@ -83,6 +83,7 @@ tests.suite("compaction_overlay", function(_, it)
 
     local request_mod = require("NeoAI.core.agent.request")
     local orig = request_mod.send_stream
+    ---@diagnostic disable-next-line: duplicate-set-field
     request_mod.send_stream = function(_, _, on_chunk)
       if on_chunk then on_chunk({ content = "摘要" }) end
       return async.resolve({ content = "## 摘要\n- 压缩后的检查点", usage = nil })
@@ -129,7 +130,7 @@ tests.suite("compaction_overlay", function(_, it)
     chat.attach_window(1, agent)
     chat.detach_window(1)
 
-    local reloaded = session_store.get(s.id)
+    local reloaded = assert(session_store.get(s.id))
     t.not_nil(reloaded.metadata.compaction, "覆盖层应持久化到会话元数据")
     t.eq(2, reloaded.metadata.compaction.replaced)
     t.eq(4, #reloaded.messages, "原始消息应完整保留（渲染用）")

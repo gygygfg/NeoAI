@@ -1,5 +1,5 @@
 --- git 操作工具（tools.builtin.git_ops）专项测试
---- @module NeoAI.tests.test_git_ops
+--- @module 'NeoAI.tests.test_git_ops'
 --- 使用临时真实 git 仓库（-u NONE 下离线可复现），覆盖只读命令与写命令的错误路径。
 local tests = require("NeoAI.tests")
 

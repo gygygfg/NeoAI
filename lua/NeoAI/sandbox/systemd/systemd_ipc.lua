@@ -1,5 +1,5 @@
 --- systemd 门面 IPC 桥（宿主侧）
---- @module NeoAI.sandbox.systemd.systemd_ipc
+--- @module 'NeoAI.sandbox.systemd.systemd_ipc'
 --- 沙箱内 `/usr/bin/systemctl`、`/usr/bin/journalctl` 是**极薄入口**（只负责转发）：把 argv
 --- 以 NUL 分隔写入宿主绑定进来的收件目录，等待响应文件，再按结果打印 stdout/stderr 并以真实
 --- 退出码退出。**全部解析与实现都在 Lua**（`NeoAI.sandbox.systemd.systemd.exec`），因此脚本/管道里的
@@ -15,6 +15,7 @@ local M = {}
 --- 沙箱内 IPC 目录（宿主绑定注入；命名取真实 systemd 运行时目录，降低可识别性）。
 local GUEST_DIR = "/run/systemd/units"
 
+---@type table<string, any>
 local state = {
   host_dir = nil,
   fs_handle = nil,

@@ -47,6 +47,18 @@ Tool definitions support two execution forms (`executor._call_tool`):
 - **Callback style**: `func(args, on_success, on_error, ctx)` (`arity >= 2`).
 - **Returns a Deferred**: `func(args, ctx)` returns an object with `then_`.
 
+> **Tool conventions (shared system-prompt section)**: to cut prompt size, per-tool descriptions are
+> kept terse and cross-tool boilerplate is factored into a single system section `tools:conventions`
+> (registered by `tools/init.lua` via `kernel.core_bridge.prefix`, emitted once): required
+> `description`; 1-based line numbers; `~`/`$VAR` path expansion; oversized output truncated to
+> head+tail and spilled to disk (read back via `read_file` `offset/limit`); `git_*` `repo` defaults
+> to the session repo; `run_command` interactive PTY auto-answer and `terminal_*` precise control.
+>
+> **opencode-style aliases (additive, back-compatible)**: `executor._normalize_arguments` accepts
+> `filePath → file_path`, `oldString/newString → old_text/new_text`, `pattern → query`,
+> `glob → include`, `timeout → timeout_ms`; `registry.resolve_name` accepts opencode tool names
+> `bash/glob/grep/webfetch/task/todowrite/todoread`. Old names keep working.
+
 ## 3. Tool Registration
 
 `BUILTIN_MODULES` in `tools/init.lua` lists the built-in tool modules; `init()` registers them synchronously via
@@ -263,7 +275,7 @@ dedicated tools above.
 `lsp_hover` / `lsp_definition` / `lsp_references` / `lsp_implementation` / `lsp_declaration` /
 `lsp_document_symbols` / `lsp_workspace_symbols` / `lsp_code_action` / `lsp_rename` / `lsp_format` /
 `lsp_diagnostics` / `lsp_client_info` / `lsp_signature_help` / `lsp_completion` /
-`lsp_type_definition` / `lsp_service_info`.
+`lsp_type_definition` / `lsp_service_info` / `lsp_check`.
 
 > `lsp_ops` has a **request-level timeout** fallback (`tools.lsp.timeout_ms`, default 10s): it fails fast when the
 > server does not respond, preventing the tool loop from hanging until the executor timeout.
@@ -281,6 +293,42 @@ dedicated tools above.
 > preferred) are queried directly for the latest diagnostics; when only push clients exist, it forces a
 > didChange (content unchanged, no undo entry) so the server re-lints, then waits for `publishDiagnostics`
 > before reading the cache (with timeout fallback) instead of returning a stale cache.
+>
+> **Unified output format** (all `lsp_*` tools share one text convention; line/column are 1-based):
+> position tools (`lsp_definition`/`lsp_references`/`lsp_declaration`/`lsp_implementation`/
+> `lsp_type_definition`) output `path:line:col`; `lsp_diagnostics` outputs
+> `path:line:col [Severity] message` (Severity is `Error`/`Warning`/`Info`/`Hint`); symbol tools output
+> `Name (Kind)  path:line:col` (`lsp_document_symbols` nests children by two spaces per depth).
+>
+> `lsp_check`: **project-wide diagnostics** running the LSP server's **CLI check command** over a
+> file/directory/glob (e.g. `lua-language-server --check=.`, see `tools.lsp.check.servers`); independent
+> of whether buffers are open, fully recomputed and reproducible. The command runs inside the sandbox
+> (reads the staged view, writes never leak) so it is decoupled from the editor LSP's mount/cache state.
+> Result reading: lua-language-server writes JSON to `--check_out_path` (stdout carries only the progress
+> bar); config uses the `{out}` placeholder pointing to a "sandbox-writable, host-readable" file that the
+> tool reads back after exit. stdout progress/ANSI (`Initializing`, `===017/322`, `Diagnosis complete`,
+> …) is stripped and never echoed. Parsing tolerates lua-language-server / pyright / generic JSON, and
+> extracts JSON from text when needed.
+> Params: `path` (file/dir/glob, default cwd), `severity` (minimum level error|warning|information|hint,
+> passed to the CLI and also filtered locally), `format` (`summary` (default: file/problem counts +
+> per-rule/per-message/per-file breakdown) / `text` (grouped by code) / `json`), `server` (auto-selected),
+> `codes`/`exclude_codes` (rule include/exclude), `paths`/`exclude_paths` (path substring or glob
+> include/exclude), `limit` (text/json detail cap, default 200), `baseline` (a json output path, or
+> `"auto"` to use the cached previous result → report **new/fixed**).
+> **Scope consistency**: file/dir/glob all scan the same **workspace root** and then filter, so a single
+> file's result equals its result inside a directory run (no order-of-magnitude drift from the CLI's
+> single-file vs directory loading differences).
+> Output is capped by `output_guard`. If the server config declares `root_files` (e.g. `.luarc.json`) and
+> the workspace root lacks them (**detected via the sandbox view**: a just-staged `.luarc.json` counts), a
+> **strong warning** is prepended; if `auto_config` is also set (on by default for lua-language-server),
+> the check runs with **built-in defaults** (LuaJIT + vim globals), removing the bulk of `undefined-global`
+> noise. That temporary config **only affects this sandboxed check and is never written to the workspace**,
+> so `file_exists(.luarc.json)` being false is normal; set `auto_config_persist=true` to generate a real,
+> pending (staged) file visible to read tools and publishable on approval. On empty results the tool
+> **attributes the filter correctly** (severity vs out-of-scope vs code/path).
+> `lsp_service_info`/`lsp_client_info` show each client's **workspace root and launch command**; an empty
+> root is flagged with "cross-file/type resolution will produce heavy false positives (e.g.
+> undefined-global)" plus a fix suggestion.
 
 ### 🌳 Tree-sitter (tree_ops.lua)
 

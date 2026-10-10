@@ -1,5 +1,5 @@
 --- NeoAI 状态栏服务
---- @module NeoAI.services.status
+--- @module 'NeoAI.services.status'
 --- 汇总当前 Agent 的大模型用量、缓存命中、上下文容量等信息，供 nvim-lualine 等
 --- 状态栏组件消费。纯读取，无副作用；component() 返回字符串，事件驱动刷新。
 --- 集成方式（二选一）：
@@ -99,7 +99,7 @@ end
 --- @param s string
 --- @return string
 local function _stl_escape(s)
-  return (s or ""):gsub("%%", "%%%%")
+  return ((s or ""):gsub("%%", "%%%%"))
 end
 
 --- 模型 id 短名（去掉该省略的 '...'，避免状态栏成片截断显得杂乱）
@@ -461,7 +461,6 @@ function M.winbar_enabled()
 end
 
 --- 订阅事件，事件驱动状态栏刷新（幂等）
---- @return function 取消订阅
 function M.watch()
   if state.watching then return end
   state.watching = true

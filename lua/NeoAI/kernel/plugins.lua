@@ -1,5 +1,5 @@
 --- 插件宿主
---- @module NeoAI.kernel.plugins
+--- @module 'NeoAI.kernel.plugins'
 --- 管理插件状态、依赖注入、服务提供、启停与失败回滚。
 ---
 --- 插件规格（spec）：

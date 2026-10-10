@@ -1,5 +1,5 @@
 --- UI 钩子注册表（core/sandbox/ui ↔ tools 解耦）
---- @module NeoAI.kernel.ui_hooks
+--- @module 'NeoAI.kernel.ui_hooks'
 --- 中性汇合点：UI 组件把「展示实现」注册到本表，工具/业务从本表读取，双方仅依赖 kernel。
 --- 解耦适用场景：UI 组件（ui/）不得直接 require 工具/业务模块（tools/），反之亦然。
 --- 当前用例：向用户提问 UI（ui/components/ask_user 注册，tools/builtin/ask_user 读取）。

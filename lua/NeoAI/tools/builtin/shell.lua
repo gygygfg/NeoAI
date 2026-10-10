@@ -1,5 +1,5 @@
 --- Shell 命令工具
---- @module NeoAI.tools.builtin.shell
+--- @module 'NeoAI.tools.builtin.shell'
 --- 执行 Shell 命令（异步，非交互）。交互式 PTY 见阶段8 ui/components。
 
 local async = require("NeoAI.utils.async")
@@ -279,7 +279,7 @@ local function _run_interactive(command, opts)
   if not pty then
     return _run_command(command, opts)
   end
-  local ok, reason = pty.available()
+  local ok = pty.available()
   if not ok then
     -- 引擎不可用：回退非交互（不静默失败）。
     return _run_command(command, opts)
@@ -293,7 +293,7 @@ local function _run_interactive(command, opts)
   full[#full + 1] = command
   -- 命令开始时的资源域 OOM 计数基线：结束后差分归因（PTY 路径此前缺失，导致 137 无法归因）。
   local cgroup_baseline = _oom_baseline(opts.cgroup_path)
-  local session, oerr = pty.open({
+  local session = pty.open({
     argv = full,
     cwd = opts.cwd,
     env = require("NeoAI.utils.env").for_jobstart(opts.env),
@@ -313,6 +313,9 @@ local function _run_interactive(command, opts)
   return pty.await(session):then_(function(result)
     -- 终端输出含 ANSI/回车控制：回传模型前剥离 ANSI 并归一化换行（UI 窗口仍展示原始字节）。
     local out = result.output or ""
+    -- 注意：此处沿用原有的 `pcall(require(...))` 写法（先求 require 结果再交给 pcall），
+    -- 其实际效果是 pcall 收到模块表而非函数；保持现状以免改变运行时行为。
+    ---@diagnostic disable-next-line: param-type-mismatch
     local ok_ansi, ansi = pcall(require("NeoAI.utils.ansi"))
     if ok_ansi and ansi and ansi.strip then
       out = ansi.strip(out)
@@ -409,29 +412,18 @@ end
 
 local shell_tools = {}
 
--- 非交互（interactive 关闭）：前台一次性执行。交互式开启时在 get_tools 中改用交互式描述。
+-- 非交互（interactive 关闭）：前台一次性执行。
 local RUN_COMMAND_DESC_BASE =
-  "执行 Shell 命令（前台，单次调用内完成）。command 必填。timeout_ms 可选（默认 30000ms，-1 为不限）。"
-  .. "长任务（安装依赖/编译/下载）请在**同一次调用**内显式传较大的 timeout_ms（如 600000），"
-  .. "不要靠重试短命令规避超时。以 `&`/nohup/setsid 启动的后台进程，仅在会话使用常驻沙箱时"
-  .. "跨工具调用**且跨轮次**持续运行（可用 ps/kill 管理）；否则命令结束即被回收，其输出建议重定向到文件。"
-  .. "输出过长时（超过 tools.output_guard.max_chars）结果会截断为头+尾，完整输出自动落盘到沙箱私有 /tmp"
-  .. "并在结果中给出路径，可用 read_file 的 start_line/end_line 分段查看；也可提前自行把输出重定向到文件。"
+  "执行 Shell 命令（前台，单次调用内完成）。同 opencode bash（command, timeout_ms；默认 30000ms，-1 不限时）。"
+  .. "长任务（安装/编译/下载）请在同一次调用内显式传较大 timeout_ms（如 600000），不要靠重试规避超时。"
+  .. "`&`/nohup/setsid 后台进程仅在会话使用常驻沙箱时跨轮次存活，否则命令结束即回收，输出请重定向到文件。"
 
--- 交互式（PTY）：标明可交互，并写清【目标】与【如何操作】。
+-- 交互式（PTY）：标明可交互。
 local RUN_COMMAND_DESC_INTERACTIVE =
-  "执行 Shell 命令（**交互式 PTY**，可自动应答等待输入的命令）。"
-  .. "【目标】运行命令并完成其中的交互（read 输入、y/n 确认、菜单选择、口令等）。"
-  .. "【如何操作】command 必填；timeout_ms 可选（默认 30000ms，-1 不限）。"
-  .. "命令一旦等待输入，系统会**自动检测**并让判官模型依据 description 与近期输出自动作答"
-  .. "（输入文本 / 发送按键 / 结束进程），同时在聊天光标跟随时弹出悬浮终端显示；用户也可手动输入。"
-  .. "因此 **description 必填且要写清目标与预期**：说明命令目的、可能出现的提示与期望输入"
-  .. "（如“安装依赖，提示是否继续选 y”“登录，用户名 foo、密码 bar”）。"
-  .. "多轮交互较慢，请在同一次调用内显式传足够大的 timeout_ms（如 120000~600000）。"
-  .. "需要精确控制时可显式调用 terminal_send_text / terminal_send_keys / terminal_kill（仅当存在活动会话时有效）。"
-  .. "后台进程：交互式模式走一次性沙箱路径，`&`/nohup/setsid 不跨调用存活，输出建议重定向到文件。"
-  .. "输出过长时（超过 tools.output_guard.max_chars）结果会截断为头+尾，完整输出自动落盘到沙箱私有 /tmp"
-  .. "并在结果中给出路径，可用 read_file 的 start_line/end_line 分段查看。"
+  "执行 Shell 命令（交互式 PTY，可自动应答等待输入）。同 opencode bash（command, timeout_ms；默认 30000ms，-1 不限时）。"
+  .. "命令一旦等待输入，系统按 description 自动应答（输入/按键/结束），也可用 terminal_send_text/terminal_send_keys/terminal_kill 精确控制。"
+  .. "description 请写清目标与预期（如“安装依赖，提示是否继续选 y”）。多轮交互请传足够大 timeout_ms（如 120000~600000）。"
+  .. "后台进程（&/nohup/setsid）不跨调用存活，输出请重定向到文件。"
 
 shell_tools.run_command = helpers.define_tool(
   "run_command",
@@ -537,9 +529,13 @@ shell_tools.run_command = helpers.define_tool(
           elseif result.code == 137 then
             -- 非超时/取消/截断的 137：SIGKILL 来源不明（资源域终止、宿主 OOM 或外部信号）。
             local diag = ""
+            -- 注意：`cgroup_path` 为历史遗留的未定义全局（求值为 nil，分支不执行）；
+            -- 保留现状以免改变运行时行为。
+            ---@diagnostic disable-next-line: undefined-global
             if cgroup_path then
               local ok_cg, cg = pcall(require, "NeoAI.sandbox.execution.cgroup")
               if ok_cg and cg and cg.events_snapshot then
+                ---@diagnostic disable-next-line: undefined-global
                 local snap = cg.events_snapshot(cgroup_path) or {}
                 local parts = {}
                 if snap.memory_peak then

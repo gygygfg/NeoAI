@@ -1,5 +1,5 @@
 --- 命令插件
---- @module NeoAI.plugins.builtin.commands
+--- @module 'NeoAI.plugins.builtin.commands'
 --- 注册全部 NeoAI 用户命令；卸载时删除。业务调用一律经 kernel.services.use 获取服务。
 
 local services = require("NeoAI.kernel.services")

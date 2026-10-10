@@ -1,5 +1,5 @@
 --- 沙箱工具能力规格
---- @module NeoAI.sandbox.execution.tool_spec
+--- @module 'NeoAI.sandbox.execution.tool_spec'
 --- 为每个工具声明执行影响类别（effect）与需要暂存的路径参数。
 --- 未知工具按类别默认值归类；仍未知则按最保守的 process 处理（必须隔离）。
 

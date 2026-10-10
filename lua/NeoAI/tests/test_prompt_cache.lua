@@ -1,5 +1,5 @@
 --- 显式缓存管理器测试（注入 / 降级 / Gemini 生命周期）
---- @module NeoAI.tests.test_prompt_cache
+--- @module 'NeoAI.tests.test_prompt_cache'
 
 local tests = require("NeoAI.tests")
 

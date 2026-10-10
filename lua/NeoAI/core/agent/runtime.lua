@@ -1,5 +1,5 @@
 --- Agent 运行时
---- @module NeoAI.core.agent.runtime
+--- @module 'NeoAI.core.agent.runtime'
 --- 创建/派生/销毁 Agent，编排生成流程。
 --- - create(config)：全新 Agent 实例
 --- - spawn(parent, override)：创建子 Agent（全新环境，零继承）
@@ -28,7 +28,7 @@ local state = {
 --- 解析 agent 的模式配置
 --- 按当前会话模式（chat/plan）从 ai.modes 取 provider/model/temperature/etc.，
 --- 再叠加用户级覆盖，最后把 "auto" 模型解析为 registry 默认模型。
---- @param config table 用户/系统配置（覆盖层）
+--- @param config table|nil 用户/系统配置（覆盖层）
 --- @param mode string|nil "chat" | "plan"
 --- @return table agent_config
 local function _resolve_agent_config(config, mode)
@@ -69,9 +69,8 @@ end
 
 --- 发送生成请求（含工具循环决策）
 --- @param agent table
---- @param opts table { tools?=tool_service 提供的工具表 }
 --- @return Deferred resolve(最终响应)
-local function _run_generation(agent, opts)
+local function _run_generation(agent, _)
   local stream_mod = require("NeoAI.core.agent.stream")
   local tool_service = services.use("services.tool_service")
   local recovery = require("NeoAI.core.agent.recovery")
@@ -181,7 +180,7 @@ end
 --- 提供者/模型/温度/max_tokens/流式随 modes 变化；系统提示等全局项不改。
 --- @param agent table
 --- @param mode string "chat" | "plan"
---- @return table Agent
+--- @return table|nil Agent
 function M.apply_mode(agent, mode)
   if not agent then return nil end
   local cfg = _resolve_agent_config(nil, mode or "chat")

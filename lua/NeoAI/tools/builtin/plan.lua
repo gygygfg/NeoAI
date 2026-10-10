@@ -1,5 +1,5 @@
 --- 子 Agent 计划与边界审核
---- @module NeoAI.tools.builtin.plan
+--- @module 'NeoAI.tools.builtin.plan'
 --- create_sub_agent / get_sub_agent_status / cancel_sub_agent。
 --- 子 Agent 独立沙箱，零继承；边界审核由 tool_service 配合。
 
@@ -31,7 +31,7 @@ local plan_tools = {}
 
 plan_tools.create_sub_agent = helpers.define_tool(
   "create_sub_agent",
-  "创建子 Agent 执行独立子任务。task 必填；mode 可选 'background'（默认，立即返回）或 'foreground'（等待子 Agent 完成后返回完整结果）；boundaries 可选约束（allowed_tools/allowed_directories/max_tool_calls）。",
+  "创建子 Agent 执行独立子任务。task 必填；mode='background'（默认，立即返回）|'foreground'（等待完成）；boundaries 可选约束（allowed_tools/allowed_directories/max_tool_calls）。",
   {
     type = "object",
     properties = {
@@ -59,11 +59,11 @@ plan_tools.create_sub_agent = helpers.define_tool(
     local bridge = require("NeoAI.kernel.core_bridge")
 
     local sub_id = _new_id()
-    local sub_agent = bridge.agent_spawn(parent_agent, {
+    local sub_agent = assert(bridge.agent_spawn(parent_agent, {
       task = args.task,
       model = args.model,
       scenario = "agent",
-    })
+    }))
 
     local boundaries = args.boundaries or {}
     state.sub_agents[sub_id] = {

@@ -1,5 +1,5 @@
 --- 沙箱资源域（cgroup v2）
---- @module NeoAI.sandbox.execution.cgroup
+--- @module 'NeoAI.sandbox.execution.cgroup'
 --- 每次尝试使用独立 cgroup v2 资源域，限制内存/PID/CPU（设计文档 §7.1）。
 --- 能力缺失时返回明确错误，不静默降级；limits 全为 0 时不创建。
 --- 控制器按 `cgroup.controllers` 实际可用集合逐项启用：缺失或写入失败的限制记入

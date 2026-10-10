@@ -1,5 +1,5 @@
 --- 沙箱长驻服务工具
---- @module NeoAI.tools.builtin.service
+--- @module 'NeoAI.tools.builtin.service'
 --- 后台常驻进程（dev server / watch / 守护进程）跨工具调用存活，直到显式停止或会话结束。
 --- 每个服务在独立沙箱 overlay + 资源域内运行；停止时其工作区改动冻结为候选并经异步审批。
 --- run_command 中的 `&`/nohup/setsid 会自动转为长驻服务（跨调用存活）；需要显式命名/管理时
@@ -53,7 +53,7 @@ service_tools.service_start = helpers.define_tool(
     },
     required = { "name", "command" },
   },
-  function(args, on_success, on_error, _ctx)
+  function(args, on_success, on_error, _)
     local svc_mod = _svc()
     if not svc_mod then return on_error("长驻服务模块不可用") end
     local name, err = helpers.require_string(args, "name", "service_start")
@@ -83,7 +83,7 @@ service_tools.service_logs = helpers.define_tool(
     },
     required = { "name" },
   },
-  function(args, on_success, on_error, _ctx)
+  function(args, on_success, on_error, _)
     local svc_mod = _svc()
     if not svc_mod then return on_error("长驻服务模块不可用") end
     local text, err = svc_mod.logs(args.name, tonumber(args.tail))
@@ -103,7 +103,7 @@ service_tools.service_status = helpers.define_tool(
     },
     required = {},
   },
-  function(args, on_success, on_error, _ctx)
+  function(args, on_success, on_error, _)
     local svc_mod = _svc()
     if not svc_mod then return on_error("长驻服务模块不可用") end
     if args.name and args.name ~= "" then
@@ -130,7 +130,7 @@ service_tools.service_stop = helpers.define_tool(
     },
     required = { "name" },
   },
-  function(args, on_success, on_error, _ctx)
+  function(args, on_success, on_error, _)
     local svc_mod = _svc()
     if not svc_mod then return on_error("长驻服务模块不可用") end
     local name, err = helpers.require_string(args, "name", "service_stop")

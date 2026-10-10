@@ -1,5 +1,5 @@
 --- 全局键位插件
---- @module NeoAI.plugins.builtin.keymaps
+--- @module 'NeoAI.plugins.builtin.keymaps'
 --- 按 config.keymaps.global 注册全局快捷键；卸载时删除。经 kernel.services.use 获取 UI 服务。
 --- `M.run(action)` 抽出自成一体，供懒加载占位键位在首次触发时就绪后复用，避免重复服务逻辑。
 

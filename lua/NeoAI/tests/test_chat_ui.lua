@@ -14,7 +14,7 @@ tests.suite("chat_ui", function(_, it)
     vim.o.foldenable = false
 
     local opened = chat_view.open()
-    local agent = chat_service.get_current_agent()
+    local agent = assert(chat_service.get_current_agent())
     agent.messages = { { role = "assistant", content = "answer", reasoning = "step 1\nstep 2" } }
     chat_view.refresh()
 
@@ -63,7 +63,7 @@ tests.suite("chat_ui", function(_, it)
     chat_view.reset()
     chat_service.reset()
     chat_view.open()
-    local agent = chat_service.get_current_agent()
+    local agent = assert(chat_service.get_current_agent())
     agent.messages = { { role = "assistant", content = "answer" } }
     chat_view.refresh()
     -- 模拟 plugins.stop_all 已注销 chat_service：reload_all 停止沙箱时 cgroup.release 的
@@ -147,7 +147,7 @@ tests.suite("chat_ui", function(_, it)
     reasoning_panel.reset()
 
     chat_view.open()
-    local agent = chat_service.get_current_agent()
+    local agent = assert(chat_service.get_current_agent())
     event_bus.emit(events.REASONING_CHUNK, { agent_id = agent.id, chunk = "first ", reasoning = "first " })
     event_bus.emit(events.REASONING_CHUNK, { agent_id = agent.id, chunk = "step", reasoning = "first step" })
     chat_view.flush()
@@ -212,7 +212,7 @@ tests.suite("chat_ui", function(_, it)
     tool_args_panel.reset()
 
     chat_view.open()
-    local agent = chat_service.get_current_agent()
+    local agent = assert(chat_service.get_current_agent())
     local mk = function(name, args)
       local c = { index = 0, type = "function" }
       c["function"] = { name = name, arguments = args }
@@ -253,7 +253,7 @@ tests.suite("chat_ui", function(_, it)
     chat_service.reset()
 
     local opened = chat_view.open()
-    local agent = chat_service.get_current_agent()
+    local agent = assert(chat_service.get_current_agent())
     agent.messages = { { role = "assistant", content = "answer", reasoning = "brief thought" } }
     chat_view.refresh()
 
@@ -310,12 +310,13 @@ tests.suite("chat_ui", function(_, it)
 
     -- 打桩 send_message，避免真实网络请求
     local orig_send = chat_service.send_message
+    ---@diagnostic disable-next-line: duplicate-set-field
     chat_service.send_message = function() return async.resolve({}) end
 
     -- headless 下 feedkeys 的 typeahead 不会在测试期间被处理，无法直接断言插入模式；
     -- 用 spy 验证 Agent 结束后确实调用了输入框 focus（即进入插入模式的标准入口）。
     -- 多实例：输入框是每实例独立对象，打桩其「当前实例」而非模块代理。
-    local inst_ib = input_box._instance()
+    local inst_ib = assert(input_box._instance())
     t.not_nil(inst_ib, "打开后应有当前输入框实例")
     local focus_calls = 0
     local orig_focus = inst_ib.focus
@@ -335,7 +336,7 @@ tests.suite("chat_ui", function(_, it)
     t.eq(0, focus_calls, "发送过程不应调用输入框 focus")
 
     -- Agent 生成结束：应调用 focus 并把光标移回输入框
-    local agent = chat_service.get_current_agent()
+    local agent = assert(chat_service.get_current_agent())
     event_bus.emit(events.GENERATION_COMPLETED, { agent_id = agent.id })
     t.eq(1, focus_calls, "Agent 结束后应调用输入框 focus 以进入插入模式")
     t.eq(input_win, vim.api.nvim_get_current_win(), "Agent 结束后焦点应回到输入框")
@@ -356,10 +357,10 @@ tests.suite("chat_ui", function(_, it)
     chat_service.reset()
 
     local opened = chat_view.open()
-    local agent = chat_service.get_current_agent()
+    local agent = assert(chat_service.get_current_agent())
     t.true_(opened.win_id and vim.api.nvim_win_is_valid(opened.win_id), "应创建聊天窗口")
 
-    local inst_ib = input_box._instance()
+    local inst_ib = assert(input_box._instance())
     t.not_nil(inst_ib, "打开后应有当前输入框实例")
     local focus_calls = 0
     local orig_focus = inst_ib.focus
@@ -478,7 +479,7 @@ tests.suite("chat_ui", function(_, it)
     chat_view.reset()
     chat_service.reset()
 
-    local opened = chat_view.open()
+    chat_view.open()
     local input_win = input_box.get_win()
     t.true_(input_win ~= nil and vim.api.nvim_win_is_valid(input_win), "应创建输入窗口")
 
@@ -544,7 +545,7 @@ tests.suite("chat_ui", function(_, it)
     chat_service.reset()
 
     local opened = chat_view.open()
-    local agent = chat_service.get_current_agent()
+    local agent = assert(chat_service.get_current_agent())
     -- 模拟工具返回多行结果（如 shell 输出），此前会导致 nvim_buf_set_lines 抛错、界面卡住
     agent.messages = {
       { role = "user", content = "跑一下命令" },
@@ -581,7 +582,7 @@ tests.suite("chat_ui", function(_, it)
     chat_service.reset()
 
     local opened = chat_view.open()
-    local agent = chat_service.get_current_agent()
+    local agent = assert(chat_service.get_current_agent())
     -- is_named_node 返回 tostring(node:named()) = "true"/"false"：此前 _tool_result_failed
     -- 对布尔 JSON 直接 index decoded.error 抛错，render 中断，工具块永远停在 ⏳
     agent.messages = {
@@ -615,7 +616,7 @@ tests.suite("chat_ui", function(_, it)
     chat_service.reset()
 
     local opened = chat_view.open()
-    local agent = chat_service.get_current_agent()
+    local agent = assert(chat_service.get_current_agent())
     agent.messages = {
       { role = "user", content = "查一下" },
       { role = "assistant", content = "", tool_calls = {
@@ -668,7 +669,7 @@ tests.suite("chat_ui", function(_, it)
     chat_service.reset()
 
     local opened = chat_view.open()
-    local agent = chat_service.get_current_agent()
+    local agent = assert(chat_service.get_current_agent())
     -- 一轮 turn：用户消息 → 推理 + 2 个工具调用 → 2 个工具结果 → 最终正文
     agent.messages = {
       { role = "user", content = "查一下" },
@@ -749,7 +750,7 @@ tests.suite("chat_ui", function(_, it)
     chat_service.reset()
 
     local opened = chat_view.open()
-    local agent = chat_service.get_current_agent()
+    local agent = assert(chat_service.get_current_agent())
     -- 预置足够长的内容，使 buffer 行数超过 5
     agent.messages = {
       { role = "user", content = "q1" },
@@ -796,7 +797,7 @@ tests.suite("chat_ui", function(_, it)
     chat_service.reset()
 
     local opened = chat_view.open()
-    local agent = chat_service.get_current_agent()
+    local agent = assert(chat_service.get_current_agent())
     -- 工具结果为空：底部仅一个单行折叠块
     agent.messages = {
       { role = "user", content = "q1" },
@@ -847,7 +848,7 @@ tests.suite("chat_ui", function(_, it)
     chat_service.reset()
 
     local opened = chat_view.open()
-    local agent = chat_service.get_current_agent()
+    local agent = assert(chat_service.get_current_agent())
     local body = {}
     for i = 1, 100 do body[#body + 1] = "正文 " .. i end
     agent.messages = {
@@ -890,7 +891,7 @@ tests.suite("chat_ui", function(_, it)
     chat_service.reset()
 
     local opened = chat_view.open()
-    local agent = chat_service.get_current_agent()
+    local agent = assert(chat_service.get_current_agent())
     -- 模型在调用工具前先输出一段正文：流式期间正文可见，工具调用落地后也不应消失
     agent.messages = {
       { role = "user", content = "第一轮问题" },
@@ -922,7 +923,7 @@ tests.suite("chat_ui", function(_, it)
     chat_service.reset()
 
     local opened = chat_view.open()
-    local agent = chat_service.get_current_agent()
+    local agent = assert(chat_service.get_current_agent())
     -- 两个并行工具调用，但只返回了 1 个结果：第二个调用位置处不是工具消息，
     -- 不应把后面的内容（下一轮用户消息）当作结果位置消费掉
     agent.messages = {
@@ -981,7 +982,7 @@ tests.suite("chat_ui", function(_, it)
     chat_service.reset()
 
     local opened = chat_view.open()
-    local agent = chat_service.get_current_agent()
+    local agent = assert(chat_service.get_current_agent())
 
     -- 执行中：工具调用已发出但结果未到达 → 折叠文本应显示 ⏳
     agent.messages = {
@@ -1068,7 +1069,7 @@ tests.suite("chat_ui", function(_, it)
     tool_approval.reset()
 
     local confirmed_all = false
-    local confirmed = false
+    local _ = false
     local cancelled = false
 
     -- 模拟用户在输入框打字（插入模式）时弹窗打开：此前会延续插入模式导致按键失效、审批卡住
@@ -1076,7 +1077,7 @@ tests.suite("chat_ui", function(_, it)
     tool_approval.show({
       text = "工具: run_command",
       tool_name = "run_command",
-      on_confirm = function() confirmed = true end,
+      on_confirm = function() _ = true end,
       on_cancel = function() cancelled = true end,
       on_confirm_all = function() confirmed_all = true end,
     })
@@ -1105,7 +1106,7 @@ tests.suite("chat_ui", function(_, it)
     tool_approval.show({
       text = "工具: run_command",
       tool_name = "run_command",
-      on_confirm = function() confirmed = true end,
+      on_confirm = function() _ = true end,
       on_cancel = function() cancelled = true end,
       on_confirm_all = function() confirmed_all = true end,
     })
@@ -1119,7 +1120,7 @@ tests.suite("chat_ui", function(_, it)
     tool_approval.show({
       text = "工具: run_command",
       tool_name = "run_command",
-      on_confirm = function() confirmed = true end,
+      on_confirm = function() _ = true end,
       on_cancel = function() cancelled = true end,
       on_confirm_all = function() confirmed_all = true end,
     })
@@ -1181,7 +1182,7 @@ tests.suite("chat_ui", function(_, it)
     vim.api.nvim_win_set_buf(opened.win_id, other)
     t.eq(other, vim.api.nvim_win_get_buf(opened.win_id), "前置条件：聊天窗口已显示别的 buffer")
 
-    local agent = chat_service.get_current_agent()
+    local agent = assert(chat_service.get_current_agent())
     agent.messages = { { role = "assistant", content = "streamed answer", reasoning = "folded thought" } }
     event_bus.emit(events.MESSAGE_UPDATED, { agent_id = agent.id, message = agent.messages[1] })
     chat_view.flush()
@@ -1232,7 +1233,7 @@ tests.suite("chat_ui", function(_, it)
     end)
 
     -- 流式更新到达：内容应写入聊天 buffer，但绝不能操作别的 buffer 的折叠/光标
-    local agent = chat_service.get_current_agent()
+    local agent = assert(chat_service.get_current_agent())
     agent.messages = { { role = "assistant", content = "streamed answer", reasoning = "folded thought" } }
     event_bus.emit(events.MESSAGE_UPDATED, { agent_id = agent.id, message = agent.messages[1] })
     chat_view.flush()
@@ -1286,7 +1287,7 @@ tests.suite("chat_ui", function(_, it)
     chat_service.reset()
 
     local opened = chat_view.open()
-    local agent = chat_service.get_current_agent()
+    local agent = assert(chat_service.get_current_agent())
     agent.messages = {
       { role = "user", content = "跑命令" },
       { role = "assistant", content = "", tool_calls = {
@@ -1347,7 +1348,7 @@ tests.suite("chat_ui", function(_, it)
     chat_service.reset()
 
     local opened = chat_view.open()
-    local agent = chat_service.get_current_agent()
+    local agent = assert(chat_service.get_current_agent())
     agent.messages = {
       { role = "user", content = "跑命令" },
       { role = "assistant", content = "", tool_calls = {
@@ -1400,7 +1401,7 @@ tests.suite("chat_ui", function(_, it)
     chat_service.reset()
 
     local opened = chat_view.open()
-    local agent = chat_service.get_current_agent()
+    local agent = assert(chat_service.get_current_agent())
     agent.messages = {
       { role = "user", content = "装依赖" },
       { role = "assistant", content = "", tool_calls = {
@@ -1437,7 +1438,7 @@ tests.suite("chat_ui", function(_, it)
     chat_service.reset()
 
     local opened = chat_view.open()
-    local agent = chat_service.get_current_agent()
+    local agent = assert(chat_service.get_current_agent())
     agent.messages = {
       { role = "user", content = "跑命令" },
       { role = "assistant", content = "", tool_calls = {
@@ -1490,7 +1491,7 @@ tests.suite("chat_ui", function(_, it)
     chat_service.reset()
 
     local opened = chat_view.open()
-    local agent = chat_service.get_current_agent()
+    local agent = assert(chat_service.get_current_agent())
     agent.messages = {
       { role = "user", content = "跑命令" },
       { role = "assistant", content = "", tool_calls = {
@@ -1544,7 +1545,7 @@ tests.suite("chat_ui", function(_, it)
     chat_service.reset()
 
     local opened = chat_view.open()
-    local agent = chat_service.get_current_agent()
+    local agent = assert(chat_service.get_current_agent())
     agent.messages = {
       { role = "user", content = "跑命令" },
       { role = "assistant", content = "", tool_calls = {
@@ -1603,7 +1604,7 @@ tests.suite("chat_ui", function(_, it)
     chat_service.reset()
 
     local opened = chat_view.open()
-    local agent = chat_service.get_current_agent()
+    local agent = assert(chat_service.get_current_agent())
     agent.messages = {
       { role = "user", content = "跑命令" },
       { role = "assistant", content = "", tool_calls = {
@@ -1726,14 +1727,14 @@ tests.suite("chat_ui", function(_, it)
     local ask_user_ui = require("NeoAI.ui.components.ask_user")
     ask_user_ui.reset()
 
-    local answered = nil
+    local _ = nil
     ask_user_ui.show({
       question = "选择生成方式？",
       options = {
         { label = "快速生成", description = "直接用当前上下文" },
         { label = "计划模式", description = "先调研再生成" },
       },
-      on_answer = function(a) answered = a end,
+      on_answer = function(a) _ = a end,
       on_cancel = function() end,
     })
 
@@ -1769,7 +1770,7 @@ tests.suite("chat_ui", function(_, it)
     chat_service.reset()
 
     local opened = chat_view.open()
-    local agent = chat_service.get_current_agent()
+    local agent = assert(chat_service.get_current_agent())
     agent.messages = {
       { role = "user", content = "查一下" },
       { role = "assistant", content = "", tool_calls = {
@@ -1824,7 +1825,7 @@ tests.suite("chat_ui", function(_, it)
     reasoning_panel.reset()
 
     local opened = chat_view.open()
-    local agent = chat_service.get_current_agent()
+    local agent = assert(chat_service.get_current_agent())
     -- 预置足够长的内容，使 buffer 行数超过 5
     agent.messages = {
       { role = "user", content = "q1" },
@@ -1868,7 +1869,7 @@ tests.suite("chat_ui", function(_, it)
     chat_service.reset()
 
     local opened = chat_view.open()
-    local agent = chat_service.get_current_agent()
+    local agent = assert(chat_service.get_current_agent())
     -- 多轮内容：推理折叠 + 工具折叠 + 长正文，使 buffer 行数超过 5
     agent.messages = {
       { role = "user", content = "q1" },
@@ -1923,7 +1924,7 @@ tests.suite("chat_ui", function(_, it)
     chat_service.reset()
 
     local opened = chat_view.open()
-    local agent = chat_service.get_current_agent()
+    local agent = assert(chat_service.get_current_agent())
     local body = {}
     for i = 1, 40 do body[#body + 1] = "正文 " .. i end
     agent.messages = {
@@ -1974,7 +1975,7 @@ tests.suite("chat_ui", function(_, it)
     chat_service.reset()
 
     local opened = chat_view.open()
-    local agent = chat_service.get_current_agent()
+    local agent = assert(chat_service.get_current_agent())
     -- 足够多非缩进的普通行，使窗口显示高度有限，折叠块位于正文末尾
     local plain = {}
     for i = 1, 40 do plain[#plain + 1] = "普通行 " .. i end
@@ -2026,7 +2027,7 @@ tests.suite("chat_ui", function(_, it)
     float_window.reset()
 
     chat_view.open()
-    local agent = chat_service.get_current_agent()
+    local agent = assert(chat_service.get_current_agent())
     event_bus.emit(events.COMPACTION_STARTED, { agent_id = agent.id, estimated_tokens = 100 })
     chat_view.flush()
     t.true_(float_window.is_open(), "开始压缩时应打开悬浮窗")
@@ -2057,7 +2058,7 @@ tests.suite("chat_ui", function(_, it)
     float_window.reset()
 
     chat_view.open()
-    local agent = chat_service.get_current_agent()
+    local agent = assert(chat_service.get_current_agent())
     event_bus.emit(events.PLAN_DISTILL_STARTED, { agent_id = agent.id })
     chat_view.flush()
     t.true_(float_window.is_open(), "开始蒸馏时应打开悬浮窗")
@@ -2086,7 +2087,7 @@ tests.suite("chat_ui", function(_, it)
     float_window.reset()
 
     local opened = chat_view.open()
-    local agent = chat_service.get_current_agent()
+    local agent = assert(chat_service.get_current_agent())
     -- 预置足够长的内容，使 buffer 行数超过 5
     agent.messages = {
       { role = "user", content = "q1" },
@@ -2180,7 +2181,7 @@ tests.suite("chat_ui", function(_, it)
     chat_service.reset()
 
     local opened = chat_view.open()
-    local agent = chat_service.get_current_agent()
+    local agent = assert(chat_service.get_current_agent())
     -- 预置足够长的内容（远超窗口高度），使视口需要滚动
     local body = {}
     for i = 1, 200 do body[#body + 1] = "content line " .. i end
@@ -2275,11 +2276,11 @@ tests.suite("chat_ui", function(_, it)
     chat_service.reset()
 
     local opened = chat_view.open()
-    local found = nil
+    local found
     for _, m in ipairs(vim.api.nvim_buf_get_keymap(opened.buf, "n")) do
       if (m.desc or ""):find("沙箱", 1, true) then found = m break end
     end
-    t.not_nil(found, "主窗口普通模式应注册沙箱待审审批快捷键（<leader>ap）")
+    found = assert(found, "主窗口普通模式应注册沙箱待审审批快捷键（<leader>ap）")
     t.true_(found.lhs:sub(-2) == "ap", "沙箱待审审批快捷键应以 ap 结尾，实际: " .. tostring(found.lhs))
 
     chat_view.reset()
@@ -2299,7 +2300,7 @@ tests.suite("chat_ui", function(_, it)
     float_window.reset()
 
     local opened = chat_view.open()
-    local agent = chat_service.get_current_agent()
+    local agent = assert(chat_service.get_current_agent())
     -- 预置足够长的内容，使 buffer 行数超过 5（底部跟随区外可放光标）
     agent.messages = {
       { role = "user", content = "q1" },
@@ -2331,11 +2332,11 @@ tests.suite("chat_ui", function(_, it)
     t.true_(reasoning_panel.is_open(), "跳回跟随时应重弹仍在进行的思考悬浮窗")
 
     -- 广播事件（供伪终端等订阅）
-    local got = nil
+    local got
     local unsub = event_bus.on(events.UI_FOLLOW_CHANGED, function(p) got = p end)
     vim.api.nvim_win_set_cursor(opened.win_id, { 2, 0 })
     chat_view._sync_follow()
-    t.not_nil(got, "跟随跳变应广播 UI_FOLLOW_CHANGED")
+    got = assert(got, "跟随跳变应广播 UI_FOLLOW_CHANGED")
     t.eq(false, got.following, "广播 payload 应带 following=false")
     unsub()
 
@@ -2356,7 +2357,7 @@ tests.suite("chat_ui", function(_, it)
     float_window.reset()
 
     local opened = chat_view.open()
-    local agent = chat_service.get_current_agent()
+    local agent = assert(chat_service.get_current_agent())
     agent.messages = {
       { role = "user", content = "q1" },
       { role = "assistant", content = "a1\na2\na3\na4\na5\na6\na7" },
@@ -2397,7 +2398,7 @@ tests.suite("chat_ui", function(_, it)
     chat_service.reset()
 
     local opened = chat_view.open()
-    local agent = chat_service.get_current_agent()
+    local agent = assert(chat_service.get_current_agent())
     -- 模拟「插入模式期间写入折叠文本」：置 dirty 标记后补算
     agent.messages = {
       { role = "user", content = "q1" },
@@ -2610,13 +2611,13 @@ tests.suite("chat_ui", function(_, it)
     end
 
     chat_view.open({ new_window = true })
-    local agent_a = chat_service.get_current_agent()
+    local agent_a = assert(chat_service.get_current_agent())
     event_bus.emit(events.REASONING_CHUNK, { agent_id = agent_a.id, chunk = "A", reasoning = "A" })
     chat_view.flush()
     t.eq(1, count_reasoning_wins(), "实例 A 应打开自己的思考悬浮窗")
 
     chat_view.open({ new_window = true })
-    local agent_b = chat_service.get_current_agent()
+    local agent_b = assert(chat_service.get_current_agent())
     t.true_(agent_b.id ~= agent_a.id, "两实例应为不同会话")
     event_bus.emit(events.REASONING_CHUNK, { agent_id = agent_b.id, chunk = "B", reasoning = "B" })
     chat_view.flush()
@@ -2636,9 +2637,9 @@ tests.suite("chat_ui", function(_, it)
     chat_service.reset()
 
     local a = chat_view.open({ new_window = true })
-    local agent_a = chat_service.get_current_agent()
+    local agent_a = assert(chat_service.get_current_agent())
     local b = chat_view.open({ new_window = true })
-    local agent_b = chat_service.get_current_agent()
+    local agent_b = assert(chat_service.get_current_agent())
     t.true_(agent_a.id ~= agent_b.id, "两实例应为不同会话")
 
     -- B（聚焦）：写入并渲染自身内容
@@ -2836,7 +2837,7 @@ tests.suite("chat_ui", function(_, it)
     chat_view.reset()
     chat_service.reset()
 
-    local opened = chat_view.open()
+    chat_view.open()
     local ibuf = input_box.get_buf()
     local iwin = input_box.get_win()
     t.true_(iwin ~= nil and vim.api.nvim_win_is_valid(iwin), "打开后应创建输入窗口")

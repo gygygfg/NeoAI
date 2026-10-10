@@ -1,5 +1,5 @@
 --- 沙箱任务授权（grant）专项测试
---- @module NeoAI.tests.test_grant
+--- @module 'NeoAI.tests.test_grant'
 local tests = require("NeoAI.tests")
 
 tests.suite("grant", function(_, it, before_each)

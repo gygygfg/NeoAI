@@ -1,5 +1,5 @@
 --- 沙箱访客文件系统映射（sandbox.guest_fs）专项测试
---- @module NeoAI.tests.test_guest_fs
+--- @module 'NeoAI.tests.test_guest_fs'
 --- 覆盖：set_root/tmp_host 往返；to_host 无映射回退；最长前缀匹配；clear。
 local tests = require("NeoAI.tests")
 

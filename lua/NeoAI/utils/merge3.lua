@@ -1,5 +1,5 @@
 --- 三方合并（diff3）
---- @module NeoAI.utils.merge3
+--- @module 'NeoAI.utils.merge3'
 --- 纯 Lua、无 `vim.fn`/`vim.api` 依赖，可在 libuv 工作线程（`utils.work`）内使用。
 --- 用于发布阶段的「base / ours / theirs」行级三方合并：仅当真实文件被外部改动、
 --- 且候选与外部改动都相对 base 发生变化时调用（见 `sandbox/execution/candidate`）。

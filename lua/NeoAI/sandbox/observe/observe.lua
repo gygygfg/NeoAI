@@ -1,5 +1,5 @@
 --- 沙箱观测（合并原 impact + envelope）
---- @module NeoAI.sandbox.observe.observe
+--- @module 'NeoAI.sandbox.observe.observe'
 --- 影响模型（fs/process/network，未知用 null）与裁决信封（decision/severity/stats/asks/evidence）。
 --- 原 `sandbox/impact` 与 `sandbox/envelope` 保留为兼容 shim（转指本模块）。
 

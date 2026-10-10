@@ -1,5 +1,5 @@
 --- 模型注册表
---- @module NeoAI.core.model.registry
+--- @module 'NeoAI.core.model.registry'
 --- 运行时动态更新的模型列表。
 --- - list(provider?)：异步返回可用模型（含 fallback 链）
 --- - get(model_id)：获取单个模型
@@ -27,7 +27,7 @@ local state = {
 
 --- 获取某 provider 的配置
 --- @param provider string
---- @return table|nil
+--- @return table|nil, string|nil
 local function _get_provider(provider)
   if not provider then
     provider = config_store.get("ai.default_provider")

@@ -1,5 +1,5 @@
 --- 懒加载启动测试
---- @module NeoAI.tests.test_lazy_startup
+--- @module 'NeoAI.tests.test_lazy_startup'
 --- setup() 只登记占位（命令/键位），不启动服务；首次显式 ensure_started_sync 才分两阶段
 --- 异步启动。为彻底隔离全局状态，用隔离子进程 nvim 验证。
 

@@ -1,5 +1,5 @@
 --- MCP 工具描述本地缓存 + pending/stale 状态
---- @module NeoAI.services.mcp.cache
+--- @module 'NeoAI.services.mcp.cache'
 --- 预缓存：连接前从磁盘缓存注册工具/资源/提示定义，避免「连接慢导致工具不可见」。
 --- 动态更新：某服务器工具调用因参数 schema 变化失败时标记 stale，下一轮刷新前按
 --- stale 重拉 tools/list 并覆盖已注册定义与缓存。
@@ -43,7 +43,7 @@ end
 --- 写回缓存文件
 local function _write()
   if not state.path then return end
-  local ok, err = pcall(vim.fn.mkdir, vim.fn.fnamemodify(state.path, ":h"), "p")
+  local ok = pcall(vim.fn.mkdir, vim.fn.fnamemodify(state.path, ":h"), "p")
   if not ok then return end
   local ok_e, encoded = pcall(json.encode, state.data)
   if not ok_e then return end

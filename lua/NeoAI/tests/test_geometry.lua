@@ -1,5 +1,5 @@
 --- 浮窗几何计算测试
---- @module NeoAI.tests.test_geometry
+--- @module 'NeoAI.tests.test_geometry'
 
 local tests = require("NeoAI.tests")
 

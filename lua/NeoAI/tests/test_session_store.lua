@@ -66,6 +66,7 @@ tests.suite("session_store_recovery", function(_, it)
       local fired = 0
       local unsub = require("NeoAI.kernel.event_bus").on(events.SESSION_SAVED, function() fired = fired + 1 end)
       local original = fs.write_file_atomic
+      ---@diagnostic disable-next-line: duplicate-set-field
       fs.write_file_atomic = function() return false, "disk failed" end
       local called, err = xpcall(function()
         local ok, save_err = store.save_all()
@@ -106,6 +107,7 @@ tests.suite("session_store_recovery", function(_, it)
       local s = store.create({ id = "retry" })
       session.add_message(s, { role = "user", content = "recover me" })
       local original = fs.append_file
+      ---@diagnostic disable-next-line: duplicate-set-field
       fs.append_file = function(p)
         original(p, '{"partial":')
         return false, "disk full"
@@ -128,12 +130,14 @@ tests.suite("session_store_recovery", function(_, it)
       local original_run, original_append = runtime.run, fs.append_file_async
       chat.reset()
       local agent = chat.new_session({})
+      ---@diagnostic disable-next-line: duplicate-set-field
       runtime.run = function(a, content)
         a:add_message("user", content)
         a:add_message("assistant", "answer")
         return async.resolve({ content = "answer" })
       end
       local ok, err = xpcall(function()
+        ---@diagnostic disable-next-line: duplicate-set-field
         fs.append_file_async = function() return async.reject("disk full") end
         local failure
         t.await(chat.send_message("first"):catch(function(e) failure = e end))
@@ -161,6 +165,7 @@ tests.suite("session_store_recovery", function(_, it)
       local s = store.create({ id = "a" })
       session.add_message(s, { role = "user", content = "durable" })
       local original = fs.write_file_atomic
+      ---@diagnostic disable-next-line: duplicate-set-field
       fs.write_file_atomic = function() return false, "rename failed" end
       local called, ok = pcall(store.persist, s)
       fs.write_file_atomic = original
@@ -168,7 +173,7 @@ tests.suite("session_store_recovery", function(_, it)
       t.eq(2, #fs.read_jsonl(path))
       store.reset(); store.init()
       t.eq("durable", store.get("a").messages[1].content)
-      t.true_(store.persist(store.get("a")))
+      t.true_(store.persist(assert(store.get("a"))))
       t.eq(1, #fs.read_jsonl(path))
     end, { log_compaction = { max_redundant_records = 1 } })
   end)

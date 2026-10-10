@@ -1,5 +1,5 @@
 --- 沙箱行为观测（eBPF/strace/procfs）与增量密钥检测
---- @module NeoAI.tests.test_observer
+--- @module 'NeoAI.tests.test_observer'
 --- 离线覆盖：bpftrace/strace 事件解析、后端选择、密钥路径判定、增量上下文扫描、
 --- 以及「观测到的密钥文件访问」驱动的 UI 告警行。
 
@@ -17,6 +17,7 @@ local function with_config(overrides, fn)
 end
 
 tests.suite("observer", function(_, it)
+  ---@type table<string, any>
   local observer = require("NeoAI.sandbox.observe.observer")
   local secret = require("NeoAI.sandbox.secret.secret")
 
@@ -97,6 +98,7 @@ tests.suite("observer", function(_, it)
     observer.reset()
     local calls = 0
     local orig = vim.notify
+    ---@diagnostic disable-next-line: duplicate-set-field
     vim.notify = function() calls = calls + 1 end
     with_config({ tools = { sandbox = { observe = { enabled = false } } } }, function()
       observer.notify_backend()
@@ -110,6 +112,7 @@ tests.suite("observer", function(_, it)
     observer.reset()
     local msgs = {}
     local orig = vim.notify
+    ---@diagnostic disable-next-line: duplicate-set-field
     vim.notify = function(m) msgs[#msgs + 1] = tostring(m) end
     with_config({ tools = { sandbox = { observe = { backend = "heuristic", notify = true } } } }, function()
       observer.notify_backend()
@@ -130,7 +133,7 @@ tests.suite("observer", function(_, it)
 
   it("增量上下文扫描：仅检测新增消息", function(t)
     secret.reset()
-    local _tok, used = secret.tokenize("aws = AKIAIOSFODNN7EXAMPLE")
+    local _, used = secret.tokenize("aws = AKIAIOSFODNN7EXAMPLE")
     t.true_(#used >= 1, "应登记至少一个密钥 token")
     local msgs = {
       { role = "user", content = "ordinary" },
@@ -188,7 +191,6 @@ tests.suite("observer", function(_, it)
     local cgroup = require("NeoAI.sandbox.execution.cgroup")
     if not cgroup.probe().available then return end
     wrapper.clear_prewarm()
-    local observer = require("NeoAI.sandbox.observe.observer")
     local orig_backend, orig_available, orig_start = observer.backend, observer.available, observer.start
     observer.backend = function() return "ebpf" end
     observer.available = function() return true, "ebpf" end
@@ -225,7 +227,7 @@ tests.suite("observer", function(_, it)
     })
     t.not_nil(prefix, "应返回 strace 前缀")
     t.not_nil(handle, "应返回 handle")
-    local f = io.open(handle.path, "w")
+    local f = assert(io.open(handle.path, "w"))
     f:write('123 openat(AT_FDCWD, "/root/.ssh/id_rsa", O_RDONLY) = 3\n')
     f:write('123 openat(AT_FDCWD, "/root/.ssh/id_rsa", O_RDONLY) = 3\n')
     f:write('123 openat(AT_FDCWD, "/usr/bin/ls", O_RDONLY) = 4\n')
@@ -247,7 +249,7 @@ tests.suite("observer", function(_, it)
   it("cgroup：预热句柄可认领到 attempt（release 生效）", function(t)
     local cgroup = require("NeoAI.sandbox.execution.cgroup")
     if not cgroup.probe().available then return end
-    local h = cgroup.prepare("prewarm_test", { pids = 4 })
+    local h = assert(cgroup.prepare("prewarm_test", { pids = 4 }))
     t.not_nil(h, "应能创建预热 cgroup")
     cgroup.adopt(h, "attempt_real")
     t.eq("attempt_real", h.attempt_id, "应改挂到真实 attempt")

@@ -1,10 +1,11 @@
 --- 计划提取测试
---- @module NeoAI.tests.test_plan_distill
+--- @module 'NeoAI.tests.test_plan_distill'
 
 local tests = require("NeoAI.tests")
 
 tests.suite("plan_distill", function(_, it)
   --- 等待 Deferred 完成（async 基于 vim.schedule）
+  ---@return any
   local function await(d, timeout)
     local done, val = false, nil
     d:then_(function(v) done = true; val = v end, function(e) done = true; val = e end)
@@ -369,7 +370,7 @@ lua/b.lua</Files>
     local p = require("NeoAI.core.session.plan_distill")
     local async = require("NeoAI.utils.async")
     local cb = require("NeoAI.core.session.context_builder")
-    local counts, restore = install_router(p, {
+    local _, restore = install_router(p, {
       overrides = { front = function() return async.reject({ message = "boom" }) end },
     })
     local msgs = sample_msgs()
@@ -471,6 +472,7 @@ lua/b.lua</Files>
 
   it("_send_extract 下发 extract_max_tokens；默认（nil）不下发 max_tokens", function(t)
     local p = require("NeoAI.core.session.plan_distill")
+    ---@type table<string, any>
     local request = require("NeoAI.core.agent.request")
     local async = require("NeoAI.utils.async")
     local orig = request.send_stream

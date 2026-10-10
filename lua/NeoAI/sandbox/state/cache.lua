@@ -1,5 +1,5 @@
 --- 沙箱内容寻址缓存
---- @module NeoAI.sandbox.state.cache
+--- @module 'NeoAI.sandbox.state.cache'
 --- 依赖/产物按内容寻址缓存；写入方隔离，未验证内容不污染共享可信缓存（设计文档 §12）。
 --- 键必须覆盖输入、运行时、规则与事实；授权与撤销状态不可通过旧缓存跳过。
 

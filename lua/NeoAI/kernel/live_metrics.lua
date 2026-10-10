@@ -1,5 +1,5 @@
 --- 实时指标桥（core ↔ ui 解耦）
---- @module NeoAI.kernel.live_metrics
+--- @module 'NeoAI.kernel.live_metrics'
 --- 存放**按引用**共享的运行态对象（当前仅工具的可暂停计时器）。
 --- 事件总线经 `nvim_exec_autocmds` 传递 data 会深拷贝并丢失元表/方法，计时器的 `elapsed()`
 --- 无法随事件传播；而 core（工具循环）与 ui（折叠渲染）都不得相互直接依赖。故以本 kernel 设施

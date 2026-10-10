@@ -1,5 +1,5 @@
 --- 合并冲突留待审 + 交给 AI 回归
---- @module NeoAI.tests.test_sandbox_conflict_ai
+--- @module 'NeoAI.tests.test_sandbox_conflict_ai'
 --- 覆盖：
 --- 1) 三方合并冲突时 apply 返回 CONFLICT，条目保持 PENDING 并记录 merge_conflict；
 --- 2) 冲突时真实文件零改动；
@@ -55,7 +55,7 @@ tests.suite("sandbox_conflict_ai", function(_, it)
     t.false_(pub.ok, "应冲突")
     t.eq("CONFLICT", pub.state)
     t.matches("^MERGE_CONFLICT", pub.reason or "", "应为合并冲突")
-    local after = review.get(item.change_set_id)
+    local after = assert(review.get(item.change_set_id))
     t.eq(review.REVIEW.PENDING, after.review_state, "冲突条目应保持待审")
     t.eq(review.APPLY.CONFLICT, after.apply_state, "应标记为 CONFLICT")
     t.not_nil(after.merge_conflict, "应记录合并冲突")
@@ -72,6 +72,7 @@ tests.suite("sandbox_conflict_ai", function(_, it)
     review.apply(item.change_set_id, { auto_approve = true })
 
     local captured
+    ---@type table<string, any>
     local cs = require("NeoAI.services.chat_service")
     local orig = cs.send_message
     cs.send_message = function(msg, opts) captured = { msg = msg, opts = opts }; return {} end

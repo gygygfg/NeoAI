@@ -1,5 +1,5 @@
 --- 运行时上下文快照
---- @module NeoAI.core.session.runtime_context
+--- @module 'NeoAI.core.session.runtime_context'
 --- 对齐 deepseek-harness 的 PromptContext：
 --- - 系统提示（identity/persona）必须逐字节稳定，才能复用 DeepSeek 前缀缓存；
 ---   任何易变运行态（当前任务清单 todo、计划模式等）不能放进系统提示，否则改动会让
@@ -55,7 +55,9 @@ end
 --- 渲染运行时上下文文本（供测试/复用）
 --- @param agent table
 --- @return string
-M.render = _render
+function M.render(agent)
+  return _render(agent)
+end
 
 --- 判断是否为运行时上下文快照消息
 --- @param msg table

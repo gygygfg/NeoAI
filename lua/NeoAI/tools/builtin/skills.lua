@@ -1,5 +1,5 @@
 --- 技能工具（list_skills / load_skill）
---- @module NeoAI.tools.builtin.skills
+--- @module 'NeoAI.tools.builtin.skills'
 --- 把「技能目录 SKILL.md + load_skill 工具」模型落地：
 --- 1. 注册系统提示段 deployment:skills（order=90，工具指引之前）列出可用技能；
 --- 2. list_skills：列出技能；load_skill：装载某技能正文给模型（可选持久化为 agent 级段）。
@@ -63,7 +63,7 @@ skill_tools.list_skills = helpers.define_tool(
     properties = {},
     required = {},
   },
-  function(args, on_success, on_error)
+  function(_, on_success, on_error)
     local skills = services.use("services.skills")
     if not skills then
       on_error("技能服务未启用")
@@ -86,7 +86,7 @@ skill_tools.list_skills = helpers.define_tool(
 
 skill_tools.load_skill = helpers.define_tool(
   "load_skill",
-  "装载一个技能（Skills）的完整内容（SKILL.md 正文），用于获取针对特定任务的步骤式指引。name 必填（来自 list_skills / 系统提示中的技能清单）。",
+  "装载一个技能的完整正文（SKILL.md），获取针对特定任务的步骤式指引。name 必填（来自 list_skills / 技能清单）。",
   {
     type = "object",
     properties = {

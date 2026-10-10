@@ -467,6 +467,16 @@ is only kept for other `approval.mode` values (`prompt`/`strict`).
         deletes child-before-parent) or an unavailable thread pool **fall back to synchronous
         `candidate.publish`** with identical semantics. The review UI (`<CR>`/`A`/L3 re-confirm) uses
         async publish by default and yields the main loop per item in a batch-apply session.
+      - **Idempotent delete/rmdir**: publishing no longer fails when the target is already gone
+        (removed externally) — `delete`/`rmdir` succeed when the removal succeeded **or** the target
+        no longer exists, avoiding spurious `WRITE_FAILED: ... rmdir` errors.
+      - **Partial apply for non-atomic units**: non-atomic change units (no `atomic_group="git"`
+        object/pointer) **allow partial writes** during the write phase — a single per-file write
+        failure no longer fails the whole unit: successful files are applied and settled, failed files
+        (with reasons) are **requeued as a new pending unit** by the `PARTIAL` branch of
+        `review._apply_settle` for retry. `git` atomic groups, `NEEDS_ROOT`, `CONFLICT`,
+        `SECRET_UNRESOLVED` and CAS pre-check failures still abort the whole unit immediately (CAS-phase
+        consistency is unchanged: any baseline drift is still rejected wholesale before writing).
       - **CAS mode**: `tools.sandbox.review.cas_mode` (`hash` default — full read+hash per file, the
         strongest consistency; `auto` — stat signature for very large files/blobs, hash otherwise;
         `sig` — signatures only, fastest). Non-default values loosen detection of "same-size,
@@ -1386,6 +1396,12 @@ the facade (`sandbox/systemd/systemd.lua`) with a **fake parser** covering only 
 - Diagnostics: the clone's `textDocument/publishDiagnostics` does not leak into the editor;
   `lsp_diagnostics` prefers pull diagnostics (`textDocument/diagnostic`) from the clone (reflecting
   staged content) and falls back to editor diagnostics when the server does not support it.
+- Project-wide diagnostics (`lsp_check` tool): unlike the clone above, it runs the server's **CLI check
+  command** (`tools.lsp.check.servers`, e.g. `lua-language-server --check=.`). Its sandbox spec is
+  `process` + `read_only`, executed via `ctx.sandbox_prefix` in the **same namespace/overlay as
+  `run_command`**: it reads the staged view (including unpublished AI changes), recomputes everything,
+  and neither captures candidates nor leaks writes. Fully decoupled from the editor LSP's mount/cache
+  state, suited for batch diagnostics on large projects.
 - Consistency refresh: before every LSP tool call and at clone start, `sandbox.lsp.refresh()`
   re-materializes the upper from the current workspace staging (wipe then write), so the clone
   immediately sees the latest unpublished changes.
@@ -1398,9 +1414,17 @@ the facade (`sandbox/systemd/systemd.lua`) with a **fake parser** covering only 
   `mask_paths` as `run_command` are applied (e.g. `~/.config/gh`, `~/.config/gcloud`,
   `~/.config/git/credentials`, `~/.local/share/keyrings`, `~/.cache/keyring-*`), so credentials are not
   exposed to the clone via config/cache dirs.
-- Lifecycle: clones are started and cached on demand by `sandbox.lsp.clients_for` /
+- Lifecycle and keepalive: clones are started and cached on demand by `sandbox.lsp.clients_for` /
   `client_supporting`, and stopped by `stop_all()`. No global hook is registered, so unload/disable
   never affects the editor LSP.
+  - **Idle keepalive**: a clone is kept warm for `tools.sandbox.lsp_overlay.idle_timeout_ms`
+    (default 600000 ms = 10 min) after its last use; later `lsp_*` calls reuse the resident process
+    directly, **without waiting for the server to restart** (no cold start on every diagnostic).
+    When idle past the timeout a background reaper stops it to avoid leaking resident processes;
+    set 0/negative to disable idle reaping (alive until an explicit `stop_all`/exit).
+  - **Reuse fallback**: when the target buffer has no editor client attached (background-loaded, or
+    the user buffer was detached), `client_supporting` still falls back to an already-**kept-warm**
+    clone and reuses it instead of restarting or reporting "no LSP client".
 
 ## 6. Runtime backend
 
@@ -2281,6 +2305,15 @@ secret files (`secret.is_secret_path` / `is_sensitive_path` return false): they 
 high-entropy tokenized nor flagged as "secret access", and the generated-secret scan
 (`detect_generated`) skips their contents. This avoids mistaking `sha256sum` output or the
 history/register high-entropy fragments inside `.shada` for secrets.
+
+**Non-credential files do not participate in secret operations at all**: candidate freezing/staging
+**skips all tokenization** for non-credential paths (named rules, name-assignment and known env-var
+secrets all omitted) and the secret warning counter (`warn_for_files`) skips them too. Moreover the
+secret signal only escalates for *credential* write paths — when a candidate only touches
+non-credential/editor-state files (e.g. `~/.local/state/nvim/shada/main.shada`), the command-level
+`secret_operation` no longer pushes it to L3; the path level naturally caps it at L1
+(`USER_PATH_WRITE`). This avoids flagging commands that merely touch editor state (e.g. headless
+nvim) as out-of-workspace secret operations.
 
 **Env-var secret values are soft-handled**: `sanitized_env` registers the real value of a sensitive
 env var as an "env-var secret" (`secret.is_env_secret`). Such values are **fallback plaintext-

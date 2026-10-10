@@ -1,5 +1,5 @@
 --- 服务层测试
---- @module NeoAI.tests.test_services
+--- @module 'NeoAI.tests.test_services'
 
 local tests = require("NeoAI.tests")
 
@@ -33,7 +33,7 @@ tests.suite("services", function(_, it)
     local model_service = require("NeoAI.services.model_service")
     model_service.reset()
     model_service.set_active("m1", "p1")
-    local active = model_service.get_active()
+    local active = assert(model_service.get_active())
     t.eq("m1", active.model)
     t.eq("p1", active.provider)
   end)
@@ -44,7 +44,7 @@ tests.suite("services", function(_, it)
     local tool_service = require("NeoAI.services.tool_service")
     local registry = require("NeoAI.tools.registry")
     local helpers = require("NeoAI.tools.builtin.tool_helpers")
-    registry.register(helpers.define_tool("fast_tool", "快", nil, function(args, on_success) on_success("fast") end))
+    registry.register(helpers.define_tool("fast_tool", "快", nil, function(_, on_success) on_success("fast") end))
     tool_service.reset()
     tool_service.set_allow_all("fast_tool", true)
     local shown = false

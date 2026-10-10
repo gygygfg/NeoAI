@@ -45,6 +45,17 @@
 - **回调风格**：`func(args, on_success, on_error, ctx)`（`arity >= 2`）。
 - **返回 Deferred**：`func(args, ctx)` 返回带 `then_` 的对象。
 
+> **工具约定（共享系统提示段）**：为降低提示词规模，工具描述统一精简，把跨工具重复的约定
+> 提取到单个系统提示段 `tools:conventions`（`tools/init.lua` 经 `kernel.core_bridge.prefix`
+> 注册，仅出现一次）：`description` 必填、行号 1-based、路径自动展开 `~`/`$VAR`、输出超限截断为
+> 头+尾并落盘（用 `read_file` 的 `offset/limit` 回读）、`git_*` 的 `repo` 缺省=会话仓库、
+> `run_command` 交互式 PTY 的自动应答与 `terminal_*` 精确控制。
+>
+> **opencode 风格别名（加别名、保持兼容）**：`executor._normalize_arguments` 接受
+> `filePath → file_path`、`oldString/newString → old_text/new_text`、`pattern → query`、
+> `glob → include`、`timeout → timeout_ms`；`registry.resolve_name` 接受 opencode 工具名
+> `bash/glob/grep/webfetch/task/todowrite/todoread`。旧名仍完全可用。
+
 ## 3. 工具注册
 
 `tools/init.lua` 的 `BUILTIN_MODULES` 列出内置工具模块，`init()` 时经 `registry.register_many` 同步注册
@@ -237,7 +248,7 @@ M.execute(agent, name, args, tool_call_id, opts)
 `lsp_hover` / `lsp_definition` / `lsp_references` / `lsp_implementation` / `lsp_declaration` /
 `lsp_document_symbols` / `lsp_workspace_symbols` / `lsp_code_action` / `lsp_rename` / `lsp_format` /
 `lsp_diagnostics` / `lsp_client_info` / `lsp_signature_help` / `lsp_completion` /
-`lsp_type_definition` / `lsp_service_info`。
+`lsp_type_definition` / `lsp_service_info` / `lsp_check`。
 
 > `lsp_ops` 有**请求级超时**兜底（`tools.lsp.timeout_ms` 默认 10s）：服务器无响应时快速失败，
 > 避免工具循环挂到 executor 超时。
@@ -251,6 +262,36 @@ M.execute(agent, name, args, tool_call_id, opts)
 > `lsp_diagnostics` **每次调用都重新获取**：pull 客户端（`textDocument/diagnostic`，优先 AI 沙箱克隆）
 > 直接请求最新诊断；仅 push 客户端时强制触发一次 didChange（内容不变、不产生撤销项）让服务器重新
 > lint，等其 `publishDiagnostics` 后再读缓存（超时兜底），不返回陈旧缓存。
+>
+> **统一输出格式**（各 `lsp_*` 工具共用同一套文本约定，行列均为 1-based）：
+> 位置类（`lsp_definition`/`lsp_references`/`lsp_declaration`/`lsp_implementation`/
+> `lsp_type_definition`）输出 `path:line:col`；`lsp_diagnostics` 输出
+> `path:line:col [Severity] message`（Severity 为 `Error`/`Warning`/`Info`/`Hint`）；
+> 符号类输出 `Name (Kind)  path:line:col`（`lsp_document_symbols` 层级按深度缩进两空格）。
+>
+> `lsp_check`：**项目级全量诊断**，对文件/目录/glob 运行 LSP server 的 **CLI 检查命令**
+> （如 `lua-language-server --check=.`，见 `tools.lsp.check.servers`），不依赖 buffer 是否打开、
+> 全量重算、可复现；命令在沙箱内执行（读暂存视图、写入不外泄），与编辑器 LSP 的挂载/缓存状态解耦。
+> 结果读取：lua-language-server 把 JSON 写到 `--check_out_path`（stdout 只有进度条），配置用 `{out}`
+> 占位符指向「沙箱可写、宿主可读」的文件，进程退出后读回解析；stdout 的进度/ANSI（`Initializing`、
+> `===017/322`、`Diagnosis complete` 等）被剥离，绝不回吐。解析容错 lua-language-server / pyright /
+> 通用 JSON，必要时从文本抽取 JSON。
+> 参数：`path`（文件/目录/glob，默认当前目录）、`severity`（最低级别 error|warning|information|hint，
+> 同时下发给 CLI 与本地过滤）、`format`（`summary`（默认：文件/问题计数 + 按规则/按消息/文件统计）/
+> `text`（按 code 分组）/`json`）、`server`（默认自动）、`codes`/`exclude_codes`（按规则白/黑名单）、
+> `paths`/`exclude_paths`（按路径子串或 glob 白/黑名单）、`limit`（text/json 明细上限，默认 200）、
+> `baseline`（json 输出路径，或 `"auto"` 用上次缓存结果 → 报告**新增/已修复**）。
+> **scope 一致性**：无论请求文件/目录/glob，都在**同一工作区根**上扫描后过滤，保证单文件结果 ==
+> 目录内该文件的结果（不会因 server 对单文件/目录的加载差异而数字偏差）。
+> 输出经 `output_guard` 限流。若 server 配置声明了 `root_files`（如 `.luarc.json`）且工作区根缺失
+> （**按沙箱视图检测**：AI 刚暂存的 `.luarc.json` 也算存在），结果顶部给出**强警示**；
+> 若同时配置了 `auto_config`（默认对 lua-language-server 开启），则用**内置默认配置**执行本次检查
+> （LuaJIT + vim globals），消除大批 `undefined-global` 噪声——该临时配置**只在沙箱内生效、不写入
+> 工作区**，故 `file_exists(.luarc.json)` 为 false 属正常；如需生成真实文件，设
+> `auto_config_persist=true`（暂存为待审改动，read 工具可见，审批后发布）。
+> 空结果时**准确归因**：区分「严重级别过滤」「不在 scope 内」「code/path 过滤」并给出对应提示。
+> `lsp_service_info`/`lsp_client_info` 会显示每个客户端的**工作区根与启动命令**；工作区根为空时明确
+> 警示「跨文件/类型解析会大量误报（如 undefined-global）」并给出修复建议。
 
 ### 🌳 Tree-sitter（tree_ops.lua）
 

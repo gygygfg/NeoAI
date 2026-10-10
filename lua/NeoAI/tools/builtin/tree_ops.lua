@@ -1,8 +1,18 @@
 --- Tree-sitter 语法树工具
---- @module NeoAI.tools.builtin.tree_ops
+--- @module 'NeoAI.tools.builtin.tree_ops'
 --- 通过 Neovim 内置 treesitter（vim.treesitter）提供代码分析工具。
 
 local helpers = require("NeoAI.tools.builtin.tool_helpers")
+
+-- Tree-sitter 节点（`vim.treesitter` 返回的 TSNode）：仅声明本文件用到的成员。
+--- @class TSNode
+--- @field named_descendant_for_range fun(self: TSNode, start_row: integer, start_col: integer, end_row: integer, end_col: integer): TSNode|nil
+--- @field range fun(self: TSNode): integer, integer, integer, integer
+--- @field type fun(self: TSNode): string
+--- @field child_count fun(self: TSNode): integer
+--- @field named fun(self: TSNode): boolean
+--- @field parent fun(self: TSNode): TSNode|nil
+--- @field child fun(self: TSNode, index: integer): TSNode|nil
 
 local M = {}
 
@@ -238,7 +248,7 @@ tree_tools.get_child_nodes = helpers.define_tool(
     for i = 0, node:child_count() - 1 do
       local c = node:child(i)
       if c then
-        local sr, sc, er, ec = _node_range(c)
+        local sr, sc = _node_range(c)
         out[#out + 1] = string.format("%d: %s %d:%d", i, c:type(), sr + 1, sc + 1)
       end
     end
@@ -267,13 +277,10 @@ tree_tools.get_node_code = helpers.define_tool(
 
 tree_tools.query_tree = helpers.define_tool(
   "query_tree",
-  "用 treesitter query 查询节点。file_path 必填，query 必填。"
-    .. "字段名（field:）必须是该语言语法对该节点类型定义的有效字段，"
-    .. "错误示例(Lua): (dot_index_expression object: ...) 的 object 是错的，应为 table；"
-    .. "(function_call function: ...) 的 function 是错的，function_call 无该字段。"
-    .. "正确示例(Lua): (dot_index_expression table: (identifier) @obj field: (identifier) @field)、"
-    .. "(function_call arguments: (arguments (string) @arg))、"
-    .. "(local_variable_declarator name: (identifier) @name value: (expression) @val)。",
+  "用 treesitter query 查询节点。file_path/query 必填。"
+    .. "字段名须是该节点类型定义的**有效字段**（写错时返回可用字段提示）。"
+    .. "例(Lua): `(dot_index_expression table: (identifier) @obj field: (identifier) @field)`、"
+    .. "`(function_call arguments: (arguments (string) @arg))`。",
   {
     type = "object",
     properties = { file_path = { type = "string" }, query = { type = "string" } },
@@ -288,7 +295,7 @@ tree_tools.query_tree = helpers.define_tool(
     local root = _root(bufnr)
     if not root then on_error("无法获取语法树") return end
     local out = {}
-    for id, node, metadata in query:iter_captures(root, bufnr) do
+    for id, node, _ in query:iter_captures(root, bufnr) do
       local name = query.captures[id] or tostring(id)
       local sr, sc, er, ec = _node_range(node)
       out[#out + 1] = string.format("%s %d:%d-%d:%d", name, sr + 1, sc + 1, er + 1, ec + 1)

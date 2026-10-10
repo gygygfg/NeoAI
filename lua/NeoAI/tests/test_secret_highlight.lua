@@ -1,5 +1,5 @@
 --- chat 界面密钥高亮回归
---- @module NeoAI.tests.test_secret_highlight
+--- @module 'NeoAI.tests.test_secret_highlight'
 --- 工具参数 / 工具结果（模型上下文）含密钥时，chat 界面应在对应工具折叠块**外**
 --- 单独一行高亮警告（`NeoAISecretWarning`），折叠标题保持干净（不含 `⚠ 密钥`）；
 --- 含密钥的工具调用参数/结果**不截断**完整展示，且行内密钥值本身也以同组高亮。

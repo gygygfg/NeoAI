@@ -1,5 +1,5 @@
 --- NeoAI 核心业务层入口
---- @module NeoAI.core
+--- @module 'NeoAI.core'
 --- 依赖：kernel + utils。向上（services）暴露模块引用。
 --- 本层只做模块编排，不含具体业务逻辑。
 

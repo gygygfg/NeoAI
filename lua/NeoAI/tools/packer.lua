@@ -1,5 +1,5 @@
 --- 工具分组打包
---- @module NeoAI.tools.packer
+--- @module 'NeoAI.tools.packer'
 --- 按类别对工具调用分组，用于 UI 分类展示和分批执行。
 
 local M = {}
@@ -78,10 +78,8 @@ end
 --- @return table 数组
 function M.get_all_packs()
   local packs = {}
-  local seen = {}
   for name, order in pairs(PACK_ORDER) do
     packs[#packs + 1] = { name = name, order = order }
-    seen[name] = true
   end
   table.sort(packs, function(a, b) return a.order < b.order end)
   local out = {}

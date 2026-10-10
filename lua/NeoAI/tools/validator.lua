@@ -1,5 +1,5 @@
 --- 参数校验
---- @module NeoAI.tools.validator
+--- @module 'NeoAI.tools.validator'
 --- 校验工具定义结构、参数 schema、审批决策。
 
 local M = {}
@@ -56,7 +56,8 @@ end
 --- @param parameters table { type="object", properties, required }
 --- @param args table
 --- @param prefix string|nil 嵌套路径前缀（用于错误信息）
---- @return boolean, string|nil 是否有效, 错误信息
+--- @return boolean 是否有效
+--- @return string|nil 错误信息
 function M.validate_parameters(parameters, args, prefix)
   if not parameters then return true end
   if parameters.type and parameters.type ~= "object" then
@@ -160,12 +161,11 @@ function M.is_params_safe(args, groups)
 end
 
 --- 审批决策
---- @param tool_name string
 --- @param args table
 --- @param approval_config table { auto_allow, allowed_directories, allowed_param_groups }
 --- @param mode string "prompt" | "auto_allow" | "strict"
 --- @return boolean 是否需要审批
-function M.check_approval(tool_name, args, approval_config, mode)
+function M.check_approval(_, args, approval_config, mode)
   if mode == "auto_allow" then return false end
   if mode == "strict" then return true end
   if approval_config.auto_allow then return false end

@@ -1,5 +1,5 @@
 --- 模型选择器测试
---- @module NeoAI.tests.test_model_picker
+--- @module 'NeoAI.tests.test_model_picker'
 
 local tests = require("NeoAI.tests")
 local config_store = require("NeoAI.kernel.config_store")
@@ -69,6 +69,7 @@ tests.suite("model_picker", function(_, it)
     local picker = require("NeoAI.ui.components.model_picker")
     picker.reset()
 
+    ---@type { model: any, provider: any }|nil
     local selected = nil
     picker.open(function(model_id, provider)
       selected = { model = model_id, provider = provider }
@@ -98,7 +99,7 @@ tests.suite("model_picker", function(_, it)
       end
       return nil
     end
-    local cr = cr_map()
+    local cr = assert(cr_map())
     t.not_nil(cr, "应注册回车映射")
 
     -- 在头行回车：切换折叠（alpha 组关闭又打开）
@@ -113,8 +114,9 @@ tests.suite("model_picker", function(_, it)
     vim.api.nvim_win_set_cursor(win, { 5, 0 })
     cr.callback()
     t.not_nil(selected, "回车应触发选择")
-    t.eq("G1", selected.model, "应选中 gamma 的 G1")
-    t.eq("gamma", selected.provider, "应返回提供商 gamma")
+    local sel = assert(selected)
+    t.eq("G1", sel.model, "应选中 gamma 的 G1")
+    t.eq("gamma", sel.provider, "应返回提供商 gamma")
   end)
 
   it("所有提供商都无 api_key 时展示提示", function(t)
@@ -129,6 +131,7 @@ tests.suite("model_picker", function(_, it)
     })
     local picker = require("NeoAI.ui.components.model_picker")
     picker.reset()
+    ---@type { model: any, provider: any }|nil
     local selected = nil
     picker.open(function(model_id, provider)
       selected = { model = model_id, provider = provider }

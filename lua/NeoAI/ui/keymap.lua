@@ -1,5 +1,5 @@
 --- 按键映射管理
---- @module NeoAI.ui.keymap
+--- @module 'NeoAI.ui.keymap'
 --- 统一管理所有按键映射，按上下文分组（global/tree/chat/input/approval）。
 --- 支持运行时注册/注销。
 
@@ -84,8 +84,7 @@ function M.register_global(actions)
 end
 
 --- 注销已注册按键
---- @param context string|nil
-function M.unregister(context)
+function M.unregister(_)
   -- 简化：全量清理
   for _, info in pairs(state.registered) do
     if info.buf and vim.api.nvim_buf_is_valid(info.buf) then

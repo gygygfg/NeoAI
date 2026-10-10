@@ -1,5 +1,5 @@
 --- 上下文压缩
---- @module NeoAI.core.session.compactor
+--- @module 'NeoAI.core.session.compactor'
 --- 后台异步、非阻塞压缩：
 --- 1. 达到 token 压力阈值时，先做模型无关的工具结果裁剪（tool_result_pruner）；
 ---    裁剪后已回到阈值内则跳过摘要调用。
@@ -124,6 +124,7 @@ end
 --- 估算当前上下文 token 占用（优先 API 最近一次请求的真实用量，缺失回退完整请求估算）
 --- @param agent table
 --- @return number
+--- @return string|nil 来源（api / estimate）
 local function _estimate(agent)
   local context_builder = require("NeoAI.core.session.context_builder")
   local caps = _caps(agent)
@@ -197,10 +198,10 @@ end
 --- 按轮次选择被折叠区间：折叠第一轮至倒数第二轮，保留最后一轮完整。
 --- 在请求视图上操作（可能已含上一次的检查点）：以最后一条非运行态 user 消息为最后一轮起点。
 --- @param agent table
---- @param cfg table
+--- @param _ table
 --- @return table shadow 被折叠消息数组（可为空）
 --- @return number added 其中「原始（非运行态、非检查点）消息」条数，用于累加覆盖层 replaced
-local function _select_round_shadow(agent, cfg)
+local function _select_round_shadow(agent, _)
   local context_builder = require("NeoAI.core.session.context_builder")
   local messages = context_builder.request_view(agent)
   local last_user = nil

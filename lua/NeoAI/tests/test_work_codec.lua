@@ -1,5 +1,5 @@
 --- 工作线程结构化卸载（vim.mpack 编解码）专项测试
---- @module NeoAI.tests.test_work_codec
+--- @module 'NeoAI.tests.test_work_codec'
 --- 覆盖：utils.work.run_codec 的结构化输入输出、二进制往返、额外原始参数与错误传播。
 
 local tests = require("NeoAI.tests")

@@ -1,5 +1,5 @@
 --- 工具循环内上下文压缩测试
---- @module NeoAI.tests.test_loop_compaction
+--- @module 'NeoAI.tests.test_loop_compaction'
 --- 验证：压缩不再被 idle 守卫一律拒绝——
 --- 1. maybe_compact 默认仍要求 idle（回合边界），传入 allow_busy 后允许非 idle 压缩；
 --- 2. force_compact 缺省 allow_busy（溢出恢复在 generating/tool_running 下也能真正压缩）；
@@ -38,6 +38,7 @@ tests.suite("loop_compaction", function(_, it)
   local function stub_summarize()
     local request_mod = require("NeoAI.core.agent.request")
     local orig = request_mod.send_stream
+    ---@diagnostic disable-next-line: duplicate-set-field
     request_mod.send_stream = function(_, _, on_chunk)
       if on_chunk then on_chunk({ content = "## 摘要\n- 压缩后的检查点" }) end
       return async.resolve({ content = "## 摘要\n- 压缩后的检查点", usage = nil })
@@ -252,7 +253,7 @@ tests.suite("loop_compaction", function(_, it)
     chat.attach_window(1, agent)
     chat.detach_window(1)
 
-    local reloaded = session_store.get(s.id)
+    local reloaded = assert(session_store.get(s.id))
     t.not_nil(reloaded, "会话应仍存在")
     local has_checkpoint = false
     for _, m in ipairs(reloaded.messages) do

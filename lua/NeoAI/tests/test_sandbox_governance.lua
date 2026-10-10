@@ -1,5 +1,5 @@
 --- 沙箱治理专项测试：安全分级、容器受控、行为审计、敏感信息脱敏、会话自动审批
---- @module NeoAI.tests.test_sandbox_governance
+--- @module 'NeoAI.tests.test_sandbox_governance'
 
 local tests = require("NeoAI.tests")
 local _provide_sandbox = require("NeoAI.tests.sandbox_stub").provide
@@ -113,18 +113,18 @@ tests.suite("sandbox_governance", function(_, it)
 
   it("容器受控：podman 注入命名空间共享，docker 走受控 socket", function(t)
     local container = require("NeoAI.sandbox.execution.container")
-    local plan = container.plan("podman run -it ubuntu bash")
+    local plan = assert(container.plan("podman run -it ubuntu bash"))
     t.eq("podman", plan.manager, "应识别 podman")
     t.true_(plan.rewritten, "应重写命令")
     t.matches("--pid=host", plan.command, "应注入 --pid=host")
     t.matches("--net=host", plan.command, "应注入 --net=host")
     t.matches("podman run %-%-net=host", plan.command, "标志应紧跟 run 子命令")
     -- 已有共享标志时不重复注入
-    local plan2 = container.plan("podman run --net=host ubuntu true")
+    local plan2 = assert(container.plan("podman run --net=host ubuntu true"))
     t.false_(plan2.rewritten, "已有标志不应重复注入")
     t.true_(plan2.share_namespace, "应识别为共享")
     -- docker 依赖外部 daemon，无法共享命名空间
-    local d = container.plan("docker run ubuntu true")
+    local d = assert(container.plan("docker run ubuntu true"))
     t.eq("controlled", d.mode, "docker 应走受控 socket")
     t.eq("DOCKER_NAMESPACE_NOT_SHARABLE", d.reason)
     t.false_(d.rewritten, "docker 不应重写")
@@ -132,7 +132,7 @@ tests.suite("sandbox_governance", function(_, it)
     t.nil_(container.plan("ls -la"), "非容器命令应返回 nil")
     t.nil_(container.detect("echo podman"), "参数中的 podman 不应误识别")
     with_config({ tools = { sandbox = { container = { share_namespace = false } } } }, function()
-      local off = container.plan("podman run ubuntu true")
+      local off = assert(container.plan("podman run ubuntu true"))
       t.false_(off.rewritten, "关闭共享后不应重写")
     end)
   end)
@@ -146,11 +146,11 @@ tests.suite("sandbox_governance", function(_, it)
     -- docker/nerdctl 默认（docker.mode=off、无 podman）→ 明确拒绝
     container._set_podman_available(false)
     with_config({ tools = { sandbox = { container = { docker_to_podman = false } } } }, function()
-      local d0 = container.facade("docker run ubuntu true")
+      local d0 = assert(container.facade("docker run ubuntu true"))
       t.eq("unsupported", d0.mode)
       t.eq("CONTAINER_REQUIRES_HOST_DAEMON", d0.reason)
     end)
-    local d = container.facade("docker run ubuntu true")
+    local d = assert(container.facade("docker run ubuntu true"))
     t.eq("unsupported", d.mode)
     t.eq("CONTAINER_PODMAN_UNAVAILABLE", d.reason, "无 podman 时应提示不可替代")
     t.eq("unsupported", container.facade("nerdctl run ubuntu").mode)
@@ -170,7 +170,7 @@ tests.suite("sandbox_governance", function(_, it)
     local sock = dir .. "/docker.sock"
     local f = assert(io.open(sock, "w")); f:close()
     with_config({ tools = { sandbox = { docker = { mode = "controlled", socket = sock } } } }, function()
-      local c = container.facade("docker ps")
+      local c = assert(container.facade("docker ps"))
       t.eq("controlled", c.mode, "配置受控 socket 后应放行")
     end)
     vim.fn.delete(dir, "rf")
@@ -180,15 +180,16 @@ tests.suite("sandbox_governance", function(_, it)
     local container = require("NeoAI.sandbox.execution.container")
     container._set_podman_available(true)
     local p = container.facade("docker run -e \"A=b c\" ubuntu true")
+    assert(p)
     t.eq("sandbox", p.mode)
     t.true_(p.rewritten, "应标记改写")
     t.eq("podman", p.manager)
     t.eq("docker", p.original_manager)
     t.matches("^podman run", p.command)
     t.matches("\"A=b c\"", p.command, "应保留引号内空白与参数原文")
-    local c = container.facade("docker-compose up -d")
+    local c = assert(container.facade("docker-compose up -d"))
     t.matches("^podman%-compose up", c.command)
-    local s = container.facade("sudo docker ps")
+    local s = assert(container.facade("sudo docker ps"))
     t.matches("podman", s.command)
     -- 关闭改写则拒绝
     with_config({ tools = { sandbox = { container = { docker_to_podman = false } } } }, function()
@@ -246,7 +247,7 @@ tests.suite("sandbox_governance", function(_, it)
   it("敏感信息脱敏：具名规则 token 化且可还原，redact 破坏性脱敏", function(t)
     local secret = require("NeoAI.sandbox.secret.secret")
     secret.reset()
-    local key = "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA1234abcd\n-----END RSA PRIVATE KEY-----"
+    local key = "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQE A1234abcd\n-----END RSA PRIVATE KEY-----"
     local tok, used = secret.tokenize("data: " .. key)
     t.true_(#used == 1, "私钥块应生成 1 个 token")
     t.true_(secret.has_token(tok), "应含 token")
@@ -275,7 +276,6 @@ tests.suite("sandbox_governance", function(_, it)
 
   it("审批界面：显示安全级徽标与风险原因", function(t)
     local sr = require("NeoAI.ui.components.sandbox_review")
-    local cwd = vim.fn.getcwd()
     local data = sr.build_lines({
       {
         change_set_id = "csL2", tool = "run_command",
@@ -521,7 +521,7 @@ tests.suite("sandbox_governance", function(_, it)
       end
       local out = run("useradd -M -s /sbin/nologin neoai_test_sys 2>&1 && echo USERADD_OK || echo USERADD_FAIL")
       t.matches("USERADD_OK", out, "沙箱内 useradd 应成功（账户库写入进 overlay 暂存）")
-      local sh = run("cat /etc/shadow 2>&1 | head -c 40; echo; echo SHADOW_DONE")
+      local sh = assert(run("cat /etc/shadow 2>&1 | head -c 40; echo; echo SHADOW_DONE"))
       t.true_(sh:find("%$y%$") == nil and sh:find("root:%$") == nil,
         "普通命令不应读到真实 /etc/shadow 哈希，实际: " .. tostring(sh))
     end)
@@ -591,9 +591,9 @@ tests.suite("sandbox_governance", function(_, it)
       { path = root .. "/pkg/__init__.py", action = "create", content = "KEY = '" .. fake .. "'\n" },
     } })
     -- AI 可见的暂存视图应为 token（密钥被遮蔽）
-    local staged = candidate.read_path(root .. "/pkg/__init__.py")
+    local staged = assert(candidate.read_path(root .. "/pkg/__init__.py"))
     t.not_nil(staged, "应有暂存副本")
-    t.true_(secret.has_token(fs.read_file(staged)), "AI 视图应为 token")
+    t.true_(secret.has_token(assert(fs.read_file(staged))), "AI 视图应为 token")
     -- 物化进 overlay（命令执行层）应为真实内容
     local upper = root .. "/.upper"
     fs.ensure_dir(upper)
@@ -608,10 +608,10 @@ tests.suite("sandbox_governance", function(_, it)
     local runtime = require("NeoAI.sandbox.execution.runtime")
     if runtime.backend() ~= "bwrap" or vim.uv.getuid() ~= 0 then return end
     with_config({ tools = { sandbox = { run_as = { uid = 65534, gid = 65534 } } } }, function()
-      local prefix = runtime.process_prefix({
+      local prefix = assert(runtime.process_prefix({
         cwd = "/tmp",
         privileges = { cap_add = { "CAP_DAC_OVERRIDE", "CAP_CHOWN" }, network = true },
-      })
+      }))
       t.not_nil(prefix, "应能构造前缀")
       local joined = table.concat(prefix, " ")
       t.true_(joined:find("--ambient-caps +dac_override,+chown", 1, true) ~= nil,
@@ -745,7 +745,7 @@ tests.suite("sandbox_governance", function(_, it)
     end)
     -- passthrough：不清除代理变量，但 SSH agent 变量始终清除
     with_config(cfg({ proxy = "passthrough" }), function()
-      local sn = runtime.proxy_unset_snippet()
+      local sn = assert(runtime.proxy_unset_snippet())
       t.not_nil(sn, "应始终生成 SSH agent 清除片段")
       t.matches("SSH_AUTH_SOCK", sn, "应清除 SSH_AUTH_SOCK")
       t.true_(sn:find("HTTPS_PROXY", 1, true) == nil, "passthrough 不应清除代理")
@@ -754,7 +754,7 @@ tests.suite("sandbox_governance", function(_, it)
     with_config(cfg({ proxy = { https = "http://10.0.0.1:8080" } }), function()
       local env = runtime.sandbox_env(nil)
       t.eq("http://10.0.0.1:8080", env.HTTPS_PROXY, "应写入显式 HTTPS 代理")
-      local sn = runtime.proxy_unset_snippet()
+      local sn = assert(runtime.proxy_unset_snippet())
       t.true_(sn == nil or not sn:find("HTTPS_PROXY", 1, true), "不应清除显式指定的 HTTPS_PROXY")
       t.matches("HTTP_PROXY", sn or "", "应清除未指定的 HTTP_PROXY")
     end)

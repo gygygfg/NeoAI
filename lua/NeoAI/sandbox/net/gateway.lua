@@ -1,5 +1,5 @@
 --- 沙箱网络网关（宿主侧，纯 Lua）
---- @module NeoAI.sandbox.net.gateway
+--- @module 'NeoAI.sandbox.net.gateway'
 --- 在独立网络命名空间（netns）内，沙箱进程只能到达本网关；网关对每个目标 `host:port`
 --- 先做 TCP connect 探针判定「开放/关闭」，随后**不回传真实服务数据**，而是把结构化原因
 --- （JSON）返回给客户端。用途：允许 AI 探测宿主有哪些端口在监听，但禁止实际使用这些服务。
@@ -9,6 +9,12 @@
 --- 直接裸 TCP（不经代理）在隔离 netns 内无法到达宿主，故不生效。
 ---
 --- 仅允许探测宿主本机地址（回环 + 宿主网卡地址）；外部地址一律拒绝并返回原因。
+
+--- vim.uv.new_tcp() 返回的 socket 句柄（此处仅用 write/close/read_start）。
+---@class NeoAIVimSocket
+---@field write fun(self: NeoAIVimSocket, data: string): any
+---@field close fun(self: NeoAIVimSocket): any
+---@field read_start fun(self: NeoAIVimSocket, cb: fun(err: string|nil, data: string|nil)): any
 
 local M = {}
 
@@ -105,7 +111,7 @@ local function _body(target, open, reason)
 end
 
 --- 写 HTTP 响应并关闭
---- @param client userdata
+--- @param client NeoAIVimSocket
 --- @param code number
 --- @param status string
 --- @param body string
@@ -141,7 +147,7 @@ local function _parse_target(line)
 end
 
 --- 处理一个代理连接：读取请求头 → 探针 → 返回原因
---- @param client userdata
+--- @param client NeoAIVimSocket
 local function _handle(client)
   local buf = ""
   client:read_start(function(err, data)

@@ -1,5 +1,5 @@
 --- 待办工具测试
---- @module NeoAI.tests.test_todo
+--- @module 'NeoAI.tests.test_todo'
 
 local tests = require("NeoAI.tests")
 
@@ -16,7 +16,7 @@ tests.suite("todo", function(_, it)
     local todo = require("NeoAI.tools.builtin.todo")
     todo.reset()
     local agent = { id = "t1", session_id = "s1" }
-    local tw = find_tool("todo_write")
+    local tw = assert(find_tool("todo_write"))
     t.not_nil(tw)
 
     local out = {}
@@ -28,7 +28,7 @@ tests.suite("todo", function(_, it)
     t.nil_(out.err)
     t.matches("2 项", out.msg or "")
 
-    local items = todo.get("s1")
+    local items = assert(todo.get("s1"))
     t.eq(2, #items)
     t.eq("in_progress", items[2].status)
   end)
@@ -37,7 +37,7 @@ tests.suite("todo", function(_, it)
     local todo = require("NeoAI.tools.builtin.todo")
     todo.reset()
     local agent = { id = "t2", session_id = "s2" }
-    local tw = find_tool("todo_write")
+    local tw = assert(find_tool("todo_write"))
     local out = {}
     tw.func(
       { todos = { { content = "x", status = "in_progress" }, { content = "y", status = "in_progress" } } },
@@ -51,7 +51,7 @@ tests.suite("todo", function(_, it)
     local todo = require("NeoAI.tools.builtin.todo")
     todo.reset()
     local agent = { id = "t3", session_id = "s3" }
-    local tw = find_tool("todo_write")
+    local tw = assert(find_tool("todo_write"))
 
     local out = {}
     tw.func(
@@ -80,7 +80,7 @@ tests.suite("todo", function(_, it)
       function() end, function() end,
       { agent = agent })
 
-    local tr = find_tool("todo_read")
+    local tr = assert(find_tool("todo_read"))
     local out = {}
     tr.func({}, function(m) out.msg = m end, function(e) out.err = e end, { agent = agent })
     t.nil_(out.err)
@@ -90,7 +90,7 @@ tests.suite("todo", function(_, it)
     t.nil_(todo.get("s4"))
 
     todo.seed("s5", { { content = "恢复", status = "completed" } })
-    local items = todo.get("s5")
+    local items = assert(todo.get("s5"))
     t.eq(1, #items)
     t.eq("completed", items[1].status)
     todo.reset()

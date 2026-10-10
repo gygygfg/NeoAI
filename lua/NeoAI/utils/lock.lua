@@ -1,5 +1,5 @@
 --- 跨进程互斥锁（文件锁）
---- @module NeoAI.utils.lock
+--- @module 'NeoAI.utils.lock'
 --- 用 `O_CREAT|O_EXCL` 创建锁文件实现**跨进程**互斥；不同 key 互不影响，可并行。
 --- 用于串行化同一 overlay `work` 目录的挂载：内核 overlayfs 对同一 upper/work 的并发/重叠挂载
 --- 会打印 "workdir is in-use as upperdir/workdir of another mount" 并进入未定义行为（可死锁，

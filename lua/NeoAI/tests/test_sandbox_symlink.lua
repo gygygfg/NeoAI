@@ -1,5 +1,5 @@
 --- 符号链接候选专项测试
---- @module NeoAI.tests.test_sandbox_symlink
+--- @module 'NeoAI.tests.test_sandbox_symlink'
 --- 覆盖：`candidate.stage_link` → finish → merge → publish 的符号链接候选全链路；
 --- systemd `enable` 产生的软链被捕获为候选（不落宿主机）。
 
@@ -86,7 +86,7 @@ tests.suite("sandbox_symlink", function(_, it)
       local candidate = require("NeoAI.sandbox.execution.candidate")
       local store = require("NeoAI.sandbox.state.store")
       local attempt = control.new_attempt("run_command", { command = "enable" }, {}, { effect = "process" })
-      candidate.begin(attempt, store.root())
+      candidate.begin(attempt, assert(store.root()))
       local entry = candidate.stage_link(attempt.attempt_id, link, unit)
       t.not_nil(entry, "应登记软链条目")
       local cand = candidate.finish(attempt.attempt_id)
@@ -128,7 +128,7 @@ tests.suite("sandbox_symlink", function(_, it)
       vim.uv.fs_symlink(old_target, dir .. "/bin/python")
       vim.uv.fs_symlink(new_target, upper .. "/bin/python")
       local attempt = control.new_attempt("run_command", { command = "uv sync" }, {}, { effect = "process" })
-      candidate.begin(attempt, store.root())
+      candidate.begin(attempt, assert(store.root()))
       candidate.capture_overlay(attempt.attempt_id, dir, upper)
       local cand = candidate.finish(attempt.attempt_id)
       local f
@@ -162,7 +162,7 @@ tests.suite("sandbox_symlink", function(_, it)
       vim.uv.fs_symlink(base .. "/python-old", dir .. "/bin/python")
       fs.write_file(upper .. "/bin/python", "#!/bin/sh\n")
       local attempt = control.new_attempt("run_command", { command = "uv sync" }, {}, { effect = "process" })
-      candidate.begin(attempt, store.root())
+      candidate.begin(attempt, assert(store.root()))
       candidate.capture_overlay(attempt.attempt_id, dir, upper)
       local cand = candidate.finish(attempt.attempt_id)
       local pub = candidate.publish(cand, {})

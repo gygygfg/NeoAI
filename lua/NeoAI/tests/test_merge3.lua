@@ -1,5 +1,5 @@
 --- 三方合并（merge3）单元测试
---- @module NeoAI.tests.test_merge3
+--- @module 'NeoAI.tests.test_merge3'
 --- 覆盖 diff3 语义：单侧改动取该侧、同区间同结果去重、同区间异结果冲突、
 --- 非重叠改动合并、空文件、删除/插入/追加、大文件回退（too_large）。
 

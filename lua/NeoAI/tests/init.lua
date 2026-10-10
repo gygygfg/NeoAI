@@ -1,5 +1,5 @@
 --- NeoAI 测试运行器
---- @module NeoAI.tests
+--- @module 'NeoAI.tests'
 --- 轻量自定义测试框架（无外部依赖）。
 --- 断言 API：eq/ne/true/false/nil/not_nil/matches/ok
 --- 运行器：describe/it，按文件收集，headless 可跑。
@@ -21,7 +21,7 @@ function M.suite(name, fn)
   local before_each = nil
   state.current_suite = { name = name, tests = tests, before_each = before_each }
   state.suites[#state.suites + 1] = state.current_suite
-  local function describe(desc) end
+  local function describe(_) end
   local function it(test_name, test_fn)
     tests[#tests + 1] = { name = test_name, fn = test_fn }
   end
@@ -222,6 +222,7 @@ end
 local function _install_test_defaults()
   local config_store = require("NeoAI.kernel.config_store")
   local orig_config_load = config_store.load
+  ---@diagnostic disable-next-line: duplicate-set-field
   config_store.load = function(user_config)
     local uc = vim.deepcopy(user_config or {})
     uc.tools = uc.tools or {}
@@ -356,7 +357,7 @@ function M.list_suites()
 end
 
 --- 运行指定套件
---- @param names ... string 套件名（可选；空则全部）
+--- @param ... string 套件名（可选；空则全部）
 --- @return table { passed, failed, errors }
 function M.run_all(...)
   local requested = { ... }
@@ -707,9 +708,8 @@ end
 
 --- 默认子进程执行器：jobstart 异步运行，退出后回调（带超时终止）
 --- @param cmd table argv
---- @param script_path string
 --- @param opts table { on_done, timeout_ms? }
-local function _default_child_spawn(cmd, script_path, opts)
+local function _default_child_spawn(cmd, _, opts)
   local stdout, stderr = {}, {}
   local done = false
   local timer = nil
@@ -766,7 +766,7 @@ end
 
 --- 在隔离子进程中运行测试套件（异步；不触碰当前进程状态）
 --- @param names table 套件名数组（空 = 全部）
---- @param opts table|nil { on_done? = fun(result), timeout_ms? = number }
+--- @param opts? { on_done?: fun(result: table), timeout_ms?: number }
 function M.run_isolated(names, opts)
   opts = opts or {}
   local on_done = opts.on_done or function() end

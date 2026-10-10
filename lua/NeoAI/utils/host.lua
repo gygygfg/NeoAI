@@ -1,5 +1,5 @@
 --- 宿主资源探测（CPU 核数）
---- @module NeoAI.utils.host
+--- @module 'NeoAI.utils.host'
 --- 所有「多核计算核心数」预算的唯一来源：统一走 `core_budget()`（`max(1, 核数-2)`），
 --- 不再由配置项分散指定，避免不同路径各自为政（如硬编码 4、或留 1/上不封顶）。
 

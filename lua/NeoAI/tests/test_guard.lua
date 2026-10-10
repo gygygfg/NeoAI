@@ -1,5 +1,5 @@
 --- 循环护栏测试
---- @module NeoAI.tests.test_guard
+--- @module 'NeoAI.tests.test_guard'
 
 local tests = require("NeoAI.tests")
 

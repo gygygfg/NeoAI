@@ -1,5 +1,5 @@
 --- 模型实时元数据贯通测试
---- @module NeoAI.tests.test_model_metadata
+--- @module 'NeoAI.tests.test_model_metadata'
 --- 覆盖：各协议 parse_models 的数值提取、registry 保存/查询、capabilities 实时优先、
 --- 缓存落盘与旧格式兼容、用户覆盖最高优先级。
 
@@ -28,7 +28,7 @@ tests.suite("model_metadata", function(_, it)
 
   it("OpenAI 兼容元数据：context_window / context_length / top_provider", function(t)
     local adapter = require("NeoAI.core.model.adapter")
-    local a = adapter.get("openai")
+    local a = assert(adapter.get("openai"))
     local models = a.parse_models([[{"data":[
       {"id":"llama-3.3-70b","context_window":131072},
       {"id":"some/model","context_length":200000,"top_provider":{"max_completion_tokens":16384}}
@@ -42,7 +42,7 @@ tests.suite("model_metadata", function(_, it)
 
   it("Google 元数据：inputTokenLimit / outputTokenLimit", function(t)
     local adapter = require("NeoAI.core.model.adapter")
-    local g = adapter.get("google")
+    local g = assert(adapter.get("google"))
     local models = g.parse_models([[{"models":[
       {"name":"models/gemini-2.5-pro","inputTokenLimit":1048576,"outputTokenLimit":65536}
     ]}]])
@@ -53,7 +53,7 @@ tests.suite("model_metadata", function(_, it)
 
   it("Anthropic 元数据：无限制字段时全为 nil（回退内置）", function(t)
     local adapter = require("NeoAI.core.model.adapter")
-    local a = adapter.get("anthropic")
+    local a = assert(adapter.get("anthropic"))
     local models = a.parse_models('{"data":[{"id":"claude-3-5-sonnet","display_name":"Sonnet"}]}')
     t.eq("claude-3-5-sonnet", models[1].id)
     t.nil_(models[1].context_window)
@@ -74,7 +74,7 @@ tests.suite("model_metadata", function(_, it)
       { id = "llama-3.3-70b", context_window = 131072, max_output = 32768 },
       "plain-model",
     })
-    local meta = registry.meta("llama-3.3-70b", "groq")
+    local meta = assert(registry.meta("llama-3.3-70b", "groq"))
     t.not_nil(meta)
     t.eq(131072, meta.context_window)
     t.eq(32768, meta.max_output)
@@ -149,7 +149,7 @@ tests.suite("model_metadata", function(_, it)
     config_store.load({ ai = { model_refresh = { cache_path = "/tmp/neoai_test_meta" } } })
     local cache = require("NeoAI.core.model.cache")
     cache.write("groq", { { id = "llama", context_window = 131072 } })
-    local data = cache.read("groq")
+    local data = assert(cache.read("groq"))
     t.eq(1, #data.models)
     t.eq("llama", data.models[1].id)
     t.eq(131072, data.models[1].context_window)
@@ -158,6 +158,7 @@ tests.suite("model_metadata", function(_, it)
 
   it("沙箱内不自动刷新服务商模型列表（避免写入被沙箱待审捕获）", function(t)
     load({ ai = { model_refresh = { on_startup = true } } })
+    ---@type table<string, any>
     local model_service = require("NeoAI.services.model_service")
     local env = require("NeoAI.utils.env")
     local orig_prefetch = model_service.prefetch

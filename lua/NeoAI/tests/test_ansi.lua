@@ -1,5 +1,5 @@
 --- ANSI SGR 解析测试
---- @module NeoAI.tests.test_ansi
+--- @module 'NeoAI.tests.test_ansi'
 --- 覆盖：颜色/属性解析、reset、256 色与真彩色、非 SGR 序列剥离。
 
 local tests = require("NeoAI.tests")

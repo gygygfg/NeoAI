@@ -35,7 +35,6 @@ local function main()
   print("HOST_LISTENER_PORT=" .. hp)
 
   local workdir = "/tmp"
-  
   local prefix = runtime.process_prefix({ cwd = workdir })
   if not prefix then print("SKIP: 无法构造沙箱前缀"); return end
   local env = runtime.sandbox_env(nil)

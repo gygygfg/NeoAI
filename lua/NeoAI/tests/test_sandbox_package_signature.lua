@@ -1,5 +1,5 @@
 --- 包/生成内容候选的「签名模式」回归
---- @module NeoAI.tests.test_sandbox_package_signature
+--- @module 'NeoAI.tests.test_sandbox_package_signature'
 --- 覆盖：
 --- 1) 包捕获：现有 base 用 stat 签名（`sig:`）代替内容哈希，且不读真实盘内容；
 --- 2) 包冻结：内容磁盘化为 blob，after_hash 用 stat 签名（不做纯 Lua SHA）；
@@ -50,7 +50,7 @@ tests.suite("sandbox_package_signature", function(_, it)
       fs.write_file(upper .. "/new.txt", "new\n")
 
       local a = control.new_attempt("run_command", {}, {}, { effect = "process" })
-      candidate.begin(a, store.root())
+      candidate.begin(a, assert(store.root()))
       local _, err = await(candidate.capture_overlay_async(a.attempt_id, dir, upper, nil, { package = true }))
       t.eq(nil, err, "包捕获应完成")
       local m = candidate.mapping(a.attempt_id)
@@ -66,7 +66,7 @@ tests.suite("sandbox_package_signature", function(_, it)
       fs.ensure_dir(upper2)
       fs.write_file(upper2 .. "/existing.txt", "changed-content-2\n")
       local a2 = control.new_attempt("run_command", {}, {}, { effect = "process" })
-      candidate.begin(a2, store.root())
+      candidate.begin(a2, assert(store.root()))
       local _, err2 = await(candidate.capture_overlay_async(a2.attempt_id, dir, upper2, nil))
       t.eq(nil, err2, "非包捕获应完成")
       local ex2 = candidate.mapping(a2.attempt_id)[dir .. "/existing.txt"]
@@ -95,9 +95,9 @@ tests.suite("sandbox_package_signature", function(_, it)
       fs.write_file(upper .. "/new.txt", "brand-new\n")
 
       local a = control.new_attempt("run_command", {}, {}, { effect = "process" })
-      candidate.begin(a, store.root())
+      candidate.begin(a, assert(store.root()))
       await(candidate.capture_overlay_async(a.attempt_id, dir, upper, nil, { package = true }))
-      local cand, ferr = await(candidate.finish_async(a.attempt_id, { blob = true, classify = true }))
+      local cand, ferr = assert(await(candidate.finish_async(a.attempt_id, { blob = true, classify = true })))
       t.not_nil(cand, "冻结应产出候选: " .. tostring(ferr))
       local by = {}
       for _, f in ipairs(cand.files) do by[f.path] = f end
@@ -112,7 +112,7 @@ tests.suite("sandbox_package_signature", function(_, it)
       t.eq(nil, ex.before_hash, "签名模式下 before_hash 应为空")
       t.matches("^sig:", nw.after_hash or "", "新建项 after_hash 应用 stat 签名")
 
-      local levels = candidate.levels_for(cand)
+      local levels = assert(candidate.levels_for(cand))
       t.not_nil(levels, "应提供分类级别映射")
       t.eq("number", type(levels[dir .. "/new.txt"]), "每个路径应有数值级别")
 
@@ -149,14 +149,15 @@ tests.suite("sandbox_package_signature", function(_, it)
       fs.write_file(upper .. "/.git/objects/ab/cd", "obj")
       fs.write_file(upper .. "/.git/index.lock", "lock")
 
+      ---@type table<string, any>
       local runtime = require("NeoAI.sandbox.execution.runtime")
       local orig = runtime.is_masked_path
       local calls = 0
       runtime.is_masked_path = function(...) calls = calls + 1; return orig(...) end
       local a = control.new_attempt("run_command", {}, {}, { effect = "process" })
-      candidate.begin(a, store.root())
+      candidate.begin(a, assert(store.root()))
       await(candidate.capture_overlay_async(a.attempt_id, dir, upper, nil, { package = true }))
-      local cand = await(candidate.finish_async(a.attempt_id, { blob = true, classify = true }))
+      local cand = assert(await(candidate.finish_async(a.attempt_id, { blob = true, classify = true })))
       runtime.is_masked_path = orig
       t.eq(0, calls, "包候选分类不应在主线程调用 is_masked_path")
       local by = {}
@@ -188,9 +189,9 @@ tests.suite("sandbox_package_signature", function(_, it)
     } } }, function()
       sandbox.reset()
       local a = control.new_attempt("run_command", {}, {}, { effect = "process" })
-      candidate.begin(a, store.root())
+      candidate.begin(a, assert(store.root()))
       await(candidate.capture_overlay_async(a.attempt_id, dir, upper, nil, { package = true }))
-      local cand = await(candidate.finish_async(a.attempt_id, { blob = true, classify = true }))
+      local cand = assert(await(candidate.finish_async(a.attempt_id, { blob = true, classify = true })))
       for _, f in ipairs(cand.files or {}) do
         t.true_(f.path ~= dir .. "/secret.txt", "遮蔽路径不应进入候选")
       end
