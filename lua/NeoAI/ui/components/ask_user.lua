@@ -130,9 +130,9 @@ end
 
 -- ========== 公开 API ==========
 
---- 展示提问弹窗
+--- 展示提问弹窗（实际建窗）
 --- @param config table { question, options, on_answer, on_cancel }
-function M.show(config)
+local function _present(config)
   if state.win_id and vim.api.nvim_win_is_valid(state.win_id) then
     _close()
   end
@@ -201,8 +201,16 @@ function M.show(config)
   _set_keymaps()
 end
 
+--- 展示提问弹窗。焦点不在 NeoAI 界面（用户切到其他窗口）时不立即弹出，暂存并进入等待，
+--- 待用户切回 NeoAI 界面时再弹（经 `focus.gate` 统一实现）。提问工具侧仍照常等待回答。
+--- @param config table { question, options, on_answer, on_cancel }
+function M.show(config)
+  require("NeoAI.ui.focus").gate("ask_user", function() _present(config) end)
+end
+
 --- 隐藏提问弹窗
 function M.hide()
+  require("NeoAI.ui.focus").cancel_gate("ask_user")
   _close()
 end
 
@@ -217,9 +225,23 @@ end
 --- 重置（测试用）：关闭弹窗并解除注册
 function M.reset()
   _close()
+  require("NeoAI.ui.focus").cancel_gate("ask_user")
   state._question = nil
   state._options = nil
   pcall(function() ask_user.set_ui(nil) end)
+end
+
+--- 是否有暂存待展示的提问（测试用）
+--- @return boolean
+function M.has_deferred()
+  return require("NeoAI.ui.focus").has_gate("ask_user")
+end
+
+--- 当前弹窗 buffer（测试用）；未弹出时返回 nil
+--- @return number|nil
+function M.get_buf()
+  if state.buf and vim.api.nvim_buf_is_valid(state.buf) then return state.buf end
+  return nil
 end
 
 return M

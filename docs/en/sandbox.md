@@ -303,7 +303,8 @@ is only kept for other `approval.mode` values (`prompt`/`strict`).
     item (`q`/`<Esc>` closes it and returns to the review window with the cursor restored); on an
     **out-of-bounds access trace** line, `i` opens the **access details** for that path (each access's
     tool / kind / command / time; not an approval target),
-    `u` **undoes the save (back to pending)**, `q`/`<Esc>` closes. **While open, the window subscribes to sandbox
+    `u` **undoes the save (back to pending)** / **restores a rejected entry (back to pending)**,
+    `q`/`<Esc>` closes. **While open, the window subscribes to sandbox
     broadcast events and refreshes automatically** (enqueue/apply/reject/revert, out-of-bounds traces,
     host operations; multiple events in the same tick are coalesced into one redraw) — no manual
     refresh. The review window uses **multi-level pages** whose header splits into
@@ -319,9 +320,9 @@ is only kept for other `approval.mode` values (`prompt`/`strict`).
     that with `read_all=true` (default) masked dirs are inactive (read-only pass + out-of-bounds trace
     instead), and clearing the list falls back to the defaults (`/home`, `/root`). **The "applied" section is
     collapsed by default** (whole section collapsed via `za`/`zo`, then each item collapsed again);
-    **after a successful apply the section is auto-revealed to level one** (`reveal_applied`, item
-    headers visible, files still folded) so a just-applied item no longer looks "gone" because of the
-    default fold;
+    **after a successful apply the section is auto-revealed to entry level** (`reveal_applied`, fold
+    level raised to 2: item headers visible, files still individually folded) so every applied item
+    stays visible after a one-key approve-all instead of looking "gone" because of the default fold;
     **a pending item shows its header line with the rest folded** (the header — tool / risk badge /
     file count / `待审` — stays visible and is the whole-unit approval entry; the secret warning, risk
     reasons, git hint and file list start collapsed, `za`/`zo` expands), avoiding a flood from package
@@ -341,6 +342,26 @@ is only kept for other `approval.mode` values (`prompt`/`strict`).
       externally (hash mismatch) the operation is refused with `CONFLICT`, never overwriting user edits.
       Snapshots live in the per-process instance store (`snapshots/`) and are reclaimed with the
       instance dir.
+    - **Show rejected / restore to pending**: on an explicit reject (`d`) the candidate content is saved
+      as a `/tmp` copy; the review window's "已拒绝（u 恢复为待审）" (rejected) section lists rejected
+      entries (with the reject reason); pressing `u` on an item **rebuilds the candidate from the copy
+      and moves it back to pending** (so it can be reviewed/applied again); for host operations the
+      proposal is restored instead. The section is collapsed by default, and the oldest entries beyond
+      `rejected_max` are reclaimed automatically.
+    - **Cursor stays put after apply/reject**: after applying or rejecting an item it moves into the
+      "applied"/"rejected" section, but the review window redraw keeps the cursor **on the line number
+      it was on** (it no longer follows the item into another section).
+    - **Focus-aware interactive popups**: `ui/focus.lua` tracks whether the current window is a NeoAI
+      UI buffer (filetype prefix `neoai*`) and broadcasts `UI_FOCUS_CHANGED` on change; it also exposes
+      a unified `focus.gate(key, present)`. **When focus is not on the NeoAI UI (the user switched to
+      another window), popups do not pop up immediately — they wait** and appear once the user switches
+      back. This covers the pty floating terminal (interactive `run_command`; hide/restore), the
+      `ask_user` popup, and the three blocking popups **tool approval (tool_approval) / secret alert
+      (secret_alert) / network consent (net_consent)** (stash and show on return; their timeout /
+      decision via the approval hub calls `hide()` to cancel the stash so no stale popup appears on
+      return). While waiting, the Herder lifecycle reports `blocked` (red). The review window also
+      force-refreshes once on switching back. There is no suppression when there is no attached UI
+      (headless/tests) — there is no "other window" to switch to.
     - **Package installs are grouped per install command**: candidates produced by npm/pip/apt
       package installs are labelled on the header as `包安装 <manager>: <packages>`
       (`privilege.package_info`) and **merged into a single approval unit by the install-command
@@ -468,6 +489,16 @@ is only kept for other `approval.mode` values (`prompt`/`strict`).
         rejected/superseded (REJECTED/SUPERSEDED/EXPIRED) change sets kept in memory; excess items are
         dropped from memory and `get`/`list` fall back to disk on demand (no data loss).
         APPLIED/REVERTED are retained (the undo list depends on them).
+      - **Restorable rejected entries**: an explicit reject (`d` in the review UI) saves the candidate
+        content **verbatim** as a copy under `tools.sandbox.review.rejected_dir` (default
+        `/tmp/neoai-rejected`, dir 0700 / files 0600 — candidates may hold secret tokens). The rejected
+        entry then stays visible in the review window's **"Rejected" section** (collapsed by default);
+        pressing `u` on it **restores it to pending** (rebuilding the candidate from the copy; for host
+        ops the proposal is restored via `hostop.restore`). These restorable items do **not** take part
+        in the normal terminal eviction (they must stay visible); instead
+        `tools.sandbox.review.rejected_max` (default 50) bounds them: beyond the cap the oldest item's
+        copy is deleted and it is dropped from memory (the disk review record remains); `0` = keep none.
+        Copies are reclaimed with `sandbox.prune` (retention) and `sandbox.reset`.
       - **Snapshot metadata and bounded cache**: snapshots are written together with a metadata copy
         that strips the original file content (`snapshots_meta/`), so listing "applied" items in the
         review UI only reads metadata instead of decoding every saved snapshot's original content into
@@ -528,6 +559,10 @@ is only kept for other `approval.mode` values (`prompt`/`strict`).
   (re-freezing the composed candidate before CAS); unselected files remain queued as a new
   pending change set so the user can confirm them one by one. `sandbox.reject_file(id, path)`
   rejects a single file.
+- Reject and restore: `sandbox.reject(id, reason)` rejects and discards (also saving the candidate
+  content as a `/tmp` copy); `sandbox.list_rejected()` lists **restorable rejected** items (the review
+  UI's "Rejected" section), and `sandbox.restore(id)` **restores one to pending** from the copy (host
+  ops restore the proposal instead). See "Restorable rejected entries" above.
 - **Re-validation before publish (defense in depth)**: `candidate.publish` re-canonicalizes every
   file path — it resolves **ancestor** symlinks and collapses `..`, but treats the **final component
   literally** (it does not follow a leaf symlink); if the result differs from the recorded path

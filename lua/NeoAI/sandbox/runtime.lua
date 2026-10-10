@@ -965,6 +965,8 @@ local function _append_tmpfs_roots(argv, session_base, base_override)
     and vim.fn.fnamemodify(session_base, ":t") or nil
   local mode = _tmp_private_base_mode()
   local conceal = require("NeoAI.sandbox.conceal")
+  -- 登记访客源根→宿主私有目录，供 output_guard 落盘与 read_file 回读（幂等）。
+  local guest_fs = require("NeoAI.sandbox.guest_fs")
   local has_override = type(base_override) == "string" and base_override ~= ""
   for _, p in ipairs(_tmpfs_roots()) do
     local bound = false
@@ -982,6 +984,7 @@ local function _append_tmpfs_roots(argv, session_base, base_override)
         argv[#argv + 1] = "--bind"
         argv[#argv + 1] = dir
         argv[#argv + 1] = p
+        guest_fs.set_root(p, dir)
         bound = true
       end
     end
@@ -994,6 +997,7 @@ local function _append_tmpfs_roots(argv, session_base, base_override)
         argv[#argv + 1] = "--bind"
         argv[#argv + 1] = dir
         argv[#argv + 1] = p
+        guest_fs.set_root(p, dir)
         bound = true
       end
     end
@@ -1010,6 +1014,7 @@ function M.cleanup_tmp_roots()
   for _, p in ipairs(_tmpfs_roots()) do
     pcall(vim.fn.delete, conceal.tmp_base_host(p), "rf")
   end
+  require("NeoAI.sandbox.guest_fs").clear()
 end
 
 --- 追加 /proc/sys 整体只读绑定：一次性封闭**所有**非命名空间全局 sysctl 的写入面

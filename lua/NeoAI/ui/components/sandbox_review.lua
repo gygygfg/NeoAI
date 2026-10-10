@@ -60,7 +60,7 @@ local LEGEND_SEGMENTS = {
   { "L3严重", "risk3" },
   { "  " },
   { "⚠密钥操作", "secret" },
-  { "   |   <CR> 头行=整包应用 / 文件行=应用该文件   A 一键同意全部工作区修改   d 拒绝该文件   i 预览修改diff/越界详情   u 撤销/重做保存   a AI审计   q 关闭" },
+  { "   |   <CR> 头行=整包应用 / 文件行=应用该文件   A 一键同意全部工作区修改   d 拒绝该文件   i 预览修改diff/越界详情   u 撤销/重做保存·恢复已拒绝   a AI审计   q 关闭" },
 }
 
 local LEGEND, LEGEND_MARKS = (function()
@@ -179,7 +179,11 @@ local function _schedule_refresh()
   local function run()
     state.refresh_pending = false
     if state.buf and vim.api.nvim_buf_is_valid(state.buf) then
-      M.refresh()
+      -- 一次重绘异常不应永久停止后续刷新（refresh_pending 已复位，下次事件可再排）。
+      local ok, err = pcall(M.refresh)
+      if not ok then
+        require("NeoAI.kernel.logger").warn("[sandbox_review] 刷新失败: %s", tostring(err))
+      end
     end
   end
   if ms > 0 then vim.defer_fn(run, ms) else vim.schedule(run) end
@@ -191,6 +195,11 @@ local function _watch()
   for _, ev in ipairs(WATCH_EVENTS) do
     state.unsubs[#state.unsubs + 1] = event_bus.on(ev, _schedule_refresh)
   end
+  -- 焦点切回 NeoAI 界面时强制刷新：保证窗口内容与队列同步，避免切走期间事件丢失/重绘异常
+  -- 导致展示陈旧或部分状态（表现为「切回来只剩一条」）。
+  state.unsubs[#state.unsubs + 1] = event_bus.on(events.UI_FOCUS_CHANGED, function(payload)
+    if payload and payload.focused == true then _schedule_refresh() end
+  end)
 end
 
 --- 取消沙箱事件订阅（窗口关闭/重置时调用）。
@@ -300,8 +309,9 @@ end
 --- @param traces table|nil 越界访问留痕数组（sandbox.list_traces）
 --- @param audit table|nil AI 审计 { pending?, error?, fallback?, notes? = { [路径或命令]=说明 } }
 --- @param saved table|nil 已保存/已撤销（含快照）的变更单元数组（sandbox.list_saved）
+--- @param rejected table|nil 可恢复的已拒绝变更单元数组（sandbox.list_rejected）
 --- @return table { lines, marks, line_to_target, line_to_trace, fold_levels }
-function M.build_lines(items, traces, audit, saved)
+function M.build_lines(items, traces, audit, saved, rejected)
   local lines = {}
   local marks = {}
   local line_to_target = {}
@@ -644,6 +654,55 @@ function M.build_lines(items, traces, audit, saved)
         fold_levels[rln] = 2
       end
       -- 条目尾空行计入一级，保证区折叠连续闭合到末条（空行自身不可见）
+      local blk = #lines + 1
+      lines[#lines + 1] = ""
+      fold_levels[blk] = 1
+    end
+  end
+  -- 已拒绝（可恢复）：显式拒绝（`d`）时候选内容另存 /tmp 副本，条目在此仍可见，
+  -- `u` 恢复为待审（重新进入「未应用」区）。与「已应用」区一致默认整体折叠。
+  if rejected and #rejected > 0 then
+    local title_ln = #lines + 1
+    lines[#lines + 1] = ("── 已拒绝（%d 个变更单元，u 恢复为待审）──（默认折叠，za/zo 展开）"):format(#rejected)
+    fold_levels[title_ln] = 1
+    for _, item in ipairs(rejected) do
+      local files = item.files
+      if not files or #files == 0 then
+        files = {}
+        for _, p in ipairs(item.write_set or {}) do files[#files + 1] = { path = p } end
+      end
+      local git_op = item.atomic_group == "git"
+      local group_desc = git_op
+        and string.format("（git 操作 · %d 个文件 · 原子整组）", #files)
+        or string.format("（%d 个文件）", #files)
+      local reason = item.reject_reason and (" · " .. _one_line(item.reject_reason)) or ""
+      local base = _one_line(string.format("[%s] %s%s%s  ",
+        item.change_set_id, item.tool or "?", group_desc, reason))
+      local hln = #lines + 1
+      lines[#lines + 1] = base .. "已拒绝"
+      fold_levels[hln] = 2
+      marks[#marks + 1] = { line = hln, start_col = #base, end_col = #base + #"已拒绝", level = "system" }
+      line_to_target[hln] = { change_set_id = item.change_set_id, rejected = true, whole = true }
+      local shown = 0
+      for _, f in ipairs(files) do
+        if max_files > 0 and shown >= max_files then break end
+        shown = shown + 1
+        local path = _one_line(f.path or tostring(f))
+        local suffix = f.action and ("  [" .. _one_line(f.action) .. "]") or ""
+        local text = "  " .. path .. suffix
+        local ln = #lines + 1
+        lines[#lines + 1] = text
+        fold_levels[ln] = 2
+        marks[#marks + 1] = { line = ln, start_col = 2, end_col = 2 + #path, level = M.level_of(path, lvl_ctx) }
+        line_to_target[ln] = git_op
+          and { change_set_id = item.change_set_id, rejected = true, whole = true }
+          or { change_set_id = item.change_set_id, path = path, rejected = true }
+      end
+      if max_files > 0 and #files > shown then
+        local rln = _append_rest(#files - shown,
+          { change_set_id = item.change_set_id, rejected = true, whole = true })
+        fold_levels[rln] = 2
+      end
       local blk = #lines + 1
       lines[#lines + 1] = ""
       fold_levels[blk] = 1
@@ -995,6 +1054,10 @@ local function _apply_current()
     vim.notify("[NeoAI] 该条目已保存，请用 u 撤销/重做保存", vim.log.levels.WARN)
     return
   end
+  if target.rejected then
+    vim.notify("[NeoAI] 该条目已拒绝，请用 u 恢复到待审后再应用", vim.log.levels.WARN)
+    return
+  end
   local sandbox = services.use("services.sandbox")
   if not sandbox then return end
   -- 主机操作提案：整条审批后在主机 replay（需 root 时弹窗经 sudo）
@@ -1042,6 +1105,10 @@ local function _reject_current()
     vim.notify("[NeoAI] 该条目已保存，请用 u 撤销/重做保存", vim.log.levels.WARN)
     return
   end
+  if target.rejected then
+    vim.notify("[NeoAI] 该条目已拒绝，请用 u 恢复到待审", vim.log.levels.WARN)
+    return
+  end
   local sandbox = services.use("services.sandbox")
   if not sandbox then return end
   if target.host_op then
@@ -1075,8 +1142,26 @@ end
 --- 冲突（真实文件被外部改动）时拒绝。
 local function _undo_current()
   local target = state.line_to_target[vim.api.nvim_win_get_cursor(0)[1]]
-  if not target or not target.saved then
-    vim.notify("[NeoAI] 请将光标移到「已保存」条目行", vim.log.levels.WARN)
+  if not target then
+    vim.notify("[NeoAI] 请将光标移到「已保存」或「已拒绝」条目行", vim.log.levels.WARN)
+    return
+  end
+  -- 已拒绝条目：`u` 恢复为待审（从 /tmp 副本重建候选；host_op 恢复提案）。
+  if target.rejected then
+    local sandbox = services.use("services.sandbox")
+    if not sandbox or not sandbox.restore then return end
+    local res = sandbox.restore(target.change_set_id)
+    if res and res.ok then
+      vim.notify(("[NeoAI] 已恢复到待审 %s"):format(target.change_set_id), vim.log.levels.INFO)
+    else
+      vim.notify(("[NeoAI] 恢复失败(%s): %s"):format(tostring(res and res.state), tostring(res and res.reason)),
+        vim.log.levels.ERROR)
+    end
+    M.refresh()
+    return
+  end
+  if not target.saved then
+    vim.notify("[NeoAI] 请将光标移到「已保存」或「已拒绝」条目行", vim.log.levels.WARN)
     return
   end
   local sandbox = services.use("services.sandbox")
@@ -1646,6 +1731,10 @@ local function _open_diff_current()
     vim.notify("[NeoAI] 已保存条目暂不支持 diff 预览", vim.log.levels.WARN)
     return
   end
+  if target.rejected then
+    vim.notify("[NeoAI] 该条目已拒绝，请先用 u 恢复到待审再预览 diff", vim.log.levels.WARN)
+    return
+  end
   local item = _find_item(target.change_set_id)
   if not item then
     vim.notify("[NeoAI] 变更单元已不存在: " .. tostring(target.change_set_id), vim.log.levels.WARN)
@@ -1954,7 +2043,7 @@ end
 --- @return table ctx
 local function _gather_ctx()
   local sandbox = services.use("services.sandbox")
-  if not sandbox then return { items = {}, hostops = {}, traces = {}, saved = {}, anomalies = {} } end
+  if not sandbox then return { items = {}, hostops = {}, traces = {}, saved = {}, rejected = {}, anomalies = {} } end
   local pending = sandbox.list_reviews({ review_state = "PENDING" })
   local items, hostops = {}, {}
   for _, it in ipairs(pending) do
@@ -1968,14 +2057,22 @@ local function _gather_ctx()
   end
   table.sort(items, _by_risk)
   table.sort(hostops, _by_risk)
-  local traces = (sandbox.list_traces and sandbox.list_traces()) or {}
-  local saved = (sandbox.list_saved and sandbox.list_saved()) or {}
+  -- 各子读取单独 pcall：任一项异常（如某个快照元数据损坏）不应拖垮整次重绘，
+  -- 否则审批窗会停在陈旧/部分状态（表现为「切回来只剩一条」）。
+  local function _safe(fn, fallback)
+    local ok, v = pcall(fn)
+    if ok and v ~= nil then return v end
+    return fallback
+  end
+  local traces = _safe(function() return sandbox.list_traces and sandbox.list_traces() end, {}) or {}
+  local saved = _safe(function() return sandbox.list_saved and sandbox.list_saved() end, {}) or {}
+  -- 可恢复的已拒绝项（显式拒绝时另存了 /tmp 副本）：供「已拒绝」区展示、u 恢复。
+  local rejected = _safe(function() return sandbox.list_rejected and sandbox.list_rejected() end, {}) or {}
   -- 行为审计异常（level >= 2）：仅内存观测，供「越界/异常」页展示。
-  local anomalies = {}
-  pcall(function()
-    anomalies = require("NeoAI.sandbox.audit").list({ min_level = 2, limit = 200 })
-  end)
-  return { items = items, hostops = hostops, traces = traces, saved = saved, anomalies = anomalies }
+  local anomalies = _safe(function()
+    return require("NeoAI.sandbox.audit").list({ min_level = 2, limit = 200 })
+  end, {}) or {}
+  return { items = items, hostops = hostops, traces = traces, saved = saved, rejected = rejected, anomalies = anomalies }
 end
 
 --- 各页展示计数
@@ -1983,7 +2080,7 @@ end
 --- @param ctx table
 --- @return number
 local function _page_count(page, ctx)
-  if page == "files" then return #(ctx.items or {}) + #(ctx.saved or {}) end
+  if page == "files" then return #(ctx.items or {}) + #(ctx.saved or {}) + #(ctx.rejected or {}) end
   if page == "behavior" then return hub_mod.pending_count("behavior") + #(ctx.hostops or {}) end
   if page == "resource" then return hub_mod.pending_count("resource") end
   if page == "network" then return hub_mod.pending_count("network") end
@@ -2390,7 +2487,7 @@ function M.open()
     _reject_current()
   end, { buffer = state.buf })
   vim.keymap.set("n", "i", _open_diff_current, { buffer = state.buf })
-  vim.keymap.set("n", "u", _undo_current, { buffer = state.buf, desc = "NeoAI 撤销保存（回到待审）" })
+  vim.keymap.set("n", "u", _undo_current, { buffer = state.buf, desc = "NeoAI 撤销保存/恢复已拒绝（回到待审）" })
   -- E：打开目录设置（工作目录 / 遮蔽目录，仅本会话）；W：资源访问页把光标条目的遮蔽路径加入工作目录。
   vim.keymap.set("n", "E", function() M.open_dirs_editor() end, { buffer = state.buf, desc = "NeoAI 目录设置" })
   vim.keymap.set("n", "W", function() _add_masked_to_workspace() end, { buffer = state.buf, desc = "NeoAI 遮蔽路径加入工作目录" })
@@ -2441,7 +2538,7 @@ function M.refresh()
     body = _build_blocking_page(state.page, ctx)
   else
     -- 「待修改」页：越界留痕/异常移入「越界/异常」页，故此处 traces 传 nil。
-    body = M.build_lines(ctx.items, nil, state.audit, ctx.saved)
+    body = M.build_lines(ctx.items, nil, state.audit, ctx.saved, ctx.rejected)
   end
   local lines = {}
   for _, l in ipairs(header_lines) do lines[#lines + 1] = l end
@@ -2474,14 +2571,22 @@ function M.refresh()
   -- 恢复光标：仅「待修改」页按目标条目恢复；其余页回到顶部。
   local restore = nil
   if state.page == "files" and state.last_target then
+    local lt = state.last_target
     for ln, tgt in pairs(state.line_to_target) do
-      if tgt.change_set_id == state.last_target.change_set_id
-        and tgt.path == state.last_target.path
-        and tgt.host_op == state.last_target.host_op then
+      -- 匹配需包含全部目标类型标志（whole/saved/rejected/host_op）：应用/拒绝后条目会移入
+      -- 「已应用」/「已拒绝」区，目标类型随之变化，此处的严格匹配会失败（见下方回退）。
+      if tgt.change_set_id == lt.change_set_id
+        and tgt.path == lt.path
+        and tgt.host_op == lt.host_op
+        and tgt.whole == lt.whole
+        and tgt.saved == lt.saved
+        and tgt.rejected == lt.rejected then
         restore = ln
       end
     end
   end
+  -- 未匹配（如刚应用/拒绝：条目已移区）时回退到此前记录的行号，使光标**原地不动**，
+  -- 不再随条目跳到「已应用」/「已拒绝」区。
   if not restore and state.page == "files" and state.last_cursor then
     restore = math.max(1, math.min(state.last_cursor.line, #lines))
   end
@@ -2534,13 +2639,14 @@ function M.get_line_map()
   return state.line_to_target
 end
 
---- 应用后展开「已应用」区：至少显示区标题与条目头行，使刚应用的条目可见。
---- 「已应用」区默认整体折叠（foldlevel=0），应用后条目会移入该区但被折叠隐藏，看起来像「消失」。
---- 这里只在当前折叠级别 < 1 时提升到 1（区展开、条目仍各自折叠），不干扰用户已手动展开的层级。
+--- 应用后展开「已应用」区：一次性展示全部已应用条目，使刚应用的条目不再因默认折叠而看似「消失」。
+--- 「已应用」区两级折叠：区标题一级 / 条目头行二级，默认 foldlevel=0 整体收起。这里把折叠级别
+--- 提升到 **2（条目头行可见、文件仍各自折叠）**，让「一键同意」后多条已应用条目逐条可见；
+--- 仅在当前级别 < 2 时提升，不干扰用户已手动展开的层级。
 function M.reveal_applied()
   if state.win_id and vim.api.nvim_win_is_valid(state.win_id) then
     local cur = tonumber(vim.wo[state.win_id].foldlevel) or 0
-    if cur < 1 then vim.wo[state.win_id].foldlevel = 1 end
+    if cur < 2 then vim.wo[state.win_id].foldlevel = 2 end
   end
 end
 

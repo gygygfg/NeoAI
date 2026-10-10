@@ -50,6 +50,11 @@ local state = {
   -- `M.get` 按需从磁盘回读（数据不丢）。APPLIED/REVERTED 保留（撤销列表需要）。
   terminal_order = {},
   terminal_set = {},
+  -- 「可恢复的已拒绝」变更单元的 FIFO 序：显式拒绝（d）时把候选内容另存到 /tmp 副本，
+  -- 供审批界面「已拒绝」区展示、按 u 恢复为待审。这些项**不参与**常规终态淘汰（需持续可见），
+  -- 其内存由 `rejected_max` 单独约束：超限时删除最旧项副本并移出内存。
+  rejected_order = {},
+  rejected_set = {},
 }
 
 -- ========== 候选内容按需读取（内存 item 已剥离 content） ==========
@@ -98,6 +103,9 @@ end
 
 -- ========== 私有函数 ==========
 
+-- 前向声明（定义见下方终态/已拒绝淘汰区）
+local _mark_rejected
+
 --- 首次访问时把磁盘上的历史变更单元水合进内存，之后以内存为准。
 --- 关键：`M.list` 此前每次调用都 `store.list_reviews()`（scandir + 逐文件 JSON 解码），
 --- 待审堆积到数百/上千时，`supersede_by_paths`（每次工具调用）与状态栏
@@ -115,7 +123,18 @@ local function _ensure_loaded()
       local removed = store.read_review_removed and store.read_review_removed(id)
       if removed and type(removed.paths) == "table" then item.superseded_paths = removed.paths end
       state.items[id] = item
+      -- 播种「可恢复的已拒绝」FIFO（按 rejected_at 升序），使跨会话的 rejected_max 约束生效。
+      if item.review_state == M.REVIEW.REJECTED and item.rejected_copy == true then
+        _mark_rejected(id)
+      end
     end
+  end
+  -- 磁盘水合顺序不定，按 rejected_at 升序重排可恢复 FIFO，保证跨会话按「最旧优先」回收。
+  if #state.rejected_order > 1 then
+    table.sort(state.rejected_order, function(a, b)
+      local ia, ib = state.items[a], state.items[b]
+      return ((ia and ia.rejected_at) or 0) < ((ib and ib.rejected_at) or 0)
+    end)
   end
   state.pending_cache = nil
   state.pending_items = nil
@@ -147,12 +166,16 @@ end
 
 --- 变更单元是否为「可淘汰的终态」（已拒绝/已被取代，撤销列表不依赖它们）。
 --- APPLIED/REVERTED 保留：`list_saved` 需要据此展示撤销/重做。
+--- 例外：**可恢复的已拒绝项**（`rejected_copy == true`，即显式拒绝时另存了 /tmp 副本）不视为
+--- 可淘汰——审批界面「已拒绝」区需持续展示、供 `u` 恢复；其内存由 `rejected_max` 单独约束。
 --- @param item table|nil
 --- @return boolean
 local function _dead_terminal(item)
   if type(item) ~= "table" then return false end
-  return item.review_state == M.REVIEW.REJECTED
-    or item.review_state == M.REVIEW.SUPERSEDED
+  if item.review_state == M.REVIEW.REJECTED then
+    return item.rejected_copy ~= true
+  end
+  return item.review_state == M.REVIEW.SUPERSEDED
     or item.review_state == M.REVIEW.EXPIRED
 end
 
@@ -160,6 +183,71 @@ local function _mark_terminal(id)
   if not id or state.terminal_set[id] then return end
   state.terminal_set[id] = true
   state.terminal_order[#state.terminal_order + 1] = id
+end
+
+--- 登记「可恢复的已拒绝」项（FIFO，供 rejected_max 约束内存）。
+--- @param id string
+_mark_rejected = function(id)
+  if not id or state.rejected_set[id] then return end
+  state.rejected_set[id] = true
+  state.rejected_order[#state.rejected_order + 1] = id
+end
+
+--- 从「可恢复的已拒绝」FIFO 中移除（恢复/删除时调用）。
+--- @param id string
+local function _unmark_rejected(id)
+  if not id or not state.rejected_set[id] then return end
+  state.rejected_set[id] = nil
+  for i = 1, #state.rejected_order do
+    if state.rejected_order[i] == id then table.remove(state.rejected_order, i); break end
+  end
+end
+
+--- 已拒绝副本上限（内存中保留的「可恢复已拒绝」项数）。
+--- @return number
+local function _rejected_limit()
+  local n = tonumber(require("NeoAI.kernel.config_store").get(
+    "tools.sandbox.review.rejected_max"))
+  if n == nil then n = 50 end
+  return math.max(0, n)
+end
+
+--- 已拒绝项回收：超过 `rejected_max` 的最旧项删除其 /tmp 副本并移出内存（不再可恢复/展示）。
+--- 副本删除后条目复归常规终态（磁盘 review 记录仍在，`M.get` 可回读）。
+local function _maybe_evict_rejected()
+  local limit = _rejected_limit()
+  while #state.rejected_order > limit do
+    local id = table.remove(state.rejected_order, 1)
+    state.rejected_set[id] = nil
+    local item = state.items[id]
+    local digest = item and item.candidate_digest
+    if digest then pcall(store.delete_rejected_copy, id, digest) end
+    if item then
+      item.rejected_copy = nil
+      -- 直接移出内存：副本已删，不再可恢复/展示，内存占用随之下界。
+      state.items[id] = nil
+    end
+  end
+end
+
+--- 保存「可恢复的已拒绝」副本：显式拒绝（`d`/`reject`）时把候选内容原样另存到 /tmp，
+--- 使被拒条目在审批界面仍可见、可按 `u` 恢复为待审。host_op 无候选即以空占位（恢复依赖
+--- hostop.restore）。返回是否成功（成功才登记 FIFO，避免出现无副本却标记可恢复的项）。
+--- @param item table
+--- @return boolean
+local function _save_rejected_copy(item)
+  if type(item) ~= "table" or not item.change_set_id then return false end
+  local digest = item.candidate_digest
+  local raw = nil
+  if item.kind ~= "host_op" and digest then
+    raw = store.read_candidate_raw(digest)
+  end
+  local ok = store.write_rejected_copy(item.change_set_id, digest or "hostop", raw)
+  if ok then
+    item.rejected_copy = true
+    _mark_rejected(item.change_set_id)
+  end
+  return ok
 end
 
 --- 终态淘汰：超过 `terminal_cache_max` 的终态项从内存移除（磁盘仍有记录，`M.get` 回读）。
@@ -202,6 +290,7 @@ local function _persist(item)
   -- 终态登记与淘汰（仅在状态写入后；淘汰不影响磁盘记录与候选引用统计）。
   if item.change_set_id and _dead_terminal(item) then _mark_terminal(item.change_set_id) end
   _maybe_evict()
+  _maybe_evict_rejected()
 end
 
 --- 部分取代增量中被覆盖的路径数量。
@@ -997,6 +1086,9 @@ function M.reject(id, reason)
   item.reject_reason = reason
   item.rejected_at = os.time()
   state.items[id] = item
+  -- 保留可恢复副本（/tmp）：被拒条目在审批界面「已拒绝」区可见、可按 u 恢复。
+  -- 必须在丢弃候选之前读取原样内容。
+  _save_rejected_copy(item)
   if item.kind == "host_op" then
     pcall(function() require("NeoAI.sandbox.hostop").reject(item.host_op_id, reason) end)
     _persist(item)
@@ -1050,6 +1142,68 @@ function M.reject_file(id, path, reason)
     change_set_id = id, path = path, reason = reason,
   })
   return child
+end
+
+--- 列出「可恢复的已拒绝」变更单元（显式拒绝时另存了 /tmp 副本者），按拒绝时间倒序。
+--- 供审批界面「已拒绝」区展示，`u` 可将其恢复为待审。仅返回内存中仍保留副本的项；
+--- 超 `rejected_max` 被回收的最旧项不再出现（其副本已删）。
+--- @return table 数组
+function M.list_rejected()
+  _ensure_loaded()
+  local out = {}
+  for _, item in pairs(state.items) do
+    if item.review_state == M.REVIEW.REJECTED and item.rejected_copy == true then
+      out[#out + 1] = item
+    end
+  end
+  table.sort(out, function(a, b)
+    return (a.rejected_at or a.created_at or 0) > (b.rejected_at or b.created_at or 0)
+  end)
+  return out
+end
+
+--- 恢复一个已被拒绝的变更单元为待审：从 /tmp 副本重建候选（host_op 则恢复提案），
+--- 状态置回 PENDING 并清理副本与 FIFO 登记。恢复后即可照常应用/拒绝。
+--- @param id string change_set_id
+--- @return table { ok, state, reason?, item? }
+function M.restore(id)
+  local item = M.get(id)
+  if not item then
+    return { ok = false, state = "FAILED", reason = "CHANGE_SET_NOT_FOUND: " .. tostring(id) }
+  end
+  if item.review_state ~= M.REVIEW.REJECTED then
+    return { ok = false, state = "NOT_REJECTED", reason = "CHANGE_SET_NOT_REJECTED: " .. tostring(id) }
+  end
+  local digest = item.candidate_digest
+  if item.kind == "host_op" then
+    local ok = pcall(function() return require("NeoAI.sandbox.hostop").restore(item.host_op_id) end)
+    if not ok then
+      return { ok = false, state = "FAILED", reason = "HOST_OP_RESTORE_FAILED: " .. tostring(id) }
+    end
+  else
+    local raw = store.read_rejected_copy(id, digest)
+    if not raw or raw == "" then
+      return { ok = false, state = "FAILED", reason = "REJECTED_COPY_NOT_FOUND: " .. tostring(id) }
+    end
+    local wok, werr = store.write_candidate_raw(digest, raw)
+    if not wok then
+      return { ok = false, state = "FAILED", reason = "RESTORE_WRITE_FAILED: " .. tostring(werr) }
+    end
+  end
+  item.review_state = M.REVIEW.PENDING
+  item.reject_reason = nil
+  item.rejected_at = nil
+  item.rejected_copy = nil
+  item.apply_state = M.APPLY.NOT_REQUESTED
+  state.items[id] = item
+  -- 清理副本与 FIFO 登记（恢复后不再属于「已拒绝」）。
+  pcall(store.delete_rejected_copy, id, digest)
+  _unmark_rejected(id)
+  _persist(item)
+  _emit(require("NeoAI.kernel.events").SANDBOX_REVIEW_ENQUEUED, {
+    change_set_id = id, candidate_digest = digest, write_set = item.write_set, tool = item.tool,
+  })
+  return { ok = true, state = "PENDING", change_set_id = id, item = item }
 end
 
 --- 将选择性应用后剩余的文件重新入队为新的待审变更单元（按文件审批）。
@@ -1264,7 +1418,15 @@ local function _apply_settle(ctx, pub)
     _persist(item)
     pcall(store.delete_review_removed, item.change_set_id)
     -- 仅应用了部分文件：其余文件保留待审，供用户逐个确认
-    if #ctx.remaining > 0 then _requeue_remaining(item, ctx.remaining) end
+    if #ctx.remaining > 0 then
+      local requeued = _requeue_remaining(item, ctx.remaining)
+      if not requeued then
+        -- 回队异常（例如新建候选落盘失败）：显式告警，避免剩余文件「静默消失」无从排查。
+        require("NeoAI.kernel.logger").warn(
+          "[sandbox] 选择性应用后剩余 %d 个文件回队失败（change_set=%s）",
+          #ctx.remaining, tostring(item.change_set_id))
+      end
+    end
     _emit(require("NeoAI.kernel.events").SANDBOX_APPLIED, {
       change_set_id = id, operation_id = pub.receipt.operation_id,
     })
@@ -1703,6 +1865,8 @@ function M.reset()
   state.ref_scans = 0
   state.terminal_order = {}
   state.terminal_set = {}
+  state.rejected_order = {}
+  state.rejected_set = {}
   _clear_content_cache()
 end
 

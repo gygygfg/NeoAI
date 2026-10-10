@@ -49,14 +49,50 @@ local function agent_mod_is_disposed(agent)
   return agent.state == "disposed" or (agent.messages and #agent.messages == 0 and agent.signal and agent.signal:aborted())
 end
 
---- plan→其它模式执行前的蒸馏：仅当「上一回合是计划模式」且「本次以非计划模式发送」时触发一次。
---- 触发条件（对齐 plan→execute 语义）：
---- - 当前不在计划模式（正在计划模式下发送是计划回合，不得蒸馏）；
---- - 本 agent 记录过进入计划模式的边界（_plan_enter_index）且尚未蒸馏（_plan_distilled）；
---- - 窗口非空（有计划阶段内容待压缩）。
---- 蒸馏失败/空摘要/窗口过小一律 no-op（plan_distill 内部已兜底），不阻塞发送。
+--- 计划提取：调用 plan_distill 生成结构化计划上下文（请求覆盖层），并用提取出的步骤
+--- 正式调用 todo_write 建立任务清单。成功（或已完成提取）后置 _plan_distilled 标记。
+--- 失败 no-op，不阻塞发送。
 --- @param agent table
---- @return Deferred resolve(boolean) 是否执行了蒸馏
+--- @return Deferred resolve({ fields, steps }|nil)
+local function _run_plan_extract(agent)
+  local plan_distill = require("NeoAI.core.session.plan_distill")
+  return plan_distill.run(agent):then_(function(res)
+    if not res then
+      return nil
+    end
+    agent._plan_distilled = true
+    local steps = res.steps or {}
+    if #steps > 0 then
+      local tool_service = services.use("services.tool_service")
+      if not tool_service then
+        local ok_req, ts = pcall(require, "NeoAI.services.tool_service")
+        if ok_req then tool_service = ts end
+      end
+      if tool_service then
+        local todos = {}
+        for _, s in ipairs(steps) do todos[#todos + 1] = { content = s, status = "pending" } end
+        pcall(function()
+          tool_service.execute(agent, "todo_write", {
+            todos = todos,
+            description = "根据确认的计划建立任务清单",
+          })
+        end)
+      end
+    end
+    return res
+  end, function()
+    return nil
+  end)
+end
+
+--- plan→其它模式执行前的计划提取：仅当「上一回合是计划模式」且「本次以非计划模式发送」时触发一次。
+--- 触发条件（对齐 plan→execute 语义）：
+--- - 当前不在计划模式（正在计划模式下发送是计划回合，不得提取）；
+--- - 本 agent 记录过进入计划模式的边界（_plan_enter_index）且尚未提取（_plan_distilled）；
+--- - 窗口非空（有计划阶段内容待提取）。
+--- 提取失败一律 no-op（plan_distill 内部已兜底），不阻塞发送。
+--- @param agent table
+--- @return Deferred resolve(boolean) 是否执行了提取
 local function _distill_if_needed(agent)
   if not agent or not agent.messages then
     return async.resolve(false)
@@ -71,10 +107,8 @@ local function _distill_if_needed(agent)
   if #agent.messages <= agent._plan_enter_index then
     return async.resolve(false)
   end
-  local plan_distill = require("NeoAI.core.session.plan_distill")
-  return plan_distill.run(agent):then_(function(done)
-    if done then agent._plan_distilled = true end
-    return done
+  return _run_plan_extract(agent):then_(function(res)
+    return res ~= nil
   end, function()
     return async.resolve(false)
   end)
@@ -140,7 +174,8 @@ local function _build_persist_session(agent)
   for _, msg in ipairs(agent.messages) do
     if not msg._synced and not msg.runtime_context then
       -- 压缩检查点：先在 durable surface 移除被替换的「已同步」旧消息（替换而非追加）。
-      -- front 替换（compactor）从头部移除；tail 替换（plan_distill）从尾部移除。
+      -- front 替换（compactor）从头部移除；tail 替换（替换计划阶段窗口的旧检查点）从尾部移除，
+      -- 现仅为兼容历史会话数据（plan_distill 已改为不落检查点的 XML 提取）。
       -- 按 replaced_synced_count（被替换消息中已落盘的条数）而非 replaced_count 删除：
       -- 回合边界压缩时两者相等；但工具循环中途压缩时，本回合新增消息尚未落盘，
       -- 若按 replaced_count 删除会把上一回合的历史误删。缺省回退到 replaced_count 以
@@ -839,15 +874,6 @@ function M.approve_plan(opts)
     return { approved = false, error = "未找到计划内容（AI 尚未输出计划）" }
   end
 
-  -- 计划 → 任务清单
-  local todo_mod = require("NeoAI.tools.builtin.todo")
-  local items = plan_mode.plan_to_todos(plan)
-  local session_id = agent.session_id
-  if #items > 0 then
-    todo_mod.seed(session_id, items)
-    event_bus.emit(events.TODO_UPDATED, { session_id = session_id, count = #items })
-  end
-
   agent.plan = plan
   pending_mode = nil -- 确认计划后清除待应用的模式切换（以本次退出为准）
   pending_mode_agent_id = nil
@@ -859,16 +885,24 @@ function M.approve_plan(opts)
   if auto == nil then
     auto = config_store.get("tools.plan_mode.auto_execute_on_approve") ~= false
   end
-  if auto and #items > 0 then
-    -- 自动执行：发送确认指令驱动一轮生成，AI 按任务清单（todo）开始工作。
-    -- plan→非plan 边界蒸馏由发送路径统一触发（_run_message → _distill_if_needed）。
-    return M.send_message(APPROVE_EXECUTE_MESSAGE):then_(function(resp)
-      return { approved = true, plan = plan, todo_count = #items, message = resp }
-    end, function(err)
-      return { approved = true, plan = plan, todo_count = #items, error = tostring(err and err.message or err) }
-    end)
-  end
-  return { approved = true, plan = plan, todo_count = #items }
+
+  -- plan→execute 边界：先做 XML 计划提取（组装执行上下文 + 正式调用 todo_write 建清单），
+  -- 再按需自动执行。提取失败 no-op，不阻塞确认。
+  return _run_plan_extract(agent):then_(function(res)
+    _persist_agent(agent) -- 落盘提取后的 todo 清单与 plan 状态
+    local steps = (res and res.steps) or {}
+    local todo_count = #steps
+    if auto then
+      -- 自动执行：发送确认指令驱动一轮生成，AI 按任务清单（todo）开始工作。
+      -- 提取已在本步完成并置 _plan_distilled，发送路径不再重复提取。
+      return M.send_message(APPROVE_EXECUTE_MESSAGE):then_(function(resp)
+        return { approved = true, plan = plan, todo_count = todo_count, message = resp }
+      end, function(err)
+        return { approved = true, plan = plan, todo_count = todo_count, error = tostring(err and err.message or err) }
+      end)
+    end
+    return { approved = true, plan = plan, todo_count = todo_count }
+  end)
 end
 
 --- 当前模式（互斥：一次只处于一种模式）。

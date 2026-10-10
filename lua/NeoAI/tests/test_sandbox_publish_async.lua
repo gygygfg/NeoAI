@@ -162,8 +162,10 @@ tests.suite("sandbox_publish_async", function(_, it)
       local item = review.enqueue(cand, { tool = "edit_file" })
       ids[i] = item.change_set_id
     end
-    for i = 1, 3 do review.reject(ids[i], "test") end
-    -- 5 项中 3 项终态、2 项待审；终态上限 2 → 应淘汰 1 项（最早拒绝者）。
+    -- 内部丢弃（如候选被显式 discard 后的对账）标记为 REJECTED 但**不**保留可恢复副本，
+    -- 属「可淘汰终态」；显式用户拒绝（review.reject）则保留副本、按 rejected_max 约束（不在此淘汰）。
+    for i = 1, 3 do review.discard_by_digest("sha256:term" .. i, "test") end
+    -- 5 项中 3 项终态、2 项待审；终态上限 2 → 应淘汰 1 项（最早进入终态者）。
     t.eq(4, review._memory_count(), "超过上限的终态项应从内存淘汰")
     local back = review.get(ids[1])
     t.not_nil(back, "淘汰项应可从磁盘回读")

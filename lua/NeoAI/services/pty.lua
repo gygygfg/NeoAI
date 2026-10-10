@@ -28,6 +28,7 @@ local state = {
   active_id = nil, -- 当前判官会话 id（供 terminal_* 工具定位）
   window = nil,    -- 惰性加载的悬浮终端组件
   follow_unsub = nil, -- UI_FOLLOW_CHANGED 事件订阅句柄
+  focus_unsub = nil,  -- UI_FOCUS_CHANGED 事件订阅句柄（焦点离开 NeoAI 界面时不弹/隐藏）
   force_ui = false,   -- 测试钩子：强制视作「有 UI」（headless 下也能验证弹窗逻辑）
 }
 
@@ -83,6 +84,18 @@ local function _chat_following()
   return true
 end
 
+--- 用户当前是否聚焦在 NeoAI 界面。焦点在非 NeoAI 窗口（用户切去别处）时不应弹窗打扰，
+--- 进入等待，待切回 NeoAI 界面再由 UI_FOCUS_CHANGED 重弹。焦点模块缺失时默认允许弹出。
+--- @return boolean
+local function _focused()
+  local ok, focus = pcall(require, "NeoAI.ui.focus")
+  if ok and focus and type(focus.is_focused) == "function" then
+    local ok2, v = pcall(focus.is_focused)
+    if ok2 then return v end
+  end
+  return true
+end
+
 --- 打开某会话的悬浮终端（幂等；有 UI 且组件可用时）
 --- 组件每次都用新的 `nvim_open_term` 通道渲染（如跟随跳变隐藏后重开、或首个输出早于
 --- 弹出时机），新通道是空白的；而 `append` 只在窗口已存在时才逐片喂入，窗口创建前的
@@ -103,8 +116,9 @@ local function _open_window(session, title)
 end
 
 --- 是否应弹出悬浮终端。
---- 规则：`show_window` 决定触发时机，二者都要求 **聊天光标跟随**（光标不跟随时——
---- 用户正在回看上方内容——一律不弹）：
+--- 规则：`show_window` 决定触发时机；同时要求 **聊天光标跟随** 且 **聚焦在 NeoAI 界面**：
+--- 光标不跟随（用户在回看上方内容）或焦点在非 NeoAI 窗口（用户切去别处）时一律不弹，
+--- 后者进入等待，切回 NeoAI 界面时由 UI_FOCUS_CHANGED 重弹。
 ---   - always  : 会话启动（trigger="start"）即弹；
 ---   - on_wait : 命令运行超过 `show_window_delay_ms`（trigger="delay"）才弹；
 ---   - never   : 不弹。
@@ -122,7 +136,7 @@ local function _should_show_window(session, trigger)
   else
     return false
   end
-  return _chat_following()
+  return _chat_following() and _focused()
 end
 
 --- 关闭某会话的悬浮终端窗口，并清掉 session 上的句柄标记。
@@ -153,7 +167,7 @@ end
 --- - never：不弹。
 --- 覆盖两种情况：窗口被隐藏（window_hidden）的，以及非跟随期间从未弹出过的（首次弹窗被抑制）。
 local function _restore_pending_windows()
-  if not _has_ui() or not _chat_following() then return end
+  if not _has_ui() or not _chat_following() or not _focused() then return end
   local sw = _cfg().show_window or "on_wait"
   if sw == "never" then return end
   for _, session in pairs(state.sessions) do
@@ -167,18 +181,31 @@ local function _restore_pending_windows()
   end
 end
 
---- 订阅「光标跟随状态跳变」：跟随→非跟随隐藏终端窗；非跟随→跟随重弹仍在等待的终端窗。
---- 懒订阅：首次 open 会话时注册；reset 时注销。
+--- 订阅「光标跟随状态跳变」与「NeoAI 界面焦点跳变」：不可见（非跟随 / 失焦）时隐藏终端窗；
+--- 恢复可见（跟随 / 聚焦）时重弹仍在等待的终端窗。懒订阅：首次 open 会话时注册；reset 时注销。
 local function _ensure_follow_subscription()
-  if state.follow_unsub then return end
-  state.follow_unsub = event_bus.on(events.UI_FOLLOW_CHANGED, function(payload)
-    local following = payload and payload.following
-    if following == false then
+  local function on_visibility(payload)
+    -- UI_FOLLOW_CHANGED：{ following = bool }；UI_FOCUS_CHANGED：{ focused = bool }
+    local visible
+    if payload and payload.focused ~= nil then
+      visible = payload.focused
+    elseif payload and payload.following ~= nil then
+      visible = payload.following
+    else
+      return
+    end
+    if visible == false then
       _hide_all_windows()
-    elseif following == true then
+    else
       _restore_pending_windows()
     end
-  end)
+  end
+  if not state.follow_unsub then
+    state.follow_unsub = event_bus.on(events.UI_FOLLOW_CHANGED, on_visibility)
+  end
+  if not state.focus_unsub then
+    state.focus_unsub = event_bus.on(events.UI_FOCUS_CHANGED, on_visibility)
+  end
 end
 
 --- 读取单行 /proc 文件；失败返回 nil
@@ -887,6 +914,10 @@ function M.reset()
   if state.follow_unsub then
     pcall(state.follow_unsub)
     state.follow_unsub = nil
+  end
+  if state.focus_unsub then
+    pcall(state.focus_unsub)
+    state.focus_unsub = nil
   end
   local win = _window()
   if win and type(win.reset) == "function" then pcall(win.reset) end

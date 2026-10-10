@@ -293,6 +293,27 @@ tests.suite("herder", function(_, it)
     restore_env(orig)
   end)
 
+  it("pty 会话等待输入触发 blocked，输入送达后回到 working/idle", function(t)
+    local orig = reset_herder_env()
+    local herder = init_herder()
+    local eb = require("NeoAI.kernel.event_bus")
+    local ev = require("NeoAI.kernel.events")
+
+    emit_created("a1")
+    -- pty 等待用户输入：pane 级 blocked（渲染为红）
+    eb.emit(ev.PTY_WAITING_INPUT, { id = "pty1" })
+    t.eq("blocked", herder.get_state(), "pty 等待输入应上报 blocked")
+    -- 输入送达：回到 idle（无其他活动）
+    eb.emit(ev.PTY_INPUT_SENT, { id = "pty1" })
+    t.eq("idle", herder.get_state(), "输入送达后应回到 idle")
+    -- 会话退出也应清除等待态
+    eb.emit(ev.PTY_WAITING_INPUT, { id = "pty2" })
+    t.eq("blocked", herder.get_state())
+    eb.emit(ev.PTY_EXITED, { id = "pty2" })
+    t.eq("idle", herder.get_state(), "pty 退出后应回到 idle")
+    restore_env(orig)
+  end)
+
   it("最后一个 agent 移除时清除元数据并释放权威", function(t)
     local orig = reset_herder_env()
     local herder = init_herder()

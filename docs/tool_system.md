@@ -163,10 +163,12 @@ M.execute(agent, name, args, tool_call_id, opts)
 > 阻塞式文件 I/O（读大文件/递归搜索/写盘）经 `utils.work` 在线程池执行，不占用主线程。
 >
 > **`read_file` 大文件保护**：未指定 `start_line`/`end_line` 且文件字符数超过阈值（默认
-> `tools.read_file.outline_threshold_chars=500`）时，不返回全文，而返回该文件的 tree-sitter
-> **语法树节点大纲**（用 `get_string_parser` 从字符串解析，不加载 buffer）；该文件类型无解析器时
-> 回退为「提示 + 前 `outline_preview_lines` 行预览」。大纲仅输出有命名子节点的结构节点，
-> 受 `outline_max_nodes`/`outline_max_depth` 限制；指定行范围时不受该保护影响。
+> `tools.read_file.outline_threshold_chars=500`）时，不返回全文，而先尝试返回该文件的 tree-sitter
+> **语法树节点大纲**（用 `get_string_parser` 从字符串解析，不加载 buffer，仅输出有命名子节点的结构节点，
+> 受 `outline_max_nodes`/`outline_max_depth` 限制）；该文件类型**无解析器/解析失败**时，返回「文件首尾
+> （展示头尾，中间省略）」并**把完整文件内容落盘到沙箱私有 `/tmp`**（提示中给出路径，可用
+> `read_file` 的 `start_line`/`end_line` 分段回读）。指定行范围时不受大纲保护，但该切片仍受下述
+> **AI 上下文限流**约束。
 
 ### 💻 Shell（shell.lua）
 
@@ -182,11 +184,27 @@ M.execute(agent, name, args, tool_call_id, opts)
 - **目标**：分别在命令等待输入时注入一行文本、发送按键序列（Enter/Tab/Escape/Up/Ctrl-C 等）、结束进程。
 - **如何操作**：仅操作已存在的 PTY 会话（`effect=in_process`，不新起进程）；正常由判官自动调用，模型一般无需手动调用，除非需要精确控制。
 
-悬浮终端窗口由 `ui/components/terminal_window.lua` 用 `nvim_open_term` 渲染，焦点在内时可手动键入；`show_window` 控制弹出时机（always/on_wait/never，**均需聊天光标跟随**）：`always` 会话启动即弹；`on_wait` 仅当命令运行超过 `show_window_delay_ms`（默认 2000ms）仍未结束时弹（2 秒内结束的短命令不弹，避免一闪而过）。跟随状态跳变时经 `UI_FOLLOW_CHANGED` 自动隐藏（回看上方）/ 重弹（跳回底部，仍满足对应条件者）。窗口每次打开（首弹或重弹）都按**新的 `nvim_open_term` 通道**渲染，因此打开时会**重放该会话的累计输出**，避免弹出空白窗口（看起来「打不开」）。详见 [configuration.md](configuration.md) 的 `tools.run_command.interactive`。
+悬浮终端窗口由 `ui/components/terminal_window.lua` 用 `nvim_open_term` 渲染，焦点在内时可手动键入；`show_window` 控制弹出时机（always/on_wait/never，**均需聊天光标跟随**）：`always` 会话启动即弹；`on_wait` 仅当命令运行超过 `show_window_delay_ms`（默认 2000ms）仍未结束时弹（2 秒内结束的短命令不弹，避免一闪而过）。跟随状态跳变时经 `UI_FOLLOW_CHANGED` 自动隐藏（回看上方）/ 重弹（跳回底部，仍满足对应条件者）。窗口每次打开（首弹或重弹）都按**新的 `nvim_open_term` 通道**渲染，因此打开时会**重放该会话的累计输出**，避免弹出空白窗口（看起来「打不开」）。**焦点不在 NeoAI 界面（用户切到其他窗口）时同样不弹**：经 `UI_FOCUS_CHANGED` 进入等待，待切回 NeoAI 界面再弹（详见 [sandbox.md](sandbox.md) 的生命周期上报）。详见 [configuration.md](configuration.md) 的 `tools.run_command.interactive`。
 
 命令 stdout/stderr 合计超过 `tools.run_command.max_output_bytes`（默认 16 MiB）时截断并终止命令，
 避免超大输出（数百 MB）逐行处理冻结主线程；已产生内容仍回传并标注「已截断」。
 命令以退出码 137（SIGKILL）结束时读取资源域事件区分「疑似 OOM」与「被强制终止」。
+
+### ✂️ 工具输出「AI 上下文限流」（output_guard.lua）
+
+`run_command`（三路径）+ `git_*` 只读工具 + `read_file` 的回传文本统一经 `tools.builtin.output_guard.cap`
+出口护栏：文本字符数超过 `tools.output_guard.max_chars`（默认 20000）时，只回传「头 `head_chars` +
+截断标记 + 尾 `tail_chars`」，并把**完整输出**写入沙箱私有 `/tmp/<spill_dir>/`（默认
+`/tmp/neoai-out/…`），在标记中给出该路径——模型可用 `read_file` 的 `start_line`/`end_line` 分段回读。
+
+- 与 `run_command.max_output_bytes`（16 MiB「防冻结硬杀限」，保护主线程）**职责分离**：本项保护的是
+  **模型上下文**，量级小得多（默认 2 万字符）。
+- 落盘目录取沙箱访客 `/tmp` 在宿主侧的**会话私有目录**（`sandbox.guest_fs` 登记，`_append_tmpfs_roots`
+  在 bind 时写入），故一次性/常驻/exec/lsp 全路径落在同一目录；`read_file`/`list_files`/`file_exists`
+  的 `/tmp/…` 入参会经 `guest_fs.to_host` 还原（仅当映射后的宿主文件存在时才改写，避免遮蔽宿主真实 `/tmp`）。
+- 截断提示含沙箱内路径，必须在 `conceal.redact` **之后**附加，否则会被脱敏抹掉。
+- **降级**：未启用沙箱（无 `/tmp` 映射）时仅截断、不落盘，提示相应说明「未落盘完整内容」。
+- 关闭：`tools.output_guard.enabled=false`（可一键停止限流，仅保留既有硬限）。
 
 ### 🔌 后台进程（会话级常驻沙箱实例）
 
@@ -250,7 +268,11 @@ M.execute(agent, name, args, tool_call_id, opts)
 `ask_user`：暂停生成向用户提问，回答回传为工具结果。发射 `ASK_USER_WAITING`/`ASK_USER_ANSWERED`，
 等待期间暂停可暂停计时器。选项既可以是字符串，也可以是 `{ label, description }`（label 为选项简介，
 description 为选项描述，二者在弹窗中分别展示并高亮）。同一时刻只展示一个提问弹窗，并行发起的
-多次提问按序排队（前一个回答/取消后再展示下一个），不会直接失败。
+多次提问按序排队（前一个回答/取消后再展示下一个），不会直接失败。**焦点不在 NeoAI 界面时不立即弹出**：
+暂存待展示配置并进入等待（`ASK_USER_WAITING` 照常发射，Herder 生命周期显示 `blocked`），
+待用户切回 NeoAI 界面（`UI_FOCUS_CHANGED` focused=true）时再弹。同机制同样适用于工具审批
+（tool_approval）、密钥告警（secret_alert）、网络同意（net_consent）等阻塞弹窗（另见
+[sandbox.md](sandbox.md) 的「焦点感知的交互弹窗」）。
 
 ### 🖼 图像（read_image.lua）
 

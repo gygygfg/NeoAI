@@ -308,7 +308,7 @@ tests.suite("tools", function(_, it)
     t.true_(vim.wait(2000, function() return done end), "read_file 应完成")
   end)
 
-  it("read_file 大文件保护：无 parser 文件返回截断预览", function(t)
+  it("read_file 大文件保护：无 parser 文件超阈值返回头+尾（受限流）", function(t)
     local registry = require("NeoAI.tools.registry")
     registry.reset()
     local config_store = require("NeoAI.kernel.config_store")
@@ -318,19 +318,52 @@ tests.suite("tools", function(_, it)
     registry.register_many(file_ops.get_tools())
     local fs = require("NeoAI.utils.fs")
     local path = "/tmp/neoai_read_big.log"
+    -- 无 tree-sitter parser 的文本文件；内容超过 tools.output_guard.max_chars(20000)，
+    -- 触发「头+尾 + 截断标记」（未启用沙箱时提示未落盘）。
+    local parts = {}
+    for i = 1, 2000 do
+      parts[#parts + 1] = string.format("log line %d with some padding text", i)
+    end
+    parts[#parts + 1] = "LOG_TAIL_MARKER"
+    local content = table.concat(parts, "\n") .. "\n"
+    t.true_(#content > 20000, "测试文件应超过 max_chars")
+    fs.write_file(path, content)
+    local done = false
+    executor.execute("read_file", { file_path = path, description = "读取大日志文件" }, {}):then_(function(r)
+      t.matches("文件较大", r, "应提示文件较大")
+      t.matches("log line 1 ", r, "头部应含开头内容")
+      t.matches("LOG_TAIL_MARKER", r, "尾部应含末尾内容")
+      t.matches("输出过长已截断", r, "超阈值应被限流截断")
+      done = true
+    end, function(e)
+      t.true_(false, "不应失败: " .. tostring(e))
+      done = true
+    end)
+    t.true_(vim.wait(2000, function() return done end), "read_file 应完成")
+  end)
+
+  it("read_file 大文件保护：无 parser 中等文件（未超 max_chars）返回全文", function(t)
+    local registry = require("NeoAI.tools.registry")
+    registry.reset()
+    local config_store = require("NeoAI.kernel.config_store")
+    config_store.load({ tools = { approval = { mode = "auto_allow" } } })
+    local executor = require("NeoAI.tools.executor")
+    local file_ops = require("NeoAI.tools.builtin.file_ops")
+    registry.register_many(file_ops.get_tools())
+    local fs = require("NeoAI.utils.fs")
+    local path = "/tmp/neoai_read_mid.log"
     local parts = {}
     for i = 1, 120 do
       parts[#parts + 1] = string.format("log line %d with some padding text", i)
     end
     parts[#parts + 1] = "LOG_TAIL_MARKER"
     local content = table.concat(parts, "\n") .. "\n"
-    t.true_(#content > 500, "测试文件应超过 500 字符")
+    t.true_(#content > 500 and #content < 20000, "测试文件应超过保护阈值但未超 max_chars")
     fs.write_file(path, content)
     local done = false
-    executor.execute("read_file", { file_path = path, description = "读取大日志文件" }, {}):then_(function(r)
-      t.matches("预览", r, "无 parser 时应返回预览")
-      t.matches("log line 1 ", r, "预览应含开头内容")
-      t.eq(nil, r:find("LOG_TAIL_MARKER", 1, true), "不应回传末尾内容")
+    executor.execute("read_file", { file_path = path, description = "读取中等日志文件" }, {}):then_(function(r)
+      t.matches("LOG_TAIL_MARKER", r, "未超 max_chars 时应返回全文（含末尾标记）")
+      t.eq(nil, r:find("输出过长已截断", 1, true), "未超 max_chars 不应截断")
       done = true
     end, function(e)
       t.true_(false, "不应失败: " .. tostring(e))
@@ -665,6 +698,8 @@ tests.suite("tools", function(_, it)
   end)
 
   it("shell run_command 出错/超时也回传终端输出", function(t)
+    -- run_command 必须过沙箱门禁；无可用后端（如嵌套容器 userns 受限）时跳过。
+    if require("NeoAI.sandbox.runtime").backend() == nil then return end
     local tools = require("NeoAI.tools")
     local registry = require("NeoAI.tools.registry")
     local shell = require("NeoAI.tools.builtin.shell")
@@ -720,6 +755,8 @@ tests.suite("tools", function(_, it)
   end)
 
   it("tool_service 把 ctx.ui_notice 作为 UI-only 元数据回传（不进入结果内容）", function(t)
+    -- 工具执行需过沙箱门禁；无可用后端时跳过（否则被门禁拒绝，无法验证 ui_notice）。
+    if require("NeoAI.sandbox.runtime").backend() == nil then return end
     local config_store = require("NeoAI.kernel.config_store")
     config_store.load({ tools = { approval = { mode = "auto_allow" } } })
     local tool_service = require("NeoAI.services.tool_service")

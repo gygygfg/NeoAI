@@ -4,6 +4,7 @@
 
 local async = require("NeoAI.utils.async")
 local helpers = require("NeoAI.tools.builtin.tool_helpers")
+local output_guard = require("NeoAI.tools.builtin.output_guard")
 local conceal = require("NeoAI.sandbox.conceal")
 local secret = require("NeoAI.sandbox.secret")
 
@@ -414,6 +415,8 @@ local RUN_COMMAND_DESC_BASE =
   .. "长任务（安装依赖/编译/下载）请在**同一次调用**内显式传较大的 timeout_ms（如 600000），"
   .. "不要靠重试短命令规避超时。以 `&`/nohup/setsid 启动的后台进程，仅在会话使用常驻沙箱时"
   .. "跨工具调用**且跨轮次**持续运行（可用 ps/kill 管理）；否则命令结束即被回收，其输出建议重定向到文件。"
+  .. "输出过长时（超过 tools.output_guard.max_chars）结果会截断为头+尾，完整输出自动落盘到沙箱私有 /tmp"
+  .. "并在结果中给出路径，可用 read_file 的 start_line/end_line 分段查看；也可提前自行把输出重定向到文件。"
 
 -- 交互式（PTY）：标明可交互，并写清【目标】与【如何操作】。
 local RUN_COMMAND_DESC_INTERACTIVE =
@@ -427,6 +430,8 @@ local RUN_COMMAND_DESC_INTERACTIVE =
   .. "多轮交互较慢，请在同一次调用内显式传足够大的 timeout_ms（如 120000~600000）。"
   .. "需要精确控制时可显式调用 terminal_send_text / terminal_send_keys / terminal_kill（仅当存在活动会话时有效）。"
   .. "后台进程：交互式模式走一次性沙箱路径，`&`/nohup/setsid 不跨调用存活，输出建议重定向到文件。"
+  .. "输出过长时（超过 tools.output_guard.max_chars）结果会截断为头+尾，完整输出自动落盘到沙箱私有 /tmp"
+  .. "并在结果中给出路径，可用 read_file 的 start_line/end_line 分段查看。"
 
 shell_tools.run_command = helpers.define_tool(
   "run_command",
@@ -596,6 +601,9 @@ shell_tools.run_command = helpers.define_tool(
               text = text .. "\n\n" .. s
             end
           end
+          -- AI 上下文限流（在脱敏/各类提示之后调用，避免路径被 conceal 抹掉）：输出过长时
+          -- 只回传头+尾，并把完整输出落盘到沙箱私有 /tmp（提示中给出路径，可 read_file 回读）。
+          text = output_guard.cap(text, { tool = "run_command" })
           -- 非零退出码 / 取消 / 超时视为失败：以结构化结果 resolve（含 error 字段）——
           -- UI 据此显示 ❌；同时仍 resolve（而非 reject）以保留沙箱门禁的权限升级检测与候选冻结。
           -- 输出截断导致的终止不算失败（命令本身可能已成功，只是输出过多）。

@@ -122,6 +122,26 @@ local function _apply_overlay(messages, comp)
   return out
 end
 
+--- 应用「计划提取」覆盖层：保留前置 front，随后注入提取出的上下文（含原样文件工具对），
+--- 再拼接 window_end 之后的消息（含用户本轮真实消息与后续回合）。
+--- 覆盖层不改动原始 messages（渲染/落盘仍为原始上下文），仅用于构建请求视图。
+--- @param messages table 原始内部消息
+--- @param pe table { front_count = number, window_end = number, inject = table }
+--- @return table 请求视图消息数组
+local function _apply_plan_extract(messages, pe)
+  messages = messages or {}
+  if type(pe) ~= "table" or type(pe.front_count) ~= "number" or type(pe.window_end) ~= "number" then
+    return messages
+  end
+  local out = {}
+  local k = math.min(math.max(pe.front_count, 0), #messages)
+  for i = 1, k do out[#out + 1] = messages[i] end
+  for _, m in ipairs(pe.inject or {}) do out[#out + 1] = m end
+  local we = math.max(pe.window_end, k)
+  for i = we + 1, #messages do out[#out + 1] = messages[i] end
+  return out
+end
+
 -- ========== 公开 API ==========
 
 --- 从会话构建上下文消息列表
@@ -187,6 +207,10 @@ end
 --- @return table 内部消息数组（原始或「检查点 + 尾部」）
 function M.request_view(agent)
   if not agent then return {} end
+  -- 计划提取覆盖层优先于压缩覆盖层：计划调研窗口通常落在被替换区间内，等价丢弃。
+  if agent.plan_extract then
+    return _apply_plan_extract(agent.messages, agent.plan_extract)
+  end
   return _apply_overlay(agent.messages, agent.compaction)
 end
 

@@ -1,16 +1,16 @@
---- 计划阶段上下文蒸馏
+--- 计划阶段上下文提取
 --- @module NeoAI.core.session.plan_distill
---- 在「plan 完成 → 用户以任何非计划模式（chat/auto）确认开始」的边界，把计划阶段的
---- 调研上下文（工具调用、推理、正文）按顺序分块标号，通过一次内部分类调用交给 AI，
---- 用 compactor 的 8 段 <compacted-summary> 结构提炼出对执行有用的信息（目标、环境、
---- 文件、注意事项），再用提炼后的检查点消息【替换压缩】原调研窗口，重建上下文后开始执行。
---- 触发由 chat_service._distill_if_needed 统一判定（approve_plan 自动执行、手动切到
---- chat/auto、cycle plan→auto 等首次非 plan 发送前各触发一次）。
---- 与 compactor 的差异：
---- - compactor 按 token 压力折叠【最早的】消息（replaced_tail=false，从 durable 头部移除）；
---- - plan_distill 在 plan→execute 边界折叠【计划阶段尾部】消息（replaced_tail=true，从尾部移除），
----   待蒸馏窗口取 agent._plan_enter_index（进入计划模式时记录）之后的全部消息。
---- 失败一律 no-op：不阻塞审批、不改变历史，仅返回 false 并原样继续执行。
+--- 在「plan 完成 → 用户以任何非计划模式（chat/auto）确认开始」的边界，**不再**做 8 段蒸馏压缩。
+--- 改为：在**尚未加入用户真实消息**的前提下，内部追加一轮「XML 结构化提取」请求：
+---   - 回放现有前缀（系统 + 全部历史，复用前缀缓存）后追加提取指令，让 AI 输出结构化计划；
+---   - 解析 <target> / <stepN> / <files> / <Rollback> / <Information> 等标签（忽略大小写）；
+---   - 关键字段（target + 至少一个 stepN）缺失时重试，最多 3 次（总尝试次数），仍缺则忽略缺失；
+---   - 把 <files> 涉及的文件在计划调研窗口中出现的 function/tool 成对消息**原样**取出，
+---     与解析出的新上下文一起，作为**请求覆盖层**（agent.plan_extract）注入。
+--- 覆盖层只影响发往模型的请求视图：agent.messages 保持原始，聊天显示与落盘**完全不变**，
+--- 提取指令与 AI 的 XML 回复都**不进入** agent.messages。
+--- 触发由 chat_service._distill_if_needed / approve_plan 统一判定（各触发一次）。
+--- 失败一律 no-op：不阻塞发送、不改变历史，仅返回 false 并原样继续执行。
 
 local async = require("NeoAI.utils.async")
 local config_store = require("NeoAI.kernel.config_store")
@@ -23,54 +23,62 @@ local M = {}
 
 -- ========== 私有常量 ==========
 
---- 分类蒸馏指令：作为承载「编号分块」的最后一条 user 消息投递，
---- 沿用 compactor 的 8 段结构，并强调按用户要求分类筛选目标/环境/文件/注意事项。
-local PLAN_DISTILL_INSTRUCTION = table.concat({
-  "你是一个计划阶段上下文蒸馏引擎。上方历史消息与下面编号分块（[编号] 类别 内容）",
-  "共同构成一次计划调研。请从中分类筛选出对执行仍然有用、必须保留的信息，剔除冗余过程性",
-  "细节（大量搜索/读取结果、中间推理、临时命令等），集成成一份结构化检查点。",
+--- 关键字段缺失时的最大总尝试次数（首跑 + 重试）
+local MAX_ATTEMPTS = 3
+
+--- XML 提取指令：作为「不进入历史」的最后一条 user 消息投递。
+local PLAN_EXTRACT_INSTRUCTION = table.concat({
+  "请把上文的计划调研结论整理为结构化 XML，供后续执行阶段使用。",
   "",
-  "只需输出下面的 Markdown 结构：按顺序保留每个 section，用精简要点而非段落；",
-  "没有内容的 section 写 \"(none)\"，绝不省略任何 section。",
+  "要求：",
+  "1. 只输出 XML 文本，不要输出任何解释、Markdown 代码围栏或多余文字；",
+  "2. 不要调用任何工具；",
+  "3. 每个标签都必须成对出现，标签名忽略大小写；",
+  "4. <target> 与 <step1><step2>…<stepN> 为必需：target 概述任务目标；",
+  "   stepN 按执行先后顺序逐条给出可执行步骤（从 1 连续编号，至少一个）；",
+  "5. 其余为可选标签，没有内容就整段省略（不要输出空标签）。",
   "",
-  "## Primary Request and Intent",
-  "- [用户原始且不断演进的目标；关键措辞逐字引用]",
+  "允许的标签清单（标签名忽略大小写）：",
+  "- <target>：任务目标（必需）",
+  "- <stepN>：第 N 个执行步骤（必需，至少一个，从 step1 连续编号）",
+  "- <files>：完成目标所涉及的文件（必要读取和修改的文件；每行一个路径）",
+  "- <Rollback>：回退方案",
+  "- <Information>：所需的其他信息",
+  "- <Context>：背景（为什么做）",
+  "- <Scope>：本次改动范围",
+  "- <OutOfScope>：明确不做的事",
+  "- <Constraints>：约束条件",
+  "- <Commands>：关键命令",
+  "- <Dependencies>：依赖 / 前置条件",
+  "- <Environment>：环境 / 技术栈",
+  "- <Verify>：验证 / 验收方式",
+  "- <Risks>：风险与注意事项",
+  "- <Questions>：待澄清问题",
   "",
-  "## Key Technical Concepts",
-  "- [技术栈、框架、约定、在运用的模式]",
-  "",
-  "## Files and Code",
-  "- [精确路径：为什么重要、关键改动或片段]",
-  "",
-  "## Errors and Fixes",
-  "- [错误：如何解决，以及相关用户反馈]",
-  "",
-  "## Pending Jobs",
-  "- [明确要求但尚未完成的工作]",
-  "",
-  "## Current Work",
-  "- [此检查点处正处于什么状态/已批准的计划]",
-  "",
-  "## Next Step",
-  "- [紧接最近一次请求的下一步，或 \"(none)\"]",
-  "",
-  "## Critical Context",
-  "- [决策与理由、约束、用户偏好、澄清、需要的数据才能继续]",
-  "",
-  "分类筛选重点（务必覆盖）：",
-  "- 目标：用户真正想要什么、本期要做什么（源自 Primary Request）；",
-  "- 环境信息 / 技术背景：技术栈、工具、约定、运行环境；",
-  "- 文件信息：精确文件路径、为什么重要、关键片段或函数签名；",
-  "- 注意事项：约束、用户明确反馈与修正、需澄清的问题、回滚/验证方案、踩坑点。",
-  "",
-  "规则：",
-  "- 使用简洁的中文工程描述。保留精确文件路径、命令、错误文本、标识符、数值、函数签名。",
-  "- 忠实记录用户明确的反馈与修正。",
-  "- 不要提及本蒸馏请求，也不要提及上下文被压缩。",
-  "- 只输出检查点文本：不要调用任何工具，也不要执行其他动作。",
-  "- 若上下文中已存在 <compacted-summary> 块，它是更早的检查点：不要原样照搬，",
-  "  保留仍成立的事实、丢弃过时信息，把更新的信息合并进同一结构。",
+  "输出示例：",
+  "<target>...</target>",
+  "<step1>...</step1>",
+  "<step2>...</step2>",
+  "<files>lua/foo.lua\nlua/bar.lua</files>",
+  "<Rollback>...</Rollback>",
 }, "\n")
+
+--- 新上下文消息的小节顺序（{ key, label }）；空节省略。
+local CONTEXT_SECTIONS = {
+  { key = "context", label = "背景" },
+  { key = "scope", label = "范围" },
+  { key = "outofscope", label = "不做的事" },
+  { key = "constraints", label = "约束条件" },
+  { key = "files", label = "涉及文件" },
+  { key = "commands", label = "关键命令" },
+  { key = "dependencies", label = "依赖 / 前置条件" },
+  { key = "environment", label = "环境 / 技术栈" },
+  { key = "verify", label = "验证 / 验收" },
+  { key = "risks", label = "风险与注意事项" },
+  { key = "rollback", label = "回退方案" },
+  { key = "questions", label = "待澄清问题" },
+  { key = "information", label = "其他信息" },
+}
 
 -- ========== 私有函数 ==========
 
@@ -82,6 +90,14 @@ local function _cfg(opts)
     for k, v in pairs(opts.plan_mode) do cfg[k] = v end
   end
   return cfg
+end
+
+--- 去除首尾空白
+--- @param s string
+--- @return string
+local function _trim(s)
+  if type(s) ~= "string" then return "" end
+  return (s:gsub("^%s+", ""):gsub("%s+$", ""))
 end
 
 --- 渲染消息 content（字符串直出；table/多模态或其它用 JSON；nil 返回 ""）
@@ -112,130 +128,280 @@ local function _window(agent)
   return window, front
 end
 
---- 把窗口消息拆成按顺序编号的细粒度分块（正文/reasoning/每个工具调用/每个工具结果）
---- @param window table
---- @return table 数组 { n, label, text }
-local function _chunk(window)
-  local chunks = {}
-  local n = 0
-  for _, msg in ipairs(window or {}) do
-    local role = msg.role or "?"
-    -- 正文：tool 消息的 content 就是调用结果，交给下方「工具结果」分支统一标注，避免重复。
-    if role ~= "tool" and msg.content and msg.content ~= "" then
-      n = n + 1
-      chunks[#chunks + 1] = { n = n, label = ("%s 正文"):format(role), text = _render_content(msg.content) }
-    end
-    if msg.reasoning and msg.reasoning ~= "" then
-      n = n + 1
-      chunks[#chunks + 1] = { n = n, label = "推理", text = _render_content(msg.reasoning) }
-    end
-    if msg.tool_calls and #msg.tool_calls > 0 then
-      for _, tc in ipairs(msg.tool_calls) do
-        local fn = tc and tc["function"] or {}
-        local name = fn.name or "?"
-        local args = fn.arguments or "{}"
-        if type(args) ~= "string" then args = json.encode(args) end
-        n = n + 1
-        chunks[#chunks + 1] = { n = n, label = ("工具调用 %s"):format(name), text = tostring(args) }
-      end
-    end
-    if role == "tool" then
-      local name = msg.name or msg.tool_name or "?"
-      n = n + 1
-      chunks[#chunks + 1] = { n = n, label = ("工具结果 %s"):format(name), text = _render_content(msg.content) }
-    end
-  end
-  return chunks
+--- 读取单个标签的值（忽略大小写）。low 为 text 的小写副本（字节长度一致）。
+--- @param text string 原文
+--- @param low string 小写副本
+--- @param tag string 小写标签名
+--- @return string|nil 去首尾空白后的值（找到标签但无闭合返回 nil）
+local function _tag_value(text, low, tag)
+  local open = "<" .. tag .. ">"
+  local close = "</" .. tag .. ">"
+  local s = low:find(open, 1, true)
+  if not s then return nil end
+  local e = low:find(close, s + #open, true)
+  if not e then return nil end
+  return _trim(text:sub(s + #open, e - 1))
 end
 
---- 组装分类请求的最后一条 user 消息内容（指令 + 编号分块）
---- @param chunks table
---- @return string
-local function _build_prompt(chunks)
-  local lines = { PLAN_DISTILL_INSTRUCTION, "", "编号分块（按对话顺序，由早到晚）：", "" }
-  for _, c in ipairs(chunks) do
-    lines[#lines + 1] = ("[%d] %s: %s"):format(c.n, c.label, c.text)
+--- 解析提取结果文本为字段表（忽略大小写）。
+--- @param text string
+--- @return table { target?, steps={...}, files?, context?, ... }
+local function _parse(text)
+  local fields = { steps = {} }
+  if type(text) ~= "string" or text == "" then return fields end
+  -- 小写副本：string.lower 只改写 ASCII（字节数不变），可用同一下标切回原文取值。
+  local low = text:lower()
+
+  fields.target = _tag_value(text, low, "target")
+
+  -- 步骤：扫描所有 <stepN>，按 N 升序取用（自动支持 step1..stepN 任意数量）。
+  local nums = {}
+  for n in low:gmatch("<step(%d+)>") do
+    local v = tonumber(n)
+    if v and v >= 1 and v <= 500 then nums[#nums + 1] = v end
   end
+  table.sort(nums)
+  local seen = {}
+  for _, n in ipairs(nums) do
+    if not seen[n] then
+      seen[n] = true
+      local v = _tag_value(text, low, "step" .. n)
+      if v and v ~= "" then fields.steps[#fields.steps + 1] = v end
+    end
+  end
+
+  for _, sec in ipairs(CONTEXT_SECTIONS) do
+    local v = _tag_value(text, low, sec.key)
+    if v and v ~= "" then fields[sec.key] = v end
+  end
+  return fields
+end
+
+--- 关键字段是否缺失（target + 至少一个 stepN）
+--- @param fields table
+--- @return boolean need_retry
+--- @return string missing 描述
+local function _needs_retry(fields)
+  local missing = {}
+  if not fields or not fields.target or fields.target == "" then missing[#missing + 1] = "<target>" end
+  if not fields or not fields.steps or #fields.steps == 0 then missing[#missing + 1] = "<stepN>" end
+  return #missing > 0, table.concat(missing, ", ")
+end
+
+--- 从 <files> 文本提取候选路径（用于匹配工具调用参数 / 结果）。
+--- @param files_text string|nil
+--- @return table 数组 of string
+local function _file_candidates(files_text)
+  local out, seen = {}, {}
+  if type(files_text) ~= "string" then return out end
+  for tok in files_text:gmatch("[%w%._/%-]+") do
+    if #tok >= 3 and (tok:find("%.") or tok:find("/")) and not seen[tok] then
+      seen[tok] = true
+      out[#out + 1] = tok
+    end
+  end
+  return out
+end
+
+--- 在计划窗口中挑出与 <files> 相关的 function/tool 成对消息（原对象、按原顺序、逐字节原样）。
+--- 匹配规则：工具调用参数或工具结果内容中出现任一候选路径 → 认为是相关调用。
+--- 成对：命中的 assistant(tool_calls) 消息 + 其对应的 tool 结果消息一并取出。
+--- @param window table 计划窗口（原始内部消息）
+--- @param files_text string|nil <files> 标签原文
+--- @return table 数组（对相关消息的原始引用，保持顺序）
+local function _collect_file_tool_messages(window, files_text)
+  local candidates = _file_candidates(files_text)
+  if #candidates == 0 then return {} end
+
+  local function _matches(text)
+    if type(text) ~= "string" or text == "" then return false end
+    for _, p in ipairs(candidates) do
+      if text:find(p, 1, true) then return true end
+    end
+    return false
+  end
+
+  -- tool_call_id -> 发起它的 assistant 消息下标
+  local call_owner = {}
+  for i, m in ipairs(window) do
+    if m and m.role == "assistant" and m.tool_calls then
+      for _, tc in ipairs(m.tool_calls) do
+        if tc and tc.id then call_owner[tc.id] = i end
+      end
+    end
+  end
+
+  local included = {}
+  for i, m in ipairs(window) do
+    if m and m.role == "assistant" and m.tool_calls then
+      for _, tc in ipairs(m.tool_calls) do
+        local fn = tc and tc["function"] or {}
+        local args = fn.arguments
+        if type(args) ~= "string" then args = _render_content(args) end
+        if _matches(args) then included[i] = true end
+      end
+    elseif m and m.role == "tool" then
+      if _matches(_render_content(m.content)) then
+        local owner = call_owner[m.tool_call_id]
+        if owner then
+          included[owner] = true
+          included[i] = true
+        end
+      end
+    end
+  end
+
+  -- 补齐成对：命中的 assistant 消息，其紧随的 tool 结果尽量一并取出（保持协议完整）。
+  for i, m in ipairs(window) do
+    if included[i] and m.role == "assistant" and m.tool_calls then
+      for j = i + 1, #window do
+        local r = window[j]
+        if r and r.role == "tool" and call_owner[r.tool_call_id] == i then
+          included[j] = true
+        else
+          break
+        end
+      end
+    end
+  end
+
+  local out = {}
+  for i = 1, #window do
+    if included[i] then out[#out + 1] = window[i] end
+  end
+  return out
+end
+
+--- 把解析出的字段组装成一条新的「用户」上下文消息（空节省略）。
+--- @param fields table
+--- @return string
+local function _build_context_message(fields)
+  local lines = { "以下是计划阶段提炼出的执行上下文（已确认的计划，请据此继续执行）：", "" }
+
+  if fields.target and fields.target ~= "" then
+    lines[#lines + 1] = "## 任务目标"
+    lines[#lines + 1] = fields.target
+    lines[#lines + 1] = ""
+  end
+
+  for _, sec in ipairs(CONTEXT_SECTIONS) do
+    local v = fields[sec.key]
+    if v and v ~= "" then
+      lines[#lines + 1] = "## " .. sec.label
+      lines[#lines + 1] = v
+      lines[#lines + 1] = ""
+    end
+  end
+
+  if fields.steps and #fields.steps > 0 then
+    lines[#lines + 1] = "## 执行步骤"
+    for i, s in ipairs(fields.steps) do
+      lines[#lines + 1] = ("%d. %s"):format(i, s)
+    end
+  end
+
   return table.concat(lines, "\n")
 end
 
---- 内部分类调用：回放校验前置 front（复用前缀缓存），追加承载编号分块的 user 消息。
+--- 由解析出的步骤构建任务清单项（每步一项，pending）。
+--- @param fields table
+--- @return table 数组 { content, status }
+local function _build_todo_items(fields)
+  local out = {}
+  for _, s in ipairs(fields and fields.steps or {}) do
+    if type(s) == "string" and _trim(s) ~= "" then
+      out[#out + 1] = { content = _trim(s), status = "pending" }
+    end
+  end
+  return out
+end
+
+--- 内部分类调用（可在测试中替换）：回放 messages → 流式接收 XML。
 --- @param agent table
---- @param front table 计划入口之前的消息（保留）
---- @param chunks table 编号分块
+--- @param messages table API 消息数组
 --- @param cfg table
---- @return Deferred resolve({ content, usage })
-local function _classify(agent, front, chunks, cfg)
+--- @param on_chunk function|nil
+--- @return Deferred resolve(string|nil content)
+local function _send_extract(agent, messages, cfg, on_chunk)
   local request = require("NeoAI.core.agent.request")
-  local context_builder = require("NeoAI.core.session.context_builder")
   local tool_loop = require("NeoAI.core.agent.tool_loop")
-
-  local messages = context_builder.build_prefix(agent, front)
-  messages[#messages + 1] = { role = "user", content = _build_prompt(chunks) }
-
   local tool_defs = tool_loop._tool_definitions(agent)
-  -- 流式接收分类摘要：实时把收到的推理 / 正文分片广播出去，UI 端显示"计划蒸馏"悬浮窗。
-  local acc_reasoning = ""
-  local acc_content = ""
   return request.send_stream(messages, {
     agent_config = agent.config,
     model = agent.model,
     tools = tool_defs,
     signal = agent.signal,
     max_tokens = cfg.compact_max_tokens or 8192,
-  }, function(chunk)
-    if not chunk then return end
-    if chunk.reasoning and chunk.reasoning ~= "" then
-      acc_reasoning = acc_reasoning .. chunk.reasoning
-    end
-    if chunk.content and chunk.content ~= "" then
-      acc_content = acc_content .. chunk.content
-    end
-    event_bus.emit(events.PLAN_DISTILL_CHUNK, {
-      agent_id = agent.id,
-      reasoning = acc_reasoning,
-      content = acc_content,
-    })
-  end):then_(function(resp)
-    return { content = resp and resp.content, usage = resp and resp.usage }
+  }, on_chunk):then_(function(resp)
+    return resp and resp.content
   end)
 end
 
---- 用检查点消息替换窗口（移除窗口（尾部）→ 插入检查点）
+--- 提取并按关键字段缺失重试（总尝试 ≤ MAX_ATTEMPTS）。失败返回 nil。
 --- @param agent table
---- @param window table
---- @param summary string
-local function _splice(agent, window, summary)
-  local remove_count = #window
-  -- 记录被替换消息中已落盘的条数（与 compactor 一致）：蒸馏在 plan→execute 边界触发，
-  -- 窗口消息通常已同步；仍按实际标记记录，保证 durable surface 删除与落盘状态严格对应。
-  local synced_count = 0
-  for _, m in ipairs(window) do
-    if m and m._synced then synced_count = synced_count + 1 end
+--- @param base table 前缀 API 消息数组（不含提取指令）
+--- @param cfg table
+--- @return Deferred resolve(table fields)|resolve(nil)
+local function _extract_and_parse(agent, base, cfg)
+  local function attempt_once(extra)
+    local msgs = {}
+    for _, m in ipairs(base or {}) do msgs[#msgs + 1] = m end
+    msgs[#msgs + 1] = { role = "user", content = extra }
+    local acc_reasoning, acc_content = "", ""
+    return M._send_extract(agent, msgs, cfg, function(chunk)
+      if not chunk then return end
+      if chunk.reasoning and chunk.reasoning ~= "" then
+        acc_reasoning = acc_reasoning .. chunk.reasoning
+      end
+      if chunk.content and chunk.content ~= "" then
+        acc_content = acc_content .. chunk.content
+      end
+      event_bus.emit(events.PLAN_DISTILL_CHUNK, {
+        agent_id = agent.id,
+        reasoning = acc_reasoning,
+        content = acc_content,
+      })
+    end)
   end
-  for _ = 1, remove_count do
-    table.remove(agent.messages)
+
+  local function loop(attempt)
+    local n = attempt + 1
+    local extra = PLAN_EXTRACT_INSTRUCTION
+    if n > 1 then
+      extra = extra .. "\n\n注意：上一次输出缺少必需的 <target> 或至少一个 <stepN>，请务必补齐。"
+    end
+    return attempt_once(extra):then_(function(content)
+      local fields = _parse(content)
+      local need, missing = _needs_retry(fields)
+      if not need then return fields end
+      if n >= MAX_ATTEMPTS then
+        logger.warn("[plan_extract] 第 %d 次提取仍缺少 %s，忽略缺失", n, missing)
+        return fields
+      end
+      return loop(n)
+    end, function(err)
+      if n >= MAX_ATTEMPTS then
+        logger.warn("[plan_extract] 提取失败: %s", tostring(err and err.message or err))
+        return nil
+      end
+      return loop(n)
+    end)
   end
-  local compactor = require("NeoAI.core.session.compactor")
-  local checkpoint = compactor.checkpoint_message(summary)
-  checkpoint.ts = os.time()
-  checkpoint.replaced_count = remove_count
-  checkpoint.replaced_synced_count = synced_count
-  checkpoint.replaced_tail = true
-  table.insert(agent.messages, checkpoint)
-  event_bus.emit(events.PLAN_DISTILLED, {
-    agent_id = agent.id,
-    replaced = remove_count,
-    summary = summary,
-  })
+
+  return loop(0)
 end
 
---- 蒸馏内部分类调用（maybe 语义：仅在 plan→execute 边界且启用时；失败 no-op）
+-- ========== 公开 API ==========
+
+--- 在 plan→execute 边界执行「XML 计划提取」，结果写入请求覆盖层 agent.plan_extract。
+--- 不改动 agent.messages（显示 / 落盘不变）。
 --- @param agent table Agent
---- @param opts table|nil { plan_mode?, min_chunks? }
---- @return Deferred resolve(boolean) 是否发生了蒸馏
-local function _distill(agent, opts)
-  opts = opts or {}
+--- @param opts table|nil { plan_mode? 覆盖 tools.plan_mode }
+--- @return Deferred resolve({ fields, steps })|resolve(false)
+function M.run(agent, opts)
+  if not agent or not agent.messages then
+    return async.resolve(false)
+  end
   local cfg = _cfg(opts)
   if cfg.distill_on_execute == false then
     return async.resolve(false)
@@ -244,56 +410,52 @@ local function _distill(agent, opts)
   if #window == 0 then
     return async.resolve(false)
   end
-  local chunks = _chunk(window)
-  if #chunks < (opts.min_chunks or 2) then
-    logger.warn("[plan_distill] 计划窗口分块过少（%d），无需蒸馏", #chunks)
-    return async.resolve(false)
-  end
+
+  -- 回放现有前缀（系统 + 全部历史原对象）以复用前缀缓存；失败时退化为原始消息数组。
+  local context_builder = require("NeoAI.core.session.context_builder")
+  local ok, base = pcall(context_builder.build_prefix, agent, agent.messages)
+  if not ok or type(base) ~= "table" then base = agent.messages end
+
   agent._distilling = true
   event_bus.emit(events.PLAN_DISTILL_STARTED, { agent_id = agent.id })
-  return _classify(agent, front, chunks, cfg):then_(function(res)
-    local summary = res and res.content
-    if not summary or summary:gsub("%s", "") == "" then
-      logger.warn("[plan_distill] 分类摘要为空，跳过蒸馏")
-      agent._distilling = false
+
+  return _extract_and_parse(agent, base, cfg):then_(function(fields)
+    agent._distilling = false
+    if not fields then
       return async.resolve(false)
     end
-    -- 记录分类调用的缓存用量（对齐 compactor 的 compaction_usage；供轨迹/统计复用）
-    if res and res.usage then
-      local prefix = require("NeoAI.core.agent.prefix")
-      local cu = prefix.parse_cache_usage(res.usage)
-      if cu then
-        local cache = agent.cache or {}
-        cache.distill_usage = cu
-        agent.cache = cache
-      end
-    end
-    _splice(agent, window, summary)
-    agent._distilling = false
-    return async.resolve(true)
+    local file_msgs = _collect_file_tool_messages(window, fields.files)
+    local inject = {}
+    for _, m in ipairs(file_msgs) do inject[#inject + 1] = m end
+    inject[#inject + 1] = { role = "user", content = _build_context_message(fields) }
+    agent.plan_extract = {
+      front_count = #front,
+      window_end = #(agent.messages),
+      inject = inject,
+    }
+    event_bus.emit(events.PLAN_DISTILLED, {
+      agent_id = agent.id,
+      fields = fields,
+      steps = #fields.steps,
+    })
+    return async.resolve({ fields = fields, steps = fields.steps })
   end, function(err)
     agent._distilling = false
-    logger.warn("[plan_distill] 分类失败: %s", tostring(err and err.message or err))
+    logger.warn("[plan_extract] 提取异常: %s", tostring(err and err.message or err))
     return async.resolve(false)
   end)
 end
 
--- ========== 公开 API ==========
-
---- 在 plan→execute 边界蒸馏（供 approve_plan 自动执行前调用；失败 no-op）
---- @param agent table Agent
---- @param opts table|nil { plan_mode? 覆盖 tools.plan_mode, min_chunks? }
---- @return Deferred resolve(boolean)
-function M.run(agent, opts)
-  if not agent or not agent.messages then
-    return async.resolve(false)
-  end
-  return _distill(agent, opts)
-end
-
---- 窗口切分（供测试直接使用）
+-- ========== 测试辅助：暴露内部纯函数 ==========
 M._window = _window
---- 分块（供测试直接使用）
-M._chunk = _chunk
+M._parse = _parse
+M._needs_retry = _needs_retry
+M._file_candidates = _file_candidates
+M._collect_file_tool_messages = _collect_file_tool_messages
+M._build_context_message = _build_context_message
+M._build_todo_items = _build_todo_items
+M._extract_and_parse = _extract_and_parse
+M._send_extract = _send_extract
+M._build_prompt = PLAN_EXTRACT_INSTRUCTION
 
 return M

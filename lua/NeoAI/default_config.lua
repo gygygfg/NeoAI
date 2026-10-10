@@ -324,6 +324,21 @@ local DEFAULT_CONFIG = {
     enabled = true,
     builtin = true,
     external = {},
+    -- 工具输出「AI 上下文限流」：工具回传给模型的文本超过 max_chars 时，只回传
+    -- 「头 head_chars + 截断标记 + 尾 tail_chars」，并把完整输出自动写入沙箱私有 /tmp
+    -- 下的临时文件（提示中给出路径，可用 read_file 的 start_line/end_line 分段回读）。
+    -- 目的：git/shell 命令、read_file 可能一次产生数万行输出，直接塞给模型会瞬间耗尽
+    -- 上下文、稀释关键信息。此处与 run_command.max_output_bytes（16 MiB 防冻结硬杀限）
+    -- 职责分离：max_output_bytes 保护主线程不冻结，本项保护模型上下文不爆。
+    -- max_chars/head_chars/tail_chars 均以「字符（码点）」计，需满足 head_chars+tail_chars < max_chars。
+    output_guard = {
+      enabled = true,        -- 总开关；false 则所有工具输出原样回传（仅保留既有硬限）
+      max_chars = 20000,     -- 触发限流的字符数阈值
+      head_chars = 14000,    -- 截断后保留的头部字符数
+      tail_chars = 4000,     -- 截断后保留的尾部字符数
+      spill = true,          -- true = 把完整输出写入沙箱私有 /tmp 的临时文件供回读
+      spill_dir = "neoai-out", -- 落盘子目录（位于会话私有 /tmp 下）
+    },
     -- read_file 大文件保护：未指定 start_line/end_line 时，字符数超过
     -- outline_threshold_chars 的文件不再整篇回传，而返回语法树节点大纲
     -- （该文件类型无 tree-sitter parser 时回退为前 outline_preview_lines 行预览），
@@ -436,7 +451,7 @@ local DEFAULT_CONFIG = {
     plan_mode = {
       enabled = true, -- 计划模式
       auto_execute_on_approve = true, -- 计划经用户确认后自动转入 CHAT 并按任务清单开始执行
-      distill_on_execute = true, -- 计划完成、用户以任何非计划模式确认开始时，把计划阶段调研上下文蒸馏为 8 段检查点并替换压缩
+      distill_on_execute = true, -- 计划完成、用户以任何非计划模式确认开始时，先做一轮 XML 计划提取（组装执行上下文 + 按步骤调用 todo_write），再开始执行
       extra_safe_tools = {}, -- 计划模式白名单扩展（只读/信息查询类之外的工具需显式加入）
       mutating_tools = { -- 兼容保留（计划模式可见集已覆盖此语义）
         "edit_file",
@@ -920,6 +935,14 @@ local DEFAULT_CONFIG = {
         -- 待审/已应用堆积到数百上千时，state.items 会长期驻留全部单元（含文件条目），
         -- 超限的终态项从内存淘汰，`get`/`list` 按需从磁盘回读（数据不丢）。
         terminal_cache_max = 200,
+        -- 「可恢复的已拒绝」项上限：显式拒绝（审批界面 `d`）时把候选内容另存到 `rejected_dir`
+        -- 副本，使被拒条目在审批界面「已拒绝」区仍可见、可按 `u` 恢复为待审。这些项不参与
+        -- 上面的终态淘汰（需持续可见），其内存由本上限约束：超限删除最旧项副本并移出内存
+        -- （磁盘 review 记录仍在，仅不再可恢复/展示）。0 = 不保留任何已拒绝项。
+        rejected_max = 50,
+        -- 「已拒绝」副本目录（0700 权限、文件 0600）：候选内容可能含密钥 token，避免同机
+        -- 其他用户读取。候选原件在拒绝时被删除，本副本是恢复的唯一来源。
+        rejected_dir = "/tmp/neoai-rejected",
         -- 按需读取的候选文件内容 LRU 上限（diff 预览/合并回退用）：避免为展示一两个文件
         -- 而把整候选（可能数百 MB）常驻内存。
         content_cache_max = 64,

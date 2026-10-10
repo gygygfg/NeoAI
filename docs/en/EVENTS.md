@@ -200,6 +200,7 @@ All event constants are defined in `NeoAI.kernel.events`. They are listed below 
 | `UI_REFRESHED` | `ui:refreshed` | UI refreshed | — |
 | `UI_MODE_CHANGED` | `ui:mode_changed` | UI mode toggled | `{ mode }` |
 | `UI_FOLLOW_CHANGED` | `ui:follow_changed` | Chat cursor follow state flipped (following ↔ not following) | `{ following }` |
+| `UI_FOCUS_CHANGED` | `ui:focus_changed` | NeoAI UI focus flipped (current window is a NeoAI UI buffer ↔ a non-NeoAI window); drives deferring pty/ask_user popups and refreshing the review window | `{ focused }` |
 | `DISPLAY_MODE_CHANGED` | `display:mode_changed` | Display mode toggled | `{ name }` |
 
 ### Sub-agents
@@ -239,12 +240,12 @@ All event constants are defined in `NeoAI.kernel.events`. They are listed below 
 
 | Constant | Value | When it fires | Key payload fields |
 | --- | --- | --- | --- |
-| `PLAN_DISTILL_STARTED` | `plan_distill:started` | Plan-stage distillation starts | `{ agent_id }` |
-| `PLAN_DISTILL_CHUNK` | `plan_distill:chunk` | A streamed categorized-summary chunk arrives | `{ agent_id, reasoning, content }` |
-| `PLAN_DISTILLED` | `plan_distilled` | Distillation completes | `{ agent_id, replaced, summary }` |
+| `PLAN_DISTILL_STARTED` | `plan_distill:started` | Plan-stage XML extraction starts | `{ agent_id }` |
+| `PLAN_DISTILL_CHUNK` | `plan_distill:chunk` | A streamed extraction chunk arrives | `{ agent_id, reasoning, content }` |
+| `PLAN_DISTILLED` | `plan_distilled` | Extraction completes | `{ agent_id, fields, steps }` |
 
 > Context compaction is **asynchronous in the background and opens no window**: it no longer emits `COMPACTION_STARTED` / `COMPACTION_CHUNK` (constants reserved),
-> only `COMPACTION_COMPLETED`. Plan distillation still opens the "🧬 Plan Distillation" floating window and emits `PLAN_DISTILL_STARTED` / `PLAN_DISTILL_CHUNK`.
+> only `COMPACTION_COMPLETED`. Plan extraction still opens the "🧬 Plan Distillation" floating window and emits `PLAN_DISTILL_STARTED` / `PLAN_DISTILL_CHUNK` (original event constants reused).
 
 ### Sandbox
 

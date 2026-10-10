@@ -24,6 +24,8 @@ function M.init()
   state.initialized = true
   -- 隔离 LSP/Copilot：禁止其挂载到 NeoAI 界面 buffer（纯 UI 文本，挂载会空耗 CPU）
   require("NeoAI.ui.lsp_guard").install()
+  -- 焦点信号：跟踪「用户是否在看 NeoAI 界面」，供 pty/ask_user 延迟弹窗与审批窗刷新。
+  pcall(function() require("NeoAI.ui.focus").install() end)
   -- 注册审批 UI
   local approval_ui = require("NeoAI.ui.components.tool_approval")
   approval_ui.init()
@@ -123,6 +125,7 @@ function M.reset()
   M.close_all()
   pcall(function() require("NeoAI.ui.geometry").reset() end)
   pcall(function() require("NeoAI.ui.lsp_guard").uninstall() end)
+  pcall(function() require("NeoAI.ui.focus").uninstall() end)
   pcall(function() require("NeoAI.ui.components.tool_approval").reset() end)
   pcall(function() require("NeoAI.ui.components.ask_user").reset() end)
   pcall(function() require("NeoAI.ui.components.secret_alert").reset() end)

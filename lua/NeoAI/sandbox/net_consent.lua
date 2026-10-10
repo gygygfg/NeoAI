@@ -468,6 +468,9 @@ function M.request(ctx)
     if decision ~= "allow_once" and decision ~= "allow_session" and decision ~= "deny" then
       decision = "deny"
     end
+    -- 决策后关闭独立弹窗（若打开）并取消其「失焦延迟展示」暂存：经审批中心决策 / 超时时，
+    -- 独立弹窗可能仍处于待展示状态，需一并清理，避免切回后弹出已过期的弹窗。
+    if state.ui and state.ui.hide then pcall(state.ui.hide) end
     if hub_id then pcall(function() require("NeoAI.sandbox.approval_hub").clear(hub_id) end) end
     d:resolve(decision)
   end

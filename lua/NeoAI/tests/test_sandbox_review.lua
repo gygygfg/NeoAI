@@ -217,6 +217,34 @@ tests.suite("sandbox_review", function(_, it)
     t.true_(not text:find("已保存", 1, true), "撤销后不应再出现「已保存」，实际: " .. text)
   end)
 
+  it("build_lines 展示「已拒绝」区并映射恢复目标", function(t)
+    local sr = require("NeoAI.ui.components.sandbox_review")
+    local data = sr.build_lines({}, {}, nil, {}, {
+      { change_set_id = "csREJ", tool = "edit_file", reject_reason = "USER_DENIED",
+        files = { { path = "/root/x.txt", action = "modify" }, { path = "/root/y.txt", action = "create" } } },
+    })
+    local text = table.concat(data.lines, "\n")
+    t.matches("已拒绝", text, "应展示已拒绝区标题")
+    t.matches("csREJ", text, "应展示被拒条目")
+    t.matches("USER_DENIED", text, "应展示拒绝原因")
+    local header_rej, file_rej = false, false
+    for _, tgt in pairs(data.line_to_target) do
+      if tgt.change_set_id == "csREJ" and tgt.rejected and tgt.whole then header_rej = true end
+      if tgt.change_set_id == "csREJ" and tgt.rejected and tgt.path == "/root/x.txt" then file_rej = true end
+    end
+    t.true_(header_rej, "已拒绝头行应映射为恢复目标")
+    t.true_(file_rej, "已拒绝文件行应映射为恢复目标")
+    -- 区标题（含「已拒绝」）应为一级折叠，条目头行二级
+    local fl = data.fold_levels or {}
+    local title_ln, header_ln
+    for i, l in ipairs(data.lines) do
+      if l:find("已拒绝", 1, true) and l:find("──", 1, true) then title_ln = i end
+      if l:find("csREJ", 1, true) then header_ln = i end
+    end
+    t.eq(1, fl[title_ln], "已拒绝区标题应为一级折叠")
+    t.eq(2, fl[header_ln], "已拒绝条目头行应为二级折叠")
+  end)
+
   it("build_lines 为「已应用」区登记两级折叠级别", function(t)
     local sr = require("NeoAI.ui.components.sandbox_review")
     local data = sr.build_lines({}, {}, nil, {
@@ -451,7 +479,7 @@ tests.suite("sandbox_review", function(_, it)
     sr.open()
     t.eq(0, sr.get_foldlevel(), "默认仍整体折叠")
     sr.reveal_applied()
-    t.eq(1, sr.get_foldlevel(), "reveal 后应展开到区标题一级")
+    t.eq(2, sr.get_foldlevel(), "reveal 后应展开到条目级（条目头行可见）")
     sr.close()
     services.provide("services.sandbox", saved)
   end)
@@ -1557,5 +1585,131 @@ tests.suite("sandbox_review", function(_, it)
     t.eq(nil, sr.get_dirs_editor_buf(), "关闭审批窗应同时关闭目录编辑器")
     services.provide("services.sandbox", saved)
     config_store.load({})
+  end)
+
+  it("「已拒绝」区展示且 u 触发恢复为待审", function(t)
+    local services = require("NeoAI.kernel.services")
+    local sr = require("NeoAI.ui.components.sandbox_review")
+    sr.reset()
+    local saved = services.use("services.sandbox")
+    local restored = {}
+    services.provide("services.sandbox", {
+      list_reviews = function() return {} end,
+      list_traces = function() return {} end,
+      list_saved = function() return {} end,
+      list_rejected = function()
+        return {
+          { change_set_id = "csRJ", tool = "edit_file", reject_reason = "USER_DENIED",
+            files = { { path = "/root/x.txt" } } },
+        }
+      end,
+      apply = function() return { ok = true } end,
+      reject = function() end,
+      restore = function(id) restored[#restored + 1] = id; return { ok = true, state = "PENDING" } end,
+    })
+    sr.open()
+    local buf = sr.get_buf()
+    t.not_nil(buf, "应打开审批窗")
+    local text = table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n")
+    t.matches("已拒绝", text, "应展示已拒绝区")
+    t.matches("csRJ", text, "应展示被拒条目")
+    t.matches("USER_DENIED", text, "应展示拒绝原因")
+    local rej_line
+    for ln, target in pairs(sr.get_line_map()) do
+      if target.change_set_id == "csRJ" and target.rejected then rej_line = rej_line or ln end
+    end
+    t.not_nil(rej_line, "已拒绝条目应映射恢复目标")
+    vim.api.nvim_win_set_cursor(0, { rej_line, 0 })
+    for _, m in ipairs(vim.api.nvim_buf_get_keymap(buf, "n")) do
+      if m.lhs == "u" then m.callback() end
+    end
+    t.eq(1, #restored, "u 应触发恢复")
+    t.eq("csRJ", restored[1], "恢复目标应正确")
+    sr.close()
+    services.provide("services.sandbox", saved)
+  end)
+
+  it("应用后光标停在原行号（不随条目移入已应用区）", function(t)
+    local services = require("NeoAI.kernel.services")
+    local sr = require("NeoAI.ui.components.sandbox_review")
+    sr.reset()
+    local saved = services.use("services.sandbox")
+    local cwd = vim.fn.getcwd()
+    local pending = {
+      { change_set_id = "csA", tool = "edit_file", files = { { path = cwd .. "/a.lua" } } },
+      { change_set_id = "csB", tool = "edit_file", files = { { path = cwd .. "/b.lua" } } },
+    }
+    local saved_items = {}
+    services.provide("services.sandbox", {
+      list_reviews = function() return vim.deepcopy(pending) end,
+      list_traces = function() return {} end,
+      list_saved = function() return vim.deepcopy(saved_items) end,
+      list_rejected = function() return {} end,
+      apply = function(id)
+        for i, it in ipairs(pending) do
+          if it.change_set_id == id then table.remove(pending, i); break end
+        end
+        saved_items[#saved_items + 1] = { change_set_id = id, tool = "edit_file",
+          apply_state = "APPLIED", saved_files = { { path = cwd .. "/a.lua" } } }
+        return { ok = true, state = "APPLIED" }
+      end,
+      reject = function() end,
+      reject_file = function() end,
+    })
+    sr.open()
+    local buf = sr.get_buf()
+    local win = vim.fn.bufwinid(buf)
+    local file_line
+    for ln, target in pairs(sr.get_line_map()) do
+      if target.change_set_id == "csA" and target.path then file_line = ln end
+    end
+    t.not_nil(file_line, "应定位 csA 文件行")
+    vim.api.nvim_win_set_cursor(win, { file_line, 0 })
+    for _, m in ipairs(vim.api.nvim_buf_get_keymap(buf, "n")) do
+      if m.lhs == "<CR>" then m.callback() end
+    end
+    local after = vim.api.nvim_win_get_cursor(win)[1]
+    t.eq(file_line, after, "应用后光标应停在原行号（不随条目移动）")
+    sr.close()
+    services.provide("services.sandbox", saved)
+  end)
+
+  it("切回 NeoAI 界面（焦点恢复）时审批窗自动刷新", function(t)
+    local services = require("NeoAI.kernel.services")
+    local sr = require("NeoAI.ui.components.sandbox_review")
+    local event_bus = require("NeoAI.kernel.event_bus")
+    local events = require("NeoAI.kernel.events")
+    sr.reset()
+    local saved = services.use("services.sandbox")
+    local cwd = vim.fn.getcwd()
+    local items = { { change_set_id = "csFocus1", tool = "edit_file",
+      files = { { path = cwd .. "/z.lua" } } } }
+    services.provide("services.sandbox", {
+      list_reviews = function() return vim.deepcopy(items) end,
+      list_traces = function() return {} end,
+      list_saved = function() return {} end,
+      list_rejected = function() return {} end,
+      apply = function() return { ok = true } end,
+      reject = function() end,
+    })
+    sr.open()
+    local buf = sr.get_buf()
+    t.matches("csFocus1", table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n"),
+      "初始应展示待审条目")
+    -- 切走期间产生新待审项（窗口未聚焦，事件刷新可能滞后/丢失）
+    items[#items + 1] = { change_set_id = "csFocus2", tool = "edit_file",
+      files = { { path = cwd .. "/y.lua" } } }
+    -- 切回 NeoAI 界面：广播焦点恢复 → 审批窗强制刷新，展示新条目
+    event_bus.emit(events.UI_FOCUS_CHANGED, { focused = true })
+    local found = vim.wait(2000, function()
+      if not (buf and vim.api.nvim_buf_is_valid(buf)) then return false end
+      for _, l in ipairs(vim.api.nvim_buf_get_lines(buf, 0, -1, false)) do
+        if l:find("csFocus2", 1, true) then return true end
+      end
+      return false
+    end, 10)
+    t.true_(found, "切回焦点后审批窗应刷新出新条目")
+    sr.close()
+    services.provide("services.sandbox", saved)
   end)
 end)

@@ -92,6 +92,9 @@ M.UI_REFRESHED = "ui:refreshed"
 M.UI_MODE_CHANGED = "ui:mode_changed"
 -- 光标跟随状态跳变（跟随 ↔ 非跟随）：payload { following = boolean }
 M.UI_FOLLOW_CHANGED = "ui:follow_changed"
+-- NeoAI 界面焦点跳变（当前窗口为 NeoAI 界面 ↔ 非 NeoAI 窗口）：payload { focused = boolean }
+-- 用途：焦点离开 NeoAI 界面时，pty/ask_user 等交互弹窗进入等待、切回再弹。
+M.UI_FOCUS_CHANGED = "ui:focus_changed"
 M.DISPLAY_MODE_CHANGED = "display:mode_changed"
 
 -- ========== 子 Agent ==========

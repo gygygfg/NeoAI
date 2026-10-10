@@ -309,4 +309,104 @@ tests.suite("review_cache", function(_, it)
     store.reset()
     review.reset()
   end)
+
+  it("拒绝保留可恢复副本，restore 往返重建候选并回到待审", function(t)
+    local store, review = setup()
+    local digest = "sha256:rj1"
+    local cand = { candidate_digest = digest,
+      files = { { path = "/tmp/rj.txt", action = "modify", content = "hi", after_hash = "h" } } }
+    store.write_candidate(cand)
+    local item = review.enqueue(cand, { tool = "edit_file" })
+    review.reject(item.change_set_id, "USER")
+    local after_reject = review.get(item.change_set_id)
+    t.eq(review.REVIEW.REJECTED, after_reject.review_state, "拒绝后应为 REJECTED")
+    t.eq(true, after_reject.rejected_copy, "应标记可恢复（副本已保存）")
+    t.not_nil(store.read_rejected_copy(item.change_set_id, digest), "副本应存在")
+    t.nil_(store.read_candidate(digest), "候选原件应被删除（副本是唯一来源）")
+    t.eq(1, #review.list_rejected(), "list_rejected 应含 1 项")
+    t.eq(item.change_set_id, review.list_rejected()[1].change_set_id, "已拒绝列表应含该项")
+
+    local res = review.restore(item.change_set_id)
+    t.true_(res.ok, "恢复应成功: " .. tostring(res and res.reason))
+    local after = review.get(item.change_set_id)
+    t.eq(review.REVIEW.PENDING, after.review_state, "恢复后应为待审")
+    t.eq(nil, after.rejected_copy, "恢复后应清除可恢复标记")
+    t.not_nil(store.read_candidate(digest), "恢复后候选应重建")
+    t.nil_(store.read_rejected_copy(item.change_set_id, digest), "恢复后副本应删除")
+    t.eq(0, #review.list_rejected(), "恢复后不再出现在已拒绝列表")
+    store.reset()
+    review.reset()
+  end)
+
+  it("已拒绝项超过 rejected_max 时回收最旧副本并移出内存", function(t)
+    local store, review = setup()
+    local config_store = require("NeoAI.kernel.config_store")
+    local prev = config_store.get("tools.sandbox.review.rejected_max")
+    config_store.set("tools.sandbox.review.rejected_max", 2)
+    local ids = {}
+    for i = 1, 3 do
+      local digest = "sha256:ev" .. i
+      local cand = { candidate_digest = digest,
+        files = { { path = "/tmp/ev" .. i, action = "modify", content = "c" .. i, after_hash = "h" } } }
+      store.write_candidate(cand)
+      local item = review.enqueue(cand, { tool = "x" })
+      ids[i] = item.change_set_id
+    end
+    review.reject(ids[1], "r")
+    review.reject(ids[2], "r")
+    review.reject(ids[3], "r")
+    t.eq(2, #review.list_rejected(), "超限应只保留 2 个已拒绝项")
+    t.nil_(store.read_rejected_copy(ids[1], "sha256:ev1"), "最旧项副本应被删除")
+    local found_old = false
+    for _, it in ipairs(review.list_rejected()) do
+      if it.change_set_id == ids[1] then found_old = true end
+    end
+    t.true_(not found_old, "最旧项不应出现在已拒绝列表")
+    -- 较新的两项仍可恢复
+    t.not_nil(store.read_rejected_copy(ids[3], "sha256:ev3"), "最新项副本应保留")
+    config_store.set("tools.sandbox.review.rejected_max", prev)
+    store.reset()
+    review.reset()
+  end)
+
+  it("[REPRO] 选择性应用多项后：已应用项全部保留 + 剩余文件回队待审", function(t)
+    local store, review = setup()
+    local candidate = require("NeoAI.sandbox.candidate")
+    local base = vim.fn.tempname()
+    vim.fn.mkdir(base, "p")
+    local function mk(digest, files)
+      local cand = { candidate_digest = digest, files = files, created_at = 1 }
+      store.write_candidate(cand)
+      return cand
+    end
+    local A = mk("sha256:bsA", {
+      { path = base .. "/a.txt", action = "modify", content = "a", after_hash = "ha" },
+      { path = "/etc/neoai_sysA", action = "modify", content = "s", after_hash = "hs" },
+    })
+    local B = mk("sha256:bsB", {
+      { path = base .. "/b.txt", action = "modify", content = "b", after_hash = "hb" },
+    })
+    local C = mk("sha256:bsC", {
+      { path = "/etc/neoai_sysC", action = "modify", content = "c", after_hash = "hc" },
+    })
+    local ia = review.enqueue(A, { tool = "edit_file" })
+    local ib = review.enqueue(B, { tool = "edit_file" })
+    local ic = review.enqueue(C, { tool = "edit_file" })
+    local orig = candidate.publish
+    candidate.publish = function()
+      return { ok = true, state = "COMMITTED", receipt = { operation_id = "op_repro" } }
+    end
+    review.apply(ia.change_set_id, { auto_approve = true, files = { base .. "/a.txt" } })
+    review.apply(ib.change_set_id, { auto_approve = true, files = { base .. "/b.txt" } })
+    candidate.publish = orig
+    local applied, pending = 0, 0
+    for _, it in ipairs(review.list()) do
+      if it.apply_state == review.APPLY.APPLIED then applied = applied + 1 end
+      if it.review_state == review.REVIEW.PENDING then pending = pending + 1 end
+    end
+    t.eq(2, applied, "应有 2 个已应用项（A、B）")
+    t.eq(2, pending, "应剩 2 个待审项（C + A 回队的非工作区文件）")
+    store.reset()
+    review.reset()
+  end)
 end)

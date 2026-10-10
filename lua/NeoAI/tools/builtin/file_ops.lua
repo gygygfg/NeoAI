@@ -8,6 +8,7 @@ local fs = require("NeoAI.utils.fs")
 local helpers = require("NeoAI.tools.builtin.tool_helpers")
 local config_store = require("NeoAI.kernel.config_store")
 local stringx = require("NeoAI.utils.stringx")
+local output_guard = require("NeoAI.tools.builtin.output_guard")
 
 local M = {}
 
@@ -27,6 +28,25 @@ local DEFAULT_READ_GUARD = {
 
 -- ========== 私有函数 ==========
 
+--- 把可能指向沙箱访客临时根（/tmp 等）的路径还原为宿主路径，便于读取沙箱内工具落盘的输出
+--- 文件（output_guard 写入 /tmp/neoai-out/…）。未启用沙箱或非访客路径时原样返回。
+--- @param p string
+--- @return string
+local function _resolve_guest_path(p)
+  if type(p) ~= "string" or p == "" then
+    return p
+  end
+  local ok, g = pcall(require, "NeoAI.sandbox.guest_fs")
+  if not ok or not g or type(g.to_host) ~= "function" then
+    return p
+  end
+  local ok2, mapped = pcall(g.to_host, p)
+  if ok2 and type(mapped) == "string" then
+    return mapped
+  end
+  return p
+end
+
 --- 读取 read_file 保护参数（配置缺省时用默认值兜底）
 --- @return table
 local function _read_guard_opts()
@@ -43,9 +63,13 @@ end
 --- @param s string
 --- @return number
 local function _char_count(s)
-  if type(s) ~= "string" then return 0 end
+  if type(s) ~= "string" then
+    return 0
+  end
   local ok, n = pcall(vim.fn.strchars, s)
-  if ok and type(n) == "number" then return n end
+  if ok and type(n) == "number" then
+    return n
+  end
   return #s
 end
 
@@ -53,7 +77,9 @@ end
 --- @param s string
 --- @return number
 local function _line_count(s)
-  if s == "" then return 0 end
+  if s == "" then
+    return 0
+  end
   local n = 1
   for _ in s:gmatch("\n") do
     n = n + 1
@@ -66,11 +92,15 @@ end
 --- @param row number 1-based 行号
 --- @return string
 local function _line_at(content, row)
-  if row < 1 then return "" end
+  if row < 1 then
+    return ""
+  end
   local i = 0
   for line in (content .. "\n"):gmatch("(.-)\n") do
     i = i + 1
-    if i == row then return line end
+    if i == row then
+      return line
+    end
   end
   return ""
 end
@@ -83,7 +113,9 @@ local function _lines_of(content, max)
   local out = {}
   for line in (content .. "\n"):gmatch("(.-)\n") do
     out[#out + 1] = line
-    if #out >= max then break end
+    if #out >= max then
+      break
+    end
   end
   return out
 end
@@ -137,11 +169,17 @@ local function _build_outline(content, filepath, opts)
     local sr, _, er = node:range()
     local snippet = _line_at(content, sr + 1):gsub("^%s+", ""):gsub("%s+$", "")
     -- UTF-8 安全截断：字节截断可能切断多字节字符（显示乱码），故按字符边界回退
-    if #snippet > 80 then snippet = stringx.safe_truncate(snippet, 80, "…") end
+    if #snippet > 80 then
+      snippet = stringx.safe_truncate(snippet, 80, "…")
+    end
     count = count + 1
     local seg = string.rep("  ", depth) .. node:type()
-    if er + 1 > sr + 1 then seg = seg .. " [" .. (sr + 1) .. "-" .. (er + 1) .. "]" end
-    if snippet ~= "" then seg = seg .. ": " .. snippet end
+    if er + 1 > sr + 1 then
+      seg = seg .. " [" .. (sr + 1) .. "-" .. (er + 1) .. "]"
+    end
+    if snippet ~= "" then
+      seg = seg .. ": " .. snippet
+    end
     lines[#lines + 1] = seg
     for i = 0, node:named_child_count() - 1 do
       if count >= max_nodes then
@@ -173,12 +211,12 @@ local function _build_outline(content, filepath, opts)
     return nil, "无可展示的结构节点"
   end
   if truncated then
-    lines[#lines + 1] = string.format("  …（节点较多，已省略；可用 start_line/end_line 读取具体区间）")
+    lines[#lines + 1] =
+      string.format("  …（节点较多，已省略；可用 start_line/end_line 读取具体区间）")
   end
   return table.concat(lines, "\n")
 end
 
---- 无 parser 时的截断预览：取前 n 行
 --- @param content string
 --- @param n number
 --- @return string
@@ -187,14 +225,17 @@ local function _preview_lines(content, n)
   local i = 0
   for line in (content .. "\n"):gmatch("(.-)\n") do
     i = i + 1
-    if i > n then break end
+    if i > n then
+      break
+    end
     out[#out + 1] = line
   end
   return table.concat(out, "\n")
 end
 
---- 大文件保护：阈值内返回全文；超阈值优先返回语法树大纲，
---- 无 parser 时回退为「提示 + 截断预览」。
+--- 大文件保护：阈值内返回全文；超阈值优先返回语法树大纲；无 parser/解析失败时改为
+--- 「提示 + 头+尾（超限时）+ 完整文件落盘」，避免旧行为只回退前 N 行预览而丢失文件尾部信息。
+--- 所有分支的展示文本都过 output_guard 限流（字节/字符超限时自动截断并落盘回读）。
 --- @param content string
 --- @param filepath string
 --- @return string
@@ -202,26 +243,37 @@ local function _guarded_content(content, filepath)
   local opts = _read_guard_opts()
   local chars = _char_count(content)
   if chars <= opts.outline_threshold_chars then
-    return content
+    -- 小文件：直接返回全文（仍过上下文限流以防阈值配置极大）。
+    return output_guard.cap(content, { tool = "read_file" })
   end
   local outline = _build_outline(content, filepath, {
     max_nodes = opts.outline_max_nodes,
     max_depth = opts.outline_max_depth,
   })
+  if outline then
+    local header = string.format(
+      "[文件较大] %s 共 %d 字符 / %d 行，超过阈值 %d，未返回全文以避免一次性读取过大。\n"
+        .. "以下为语法树节点大纲；请改用 start_line/end_line 读取所需行区间。",
+      filepath,
+      chars,
+      _line_count(content),
+      opts.outline_threshold_chars
+    )
+    local body = header .. "\n\n语法树节点大纲：\n" .. outline
+    -- 大纲本身超限时截断，并落盘完整文件内容供 read_file 回读。
+    return output_guard.cap(body, { tool = "read_file", spill_text = content })
+  end
+  -- 无可用解析器 / 解析失败：不再只回退「前 N 行预览」，改为头+尾（超限时自动截断），
+  -- 并把完整文件内容落盘到沙箱私有 /tmp，提示中给出路径供 read_file 分段回读。
   local header = string.format(
-    "[文件较大] %s 共 %d 字符 / %d 行，超过阈值 %d，未返回全文以避免一次性读取过大。\n"
-      .. "请改用 start_line/end_line 读取所需行区间。",
+    "[文件较大] %s 共 %d 字符 / %d 行，超过阈值 %d；该文件无可用语法树解析器，未能生成大纲。",
     filepath,
     chars,
     _line_count(content),
     opts.outline_threshold_chars
   )
-  if outline then
-    return header .. "\n\n语法树节点大纲：\n" .. outline
-  end
-  return header
-    .. string.format("\n（该文件无可用语法树解析器，以下为前 %d 行预览）：\n", opts.outline_preview_lines)
-    .. _preview_lines(content, opts.outline_preview_lines)
+  local body = output_guard.cap(content, { tool = "read_file", label = "doc", spill_text = content })
+  return header .. "\n\n" .. body
 end
 
 --- 异步文件操作公共接线：resolve → on_success，reject → on_error
@@ -240,9 +292,13 @@ end
 --- @return table
 local function _sandbox_overrides()
   local ok, cand = pcall(require, "NeoAI.sandbox.candidate")
-  if not ok or not cand or type(cand.workspace_overrides) ~= "function" then return {} end
+  if not ok or not cand or type(cand.workspace_overrides) ~= "function" then
+    return {}
+  end
   local ok2, ov = pcall(cand.workspace_overrides)
-  if not ok2 or type(ov) ~= "table" then return {} end
+  if not ok2 or type(ov) ~= "table" then
+    return {}
+  end
   return ov
 end
 
@@ -282,7 +338,9 @@ local function _sandbox_dir_present(dir)
   for _, o in ipairs(_sandbox_overrides()) do
     if not o.deleted then
       local abs = o.real
-      if abs == absdir or abs:sub(1, #absdir + 1) == absdir .. "/" then return true end
+      if abs == absdir or abs:sub(1, #absdir + 1) == absdir .. "/" then
+        return true
+      end
     end
   end
   return false
@@ -294,8 +352,12 @@ end
 local function _sandbox_path_exists(path)
   local abs = _abs_norm(path)
   for _, o in ipairs(_sandbox_overrides()) do
-    if o.real == abs then return not o.deleted end
-    if not o.deleted and o.real:sub(1, #abs + 1) == abs .. "/" then return true end
+    if o.real == abs then
+      return not o.deleted
+    end
+    if not o.deleted and o.real:sub(1, #abs + 1) == abs .. "/" then
+      return true
+    end
   end
   return nil
 end
@@ -312,7 +374,9 @@ local function _merge_list(base_text, dir, recursive, max)
   local absdir = _abs_norm(dir)
   local lines, seen, removed = {}, {}, {}
   for _, o in ipairs(overrides) do
-    if o.deleted then removed[o.real] = true end
+    if o.deleted then
+      removed[o.real] = true
+    end
   end
   if base_text ~= "" and base_text ~= "(空目录)" then
     for line in (base_text .. "\n"):gmatch("(.-)\n") do
@@ -322,7 +386,10 @@ local function _merge_list(base_text, dir, recursive, max)
         local abs = _abs_norm(raw)
         local drop = false
         for del in pairs(removed) do
-          if abs == del or abs:sub(1, #del + 1) == del .. "/" then drop = true break end
+          if abs == del or abs:sub(1, #del + 1) == del .. "/" then
+            drop = true
+            break
+          end
         end
         if not drop then
           lines[#lines + 1] = line
@@ -335,7 +402,9 @@ local function _merge_list(base_text, dir, recursive, max)
   -- 目录条目以 "/" 结尾，与真实列举格式一致。
   local function add_entry(rel, is_dir)
     local abs = absdir .. "/" .. rel
-    if seen[abs] then return end
+    if seen[abs] then
+      return
+    end
     seen[abs] = true
     lines[#lines + 1] = dir .. "/" .. rel .. (is_dir and "/" or "")
   end
@@ -349,7 +418,9 @@ local function _merge_list(base_text, dir, recursive, max)
           local acc = ""
           for seg in rel:gmatch("[^/]+") do
             acc = acc == "" and seg or (acc .. "/" .. seg)
-            if acc ~= rel then add_entry(acc, true) end
+            if acc ~= rel then
+              add_entry(acc, true)
+            end
           end
           add_entry(rel, _override_is_dir(o))
         else
@@ -364,10 +435,14 @@ local function _merge_list(base_text, dir, recursive, max)
   table.sort(lines)
   if max and max > 0 and #lines > max then
     local trimmed = {}
-    for i = 1, max do trimmed[i] = lines[i] end
+    for i = 1, max do
+      trimmed[i] = lines[i]
+    end
     lines = trimmed
   end
-  if #lines == 0 then return "(空目录)" end
+  if #lines == 0 then
+    return "(空目录)"
+  end
   return table.concat(lines, "\n")
 end
 
@@ -381,7 +456,9 @@ end
 --- @return string
 local function _merge_search(base_text, dir, query, include, max)
   local overrides = _sandbox_overrides()
-  if #overrides == 0 then return base_text end
+  if #overrides == 0 then
+    return base_text
+  end
   local absdir = _abs_norm(dir)
   local overridden = {}
   -- 被暂存覆盖（修改/删除）或整体为暂存目录的路径：其下真实搜索结果必须整体丢弃，
@@ -395,9 +472,13 @@ local function _merge_search(base_text, dir, query, include, max)
   end
   local function is_overridden(p)
     local ap = _abs_norm(p)
-    if overridden[ap] ~= nil then return true end
+    if overridden[ap] ~= nil then
+      return true
+    end
     for _, d in ipairs(overridden_dirs) do
-      if _is_under(ap, d) then return true end
+      if _is_under(ap, d) then
+        return true
+      end
     end
     return false
   end
@@ -420,7 +501,9 @@ local function _merge_search(base_text, dir, query, include, max)
     inc_pat = require("NeoAI.utils.stringx").glob_to_pattern(inc)
   end
   for _, o in ipairs(overrides) do
-    if count >= limit then break end
+    if count >= limit then
+      break
+    end
     if not o.deleted then
       local abs = o.real
       local under = abs == absdir or abs:sub(1, #absdir + 1) == absdir .. "/"
@@ -440,7 +523,9 @@ local function _merge_search(base_text, dir, query, include, max)
       end
     end
   end
-  if #out == 0 then return "未找到匹配内容" end
+  if #out == 0 then
+    return "未找到匹配内容"
+  end
   return table.concat(out, "\n")
 end
 
@@ -452,9 +537,9 @@ local file_tools = {}
 file_tools.read_file = helpers.define_tool(
   "read_file",
   "读取文件内容。file_path 必填；start_line/end_line 可选指定行范围（1-based，含两端）。"
-    .. "未指定行范围且文件较大（默认超 500 字符）时不返回全文，"
-    .. "而返回该文件的语法树节点大纲（无解析器时为截断预览），"
-    .. "以避免一次性读取过大文件；此时请改用 start_line/end_line 读取所需区间。",
+    .. "未指定行范围且文件较大（默认超 500 字符）时优先返回语法树节点大纲；"
+    .. "无解析器/解析失败时返回「文件首尾 + 完整文件落盘路径（沙箱私有 /tmp，可用 start_line/end_line 回读）」。"
+    .. "任何输出超过上下文阈值（tools.output_guard.max_chars）时会截断为头+尾并提示落盘路径。",
   {
     type = "object",
     properties = {
@@ -465,12 +550,15 @@ file_tools.read_file = helpers.define_tool(
     required = { "file_path" },
   },
   function(args, on_success, on_error)
-    local filepath = args.file_path
+    -- 沙箱访客路径（/tmp/…，如 output_guard 落盘的输出）还原为宿主路径，使 read_file 能回读。
+    local filepath = _resolve_guest_path(args.file_path)
     local guard = _read_guard_opts()
     local max_bytes = guard.max_read_bytes
     if args.start_line or args.end_line then
-      -- 指定行范围：按块逐行读取，不整读大文件，不受大文件保护影响
-      _pipe(fs.read_file_lines_async(filepath, args.start_line or 0, args.end_line or 0, max_bytes), on_success, on_error)
+      -- 指定行范围：按块逐行读取，不整读大文件。切片本身仍过上下文限流。
+      _pipe(fs.read_file_lines_async(filepath, args.start_line or 0, args.end_line or 0, max_bytes), function(res)
+        on_success(output_guard.cap(res, { tool = "read_file", label = "range" }))
+      end, on_error)
       return
     end
     -- 目录不是文件：明确报错，避免静默返回空内容。
@@ -486,10 +574,13 @@ file_tools.read_file = helpers.define_tool(
       local header = string.format(
         "[文件过大] %s 共 %d 字节，超过 %d 字节整读上限，未返回全文。\n"
           .. "请改用 start_line/end_line 读取所需行区间。",
-        filepath, stat.size, max_bytes
+        filepath,
+        stat.size,
+        max_bytes
       )
       _pipe(fs.read_file_lines_async(filepath, 1, guard.outline_preview_lines, preview_cap), function(preview)
-        on_success(header .. string.format("\n\n以下为前 %d 行预览：\n%s", guard.outline_preview_lines, preview))
+        local body = header .. string.format("\n\n以下为前 %d 行预览：\n%s", guard.outline_preview_lines, preview)
+        on_success(output_guard.cap(body, { tool = "read_file", label = "preview" }))
       end, function(err)
         -- 预览读取失败（如单行超长）也不应让整个读取失败，回传提示即可。
         on_success(header .. "\n（预览读取失败: " .. tostring(err) .. "）")
@@ -527,8 +618,14 @@ file_tools.edit_file = helpers.define_tool(
         description = "结构化替换 { old_text, new_text } 数组（与 mode 互斥，不传 mode）",
         items = { type = "object", properties = { old_text = { type = "string" }, new_text = { type = "string" } } },
       },
-      old_text = { type = "string", description = "单条替换：被替换文本（须与 new_text 成对，与 mode 互斥）" },
-      new_text = { type = "string", description = "单条替换：替换为的文本（须与 old_text 成对，与 mode 互斥）" },
+      old_text = {
+        type = "string",
+        description = "单条替换：被替换文本（须与 new_text 成对，与 mode 互斥）",
+      },
+      new_text = {
+        type = "string",
+        description = "单条替换：替换为的文本（须与 old_text 成对，与 mode 互斥）",
+      },
     },
     required = { "file_path", "description" },
   },
@@ -544,7 +641,9 @@ file_tools.edit_file = helpers.define_tool(
     local has_top = args.old_text ~= nil or args.new_text ~= nil
     local has_content = args.content ~= nil
     local mode = args.mode
-    if type(mode) == "string" then mode = mode:lower() end
+    if type(mode) == "string" then
+      mode = mode:lower()
+    end
     local has_mode = type(mode) == "string" and mode ~= ""
 
     -- R6：content 与替换字段语义冲突
@@ -573,8 +672,10 @@ file_tools.edit_file = helpers.define_tool(
     -- R5：mode 仅接受 write/append（消除 replace/edit 等同义词歧义）
     if has_mode and mode ~= "write" and mode ~= "append" then
       on_error(
-        ("edit_file：mode 只支持 'write'（整体覆写）或 'append'（追加），收到 '%s'；"
-          .. "如需局部替换请改用 edits 数组（或顶层 old_text/new_text）且不要传 mode"):format(tostring(args.mode))
+        (
+          "edit_file：mode 只支持 'write'（整体覆写）或 'append'（追加），收到 '%s'；"
+          .. "如需局部替换请改用 edits 数组（或顶层 old_text/new_text）且不要传 mode"
+        ):format(tostring(args.mode))
       )
       return
     end
@@ -635,36 +736,46 @@ file_tools.edit_file = helpers.define_tool(
       on_error("edits 需要包含有效的 old_text/new_text")
       return
     end
-    fs.read_file_async(filepath):then_(function()
-      local work = require("NeoAI.utils.work")
-      return work.run(function(payload)
-        local path, edits_blob = payload:match("^(.-)\3(.*)$")
-        if not path then error("编辑负载格式错误") end
-        local f = io.open(path, "rb")
-        if not f then error("无法读取文件: " .. path) end
-        local text = f:read("*a")
-        f:close()
-        for entry in edits_blob:gmatch("[^\2]+") do
-          local old, new = entry:match("^(.-)\1(.*)$")
-          if old and new ~= nil then
-            -- new 作为替换串会被 gsub 解析其中的 % 转义（如 %d/%s 被吞），
-            -- 用函数替换使 new 按字面写入，避免破坏含 % 的内容。
-            local escaped = old:gsub("([%(%)%.%%%+%-%*%?%[%]%^%$])", "%%%1")
-            text = text:gsub(escaped, function() return new end)
+    fs.read_file_async(filepath)
+      :then_(function()
+        local work = require("NeoAI.utils.work")
+        return work.run(function(payload)
+          local path, edits_blob = payload:match("^(.-)\3(.*)$")
+          if not path then
+            error("编辑负载格式错误")
           end
-        end
-        local w = io.open(path, "wb")
-        if not w then error("无法写入文件: " .. path) end
-        w:write(text)
-        w:close()
-        return "ok"
-      end, filepath .. "\3" .. table.concat(packed, "\2"))
-    end):then_(function()
-      helpers.reload_buffers_for(filepath)
-      on_success("文件已编辑: " .. filepath)
-    end, function(e)
-      on_error(e.message or tostring(e))
-    end)
+          local f = io.open(path, "rb")
+          if not f then
+            error("无法读取文件: " .. path)
+          end
+          local text = f:read("*a")
+          f:close()
+          for entry in edits_blob:gmatch("[^\2]+") do
+            local old, new = entry:match("^(.-)\1(.*)$")
+            if old and new ~= nil then
+              -- new 作为替换串会被 gsub 解析其中的 % 转义（如 %d/%s 被吞），
+              -- 用函数替换使 new 按字面写入，避免破坏含 % 的内容。
+              local escaped = old:gsub("([%(%)%.%%%+%-%*%?%[%]%^%$])", "%%%1")
+              text = text:gsub(escaped, function()
+                return new
+              end)
+            end
+          end
+          local w = io.open(path, "wb")
+          if not w then
+            error("无法写入文件: " .. path)
+          end
+          w:write(text)
+          w:close()
+          return "ok"
+        end, filepath .. "\3" .. table.concat(packed, "\2"))
+      end)
+      :then_(function()
+        helpers.reload_buffers_for(filepath)
+        on_success("文件已编辑: " .. filepath)
+      end, function(e)
+        on_error(e.message or tostring(e))
+      end)
   end,
   { category = "file", approval = { auto_allow = false } }
 )
@@ -683,7 +794,7 @@ file_tools.list_files = helpers.define_tool(
     required = {},
   },
   function(args, on_success, on_error)
-    local dir = args.path or "."
+    local dir = _resolve_guest_path(args.path or ".")
     local max = args.max_results or 0
     -- 安全默认：递归默认最多 2000 条、非递归单层最多 5000 条。否则对 home/ 等超大目录
     -- 会返回数万行（数 MB）并撑爆模型上下文；显式 max_results 可覆盖（仍受 worker 硬上限钳制）。
@@ -701,7 +812,9 @@ file_tools.list_files = helpers.define_tool(
       local eff_max = (max and max > 0) and max or RECURSIVE_DEFAULT
       _pipe(fs.list_dir_async(dir, eff_max), function(out)
         local n = 0
-        for _ in out:gmatch("[^\n]+") do n = n + 1 end
+        for _ in out:gmatch("[^\n]+") do
+          n = n + 1
+        end
         local text = _merge_list(out, dir, true, eff_max)
         if n >= eff_max then
           text = text .. "\n（递归列举上限 " .. eff_max .. " 条，可用 max_results 调整）"
@@ -722,18 +835,27 @@ file_tools.list_files = helpers.define_tool(
     local truncated = false
     while true do
       local name, t = vim.uv.fs_scandir_next(handle)
-      if not name then break end
-      if #out >= flat_cap then truncated = true break end
+      if not name then
+        break
+      end
+      if #out >= flat_cap then
+        truncated = true
+        break
+      end
       out[#out + 1] = dir .. "/" .. name .. (t == "directory" and "/" or "")
     end
     table.sort(out)
     if max and max > 0 and #out > max then
       local trimmed = {}
-      for i = 1, max do trimmed[i] = out[i] end
+      for i = 1, max do
+        trimmed[i] = out[i]
+      end
       out = trimmed
     end
     local text = _merge_list(table.concat(out, "\n"), dir, false, max)
-    if truncated then text = text .. "\n（已截断，单层最多 " .. FLAT_CAP .. " 条；可用 max_results 调整）" end
+    if truncated then
+      text = text .. "\n（已截断，单层最多 " .. FLAT_CAP .. " 条；可用 max_results 调整）"
+    end
     on_success(text)
   end,
   { category = "file" }
@@ -754,17 +876,21 @@ file_tools.search_files = helpers.define_tool(
     required = { "query" },
   },
   function(args, on_success, on_error)
-    local dir = args.path or "."
+    local dir = _resolve_guest_path(args.path or ".")
     local search_cfg = config_store.get("tools.search_files") or {}
     local max_file_bytes = type(search_cfg.max_file_bytes) == "number" and search_cfg.max_file_bytes or nil
     local max_results = args.max_results or 50
-    _pipe(fs.search_files_async(dir, args.query, {
-      include = args.include,
-      max_results = max_results,
-      max_file_bytes = max_file_bytes,
-    }), function(out)
-      on_success(_merge_search(out, dir, args.query, args.include, max_results))
-    end, on_error)
+    _pipe(
+      fs.search_files_async(dir, args.query, {
+        include = args.include,
+        max_results = max_results,
+        max_file_bytes = max_file_bytes,
+      }),
+      function(out)
+        on_success(_merge_search(out, dir, args.query, args.include, max_results))
+      end,
+      on_error
+    )
   end,
   { category = "file" }
 )
@@ -779,12 +905,13 @@ file_tools.file_exists = helpers.define_tool(
     required = { "file_path" },
   },
   function(args, on_success)
-    local sv = _sandbox_path_exists(args.file_path)
+    local fp = _resolve_guest_path(args.file_path)
+    local sv = _sandbox_path_exists(fp)
     if sv ~= nil then
       on_success(tostring(sv))
       return
     end
-    on_success(tostring(fs.exists(args.file_path)))
+    on_success(tostring(fs.exists(fp)))
   end,
   { category = "file" }
 )
@@ -800,7 +927,10 @@ file_tools.create_directory = helpers.define_tool(
   },
   function(args, on_success, on_error)
     local ok, err = fs.ensure_dir(args.file_path)
-    if not ok then on_error("创建目录失败: " .. tostring(err)) return end
+    if not ok then
+      on_error("创建目录失败: " .. tostring(err))
+      return
+    end
     on_success("目录已创建: " .. args.file_path)
   end,
   { category = "file", approval = { auto_allow = false } }
@@ -817,33 +947,30 @@ file_tools.ensure_dir = helpers.define_tool(
   },
   function(args, on_success, on_error)
     local ok, err = fs.ensure_dir(args.file_path)
-    if not ok then on_error("创建目录失败: " .. tostring(err)) return end
+    if not ok then
+      on_error("创建目录失败: " .. tostring(err))
+      return
+    end
     on_success("目录已就绪: " .. args.file_path)
   end,
   { category = "file", approval = { auto_allow = false } }
 )
 
 -- 删除文件（线程池异步）
-file_tools.delete_file = helpers.define_tool(
-  "delete_file",
-  "删除文件。file_path 必填。",
-  {
-    type = "object",
-    properties = { file_path = { type = "string" } },
-    required = { "file_path" },
-  },
-  function(args, on_success, on_error)
-    if not fs.exists(args.file_path) then
-      on_error("文件不存在: " .. args.file_path)
-      return
-    end
-    _pipe(fs.delete_file_async(args.file_path), function()
-      helpers.reload_buffers_for(args.file_path)
-      on_success("文件已删除: " .. args.file_path)
-    end, on_error)
-  end,
-  { category = "file", approval = { auto_allow = false } }
-)
+file_tools.delete_file = helpers.define_tool("delete_file", "删除文件。file_path 必填。", {
+  type = "object",
+  properties = { file_path = { type = "string" } },
+  required = { "file_path" },
+}, function(args, on_success, on_error)
+  if not fs.exists(args.file_path) then
+    on_error("文件不存在: " .. args.file_path)
+    return
+  end
+  _pipe(fs.delete_file_async(args.file_path), function()
+    helpers.reload_buffers_for(args.file_path)
+    on_success("文件已删除: " .. args.file_path)
+  end, on_error)
+end, { category = "file", approval = { auto_allow = false } })
 
 -- 写入确认（与 edit_file 配合）
 file_tools.confirm_file_change = helpers.define_tool(
@@ -858,7 +985,11 @@ file_tools.confirm_file_change = helpers.define_tool(
     required = { "action" },
   },
   function(args, on_success)
-    on_success(("文件修改%s确认"):format(args.action == "confirm" and "已" or (args.action == "abandon" and "已放弃" or "将重试")))
+    on_success(
+      ("文件修改%s确认"):format(
+        args.action == "confirm" and "已" or (args.action == "abandon" and "已放弃" or "将重试")
+      )
+    )
   end,
   { category = "file" }
 )

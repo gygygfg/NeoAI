@@ -211,6 +211,7 @@ vim.api.nvim_create_autocmd("User", {
 | `UI_REFRESHED` | `ui:refreshed` | UI 刷新 | — |
 | `UI_MODE_CHANGED` | `ui:mode_changed` | UI 模式切换 | `{ mode }` |
 | `UI_FOLLOW_CHANGED` | `ui:follow_changed` | 聊天光标跟随状态跳变（跟随 ↔ 非跟随） | `{ following }` |
+| `UI_FOCUS_CHANGED` | `ui:focus_changed` | NeoAI 界面焦点跳变（当前窗口为 NeoAI 界面 ↔ 非 NeoAI 窗口）；据此延迟 pty/ask_user 弹窗、刷新审批窗 | `{ focused }` |
 | `DISPLAY_MODE_CHANGED` | `display:mode_changed` | 显示模式切换 | `{ name }` |
 
 ### 子 Agent
@@ -250,9 +251,9 @@ vim.api.nvim_create_autocmd("User", {
 
 | 常量 | 值 | 触发时机 | payload 关键字段 |
 | --- | --- | --- | --- |
-| `PLAN_DISTILL_STARTED` | `plan_distill:started` | 开始计划阶段蒸馏 | `{ agent_id }` |
-| `PLAN_DISTILL_CHUNK` | `plan_distill:chunk` | 分类摘要流式分片到达 | `{ agent_id, reasoning, content }` |
-| `PLAN_DISTILLED` | `plan_distilled` | 蒸馏完成 | `{ agent_id, replaced, summary }` |
+| `PLAN_DISTILL_STARTED` | `plan_distill:started` | 开始计划阶段 XML 提取 | `{ agent_id }` |
+| `PLAN_DISTILL_CHUNK` | `plan_distill:chunk` | 提取结果流式分片到达 | `{ agent_id, reasoning, content }` |
+| `PLAN_DISTILLED` | `plan_distilled` | 提取完成 | `{ agent_id, fields, steps }` |
 
 > 上下文压缩为**后台异步、不弹窗**：不再发射 `COMPACTION_STARTED` / `COMPACTION_CHUNK`（常量保留），仅发射 `COMPACTION_COMPLETED`。
 > 计划蒸馏仍会打开"🧬 计划蒸馏"悬浮窗并发射 `PLAN_DISTILL_STARTED` / `PLAN_DISTILL_CHUNK`。

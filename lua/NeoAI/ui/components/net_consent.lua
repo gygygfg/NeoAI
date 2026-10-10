@@ -110,10 +110,10 @@ end
 
 -- ========== 公开 API ==========
 
---- 展示同意弹窗
+--- 展示同意弹窗（实际建窗）
 --- @param ctx table { host, port, local_?, proto? }
 --- @param decide function(decision)
-function M.show(ctx, decide)
+local function _present(ctx, decide)
   if state.win_id and vim.api.nvim_win_is_valid(state.win_id) then _close() end
   state.decide = decide
   state.buf = vim.api.nvim_create_buf(false, true)
@@ -146,8 +146,17 @@ function M.show(ctx, decide)
   _set_keymaps()
 end
 
+--- 展示同意弹窗。焦点不在 NeoAI 界面（用户切到其他窗口）时不立即弹出，暂存并进入等待，
+--- 待切回 NeoAI 界面再弹（经 `focus.gate`）。同意超时/经审批中心决策会调用 `hide()` 取消暂存。
+--- @param ctx table { host, port, local_?, proto? }
+--- @param decide function(decision)
+function M.show(ctx, decide)
+  require("NeoAI.ui.focus").gate("net_consent", function() _present(ctx, decide) end)
+end
+
 --- 隐藏弹窗
 function M.hide()
+  require("NeoAI.ui.focus").cancel_gate("net_consent")
   _close()
 end
 
@@ -160,6 +169,7 @@ end
 --- 重置（测试用）
 function M.reset()
   _close()
+  pcall(function() require("NeoAI.ui.focus").cancel_gate("net_consent") end)
   pcall(function() require("NeoAI.sandbox.net_consent").set_ui(nil) end)
 end
 

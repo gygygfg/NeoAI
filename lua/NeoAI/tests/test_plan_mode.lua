@@ -111,21 +111,32 @@ tests.suite("plan_mode", function(_, it)
     t.eq(0, #pm.plan_to_todos(nil))
   end)
 
-  it("approve_plan 确认后直接转入 CHAT 并建立任务清单", function(t)
+  it("approve_plan 确认后转入 CHAT 并经计划提取建立任务清单", function(t)
     local config_store = require("NeoAI.kernel.config_store")
     config_store.load({
       tools = {
-        approval = { mode = "prompt", per_tool = {} },
+        approval = { mode = "auto_allow", per_tool = {} },
         plan_mode = { auto_execute_on_approve = false },
       },
     })
     local chat_service = require("NeoAI.services.chat_service")
     local tool_service = require("NeoAI.services.tool_service")
     local todo = require("NeoAI.tools.builtin.todo")
+    local registry = require("NeoAI.tools.registry")
+    local async = require("NeoAI.utils.async")
+    local pd = require("NeoAI.core.session.plan_distill")
     local pm = require("NeoAI.tools.builtin.plan_mode")
     chat_service.reset()
     tool_service.reset()
     todo.reset()
+    pcall(function() registry.register_many(todo.get_tools()) end)
+
+    -- 用桩替换真实模型调用：返回含 3 个步骤的 XML（避免真实网络调用）。
+    local orig_run = pd.run
+    local steps = { "步骤一", "步骤二", "步骤三" }
+    pd.run = function()
+      return async.resolve({ fields = { target = "目标", steps = steps }, steps = steps })
+    end
 
     local agent = chat_service.new_session({})
     t.true_(pm.enter(agent))
@@ -134,14 +145,19 @@ tests.suite("plan_mode", function(_, it)
     agent:add_message("assistant", plan_message)
 
     local result = chat_service.approve_plan({ auto_execute = false })
-    t.true_(result.approved, "应确认成功")
-    t.eq(3, result.todo_count)
-    t.true_(result.plan:find("步骤一", 1, true) ~= nil)
+    local done, val = false, nil
+    result:then_(function(v) done = true; val = v end, function(e) done = true; val = e end)
+    vim.wait(2000, function() return done end, 5)
+    pd.run = orig_run
+
+    t.true_(val and val.approved, "应确认成功")
+    t.eq(3, val.todo_count)
+    t.true_(val.plan:find("步骤一", 1, true) ~= nil)
     -- 直接转入 CHAT 模式
     t.false_(pm.is_active(agent))
     t.eq("chat", chat_service.get_mode())
     t.eq(plan_message, agent.plan)
-    -- 任务清单已建立
+    -- 任务清单已建立（由计划提取的步骤经 todo_write 写入）
     local items = todo.get(agent.session_id)
     t.not_nil(items)
     t.eq(3, #items)

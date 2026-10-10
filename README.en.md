@@ -17,8 +17,8 @@
 - **Multiple chat instances** — `<leader>ac` / `:NeoAIChat` opens an **independent chat instance in a new tab** (unique buffer name); run several chats at once, each with its own session, streaming output, **its own reasoning / tool-args floats, and its own reasoning-visibility toggle**, while existing instances stay alive
 - **A rich set of built-in tools** — the AI can call 40+ tools for file operations, code analysis, LSP, Shell commands, and more
 - **Tool approval system** — fine-grained control over tool execution permissions, supporting auto-allow / manual approval / argument-level allowlists
-- **Plan mode (PLAN) and plan distillation** — toggle with `m` or `:NeoAIPlan`; the tool context retains only read-only / informational queries plus `run_command` (read-only research) and `ask_user` (no mutating tools are exposed, and no mode-switching tool is given to the AI); after the AI researches and clarifies, it emits a formatted change plan and ends the turn; once the user confirms (`:NeoAIApprovePlan` or manually toggling the mode), NeoAI switches to CHAT and executes the plan automatically, **distilling** the research context gathered during planning into a checkpoint that replaces the compacted range
-- **Background context compaction** — as the context threshold approaches, round 1 through the second-to-last round (keeping the last round intact) is folded **asynchronously in the background, non-blocking**, and a checkpoint is written into a **compaction overlay**: subsequent requests and further compactions use the compacted replacement, while chat rendering and session persistence keep the original context (the overlay is saved with the session and survives a restart); compaction opens no floating window; in addition to turn boundaries, **a pressure check runs before every round of the tool loop** (after tool results are written back and before the next request), so long loops converge round by round; on overflow the request is compacted and retried automatically; plan distillation still shows reasoning and content live in a floating window
+- **Plan mode (PLAN) and plan extraction** — toggle with `m` or `:NeoAIPlan`; the tool context retains only read-only / informational queries plus `run_command` (read-only research) and `ask_user` (no mutating tools are exposed, and no mode-switching tool is given to the AI); after the AI researches and clarifies, it emits a formatted change plan and ends the turn; once the user confirms (`:NeoAIApprovePlan` or manually toggling the mode), NeoAI switches to CHAT: at the boundary it first runs one **XML plan extraction** (`<target>`/`<stepN>`/`<files>` etc., case-insensitive, retrying up to 3 times when key fields are missing), assembles the execution context, builds the task list automatically per step (`todo_write`), and keeps `<files>`-related tool messages verbatim for cache hits before starting execution
+- **Background context compaction** — as the context threshold approaches, round 1 through the second-to-last round (keeping the last round intact) is folded **asynchronously in the background, non-blocking**, and a checkpoint is written into a **compaction overlay**: subsequent requests and further compactions use the compacted replacement, while chat rendering and session persistence keep the original context (the overlay is saved with the session and survives a restart); compaction opens no floating window; in addition to turn boundaries, **a pressure check runs before every round of the tool loop** (after tool results are written back and before the next request), so long loops converge round by round; on overflow the request is compacted and retried automatically; plan extraction still shows reasoning and content live in a floating window
 - **Sub-Agent system** — the AI can spawn sub-Agents to run subtasks in parallel, with boundary review
 - **Decoupled frontend/backend architecture** — an event-driven asynchronous architecture that separates the UI from business logic
 - **Highly configurable** — full customization of keymaps, UI layout, log level, and more
@@ -349,7 +349,7 @@ require("NeoAI").setup({
     plan_mode = {
       enabled = true,                    -- plan mode
       auto_execute_on_approve = true,    -- after the plan is approved, switch to CHAT automatically and execute it item by item
-      distill_on_execute = true,         -- distill the research context from the planning phase into a checkpoint to replace compaction
+      distill_on_execute = true,         -- on plan completion run one XML plan extraction (build the execution context + call todo_write per step), then execute
       extra_safe_tools = {},             -- extensions to the plan mode allowlist
       -- mutating_tools = { ... },       -- mutating tools (the visible set in plan mode already covers this semantics)
     },
@@ -914,7 +914,7 @@ NeoAI/
 │   │   ├── context_builder.lua# Context building (system rendering + tool call protocol)
 │   │   ├── tool_result_pruner.lua # Tool result pruning (head summary / marker / tail pruning)
 │   │   ├── compactor.lua      # Context compaction (pairing-safe splitting + checkpoint replacement + auxiliary summary)
-│   │   ├── plan_distill.lua   # Plan-phase distillation (research context → 8-part checkpoint)
+│   │   ├── plan_distill.lua   # Plan-phase XML extraction (structured plan → execution context + todos)
 │   │   └── runtime_context.lua# Runtime context (environment/time injection, etc.)
 │   ├── model/                 # Model management
 │   │   ├── registry.lua       # Model registry (runtime dynamic updates + live metadata)
@@ -961,7 +961,7 @@ NeoAI/
 │   │   ├── message_list.lua   # Message list rendering
 │   │   ├── reasoning_panel.lua# Reasoning panel
 │   │   ├── tool_args_panel.lua# Tool argument receiving floating window (streaming)
-│   │   ├── float_stream_window.lua # Reusable streaming floating window (shared by reasoning/arguments/compaction/distillation)
+│   │   ├── float_stream_window.lua # Reusable streaming floating window (shared by reasoning/arguments/extraction)
 │   │   ├── model_picker.lua   # Model picker (async loading)
 │   │   ├── tool_approval.lua  # Tool approval dialog
 │   │   ├── ask_user.lua       # Ask-user dialog
@@ -1056,7 +1056,7 @@ NeoAI/
     ├── test_herder.lua        # Herder status reporting
     ├── test_ask_user.lua      # Ask the user
     ├── test_plan_mode.lua     # Plan mode
-    ├── test_plan_distill.lua  # Plan distillation
+    ├── test_plan_distill.lua  # Plan extraction
     ├── test_todo.lua          # Todo list
     ├── test_sub_agent_result.lua # Sub-agent results
     ├── test_skills.lua        # Skills (frontmatter/discovery/loading)
@@ -1112,7 +1112,7 @@ NeoAI implements an event-driven architecture on top of Neovim's native `User` a
 | MCP                  | 5     | Connect, ready, error, disconnect, tool update |
 | Skills               | 1     | Skill index hot reload             |
 | Logging/context compaction | 4 | Log message, compaction start, compaction chunk, compaction complete |
-| Plan distillation    | 3     | Distillation start, chunk arrival, complete |
+| Plan extraction      | 3     | Extraction start, chunk arrival, complete |
 
 See [docs/EVENTS.md](docs/en/EVENTS.md) for details (the single authoritative event document).
 

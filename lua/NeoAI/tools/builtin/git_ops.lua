@@ -4,6 +4,7 @@
 
 local async = require("NeoAI.utils.async")
 local helpers = require("NeoAI.tools.builtin.tool_helpers")
+local output_guard = require("NeoAI.tools.builtin.output_guard")
 
 local M = {}
 
@@ -134,7 +135,8 @@ local git_tools = {}
 
 git_tools.git_status = helpers.define_tool(
   "git_status",
-  "查看 git 状态（--short）。repo 可选（目标仓库目录，缺省=当前会话仓库）。",
+  "查看 git 状态（--short）。repo 可选（目标仓库目录，缺省=当前会话仓库）。"
+    .. "输出过长时截断为头+尾并把完整输出落盘到沙箱私有 /tmp（结果中给出路径，可用 read_file 回读）。",
   {
     type = "object",
     properties = {
@@ -144,7 +146,7 @@ git_tools.git_status = helpers.define_tool(
   },
   function(args, on_success, on_error, ctx)
     _git({ "status", "--short" }, ctx, _repo(args)):then_(function(r)
-      on_success(r.code == 0 and (r.output ~= "" and r.output or "工作区干净") or r.output)
+      on_success(output_guard.cap(r.code == 0 and (r.output ~= "" and r.output or "工作区干净") or r.output, { tool = "git_status" }))
     end, function(e) on_error(e.message) end)
   end,
   { category = "git" }
@@ -152,7 +154,8 @@ git_tools.git_status = helpers.define_tool(
 
 git_tools.git_diff = helpers.define_tool(
   "git_diff",
-  "查看未提交的改动（git diff）。file_path 可选；repo 可选（目标仓库目录，缺省=当前会话仓库）。",
+  "查看未提交的改动（git diff）。file_path 可选；repo 可选（目标仓库目录，缺省=当前会话仓库）。"
+    .. "输出过长时截断为头+尾并把完整输出落盘到沙箱私有 /tmp（结果中给出路径，可用 read_file 回读）。",
   {
     type = "object",
     properties = {
@@ -164,7 +167,7 @@ git_tools.git_diff = helpers.define_tool(
   function(args, on_success, on_error, ctx)
     local cmd = args.file_path and { "diff", "--", args.file_path } or { "diff" }
     _git(cmd, ctx, _repo(args)):then_(function(r)
-      on_success(r.output ~= "" and r.output or "无改动")
+      on_success(output_guard.cap(r.output ~= "" and r.output or "无改动", { tool = "git_diff" }))
     end, function(e) on_error(e.message) end)
   end,
   { category = "git" }
@@ -172,7 +175,8 @@ git_tools.git_diff = helpers.define_tool(
 
 git_tools.git_log = helpers.define_tool(
   "git_log",
-  "查看提交历史。max 可选（默认 20）；path 可选（pathspec 文件路径）；repo 可选（目标仓库目录，缺省=当前会话仓库）。",
+  "查看提交历史。max 可选（默认 20）；path 可选（pathspec 文件路径）；repo 可选（目标仓库目录，缺省=当前会话仓库）。"
+    .. "输出过长时截断为头+尾并把完整输出落盘到沙箱私有 /tmp（结果中给出路径，可用 read_file 回读）。",
   {
     type = "object",
     properties = {
@@ -186,7 +190,7 @@ git_tools.git_log = helpers.define_tool(
     local cmd = { "log", "--oneline", "-n", tostring(args.max or 20) }
     if args.path then cmd[#cmd + 1] = "--"; cmd[#cmd + 1] = args.path end
     _git(cmd, ctx, _repo(args)):then_(function(r)
-      on_success(r.output)
+      on_success(output_guard.cap(r.output, { tool = "git_log" }))
     end, function(e) on_error(e.message) end)
   end,
   { category = "git" }
@@ -194,7 +198,8 @@ git_tools.git_log = helpers.define_tool(
 
 git_tools.git_commit_detail = helpers.define_tool(
   "git_commit_detail",
-  "查看某次提交详情。ref 必填；repo 可选（目标仓库目录，缺省=当前会话仓库）。",
+  "查看某次提交详情。ref 必填；repo 可选（目标仓库目录，缺省=当前会话仓库）。"
+    .. "输出过长时截断为头+尾并把完整输出落盘到沙箱私有 /tmp（结果中给出路径，可用 read_file 回读）。",
   {
     type = "object",
     properties = {
@@ -205,7 +210,7 @@ git_tools.git_commit_detail = helpers.define_tool(
   },
   function(args, on_success, on_error, ctx)
     _git({ "show", "--stat", args.ref }, ctx, _repo(args)):then_(function(r)
-      on_success(r.output)
+      on_success(output_guard.cap(r.output, { tool = "git_commit_detail" }))
     end, function(e) on_error(e.message) end)
   end,
   { category = "git" }
@@ -213,7 +218,8 @@ git_tools.git_commit_detail = helpers.define_tool(
 
 git_tools.git_branch = helpers.define_tool(
   "git_branch",
-  "查看分支列表（-a）。repo 可选（目标仓库目录，缺省=当前会话仓库）。",
+  "查看分支列表（-a）。repo 可选（目标仓库目录，缺省=当前会话仓库）。"
+    .. "输出过长时截断为头+尾并把完整输出落盘到沙箱私有 /tmp（结果中给出路径，可用 read_file 回读）。",
   {
     type = "object",
     properties = {
@@ -223,7 +229,7 @@ git_tools.git_branch = helpers.define_tool(
   },
   function(args, on_success, on_error, ctx)
     _git({ "branch", "-a" }, ctx, _repo(args)):then_(function(r)
-      on_success(r.output)
+      on_success(output_guard.cap(r.output, { tool = "git_branch" }))
     end, function(e) on_error(e.message) end)
   end,
   { category = "git" }
@@ -231,7 +237,8 @@ git_tools.git_branch = helpers.define_tool(
 
 git_tools.git_file_history = helpers.define_tool(
   "git_file_history",
-  "查看文件历史。file_path 必填；max 可选；repo 可选（目标仓库目录，缺省=当前会话仓库）。",
+  "查看文件历史。file_path 必填；max 可选；repo 可选（目标仓库目录，缺省=当前会话仓库）。"
+    .. "输出过长时截断为头+尾并把完整输出落盘到沙箱私有 /tmp（结果中给出路径，可用 read_file 回读）。",
   {
     type = "object",
     properties = {
@@ -243,7 +250,7 @@ git_tools.git_file_history = helpers.define_tool(
   },
   function(args, on_success, on_error, ctx)
     _git({ "log", "--oneline", "-n", tostring(args.max or 20), "--", args.file_path }, ctx, _repo(args)):then_(function(r)
-      on_success(r.output)
+      on_success(output_guard.cap(r.output, { tool = "git_file_history" }))
     end, function(e) on_error(e.message) end)
   end,
   { category = "git" }

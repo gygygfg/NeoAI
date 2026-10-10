@@ -173,7 +173,8 @@ session = {
 | `enabled` | `true` | Master switch for the tool system |
 | `builtin` | `true` | Load built-in tools |
 | `external` | `{}` | External tools |
-| `read_file` | `{outline_threshold_chars=500, outline_max_nodes=200, outline_max_depth=4, outline_preview_lines=50, max_read_bytes=5242880}` | read_file large-file protection: when no line range is specified and the threshold is exceeded, return a syntax-tree outline (or a truncated preview if no parser is available); files over `max_read_bytes` are never fully read (preview only) to avoid OOM |
+| `read_file` | `{outline_threshold_chars=500, outline_max_nodes=200, outline_max_depth=4, outline_preview_lines=50, max_read_bytes=5242880}` | read_file large-file protection: when no line range is specified and the threshold is exceeded, return a syntax-tree outline; when no parser exists (or parsing fails), return the file head+tail and spill the full file to the sandbox-private /tmp (readable back by path); files over `max_read_bytes` are never fully read (preview only) to avoid OOM. All returned text is additionally bounded by `output_guard` |
+| `output_guard` | `{enabled=true, max_chars=20000, head_chars=14000, tail_chars=4000, spill=true, spill_dir="neoai-out"}` | Tool-output **AI-context cap**: when the text returned by `run_command` + read-only `git_*` + `read_file` exceeds `max_chars` (characters), only the head `head_chars` + a truncation marker + the tail `tail_chars` are returned, and the full output is written to the sandbox-private `/tmp/<spill_dir>/` (default `/tmp/neoai-out/…`; the marker gives the path, readable back in segments via `read_file` `start_line`/`end_line`). `head_chars+tail_chars` must be `< max_chars` (otherwise auto-rescaled). `spill=false` truncates without spilling; with no sandbox (no `/tmp` mapping) it degrades to truncation only. `enabled=false` disables the cap (only hard limits such as `run_command.max_output_bytes` remain). Separate from `max_output_bytes` (the 16 MiB anti-freeze hard kill protecting the main thread) |
 | `search_files` | `{max_file_bytes=8388608}` | Per-file scan cap (bytes) during search; larger files and binaries (containing NUL) are skipped to avoid OOM |
 | `run_command` | `{max_output_bytes=16777216, max_wall_ms=0, interactive={enabled=true, engine="auto", poll_ms=80, show_window="on_wait", show_window_delay_ms=2000, judge={enabled=true, model=nil, max_rounds=12, timeout_ms=120000, output_tail_lines=80}}}` | Combined stdout/stderr cap (bytes): beyond it the command is truncated and terminated, so huge outputs cannot freeze the main thread with line-by-line processing; 0 = unlimited. `max_wall_ms>0` is a wall-clock safety net: the command may run at most that many milliseconds (also bounding `timeout_ms=-1` "unlimited" commands) and is then truly killed via the sandbox resource domain; 0 = unlimited. `interactive` (**on by default**): `run_command` runs under a **PTY** and polls `/proc` to detect "process blocked reading the terminal = waiting for input" (an OS-level signal, not text matching; consecutive reads are distinguished via `/proc/<pid>/io` `rchar` growth). Each wait is answered by a **judge** (**a single-turn LLM request**: the model returns `{"action":"text"|"keys"|"kill"|"none",...}` JSON, which directly injects text/keys or ends the process; no sub-agent, no tool loop) or by the user (manual input in the floating terminal); `poll_ms` is the poll interval, `show_window` controls when the terminal window pops up (always = at session start / on_wait = only after the command has been running longer than `show_window_delay_ms` (default 2000ms) and has not yet finished, so a fast command never flashes a window / never = no window; **both always/on_wait require the chat cursor to be following — nothing pops while the user is scrolled up**), and `engine="off"` disables it. Plain foreground commands use the **one-shot** sandbox path (the resident command server's stdin is /dev/null and cannot be interactive); however commands with background intent (`&`/nohup/setsid) and subsequent commands **while a resident instance is already active** still use the resident instance, so background processes survive across calls and stay visible/manageable (`ps`/`kill`/logs) in the same namespace. Setting `enabled=false` sends all commands through the resident instance |
 | `lsp` | `{timeout_ms=10000, attach_timeout_ms=3000}` | LSP request timeout (fail fast when the server does not respond); `attach_timeout_ms` is how long to wait for a client to attach: when a background-loaded buffer or a starting/restarting server has no client yet, `lsp_diagnostics` waits for it instead of failing immediately with "no LSP client" |
@@ -572,13 +573,20 @@ sandbox = {
   --     strip content after persisting, so staging many files does not double memory.
   --   terminal_cache_max: cap on terminal (REJECTED/SUPERSEDED/EXPIRED) change sets kept in memory;
   --     excess items are evicted and re-read from disk on demand (no data loss).
+  --   rejected_max / rejected_dir: on explicit reject, the candidate content is saved to rejected_dir
+  --     (default /tmp/neoai-rejected, dir 0700 / files 0600) so the rejected entry stays visible in
+  --     the review UI's "Rejected" section and can be restored to pending with `u`. These restorable
+  --     items do NOT participate in terminal_cache_max eviction; rejected_max (default 50) bounds them
+  --     instead: the oldest is dropped (copy deleted, out of memory) beyond the cap (disk record
+  --     remains); 0 = keep none.
   --   cas_mode: publish CAS mode "hash" (default, strictest) | "auto" | "sig"; non-default loosens
   --     consistency detection.
   --   snapshot_cas: undo-snapshot CAS "sig" (default, signatures, less CPU) | "hash" (content hash,
   --     strictest).
   review = { enabled = true, auto_apply = false, session_auto_approve = false,
              max_display_files = 200, refresh_debounce_ms = 80,
-             content_cache_max = 64, terminal_cache_max = 200, cas_mode = "hash",
+             content_cache_max = 64, terminal_cache_max = 200, rejected_max = 50,
+             rejected_dir = "/tmp/neoai-rejected", cas_mode = "hash",
              snapshot_cas = "sig",
              l3_warning = { enabled = true, package_confirm = true, max_tokens = 256, timeout_ms = 15000 },
              ai_audit = { enabled = true, auto = false, key = "a", max_concurrent = 10,
@@ -728,6 +736,10 @@ herder = {
   agent identities are a compile-time fixed set, and a local detection manifest can only **override an existing**
   agent, never add a new one.
 - Multi-session aggregation priority `blocked > working > idle`, with a strictly increasing `--seq` to avoid rollback.
+- **Sources of `blocked`**: tool approval (`TOOL_APPROVAL_REQUESTED`), `ask_user` waiting for an answer
+  (`ASK_USER_WAITING`), and **pty sessions waiting for input** (`PTY_WAITING_INPUT`: while the floating terminal
+  waits for the user's typing / the judge's injection, the pane lifecycle shows `blocked`/red). It falls back to
+  `working`/`idle` once input is sent (`PTY_INPUT_SENT`) or the session exits (`PTY_EXITED`).
 - Display-enhancement snippet: with `auto_install = true` it is written **asynchronously, silently and idempotently**
   into `~/.config/herdr/config.toml` on startup (skipped if already installed, backs up first, rolls back if
   `herdr config check` fails) — no manual action required.

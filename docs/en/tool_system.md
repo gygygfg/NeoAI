@@ -182,9 +182,11 @@ approval is allowed by default and a notify is sent.
 > **`read_file` large-file protection**: when `start_line`/`end_line` is not specified and the file's character count
 > exceeds the threshold (default `tools.read_file.outline_threshold_chars=500`), the full text is not returned;
 > instead, a tree-sitter **syntax tree node outline** of the file is returned (parsed from the string via
-> `get_string_parser`, without loading a buffer); when no parser exists for that file type, it falls back to
-> "a hint + a preview of the first `outline_preview_lines` lines". The outline only prints structural nodes that have
-> named children, subject to `outline_max_nodes`/`outline_max_depth`; specifying a line range bypasses this protection.
+> `get_string_parser`, without loading a buffer; it prints only structural nodes that have named children,
+> subject to `outline_max_nodes`/`outline_max_depth`); when no parser exists for that file type (or parsing fails),
+> it returns the file's **head + tail** and **spills the full file content to the sandbox-private `/tmp`** (the path is
+> included so the model can read it back in segments via `read_file` `start_line`/`end_line`). Specifying a line range
+> bypasses the outline protection, but the slice is still bounded by the **AI-context output cap** described below.
 
 ### 💻 Shell (shell.lua)
 
@@ -200,12 +202,31 @@ approval is allowed by default and a notify is sent.
 - **Goal**: while a command awaits input, inject a line of text / send a key sequence (Enter/Tab/Escape/Up/Ctrl-C, ...) / end the process.
 - **How to operate**: only operate on an existing PTY session (`effect=in_process`; never spawns a process); normally called automatically by the judge, so the model usually does not need to call them manually unless precise control is required.
 
-The floating terminal window is rendered with `nvim_open_term` by `ui/components/terminal_window.lua` and forwards manual typing when focused; `show_window` controls when it pops up (always/on_wait/never, **all requiring the chat cursor to be following**): `always` pops at session start; `on_wait` pops only after the command has been running longer than `show_window_delay_ms` (default 2000ms) without finishing (a fast command that ends within ~2s never flashes a window). On a follow flip it automatically hides (reviewing earlier content) / re-pops (back at the bottom, for sessions still meeting the respective condition) via `UI_FOLLOW_CHANGED`; every open (first pop or re-pop) renders a **fresh `nvim_open_term` channel**, so the session's accumulated output is **replayed on open** to avoid an empty window (which would look like "it won't open"). See [configuration.md](configuration.md) `tools.run_command.interactive`.
+The floating terminal window is rendered with `nvim_open_term` by `ui/components/terminal_window.lua` and forwards manual typing when focused; `show_window` controls when it pops up (always/on_wait/never, **all requiring the chat cursor to be following**): `always` pops at session start; `on_wait` pops only after the command has been running longer than `show_window_delay_ms` (default 2000ms) without finishing (a fast command that ends within ~2s never flashes a window). On a follow flip it automatically hides (reviewing earlier content) / re-pops (back at the bottom, for sessions still meeting the respective condition) via `UI_FOLLOW_CHANGED`; every open (first pop or re-pop) renders a **fresh `nvim_open_term` channel**, so the session's accumulated output is **replayed on open** to avoid an empty window (which would look like "it won't open"). **It also does not pop up when focus is not on the NeoAI UI** (the user switched to another window): it waits via `UI_FOCUS_CHANGED` and pops after switching back (see the lifecycle reporting in [sandbox.md](sandbox.md)). See [configuration.md](configuration.md) `tools.run_command.interactive`.
 When combined stdout/stderr exceeds `tools.run_command.max_output_bytes` (default 16 MiB), the command is
 truncated and terminated so huge outputs (hundreds of MB) cannot freeze the main thread with line-by-line
 processing; already-produced content is still returned and marked "truncated".
 When a command ends with exit code 137 (SIGKILL), the resource-domain events are read to distinguish
 "suspected OOM" from "forcibly terminated".
+
+### ✂️ Tool-output "AI-context cap" (output_guard.lua)
+
+The text returned by `run_command` (all three paths) + read-only `git_*` tools + `read_file` passes through the
+`tools.builtin.output_guard.cap` exit guard: when the text exceeds `tools.output_guard.max_chars` (default 20000)
+characters, only the **head `head_chars` + a truncation marker + the tail `tail_chars`** are returned, and the
+**full output is written to the sandbox-private** `/tmp/<spill_dir>/` (default `/tmp/neoai-out/…`); the marker
+gives that path, which the model can read back in segments via `read_file` `start_line`/`end_line`.
+
+- **Separate concerns** from `run_command.max_output_bytes` (the 16 MiB "anti-freeze hard kill" protecting the
+  main thread): this cap protects the **model context** and is far smaller (default 20k chars).
+- The spill directory is the host-side **session-private directory** bound to the guest `/tmp` (registered in
+  `sandbox.guest_fs` by `_append_tmpfs_roots` on bind), so one-shot/resident/exec/lsp paths all land in the same
+  directory; `/tmp/…` arguments to `read_file`/`list_files`/`file_exists` are mapped back via `guest_fs.to_host`
+  (only when the mapped host file exists, so a real host `/tmp` file is never shadowed).
+- The truncation note contains a sandbox path, so it must be appended **after** `conceal.redact`, otherwise it is
+  stripped by redaction.
+- **Degradation**: with no sandbox (no `/tmp` mapping) the guard only truncates and does not spill, and says so.
+- Disable with `tools.output_guard.enabled=false` (one-switch opt-out; only the existing hard caps remain).
 
 ### 🔌 Background processes (session-resident sandbox instance)
 
@@ -274,7 +295,11 @@ dedicated tools above.
 or `{ label, description }` (label is a short option summary, description is the option description; the two are
 displayed separately in the popup and highlighted). Only one question popup is shown at a time; multiple questions
 issued in parallel are queued in order (the next is shown after the previous is answered/cancelled), and they do not
-fail outright.
+fail outright. **It does not pop up immediately when focus is not on the NeoAI UI**: the config is stashed and it
+waits (`ASK_USER_WAITING` is still emitted, so the Herder lifecycle shows `blocked`), then pops once the user
+switches back to the NeoAI UI (`UI_FOCUS_CHANGED` focused=true). The same mechanism applies to the blocking
+tool-approval (tool_approval), secret-alert (secret_alert) and network-consent (net_consent) popups (see the
+"Focus-aware interactive popups" section in [sandbox.md](sandbox.md)).
 
 ### 🖼 Images (read_image.lua)
 

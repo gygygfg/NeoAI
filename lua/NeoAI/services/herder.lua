@@ -33,6 +33,7 @@ local state = {
   auto_install = true, -- 启动时是否异步自动安装 Herder 展示增强片段（幂等）
   metadata_sent = false, -- 本次权威生命周期内是否已上报过展示元数据
   agents = {}, -- agent_id -> { state, blocked, ask_user_waiting }
+  pty_waiting = {}, -- session_id -> true（pty 会话正在等待用户输入；占位即 pane 级 blocked）
   seq = 0, -- 单调递增信号序号（init/reset 时用挂钟基数 _seq_base() 起始，见下）
   last_reported = nil, -- 上次已上报的 pane 状态；nil = 尚未接管权威
 }
@@ -194,9 +195,11 @@ local function _schedule_auto_install()
 end
 
 --- 聚合所有已跟踪 agent 的 pane 级状态：blocked > working > idle
+--- pty 会话等待用户输入（占位即等待）同样视为 pane 级 blocked（渲染为红）。
 --- @return string
 local function _aggregate()
   local blocked, working = false, false
+  for _ in pairs(state.pty_waiting) do blocked = true; break end
   for _, e in pairs(state.agents) do
     if e.blocked > 0 or e.ask_user_waiting then
       blocked = true
@@ -342,6 +345,19 @@ local function _subscribe()
   on(ev.TOOL_APPROVAL_CANCELLED, function(d) _blocked_dec(d and d.agent_id) end)
   on(ev.ASK_USER_WAITING, function(d) _ask_waiting(d and d.agent_id, true) end)
   on(ev.ASK_USER_ANSWERED, function(d) _ask_waiting(d and d.agent_id, false) end)
+  -- pty 会话等待用户输入：pane 级 blocked（渲染为红），直到输入送达或会话结束。
+  on(ev.PTY_WAITING_INPUT, function(d)
+    local id = d and d.id
+    if id then state.pty_waiting[id] = true; _recompute() end
+  end)
+  on(ev.PTY_INPUT_SENT, function(d)
+    local id = d and d.id
+    if id and state.pty_waiting[id] then state.pty_waiting[id] = nil; _recompute() end
+  end)
+  on(ev.PTY_EXITED, function(d)
+    local id = d and d.id
+    if id and state.pty_waiting[id] then state.pty_waiting[id] = nil; _recompute() end
+  end)
 end
 
 -- ========== 公开 API ==========
@@ -493,6 +509,7 @@ function M.reset()
     auto_install = true,
     metadata_sent = false,
     agents = {},
+    pty_waiting = {},
     seq = _seq_base(),
     last_reported = nil,
   }

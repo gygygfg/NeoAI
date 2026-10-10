@@ -132,6 +132,9 @@ tests.suite("pty", function(_, it, before_each)
     local cfg = config_store
     local old = cfg.get("tools.run_command.interactive.show_window")
     local saved = package.loaded["NeoAI.ui.window.chat_view"]
+    -- 本用例只验证「光标跟随」维度：固定焦点为「聚焦 NeoAI 界面」，隔离焦点门控变量。
+    local focus_saved = package.loaded["NeoAI.ui.focus"]
+    package.loaded["NeoAI.ui.focus"] = { is_focused = function() return true end }
 
     cfg.set("tools.run_command.interactive.show_window", "on_wait")
     package.loaded["NeoAI.ui.window.chat_view"] = { is_following = function() return false end }
@@ -166,6 +169,7 @@ tests.suite("pty", function(_, it, before_each)
     t.false_(pty._should_show_window({}, "delay"), "never 不弹")
 
     package.loaded["NeoAI.ui.window.chat_view"] = saved
+    package.loaded["NeoAI.ui.focus"] = focus_saved
     cfg.set("tools.run_command.interactive.show_window", old)
   end)
 
@@ -175,6 +179,8 @@ tests.suite("pty", function(_, it, before_each)
     local old_sw = cfg.get("tools.run_command.interactive.show_window")
     local tw_saved = package.loaded["NeoAI.ui.components.terminal_window"]
     local cv_saved = package.loaded["NeoAI.ui.window.chat_view"]
+    local focus_saved = package.loaded["NeoAI.ui.focus"]
+    package.loaded["NeoAI.ui.focus"] = { is_focused = function() return true end }
     pcall(pty.reset)
 
     local opened = true
@@ -199,6 +205,7 @@ tests.suite("pty", function(_, it, before_each)
     pcall(pty.reset)
     package.loaded["NeoAI.ui.components.terminal_window"] = tw_saved
     package.loaded["NeoAI.ui.window.chat_view"] = cv_saved
+    package.loaded["NeoAI.ui.focus"] = focus_saved
     cfg.set("tools.run_command.interactive.show_window", old_sw)
   end)
 
@@ -208,6 +215,8 @@ tests.suite("pty", function(_, it, before_each)
     local old_sw = cfg.get("tools.run_command.interactive.show_window")
     local tw_saved = package.loaded["NeoAI.ui.components.terminal_window"]
     local cv_saved = package.loaded["NeoAI.ui.window.chat_view"]
+    local focus_saved = package.loaded["NeoAI.ui.focus"]
+    package.loaded["NeoAI.ui.focus"] = { is_focused = function() return true end }
     pcall(pty.reset)
 
     local opens = {}
@@ -253,6 +262,49 @@ tests.suite("pty", function(_, it, before_each)
     t.true_(opens["ptyC"] == true, "always 下未结束会话应重弹")
 
     pty._set_force_ui(false)
+    pcall(pty.reset)
+    package.loaded["NeoAI.ui.components.terminal_window"] = tw_saved
+    package.loaded["NeoAI.ui.window.chat_view"] = cv_saved
+    package.loaded["NeoAI.ui.focus"] = focus_saved
+    cfg.set("tools.run_command.interactive.show_window", old_sw)
+  end)
+
+  it("焦点不在 NeoAI 界面时悬浮终端不弹（进入等待）", function(t)
+    local pty = require("NeoAI.services.pty")
+    local focus = require("NeoAI.ui.focus")
+    local cfg = config_store
+    local old_sw = cfg.get("tools.run_command.interactive.show_window")
+    local tw_saved = package.loaded["NeoAI.ui.components.terminal_window"]
+    local cv_saved = package.loaded["NeoAI.ui.window.chat_view"]
+    pcall(pty.reset)
+    focus.reset()
+
+    package.loaded["NeoAI.ui.components.terminal_window"] = { is_open = function() return false end }
+    package.loaded["NeoAI.ui.window.chat_view"] = { is_following = function() return true end }
+    pty._set_force_ui(true)
+    cfg.set("tools.run_command.interactive.show_window", "on_wait")
+
+    focus.install()
+    focus._set_force_ui(true) -- headless 下模拟 attached UI，使焦点门控生效
+    -- 当前窗口为普通 buffer → 未聚焦 → 即使光标跟随也不弹
+    local plain = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_set_current_buf(plain)
+    focus.refresh()
+    t.false_(focus.is_focused())
+    t.false_(pty._should_show_window({}, "delay"), "未聚焦时不应弹出（进入等待）")
+
+    -- 切到 NeoAI 界面 buffer → 聚焦 → 可弹
+    local neo = vim.api.nvim_create_buf(false, true)
+    vim.bo[neo].filetype = "neoai_sandbox_review"
+    vim.api.nvim_set_current_buf(neo)
+    focus.refresh()
+    t.true_(focus.is_focused())
+    t.true_(pty._should_show_window({}, "delay"), "聚焦且跟随时应可弹出")
+
+    vim.api.nvim_buf_delete(plain, { force = true })
+    vim.api.nvim_buf_delete(neo, { force = true })
+    pty._set_force_ui(false)
+    focus.reset()
     pcall(pty.reset)
     package.loaded["NeoAI.ui.components.terminal_window"] = tw_saved
     package.loaded["NeoAI.ui.window.chat_view"] = cv_saved

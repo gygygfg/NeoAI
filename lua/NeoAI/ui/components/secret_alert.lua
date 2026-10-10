@@ -105,10 +105,10 @@ end
 
 -- ========== 公开 API ==========
 
---- 展示告警弹窗
+--- 展示告警弹窗（实际建窗）
 --- @param ctx table
 --- @param decide function(decision)
-function M.show(ctx, decide)
+local function _present(ctx, decide)
   if state.win_id and vim.api.nvim_win_is_valid(state.win_id) then _close() end
   state.decide = decide
   state.has_fake = ctx and ctx.fake ~= nil and ctx.fake ~= ""
@@ -142,8 +142,17 @@ function M.show(ctx, decide)
   _set_keymaps()
 end
 
+--- 展示告警弹窗。焦点不在 NeoAI 界面（用户切到其他窗口）时不立即弹出，暂存并进入等待，
+--- 待切回 NeoAI 界面再弹（经 `focus.gate`）。
+--- @param ctx table
+--- @param decide function(decision)
+function M.show(ctx, decide)
+  require("NeoAI.ui.focus").gate("secret_alert", function() _present(ctx, decide) end)
+end
+
 --- 隐藏弹窗
 function M.hide()
+  require("NeoAI.ui.focus").cancel_gate("secret_alert")
   _close()
 end
 
@@ -156,6 +165,7 @@ end
 --- 重置（测试用）
 function M.reset()
   _close()
+  pcall(function() require("NeoAI.ui.focus").cancel_gate("secret_alert") end)
   pcall(function() require("NeoAI.sandbox.secret_alert").set_ui(nil) end)
 end
 

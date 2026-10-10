@@ -166,4 +166,32 @@ tests.suite("git_ops", function(_, it, before_each)
     ctx.sandbox_cwd = saved
     t.eq("git status --short", out, "前缀应被置于 git 参数之前")
   end)
+
+  it("git_log：输出超限时截断为头+尾并落盘到沙箱 /tmp", function(t)
+    local config_store = require("NeoAI.kernel.config_store")
+    local guest_fs = require("NeoAI.sandbox.guest_fs")
+    local cs = config_store.get("tools.output_guard") or {}
+    local saved = { max_chars = cs.max_chars, head_chars = cs.head_chars, tail_chars = cs.tail_chars }
+    config_store.set("tools.output_guard.max_chars", 100)
+    config_store.set("tools.output_guard.head_chars", 70)
+    config_store.set("tools.output_guard.tail_chars", 20)
+    local host = vim.fn.tempname() .. "-og"
+    vim.fn.mkdir(host, "p")
+    guest_fs.set_root("/tmp", host)
+    local ok, err = pcall(function()
+      for i = 1, 10 do
+        write("a.txt", "hello\n" .. i .. "\n")
+        git("add a.txt")
+        git("commit -qm c" .. i)
+      end
+      local out = invoke(tools.git_log, { max = 10 })
+      t.matches("输出过长已截断", out, "超限输出应被截断")
+      t.matches("/tmp/neoai%-out/[%w_%-%.]+%.log", out, "应给出落盘路径")
+    end)
+    config_store.set("tools.output_guard.max_chars", saved.max_chars)
+    config_store.set("tools.output_guard.head_chars", saved.head_chars)
+    config_store.set("tools.output_guard.tail_chars", saved.tail_chars)
+    guest_fs.clear()
+    if not ok then error(err, 0) end
+  end)
 end)

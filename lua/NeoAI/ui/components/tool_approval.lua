@@ -114,9 +114,9 @@ end
 
 -- ========== 公开 API ==========
 
---- 展示审批弹窗
+--- 展示审批弹窗（实际建窗）
 --- @param config table { text, tool_name, args, on_confirm, on_cancel, on_confirm_all, on_add_to_workspace }
-function M.show(config)
+local function _present(config)
   if state.win_id and vim.api.nvim_win_is_valid(state.win_id) then
     _close()
   end
@@ -163,8 +163,16 @@ function M.show(config)
   _set_keymaps()
 end
 
+--- 展示审批弹窗。焦点不在 NeoAI 界面（用户切到其他窗口）时不立即弹出，暂存并进入等待，
+--- 待切回 NeoAI 界面再弹（经 `focus.gate`）。审批超时/经审批中心决策会调用 `hide()` 取消暂存。
+--- @param config table { text, tool_name, args, on_confirm, on_cancel, on_confirm_all, on_add_to_workspace }
+function M.show(config)
+  require("NeoAI.ui.focus").gate("tool_approval", function() _present(config) end)
+end
+
 --- 隐藏弹窗
 function M.hide()
+  require("NeoAI.ui.focus").cancel_gate("tool_approval")
   _close()
 end
 
@@ -181,6 +189,7 @@ end
 --- 重置（测试用）：关闭弹窗并解除 tool_service 注册
 function M.reset()
   _close()
+  pcall(function() require("NeoAI.ui.focus").cancel_gate("tool_approval") end)
   local tool_service = services.use("services.tool_service")
   if tool_service then tool_service.set_approval_ui(nil) end
 end
