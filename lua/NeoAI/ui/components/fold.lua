@@ -107,17 +107,16 @@ function M.record_start(tool_call_id, timer)
   }
 end
 
---- 注册工具的原对象计时器（tool_loop 直接调用）。
+--- 注册工具的原对象计时器（供外部注入的兼容入口；core 现经 kernel 实时指标桥注入）。
 --- 事件总线经 nvim_exec_autocmds 传递 data 会深拷贝并丢失元表/方法，计时器的 elapsed
---- 等方法无法随事件传播；tool_loop 以原对象（含元表）注册到这里，get_duration 才可用它
---- 实时读取剔除用户交互等待的活跃耗时。已存在记录时仅更新 timer 字段。
+--- 等方法无法随事件传播；core 侧将原对象注册到 kernel.live_metrics，get_duration 据此
+--- 实时读取剔除用户交互等待的活跃耗时。
 --- @param tool_call_id string
 --- @param timer table|nil
 function M.set_live_timer(tool_call_id, timer)
+  require("NeoAI.kernel.live_metrics").set(tool_call_id, timer)
   local rec = timing[tool_call_id]
-  if rec then
-    rec.timer = timer
-  else
+  if not rec then
     timing[tool_call_id] = { timer = timer, start_ms = _now_ms(), duration_ms = nil, status = "running" }
   end
 end
@@ -134,6 +133,8 @@ function M.record_end(tool_call_id, duration_ms, status)
   else
     timing[tool_call_id] = { start_ms = nil, duration_ms = duration_ms, status = status or "success" }
   end
+  -- 结束后清除实时指标桥中的计时器引用，避免泄漏。
+  require("NeoAI.kernel.live_metrics").clear(tool_call_id)
 end
 
 --- 工具耗时：未完成返回已执行时长，已完成返回总时长
@@ -145,8 +146,12 @@ function M.get_duration(tool_call_id)
   if not rec then return nil end
   if rec.duration_ms then return rec.duration_ms end
   -- 优先用可暂停计时器的活跃耗时：等待用户交互的暂停期间耗时保持不变。
-  -- 计时器须是 set_live_timer 注册的原对象（含元表）；经事件总线深拷贝的副本无 elapsed，
-  -- 会回退到墙钟。
+  -- 计时器由 core 经 kernel 实时指标桥（live_metrics）按原对象注入（含元表，可用 elapsed）；
+  -- 经事件总线深拷贝的副本无 elapsed，会回退到墙钟。
+  local live = require("NeoAI.kernel.live_metrics").get(tool_call_id)
+  if live and live.elapsed then
+    return live:elapsed()
+  end
   if rec.timer and rec.timer.elapsed then
     return rec.timer:elapsed()
   end
@@ -176,6 +181,9 @@ end
 
 --- 清空计时（窗口关闭/会话切换时调用）
 function M.clear_timing()
+  for id in pairs(timing) do
+    require("NeoAI.kernel.live_metrics").clear(id)
+  end
   timing = {}
 end
 

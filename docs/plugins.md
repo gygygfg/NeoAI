@@ -181,6 +181,23 @@ require("NeoAI").setup({
 3. `plugins.stop_all()` → `event_bus.clear_all()` → 清空 `NeoAI.*` 缓存 → 重新 `setup()`；
 4. 重建界面并恢复会话；失败则恢复模块缓存快照。
 
+> 热重载实现位于 `lua/NeoAI/plugins/reload.lua`（插件宿主操作，非 AI 工具），由 `commands` 插件经
+> `require("NeoAI.plugins.reload")` 调用。
+
+## 6.1 组合根注入的 kernel 桥
+
+`catalog.lua` 作为组合根，在启动相应服务时向 `kernel/` 的中立桥接模块注入实现，使 core / services /
+tools / sandbox / ui 之间不再直接互相 `require`（详见 `styleGuide.md` 依赖规则）：
+
+- `services.agent` 启动时注入 `kernel.core_bridge`（Agent 运行时 spawn/get/run/abort、`core.agent.prefix`、
+  `core.attachment.attachment`）——解 tools→core。
+- `services.sandbox` 启动时注入 `kernel.llm_bridge`（`core.agent.request.send`）与
+  `kernel.sandbox_bridge`（`sandbox.secret_alert`/`exec`/`candidate`）——解 sandbox→core 与 core→sandbox。
+- `kernel.live_metrics` 由 core（工具循环）写入、ui（折叠渲染）读取——解 core→ui。
+- `kernel.ui_hooks` 由 ui（提问弹窗）写入、tools（ask_user）读取——解 tools↔ui。
+
+桥在对应服务未启动/被禁用时返回 `nil`/no-op，调用方显式降级；`stop` 时一并 `reset`。
+
 ## 7. 测试要求
 
 插件专项测试见 `lua/NeoAI/tests/test_plugins.lua`，覆盖：

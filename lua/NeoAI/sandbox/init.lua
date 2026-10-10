@@ -665,6 +665,193 @@ function M.metrics()
   return m
 end
 
+-- ========== UI 门面 ==========
+-- 供表现层经 `services.use("services.sandbox")` 调用；ui/ 不得直接 require 沙箱内部模块。
+-- 下列为语义化封装（内部实现可自由重构，不影响调用方）。
+
+--- 审批中心页定义（对齐 approval_hub.PAGES）
+--- @return table 数组 { { id, label, ... } }
+function M.hub_pages()
+  return require("NeoAI.sandbox.approval_hub").PAGES
+end
+
+--- 注册审批中心的 UI 渲染器（由 ui 层初始化时注入；传 nil 解绑）
+--- @param ui table|nil
+function M.set_hub_ui(ui)
+  return require("NeoAI.sandbox.approval_hub").set_ui(ui)
+end
+
+--- 某审批页的待处理数量
+--- @param page string
+--- @return number
+function M.hub_pending_count(page)
+  return require("NeoAI.sandbox.approval_hub").pending_count(page)
+end
+
+--- 列出某审批页的条目
+--- @param page string
+--- @return table 数组
+function M.hub_list(page)
+  return require("NeoAI.sandbox.approval_hub").list(page)
+end
+
+--- 解析一个审批条目（用户作答）
+--- @param id string
+--- @param value any
+--- @return boolean
+function M.hub_resolve(id, value)
+  return require("NeoAI.sandbox.approval_hub").resolve(id, value)
+end
+
+--- 读取一个审批条目
+--- @param id string
+--- @return table|nil
+function M.hub_get(id)
+  return require("NeoAI.sandbox.approval_hub").get(id)
+end
+
+--- 重置审批中心（测试/关闭清理用）
+function M.reset_approval_hub()
+  return require("NeoAI.sandbox.approval_hub").reset()
+end
+
+--- 注册网络放行确认 UI 渲染器（由 ui 层注入；传 nil 解绑）
+--- @param ui table|nil
+function M.set_net_consent_ui(ui)
+  return require("NeoAI.sandbox.net_consent").set_ui(ui)
+end
+
+--- 注册密钥外泄告警 UI 渲染器（由 ui 层注入；传 nil 解绑）
+--- @param ui table|nil
+function M.set_secret_alert_ui(ui)
+  return require("NeoAI.sandbox.secret_alert").set_ui(ui)
+end
+
+-- ---------- 呈现层只读查询（语义封装） ----------
+
+--- 风险等级徽标文本
+--- @param level number|nil
+--- @return string
+function M.risk_badge(level)
+  return risk.badge(level)
+end
+
+--- 把文本中的密钥令牌还原为真实值（best-effort；预览展示用）
+--- @param text string
+--- @return string
+function M.detokenize(text)
+  return secret.detokenize(text)
+end
+
+--- 脱敏：把文本中的真实密钥替换为占位
+--- @param text string
+--- @return string
+function M.redact(text)
+  return secret.redact(text)
+end
+
+--- 路径分类（git 内部路径等；供展示选择目标）
+--- @param path string
+--- @return string|nil
+function M.git_path_class(path)
+  return runtime.git_path_class(path)
+end
+
+--- 按文件路径聚合留痕（可对任意留痕子集调用）
+--- @param entries table|nil
+--- @return table 数组
+function M.group_traces(entries)
+  return trace.group(entries)
+end
+
+--- 按命令聚合留痕（可对任意留痕子集调用）
+--- @param entries table|nil
+--- @return table 数组
+function M.group_traces_by_command(entries)
+  return trace.group_by_command(entries)
+end
+
+--- 行为审计条目分页/过滤
+--- @param filter table|nil
+--- @return table 数组
+function M.audit_list(filter)
+  return audit.list(filter)
+end
+
+--- 行为审计与风险评估摘要
+--- @return string
+function M.audit_summary()
+  return audit.summary()
+end
+
+--- 沙箱资源域/负载诊断（137/OOM 归因）
+--- @return table
+function M.diag_sandbox_limits()
+  return require("NeoAI.sandbox.diag").sandbox_limits()
+end
+
+-- ---------- AI 审计 / L3 警示（异步生成） ----------
+
+--- AI 审计：从审计 notes 文本判定结论（safe/unsafe/nil）
+--- @param notes string|nil
+--- @return string|nil
+function M.audit_verdict(notes)
+  return require("NeoAI.sandbox.ai_audit").verdict(notes)
+end
+
+--- AI 审计：构造发给模型的用户消息（取当前 agent 的安全上下文）
+--- @param agent table|nil
+--- @return table
+function M.audit_user_messages(agent)
+  return require("NeoAI.sandbox.ai_audit").user_messages(agent)
+end
+
+--- AI 审计：异步生成审计结论
+--- @param items table
+--- @param user_messages table
+--- @param opts table
+--- @param on_done function
+function M.audit_generate(items, user_messages, opts, on_done)
+  return require("NeoAI.sandbox.ai_audit").generate(items, user_messages, opts, on_done)
+end
+
+--- L3 高危二次确认警示文案：异步生成（失败时调用方回退 l3_fallback）
+--- @param item table
+--- @param target table
+--- @param on_done function(text: string)
+function M.l3_generate(item, target, on_done)
+  return require("NeoAI.sandbox.l3_warning").generate(item, target, on_done)
+end
+
+--- L3 高危二次确认警示文案：同步兜底
+--- @param item table
+--- @param target table
+--- @return string
+function M.l3_fallback(item, target)
+  return require("NeoAI.sandbox.l3_warning").fallback(item, target)
+end
+
+-- ---------- 会话级自动审批 / 运行时诊断 ----------
+
+--- 会话级自动审批开关（nil 走配置默认）
+--- @param v boolean|nil
+function M.set_session_auto(v)
+  return review.set_session_auto(v)
+end
+
+--- 当前会话自动审批是否生效
+--- @return boolean
+function M.session_auto()
+  return review.session_auto()
+end
+
+--- overlay 可用性诊断（供 :NeoAISandboxCaps 展示）
+--- @param root string|nil
+--- @return table { available: boolean, reason: string|nil }
+function M.overlay_diagnosis(root)
+  return runtime.overlay_diagnosis(root)
+end
+
 --- 子模块引用
 M.control = control
 M.candidate = candidate

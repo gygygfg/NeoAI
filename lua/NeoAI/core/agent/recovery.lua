@@ -89,8 +89,8 @@ local function _guard_secret_context(agent, messages)
   -- 弹窗展示信息：来源消息 + 命中的真实密钥 + 将替换使用的假密钥。
   local source = _find_leak_source(messages, leaked)
   local fake = secret.fake_for and secret.fake_for(leaked) or nil
-  local alert = require("NeoAI.sandbox.secret_alert")
-  if not alert.available() then return stop() end
+  local alert = require("NeoAI.kernel.sandbox_bridge").secret_alert()
+  if not alert or not alert.available() then return stop() end
   return alert.request({
     kind = "context", agent = agent, command = source,
     secret = leaked, secret_preview = tostring(leaked):sub(1, 6) .. "…", fake = fake,
@@ -103,7 +103,7 @@ local function _guard_secret_context(agent, messages)
         pcall(function() secret.replace_value(agent.messages, leaked, fake) end)
       end
       pcall(function()
-        require("NeoAI.sandbox.secret_flow").record("context", { fake = fake, command = source })
+        require("NeoAI.kernel.sandbox_bridge").record_secret_flow("context", { fake = fake, command = source })
       end)
     end
     pcall(function()

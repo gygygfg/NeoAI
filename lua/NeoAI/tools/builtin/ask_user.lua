@@ -8,12 +8,14 @@
 local helpers = require("NeoAI.tools.builtin.tool_helpers")
 local event_bus = require("NeoAI.kernel.event_bus")
 local events = require("NeoAI.kernel.events")
+local ui_hooks = require("NeoAI.kernel.ui_hooks")
 
 local M = {}
 
 -- ========== 私有状态 ==========
 
-local ui = nil -- { show(config), hide() }
+-- 提问 UI 经 kernel.ui_hooks 注册（ui/components/ask_user 注入），tools 不直接依赖 ui。
+local UI_HOOK = "ask_user"
 -- 并行提问排队：同一时刻只展示一个提问弹窗，其余按序等待；前一个回答/取消后再展示下一个，
 -- 而不是直接失败。UI 是单窗口，串行展示避免双弹窗互相覆盖挂起。
 local queue = {} -- 待展示的提问（FIFO）
@@ -77,6 +79,7 @@ local function _activate(inv)
     end,
   }
 
+  local ui = ui_hooks.get(UI_HOOK)
   if ui and ui.show then
     local ok, err = pcall(ui.show, config)
     if not ok then
@@ -181,6 +184,7 @@ ask_user_tools.ask_user = helpers.define_tool(
     local signal = ctx and ctx.signal
     if signal and signal.subscribe then
       inv.unsub = signal:subscribe(function(reason)
+        local ui = ui_hooks.get(UI_HOOK)
         if current == inv and ui and ui.hide then pcall(ui.hide) end
         _settle(inv, false, { kind = "aborted", message = "提问被取消（" .. tostring(reason or "aborted") .. "）" }, false)
       end)
@@ -195,22 +199,22 @@ ask_user_tools.ask_user = helpers.define_tool(
 
 -- ========== 公开 API ==========
 
---- 注册提问 UI 实现
+--- 注册提问 UI 实现（经 kernel.ui_hooks；tools 不直接依赖 ui）
 --- @param impl table { show(config), hide() }
 ---   show(config): { question, options, on_answer(answer), on_cancel(reason) }
 function M.set_ui(impl)
-  ui = impl
+  ui_hooks.set(UI_HOOK, impl)
 end
 
 --- 获取当前提问 UI（测试用）
 --- @return table|nil
 function M.get_ui()
-  return ui
+  return ui_hooks.get(UI_HOOK)
 end
 
 --- 重置（测试用）
 function M.reset()
-  ui = nil
+  ui_hooks.clear(UI_HOOK)
   queue = {}
   current = nil
 end

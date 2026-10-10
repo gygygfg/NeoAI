@@ -21,6 +21,7 @@ local state = {
   lualine_injected = false, -- 是否已把 'neoai' 注入 lualine extensions
   unsubs = {}, -- 事件订阅句柄
   capacity_cache = {}, -- agent_id -> { key, value }：容量估算缓存（避免每次状态栏重绘重算）
+  display = nil, -- 当前显示模式标签（由 UI 经事件/推送上报，服务不反向依赖 ui）
 }
 
 -- 沙箱待审徽标的自定义高亮组：黄底加粗，醒目；用户可在
@@ -394,9 +395,9 @@ function M.get_info()
     -- 上下文容量：优先 API 最近一次请求的真实输入 token，缺失回退完整请求估算
     info.capacity = M.capacity_for(agent)
   end
-  local display_modes = require("NeoAI.ui.components.display_modes")
-  local disp = display_modes.get_current()
-  info.display = disp and (disp.label or disp.name) or nil
+  -- 显示模式标签：由 UI 经 DISPLAY_MODE_CHANGED 事件（或 set_display 推送）上报；
+  -- services 不反向 require ui 组件。
+  info.display = state.display
   return info
 end
 
@@ -474,6 +475,11 @@ function M.watch()
   for _, ev in ipairs(subscribed) do
     state.unsubs[#state.unsubs + 1] = event_bus.on(ev, _refresh)
   end
+  -- 显示模式标签单独订阅：从事件负载取 label 存入 state（不再反向读 ui 组件）。
+  state.unsubs[#state.unsubs + 1] = event_bus.on(events.DISPLAY_MODE_CHANGED, function(data)
+    state.display = data and data.label or nil
+    _refresh()
+  end)
   -- Agent 销毁时清理其容量缓存条目，避免 capacity_cache 随会话数无界增长。
   state.unsubs[#state.unsubs + 1] = event_bus.on(events.AGENT_DISPOSED, function(data)
     if data and data.agent_id then state.capacity_cache[data.agent_id] = nil end
@@ -493,6 +499,13 @@ end
 --- 刷新状态栏（供扩展 init / 手动调用）
 function M.refresh()
   _refresh()
+end
+
+--- 上报当前显示模式标签（由 UI 调用；幂等）。
+--- 经此或 DISPLAY_MODE_CHANGED 事件更新，状态栏据此渲染 display 部件。
+--- @param label string|nil
+function M.set_display(label)
+  state.display = label
 end
 
 return M

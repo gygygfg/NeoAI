@@ -184,6 +184,25 @@ The controlled reload in `:NeoAIReloadAll`:
 3. `plugins.stop_all()` → `event_bus.clear_all()` → clear `NeoAI.*` cache → `setup()` again;
 4. Rebuild the UI and restore the session; on failure restore the cache snapshot.
 
+> The reload implementation lives in `lua/NeoAI/plugins/reload.lua` (a plugin-host operation, not an
+> AI tool); the `commands` plugin calls it via `require("NeoAI.plugins.reload")`.
+
+## 6.1 Kernel bridges injected by the composition root
+
+As the composition root, `catalog.lua` injects implementations into the neutral bridge modules under
+`kernel/` when starting the relevant services, so core / services / tools / sandbox / ui no longer
+`require` each other directly (see the dependency rules in `styleGuide.md`):
+
+- Starting `services.agent` injects `kernel.core_bridge` (agent runtime spawn/get/run/abort,
+  `core.agent.prefix`, `core.attachment.attachment`) — decouples tools→core.
+- Starting `services.sandbox` injects `kernel.llm_bridge` (`core.agent.request.send`) and
+  `kernel.sandbox_bridge` (`sandbox.secret_alert`/`exec`/`candidate`) — decouples sandbox→core and core→sandbox.
+- `kernel.live_metrics` is written by core (tool loop) and read by ui (fold rendering) — decouples core→ui.
+- `kernel.ui_hooks` is written by ui (ask prompt) and read by tools (ask_user) — decouples tools↔ui.
+
+When the corresponding service is not started/disabled, a bridge returns `nil`/no-op and callers
+degrade explicitly; `stop` also `reset`s them.
+
 ## 7. Testing Requirements
 
 Plugin-specific tests live in `lua/NeoAI/tests/test_plugins.lua` and cover:

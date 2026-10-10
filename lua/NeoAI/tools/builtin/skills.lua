@@ -6,7 +6,13 @@
 
 local helpers = require("NeoAI.tools.builtin.tool_helpers")
 local config_store = require("NeoAI.kernel.config_store")
-local prefix = require("NeoAI.core.agent.prefix")
+-- 提示段注册经 kernel.core_bridge（组合根注入）解析：tools 不直接依赖 core。
+local prefix = setmetatable({}, {
+  __index = function(_, k)
+    local p = require("NeoAI.kernel.core_bridge").prefix()
+    return p and p[k]
+  end,
+})
 local services = require("NeoAI.kernel.services")
 
 local M = {}

@@ -12,7 +12,7 @@ tests.suite("reload_all", function(_, it)
   end)
 
   it("_plugin_root 解析出含 lua/ 的插件根目录", function(t)
-    local m = require("NeoAI.tools.builtin.reload_all")
+    local m = require("NeoAI.plugins.reload")
     local root = m._plugin_root()
     t.not_nil(root, "应解析出插件根目录")
     t.true_(vim.fn.isdirectory(root .. "/lua") == 1, "插件根下应存在 lua/ 目录")
@@ -20,7 +20,7 @@ tests.suite("reload_all", function(_, it)
   end)
 
   it("预检脚本包含关键模块与结果标记", function(t)
-    local m = require("NeoAI.tools.builtin.reload_all")
+    local m = require("NeoAI.plugins.reload")
     local script = m._precheck_script()
     t.matches("NeoAI", script)
     t.matches("setup", script)
@@ -32,7 +32,7 @@ tests.suite("reload_all", function(_, it)
   end)
 
   it("预检失败时返回报错", function(t)
-    local m = require("NeoAI.tools.builtin.reload_all")
+    local m = require("NeoAI.plugins.reload")
     -- 注入一个必定失败的预检执行器（模拟子进程报错）
     m._set_spawner(function()
       return { code = 1, stdout = "RELOAD_PRECHECK_FAIL\n", stderr = "some_module: syntax error near 'x'" }
@@ -47,7 +47,7 @@ tests.suite("reload_all", function(_, it)
   end)
 
   it("预检通过时返回 ok", function(t)
-    local m = require("NeoAI.tools.builtin.reload_all")
+    local m = require("NeoAI.plugins.reload")
     m._set_spawner(function()
       return { code = 0, stdout = "RELOAD_PRECHECK_OK\n", stderr = "" }
     end)

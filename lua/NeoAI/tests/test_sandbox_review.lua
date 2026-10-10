@@ -3,6 +3,9 @@
 --- 覆盖：路径级别分类、按级别高亮标记、按安全等级着色的「待审」标签、渲染与行映射。
 
 local tests = require("NeoAI.tests")
+-- 沙箱审批 UI 经 `services.sandbox` 门面访问沙箱能力；本套件的部分桩只覆盖数据/行为方法，
+-- 渲染与查询辅助经共享辅助按真实实现补齐（等价于重构前 UI 直接 require 沙箱内部模块的行为）。
+local _provide_sandbox = require("NeoAI.tests.sandbox_stub").provide
 
 tests.suite("sandbox_review", function(_, it)
   it("level_of 按工作区/用户目录/系统分类", function(t)
@@ -322,7 +325,7 @@ tests.suite("sandbox_review", function(_, it)
     sr.reset()
     local saved = services.use("services.sandbox")
     local cwd = vim.fn.getcwd()
-    services.provide("services.sandbox", {
+    _provide_sandbox({
       list_reviews = function()
         return { { change_set_id = "csGFO", tool = "git_add", atomic_group = "git", risk_level = 0,
           files = { { path = cwd .. "/.git/index" }, { path = cwd .. "/a.lua" } } } }
@@ -378,7 +381,7 @@ tests.suite("sandbox_review", function(_, it)
     local cwd = vim.fn.getcwd()
     local items = { { change_set_id = "csA", tool = "edit_file",
       files = { { path = cwd .. "/a.lua" } } } }
-    services.provide("services.sandbox", {
+    _provide_sandbox({
       list_reviews = function() return vim.deepcopy(items) end,
       list_traces = function() return {} end,
       list_saved = function() return {} end,
@@ -411,7 +414,7 @@ tests.suite("sandbox_review", function(_, it)
     local sr = require("NeoAI.ui.components.sandbox_review")
     sr.reset()
     local saved = services.use("services.sandbox")
-    services.provide("services.sandbox", {
+    _provide_sandbox({
       list_reviews = function() return {} end,
       list_traces = function() return {} end,
       list_saved = function()
@@ -464,7 +467,7 @@ tests.suite("sandbox_review", function(_, it)
     local sr = require("NeoAI.ui.components.sandbox_review")
     sr.reset()
     local saved = services.use("services.sandbox")
-    services.provide("services.sandbox", {
+    _provide_sandbox({
       list_reviews = function() return {} end,
       list_traces = function() return {} end,
       list_saved = function()
@@ -489,7 +492,7 @@ tests.suite("sandbox_review", function(_, it)
     local sr = require("NeoAI.ui.components.sandbox_review")
     sr.reset()
     local saved = services.use("services.sandbox")
-    services.provide("services.sandbox", {
+    _provide_sandbox({
       list_reviews = function() return {} end,
       list_traces = function() return {} end,
       list_saved = function() return {} end,
@@ -520,7 +523,7 @@ tests.suite("sandbox_review", function(_, it)
     local sr = require("NeoAI.ui.components.sandbox_review")
     sr.reset()
     local saved = services.use("services.sandbox")
-    services.provide("services.sandbox", {
+    _provide_sandbox({
       list_reviews = function() return {} end,
       list_traces = function() return { { tool = "read_file", path = "/root/other/x.txt" } } end,
       apply = function() return { ok = true } end,
@@ -540,7 +543,7 @@ tests.suite("sandbox_review", function(_, it)
     local sr = require("NeoAI.ui.components.sandbox_review")
     sr.reset()
     local saved = services.use("services.sandbox")
-    services.provide("services.sandbox", {
+    _provide_sandbox({
       list_reviews = function() return {} end,
       list_traces = function()
         return {
@@ -586,7 +589,7 @@ tests.suite("sandbox_review", function(_, it)
     local sr = require("NeoAI.ui.components.sandbox_review")
     sr.reset()
     local saved = services.use("services.sandbox")
-    services.provide("services.sandbox", {
+    _provide_sandbox({
       list_reviews = function() return {} end,
       list_traces = function()
         return {
@@ -632,7 +635,7 @@ tests.suite("sandbox_review", function(_, it)
     local sr = require("NeoAI.ui.components.sandbox_review")
     sr.reset()
     local saved = services.use("services.sandbox")
-    services.provide("services.sandbox", {
+    _provide_sandbox({
       list_reviews = function() return {} end,
       list_traces = function()
         return {
@@ -669,7 +672,7 @@ tests.suite("sandbox_review", function(_, it)
     sr.reset()
     local saved = services.use("services.sandbox")
     local cwd = vim.fn.getcwd()
-    services.provide("services.sandbox", {
+    _provide_sandbox({
       list_reviews = function()
         return {
           { change_set_id = "cs9", tool = "edit_file", files = { { path = cwd .. "/x.lua", action = "modify" } } },
@@ -703,7 +706,7 @@ tests.suite("sandbox_review", function(_, it)
     local saved = services.use("services.sandbox")
     local cwd = vim.fn.getcwd()
     local rejected = {}
-    services.provide("services.sandbox", {
+    _provide_sandbox({
       list_reviews = function()
         return {
           { change_set_id = "cs10", tool = "edit_file", files = { { path = cwd .. "/y.lua", action = "modify" } } },
@@ -760,7 +763,7 @@ tests.suite("sandbox_review", function(_, it)
     sr.reset()
     local saved = services.use("services.sandbox")
     local cwd = vim.fn.getcwd()
-    services.provide("services.sandbox", {
+    _provide_sandbox({
       list_reviews = function()
         return {
           { change_set_id = "csL2c", tool = "edit_file", risk_level = 2,
@@ -802,7 +805,7 @@ tests.suite("sandbox_review", function(_, it)
     sr.reset()
     local saved = services.use("services.sandbox")
     local applied = {}
-    services.provide("services.sandbox", {
+    _provide_sandbox({
       list_reviews = function()
         return {
           { change_set_id = "csH", kind = "host_op", tool = "run_command",
@@ -877,7 +880,7 @@ tests.suite("sandbox_review", function(_, it)
     local path = cwd .. "/preview.txt"
     local fs = require("NeoAI.utils.fs")
     fs.write_file(path, "old line\nkeep\n")
-    services.provide("services.sandbox", {
+    _provide_sandbox({
       list_reviews = function()
         return {
           {
@@ -939,7 +942,7 @@ tests.suite("sandbox_review", function(_, it)
     local fs = require("NeoAI.utils.fs")
     fs.write_file(path, "old\n")
     local applied = {}
-    services.provide("services.sandbox", {
+    _provide_sandbox({
       list_reviews = function()
         return {
           {
@@ -1005,7 +1008,7 @@ tests.suite("sandbox_review", function(_, it)
     local fs = require("NeoAI.utils.fs")
     fs.write_file(path, "old\n")
     local applied = 0
-    services.provide("services.sandbox", {
+    _provide_sandbox({
       list_reviews = function()
         return {
           {
@@ -1052,7 +1055,7 @@ tests.suite("sandbox_review", function(_, it)
     local cwd = vim.fn.getcwd()
     local path = cwd .. "/l2.txt"
     local applied = 0
-    services.provide("services.sandbox", {
+    _provide_sandbox({
       list_reviews = function()
         return {
           {
@@ -1091,7 +1094,7 @@ tests.suite("sandbox_review", function(_, it)
     local cwd = vim.fn.getcwd()
     local path = cwd .. "/needsroot.txt"
     local calls = {}
-    services.provide("services.sandbox", {
+    _provide_sandbox({
       list_reviews = function()
         return {
           { change_set_id = "csNR", tool = "edit_file", risk_level = 1,
@@ -1145,7 +1148,7 @@ tests.suite("sandbox_review", function(_, it)
     local fs = require("NeoAI.utils.fs")
     fs.write_file(path, "old\n")
     local applied = {}
-    services.provide("services.sandbox", {
+    _provide_sandbox({
       list_reviews = function()
         return {
           {
@@ -1206,7 +1209,7 @@ tests.suite("sandbox_review", function(_, it)
     local cwd = vim.fn.getcwd()
     local path = cwd .. "/pkg2off.txt"
     local applied = 0
-    services.provide("services.sandbox", {
+    _provide_sandbox({
       list_reviews = function()
         return {
           {
@@ -1267,7 +1270,7 @@ tests.suite("sandbox_review", function(_, it)
     local saved = services.use("services.sandbox")
     local cwd = vim.fn.getcwd()
     local calls = {}
-    services.provide("services.sandbox", {
+    _provide_sandbox({
       list_reviews = function()
         return {
           { change_set_id = "csW", tool = "edit_file", files = {
@@ -1306,7 +1309,7 @@ tests.suite("sandbox_review", function(_, it)
     local saved = services.use("services.sandbox")
     local cwd = vim.fn.getcwd()
     local calls = {}
-    services.provide("services.sandbox", {
+    _provide_sandbox({
       list_reviews = function()
         local items = {}
         for i = 1, 3 do
@@ -1406,7 +1409,7 @@ tests.suite("sandbox_review", function(_, it)
     local sr = require("NeoAI.ui.components.sandbox_review")
     sr.reset()
     local saved = services.use("services.sandbox")
-    services.provide("services.sandbox", {
+    _provide_sandbox({
       list_reviews = function() return {} end,
       list_traces = function() return { { tool = "read_file", path = "/root/x.txt" } } end,
       list_saved = function() return {} end,
@@ -1435,7 +1438,7 @@ tests.suite("sandbox_review", function(_, it)
     local hub = require("NeoAI.sandbox.approval_hub")
     sr.reset()
     local saved = services.use("services.sandbox")
-    services.provide("services.sandbox", {
+    _provide_sandbox({
       list_reviews = function() return {} end,
       list_traces = function() return {} end,
       list_saved = function() return {} end,
@@ -1471,7 +1474,7 @@ tests.suite("sandbox_review", function(_, it)
     local sr = require("NeoAI.ui.components.sandbox_review")
     sr.reset()
     local saved = services.use("services.sandbox")
-    services.provide("services.sandbox", {
+    _provide_sandbox({
       list_reviews = function()
         return { { change_set_id = "csHO", kind = "host_op", tool = "run_command",
           host_op_id = "ho1", risk_level = 3, privilege_tier = 2,
@@ -1503,7 +1506,7 @@ tests.suite("sandbox_review", function(_, it)
       },
     })
     local saved = services.use("services.sandbox")
-    services.provide("services.sandbox", {
+    _provide_sandbox({
       list_reviews = function() return {} end,
       list_traces = function() return {} end,
       list_saved = function() return {} end,
@@ -1562,7 +1565,7 @@ tests.suite("sandbox_review", function(_, it)
       tools = { approval = { allowed_directories = { "/tmp/ws-b" } } },
     })
     local saved = services.use("services.sandbox")
-    services.provide("services.sandbox", {
+    _provide_sandbox({
       list_reviews = function() return {} end,
       list_traces = function() return {} end,
       list_saved = function() return {} end,
@@ -1593,7 +1596,7 @@ tests.suite("sandbox_review", function(_, it)
     sr.reset()
     local saved = services.use("services.sandbox")
     local restored = {}
-    services.provide("services.sandbox", {
+    _provide_sandbox({
       list_reviews = function() return {} end,
       list_traces = function() return {} end,
       list_saved = function() return {} end,
@@ -1640,7 +1643,7 @@ tests.suite("sandbox_review", function(_, it)
       { change_set_id = "csB", tool = "edit_file", files = { { path = cwd .. "/b.lua" } } },
     }
     local saved_items = {}
-    services.provide("services.sandbox", {
+    _provide_sandbox({
       list_reviews = function() return vim.deepcopy(pending) end,
       list_traces = function() return {} end,
       list_saved = function() return vim.deepcopy(saved_items) end,
@@ -1684,7 +1687,7 @@ tests.suite("sandbox_review", function(_, it)
     local cwd = vim.fn.getcwd()
     local items = { { change_set_id = "csFocus1", tool = "edit_file",
       files = { { path = cwd .. "/z.lua" } } } }
-    services.provide("services.sandbox", {
+    _provide_sandbox({
       list_reviews = function() return vim.deepcopy(items) end,
       list_traces = function() return {} end,
       list_saved = function() return {} end,

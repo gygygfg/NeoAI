@@ -1807,6 +1807,13 @@ overlay 会 `EINVAL`），此时命令只能运行在「只读根 + 私有可写
   可经 `tools.sandbox.secrets.alert.enabled=false` 关闭弹窗（此时按 fail-closed 直接停止）。
 - **误还原判断**：还原仅当假密钥**不嵌于更长的凭据字符串**（前后非字母/数字/`_`/`-`）时发生；
   二进制 blob 走整块精确匹配，避免部分子串误替换。
+- **非凭据文件排除**：哈希/校验和文件（`SHA256SUMS`、`*.sha256`/`.sha512`/`.md5`/`.sha*sum`/
+  `.md5sum`、`checksums.txt` 等）、编辑器状态转储（Neovim/Vim 的 `*.shada`、`/shada/` 目录）、
+  git 对象库（`/.git/objects/`）、公开 CA 证书包与第三方包缓存（`node_modules`/`site-packages`/
+  `.cargo`/`go/pkg/mod` 等）**一律不视为密钥文件**（`secret.is_secret_path` /
+  `is_sensitive_path` 返回 false）：既不做高熵 token 化、也不触发「获取密钥」告警，生成式密钥
+  扫描（`detect_generated`）同样跳过其内容。避免把 sha256sum 输出、`.shada` 内的历史/寄存器
+  高熵片段误判为密钥。
 
 注：检测前会解析路径/代码语义，`api_key = os.getenv("..._API_KEY")` 这类代码表达式不会被当作
 原始密钥；赋值右侧为**敏感环境变量名引用**（如 `api_key=DASHSCOPE_API_KEY`）时同样不登记。

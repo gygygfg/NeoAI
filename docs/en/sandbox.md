@@ -2227,6 +2227,15 @@ registering it would make any later ordinary code/doc that mentions the name loo
 **Sensitive env-var names (all-uppercase, with a sensitive segment) are monitor-only**: traced and
 escalated to review, never hard-blocked/aborted.
 
+**Non-credential files are excluded**: hash/checksum files (`SHA256SUMS`, `*.sha256`/`.sha512`/
+`.md5`/`.sha*sum`/`.md5sum`, `checksums.txt`, …), editor state dumps (Neovim/Vim `*.shada`, the
+`/shada/` directory), git object stores (`/.git/objects/`), public CA bundles and third-party
+package caches (`node_modules`/`site-packages`/`.cargo`/`go/pkg/mod`, …) are **never** treated as
+secret files (`secret.is_secret_path` / `is_sensitive_path` return false): they are neither
+high-entropy tokenized nor flagged as "secret access", and the generated-secret scan
+(`detect_generated`) skips their contents. This avoids mistaking `sha256sum` output or the
+history/register high-entropy fragments inside `.shada` for secrets.
+
 **Env-var secret values are soft-handled**: `sanitized_env` registers the real value of a sensitive
 env var as an "env-var secret" (`secret.is_env_secret`). Such values are **fallback plaintext-
 tokenized** in AI-visible output — even a bare value (pure hex / no named prefix) that is not in a

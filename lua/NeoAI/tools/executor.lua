@@ -394,7 +394,7 @@ local function _handle_scan_result(scan, tool, tool_name, args, ctx)
     local err = { kind = "secret", message = "SANDBOX_SECRET_BLOCKED: 工具参数包含原始密钥，已终止 Agent" }
     local function stop()
       if agent then
-        pcall(function() require("NeoAI.core.agent.runtime").abort(agent, "secret_exposure") end)
+        pcall(function() require("NeoAI.kernel.core_bridge").agent_abort(agent, "secret_exposure") end)
       end
       pcall(vim.notify,
         "[NeoAI] 检测到对原始密钥的操作，已停止 Agent（工具: " .. tostring(tool_name) .. "）",
@@ -435,7 +435,7 @@ local function _handle_scan_result(scan, tool, tool_name, args, ctx)
     }):then_(function(decision)
       if decision == "stop" then
         if agent then
-          pcall(function() require("NeoAI.core.agent.runtime").abort(agent, "secret_exposure") end)
+          pcall(function() require("NeoAI.kernel.core_bridge").agent_abort(agent, "secret_exposure") end)
         end
         pcall(vim.notify,
           "[NeoAI] 检测到对原始密钥的操作，已停止 Agent（工具: " .. tostring(tool_name) .. "）",
@@ -623,7 +623,7 @@ local function _execute_after_secret_guard(tool, resolved, args, ctx)
         seen[a.id] = true
         local c = a._cross_mount_approved
         if c and c[mount_root] then approved = true break end
-        a = a.parent and require("NeoAI.core.agent.runtime").get(a.parent)
+        a = a.parent and require("NeoAI.kernel.core_bridge").agent_get(a.parent)
       end
       if approved then
         -- 本会话已批准过该挂载点：直接以兼容模式运行，不再重复弹窗。

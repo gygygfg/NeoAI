@@ -116,6 +116,11 @@ lua/NeoAI/
     config_store.lua
     logger.lua
     lifecycle.lua
+    live_metrics.lua         -- Live metrics bridge (core→ui)
+    ui_hooks.lua             -- UI hook registry (ui↔tools)
+    llm_bridge.lua           -- LLM send bridge (sandbox→core)
+    sandbox_bridge.lua       -- Sandbox capability bridge (core→sandbox)
+    core_bridge.lua          -- Core capability bridge (tools→core)
   core/                      -- Core business layer
     session/                 -- Session (object, JSONL store, context builder, compactor,
                              -- plan_distill, runtime_context)

@@ -18,6 +18,86 @@ local geometry = require("NeoAI.ui.geometry")
 
 local M = {}
 
+-- ========== 沙箱服务门面访问器 ==========
+-- ui/ 层唯一入口：全部沙箱能力经 `services.use("services.sandbox")` 获取，
+-- 不直接 require 沙箱内部模块（保持依赖单向 ui → services）。
+
+--- 取沙箱服务（未就绪返回 nil，调用方降级）
+local function _sb() return services.use("services.sandbox") end
+
+--- AI 审计结论判定；服务缺失返回 nil
+local function _audit_verdict(notes)
+  local sb = _sb()
+  return sb and sb.audit_verdict(notes)
+end
+
+--- 风险徽标文本；服务缺失返回 ""
+local function _risk_badge(level)
+  local sb = _sb()
+  return (sb and sb.risk_badge(level)) or ""
+end
+
+--- 按文件聚合留痕；服务缺失返回 {}
+local function _group_traces(entries)
+  local sb = _sb()
+  return (sb and sb.group_traces(entries)) or {}
+end
+
+--- 按命令聚合留痕；服务缺失返回 {}
+local function _group_traces_by_command(entries)
+  local sb = _sb()
+  return (sb and sb.group_traces_by_command(entries)) or {}
+end
+
+--- 审批中心页定义；服务缺失返回 {}
+local function _hub_pages()
+  local sb = _sb()
+  return (sb and sb.hub_pages()) or {}
+end
+
+--- 审批中心某页待处理数量；服务缺失返回 0
+local function _hub_pending(page)
+  local sb = _sb()
+  return (sb and sb.hub_pending_count(page)) or 0
+end
+
+--- 审批中心某页条目；服务缺失返回 {}
+local function _hub_list(page)
+  local sb = _sb()
+  return (sb and sb.hub_list(page)) or {}
+end
+
+--- 裁决一个审批条目
+local function _hub_resolve(id, value)
+  local sb = _sb()
+  return sb and sb.hub_resolve(id, value)
+end
+
+--- 读取一个审批条目
+local function _hub_get(id)
+  local sb = _sb()
+  return sb and sb.hub_get(id)
+end
+
+-- 审批页标签缓存（沙箱服务就绪后惰性填充；见 _ensure_page_labels）
+local PAGE_LABEL = {}
+local _page_labels_ready = false
+local function _ensure_page_labels()
+  if _page_labels_ready then return end
+  local sb = _sb()
+  if not sb then return end
+  local pages = sb.hub_pages() or {}
+  if #pages == 0 then return end
+  for _, p in ipairs(pages) do PAGE_LABEL[p.id] = p.label end
+  _page_labels_ready = true
+end
+
+--- 审批页标签（惰性填充缓存）
+local function _page_label(page)
+  _ensure_page_labels()
+  return PAGE_LABEL[page]
+end
+
 -- ========== 私有常量 ==========
 
 -- 路径级别 -> 高亮组
@@ -333,7 +413,7 @@ function M.build_lines(items, traces, audit, saved, rejected)
     if audit.pending then
       status = "🤖 AI 审计生成中…"
     elseif audit.notes then
-      local verdict = require("NeoAI.sandbox.ai_audit").verdict(audit.notes)
+      local verdict = _audit_verdict(audit.notes)
       if verdict == "unsafe" then
         status, level = "🤖 AI 审计结论：⚠ 不安全 — 存在不安全变更，请逐条确认", "verdict_unsafe"
       elseif verdict == "safe" then
@@ -418,7 +498,6 @@ function M.build_lines(items, traces, audit, saved, rejected)
     lines[#lines + 1] = text
     marks[#marks + 1] = { line = ln, start_col = 4, end_col = 4 + #note, level = missing and "verdict_unsafe" or "note" }
   end
-  local risk = require("NeoAI.sandbox.risk")
   -- 每单元最多渲染的文件行数（0 = 不限）：包安装/git 操作可达数千文件，逐行渲染（字符串 +
   -- 高亮 + 行→目标映射）在开窗/每次刷新时都很慢；超限折叠为一行汇总。
   local max_files = tonumber(require("NeoAI.kernel.config_store").get(
@@ -445,7 +524,7 @@ function M.build_lines(items, traces, audit, saved, rejected)
     local badge = tier > 0 and string.format(" [T%d]", tier) or ""
     local risk_badge = ""
     if item.risk_level ~= nil then
-      risk_badge = string.format(" [%s]%s", risk.badge(item.risk_level), _risk_label(item.risk_level))
+      risk_badge = string.format(" [%s]%s", _risk_badge(item.risk_level), _risk_label(item.risk_level))
     end
     -- 主机操作提案（T2）：展示命令，整条审批；审批后主机 replay。
     if item.kind == "host_op" then
@@ -711,7 +790,7 @@ function M.build_lines(items, traces, audit, saved, rejected)
   -- 越界访问留痕（read_all 下访问 cwd 之外用户工作目录；仅记录，非阻塞）。
   -- 按文件路径合并（同一路径的多工具访问合并）、路径升序排序后展示。
   if traces and #traces > 0 then
-    local grouped = require("NeoAI.sandbox.trace").group(traces)
+    local grouped = _group_traces(traces)
     if #grouped > 0 then
       local head = "── 越界访问留痕（工作区外，仅记录）──"
       lines[#lines + 1] = head
@@ -1222,10 +1301,9 @@ local function _ai_audit(opts)
     end
     return
   end
-  local ai_audit = require("NeoAI.sandbox.ai_audit")
   local chat = services.use("services.chat_service")
   local source_agent = chat and chat.get_current_agent() or nil
-  local user_msgs = ai_audit.user_messages(source_agent)
+  local user_msgs = sandbox.audit_user_messages(source_agent)
   local agent_config = source_agent and source_agent.config or nil
 
   state.audit_seq = state.audit_seq + 1
@@ -1233,7 +1311,7 @@ local function _ai_audit(opts)
   state.audit = { pending = true }
   state.audit_sig = _pending_sig(items)
   M.refresh()
-  ai_audit.generate(items, user_msgs, { agent_config = agent_config }, function(result, err)
+  sandbox.audit_generate(items, user_msgs, { agent_config = agent_config }, function(result, err)
     if seq ~= state.audit_seq then return end
     if err then
       state.audit = { error = err }
@@ -1449,13 +1527,14 @@ local function _preview_data(target, item)
   local after = (action == "delete" or action == "rmdir") and "" or ((f and f.content) or "")
   -- 内存 item 落盘后 content 已剥离：按候选摘要按需读取（小型 LRU）。
   if (action ~= "delete" and action ~= "rmdir") and after == "" and not (f and f.content) then
-    local review = require("NeoAI.sandbox.review")
-    local lazy = review.content_for(item.change_set_id, target.path)
+    local sb = _sb()
+    local lazy = sb and sb.content_for(item.change_set_id, target.path)
     if lazy then after = lazy end
   end
   -- 预览给用户看：token 还原为真实密钥（best-effort）。
   pcall(function()
-    local restored = require("NeoAI.sandbox.secret").detokenize(after)
+    local sb = _sb()
+    local restored = sb and sb.detokenize(after)
     if restored ~= nil then after = restored end
   end)
   return string.format("%s · %s · %s", action, _risk_label(level), target.path), before, after
@@ -1673,7 +1752,7 @@ local function _open_command_detail(command)
     return
   end
   local lvl_ctx = { cwd = _canon_base(vim.fn.getcwd()), home = _canon_base(vim.fn.expand("~")) }
-  local grouped = require("NeoAI.sandbox.trace").group(matched)
+  local grouped = _group_traces(matched)
   local lines = { "越界命令详情（工作区外，仅记录）", "q/Esc 返回审批", "" }
   lines[#lines + 1] = "命令: " .. (command and ("$ " .. _one_line(command)) or "（非命令工具访问）")
   lines[#lines + 1] = string.format("涉及文件: %d 个", #grouped)
@@ -1697,10 +1776,10 @@ end
 local function _preview_path(item, target)
   if target.path then return target.path end
   if not (item and item.files) then return nil end
-  local rt = require("NeoAI.sandbox.runtime")
+  local sb = _sb()
   local first
   for _, f in ipairs(item.files) do
-    local gc = rt.git_path_class(f.path)
+    local gc = sb and sb.git_path_class(f.path)
     if not gc then return f.path end -- 普通工作区文件优先
     first = first or f.path
   end
@@ -1808,20 +1887,18 @@ _open_l3_confirm = function(target, item)
     item, { mode = "l3_confirm", on_confirm = _confirm_l3, pending = true })
   state.l3_seq = state.l3_seq + 1
   local seq = state.l3_seq
-  local l3 = require("NeoAI.sandbox.l3_warning")
-  l3.generate(item, target, function(text)
+  local sb = _sb()
+  if not sb then return end
+  sb.l3_generate(item, target, function(text)
     if seq ~= state.l3_seq then return end
     local d = state.diff
     if not d or d.mode ~= "l3_confirm" then return end
-    _set_diff_warning(text or l3.fallback(item, target))
+    _set_diff_warning(text or sb.l3_fallback(item, target))
   end)
 end
 
 -- ========== 多级页面（审批分流） ==========
-
-local hub_mod = require("NeoAI.sandbox.approval_hub")
-local PAGE_LABEL = {}
-for _, p in ipairs(hub_mod.PAGES) do PAGE_LABEL[p.id] = p.label end
+-- 页定义与标签经门面 `services.sandbox` 获取（见顶部辅助函数）。
 
 -- ========== 目录设置（工作目录 / 遮蔽目录，仅本会话） ==========
 -- 「资源访问」页可管理两类目录（仅当前会话生效：config_store.set 热更新，不写盘，
@@ -2070,7 +2147,7 @@ local function _gather_ctx()
   local rejected = _safe(function() return sandbox.list_rejected and sandbox.list_rejected() end, {}) or {}
   -- 行为审计异常（level >= 2）：仅内存观测，供「越界/异常」页展示。
   local anomalies = _safe(function()
-    return require("NeoAI.sandbox.audit").list({ min_level = 2, limit = 200 })
+    return sandbox.audit_list({ min_level = 2, limit = 200 })
   end, {}) or {}
   return { items = items, hostops = hostops, traces = traces, saved = saved, rejected = rejected, anomalies = anomalies }
 end
@@ -2081,9 +2158,9 @@ end
 --- @return number
 local function _page_count(page, ctx)
   if page == "files" then return #(ctx.items or {}) + #(ctx.saved or {}) + #(ctx.rejected or {}) end
-  if page == "behavior" then return hub_mod.pending_count("behavior") + #(ctx.hostops or {}) end
-  if page == "resource" then return hub_mod.pending_count("resource") end
-  if page == "network" then return hub_mod.pending_count("network") end
+  if page == "behavior" then return _hub_pending("behavior") + #(ctx.hostops or {}) end
+  if page == "resource" then return _hub_pending("resource") end
+  if page == "network" then return _hub_pending("network") end
   if page == "anomaly" then
     local n = 0
     for _ in ipairs(ctx.traces or {}) do n = n + 1 end
@@ -2107,11 +2184,12 @@ local function _build_header(page, ctx)
     if level then marks[#marks + 1] = { line = 1, start_col = start, end_col = start + #text, level = level } end
   end
   seg("页面: ")
-  for i, p in ipairs(hub_mod.PAGES) do
+  local pages = _hub_pages()
+  for i, p in ipairs(pages) do
     local n = _page_count(p.id, ctx)
     local text = string.format("[%d %s%s]", i, p.label, n > 0 and (" " .. n) or "")
     seg(text, p.id == page and "ai" or "note")
-    if i < #hub_mod.PAGES then seg("  ") end
+    if i < #pages then seg("  ") end
   end
   seg("      h/l 切换页面    q 关闭")
   lines[#lines + 1] = ""
@@ -2124,8 +2202,8 @@ end
 --- @return table
 local function _build_blocking_page(page, ctx)
   local lines, marks, line_to_hub, line_to_target = {}, {}, {}, {}
-  local entries = hub_mod.list(page)
-  local head = ("── %s（待批准 %d）──"):format(PAGE_LABEL[page] or page, #entries)
+  local entries = _hub_list(page)
+  local head = ("── %s（待批准 %d）──"):format(_page_label(page) or page, #entries)
   lines[#lines + 1] = head
   lines[#lines + 1] = "快捷键: <CR> 仅本次允许    S 本次会话允许    d 拒绝"
   lines[#lines + 1] = ""
@@ -2151,7 +2229,7 @@ local function _build_blocking_page(page, ctx)
       local badge = tier > 0 and string.format(" [T%d]", tier) or ""
       local risk_badge = ""
       if item.risk_level ~= nil then
-        risk_badge = string.format(" [%s]%s", require("NeoAI.sandbox.risk").badge(item.risk_level), _risk_label(item.risk_level))
+        risk_badge = string.format(" [%s]%s", _risk_badge(item.risk_level), _risk_label(item.risk_level))
       end
       local cmd = _one_line((item.write_set and item.write_set[1]) or "?")
       local base = _one_line(string.format("[%s] %s%s%s（主机操作）  ", item.change_set_id, item.tool or "?", badge, risk_badge))
@@ -2186,10 +2264,9 @@ end
 local function _build_anomaly_page(ctx)
   local lines, marks, line_to_trace, line_to_cmd = {}, {}, {}, {}
   local lvl_ctx = { cwd = _canon_base(vim.fn.getcwd()), home = _canon_base(vim.fn.expand("~")) }
-  local trace_mod = require("NeoAI.sandbox.trace")
   -- === 越界访问留痕（按文件路径合并）===
   lines[#lines + 1] = "── 越界访问留痕（工作区外，仅记录，i 查看文件涉及的命令）──"
-  local grouped = trace_mod.group(ctx.traces or {})
+  local grouped = _group_traces(ctx.traces or {})
   if #grouped == 0 then
     lines[#lines + 1] = "（无）"
   end
@@ -2214,7 +2291,7 @@ local function _build_anomaly_page(ctx)
   lines[#lines + 1] = ""
   -- === 越界命令（命令 → 涉及文件）===
   lines[#lines + 1] = "── 越界命令（命令 → 涉及文件，i 查看该命令涉及的文件）──"
-  local by_cmd = trace_mod.group_by_command(ctx.traces or {})
+  local by_cmd = _group_traces_by_command(ctx.traces or {})
   if #by_cmd == 0 then
     lines[#lines + 1] = "（无）"
   end
@@ -2256,7 +2333,7 @@ end
 --- 切换页面（delta=-1 上一页 / +1 下一页，环绕）。
 --- @param delta number
 local function _switch_page(delta)
-  local pages = hub_mod.PAGES
+  local pages = _hub_pages()
   local n = #pages
   if n == 0 then return end
   local cur = 1
@@ -2275,7 +2352,7 @@ local function _blocking_decide(value)
   local ln = vim.api.nvim_win_get_cursor(0)[1]
   local id = state.line_to_hub and state.line_to_hub[ln]
   if id then
-    if hub_mod.resolve(id, value) then
+    if _hub_resolve(id, value) then
       vim.notify(("[NeoAI] 审批: %s"):format(value), vim.log.levels.INFO)
       _schedule_refresh()
     end
@@ -2293,7 +2370,7 @@ end
 local function _add_masked_to_workspace()
   local ln = vim.api.nvim_win_get_cursor(0)[1]
   local id = state.line_to_hub and state.line_to_hub[ln]
-  local entry = id and hub_mod.get(id)
+  local entry = id and _hub_get(id)
   local masked = entry and entry.meta and entry.meta.masked
   if not masked then
     vim.notify("[NeoAI] 光标所在条目没有可加入工作目录的遮蔽路径", vim.log.levels.WARN)
@@ -2376,7 +2453,7 @@ end
 --- 由审批分流中心拉起/刷新窗口并切页。
 --- @param page string|nil
 function M.open_page(page)
-  if page and PAGE_LABEL[page] then state.page = page end
+  if page and _page_label(page) then state.page = page end
   if state.win_id and vim.api.nvim_win_is_valid(state.win_id) then
     M.refresh()
   else
@@ -2386,7 +2463,9 @@ end
 
 --- 注册审批分流中心窗口（ui/init.lua 调用）。
 function M.setup()
-  hub_mod.set_ui({
+  local sb = _sb()
+  if not sb then return end
+  sb.set_hub_ui({
     refresh = function()
       if state.win_id and vim.api.nvim_win_is_valid(state.win_id) then _schedule_refresh() end
     end,
@@ -2567,7 +2646,7 @@ function M.refresh()
       vim.api.nvim_buf_add_highlight(state.buf, state.ns, LEVEL_HL[m.level], m.line - 1, m.start_col, m.end_col)
     end
   end
-  _set_review_title(("🗂 沙箱审批 · %s"):format(PAGE_LABEL[state.page] or ""))
+  _set_review_title(("🗂 沙箱审批 · %s"):format(_page_label(state.page) or ""))
   -- 恢复光标：仅「待修改」页按目标条目恢复；其余页回到顶部。
   local restore = nil
   if state.page == "files" and state.last_target then
@@ -2696,7 +2775,7 @@ function M.reset()
   state.fold_levels = {}
   state.page = "files"
   state.line_to_hub = {}
-  pcall(function() require("NeoAI.sandbox.approval_hub").reset() end)
+  pcall(function() local sb = _sb(); if sb then sb.reset_approval_hub() end end)
   _close_root_prompt()
   _close_dirs_editor()
   _close_diff()
@@ -2704,3 +2783,4 @@ function M.reset()
 end
 
 return M
+

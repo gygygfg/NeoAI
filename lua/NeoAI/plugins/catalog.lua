@@ -67,15 +67,61 @@ end
 local function _service_specs()
   return {
     { id = "services.session", module = "NeoAI.core.session.session_store", service = "services.session" },
-    { id = "services.agent", module = "NeoAI.core.agent.agent", service = "services.agent" },
+    {
+      id = "services.agent", module = "NeoAI.core.agent.agent", service = "services.agent",
+      start = function()
+        -- 组合根注入核心能力桥：tools 侧（子 Agent 派生 / 提示段 / 附件 / 中止）经
+        -- kernel.core_bridge 访问 core 能力，不直接依赖 core，保持 tools → kernel 单向。
+        require("NeoAI.kernel.core_bridge").set({
+          agent_spawn = function(parent, opts)
+            return require("NeoAI.core.agent.runtime").spawn(parent, opts)
+          end,
+          agent_get = function(id)
+            return require("NeoAI.core.agent.runtime").get(id)
+          end,
+          agent_run = function(agent, content)
+            return require("NeoAI.core.agent.runtime").run(agent, content)
+          end,
+          agent_abort = function(agent, reason)
+            require("NeoAI.core.agent.runtime").abort(agent, reason)
+          end,
+          prefix = require("NeoAI.core.agent.prefix"),
+          attachment = require("NeoAI.core.attachment.attachment"),
+        })
+      end,
+      stop = function() pcall(require("NeoAI.kernel.core_bridge").reset) end,
+    },
     {
       id = "services.tools", module = "NeoAI.tools", service = "services.tools", phase = 2,
       start = function() require("NeoAI.tools").init({ builtin = false }) end,
     },
     {
       id = "services.sandbox", module = "NeoAI.sandbox", service = "services.sandbox", phase = 2,
-      start = function() require("NeoAI.sandbox").init() end,
-      stop = function() pcall(require("NeoAI.sandbox").shutdown) end,
+      start = function()
+        -- 组合根注入 LLM 发送桥：sandbox 侧（AI 审计 / L3 警示）经 kernel.llm_bridge 调模型，
+        -- 不直接依赖 core，保持 sandbox → kernel 单向。
+        require("NeoAI.kernel.llm_bridge").set_caller(function(messages, opts)
+          return require("NeoAI.core.agent.request").send(messages, opts)
+        end)
+        -- 组合根注入沙箱能力桥：core 侧（密钥泄漏告警 / 附件缩放）经 kernel.sandbox_bridge 访问
+        -- 沙箱能力，不直接依赖 sandbox，保持 core → kernel 单向。
+        require("NeoAI.kernel.sandbox_bridge").set({
+          secret_alert = require("NeoAI.sandbox.secret_alert"),
+          record_secret_flow = function(event, meta)
+            require("NeoAI.sandbox.secret_flow").record(event, meta)
+          end,
+          exec = require("NeoAI.sandbox.exec"),
+          candidate_read_path = function(path)
+            return require("NeoAI.sandbox.candidate").read_path(path)
+          end,
+        })
+        require("NeoAI.sandbox").init()
+      end,
+      stop = function()
+        pcall(require("NeoAI.kernel.llm_bridge").reset)
+        pcall(require("NeoAI.kernel.sandbox_bridge").reset)
+        pcall(require("NeoAI.sandbox").shutdown)
+      end,
     },
     { id = "services.model_service", module = "NeoAI.services.model_service", service = "services.model_service" },
     {
@@ -90,7 +136,11 @@ local function _service_specs()
       -- 交互式 PTY 会话管理（run_command 等待输入检测 + 判官编排）
       id = "services.pty", module = "NeoAI.services.pty", service = "services.pty",
       deps = { "services.sandbox" }, phase = 2,
-      stop = function() pcall(require("NeoAI.services.pty").stop_all) end,
+      -- 复用宿主按 module 字段解析出的实现（ctx.impl），不再直接 require 具体服务模块。
+      stop = function(ctx)
+        local m = ctx and ctx.impl
+        if m and type(m.stop_all) == "function" then pcall(m.stop_all) end
+      end,
     },
     { id = "services.skills", module = "NeoAI.services.skills", service = "services.skills", phase = 2 },
     {

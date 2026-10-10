@@ -109,6 +109,11 @@ lua/NeoAI/
     config_store.lua
     logger.lua
     lifecycle.lua
+    live_metrics.lua         -- 实时指标桥（core→ui）
+    ui_hooks.lua             -- UI 钩子注册表（ui↔tools）
+    llm_bridge.lua           -- LLM 发送桥（sandbox→core）
+    sandbox_bridge.lua       -- 沙箱能力桥（core→sandbox）
+    core_bridge.lua          -- 核心能力桥（tools→core）
   core/                      -- 核心业务层
     session/                 -- Session（对象、JSONL 存储、上下文构建器、压缩器、
                              -- plan_distill、runtime_context）

@@ -129,8 +129,8 @@ function M.generate(item, target, on_done)
   end
   local cfg = config_store.get("tools.sandbox.review.l3_warning") or {}
   local ok, d = pcall(function()
-    local request = require("NeoAI.core.agent.request")
-    return request.send(M.build_messages(item, target), {
+    local bridge = require("NeoAI.kernel.llm_bridge")
+    return bridge.send(M.build_messages(item, target), {
       temperature = 0.2,
       max_tokens = cfg.max_tokens or 256,
       max_retries = 0,

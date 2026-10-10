@@ -53,6 +53,11 @@ NeoAI/
 │   ├── config_store.lua       # 配置存储（merge + validate + watch）
 │   ├── services.lua           # 服务定位器（provide/use/wait，use 不回落默认模块）
 │   ├── plugins.lua            # 插件宿主（依赖注入/服务提供/启停/失败回滚）
+│   ├── live_metrics.lua       # 实时指标桥（core→ui：工具计时器等按引用共享）
+│   ├── ui_hooks.lua           # UI 钩子注册表（ui↔tools：如向用户提问 UI 实现）
+│   ├── llm_bridge.lua         # LLM 发送桥（sandbox→core：AI 审计/L3 警示调用模型）
+│   ├── sandbox_bridge.lua     # 沙箱能力桥（core→sandbox：密钥告警/附件缩放）
+│   ├── core_bridge.lua        # 核心能力桥（tools→core：子 Agent/提示段/附件）
 │   └── logger.lua            # 日志
 │
 ├── core/                       # 核心业务层
@@ -428,6 +433,20 @@ ui ──→ chat_service ──→ engine ──→ request_handler ──→ h
 - `utils/` → 不依赖任何项目模块
 - 业务代码禁止直接 `require("NeoAI.services.*")`；改为 `kernel.services.use()` 并处理 `nil`
 - 禁止反向依赖、禁止跨层穿透、禁止同级循环引用
+
+**kernel 桥接（解耦跨层依赖）**：core / services / tools / sandbox / ui 之间存在少量必需的
+双向能力调用（如 core↔sandbox、core↔tools、tools↔ui、sandbox→core）。这些一律不直接
+`require` 对方，而是经 `kernel/` 下的**中立桥接模块**汇合——由组合根（`plugins/catalog`）
+在启动相应服务时注入实现，调用方从桥读取：
+
+- `kernel.live_metrics`：core 注入工具计时器原对象，ui 读取实时耗时（解 core→ui）
+- `kernel.ui_hooks`：ui 注册「提问弹窗」等 UI 实现，tools 读取（解 tools↔ui）
+- `kernel.llm_bridge`：组合根注入 `core.agent.request.send`，sandbox 读取（解 sandbox→core）
+- `kernel.sandbox_bridge`：组合根注入 `secret_alert`/`exec`/`candidate` 等，core 读取（解 core→sandbox）
+- `kernel.core_bridge`：组合根注入 Agent 运行时 / prompt 段注册 / 附件存储，tools 读取（解 tools→core）
+
+桥在未注入（服务未启动/被禁用）时返回 `nil`/no-op，调用方须显式降级。新增此类跨层能力时，
+优先复用既有桥；确需新桥则登记在 `kernel/`（方向合法），并在本清单补一行。
 
 ### 决策 5：取消信号替代全局标志
 

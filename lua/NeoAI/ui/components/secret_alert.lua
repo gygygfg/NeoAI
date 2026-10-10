@@ -4,6 +4,7 @@
 --- 注册到 sandbox.secret_alert。
 
 local geometry = require("NeoAI.ui.geometry")
+local services = require("NeoAI.kernel.services")
 
 local M = {}
 
@@ -158,15 +159,20 @@ end
 
 --- 注册到 sandbox.secret_alert
 function M.init()
-  local alert = require("NeoAI.sandbox.secret_alert")
-  alert.set_ui({ show = M.show, hide = M.hide })
+  local sandbox = services.use("services.sandbox")
+  if sandbox and sandbox.set_secret_alert_ui then
+    sandbox.set_secret_alert_ui({ show = M.show, hide = M.hide })
+  end
 end
 
 --- 重置（测试用）
 function M.reset()
   _close()
   pcall(function() require("NeoAI.ui.focus").cancel_gate("secret_alert") end)
-  pcall(function() require("NeoAI.sandbox.secret_alert").set_ui(nil) end)
+  pcall(function()
+    local sandbox = services.use("services.sandbox")
+    if sandbox and sandbox.set_secret_alert_ui then sandbox.set_secret_alert_ui(nil) end
+  end)
 end
 
 --- 构建弹窗文本（测试用）

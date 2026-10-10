@@ -56,10 +56,10 @@ plan_tools.create_sub_agent = helpers.define_tool(
   },
   function(args, on_success, on_error, ctx)
     local parent_agent = ctx and ctx.agent
-    local runtime = require("NeoAI.core.agent.runtime")
+    local bridge = require("NeoAI.kernel.core_bridge")
 
     local sub_id = _new_id()
-    local sub_agent = runtime.spawn(parent_agent, {
+    local sub_agent = bridge.agent_spawn(parent_agent, {
       task = args.task,
       model = args.model,
       scenario = "agent",
@@ -103,7 +103,7 @@ plan_tools.create_sub_agent = helpers.define_tool(
         event_bus.emit(events.SUB_AGENT_RESULT_READY, { sub_agent_id = sub_id })
       end
     end
-    runtime.run(sub_agent, args.task):then_(_finish, _fail)
+    bridge.agent_run(sub_agent, args.task):then_(_finish, _fail)
 
     if args.mode == "foreground" then
       -- 前台模式：等待子 Agent 完成后返回完整结果
@@ -180,10 +180,10 @@ plan_tools.cancel_sub_agent = helpers.define_tool(
       on_error("子 Agent 不存在: " .. tostring(args.sub_agent_id))
       return
     end
-    local runtime = require("NeoAI.core.agent.runtime")
-    local sub = runtime.get(entry.agent_id)
+    local bridge = require("NeoAI.kernel.core_bridge")
+    local sub = bridge.agent_get(entry.agent_id)
     if sub then
-      runtime.abort(sub, "user_cancelled")
+      bridge.agent_abort(sub, "user_cancelled")
     end
     entry.status = "cancelled"
     event_bus.emit(events.SUB_AGENT_UPDATED, { sub_agent_id = args.sub_agent_id, status = "cancelled" })

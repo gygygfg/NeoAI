@@ -53,6 +53,11 @@ NeoAI/
 │   ├── config_store.lua          # Config store (merge + validate + watch)
 │   ├── services.lua              # Service locator (provide/use/wait; use never falls back)
 │   ├── plugins.lua               # Plugin host (DI/service provision/start-stop/failure rollback)
+│   ├── live_metrics.lua          # Live metrics bridge (core→ui: tool timers by reference)
+│   ├── ui_hooks.lua              # UI hook registry (ui↔tools: e.g. ask_user UI impl)
+│   ├── llm_bridge.lua            # LLM send bridge (sandbox→core: AI audit / L3 warning use the model)
+│   ├── sandbox_bridge.lua        # Sandbox capability bridge (core→sandbox: secret alert / image downscale)
+│   ├── core_bridge.lua           # Core capability bridge (tools→core: sub-agent / prompt section / attachment)
 │   └── logger.lua                # Logging
 │
 ├── core/                         # Core business layer
@@ -427,6 +432,22 @@ ui ──→ chat_service ──→ engine ──→ request_handler ──→ h
 - `utils/` → depends on no project modules
 - Business code must not `require("NeoAI.services.*")` directly; use `kernel.services.use()` and handle `nil`
 - No reverse dependencies, no cross-layer penetration, no same-level circular references
+
+**Kernel bridges (decoupling cross-layer dependencies)**: there are a handful of indispensable
+bidirectional capability calls between core / services / tools / sandbox / ui (e.g. core↔sandbox,
+core↔tools, tools↔ui, sandbox→core). These never `require` each other directly; instead they
+converge on a **neutral bridge module** under `kernel/` — the composition root (`plugins/catalog`)
+injects the implementation when starting the relevant service, and callers read from the bridge:
+
+- `kernel.live_metrics`: core injects the tool-timer object, ui reads the live elapsed time (core→ui)
+- `kernel.ui_hooks`: ui registers UI impls (e.g. the ask prompt), tools read them (tools↔ui)
+- `kernel.llm_bridge`: composition root injects `core.agent.request.send`, sandbox reads it (sandbox→core)
+- `kernel.sandbox_bridge`: composition root injects `secret_alert`/`exec`/`candidate`, core reads them (core→sandbox)
+- `kernel.core_bridge`: composition root injects agent runtime / prompt-section registry / attachment store, tools read them (tools→core)
+
+When uninjected (service not started/disabled) a bridge returns `nil`/no-op; callers must degrade
+explicitly. For new cross-layer capabilities, prefer reusing an existing bridge; if a new one is
+needed, register it under `kernel/` (a legal direction) and add a line to this list.
 
 ### Decision 5: Abort Signals Instead of Global Flags
 

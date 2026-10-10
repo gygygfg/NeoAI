@@ -140,9 +140,9 @@ local function _execute_single(agent, tool_call, tool_service, opts)
   exec_opts.ui_notice = nil -- 由 tool_service 在执行后回填（仅 UI 展示，不进入模型上下文）
   logger.warn("[tool_loop] 执行工具 %s round=%s", name, tostring(agent._round_seq or ""))
 
-  -- 以原对象注册到 fold：事件经 nvim_exec_autocmds 深拷贝会丢失元表/方法，计时器无法随
-  -- 事件传播。tool_loop 直接以原对象（含元表）注册，供 UI 实时读取剔除等待的活跃耗时。
-  require("NeoAI.ui.components.fold").set_live_timer(tool_call.id, timer)
+  -- 以原对象（含元表）注册到 kernel 实时指标桥：事件经 nvim_exec_autocmds 深拷贝会丢失元表/方法，
+  -- 计时器无法随事件传播。core 只依赖 kernel（不反向依赖 ui），由 ui 的折叠渲染从同一桥读取实时值。
+  require("NeoAI.kernel.live_metrics").set(tool_call.id, timer)
 
   event_bus.emit(events.TOOL_EXECUTION_STARTED, {
     agent_id = agent.id, name = name, args = args, tool_call_id = tool_call.id,
@@ -162,6 +162,7 @@ local function _execute_single(agent, tool_call, tool_service, opts)
       agent_id = agent.id, name = name,
       tool_call_id = tool_call.id, duration_ms = duration_ms,
     })
+    require("NeoAI.kernel.live_metrics").clear(tool_call.id)
     return { tool_call_id = tool_call.id, name = name, result_str = result_str, duration_ms = duration_ms,
       notice = exec_opts.ui_notice, secret_paths = exec_opts.observed_secret_paths }
   end, function(err)
@@ -175,6 +176,7 @@ local function _execute_single(agent, tool_call, tool_service, opts)
       agent_id = agent.id, name = name, error = err_msg,
       tool_call_id = tool_call.id, duration_ms = duration_ms,
     })
+    require("NeoAI.kernel.live_metrics").clear(tool_call.id)
     return { tool_call_id = tool_call.id, name = name, result_str = result_str, duration_ms = duration_ms,
       notice = exec_opts.ui_notice, secret_paths = exec_opts.observed_secret_paths }
   end)

@@ -11,7 +11,13 @@
 local work = require("NeoAI.utils.work")
 local fs = require("NeoAI.utils.fs")
 local image = require("NeoAI.utils.image")
-local attachment = require("NeoAI.core.attachment.attachment")
+-- 附件存储经 kernel.core_bridge（组合根注入）解析：tools 不直接依赖 core。
+local attachment = setmetatable({}, {
+  __index = function(_, k)
+    local a = require("NeoAI.kernel.core_bridge").attachment()
+    return a and a[k]
+  end,
+})
 local helpers = require("NeoAI.tools.builtin.tool_helpers")
 local async = require("NeoAI.utils.async")
 local sandbox_exec = require("NeoAI.sandbox.exec")

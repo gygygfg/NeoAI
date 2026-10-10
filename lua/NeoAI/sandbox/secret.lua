@@ -1979,6 +1979,10 @@ function M.warn_for_files(files)
   return { count = count, tokens = list }
 end
 
+-- 前向声明：非凭据文件判定（哈希/校验和文件、编辑器状态转储 .shada、包缓存等）。
+-- 定义见文件后部（与 is_secret_path/is_sensitive_path 同处）；此处前向声明以便 detect_generated 引用。
+local is_non_credential_path
+
 --- 检测 AI **生成/写入**的高熵/结构化敏感内容（候选文件内容）。
 --- 与 `warn_for_files`（只识别已假化的宿主密钥）不同：此函数直接对候选内容做熵/具名规则
 --- 检测，捕获 AI 自行生成的密钥类信息（生成的私钥、随机 token、API key 等），供留痕与审批提示。
@@ -1996,7 +2000,10 @@ function M.detect_generated(files)
   local scanned_bytes, scanned_files = 0, 0
   for _, f in ipairs(files or {}) do
     if max_files > 0 and scanned_files >= max_files then break end
-    if type(f.content) == "string" and f.content ~= "" then
+    -- 非凭据文件（哈希/校验和文件、编辑器状态转储 .shada、包缓存等）：跳过生成式密钥扫描，
+    -- 避免把 sha256sum 输出、.shada 等含哈希/历史高熵片段的内容误判为「生成密钥」。
+    if not (type(f.path) == "string" and is_non_credential_path(f.path))
+        and type(f.content) == "string" and f.content ~= "" then
       local size = #f.content
       if max_bytes > 0 and scanned_bytes + size > max_bytes then
         -- 本文件超预算：跳过（不再继续消耗主线程）。
@@ -2062,6 +2069,28 @@ local NON_CREDENTIAL_DIR_PATS = {
   "/go/pkg/mod/", "/%.gradle/caches/", "/%.m2/repository/", "/%.pub%-cache/",
 }
 
+-- 非凭据文件（按文件名，小写）：哈希/校验和清单文件，内容为纯哈希，不是凭据。
+local NON_CREDENTIAL_BASENAMES = {
+  ["sha256sums"] = true, ["sha512sums"] = true, ["sha1sums"] = true, ["md5sums"] = true,
+  ["checksums"] = true, ["checksums.txt"] = true,
+  ["sha256sums.txt"] = true, ["sha512sums.txt"] = true, ["md5sums.txt"] = true,
+}
+-- 非凭据文件（按后缀，小写）：哈希/校验和文件、Neovim/Vim 状态转储。
+-- 这些文件内容常为纯哈希或历史记录（可能夹带高熵片段），但本身不是用户凭据，
+-- 不应触发「获取密钥」告警、不应做高熵 token 化、也不应做生成式密钥扫描。
+local NON_CREDENTIAL_BASENAME_PATS = {
+  -- 哈希/校验和文件（sha256sum/md5sum 等输出落盘）
+  "%.sha256$", "%.sha512$", "%.sha1$", "%.md5$",
+  "%.sha256sum$", "%.sha512sum$", "%.sha1sum$", "%.md5sum$",
+  -- Neovim/Vim 状态转储（历史命令/寄存器/标记）
+  "%.shada",
+}
+-- 非凭据文件（按路径）：nvim shada 目录、git 对象库（内容寻址哈希）。
+local NON_CREDENTIAL_PATH_PATS = {
+  "/shada/",         -- nvim 的 shada 目录
+  "/%.git/objects/", -- git 对象库（哈希命名，非凭据）
+}
+
 --- 路径是否为公开 CA 证书包/信任库（非密钥）。
 --- @param path string
 --- @return boolean
@@ -2084,12 +2113,30 @@ local function is_non_credential_dir(path)
   return false
 end
 
+--- 路径是否为非凭据文件（哈希/校验和文件、编辑器状态转储、git 对象、包缓存等）。
+--- 这些文件不是用户凭据：不应触发「获取密钥」告警、不应做高熵 token 化、也不应做生成式密钥扫描。
+--- @param path string
+--- @return boolean
+is_non_credential_path = function(path)
+  if type(path) ~= "string" or path == "" then return false end
+  local lower = path:lower()
+  local base = lower:match("[^/]+$") or lower
+  if NON_CREDENTIAL_BASENAMES[base] then return true end
+  for _, pat in ipairs(NON_CREDENTIAL_BASENAME_PATS) do
+    if lower:match(pat) then return true end
+  end
+  for _, pat in ipairs(NON_CREDENTIAL_PATH_PATS) do
+    if path:find(pat) then return true end
+  end
+  return is_non_credential_dir(path)
+end
+
 --- 路径是否疑似密钥文件（宽口径：用于决定是否做高熵扫描）
 --- @param path string|nil
 --- @return boolean
 function M.is_secret_path(path)
   if type(path) ~= "string" or path == "" then return false end
-  if is_public_cert_bundle(path) or is_non_credential_dir(path) then return false end
+  if is_public_cert_bundle(path) or is_non_credential_path(path) then return false end
   for _, pat in ipairs(SECRET_PATH_PATS) do
     if path:find(pat) then return true end
   end
@@ -2115,7 +2162,7 @@ local SENSITIVE_PATH_PATS = {
 --- @return boolean
 function M.is_sensitive_path(path)
   if type(path) ~= "string" or path == "" then return false end
-  if is_public_cert_bundle(path) or is_non_credential_dir(path) then return false end
+  if is_public_cert_bundle(path) or is_non_credential_path(path) then return false end
   for _, pat in ipairs(SENSITIVE_PATH_PATS) do
     if path:find(pat) then return true end
   end

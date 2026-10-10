@@ -235,7 +235,9 @@ function M.downscale_sync(data, media_type, width, height, max_pixels)
   local th = math.max(1, math.floor(height * scale))
   -- 统一经沙箱运行：以共享目录下的临时文件承载输入/输出，写入经 overlay 暂存为候选。
   -- 属罕见 best-effort 路径：同步等待其完成；失败（含沙箱拒绝）返回 nil，放弃缩放。
-  local sandbox_exec = require("NeoAI.sandbox.exec")
+  -- 沙箱能力经 kernel.sandbox_bridge（组合根注入）获取，core 不直接依赖 sandbox。
+  local sandbox_exec = require("NeoAI.kernel.sandbox_bridge").exec()
+  if not sandbox_exec then return nil end
   local shared = sandbox_exec.ensure_shared()
   local stamp = ("%d_%d"):format(vim.fn.getpid(), vim.fn.rand())
   local inp = shared .. "/ds_in_" .. stamp
@@ -252,7 +254,7 @@ function M.downscale_sync(data, media_type, width, height, max_pixels)
   local result = d._value
   local out = nil
   if d:is_resolved() and result and result.code == 0 then
-    local read_target = require("NeoAI.sandbox.candidate").read_path(outp) or outp
+    local read_target = require("NeoAI.kernel.sandbox_bridge").candidate_read_path(outp)
     local rf = io.open(read_target, "rb")
     if rf then out = rf:read("*a"); rf:close() end
   end

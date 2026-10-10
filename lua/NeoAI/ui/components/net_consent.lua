@@ -4,6 +4,7 @@
 --- 阻塞并请用户确认。注册到 sandbox.net_consent。
 
 local geometry = require("NeoAI.ui.geometry")
+local services = require("NeoAI.kernel.services")
 
 local M = {}
 
@@ -41,7 +42,8 @@ end
 local function _sanitize_cmdline(s)
   if type(s) ~= "string" or s == "" then return nil end
   local ok, red = pcall(function()
-    return require("NeoAI.sandbox.secret").redact(s)
+    local sandbox = services.use("services.sandbox")
+    return sandbox and sandbox.redact(s)
   end)
   local v = (ok and red) or s
   if #v > 160 then v = v:sub(1, 157) .. "…" end
@@ -162,15 +164,20 @@ end
 
 --- 注册到 sandbox.net_consent
 function M.init()
-  local consent = require("NeoAI.sandbox.net_consent")
-  consent.set_ui({ show = M.show, hide = M.hide })
+  local sandbox = services.use("services.sandbox")
+  if sandbox and sandbox.set_net_consent_ui then
+    sandbox.set_net_consent_ui({ show = M.show, hide = M.hide })
+  end
 end
 
 --- 重置（测试用）
 function M.reset()
   _close()
   pcall(function() require("NeoAI.ui.focus").cancel_gate("net_consent") end)
-  pcall(function() require("NeoAI.sandbox.net_consent").set_ui(nil) end)
+  pcall(function()
+    local sandbox = services.use("services.sandbox")
+    if sandbox and sandbox.set_net_consent_ui then sandbox.set_net_consent_ui(nil) end
+  end)
 end
 
 return M

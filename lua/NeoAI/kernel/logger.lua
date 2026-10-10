@@ -151,4 +151,12 @@ function M.get_path()
   return state.path
 end
 
+-- 把自身接入 utils.work 的异步错误上报钩子（kernel → utils，方向合法）。
+-- utils/ 保持零项目依赖，无需反向 require kernel.logger。
+pcall(function()
+  require("NeoAI.utils.work").set_async_error_reporter(function(message)
+    M.error("%s", message)
+  end)
+end)
+
 return M

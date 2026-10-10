@@ -4,12 +4,20 @@
 --- 默认展开根节点，子节点用连接线缩进显示。
 
 local window_manager = require("NeoAI.ui.window.manager")
-local session_store = require("NeoAI.core.session.session_store")
 local event_bus = require("NeoAI.kernel.event_bus")
 local events = require("NeoAI.kernel.events")
 local chat_view = require("NeoAI.ui.window.chat_view")
 local services = require("NeoAI.kernel.services")
 local config_store = require("NeoAI.kernel.config_store")
+
+-- 会话存储经服务定位器解析（禁用/未就绪时为 nil）：ui 不直接 require core 模块。
+-- 以代理保持既有 `session_store.xxx` 调用点不变，调用时惰性解析服务。
+local session_store = setmetatable({}, {
+  __index = function(_, k)
+    local ss = services.use("services.session")
+    return ss and ss[k]
+  end,
+})
 
 --- 聊天服务经服务定位器动态解析（禁用时为 nil）
 local function _chat_service()

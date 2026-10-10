@@ -326,7 +326,7 @@ local function _invoke(items, user_messages, opts, on_done)
   local cfg = opts.cfg or config_store.get("tools.sandbox.review.ai_audit") or {}
   local messages = M.build_messages(items, user_messages, cfg)
   local ok, d = pcall(function()
-    return require("NeoAI.core.agent.request").send(messages, {
+    return require("NeoAI.kernel.llm_bridge").send(messages, {
       agent_config = opts.agent_config,
       temperature = 0.2,
       max_tokens = cfg.max_tokens or 1024,

@@ -4067,6 +4067,34 @@ tests.suite("sandbox", function(_, it)
       "certifi CA bundle 不应视为疑似密钥文件")
   end)
 
+  it("密钥防护：哈希/校验和文件与 .shada 不视为密钥", function(t)
+    local secret = require("NeoAI.sandbox.secret")
+    -- 哈希/校验和清单、Neovim 状态转储（.shada）、git 对象库：非凭据，
+    -- 既不应触发高熵扫描，也不应触发「获取密钥」告警。
+    for _, p in ipairs({
+      "/root/.local/state/nvim/shada/main.shada",
+      "/root/.local/state/nvim/shada/main.shada.tmp",
+      "/root/.local/share/nvim/shada/main.shada",
+      "/repo/SHA256SUMS", "/repo/SHA512SUMS", "/repo/MD5SUMS", "/repo/CHECKSUMS",
+      "/repo/pkg.tar.gz.sha256", "/repo/pkg.zip.sha512", "/repo/pkg.md5",
+      "/repo/pkg.sha256sum", "/repo/pkg.md5sum",
+      "/repo/.git/objects/ab/cdef0123456789abcdef0123456789abcdef01",
+    }) do
+      t.false_(secret.is_secret_path(p), "非凭据文件不应视为疑似密钥文件: " .. p)
+      t.false_(secret.is_sensitive_path(p), "非凭据文件不应触发获取密钥告警: " .. p)
+    end
+    -- 生成式密钥扫描也跳过非凭据文件：即便内部含含 `-`/`_` 的高熵片段（如 base64url 寄存器）也不告警。
+    local flags = secret.detect_generated({
+      { path = "/root/.local/state/nvim/shada/main.shada",
+        content = "reg eyJhbGciOiJIUzI1NiJ9-abc_DEF-1234567890abcdefghij mm" },
+      { path = "/repo/SHA256SUMS",
+        content = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678abcdef0123456789abcdef01  f.tar.gz" },
+    })
+    t.eq(0, #flags, "非凭据文件不应被生成式密钥扫描命中")
+    -- 但真正的敏感路径仍应命中（回归保护）
+    t.true_(secret.is_sensitive_path("/root/.ssh/id_rsa"), "id_rsa 仍应视为凭据文件")
+  end)
+
   it("密钥防护：告警严口径路径判定（排除普通系统文件/历史）", function(t)
     local secret = require("NeoAI.sandbox.secret")
     -- 真正的凭据文件

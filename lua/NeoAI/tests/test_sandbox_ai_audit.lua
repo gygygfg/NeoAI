@@ -3,6 +3,7 @@
 --- 覆盖：结构化审计文本构造（分级/文件/diff/主机操作/截断）与用户消息提取。
 
 local tests = require("NeoAI.tests")
+local _provide_sandbox = require("NeoAI.tests.sandbox_stub").provide
 
 tests.suite("sandbox_ai_audit", function(_, it)
   it("user_messages 仅保留真实用户消息（排除运行上下文与压缩检查点）", function(t)
@@ -314,7 +315,7 @@ tests.suite("sandbox_ai_audit", function(_, it)
     local saved_sandbox = services.use("services.sandbox")
     local saved_cfg = config_store.get_all()
     local cwd = vim.fn.getcwd()
-    services.provide("services.sandbox", {
+    _provide_sandbox({
       list_reviews = function()
         return { { change_set_id = "csAuto", tool = "edit_file",
           files = { { path = cwd .. "/a.lua", action = "modify" } } } }
@@ -349,7 +350,7 @@ tests.suite("sandbox_ai_audit", function(_, it)
     sr.reset()
     local saved = services.use("services.sandbox")
     local cwd = vim.fn.getcwd()
-    services.provide("services.sandbox", {
+    _provide_sandbox({
       list_reviews = function()
         return {
           { change_set_id = "csA", tool = "edit_file", files = { { path = cwd .. "/a.lua", action = "modify" } } },

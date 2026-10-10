@@ -3,7 +3,7 @@
 --- 注册到 NeoAI.tools.builtin.ask_user。显示问题 + 可选选项：
 --- 数字键 1-9 直接选择选项；i / 回车进入自由输入（vim.ui.input）；Esc 取消提问。
 
-local ask_user = require("NeoAI.tools.builtin.ask_user")
+local ui_hooks = require("NeoAI.kernel.ui_hooks")
 local geometry = require("NeoAI.ui.geometry")
 
 local M = {}
@@ -214,9 +214,9 @@ function M.hide()
   _close()
 end
 
---- 注册到 ask_user 模块
+--- 注册到 ask_user 模块（经 kernel.ui_hooks，ui 不直接依赖 tools）
 function M.init()
-  ask_user.set_ui({
+  ui_hooks.set("ask_user", {
     show = M.show,
     hide = M.hide,
   })
@@ -228,7 +228,7 @@ function M.reset()
   require("NeoAI.ui.focus").cancel_gate("ask_user")
   state._question = nil
   state._options = nil
-  pcall(function() ask_user.set_ui(nil) end)
+  ui_hooks.clear("ask_user")
 end
 
 --- 是否有暂存待展示的提问（测试用）

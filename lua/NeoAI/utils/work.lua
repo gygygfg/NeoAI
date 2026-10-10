@@ -17,6 +17,28 @@ local async = require("NeoAI.utils.async")
 
 local M = {}
 
+-- ========== 私有状态 ==========
+
+-- 异步兜底失败的上报回调。utils/ 不依赖任何项目模块，故不直接 require kernel.logger；
+-- 由内核层（kernel/logger 加载时）注入以接入统一日志，未注入时退化为 vim.notify 提示。
+local _async_error_reporter = nil
+
+--- 注入异步错误上报函数（由内核层设置以接入统一日志）。
+--- @param fn function(message: string)
+function M.set_async_error_reporter(fn)
+  _async_error_reporter = fn
+end
+
+--- 上报一次异步兜底错误（优先注入的回调，其次 vim.notify）。
+--- @param message string
+local function _report_async_error(message)
+  if _async_error_reporter then
+    local ok = pcall(_async_error_reporter, message)
+    if ok then return end
+  end
+  vim.schedule(function() vim.notify(message, vim.log.levels.ERROR) end)
+end
+
 -- ========== 私有常量 ==========
 
 -- 工作线程内统一执行器：接收 string.dump 出来的函数字节码，load 后 pcall 运行。
@@ -142,9 +164,8 @@ function M.selfcheck(opts)
   if not waited then
     -- 当前上下文不允许同步等待：异步兜底，仅在失败时记录日志。
     d:then_(nil, function(e)
-      require("NeoAI.kernel.logger").error(
-        "[NeoAI.work] 工作线程自检失败: %s",
-        tostring(type(e) == "table" and (e.message or e.kind) or e))
+      _report_async_error("[NeoAI.work] 工作线程自检失败: "
+        .. tostring(type(e) == "table" and (e.message or e.kind) or e))
     end)
     return true
   end

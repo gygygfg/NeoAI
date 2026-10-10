@@ -2,6 +2,7 @@
 --- @module NeoAI.tests.test_sandbox_governance
 
 local tests = require("NeoAI.tests")
+local _provide_sandbox = require("NeoAI.tests.sandbox_stub").provide
 
 --- 保存/恢复全局配置（默认关闭临时根免候选，避免 /tmp 测试工作区被当作临时根）
 local function with_config(overrides, fn)
@@ -627,7 +628,7 @@ tests.suite("sandbox_governance", function(_, it)
     sr.reset()
     local saved = services.use("services.sandbox")
     local cwd = vim.fn.getcwd()
-    services.provide("services.sandbox", {
+    _provide_sandbox({
       list_reviews = function()
         return {
           { change_set_id = "csA", tool = "edit_file", files = {

@@ -87,6 +87,8 @@ local function _start_recursive(id, newly, visiting)
       return false, ("服务模块加载失败 %s: %s"):format(p.spec.module, tostring(mod))
     end
     services.provide(p.spec.service, mod)
+    -- 缓存已解析的实现，供 start/stop 副作用经 ctx.impl 复用（无需再次 require 具体模块）。
+    p.impl = mod
   end
 
   -- 3) 执行启动副作用

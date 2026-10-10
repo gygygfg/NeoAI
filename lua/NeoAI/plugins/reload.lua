@@ -1,5 +1,5 @@
 --- 插件热重载实现（供 `:NeoAIReloadAll` 命令使用的底层实现，不暴露为 AI 工具）
---- @module NeoAI.tools.builtin.reload_all
+--- @module NeoAI.plugins.reload
 --- 热重载整个 NeoAI 插件。安全策略：
 --- 1. 隔离子进程预检：用一个全新的 headless nvim（--clean -u NONE + rtp=插件根）
 ---    加载插件并做冒烟校验。任何报错都只在子进程里发生，绝不影响当前会话。
@@ -7,6 +7,9 @@
 --- 3. 预检通过后，才在当前进程执行受控热重载（清空 NeoAI.* require 缓存 →
 ---    重新 setup → 重建工具/技能/MCP 与聊天界面，尽量保留当前会话）。
 --- 4. 重载本身 pcall 包裹，失败时按 require 缓存快照尽力回滚。
+---
+--- 归位说明：本模块是「插件宿主操作」而非 AI 工具，故位于 plugins/（与组合/副作用插件同层），
+--- 由 commands 插件（同层）经 `require("NeoAI.plugins.reload")` 调用。
 
 local stringx = require("NeoAI.utils.stringx")
 
@@ -43,8 +46,8 @@ end
 function M._plugin_root()
   local src = debug.getinfo(1, "S").source or ""
   local path = src:match("^@(.+)$") or src
-  -- .../lua/NeoAI/tools/builtin/reload_all.lua  →  去掉 /lua/NeoAI/... 后缀
-  local root = path:match("^(.*)[/\\]lua[/\\]NeoAI[/\\]tools[/\\]builtin[/\\]reload_all%.lua$")
+  -- .../lua/NeoAI/plugins/reload.lua  →  去掉 /lua/NeoAI/... 后缀
+  local root = path:match("^(.*)[/\\]lua[/\\]NeoAI[/\\]plugins[/\\]reload%.lua$")
   if root and root ~= "" then return root end
   return nil
 end
@@ -112,7 +115,7 @@ end
 function M._precheck()
   local root = M._plugin_root()
   if not root then
-    return { ok = false, message = "无法定位插件根目录（reload_all.lua 路径异常）" }
+    return { ok = false, message = "无法定位插件根目录（reload.lua 路径异常）" }
   end
 
   local script_path = vim.fn.tempname() .. "_neoai_precheck.lua"

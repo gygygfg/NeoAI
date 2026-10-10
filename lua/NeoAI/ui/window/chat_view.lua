@@ -1389,8 +1389,13 @@ end
 
 --- 显示模式变化：同步轨迹保存能力
 --- @param payload table
-local function _on_display_mode_changed(payload) -- luacheck: ignore payload
+local function _on_display_mode_changed(payload)
   _sync_trajectory_save()
+  -- 上报显示模式标签给状态栏服务（services 不再反向读 ui 组件）。
+  local st = services.use("services.status")
+  if st and st.set_display then
+    st.set_display(payload and payload.label or nil)
+  end
 end
 
 local function _register_focus_tracking()
@@ -1737,6 +1742,14 @@ function M.open(opts)
   state.unsubs[#state.unsubs + 1] = event_bus.on(events.DISPLAY_MODE_CHANGED, _on_display_mode_changed)
   -- 打开窗口时按当前显示模式同步一次（activate 的 DISPLAY_MODE_CHANGED 在订阅前已发出）
   _sync_trajectory_save()
+  -- 同步当前显示模式标签给状态栏（订阅前 activate 已发出事件，此处补推一次）。
+  do
+    local p = display_modes.get_current()
+    local st = services.use("services.status")
+    if st and st.set_display then
+      st.set_display(p and (p.label or p.name) or nil)
+    end
+  end
 
   -- 打开聊天窗口时懒注入 lualine 扩展：此阶段用户启动配置已执行、lualine 已可用，
   -- 避免因 lualine 懒加载 / setup 顺序导致扩展注册不到。
