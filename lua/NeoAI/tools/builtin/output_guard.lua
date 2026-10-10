@@ -81,7 +81,7 @@ end
 --- @return string|nil guest_path
 --- @return string|nil reason "truncated-bytes"|"no-sandbox-tmp"|"mkdir-failed"|"write-failed"
 local function _spill(content, opts)
-  local guest_fs = require("NeoAI.sandbox.guest_fs")
+  local guest_fs = require("NeoAI.sandbox.execution.guest_fs")
   local host_root = guest_fs.tmp_host("/tmp")
   if not host_root then
     return nil, "no-sandbox-tmp"
@@ -173,7 +173,7 @@ end
 --- 当前是否具备落盘能力（供调用方决定展示形态）。
 --- @return boolean
 function M.spill_available()
-  local ok, guest_fs = pcall(require, "NeoAI.sandbox.guest_fs")
+  local ok, guest_fs = pcall(require, "NeoAI.sandbox.execution.guest_fs")
   if not ok or not guest_fs then return false end
   return guest_fs.tmp_host("/tmp") ~= nil
 end

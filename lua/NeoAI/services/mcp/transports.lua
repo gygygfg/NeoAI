@@ -123,7 +123,7 @@ function M.stdio(server, opts)
     -- 统一经沙箱创建 server 子进程：网络放行；只读暴露 command 所在目录（支持装在
     -- $HOME 下的 server）；cwd（或进程工作目录）作为可写根经 overlay 暂存，server 的
     -- 写入在退出时冻结为候选（与 edit_file 一样走暂存）。后端不可用时拒绝启动（fail-closed）。
-    local sandbox_exec = require("NeoAI.sandbox.exec")
+    local sandbox_exec = require("NeoAI.sandbox.execution.exec")
     local ro, rw = {}, {}
     local resolved = vim.fn.exepath(self.command)
     local cmd_path = (resolved ~= "" and resolved) or self.command

@@ -8,35 +8,35 @@
 ---   硬拒绝不可被确认覆盖；未知结果不报告为成功。
 
 local config_store = require("NeoAI.kernel.config_store")
-local instance = require("NeoAI.sandbox.instance")
-local store = require("NeoAI.sandbox.store")
+local instance = require("NeoAI.sandbox.execution.instance")
+local store = require("NeoAI.sandbox.state.store")
 local logger = require("NeoAI.kernel.logger")
-local control = require("NeoAI.sandbox.control")
-local candidate = require("NeoAI.sandbox.candidate")
-local runtime = require("NeoAI.sandbox.runtime")
-local wrapper = require("NeoAI.sandbox.wrapper")
-local policy = require("NeoAI.sandbox.policy")
-local tool_spec = require("NeoAI.sandbox.tool_spec")
-local review = require("NeoAI.sandbox.review")
-local grant = require("NeoAI.sandbox.grant")
-local impact = require("NeoAI.sandbox.impact")
-local evidence = require("NeoAI.sandbox.evidence")
-local envelope = require("NeoAI.sandbox.envelope")
-local network = require("NeoAI.sandbox.network")
-local broker = require("NeoAI.sandbox.broker")
-local replay = require("NeoAI.sandbox.replay")
-local cgroup = require("NeoAI.sandbox.cgroup")
-local seccomp = require("NeoAI.sandbox.seccomp")
-local privilege = require("NeoAI.sandbox.privilege")
-local hostop = require("NeoAI.sandbox.hostop")
-local cache = require("NeoAI.sandbox.cache")
-local fault = require("NeoAI.sandbox.fault")
-local bench = require("NeoAI.sandbox.bench")
-local risk = require("NeoAI.sandbox.risk")
-local audit = require("NeoAI.sandbox.audit")
-local container = require("NeoAI.sandbox.container")
-local secret = require("NeoAI.sandbox.secret")
-local trace = require("NeoAI.sandbox.trace")
+local control = require("NeoAI.sandbox.execution.control")
+local candidate = require("NeoAI.sandbox.execution.candidate")
+local runtime = require("NeoAI.sandbox.execution.runtime")
+local wrapper = require("NeoAI.sandbox.execution.wrapper")
+local policy = require("NeoAI.sandbox.review.policy")
+local tool_spec = require("NeoAI.sandbox.execution.tool_spec")
+local review = require("NeoAI.sandbox.review.review")
+local grant = require("NeoAI.sandbox.review.grant")
+local impact = require("NeoAI.sandbox.observe.impact")
+local evidence = require("NeoAI.sandbox.review.evidence")
+local envelope = require("NeoAI.sandbox.observe.envelope")
+local network = require("NeoAI.sandbox.net.network")
+local broker = require("NeoAI.sandbox.net.broker")
+local replay = require("NeoAI.sandbox.review.replay")
+local cgroup = require("NeoAI.sandbox.execution.cgroup")
+local seccomp = require("NeoAI.sandbox.execution.seccomp")
+local privilege = require("NeoAI.sandbox.execution.privilege")
+local hostop = require("NeoAI.sandbox.execution.hostop")
+local cache = require("NeoAI.sandbox.state.cache")
+local fault = require("NeoAI.sandbox.observe.fault")
+local bench = require("NeoAI.sandbox.observe.bench")
+local risk = require("NeoAI.sandbox.review.risk")
+local audit = require("NeoAI.sandbox.observe.audit")
+local container = require("NeoAI.sandbox.execution.container")
+local secret = require("NeoAI.sandbox.secret.secret")
+local trace = require("NeoAI.sandbox.observe.trace")
 local events = require("NeoAI.kernel.events")
 
 local M = {}
@@ -120,7 +120,7 @@ function M.init()
   _rehydrate_pending()
   -- 启动探测内核级观测后端（eBPF/strace/procfs）：不可用或发生回退时 notify（异步，不阻塞启动）。
   vim.schedule(function()
-    pcall(function() require("NeoAI.sandbox.observer").notify_backend() end)
+    pcall(function() require("NeoAI.sandbox.observe.observer").notify_backend() end)
   end)
   if not state.gc_scheduled then
     state.gc_scheduled = true
@@ -139,11 +139,11 @@ function M.init()
     end, 200)
   end
   -- 后台统计一次沙箱暂存磁盘用量（供磁盘上限门禁读缓存；不阻塞启动）。
-  vim.schedule(function() pcall(function() require("NeoAI.sandbox.disk").refresh(true) end) end)
+  vim.schedule(function() pcall(function() require("NeoAI.sandbox.execution.disk").refresh(true) end) end)
   -- 注册出网密钥守卫：向非白名单地址发送密钥时弹窗阻止（utils/http 程序化路径）。
   pcall(function()
     require("NeoAI.utils.http").set_guard(function(o, c)
-      return require("NeoAI.sandbox.secret_egress").guard_http(o, c)
+      return require("NeoAI.sandbox.secret.secret_egress").guard_http(o, c)
     end)
   end)
   return M
@@ -167,24 +167,24 @@ end
 --- 关闭：清理暂存
 function M.shutdown()
   M.unwatch_sessions()
-  pcall(function() require("NeoAI.sandbox.net_gateway").teardown() end)
-  pcall(function() require("NeoAI.sandbox.host_proxy").stop() end)
+  pcall(function() require("NeoAI.sandbox.net.net_gateway").teardown() end)
+  pcall(function() require("NeoAI.sandbox.net.host_proxy").stop() end)
   -- 停止 systemd 门面 IPC 桥（沙箱内 systemctl/journalctl 入口的宿主服务端）。
-  pcall(function() require("NeoAI.sandbox.systemd_ipc").stop() end)
+  pcall(function() require("NeoAI.sandbox.systemd.systemd_ipc").stop() end)
   -- 停止长驻服务：捕获其改动为候选并合并回暂存（有界等待），避免服务进程跨关闭残留。
-  pcall(function() require("NeoAI.sandbox.service").stop_all({ timeout_ms = 10000 }) end)
+  pcall(function() require("NeoAI.sandbox.execution.service").stop_all({ timeout_ms = 10000 }) end)
   -- 停止会话级常驻沙箱实例（连同其命名空间内的后台进程）。
-  pcall(function() require("NeoAI.sandbox.resident").stop({ timeout_ms = 2000 }) end)
+  pcall(function() require("NeoAI.sandbox.execution.resident").stop({ timeout_ms = 2000 }) end)
   -- 卸载用户态 overlay（fuse-overlayfs）兜底挂载，避免残留挂载点影响后续/清理。
-  pcall(function() require("NeoAI.sandbox.runtime").fuse_release_all() end)
+  pcall(function() require("NeoAI.sandbox.execution.runtime").fuse_release_all() end)
   -- 先等后台后处理（异步模式下命令结果已返回、捕获/冻结/结算未完成）与异步写入落盘，
   -- 避免关闭时丢失最后一笔冻结与待审入队。等待有上限（tools.sandbox.shutdown_timeout_ms，
   -- 默认 3s）：后处理卡住时不至于让 `:qall` / 插件热重载长时间无响应。
   local timeout = tonumber(config_store.get("tools.sandbox.shutdown_timeout_ms"))
   if timeout == nil then timeout = 3000 end
   timeout = math.max(0, timeout)
-  pcall(function() require("NeoAI.sandbox.wrapper").await_postprocess(timeout) end)
-  logger.try("store_flush", function() require("NeoAI.sandbox.store").flush(timeout) end)
+  pcall(function() require("NeoAI.sandbox.execution.wrapper").await_postprocess(timeout) end)
+  logger.try("store_flush", function() require("NeoAI.sandbox.state.store").flush(timeout) end)
   candidate.reset(timeout)
   state.active = nil
   state.initialized = false
@@ -222,12 +222,12 @@ function M.watch_sessions()
       pcall(candidate.rotate_session)
     end
     local function rotate_when_idle(tries)
-      local resident = require("NeoAI.sandbox.resident")
+      local resident = require("NeoAI.sandbox.execution.resident")
       -- 同时在途命令与后台后处理（捕获/冻结/合并）时延迟轮换：合并的暂存写入是异步的，
       -- 若在写完前轮换，缺失的暂存副本会被误判为删除并物化成 whiteout（命令产物回退）。
       local busy = resident.busy()
       if not busy then
-        local ok, wrapper = pcall(require, "NeoAI.sandbox.wrapper")
+        local ok, wrapper = pcall(require, "NeoAI.sandbox.execution.wrapper")
         busy = ok and type(wrapper.postprocess_pending) == "function" and wrapper.postprocess_pending()
       end
       if busy and tries > 0 then
@@ -393,14 +393,14 @@ end
 --- 是否有后台后处理在途（异步模式下命令结果已返回、捕获/冻结/结算尚未完成）
 --- @return boolean
 function M.postprocess_pending()
-  return require("NeoAI.sandbox.wrapper").postprocess_pending()
+  return require("NeoAI.sandbox.execution.wrapper").postprocess_pending()
 end
 
 --- 等待后台后处理完成（测试/关闭前调用）
 --- @param timeout_ms number|nil
 --- @return boolean
 function M.await_postprocess(timeout_ms)
-  return require("NeoAI.sandbox.wrapper").await_postprocess(timeout_ms)
+  return require("NeoAI.sandbox.execution.wrapper").await_postprocess(timeout_ms)
 end
 
 --- 越界访问留痕（访问 cwd 之外用户工作目录；供审批悬浮窗展示）
@@ -673,27 +673,27 @@ end
 --- 审批中心页定义（对齐 approval_hub.PAGES）
 --- @return table 数组 { { id, label, ... } }
 function M.hub_pages()
-  return require("NeoAI.sandbox.approval_hub").PAGES
+  return require("NeoAI.sandbox.review.approval_hub").PAGES
 end
 
 --- 注册审批中心的 UI 渲染器（由 ui 层初始化时注入；传 nil 解绑）
 --- @param ui table|nil
 function M.set_hub_ui(ui)
-  return require("NeoAI.sandbox.approval_hub").set_ui(ui)
+  return require("NeoAI.sandbox.review.approval_hub").set_ui(ui)
 end
 
 --- 某审批页的待处理数量
 --- @param page string
 --- @return number
 function M.hub_pending_count(page)
-  return require("NeoAI.sandbox.approval_hub").pending_count(page)
+  return require("NeoAI.sandbox.review.approval_hub").pending_count(page)
 end
 
 --- 列出某审批页的条目
 --- @param page string
 --- @return table 数组
 function M.hub_list(page)
-  return require("NeoAI.sandbox.approval_hub").list(page)
+  return require("NeoAI.sandbox.review.approval_hub").list(page)
 end
 
 --- 解析一个审批条目（用户作答）
@@ -701,31 +701,31 @@ end
 --- @param value any
 --- @return boolean
 function M.hub_resolve(id, value)
-  return require("NeoAI.sandbox.approval_hub").resolve(id, value)
+  return require("NeoAI.sandbox.review.approval_hub").resolve(id, value)
 end
 
 --- 读取一个审批条目
 --- @param id string
 --- @return table|nil
 function M.hub_get(id)
-  return require("NeoAI.sandbox.approval_hub").get(id)
+  return require("NeoAI.sandbox.review.approval_hub").get(id)
 end
 
 --- 重置审批中心（测试/关闭清理用）
 function M.reset_approval_hub()
-  return require("NeoAI.sandbox.approval_hub").reset()
+  return require("NeoAI.sandbox.review.approval_hub").reset()
 end
 
 --- 注册网络放行确认 UI 渲染器（由 ui 层注入；传 nil 解绑）
 --- @param ui table|nil
 function M.set_net_consent_ui(ui)
-  return require("NeoAI.sandbox.net_consent").set_ui(ui)
+  return require("NeoAI.sandbox.net.net_consent").set_ui(ui)
 end
 
 --- 注册密钥外泄告警 UI 渲染器（由 ui 层注入；传 nil 解绑）
 --- @param ui table|nil
 function M.set_secret_alert_ui(ui)
-  return require("NeoAI.sandbox.secret_alert").set_ui(ui)
+  return require("NeoAI.sandbox.secret.secret_alert").set_ui(ui)
 end
 
 -- ---------- 呈现层只读查询（语义封装） ----------
@@ -788,7 +788,7 @@ end
 --- 沙箱资源域/负载诊断（137/OOM 归因）
 --- @return table
 function M.diag_sandbox_limits()
-  return require("NeoAI.sandbox.diag").sandbox_limits()
+  return require("NeoAI.sandbox.observe.diag").sandbox_limits()
 end
 
 -- ---------- AI 审计 / L3 警示（异步生成） ----------
@@ -797,14 +797,14 @@ end
 --- @param notes string|nil
 --- @return string|nil
 function M.audit_verdict(notes)
-  return require("NeoAI.sandbox.ai_audit").verdict(notes)
+  return require("NeoAI.sandbox.observe.ai_audit").verdict(notes)
 end
 
 --- AI 审计：构造发给模型的用户消息（取当前 agent 的安全上下文）
 --- @param agent table|nil
 --- @return table
 function M.audit_user_messages(agent)
-  return require("NeoAI.sandbox.ai_audit").user_messages(agent)
+  return require("NeoAI.sandbox.observe.ai_audit").user_messages(agent)
 end
 
 --- AI 审计：异步生成审计结论
@@ -813,7 +813,7 @@ end
 --- @param opts table
 --- @param on_done function
 function M.audit_generate(items, user_messages, opts, on_done)
-  return require("NeoAI.sandbox.ai_audit").generate(items, user_messages, opts, on_done)
+  return require("NeoAI.sandbox.observe.ai_audit").generate(items, user_messages, opts, on_done)
 end
 
 --- L3 高危二次确认警示文案：异步生成（失败时调用方回退 l3_fallback）
@@ -821,7 +821,7 @@ end
 --- @param target table
 --- @param on_done function(text: string)
 function M.l3_generate(item, target, on_done)
-  return require("NeoAI.sandbox.l3_warning").generate(item, target, on_done)
+  return require("NeoAI.sandbox.review.l3_warning").generate(item, target, on_done)
 end
 
 --- L3 高危二次确认警示文案：同步兜底
@@ -829,7 +829,7 @@ end
 --- @param target table
 --- @return string
 function M.l3_fallback(item, target)
-  return require("NeoAI.sandbox.l3_warning").fallback(item, target)
+  return require("NeoAI.sandbox.review.l3_warning").fallback(item, target)
 end
 
 -- ---------- 会话级自动审批 / 运行时诊断 ----------
@@ -888,13 +888,13 @@ function M.reset()
   -- 跨 reset/跨套件污染。先按当前实例根初始化，使其可被清理。
   if not store.root() then store.init(_root()) end
   -- 等待后台后处理完成，避免 reset 时仍有在途捕获/冻结/结算写入旧实例目录造成污染。
-  pcall(function() require("NeoAI.sandbox.wrapper").await_postprocess(60000) end)
+  pcall(function() require("NeoAI.sandbox.execution.wrapper").await_postprocess(60000) end)
   -- 停止 systemd 门面 IPC 桥（测试隔离：避免跨套件残留定时器/监听）。
-  pcall(function() require("NeoAI.sandbox.systemd_ipc").reset() end)
+  pcall(function() require("NeoAI.sandbox.systemd.systemd_ipc").reset() end)
   -- 停止长驻服务并回收其 overlay/cgroup（先于 candidate/control/store 清理）。
-  pcall(function() require("NeoAI.sandbox.service").reset() end)
+  pcall(function() require("NeoAI.sandbox.execution.service").reset() end)
   -- 停止会话级常驻沙箱实例（连同其后台进程与资源域）。
-  pcall(function() require("NeoAI.sandbox.resident").reset() end)
+  pcall(function() require("NeoAI.sandbox.execution.resident").reset() end)
   candidate.reset()
   control.reset()
   store.reset()
@@ -914,14 +914,14 @@ function M.reset()
   risk.reset()
   audit.reset()
   container.reset()
-  pcall(function() require("NeoAI.sandbox.systemd").reset() end)
-  require("NeoAI.sandbox.secret").reset()
+  pcall(function() require("NeoAI.sandbox.systemd.systemd").reset() end)
+  require("NeoAI.sandbox.secret.secret").reset()
   trace.reset()
-  pcall(function() require("NeoAI.sandbox.net_gateway").reset() end)
-  pcall(function() require("NeoAI.sandbox.host_proxy").reset() end)
-  pcall(function() require("NeoAI.sandbox.disk").reset() end)
+  pcall(function() require("NeoAI.sandbox.net.net_gateway").reset() end)
+  pcall(function() require("NeoAI.sandbox.net.host_proxy").reset() end)
+  pcall(function() require("NeoAI.sandbox.execution.disk").reset() end)
   -- 回收观测预热（后台预挂载的 bpftrace 探针 + 预创建 cgroup），避免 reset 后残留。
-  pcall(function() require("NeoAI.sandbox.wrapper").clear_prewarm() end)
+  pcall(function() require("NeoAI.sandbox.execution.wrapper").clear_prewarm() end)
   state.active = nil
   state.initialized = false
   M.init()

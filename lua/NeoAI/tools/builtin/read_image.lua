@@ -20,7 +20,7 @@ local attachment = setmetatable({}, {
 })
 local helpers = require("NeoAI.tools.builtin.tool_helpers")
 local async = require("NeoAI.utils.async")
-local sandbox_exec = require("NeoAI.sandbox.exec")
+local sandbox_exec = require("NeoAI.sandbox.execution.exec")
 
 local M = {}
 
@@ -64,12 +64,12 @@ end
 --- @return string|nil readable_path
 local function _view_readable_path(path)
   if vim.fn.filereadable(path) == 1 then return path end
-  local okc, candidate = pcall(require, "NeoAI.sandbox.candidate")
+  local okc, candidate = pcall(require, "NeoAI.sandbox.execution.candidate")
   if okc and candidate and type(candidate.read_path) == "function" then
     local sp = candidate.read_path(path)
     if sp and vim.fn.filereadable(sp) == 1 then return sp end
   end
-  local okr, runtime = pcall(require, "NeoAI.sandbox.runtime")
+  local okr, runtime = pcall(require, "NeoAI.sandbox.execution.runtime")
   if okr and type(runtime.root_overlay_uppers) == "function" then
     for _, up in ipairs(runtime.root_overlay_uppers()) do
       local cand = up .. path

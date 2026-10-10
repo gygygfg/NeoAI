@@ -26,7 +26,7 @@ end
 
 tests.suite("sandbox_hardening", function(_, it)
   it("能力门禁：CAP_NET_ADMIN 授予时 iptables 放行，缺失时拒绝", function(t)
-    local risk = require("NeoAI.sandbox.risk")
+    local risk = require("NeoAI.sandbox.review.risk")
     -- 缺省（无能力）→ 拒绝
     t.not_nil(risk.deny_reason("iptables -F"), "无能力应拒绝 iptables")
     t.not_nil(risk.deny_reason("iptables -F", { caps = {} }), "显式空能力应拒绝")
@@ -41,7 +41,7 @@ tests.suite("sandbox_hardening", function(_, it)
   end)
 
   it("privilege.effective_caps：T2 默认 ALL 不展开，显式 cap_add 才授予", function(t)
-    local privilege = require("NeoAI.sandbox.privilege")
+    local privilege = require("NeoAI.sandbox.execution.privilege")
     -- 默认 T2 cap_add={"ALL"}：ALL 不解除全局 cap_drop，故 CAP_NET_ADMIN 未授予
     local caps = privilege.effective_caps("run_command", { command = "iptables -F" }, { effect = "process" })
     t.true_(caps.CAP_NET_ADMIN ~= true, "ALL 不应展开为 CAP_NET_ADMIN")
@@ -53,8 +53,8 @@ tests.suite("sandbox_hardening", function(_, it)
   end)
 
   it("代理规避门禁：识别 unset/env -u/--noproxy/--proxy 空值", function(t)
-    local risk = require("NeoAI.sandbox.risk")
-    local script_scan = require("NeoAI.sandbox.script_scan")
+    local risk = require("NeoAI.sandbox.review.risk")
+    local script_scan = require("NeoAI.sandbox.observe.script_scan")
     -- 与门禁一致：对脚本折叠后的有效命令文本判定（bash -c '…' 内联脚本会被展开）。
     local function eff(c)
       local ok, scan = pcall(script_scan.scan, c, { cwd = vim.fn.getcwd() })
@@ -103,7 +103,7 @@ tests.suite("sandbox_hardening", function(_, it)
   end)
 
   it("策略确认：headless 拒绝；交互式可仅本次/会话允许", function(t)
-    local pc = require("NeoAI.sandbox.policy_consent")
+    local pc = require("NeoAI.sandbox.review.policy_consent")
     pc.reset()
     local orig_uis = vim.api.nvim_list_uis
     local orig_confirm = vim.fn.confirm
@@ -126,7 +126,7 @@ tests.suite("sandbox_hardening", function(_, it)
 
   it("代理规避：默认弹窗拒绝（headless）；批准后放行；可配置 deny/allow", function(t)
     local tools = require("NeoAI.tools")
-    local pc = require("NeoAI.sandbox.policy_consent")
+    local pc = require("NeoAI.sandbox.review.policy_consent")
     local function run(cmd)
       local done, out = false, nil
       tools.execute("run_command", { command = cmd, description = "t" }, {})
@@ -156,7 +156,7 @@ tests.suite("sandbox_hardening", function(_, it)
   end)
 
   it("cgroup：applied/unavailable 暴露真实生效状态，控制器列表可读", function(t)
-    local cgroup = require("NeoAI.sandbox.cgroup")
+    local cgroup = require("NeoAI.sandbox.execution.cgroup")
     t.eq("function", type(cgroup.applied), "应导出 applied")
     t.eq("function", type(cgroup.unavailable), "应导出 unavailable")
     t.eq("table", type(cgroup.applied(nil)), "applied(nil) 应返回表")
@@ -165,7 +165,7 @@ tests.suite("sandbox_hardening", function(_, it)
   end)
 
   it("tar 属主还原兼容：沙箱环境默认 TAR_OPTIONS=--no-same-owner", function(t)
-    local runtime = require("NeoAI.sandbox.runtime")
+    local runtime = require("NeoAI.sandbox.execution.runtime")
     local env = runtime.sandbox_env({})
     t.matches("no%-same%-owner", tostring(env.TAR_OPTIONS), "应注入 --no-same-owner")
     -- 已有 TAR_OPTIONS 时保留并补开关
@@ -174,7 +174,7 @@ tests.suite("sandbox_hardening", function(_, it)
   end)
 
   it("systemd 门面：daemon-reload 静默成功（真实 systemctl 行为）", function(t)
-    local sd = require("NeoAI.sandbox.systemd")
+    local sd = require("NeoAI.sandbox.systemd.systemd")
     with_config({ tools = { sandbox = { systemd = { enabled = true } } } }, function()
       local plan = sd.parse_command("systemctl daemon-reload")
       t.not_nil(plan, "应识别 daemon-reload")
@@ -188,7 +188,7 @@ tests.suite("sandbox_hardening", function(_, it)
   end)
 
   it("网络自动登记：解析 LISTEN inode 并按 cgroup 归属识别沙箱监听", function(t)
-    local nc = require("NeoAI.sandbox.net_consent")
+    local nc = require("NeoAI.sandbox.net.net_consent")
     nc.reset()
     -- /proc/net/tcp 行：local=0100007F:1F90(8080) st=0A inode=123456
     local text = table.concat({
@@ -210,7 +210,7 @@ tests.suite("sandbox_hardening", function(_, it)
   end)
 
   it("cgroup 委派：限额写在不可写层，暴露给沙箱的是可写叶子", function(t)
-    local cgroup = require("NeoAI.sandbox.cgroup")
+    local cgroup = require("NeoAI.sandbox.execution.cgroup")
     if not cgroup.capabilities().available then return end
     local h, err = cgroup.prepare_delegated("test_hardening", cgroup.resolve_limits())
     t.not_nil(h, tostring(err))
@@ -221,7 +221,7 @@ tests.suite("sandbox_hardening", function(_, it)
   end)
 
   it("cgroup：内部委派叶子（有 subtree_control）上 join_prefix 下沉到非内部子域", function(t)
-    local cgroup = require("NeoAI.sandbox.cgroup")
+    local cgroup = require("NeoAI.sandbox.execution.cgroup")
     if not cgroup.capabilities().available then return end
     local h, err = cgroup.prepare_delegated("test_join_internal", cgroup.resolve_limits())
     t.not_nil(h, tostring(err))
@@ -241,9 +241,9 @@ tests.suite("sandbox_hardening", function(_, it)
   end)
 
   it("端到端：沙箱内命令启动的临时监听端口自动免权限放行", function(t)
-    local runtime = require("NeoAI.sandbox.runtime")
+    local runtime = require("NeoAI.sandbox.execution.runtime")
     if runtime.backend() ~= "bwrap" then return end
-    local resident = require("NeoAI.sandbox.resident")
+    local resident = require("NeoAI.sandbox.execution.resident")
     if not resident.available() then return end
     if vim.fn.executable("python3") ~= 1 or vim.fn.executable("curl") ~= 1 then return end
     local port = 38999
@@ -257,7 +257,7 @@ tests.suite("sandbox_hardening", function(_, it)
       },
     }, function()
       require("NeoAI.sandbox").reset()
-      require("NeoAI.sandbox.net_consent").reset()
+      require("NeoAI.sandbox.net.net_consent").reset()
       local function run(cmd)
         local out, done = nil, false
         require("NeoAI.tools").execute("run_command", { command = cmd, description = "t" }, {})

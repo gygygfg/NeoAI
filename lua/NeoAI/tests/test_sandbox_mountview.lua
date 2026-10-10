@@ -7,7 +7,7 @@ local tests = require("NeoAI.tests")
 
 tests.suite("sandbox_mountview", function(_, it)
   it("mount_root_of 取最深祖先挂载点，cross_mount_root 仅独立挂载时返回", function(t)
-    local rt = require("NeoAI.sandbox.runtime")
+    local rt = require("NeoAI.sandbox.execution.runtime")
     rt.set_mountinfo_for_test({ "/", "/mnt", "/mnt/uuid-1", "/tmp" })
     t.eq("/mnt/uuid-1", rt.mount_root_of("/mnt/uuid-1/Agent沙箱论文/src"))
     t.eq("/mnt", rt.mount_root_of("/mnt/other/x"))
@@ -20,8 +20,8 @@ tests.suite("sandbox_mountview", function(_, it)
   end)
 
   it("no_root_overlay 兼容模式跳过整机根 overlay，改为覆盖工作区", function(t)
-    local rt = require("NeoAI.sandbox.runtime")
-    local wrapper = require("NeoAI.sandbox.wrapper")
+    local rt = require("NeoAI.sandbox.execution.runtime")
+    local wrapper = require("NeoAI.sandbox.execution.wrapper")
     local orig_read_all = rt.read_all
     local orig_ow = rt.overlay_writable
     rt.read_all = function() return true end
@@ -51,9 +51,9 @@ tests.suite("sandbox_mountview", function(_, it)
   end)
 
   it("内核 overlay 不可用时按配置回退 fuse-overlayfs 根视图", function(t)
-    local rt = require("NeoAI.sandbox.runtime")
-    local wrapper = require("NeoAI.sandbox.wrapper")
-    local fo = require("NeoAI.sandbox.fuse_overlay")
+    local rt = require("NeoAI.sandbox.execution.runtime")
+    local wrapper = require("NeoAI.sandbox.execution.wrapper")
+    local fo = require("NeoAI.sandbox.execution.fuse_overlay")
     local config_store = require("NeoAI.kernel.config_store")
     local orig_read_all = rt.read_all
     local orig_ow = rt.overlay_writable

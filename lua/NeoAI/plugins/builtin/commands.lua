@@ -296,7 +296,7 @@ function M.start()
 
   --- 137 / OOM 归因：采集宿主/容器 cgroup 限制、负载与已解析沙箱限制
   _cmd("NeoAISandboxDiag", function()
-    local ok, diag = pcall(require, "NeoAI.sandbox.diag")
+    local ok, diag = pcall(require, "NeoAI.sandbox.observe.diag")
     if not ok or type(diag.sandbox_limits) ~= "function" then
       vim.notify("[NeoAI] 诊断模块不可用", vim.log.levels.WARN)
       return
@@ -435,7 +435,7 @@ function M.start()
 
   --- 行为审计与风险评估（监视 AI 的读取/调用行为）
   _cmd("NeoAISandboxAudit", function()
-    local ok, audit = pcall(require, "NeoAI.sandbox.audit")
+    local ok, audit = pcall(require, "NeoAI.sandbox.observe.audit")
     if not ok then return end
     vim.notify("[NeoAI] " .. audit.summary(), vim.log.levels.INFO)
   end, { desc = "显示沙箱行为审计与风险评估摘要" })

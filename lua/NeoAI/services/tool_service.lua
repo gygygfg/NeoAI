@@ -56,7 +56,7 @@ end
 --- @return string|nil
 local function _target_path(tool_name, args)
   if type(args) ~= "table" then return nil end
-  local spec = require("NeoAI.sandbox.tool_spec").get(tool_name)
+  local spec = require("NeoAI.sandbox.execution.tool_spec").get(tool_name)
   for _, field in ipairs(spec.paths or {}) do
     local p = args[field]
     if type(p) == "string" and p ~= "" then return p end
@@ -92,7 +92,7 @@ local function _approval_text(tool_name, args, ctx)
   end
   -- 越界访问留痕：把近期访问 cwd 之外用户工作目录的记录附在审批窗内（非阻塞、仅展示）。
   -- 按文件路径合并（同一路径的多工具访问合并）、路径升序排序后展示。
-  local ok, trace = pcall(require, "NeoAI.sandbox.trace")
+  local ok, trace = pcall(require, "NeoAI.sandbox.observe.trace")
   if ok and trace then
     local items = trace.list_grouped()
     if #items > 0 then
@@ -166,7 +166,7 @@ local function _show_approval(tool_name, args, decision_cb, ctx)
   -- 镜像到审批分流中心（多级页面审批悬浮窗可决策）：
   --   命中遮蔽目录（ctx.sandbox_unmask）→「资源访问」页；其余工具调用同意 →「工具行为」页。
   -- 独立弹窗仍为即时通道；先决策者生效（decide 幂等）。
-  local okhub, hub = pcall(require, "NeoAI.sandbox.approval_hub")
+  local okhub, hub = pcall(require, "NeoAI.sandbox.review.approval_hub")
   if okhub and hub.available() then
     local page = (type(ctx) == "table" and type(ctx.sandbox_unmask) == "table"
       and #ctx.sandbox_unmask > 0) and "resource" or "behavior"

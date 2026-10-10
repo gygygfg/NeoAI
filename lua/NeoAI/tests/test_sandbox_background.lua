@@ -31,7 +31,7 @@ end
 
 tests.suite("sandbox_background", function(_, it)
   it("background.parse：识别 & / nohup / setsid，排除 && / 重定向 / 中段 &", function(t)
-    local bg = require("NeoAI.sandbox.background")
+    local bg = require("NeoAI.sandbox.execution.background")
     local a = bg.parse("sleep 30 &")
     t.not_nil(a, "终止 & 应识别")
     t.eq("amp", a.kind)
@@ -55,7 +55,7 @@ tests.suite("sandbox_background", function(_, it)
   end)
 
   it("resident：结果目录按实例唯一（mktemp），不再共用静态路径", function(t)
-    local resident = require("NeoAI.sandbox.resident")
+    local resident = require("NeoAI.sandbox.execution.resident")
     t.not_nil(resident._server_script, "应暴露 _server_script 测试钩子")
     local script = resident._server_script(nil)
     t.true_(script:find("mktemp -d /tmp/.neoai_res.XXXXXX", 1, true) ~= nil,
@@ -74,9 +74,9 @@ tests.suite("sandbox_background", function(_, it)
   end)
 
   it("run_command：后台进程跨调用存活（会话级常驻沙箱）", function(t)
-    local runtime = require("NeoAI.sandbox.runtime")
+    local runtime = require("NeoAI.sandbox.execution.runtime")
     if runtime.backend() ~= "bwrap" then return end
-    local resident = require("NeoAI.sandbox.resident")
+    local resident = require("NeoAI.sandbox.execution.resident")
     if not resident.available() then return end
     with_config({
       tools = { approval = { mode = "auto_allow" }, sandbox = resident_sandbox_config() },
@@ -102,9 +102,9 @@ tests.suite("sandbox_background", function(_, it)
   end)
 
   it("interactive 开启时后台命令仍走常驻实例（后台进程跨调用存活）", function(t)
-    local runtime = require("NeoAI.sandbox.runtime")
+    local runtime = require("NeoAI.sandbox.execution.runtime")
     if runtime.backend() ~= "bwrap" then return end
-    local resident = require("NeoAI.sandbox.resident")
+    local resident = require("NeoAI.sandbox.execution.resident")
     if not resident.available() then return end
     with_config({
       tools = { approval = { mode = "auto_allow" },
@@ -130,9 +130,9 @@ tests.suite("sandbox_background", function(_, it)
   end)
 
   it("resident：后台进程跨 agentEnd 会话轮换存活", function(t)
-    local runtime = require("NeoAI.sandbox.runtime")
+    local runtime = require("NeoAI.sandbox.execution.runtime")
     if runtime.backend() ~= "bwrap" then return end
-    local resident = require("NeoAI.sandbox.resident")
+    local resident = require("NeoAI.sandbox.execution.resident")
     if not resident.available() then return end
     local event_bus = require("NeoAI.kernel.event_bus")
     local events = require("NeoAI.kernel.events")
@@ -163,7 +163,7 @@ tests.suite("sandbox_background", function(_, it)
   end)
 
   it("run_command：非后台命令正常返回输出", function(t)
-    local runtime = require("NeoAI.sandbox.runtime")
+    local runtime = require("NeoAI.sandbox.execution.runtime")
     if runtime.backend() ~= "bwrap" then return end
     with_config({
       tools = { approval = { mode = "auto_allow" }, sandbox = resident_sandbox_config() },
@@ -176,14 +176,14 @@ tests.suite("sandbox_background", function(_, it)
       t.true_(vim.wait(15000, function() return done end, 50), "应返回")
       t.eq(nil, err, "不应报错: " .. tostring(err and (err.message or err)))
       t.matches("b", tostring(result), "应执行并返回输出")
-      require("NeoAI.sandbox.resident").stop({ timeout_ms = 5000 })
+      require("NeoAI.sandbox.execution.resident").stop({ timeout_ms = 5000 })
     end)
   end)
 
   it("resident：输出含控制字节/NUL 不破坏帧定界（base64 承载）", function(t)
-    local runtime = require("NeoAI.sandbox.runtime")
+    local runtime = require("NeoAI.sandbox.execution.runtime")
     if runtime.backend() ~= "bwrap" then return end
-    local resident = require("NeoAI.sandbox.resident")
+    local resident = require("NeoAI.sandbox.execution.resident")
     if not resident.available() then return end
     with_config({
       tools = { approval = { mode = "auto_allow" }, sandbox = resident_sandbox_config() },
@@ -203,9 +203,9 @@ tests.suite("sandbox_background", function(_, it)
   end)
 
   it("resident：服务器意外退出后自动重建实例并执行命令", function(t)
-    local runtime = require("NeoAI.sandbox.runtime")
+    local runtime = require("NeoAI.sandbox.execution.runtime")
     if runtime.backend() ~= "bwrap" then return end
-    local resident = require("NeoAI.sandbox.resident")
+    local resident = require("NeoAI.sandbox.execution.resident")
     if not resident.available() then return end
     with_config({
       tools = { approval = { mode = "auto_allow" }, sandbox = resident_sandbox_config() },
@@ -236,9 +236,9 @@ tests.suite("sandbox_background", function(_, it)
   end)
 
   it("resident：服务器协议失步卡死后自动恢复（后续命令不再永久超时）", function(t)
-    local runtime = require("NeoAI.sandbox.runtime")
+    local runtime = require("NeoAI.sandbox.execution.runtime")
     if runtime.backend() ~= "bwrap" then return end
-    local resident = require("NeoAI.sandbox.resident")
+    local resident = require("NeoAI.sandbox.execution.resident")
     if not resident.available() then return end
     with_config({
       tools = { approval = { mode = "auto_allow" }, sandbox = resident_sandbox_config() },
@@ -274,9 +274,9 @@ tests.suite("sandbox_background", function(_, it)
   end)
 
   it("resident：大文件物化走收件箱复制（不内嵌内容）且命令可见", function(t)
-    local runtime = require("NeoAI.sandbox.runtime")
+    local runtime = require("NeoAI.sandbox.execution.runtime")
     if runtime.backend() ~= "bwrap" then return end
-    local resident = require("NeoAI.sandbox.resident")
+    local resident = require("NeoAI.sandbox.execution.resident")
     if not resident.available() then return end
     -- 极小上限：用 200KB 文件即触发「大文件」路径，测试保持快速。
     with_config({
@@ -308,7 +308,7 @@ tests.suite("sandbox_background", function(_, it)
   end)
 
   it("run_command：非常驻（resident 关闭）时后台意图给出 UI 提示", function(t)
-    local runtime = require("NeoAI.sandbox.runtime")
+    local runtime = require("NeoAI.sandbox.execution.runtime")
     if runtime.backend() ~= "bwrap" then return end
     with_config({
       tools = {

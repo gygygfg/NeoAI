@@ -5,8 +5,8 @@
 local async = require("NeoAI.utils.async")
 local helpers = require("NeoAI.tools.builtin.tool_helpers")
 local output_guard = require("NeoAI.tools.builtin.output_guard")
-local conceal = require("NeoAI.sandbox.conceal")
-local secret = require("NeoAI.sandbox.secret")
+local conceal = require("NeoAI.sandbox.observe.conceal")
+local secret = require("NeoAI.sandbox.secret.secret")
 
 local M = {}
 
@@ -48,7 +48,7 @@ end
 --- @return table|nil
 local function _oom_baseline(cgroup_path)
   if not cgroup_path then return nil end
-  local ok, cg = pcall(require, "NeoAI.sandbox.cgroup")
+  local ok, cg = pcall(require, "NeoAI.sandbox.execution.cgroup")
   if not (ok and cg and cg.oom_baseline) then return nil end
   local b
   pcall(function() b = cg.oom_baseline(cgroup_path) end)
@@ -63,7 +63,7 @@ end
 --- @return string|nil level "sandbox"|"ancestor"
 local function _oom_attribution(cgroup_path, baseline, code)
   if not cgroup_path or (code ~= 137 and code ~= -1) then return false, nil end
-  local ok, cg = pcall(require, "NeoAI.sandbox.cgroup")
+  local ok, cg = pcall(require, "NeoAI.sandbox.execution.cgroup")
   if not (ok and cg) then return false, nil end
   if cg.oom_attribution then
     local attr = cg.oom_attribution(cgroup_path, { baseline = baseline }) or {}
@@ -83,7 +83,7 @@ local function _run_command(command, opts)
   opts = opts or {}
   -- 出网密钥守卫：命令含密钥（真实值或将被还原的假密钥）且指向非白名单地址时弹窗阻止。
   if not opts._egress_checked then
-    local guard = require("NeoAI.sandbox.secret_egress").guard_process(command, opts.env, { tool = "run_command" })
+    local guard = require("NeoAI.sandbox.secret.secret_egress").guard_process(command, opts.env, { tool = "run_command" })
     if guard then
       local opts2 = vim.tbl_extend("force", {}, opts)
       opts2._egress_checked = true
@@ -94,7 +94,7 @@ local function _run_command(command, opts)
   end
   -- 常驻沙箱：命令经 nsenter 进入会话级共享命名空间执行（后台进程跨调用存活）。
   if opts.resident then
-    return require("NeoAI.sandbox.resident").exec(command, {
+    return require("NeoAI.sandbox.execution.resident").exec(command, {
       timeout_ms = opts.timeout_ms,
       signal = opts.signal,
       cwd = opts.cwd,
@@ -120,7 +120,7 @@ local function _run_command(command, opts)
   -- 命令开始时的祖先 OOM 计数基线：结束后差分，避免把命令前已存在的祖先 OOM 误判为本次。
   local cgroup_baseline = nil
   if cgroup_path then
-    local ok_cg, cg = pcall(require, "NeoAI.sandbox.cgroup")
+    local ok_cg, cg = pcall(require, "NeoAI.sandbox.execution.cgroup")
     if ok_cg and cg and cg.oom_baseline then
       pcall(function()
         cgroup_baseline = cg.oom_baseline(cgroup_path)
@@ -229,7 +229,7 @@ local function _run_command(command, opts)
       local oom, oom_level = false, nil
       -- 137（SIGKILL）与裸 -1（无超时/取消标记、进程树被终止后无法回传退出码）都做 OOM 归因。
       if cgroup_path and (code == 137 or code == -1) then
-        local ok, cgroup = pcall(require, "NeoAI.sandbox.cgroup")
+        local ok, cgroup = pcall(require, "NeoAI.sandbox.execution.cgroup")
         if ok and cgroup then
           if cgroup.oom_attribution then
             local attr = cgroup.oom_attribution(cgroup_path, { baseline = cgroup_baseline })
@@ -266,7 +266,7 @@ local function _run_interactive(command, opts)
   opts = opts or {}
   -- 出网密钥守卫（与 _run_command 一致）
   if not opts._egress_checked then
-    local guard = require("NeoAI.sandbox.secret_egress").guard_process(command, opts.env, { tool = "run_command" })
+    local guard = require("NeoAI.sandbox.secret.secret_egress").guard_process(command, opts.env, { tool = "run_command" })
     if guard then
       local opts2 = vim.tbl_extend("force", {}, opts)
       opts2._egress_checked = true
@@ -453,7 +453,7 @@ shell_tools.run_command = helpers.define_tool(
     -- 资源域内运行，命令结束即 `cgroup.kill` 回收整个进程树，后台进程不会存活。明确告知
     -- 用户（仅 UI，不写入模型可见结果），避免误以为后台任务仍在运行。
     if ctx and not ctx.sandbox_resident then
-      local bg = require("NeoAI.sandbox.background").parse(command)
+      local bg = require("NeoAI.sandbox.execution.background").parse(command)
       if bg then
         ctx.ui_notice = "[NeoAI] 注意：本次命令请求后台执行（`&`/nohup/setsid），但当前会话未使用"
           .. "常驻沙箱（如 overlay 不可用或特权档），命令结束后后台进程会被回收，不会跨调用存活。"
@@ -462,7 +462,7 @@ shell_tools.run_command = helpers.define_tool(
     end
     -- 代理策略：默认不把宿主代理（如不可达的 127.0.0.1:7890）传入沙箱，
     -- 避免 pip/npm 等按代理配置走网络时 Connection refused；仅 opencode 自身用代理。
-    local unset_proxy = require("NeoAI.sandbox.runtime").proxy_unset_snippet()
+    local unset_proxy = require("NeoAI.sandbox.execution.runtime").proxy_unset_snippet()
     if unset_proxy then
       command = unset_proxy .. "\n" .. command
     end
@@ -470,7 +470,7 @@ shell_tools.run_command = helpers.define_tool(
       command = _wrap_session_command(command, ctx.sandbox_shell_state)
     end
     -- 丢弃上一条命令遗留的网关探测记录，确保摘要只反映本次命令。
-    local ok_gw0, gw0 = pcall(require, "NeoAI.sandbox.gateway")
+    local ok_gw0, gw0 = pcall(require, "NeoAI.sandbox.net.gateway")
     if ok_gw0 and gw0 then
       gw0.drain_probes()
     end
@@ -538,7 +538,7 @@ shell_tools.run_command = helpers.define_tool(
             -- 非超时/取消/截断的 137：SIGKILL 来源不明（资源域终止、宿主 OOM 或外部信号）。
             local diag = ""
             if cgroup_path then
-              local ok_cg, cg = pcall(require, "NeoAI.sandbox.cgroup")
+              local ok_cg, cg = pcall(require, "NeoAI.sandbox.execution.cgroup")
               if ok_cg and cg and cg.events_snapshot then
                 local snap = cg.events_snapshot(cgroup_path) or {}
                 local parts = {}
@@ -586,7 +586,7 @@ shell_tools.run_command = helpers.define_tool(
             ctx.ui_notice = PRIVILEGED_NOTE
           end
           -- 网络网关模式：把本次命令经网关探测到的宿主端口及拦截原因回传给 AI。
-          local ok_gw, gw = pcall(require, "NeoAI.sandbox.gateway")
+          local ok_gw, gw = pcall(require, "NeoAI.sandbox.net.gateway")
           if ok_gw and gw then
             local s = gw.summary()
             if s then
@@ -594,7 +594,7 @@ shell_tools.run_command = helpers.define_tool(
             end
           end
           -- 本机访问拦截代理：回传本次经代理放行/拦截的目标摘要（应用层）。
-          local ok_hp, hp = pcall(require, "NeoAI.sandbox.host_proxy")
+          local ok_hp, hp = pcall(require, "NeoAI.sandbox.net.host_proxy")
           if ok_hp and hp then
             local s = hp.summary()
             if s then

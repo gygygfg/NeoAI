@@ -13,7 +13,7 @@ local M = {}
 
 --- @return table|nil
 local function _svc()
-  local ok, mod = pcall(require, "NeoAI.sandbox.service")
+  local ok, mod = pcall(require, "NeoAI.sandbox.execution.service")
   if not ok then return nil end
   return mod
 end

@@ -33,7 +33,7 @@ tests.suite("sandbox_service", function(_, it)
   it("service：启动/日志/状态/停止 + 注册表清理", function(t)
     with_config({ tools = { sandbox = sandbox_config() } }, function()
       require("NeoAI.sandbox").reset()
-      local svc_mod = require("NeoAI.sandbox.service")
+      local svc_mod = require("NeoAI.sandbox.execution.service")
       local svc, err = svc_mod.start("t1",
         "for i in 1 2 3 4 5; do echo hello-$i; sleep 0.2; done", { cwd = vim.fn.getcwd() })
       t.not_nil(svc, "启动失败: " .. tostring(err))
@@ -57,8 +57,8 @@ tests.suite("sandbox_service", function(_, it)
     vim.fn.mkdir(dir, "p")
     with_config({ tools = { sandbox = sandbox_config() } }, function()
       require("NeoAI.sandbox").reset()
-      local svc_mod = require("NeoAI.sandbox.service")
-      local candidate = require("NeoAI.sandbox.candidate")
+      local svc_mod = require("NeoAI.sandbox.execution.service")
+      local candidate = require("NeoAI.sandbox.execution.candidate")
       local out = dir .. "/svc_out.txt"
       local svc, err = svc_mod.start("writer",
         "echo svcdata > " .. out .. "; echo READY; sleep 30", { cwd = dir })
@@ -100,7 +100,7 @@ tests.suite("sandbox_service", function(_, it)
       },
     }, function()
       require("NeoAI.sandbox").reset()
-      local runtime = require("NeoAI.sandbox.runtime")
+      local runtime = require("NeoAI.sandbox.execution.runtime")
       local env = runtime.sandbox_env({})
       t.eq("https://pypi.tuna.tsinghua.edu.cn/simple", env.PIP_INDEX_URL)
       t.eq("pypi.tuna.tsinghua.edu.cn", env.PIP_TRUSTED_HOST)
@@ -108,7 +108,7 @@ tests.suite("sandbox_service", function(_, it)
       t.matches("%-s ", env.MAVEN_OPTS or "")
       t.matches("/tmp/.mvn%-settings.xml", env.MAVEN_OPTS or "")
       -- settings.xml 生成在宿主私有目录，由 process_prefix 只读绑定到 guest 路径。
-      local host = require("NeoAI.sandbox.conceal").base_host() .. "/runtime/mvn-settings.xml"
+      local host = require("NeoAI.sandbox.observe.conceal").base_host() .. "/runtime/mvn-settings.xml"
       local f = io.open(host, "r")
       t.not_nil(f, "settings.xml 应存在: " .. host)
       local body = f:read("*a")
@@ -118,7 +118,7 @@ tests.suite("sandbox_service", function(_, it)
   end)
 
   it("诊断：cgroup 事件快照与 OOM 判定", function(t)
-    local cgroup = require("NeoAI.sandbox.cgroup")
+    local cgroup = require("NeoAI.sandbox.execution.cgroup")
     local snap = cgroup.events_snapshot("/nonexistent")
     t.eq("table", type(snap))
     t.false_(cgroup.snapshot_oom({ memory_events = "oom_kill 0" }))
@@ -143,7 +143,7 @@ tests.suite("sandbox_service", function(_, it)
     local attr3 = cgroup.oom_attribution("/cg/neoai/a", { base = "/cg", reader = reader, baseline = baseline })
     t.true_(attr3.oom, "子域新增 OOM 应归因")
     t.eq("sandbox", attr3.level, "子域 OOM 应标记为 sandbox")
-    local diag = require("NeoAI.sandbox.diag")
+    local diag = require("NeoAI.sandbox.observe.diag")
     local limits = diag.sandbox_limits()
     t.eq("table", type(limits))
     t.eq("boolean", type(limits.systemd))
@@ -157,8 +157,8 @@ tests.suite("sandbox_service", function(_, it)
       tools = { sandbox = sandbox_config({ service = { enabled = true, stop_timeout_ms = 2000 } }) },
     }, function()
       require("NeoAI.sandbox").reset()
-      local svc_mod = require("NeoAI.sandbox.service")
-      local candidate = require("NeoAI.sandbox.candidate")
+      local svc_mod = require("NeoAI.sandbox.execution.service")
+      local candidate = require("NeoAI.sandbox.execution.candidate")
       local term = dir .. "/term.txt"
       local svc, err = svc_mod.start("grace",
         "trap 'echo GRACEFUL > " .. term .. "; exit 0' TERM; echo READY; "
@@ -187,7 +187,7 @@ tests.suite("sandbox_service", function(_, it)
       tools = { sandbox = sandbox_config({ service = { enabled = true, stop_timeout_ms = 700 } }) },
     }, function()
       require("NeoAI.sandbox").reset()
-      local svc_mod = require("NeoAI.sandbox.service")
+      local svc_mod = require("NeoAI.sandbox.execution.service")
       local svc, err = svc_mod.start("stubborn",
         "trap '' TERM; echo READY; while true; do sleep 0.1; done", { cwd = dir })
       t.not_nil(svc, "启动失败: " .. tostring(err))
@@ -211,8 +211,8 @@ tests.suite("sandbox_service", function(_, it)
       tools = { sandbox = sandbox_config({ service = { enabled = true, stop_timeout_ms = 2000 } }) },
     }, function()
       require("NeoAI.sandbox").reset()
-      local svc_mod = require("NeoAI.sandbox.service")
-      local candidate = require("NeoAI.sandbox.candidate")
+      local svc_mod = require("NeoAI.sandbox.execution.service")
+      local candidate = require("NeoAI.sandbox.execution.candidate")
       local term = dir .. "/term.txt"
       local svc, err = svc_mod.start("grace_all",
         "trap 'echo GRACEFUL > " .. term .. "; exit 0' TERM; echo READY; "

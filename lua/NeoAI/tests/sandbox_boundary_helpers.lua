@@ -26,7 +26,7 @@ end
 --- 后端是否为 bwrap（真实内核隔离）。
 --- @return boolean
 function M.bwrap()
-  return require("NeoAI.sandbox.runtime").backend() == "bwrap"
+  return require("NeoAI.sandbox.execution.runtime").backend() == "bwrap"
 end
 
 --- 可执行是否存在
@@ -49,7 +49,7 @@ end
 --- @return string 输出（stdout+stderr）
 --- @return number 退出码
 function M.direct(opts, shell)
-  local rt = require("NeoAI.sandbox.runtime")
+  local rt = require("NeoAI.sandbox.execution.runtime")
   local prefix = rt.process_prefix(opts or { cwd = "/tmp" })
   assert(prefix, "process_prefix 应可构造（后端不可用？）")
   local cmd = {}
@@ -67,7 +67,7 @@ end
 --- @return string
 --- @return number
 function M.python(opts, script)
-  local rt = require("NeoAI.sandbox.runtime")
+  local rt = require("NeoAI.sandbox.execution.runtime")
   local prefix = rt.process_prefix(opts or { cwd = "/tmp" })
   if not prefix then return "", -1 end
   local cmd = {}

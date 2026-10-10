@@ -7,7 +7,7 @@ tests.suite("guest_fs", function(_, it, before_each)
   local guest_fs
 
   before_each(function()
-    guest_fs = require("NeoAI.sandbox.guest_fs")
+    guest_fs = require("NeoAI.sandbox.execution.guest_fs")
     guest_fs.clear()
   end)
 

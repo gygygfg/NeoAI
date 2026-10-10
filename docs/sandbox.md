@@ -25,34 +25,34 @@
 | 模块 | 职责 |
 | --- | --- |
 | `sandbox/init.lua` | 控制面入口：`init/probe/gate/attach/commit/discard/list/show` |
-| `sandbox/control.lua` | 标识/摘要、状态机、幂等键、租约与 fencing token |
-| `sandbox/policy.lua` | 规则评估与聚合（DENY > NEEDS_CONFIRMATION > ALLOW）、受限 Lua 规则沙箱 |
-| `sandbox/runtime.lua` | 外部隔离后端探测与进程前缀（bwrap 优先，unshare 兜底） |
-| `sandbox/candidate.lua` | 私有暂存层、候选冻结、CAS 发布 |
-| `sandbox/store.lua` | 候选与发布回执持久化（可查询对账） |
-| `sandbox/review.lua` | 异步审批：变更单元队列与 review/apply 状态 |
-| `sandbox/observe.lua` | 影响记录（fs/process/network，未知用 null）与裁决信封（decision/severity/stats/asks/evidence）；合并原 `impact`+`envelope`（旧文件为兼容 shim） |
-| `sandbox/evidence.lua` | 证据保存、脱敏、分页读取 |
-| `sandbox/grant.lua` | 窄范围任务授权（范围/操作/预算/有效期/撤销） |
-| `sandbox/writer.lua` | 落盘写入器：先非 root 尝试，权限不足 → NEEDS_ROOT，批准后 root/`sudo`(tty) 写入 |
-| `sandbox/network.lua` | 受控网络网关（默认放行；启用后按声明端点放行） |
-| `sandbox/broker.lua` | 外部操作适配器协议（幂等/查询/补偿能力声明与对账） |
-| `sandbox/replay.lua` | 策略回放（同规则同事实复现裁决） |
-| `sandbox/cgroup.lua` | cgroup v2 资源域（内存/PID/CPU），每次尝试独立域 |
-| `sandbox/disk.lua` | 沙箱暂存磁盘用量统计与上限门禁（异步缓存，超限拒绝写类/进程工具） |
-| `sandbox/background.lua` | 后台命令识别（`&`/nohup/setsid） |
-| `sandbox/resident.lua` | 会话级常驻沙箱实例（命令服务器，后台进程跨调用存活） |
-| `sandbox/seccomp.lua` | seccomp 能力探测与 require_seccomp 门禁 |
-| `sandbox/privilege.lua` | 权限档位（T0/T1/T2）分类、解析、自动升级检测与留痕 |
-| `sandbox/hostop.lua` | T2 主机效果提案（冻结/审批后 replay/拒绝） |
-| `sandbox/cache.lua` | 内容寻址缓存（隔离写入、可清理） |
-| `sandbox/diag.lua` | 故障注入（后端/冻结/发布/持久化）与关键路径性能基准；合并原 `fault`+`bench`（旧文件为兼容 shim） |
-| `sandbox/tool_spec.lua` | 每个工具的影响类别（effect）与暂存路径声明 |
-| `sandbox/wrapper.lua` | 执行门禁：`attach` 附加规格、`gate` 强制过闸门 |
-| `sandbox/risk.lua` | 安全级别评估（L0-L3）、审批分级动作与结果分级 |
-| `sandbox/script_scan.lua` | 脚本间接执行静态扫描（Shell 正文 + 高级语言内嵌 shell、递归、不透明判定） |
-| `sandbox/audit.lua` | AI 读取/调用行为监视、风险分与异常事件 |
-| `sandbox/container.lua` | 容器运行时受控：与沙箱同 namespace（podman）或受控 socket（docker） |
+| `sandbox/execution/control.lua` | 标识/摘要、状态机、幂等键、租约与 fencing token |
+| `sandbox/review/policy.lua` | 规则评估与聚合（DENY > NEEDS_CONFIRMATION > ALLOW）、受限 Lua 规则沙箱 |
+| `sandbox/execution/runtime.lua` | 外部隔离后端探测与进程前缀（bwrap 优先，unshare 兜底） |
+| `sandbox/execution/candidate.lua` | 私有暂存层、候选冻结、CAS 发布 |
+| `sandbox/state/store.lua` | 候选与发布回执持久化（可查询对账） |
+| `sandbox/review/review.lua` | 异步审批：变更单元队列与 review/apply 状态 |
+| `sandbox/observe/observe.lua` | 影响记录（fs/process/network，未知用 null）与裁决信封（decision/severity/stats/asks/evidence）；合并原 `impact`+`envelope`（旧文件为兼容 shim） |
+| `sandbox/review/evidence.lua` | 证据保存、脱敏、分页读取 |
+| `sandbox/review/grant.lua` | 窄范围任务授权（范围/操作/预算/有效期/撤销） |
+| `sandbox/execution/writer.lua` | 落盘写入器：先非 root 尝试，权限不足 → NEEDS_ROOT，批准后 root/`sudo`(tty) 写入 |
+| `sandbox/net/network.lua` | 受控网络网关（默认放行；启用后按声明端点放行） |
+| `sandbox/net/broker.lua` | 外部操作适配器协议（幂等/查询/补偿能力声明与对账） |
+| `sandbox/review/replay.lua` | 策略回放（同规则同事实复现裁决） |
+| `sandbox/execution/cgroup.lua` | cgroup v2 资源域（内存/PID/CPU），每次尝试独立域 |
+| `sandbox/execution/disk.lua` | 沙箱暂存磁盘用量统计与上限门禁（异步缓存，超限拒绝写类/进程工具） |
+| `sandbox/execution/background.lua` | 后台命令识别（`&`/nohup/setsid） |
+| `sandbox/execution/resident.lua` | 会话级常驻沙箱实例（命令服务器，后台进程跨调用存活） |
+| `sandbox/execution/seccomp.lua` | seccomp 能力探测与 require_seccomp 门禁 |
+| `sandbox/execution/privilege.lua` | 权限档位（T0/T1/T2）分类、解析、自动升级检测与留痕 |
+| `sandbox/execution/hostop.lua` | T2 主机效果提案（冻结/审批后 replay/拒绝） |
+| `sandbox/state/cache.lua` | 内容寻址缓存（隔离写入、可清理） |
+| `sandbox/observe/diag.lua` | 故障注入（后端/冻结/发布/持久化）与关键路径性能基准；合并原 `fault`+`bench`（旧文件为兼容 shim） |
+| `sandbox/execution/tool_spec.lua` | 每个工具的影响类别（effect）与暂存路径声明 |
+| `sandbox/execution/wrapper.lua` | 执行门禁：`attach` 附加规格、`gate` 强制过闸门 |
+| `sandbox/review/risk.lua` | 安全级别评估（L0-L3）、审批分级动作与结果分级 |
+| `sandbox/observe/script_scan.lua` | 脚本间接执行静态扫描（Shell 正文 + 高级语言内嵌 shell、递归、不透明判定） |
+| `sandbox/observe/audit.lua` | AI 读取/调用行为监视、风险分与异常事件 |
+| `sandbox/execution/container.lua` | 容器运行时受控：与沙箱同 namespace（podman）或受控 socket（docker） |
 
 ## 3. 强制入口（加载器 + 执行器）
 
@@ -227,7 +227,7 @@
     `core/agent/tool_loop.lua`）。
   - **墙钟安全网**：`tools.run_command.max_wall_ms`（默认 0 = 不限）>0 时约束所有命令（含
     `timeout_ms=-1` 的「不限」命令），到时经资源域终止，避免长任务永久占用、工具永不返回。
-  - **基准复现**：`require("NeoAI.sandbox.diag").bench_capture({ files = N })` 返回
+  - **基准复现**：`require("NeoAI.sandbox.observe.diag").bench_capture({ files = N })` 返回
     物化冷/热与捕获主线程耗时，用于回归对比（会重置沙箱，仅诊断用）。
 - **大量文件进入审批悬浮窗/应用到落盘/暂存内存的优化**（暂存上万文件回归）：
   - **审批窗渲染上限 + 刷新防抖**：`tools.sandbox.review.max_display_files`（默认 200）限制
@@ -305,7 +305,7 @@
     「待审」状态标签**按安全等级着色**（L0 灰 / L1 黄 / L2 橙 / L3 红）；并按安全级别显示
     **高危/中危/低危** 风险档（`[L0]低危` …
       `[L2]/[L3]高危`）与风险原因（同类原因**去重合并计数**，如 `SYSTEM_PATH_WRITE×2797`，
-      避免包安装逐文件重复刷屏；`sandbox/risk.lua` 已在源头按类别去重）。界面**按「未应用 / 已应用」分区展示**：待审（未应用）
+      避免包安装逐文件重复刷屏；`sandbox/review/risk.lua` 已在源头按类别去重）。界面**按「未应用 / 已应用」分区展示**：待审（未应用）
       变更在前，已发布（含快照，可撤销）变更在后。**头行 = 整单元审批**（`<CR>` 一次应用该变更
       单元的全部文件），**文件行 = 单文件审批**（`<CR>` 仅应用光标所在文件）；`A` **一键同意
       所有工作区内修改**（按文件粒度应用工作区内待审文件；工作区外的文件与主机操作提案保留
@@ -399,7 +399,7 @@
        拒绝前一直保留可读，不随会话轮转/退出销毁。
     - **高危二次确认**（`tools.sandbox.review.l3_warning.enabled`，默认开）：对 `risk_level=3`
       的条目，以及 **L2 的包安装/敏感安装**（`package_confirm`，默认开；如 `apt-key`、`gpg --import`、
-      改软件源等），首次 `<CR>` **不直接应用**，而是由模型（`sandbox/l3_warning.lua` 经
+      改软件源等），首次 `<CR>` **不直接应用**，而是由模型（`sandbox/review/l3_warning.lua` 经
       `core/agent/request`）生成一条简洁的中文**后果警告**，并自动打开该条目的**修改 diff**，
       警告展示在 diff 顶部（生成期间显示占位）。确认窗顶部标题按级别区分（`⚠ L2 高危 · 确认应用` /
       `⚠ L3 严重 · 确认应用`），按键提示行高亮；若冻结时剔除了遮蔽/易变缓存文件，警告区追加
@@ -408,7 +408,7 @@
       `risk_reasons`/路径的确定性规则警告，不阻断流程。安全安装（L1）仍只需一次确认。
     - **AI 审计**（`tools.sandbox.review.ai_audit`，默认开，待审界面内按 `a`，可配置 `key`）：
       把**原会话的用户消息**（排除运行上下文快照与压缩检查点）与**分级的待审变更/修改内容
-      的结构化文本**（`sandbox/ai_audit.lua`：变更单元 id、工具、权限档、风险级别与原因、
+      的结构化文本**（`sandbox/observe/ai_audit.lua`：变更单元 id、工具、权限档、风险级别与原因、
       密钥/包安装/命令、逐文件 diff）交给模型，为**每个文件（主机操作为其命令）生成一句不超过
       50 字的简体中文风险说明**。说明**以「安全」或「不安全」开头（先结论后原因）**，
       并**暗灰色补充渲染在对应文件行下方**（模型按 `<路径或命令> => <安全|不安全>：<说明>`
@@ -425,7 +425,7 @@
       集合变化时自动重审；也可随时按 `key`（默认 `a`）手动触发。
   - **多级页面审批悬浮窗（审批分流）**：`:NeoAISandboxReview` 采用多级页面，页头按
     **待修改 / 工具行为 / 资源访问 / 网络请求 / 越界·异常** 分页，`h`/`l`（或 `←`/`→`）切换、
-    各页计数醒目。分流机制（`sandbox/approval_hub.lua`）汇聚所有需批准/需关注的请求与观测：
+    各页计数醒目。分流机制（`sandbox/review/approval_hub.lua`）汇聚所有需批准/需关注的请求与观测：
     **待修改**＝文件变更单元（`files`，非阻塞，走异步待审队列，`<CR>` 应用 / `d` 拒绝）；
     **工具行为**＝工具调用同意（阻塞，审批通过才执行）与 T2 主机操作提案；
     **资源访问**＝命中遮蔽目录等资源访问审批（阻塞）；**网络请求**＝出沙箱访问同意（阻塞）；
@@ -485,7 +485,7 @@
 
 命令把执行委托给脚本/解释器时，命令字符串本身看不到真正的操作（`bash deploy.sh`、
 `python setup.py`、`node x.js`、`./run.sh`、`bash -c '…'`、`python -c '…'`）。执行前
-`sandbox/script_scan.lua` 会：
+`sandbox/observe/script_scan.lua` 会：
 
 - 识别解释器调用与直接可执行脚本（按 shebang 判语言），支持 `source`/`.` 引用；
 - 读取脚本内容（**优先沙箱暂存副本**，使 AI 本次新建/修改的脚本也被扫描；宿主敏感遮蔽路径
@@ -564,7 +564,7 @@
       进入审批悬浮窗，用户确认后原子应用（`SANDBOX_GIT_INTERNAL` 仅兜底拒绝瞬态/配置类目标）。
     - 这些 git 变更工具在**沙箱内**执行（`effect=process`，看到暂存工作区），改动冻结为候选、
       dry_run 下不改真实 `.git`。`run_command` 中的 git **变更**子命令被守卫拒绝
-      （`SANDBOX_GIT_MUTATION_VIA_COMMAND`，`sandbox/git_guard.lua`），须改用上述专用工具。
+      （`SANDBOX_GIT_MUTATION_VIA_COMMAND`，`sandbox/observe/git_guard.lua`），须改用上述专用工具。
     - **审批悬浮窗整组呈现**：涉及 `.git` 对象/指针的候选被标记为原子组
       （`review` 的 `atomic_group="git"`），界面渲染为「git 操作 · N 个文件 · 原子整组」，
       头行与各文件行都映射到**整组**——`<CR>` 通过、`d` 丢弃均作用于整组，禁止逐文件选择性
@@ -700,7 +700,7 @@
   T0 进程命令共享一个**常驻 bwrap 实例**——它在一个持久的 mount+pid+net+ipc+uts+cgroup
   命名空间内运行一个**命令服务器**（`bash` 从 stdin 读取请求），命令在服务器内执行。
   因此 `&`/nohup/setsid 启动的后台进程**跨工具调用、且跨轮次（agentEnd 会话轮换）存活**，
-  同一会话内 `ps`/`kill` 可见，行为接近普通 bash（`sandbox/resident.lua`）。
+  同一会话内 `ps`/`kill` 可见，行为接近普通 bash（`sandbox/execution/resident.lua`）。
 - **并发执行**：命令服务器按请求 id **多路复用**——每条命令独立 `setsid` 后台运行、输出写独立
   文件，完成后以 `flock` 加锁原子输出 `BEGIN/内容/END` 块，客户端按 id 解复用，故同一实例内
   多条命令**真正并行**且输出不交错。超时/取消由服务器在命名空间内按命令进程组终止（宿主无法
@@ -770,7 +770,7 @@
 
 - **AI 不可见**：`service_start`/`service_logs`/`service_status`/`service_stop` 不再注册为工具。
   后台进程由上述常驻实例承载，AI 用普通 shell 命令（`ps`/`kill`/重定向日志）管理。
-- **内部复用**：`sandbox/service.lua` 仍作为内部能力保留，供 systemctl 门面（`sandbox/systemd`）
+- **内部复用**：`sandbox/execution/service.lua` 仍作为内部能力保留，供 systemctl 门面（`sandbox/systemd/systemd`）
   在沙箱内启动/停止单元进程（独立 overlay + 资源域，停止时捕获改动为候选）。
 - **隔离/边界同步/优雅停止**：与常驻实例一致——独立 overlay attempt、启动时单向物化暂存、
   停止时捕获合并回暂存并经异步审批（复用 `wrapper.settle_exec_candidate`）；`cgroup.term`
@@ -787,16 +787,16 @@ bus`；默认 T2 路径会把主机效果冻结为 hostop 提案并在宿主 rep
 overlay + cgroup），写入停止时冻结为候选，**不调用宿主 systemd、也不修改宿主机**。
 
 **架构（解析/实现全在 Lua，沙箱内只有极薄入口）**：所有解析与实现都在
-`sandbox/systemd.lua` 的 `M.exec(argv)`（返回 `{stdout, stderr, code}`）。沙箱内
+`sandbox/systemd/systemd.lua` 的 `M.exec(argv)`（返回 `{stdout, stderr, code}`）。沙箱内
 `/usr/bin/systemctl`、`/usr/bin/journalctl`、`/usr/bin/systemd-run`、`/usr/bin/systemd-analyze`、
 `hostnamectl`、`timedatectl`、`dmesg` 由 `runtime._maintscript_stubs` 生成的**极薄入口**覆盖
 （`--ro-bind` 到真实二进制路径，不再 PATH 前置 `/tmp/.dynbin`）。入口是一个 bash 文件 IPC
 客户端：把 argv（NUL 分隔）写入宿主绑定进来的收件目录 `/run/systemd/units`，等待响应后按真实
-stdout/stderr/退出码返回。宿主侧由 `sandbox/systemd_ipc.lua` 以 fs_event（+ 兜底定时器）扫描并
+stdout/stderr/退出码返回。宿主侧由 `sandbox/systemd/systemd_ipc.lua` 以 fs_event（+ 兜底定时器）扫描并
 调用门面。因此**独立调用与脚本/管道调用走同一份实现、行为完全一致**，入口文件本身不含任何
 逻辑或可识别沙箱的注释/字样。
 
-- **拦截**：`sandbox/systemd.lua` 的 `parse_command` 识别**独立调用**（可跳过
+- **拦截**：`sandbox/systemd/systemd.lua` 的 `parse_command` 识别**独立调用**（可跳过
   `sudo`/`doas`/`env` 等前缀）。独立调用由门禁在 `effect="process"` 分支、`container.plan`
   同级经 `wrapper._maybe_systemd` 直接路由到门面；复合命令 `a && systemctl …`、管道、脚本内
   调用无法在门禁拆分，改由沙箱内入口经 IPC 转发到同一门面。
@@ -949,7 +949,7 @@ stdout/stderr/退出码返回。宿主侧由 `sandbox/systemd_ipc.lua` 以 fs_ev
 
 **背景**：沙箱环境是临时的（容器/评测机通常没有可用的 dbus 与 `systemd --user`，启动真实用户实例
 不稳定且依赖 cgroup 委派与 `/run/systemd` 标记）。因此 `systemctl --user` **不再启动真实
-`systemd --user`**，而由门面（`sandbox/systemd.lua`）用**伪造的解析器**处理，只覆盖简单
+`systemd --user`**，而由门面（`sandbox/systemd/systemd.lua`）用**伪造的解析器**处理，只覆盖简单
 `start`/`stop`/`restart`/`is-active`/`status`/`show`/`cat`/`list-units`/`daemon-reload` 与
 `enable`/`disable`。
 
@@ -1263,7 +1263,7 @@ seccomp（含设备节点屏障）**——沙箱内进程看到的是一份「�
     退回「整机只读（`--ro-bind / /`，递归绑定保留全部挂载读取面）+ 仅对工作区做**单层**
     overlay」的兼容模式（写入仍进暂存待审），不堆叠 overlay、不产生额外计算；批准结果按挂载点
     缓存在当前 Agent，后续命令不再重复弹窗。子 Agent / 无审批能力时 fail-closed 拒绝并说明原因。
-- **工具子进程统一经沙箱（`NeoAI.sandbox.exec`）**：所有工具内部 spawn 的子进程
+- **工具子进程统一经沙箱（`NeoAI.sandbox.execution.exec`）**：所有工具内部 spawn 的子进程
   （`run_command` 的 shell、`git` 操作、`read_image` 的 curl 下载、`web_fetch` 的
   bash/node 渲染与依赖安装、MCP stdio server 等）都在 bwrap 命名空间内创建，而非宿主。
   这些辅助进程不做候选冻结（只写工具自身缓存/临时目录），通过 `rw_binds` 以可写方式暴露
@@ -1334,7 +1334,7 @@ seccomp（含设备节点屏障）**——沙箱内进程看到的是一份「�
 防止 AI 借外部命令触达宿主服务（SSRF，如宿主管理面板、内部端口、云元数据）：
 
 - **机制**：为沙箱外部命令注入 `HTTP_PROXY`/`HTTPS_PROXY`（HTTP 代理）与 `ALL_PROXY`
-  （`socks5h://`），指向宿主侧纯 Lua 过滤代理 `sandbox/host_proxy.lua`（监听 `127.0.0.1`
+  （`socks5h://`），指向宿主侧纯 Lua 过滤代理 `sandbox/net/host_proxy.lua`（监听 `127.0.0.1`
   随机端口，`host_local_proxy_port` 可固定）。代理支持 **HTTP CONNECT + 绝对形式 + SOCKS5**：
   目标命中本机集合（`127/8`、`::1`、宿主各网卡 IP、`169.254/16`、`fe80::/10`、
   `169.254.169.254`）即拒绝并记录；其余外部目标双向转发并记录。**目标只解析一次**：
@@ -1347,11 +1347,11 @@ seccomp（含设备节点屏障）**——沙箱内进程看到的是一份「�
 - **T0 默认放行网络**：`tools.sandbox.privilege.tiers[0].network = true`，T0 不再
   `--unshare-net`；`offline=true` 时仍硬隔离（优先于档位）。
 - **访问策略（`network.access`）**：沙箱内部创建的进程/端口（回环 + `allow_localhost_ports` +
-  服务端口登记表，见 `sandbox/net_consent.lua`）在沙箱内访问**免权限**；访问沙箱外（宿主本机
+  服务端口登记表，见 `sandbox/net/net_consent.lua`）在沙箱内访问**免权限**；访问沙箱外（宿主本机
   其他端口、宿主网卡 IP、外部主机）按 `access` 处理：`"ask"`（默认）弹窗请求用户同意，
   `"allow"` 直接放行并记录（旧行为），`"deny"` 直接拒绝。弹窗由
    `ui/components/net_consent.lua` 提供（`<CR>` 仅本次 / `S` 本次会话始终 / `Esc` 拒绝），
-   决策经 `sandbox/net_consent` 的服务端会话白名单记忆。headless/无 UI 时失败关闭（拒绝）。
+   决策经 `sandbox/net/net_consent` 的服务端会话白名单记忆。headless/无 UI 时失败关闭（拒绝）。
    发起请求时发 `sandbox:net_consent_requested` 事件。长驻服务启动时按 `PORT`/`--port` 等
    声明自动登记内部端口（`net_consent.register_from_command`）。
    - **按「端口 + 服务进程」颗粒度**（`network.consent_process_granularity`，默认开）：命中
@@ -1378,7 +1378,7 @@ seccomp（含设备节点屏障）**——沙箱内进程看到的是一份「�
   忽略代理变量的工具）在共享 netns 下可直连宿主本机，不受此层约束。要硬拦截裸 TCP 只能：
   root + iptables/nft（按目的地过滤），或无 root 的 `slirp4netns`/`passt`（原生用户态
   网络栈，本机未安装）——本插件不引入这些依赖。故本机拦截为「非硬边界」，见
-  `sandbox/host_proxy.lua` 模块头。
+  `sandbox/net/host_proxy.lua` 模块头。
 - **代理规避确认**：显式清除/绕过代理（`unset *proxy`、`env -u *proxy`、`curl --noproxy`、
   `--proxy ""`/`-x ''`、`export *proxy=`）会使上述过滤失效，门禁在进入沙箱前对**折叠后的
   有效命令**识别（`PROXY_EVASION:*`），默认**暂停 Agent 并弹窗询问**（`network.block_proxy_evasion=true`：
@@ -1556,12 +1556,12 @@ run_command overlay 候选捕获（含删除 whiteout 捕获与尝试目录清�
 - 关闭端口：`HTTP 502` + `{"open":false,"reason":"port_not_open:…"}`；
 - 非宿主本机地址：`HTTP 403` + `only_host_local_addresses_allowed`。
 
-实现为宿主侧 HTTP 代理（`sandbox/gateway.lua`，纯 Lua/vim.uv）；`run_command` 注入
+实现为宿主侧 HTTP 代理（`sandbox/net/gateway.lua`，纯 Lua/vim.uv）；`run_command` 注入
 `HTTP(S)_PROXY` 指向网关，故 `curl`/`wget`/`git`/`nmap --proxies` 等**走代理的工具**可经网关
 探测并拿到原因；直接裸 TCP 不经代理无法到达宿主（隔离 netns），因此不生效。`run_command`
 结果会附上本次探测摘要（开放/关闭端口 + 拦截原因）供 AI 参考。
 
-编排（`sandbox/net_gateway.lua`）：创建 veth 对与 netns、默认路由指向网关，并在宿主防火墙
+编排（`sandbox/net/net_gateway.lua`）：创建 veth 对与 netns、默认路由指向网关，并在宿主防火墙
 （如 ufw）插入**仅针对该 veth 且限定目的地址与端口**的入站放行规则（`-i <veth> -d <gw_ip>
 -p tcp --dport <网关端口>`，而非按接口全放行——否则 netns 可直达宿主任意非 loopback 服务），
 并插入 `-i <veth> -j DROP` 的 FORWARD 丢弃规则（宿主 `ip_forward=1` 时阻止 netns 经宿主转发
@@ -1725,14 +1725,14 @@ overlay 会 `EINVAL`），此时命令只能运行在「只读根 + 私有可写
 
 ### 内容寻址缓存
 
-`sandbox/cache.lua` 按内容键（覆盖输入/运行时/规则/事实）缓存依赖或产物；写入方隔离、
+`sandbox/state/cache.lua` 按内容键（覆盖输入/运行时/规则/事实）缓存依赖或产物；写入方隔离、
 原子写，支持 `prune(days)`。授权与撤销状态不可通过旧缓存跳过。
 
 ## 13. 阶段六：故障注入、性能基准与 revision 派生
 
 ### 故障注入
 
-`sandbox/fault.lua` 在关键点注入可控故障：`backend`（后端不可用）、`freeze`（候选冻结失败）、
+`sandbox/observe/fault.lua` 在关键点注入可控故障：`backend`（后端不可用）、`freeze`（候选冻结失败）、
 `publish`（CAS 发布失败）、`store`（持久化失败）。仅测试/诊断使用，默认不注入。用于验证：
 - 发布失败**不产生部分写入**（真实工作区保持原状）；
 - 后端不可用时进程被明确拒绝；
@@ -1740,7 +1740,7 @@ overlay 会 `EINVAL`），此时命令只能运行在「只读根 + 私有可写
 
 ### 性能基准
 
-`sandbox/bench.run({ iterations })` 测量策略评估、摘要、尝试签发、信封构建等关键路径，
+`sandbox/observe/bench.run({ iterations })` 测量策略评估、摘要、尝试签发、信封构建等关键路径，
 返回 `{ iterations, total_ms, per_op_ms }`；用于性能回归与容量评估。
 
 ### revision 派生（按文件/hunk 拆分）
@@ -1759,7 +1759,7 @@ overlay 会 `EINVAL`），此时命令只能运行在「只读根 + 私有可写
 
 ## 15. 沙箱隐匿（conceal，常开）
 
-`sandbox/conceal.lua` 降低 AI 通过外部命令识别「自己处在沙箱」的能力，**无配置开关**。
+`sandbox/observe/conceal.lua` 降低 AI 通过外部命令识别「自己处在沙箱」的能力，**无配置开关**。
 它只抬高识别门槛，不声称让沙箱不可检测；固有痕迹（namespace inode、能力位、宿主自身
 容器信息）无法在不破坏隔离的前提下抹除。
 
@@ -1794,7 +1794,7 @@ overlay 会 `EINVAL`），此时命令只能运行在「只读根 + 私有可写
 
 ## 16. 密钥防护（secrets，常开）
 
-`sandbox/secret.lua` 让 AI 看不到、也用不了真实密钥：基于熵检测 + 具名规则，进沙箱把密钥替换为
+`sandbox/secret/secret.lua` 让 AI 看不到、也用不了真实密钥：基于熵检测 + 具名规则，进沙箱把密钥替换为
 **格式保真假密钥**（保留原格式前缀、长度与字符类，香农熵不低于原始值；进程内映射表，不落盘），
 仅在 commit 落盘、沙箱进程执行、私有视图物化时还原为真实值。
 
@@ -2089,8 +2089,8 @@ UI 未注册但为**交互式 Neovim** 时，回退到内建 `confirm` **暂停�
 ## 17. 权限档位与自动提权
 
 默认所有外部命令以**最小权限**运行；权限不足时**自动发起升级**（记录，不静默执行），
-并按档位逐级收紧审查。核心模块 `sandbox/privilege.lua`（分类/解析/留痕）与
-`sandbox/hostop.lua`（T2 主机效果提案）。
+并按档位逐级收紧审查。核心模块 `sandbox/execution/privilege.lua`（分类/解析/留痕）与
+`sandbox/execution/hostop.lua`（T2 主机效果提案）。
 
 ### 档位
 
@@ -2199,7 +2199,7 @@ upper/work、暂存、会话）会 chown 到该 uid。
 降级为 bind 私有可写目录。`:NeoAISandboxCaps` / `runtime.overlay_diagnosis()` 可排查。
 
 **写入全暂存 + 落盘降权优先**：命令的写入全部进入 overlay/暂存（不碰真实盘）。真正落盘
-（CAS 发布）经 `sandbox/writer.lua`：先以非 root 载荷身份尝试（root 进程用 `setpriv` 降权执行），
+（CAS 发布）经 `sandbox/execution/writer.lua`：先以非 root 载荷身份尝试（root 进程用 `setpriv` 降权执行），
 成功即 `writer=nonroot`；失败且为权限错误（EACCES/EPERM/EROFS）则返回 `NEEDS_ROOT`，由
 `review.apply` 标记 `apply_state=NEEDS_ROOT` 并进入 `:NeoAISandboxReview` 待审（不自动提权）。
 用户确认（`allow_root=true`）后：插件为 root 则以 root 写入，否则以 `sudo`（继承 tty）写入；
@@ -2219,7 +2219,7 @@ upper/work、暂存、会话）会 chown 到该 uid。
 
 ## 18. 安全分级、容器受控与行为审计
 
-### 18.1 审批按安全级别分级（`sandbox/risk.lua`）
+### 18.1 审批按安全级别分级（`sandbox/review/risk.lua`）
 
 每次效果类调用都会评估安全级别（L0-L3），并在待审界面以 `[L0]`-`[L3]` 徽标着色展示，
 同时记录证据（`kind="risk"`）与 `SANDBOX_RISK_ASSESSED` 事件：
@@ -2292,7 +2292,7 @@ upper/work、暂存、会话）会 chown 到该 uid。
 `Setting up …`/`Successfully installed …` → L1，破坏性输出 → L3），与调用前分级取较大者，
 记录证据并驱动自动提权检测（§17）。只读进程工具也会记录结果分级。
 
-### 18.3 容器门面（`sandbox/container.lua`）
+### 18.3 容器门面（`sandbox/execution/container.lua`）
 
 AI 调用容器运行时（docker/podman 等）时，**在沙箱内管理、容器不改变宿主机**。门面
 （`container.facade`）在 `effect="process"` 分支拦截命令并判定：
@@ -2334,11 +2334,11 @@ L2+ 与包/密钥仍进入待审。目的是即便仅靠本地模型的智能水
 
 ### 18.6 敏感信息全部脱敏与行为审计
 
-- **具名敏感信息规则**（`sandbox/secret.lua` 的 `rules`/`extra_rules`）：除熵检测外，按 Lua
+- **具名敏感信息规则**（`sandbox/secret/secret.lua` 的 `rules`/`extra_rules`）：除熵检测外，按 Lua
   pattern 识别私钥块、`AKIA…`、`ghp_…`、`sk-…`、`xox…`、JWT、`Bearer`/`Basic` 等结构化凭据，
   命中即 token 化（可无损还原）并留痕。`secret.redact()` 提供破坏性脱敏（用于日志/证据），
   发出 `SANDBOX_SENSITIVE_REDACTED`。
-- **行为审计**（`sandbox/audit.lua`）：记录 AI 的读取/调用/进程/网络/密钥/提权/容器/包安装等
+- **行为审计**（`sandbox/observe/audit.lua`）：记录 AI 的读取/调用/进程/网络/密钥/提权/容器/包安装等
   观测，累计加权风险分与异常计数；`:NeoAISandboxAudit` 查看摘要。高风险观测发出
   `SANDBOX_AUDIT_ANOMALY`。
 

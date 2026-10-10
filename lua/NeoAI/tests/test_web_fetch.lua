@@ -405,7 +405,7 @@ tests.suite("web_fetch", function(_, it, before_each)
   it("依赖/内核安装在宿主执行（不经沙箱，避免大产物进入 overlay）", function(t)
     _enable()
     local async = require("NeoAI.utils.async")
-    local sandbox_exec = require("NeoAI.sandbox.exec")
+    local sandbox_exec = require("NeoAI.sandbox.execution.exec")
     local tmp = vim.fn.tempname()
     wf._set_install_dir(tmp)
 

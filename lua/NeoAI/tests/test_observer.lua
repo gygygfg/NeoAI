@@ -17,8 +17,8 @@ local function with_config(overrides, fn)
 end
 
 tests.suite("observer", function(_, it)
-  local observer = require("NeoAI.sandbox.observer")
-  local secret = require("NeoAI.sandbox.secret")
+  local observer = require("NeoAI.sandbox.observe.observer")
+  local secret = require("NeoAI.sandbox.secret.secret")
 
   it("解析 bpftrace 事件行：文件/执行/网络", function(t)
     local f = observer.parse_bpftrace_line("F\topenat\t123\t/root/.ssh/id_rsa")
@@ -154,9 +154,9 @@ tests.suite("observer", function(_, it)
   end)
 
   it("观测预热：后台预创建 cgroup 并挂载探针，可清理", function(t)
-    local cgroup = require("NeoAI.sandbox.cgroup")
+    local cgroup = require("NeoAI.sandbox.execution.cgroup")
     if not cgroup.probe().available then return end
-    local wrapper = require("NeoAI.sandbox.wrapper")
+    local wrapper = require("NeoAI.sandbox.execution.wrapper")
     wrapper.clear_prewarm()
     -- 注入伪 eBPF 后端：验证预热流程（预创建 cgroup + 启动探针）而不依赖真实 bpftrace。
     local started = {}
@@ -184,11 +184,11 @@ tests.suite("observer", function(_, it)
   end)
 
   it("预热 TTL 定时器用 uv 句柄停止（不把 userdata 传给 timer_stop，避免 E5101）", function(t)
-    local wrapper = require("NeoAI.sandbox.wrapper")
-    local cgroup = require("NeoAI.sandbox.cgroup")
+    local wrapper = require("NeoAI.sandbox.execution.wrapper")
+    local cgroup = require("NeoAI.sandbox.execution.cgroup")
     if not cgroup.probe().available then return end
     wrapper.clear_prewarm()
-    local observer = require("NeoAI.sandbox.observer")
+    local observer = require("NeoAI.sandbox.observe.observer")
     local orig_backend, orig_available, orig_start = observer.backend, observer.available, observer.start
     observer.backend = function() return "ebpf" end
     observer.available = function() return true, "ebpf" end
@@ -245,7 +245,7 @@ tests.suite("observer", function(_, it)
   end)
 
   it("cgroup：预热句柄可认领到 attempt（release 生效）", function(t)
-    local cgroup = require("NeoAI.sandbox.cgroup")
+    local cgroup = require("NeoAI.sandbox.execution.cgroup")
     if not cgroup.probe().available then return end
     local h = cgroup.prepare("prewarm_test", { pids = 4 })
     t.not_nil(h, "应能创建预热 cgroup")

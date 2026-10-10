@@ -9,8 +9,8 @@ local tests = require("NeoAI.tests")
 
 tests.suite("review_cache", function(_, it)
   local function setup()
-    local store = require("NeoAI.sandbox.store")
-    local review = require("NeoAI.sandbox.review")
+    local store = require("NeoAI.sandbox.state.store")
+    local review = require("NeoAI.sandbox.review.review")
     local root = vim.fn.tempname()
     vim.fn.mkdir(root .. "/reviews", "p")
     store.init(root)
@@ -129,7 +129,7 @@ tests.suite("review_cache", function(_, it)
 
   it("apply_all 大量项：候选删除批量对账，不逐项全表扫描（避免 O(n²)）", function(t)
     local store, review = setup()
-    local candidate = require("NeoAI.sandbox.candidate")
+    local candidate = require("NeoAI.sandbox.execution.candidate")
     for i = 1, 100 do
       store.write_candidate({
         candidate_digest = "sha256:e" .. i,
@@ -159,7 +159,7 @@ tests.suite("review_cache", function(_, it)
 
   it("begin_batch/end_batch：逐项应用候选删除一次对账，不逐项全表扫描", function(t)
     local store, review = setup()
-    local candidate = require("NeoAI.sandbox.candidate")
+    local candidate = require("NeoAI.sandbox.execution.candidate")
     local ids = {}
     for i = 1, 100 do
       store.write_candidate({
@@ -234,7 +234,7 @@ tests.suite("review_cache", function(_, it)
     -- 待审计数应扣除被取代路径：A 剩 2 + B 的 1 = 3
     t.eq(3, review.pending_summary().count, "待审计数应扣除被取代路径")
     -- 应用 A 时不得写入被取代的 .pyc（该路径归新单元），但必须写入 .py/dist-info
-    local candidate = require("NeoAI.sandbox.candidate")
+    local candidate = require("NeoAI.sandbox.execution.candidate")
     local orig_pub, orig_receipt = candidate.publish, store.write_receipt
     local published
     candidate.publish = function(c)
@@ -277,7 +277,7 @@ tests.suite("review_cache", function(_, it)
 
   it("应用兜底：候选文件外部丢失但曾落盘时，从暂存副本重建并应用", function(t)
     local store, review = setup()
-    local candidate = require("NeoAI.sandbox.candidate")
+    local candidate = require("NeoAI.sandbox.execution.candidate")
     local dir = vim.fn.tempname()
     vim.fn.mkdir(dir, "p")
     local p = dir .. "/f.txt"
@@ -371,7 +371,7 @@ tests.suite("review_cache", function(_, it)
 
   it("[REPRO] 选择性应用多项后：已应用项全部保留 + 剩余文件回队待审", function(t)
     local store, review = setup()
-    local candidate = require("NeoAI.sandbox.candidate")
+    local candidate = require("NeoAI.sandbox.execution.candidate")
     local base = vim.fn.tempname()
     vim.fn.mkdir(base, "p")
     local function mk(digest, files)

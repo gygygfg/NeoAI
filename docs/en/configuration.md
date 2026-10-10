@@ -403,7 +403,7 @@ sandbox = {
     stop_timeout_ms = 5000,  -- max wait for graceful exit (SIGTERM first) before SIGKILL
     auto_background = true,  -- retained constant (old background facade removed; no longer emitted)
   },
-  -- systemctl facade (option A): all parsing/implementation is in Lua (sandbox/systemd); inside the
+  -- systemctl facade (option A): all parsing/implementation is in Lua (sandbox/systemd/systemd); inside the
   -- sandbox /usr/bin/systemctl and /usr/bin/journalctl are thin entries (bash file-IPC clients) that
   -- forward argv to the host facade and return the real stdout/stderr/exit code. Standalone calls are
   -- routed by the gate; script/pipeline calls go through the entry to the same facade; the host
@@ -594,7 +594,7 @@ sandbox = {
                           max_tokens = 2048, timeout_ms = 30000 } },
   -- Approval graded by security level (L0-L3): action auto/record/review/block; default "review".
   approval = { default = "review", levels = {} },
-  -- Risk grading (sandbox/risk.lua): when grading a command result, only the first/last
+  -- Risk grading (sandbox/review/risk.lua): when grading a command result, only the first/last
   -- result_scan_bytes bytes of stdout/stderr are scanned, so large outputs from `timeout=-1`
   -- commands (hundreds of MB) cannot freeze the UI with a full main-thread lowercase + pattern
   -- scan; 0 = unlimited.

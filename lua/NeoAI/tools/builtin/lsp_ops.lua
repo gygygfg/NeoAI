@@ -52,7 +52,7 @@ local function _sandbox_staged_for(bufnr)
   if not bufnr or type(bufnr) ~= "number" or not vim.api.nvim_buf_is_valid(bufnr) then return false end
   local realpath = vim.api.nvim_buf_get_name(bufnr)
   if realpath == "" then return false end
-  local ok, cand = pcall(require, "NeoAI.sandbox.candidate")
+  local ok, cand = pcall(require, "NeoAI.sandbox.execution.candidate")
   if not ok or not cand or type(cand.read_path) ~= "function" then return false end
   local ok2, staged = pcall(cand.read_path, realpath)
   return ok2 and staged ~= nil
@@ -63,7 +63,7 @@ end
 --- @param bufnr number|nil
 --- @return table|nil
 local function _client_supporting(method, bufnr)
-  local ok, sandbox = pcall(require, "NeoAI.sandbox.lsp")
+  local ok, sandbox = pcall(require, "NeoAI.sandbox.execution.lsp")
   if ok and sandbox then
     local ok2, clone = pcall(sandbox.client_supporting, method, bufnr)
     if ok2 and clone then
@@ -99,7 +99,7 @@ local function _request(method, params, target)
   -- 未启用 / overlay 不可用 / 无克隆时回退到编辑器客户端（原行为）。
   local sandbox_blocked = false
   if type(target) == "number" then
-    local ok, sandbox = pcall(require, "NeoAI.sandbox.lsp")
+    local ok, sandbox = pcall(require, "NeoAI.sandbox.execution.lsp")
     if ok and sandbox then
       local ok2, clone = pcall(sandbox.client_supporting, method, target)
       if ok2 and clone then

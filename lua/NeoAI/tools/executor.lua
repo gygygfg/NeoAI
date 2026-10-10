@@ -10,8 +10,8 @@ local registry = require("NeoAI.tools.registry")
 local validator = require("NeoAI.tools.validator")
 local config_store = require("NeoAI.kernel.config_store")
 local fs = require("NeoAI.utils.fs")
-local secret = require("NeoAI.sandbox.secret")
-local tool_spec = require("NeoAI.sandbox.tool_spec")
+local secret = require("NeoAI.sandbox.secret.secret")
+local tool_spec = require("NeoAI.sandbox.execution.tool_spec")
 
 local M = {}
 
@@ -27,7 +27,7 @@ local M = {}
 --- @return string|nil mask_entry
 --- @return boolean hard
 local function _masked_target(tool_name, args, ctx)
-  local runtime = require("NeoAI.sandbox.runtime")
+  local runtime = require("NeoAI.sandbox.execution.runtime")
   local cwd = (ctx and (ctx.sandbox_exec_cwd or ctx.cwd)) or vim.fn.getcwd()
   local spec = tool_spec.get(tool_name)
   for _, field in ipairs(spec.paths or {}) do
@@ -68,9 +68,9 @@ end
 --- @param args table
 --- @param ctx table
 local function _trace_outside_access(tool_name, args, ctx)
-  local ok, runtime = pcall(require, "NeoAI.sandbox.runtime")
+  local ok, runtime = pcall(require, "NeoAI.sandbox.execution.runtime")
   if not ok or not runtime.read_all() then return end
-  local ok2, trace = pcall(require, "NeoAI.sandbox.trace")
+  local ok2, trace = pcall(require, "NeoAI.sandbox.observe.trace")
   if not ok2 then return end
   local cwd = (ctx and (ctx.sandbox_exec_cwd or ctx.cwd)) or vim.fn.getcwd()
   local spec = tool_spec.get(tool_name)
@@ -291,7 +291,7 @@ local function _execute_tool(tool, args, ctx, timer)
     return _execute_tool_raw(tool, args, ctx, timer)
   end
   -- 兜底附加规格（覆盖动态注册/未走加载器的工具）
-  require("NeoAI.sandbox.wrapper").attach(tool)
+  require("NeoAI.sandbox.execution.wrapper").attach(tool)
   local out = async.Deferred.new()
   sandbox.gate(tool, args, ctx, function()
     return _execute_tool_raw(tool, args, ctx, timer)
@@ -417,7 +417,7 @@ local function _handle_scan_result(scan, tool, tool_name, args, ctx)
     local function replace_with_fake()
       secret.tokenize_args(args, { entropy = _entropy_enabled(tool_name, args, ctx) })
       pcall(function()
-        require("NeoAI.sandbox.secret_flow").record("arg", { tool = tool_name, fake = fake, command = source })
+        require("NeoAI.sandbox.secret.secret_flow").record("arg", { tool = tool_name, fake = fake, command = source })
       end)
       pcall(function()
         require("NeoAI.kernel.event_bus").emit(require("NeoAI.kernel.events").SANDBOX_SECRET_ALERT, {
@@ -427,7 +427,7 @@ local function _handle_scan_result(scan, tool, tool_name, args, ctx)
       return true
     end
     -- 先立即停止 Agent，再弹窗请用户确认；确认后继续，否则保持停止。
-    local alert = require("NeoAI.sandbox.secret_alert")
+    local alert = require("NeoAI.sandbox.secret.secret_alert")
     if not alert.available() then return stop() end
     return alert.request({
       kind = "tool", tool = tool_name, agent = agent, command = source,
@@ -448,7 +448,7 @@ local function _handle_scan_result(scan, tool, tool_name, args, ctx)
           tool = tool_name, agent_id = agent and agent.id, scope = "tool", decision = decision,
         })
       end)
-      local spec = require("NeoAI.sandbox.tool_spec").get(tool_name, tool and tool.category)
+      local spec = require("NeoAI.sandbox.execution.tool_spec").get(tool_name, tool and tool.category)
       if spec and spec.effect == "fs_write" then
         secret.tokenize_args(args, { entropy = _entropy_enabled(tool_name, args, ctx) })
       end
@@ -478,11 +478,11 @@ local function _handle_scan_result(scan, tool, tool_name, args, ctx)
       vim.log.levels.WARN)
     -- 数据流账本：记录假密钥在工具参数中的汇聚点。
     pcall(function()
-      local flow = require("NeoAI.sandbox.secret_flow")
+      local flow = require("NeoAI.sandbox.secret.secret_flow")
       for tok in pairs(scan.tokens) do flow.record("arg", { tool = tool_name, fake = tok }) end
     end)
   end
-  local spec = require("NeoAI.sandbox.tool_spec").get(tool_name, tool and tool.category)
+  local spec = require("NeoAI.sandbox.execution.tool_spec").get(tool_name, tool and tool.category)
   if spec and spec.effect == "fs_write" then
     secret.tokenize_args(args, { entropy = _entropy_enabled(tool_name, args, ctx) })
   end
@@ -611,7 +611,7 @@ local function _execute_after_secret_guard(tool, resolved, args, ctx)
   -- 因路径在该视图不存在而失败。经审批悬浮窗确认后，本次命令退回「整机只读 + 工作区单层
   -- overlay」兼容模式（见 sandbox/wrapper.build_overlay_specs 的 no_root_overlay）。
   if spec.effect == "process" and ctx.sandbox_cross_mount_approved ~= true then
-    local rt = require("NeoAI.sandbox.runtime")
+    local rt = require("NeoAI.sandbox.execution.runtime")
     local cwd = ctx.sandbox_exec_cwd or vim.fn.getcwd()
     local mount_root = rt.cross_mount_root(cwd)
     if mount_root then

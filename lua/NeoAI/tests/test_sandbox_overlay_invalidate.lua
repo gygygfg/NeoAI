@@ -39,9 +39,9 @@ end
 
 tests.suite("sandbox_overlay_invalidate", function(_, it)
   it("常驻实例：invalidate_paths 后命令读到真实盘新内容（不再读到旧物化）", function(t)
-    local runtime = require("NeoAI.sandbox.runtime")
+    local runtime = require("NeoAI.sandbox.execution.runtime")
     if runtime.backend() ~= "bwrap" then return end
-    local resident = require("NeoAI.sandbox.resident")
+    local resident = require("NeoAI.sandbox.execution.resident")
     if not resident.available() then return end
     with_config({
       tools = { approval = { mode = "auto_allow" }, sandbox = resident_sandbox_config() },

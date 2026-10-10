@@ -43,7 +43,7 @@ end
 
 tests.suite("sandbox_privdrop", function(_, it)
   it("沙箱内可降权到非 root 用户（runuser / setpriv）", function(t)
-    local runtime = require("NeoAI.sandbox.runtime")
+    local runtime = require("NeoAI.sandbox.execution.runtime")
     if runtime.backend() ~= "bwrap" then return end
     if vim.fn.executable("runuser") ~= 1 then return end
     with_config({ tools = { approval = { mode = "auto_allow" }, sandbox = sandbox_config() } }, function()
@@ -51,12 +51,12 @@ tests.suite("sandbox_privdrop", function(_, it)
       local out, err = run(t, "runuser -u nobody -- id -u 2>&1")
       t.eq(nil, err, "不应报错: " .. tostring(err and (err.message or err)))
       t.matches("65534", tostring(out), "runuser 应降权到 nobody(65534)，实际: " .. tostring(out))
-      require("NeoAI.sandbox.resident").stop({ timeout_ms = 5000 })
+      require("NeoAI.sandbox.execution.resident").stop({ timeout_ms = 5000 })
     end)
   end)
 
   it("chown 属主改动跨命令持久（sysadmin 走常驻实例持久 overlay）", function(t)
-    local runtime = require("NeoAI.sandbox.runtime")
+    local runtime = require("NeoAI.sandbox.execution.runtime")
     if runtime.backend() ~= "bwrap" then return end
     if vim.fn.executable("chown") ~= 1 then return end
     with_config({ tools = { approval = { mode = "auto_allow" }, sandbox = sandbox_config() } }, function()
@@ -67,14 +67,14 @@ tests.suite("sandbox_privdrop", function(_, it)
       local out2, err2 = run(t, "stat -c %u /tmp/.neoai_chown_probe 2>&1")
       t.eq(nil, err2, "stat 不应报错: " .. tostring(err2 and (err2.message or err2)))
       t.matches("65534", tostring(out2), "属主应跨命令持久为 nobody(65534)，实际: " .. tostring(out2))
-      require("NeoAI.sandbox.resident").stop({ timeout_ms = 5000 })
+      require("NeoAI.sandbox.execution.resident").stop({ timeout_ms = 5000 })
     end)
   end)
 
   it("沙箱内 /sys/fs/cgroup 可写：可创建子 cgroup 并写 memory.max", function(t)
-    local runtime = require("NeoAI.sandbox.runtime")
+    local runtime = require("NeoAI.sandbox.execution.runtime")
     if runtime.backend() ~= "bwrap" then return end
-    local cgroup = require("NeoAI.sandbox.cgroup")
+    local cgroup = require("NeoAI.sandbox.execution.cgroup")
     if not cgroup.delegation_enabled() then return end
     with_config({ tools = { approval = { mode = "auto_allow" }, sandbox = sandbox_config() } }, function()
       require("NeoAI.sandbox").reset()
@@ -84,7 +84,7 @@ tests.suite("sandbox_privdrop", function(_, it)
         .. "cat /sys/fs/cgroup/neoai_probe/memory.max 2>&1")
       t.eq(nil, err, "不应报错: " .. tostring(err and (err.message or err)))
       t.matches("max", tostring(out), "应能在委派子树内创建子 cgroup 并写 memory.max，实际: " .. tostring(out))
-      require("NeoAI.sandbox.resident").stop({ timeout_ms = 5000 })
+      require("NeoAI.sandbox.execution.resident").stop({ timeout_ms = 5000 })
     end)
   end)
 end)

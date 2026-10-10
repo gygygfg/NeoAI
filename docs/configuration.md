@@ -368,7 +368,7 @@ sandbox = {
     stop_timeout_ms = 5000,  -- 停止时先发 SIGTERM 等待优雅退出的上限（超时 SIGKILL）
     auto_background = true,  -- 保留常量（旧后台门面已移除，不再触发）
   },
-  -- systemctl 门面（方案 A）：解析/实现全在 Lua（sandbox/systemd），沙箱内
+  -- systemctl 门面（方案 A）：解析/实现全在 Lua（sandbox/systemd/systemd），沙箱内
   -- /usr/bin/systemctl、/usr/bin/journalctl 为极薄入口（bash 文件 IPC 客户端），把 argv 转发
   -- 给宿主门面并按真实 stdout/stderr/退出码返回。独立调用由门禁直接路由，脚本/管道调用经入口
   -- 走同一门面；不调用宿主 systemd、也不修改宿主机。支持 simple/exec/oneshot 与
@@ -528,7 +528,7 @@ sandbox = {
                           max_tokens = 2048, timeout_ms = 30000 } },
   -- 审批按安全级别分级（L0-L3）：动作 auto/record/review/block；默认 default="review"。
   approval = { default = "review", levels = {} },
-  -- 风险分级（sandbox/risk.lua）：命令结果判定级别时仅扫描 stdout/stderr 首/尾各
+  -- 风险分级（sandbox/review/risk.lua）：命令结果判定级别时仅扫描 stdout/stderr 首/尾各
   -- result_scan_bytes 字节，避免 `timeout=-1` 的大输出（可达数百 MB）在主线程全量
   -- lower + 模式匹配而冻结界面；0 = 不限制。
   risk = { result_scan_bytes = 262144 },

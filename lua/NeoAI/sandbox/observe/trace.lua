@@ -1,0 +1,258 @@
+--- 越界访问留痕
+--- @module NeoAI.sandbox.observe.trace
+--- `read_all`（默认）下沙箱可读整机（仅遮蔽 mask_paths 中的重要配置文件），但**访问 cwd
+--- 之外的用户工作目录**（home/root 等）会在此留痕：写入证据（evidence）+ 事件，并在审批
+--- 悬浮窗（`:NeoAISandboxReview`）以「越界访问」区展示。非阻塞：不阻断读取。
+---
+--- 去重：同一 (tool, path) 只记录一次，避免高频读取刷屏；可按需 `reset()`。
+--- 但同一 (tool, path) 的**多条不同命令**会在既有条目上累积（`commands`，去重有序有界），
+--- 使详情能回答「哪些命令越界访问了该文件」；反向聚合见 `group_by_command`（命令 → 文件）。
+--- 展示时按文件路径合并（`list_grouped`）、升序排序；`file_count` 返回去重文件数（供状态栏徽标）。
+
+local M = {}
+
+-- 单条留痕最多累积的命令数（去重上限，避免异常负载下无界增长）。
+local MAX_COMMANDS = 20
+
+-- ========== 私有状态 ==========
+
+local state = {
+  items = {}, -- 有序留痕项
+  seen = {}, -- key(tool\0path) -> item
+  seq = 0,
+  max = 200, -- 内存保留上限（超出丢弃最旧）
+}
+
+-- ========== 私有函数 ==========
+
+local function _emit(event, payload)
+  local event_bus = require("NeoAI.kernel.event_bus")
+  event_bus.emit(event, payload or {})
+end
+
+--- 追加一条命令到去重有序列表（有界）。
+--- @param list string[]
+--- @param cmd string|nil
+local function _push_command(list, cmd)
+  if type(cmd) ~= "string" or cmd == "" then return end
+  for _, prev in ipairs(list) do if prev == cmd then return end end
+  if #list >= MAX_COMMANDS then return end
+  list[#list + 1] = cmd
+end
+
+-- ========== 公开 API ==========
+
+--- 记录一次越界访问（非阻塞）。同 (tool, path) 去重。
+--- @param entry table { path, tool?, kind?, command?, source? }
+--- @return table|nil item 新记录（已存在时返回已有项）
+function M.record(entry)
+  entry = entry or {}
+  local path = entry.path
+  if type(path) ~= "string" or path == "" then return nil end
+  local key = tostring(entry.tool or "") .. "\0" .. path
+  local now = os.time()
+  -- 同 (tool, path) 已存在：不新增条目（保持去重口径与状态栏计数不变），
+  -- 但把本次命令并入 commands（去重有界），使「同一文件被哪些命令访问」可追溯。
+  local existing = state.seen[key]
+  if existing then
+    existing.commands = existing.commands or {}
+    _push_command(existing.commands, entry.command)
+    if existing.command == nil and type(entry.command) == "string" and entry.command ~= "" then
+      existing.command = entry.command
+    end
+    existing.last_at = now
+    if type(entry.source) == "string" and entry.source ~= "" then
+      existing.sources = existing.sources or {}
+      _push_command(existing.sources, entry.source)
+    end
+    return existing
+  end
+  state.seq = state.seq + 1
+  local item = {
+    trace_id = string.format("tr_%d_%s", state.seq, tostring(now)),
+    path = path,
+    tool = entry.tool,
+    kind = entry.kind or "read",
+    command = entry.command,
+    commands = {},
+    created_at = now,
+    last_at = now,
+  }
+  _push_command(item.commands, entry.command)
+  if item.command == nil and #item.commands > 0 then item.command = item.commands[1] end
+  if type(entry.source) == "string" and entry.source ~= "" then
+    item.sources = {}
+    _push_command(item.sources, entry.source)
+  end
+  state.items[#state.items + 1] = item
+  state.seen[key] = item
+  -- 内存上限：超出丢弃最旧（并同步 seen）
+  while #state.items > state.max do
+    local old = table.remove(state.items, 1)
+    if old then state.seen[tostring(old.tool or "") .. "\0" .. old.path] = nil end
+  end
+  pcall(function()
+    require("NeoAI.sandbox.review.evidence").add_async("observation", {
+      kind = "outside_access", path = path, tool = item.tool, command = item.command,
+    }, { tool = item.tool, source = entry.source or "observed", coverage = "full" })
+  end)
+  pcall(function()
+    _emit(require("NeoAI.kernel.events").SANDBOX_OUTSIDE_ACCESS, {
+      trace_id = item.trace_id, path = path, tool = item.tool, kind = item.kind,
+      command = item.command,
+    })
+  end)
+  return item
+end
+
+--- 列出留痕（按时间先后）
+--- @return table 数组
+function M.list()
+  local out = {}
+  for _, it in ipairs(state.items) do out[#out + 1] = vim.deepcopy(it) end
+  return out
+end
+
+--- 按文件路径聚合留痕：同一路径的多次/多工具访问合并为一条，并按路径升序排序。
+--- 纯函数，可对原始或已分组条目再次调用（幂等）。
+--- @param entries table|nil 留痕数组（缺省用当前内存留痕）
+--- @return table 数组 { path, tools = string[], tool = string, commands = string[], count, created_at, last_at }
+function M.group(entries)
+  local groups, order = {}, {}
+  for _, tr in ipairs(entries or state.items) do
+    local path = tostring(tr.path or "")
+    if path ~= "" then
+      local g = groups[path]
+      if not g then
+        g = {
+          path = path, tools = {}, commands = {}, tool = tr.tool, count = 0,
+          created_at = tr.created_at, last_at = tr.created_at,
+        }
+        groups[path] = g
+        order[#order + 1] = g
+      end
+      g.count = g.count + (tonumber(tr.count) or 1)
+      if tr.created_at then g.last_at = tr.created_at end
+      if tr.last_at then g.last_at = tr.last_at end
+      local tools = tr.tools or { tr.tool }
+      for _, name in ipairs(tools) do
+        if type(name) == "string" and name ~= "" then
+          local exists = false
+          for _, prev in ipairs(g.tools) do if prev == name then exists = true break end end
+          if not exists then g.tools[#g.tools + 1] = name end
+        end
+      end
+      -- 命令合并（去重有序有界）：无 commands 字段时回退单条 command。
+      local cmds = tr.commands
+      if cmds and #cmds > 0 then
+        for _, cmd in ipairs(cmds) do _push_command(g.commands, cmd) end
+      else
+        _push_command(g.commands, tr.command)
+      end
+    end
+  end
+  table.sort(order, function(a, b) return a.path < b.path end)
+  return order
+end
+
+--- 按命令聚合留痕：同一命令访问的多个文件合并为一条（命令 → 文件）。
+--- 用于「哪些命令越界影响了哪些文件」的命令视角展示；非命令型访问（无 command）
+--- 归入 `command = nil` 的哨兵组（UI 以占位标签展示）。
+--- 纯函数，可对原始或已分组条目再次调用。
+--- @param entries table|nil 留痕数组（缺省用当前内存留痕）
+--- @return table 数组 { command = string|nil, files = string[], tools = string[], count, created_at, last_at }
+function M.group_by_command(entries)
+  local groups, order = {}, {}
+  for _, tr in ipairs(entries or state.items) do
+    local path = tostring(tr.path or "")
+    if path ~= "" then
+      local cmds = tr.commands
+      local none = false
+      if not cmds or #cmds == 0 then
+        if type(tr.command) == "string" and tr.command ~= "" then
+          cmds = { tr.command }
+        else
+          cmds = {}
+          none = true
+        end
+      end
+      -- 无命令访问：以「一次空命令」归入哨兵组（{ nil } 在 Lua 不参与 ipairs 迭代）。
+      if none then cmds = { false } end
+      for _, cmd in ipairs(cmds) do
+        local key = (type(cmd) == "string" and cmd ~= "") and cmd or "\0none"
+        local g = groups[key]
+        if not g then
+          g = {
+            command = (key ~= "\0none") and cmd or nil,
+            files = {}, tools = {}, count = 0,
+            created_at = tr.created_at, last_at = tr.created_at,
+          }
+          groups[key] = g
+          order[#order + 1] = g
+        end
+        g.count = g.count + 1
+        if tr.created_at then g.last_at = tr.created_at end
+        if tr.last_at then g.last_at = tr.last_at end
+        local seen_file = false
+        for _, prev in ipairs(g.files) do if prev == path then seen_file = true break end end
+        if not seen_file then g.files[#g.files + 1] = path end
+        local tools = tr.tools or { tr.tool }
+        for _, name in ipairs(tools) do
+          if type(name) == "string" and name ~= "" then
+            local seen_tool = false
+            for _, prev in ipairs(g.tools) do if prev == name then seen_tool = true break end end
+            if not seen_tool then g.tools[#g.tools + 1] = name end
+          end
+        end
+      end
+    end
+  end
+  -- 排序：有命令者按命令升序在前，无命令哨兵组置末。
+  table.sort(order, function(a, b)
+    if (a.command == nil) ~= (b.command == nil) then return a.command ~= nil end
+    if a.command and b.command then return a.command < b.command end
+    return false
+  end)
+  return order
+end
+
+--- 按文件聚合后的留痕（路径升序）
+--- @return table 数组
+function M.list_grouped()
+  return M.group(state.items)
+end
+
+--- 按命令聚合后的留痕（命令 → 文件；有命令者按命令升序在前）
+--- @return table 数组
+function M.list_grouped_by_command()
+  return M.group_by_command(state.items)
+end
+
+--- 去重后的文件数（按路径聚合；O(n)，供状态栏高频调用）
+--- @return number
+function M.file_count()
+  local seen, n = {}, 0
+  for _, it in ipairs(state.items) do
+    local p = it.path
+    if type(p) == "string" and p ~= "" and not seen[p] then
+      seen[p] = true
+      n = n + 1
+    end
+  end
+  return n
+end
+
+--- 留痕数量
+--- @return number
+function M.count()
+  return #state.items
+end
+
+--- 重置（测试用）
+function M.reset()
+  state.items = {}
+  state.seen = {}
+  state.seq = 0
+end
+
+return M

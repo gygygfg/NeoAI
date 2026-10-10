@@ -29,13 +29,13 @@ local DEFAULT_READ_GUARD = {
 
 -- ========== 私有函数 ==========
 
---- 路径解析**委派给沙箱**（策略：`NeoAI.sandbox.guest_fs.resolve_read_path`）。
+--- 路径解析**委派给沙箱**（策略：`NeoAI.sandbox.execution.guest_fs.resolve_read_path`）。
 --- 工具层不实现「暂存命名空间 → 真实命名空间 → 访客临时根」的映射逻辑（那是沙箱职责）；
 --- 此处仅调用沙箱 API，保证直接调用工具句柄（不经沙箱 wrapper）时也能正确回读访客路径。
 --- @param p string
 --- @return string
 local function _resolve_guest_path(p)
-  local ok, g = pcall(require, "NeoAI.sandbox.guest_fs")
+  local ok, g = pcall(require, "NeoAI.sandbox.execution.guest_fs")
   if ok and g and type(g.resolve_read_path) == "function" then
     return g.resolve_read_path(p)
   end
@@ -286,7 +286,7 @@ end
 --- 沙箱工作区暂存覆盖快照（沙箱未启用/无暂存时返回空数组）
 --- @return table
 local function _sandbox_overrides()
-  local ok, cand = pcall(require, "NeoAI.sandbox.candidate")
+  local ok, cand = pcall(require, "NeoAI.sandbox.execution.candidate")
   if not ok or not cand or type(cand.workspace_overrides) ~= "function" then
     return {}
   end

@@ -169,7 +169,7 @@ tests.suite("git_ops", function(_, it, before_each)
 
   it("git_log：输出超限时截断为头+尾并落盘到沙箱 /tmp", function(t)
     local config_store = require("NeoAI.kernel.config_store")
-    local guest_fs = require("NeoAI.sandbox.guest_fs")
+    local guest_fs = require("NeoAI.sandbox.execution.guest_fs")
     local cs = config_store.get("tools.output_guard") or {}
     local saved = { max_chars = cs.max_chars, head_chars = cs.head_chars, tail_chars = cs.tail_chars }
     config_store.set("tools.output_guard.max_chars", 100)

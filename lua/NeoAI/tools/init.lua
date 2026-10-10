@@ -71,7 +71,7 @@ function M.load_module(mod_name, opts)
     if sandbox and sandbox.attach then
       sandbox.attach(tool)
     else
-      require("NeoAI.sandbox.wrapper").attach(tool)
+      require("NeoAI.sandbox.execution.wrapper").attach(tool)
     end
     registry.update(tool)
     names[#names + 1] = tool.name

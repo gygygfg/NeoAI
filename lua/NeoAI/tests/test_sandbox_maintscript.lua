@@ -30,7 +30,7 @@ end
 
 tests.suite("sandbox_maintscript", function(_, it)
   it("privilege.resolve：包安装注入维护脚本桩，可配置关闭", function(t)
-    local privilege = require("NeoAI.sandbox.privilege")
+    local privilege = require("NeoAI.sandbox.execution.privilege")
     with_config({ tools = { sandbox = { systemd = { maintscript_stubs = true } } } }, function()
       local r = privilege.resolve(1, { package = true, apt = true })
       t.true_(r.ok, "应解析成功")
@@ -50,7 +50,7 @@ tests.suite("sandbox_maintscript", function(_, it)
   end)
 
   it("process_prefix：入口覆盖绑定真实二进制路径（不再前置非标准 PATH）", function(t)
-    local runtime = require("NeoAI.sandbox.runtime")
+    local runtime = require("NeoAI.sandbox.execution.runtime")
     if runtime.backend() ~= "bwrap" then return end
     local prefix = runtime.process_prefix({
       cwd = "/tmp",
@@ -63,7 +63,7 @@ tests.suite("sandbox_maintscript", function(_, it)
     t.not_nil(src, "应把入口绑定到 /usr/bin/systemctl")
     t.matches("/sd%-bin/systemctl$", src, "入口源应为生成的 systemctl 桩")
     t.not_nil(src_for(prefix, "/usr/bin/journalctl"), "应绑定 journalctl 入口")
-    local ipc = require("NeoAI.sandbox.systemd_ipc")
+    local ipc = require("NeoAI.sandbox.systemd.systemd_ipc")
     t.not_nil(src_for(prefix, ipc.guest_dir()), "应绑定 IPC 目录")
     -- 未标记包安装时不绑定 policy-rc.d
     t.true_(joined:find("/usr/sbin/policy-rc.d", 1, true) == nil, "未注入时不应绑定 policy-rc.d")
@@ -76,16 +76,16 @@ tests.suite("sandbox_maintscript", function(_, it)
   end)
 
   it("sandbox_env：不再注入非标准 PATH 项", function(t)
-    local runtime = require("NeoAI.sandbox.runtime")
+    local runtime = require("NeoAI.sandbox.execution.runtime")
     if runtime.backend() ~= "bwrap" then return end
     local env = runtime.sandbox_env({ maintscript_stubs = true })
     t.true_(tostring(env.PATH or ""):find("/tmp/.dynbin", 1, true) == nil, "不应出现 /tmp/.dynbin")
   end)
 
   it("入口语义：经 IPC 转发到 Lua 门面，stdout/stderr/退出码与真实 systemctl 一致", function(t)
-    local runtime = require("NeoAI.sandbox.runtime")
+    local runtime = require("NeoAI.sandbox.execution.runtime")
     if runtime.backend() ~= "bwrap" then return end
-    local ipc = require("NeoAI.sandbox.systemd_ipc")
+    local ipc = require("NeoAI.sandbox.systemd.systemd_ipc")
     local hostdir = ipc.ensure()
     local prefix = runtime.process_prefix({
       cwd = "/tmp",

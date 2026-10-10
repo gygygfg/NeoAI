@@ -132,27 +132,14 @@ NeoAI/
 │       └── tool_helpers.lua   # define_tool 辅助函数
 │
 ├── sandbox/                    # 工具执行沙箱（控制面）
-│   ├── init.lua              # 入口（gate/attach/commit/discard/list/probe）
-│   ├── control.lua           # 状态机/幂等/fencing
-│   ├── policy.lua            # 规则评估聚合 + 受限 Lua 规则沙箱
-│   ├── runtime.lua           # bwrap/unshare 后端探测与进程前缀
-│   ├── candidate.lua         # 私有暂存/冻结/CAS 发布
-│   ├── store.lua             # 候选与回执持久化
-│   ├── review.lua            # 异步审批变更单元队列
-│   ├── impact.lua            # fs/process/network 影响记录
-│   ├── evidence.lua          # 证据保存/脱敏/分页
-│   ├── grant.lua             # 窄范围任务授权
-│   ├── envelope.lua          # 裁决信封
-│   ├── network.lua           # 受控网络网关
-│   ├── broker.lua            # 外部操作 broker
-│   ├── replay.lua            # 策略回放
-│   ├── cgroup.lua            # cgroup v2 资源域
-│   ├── seccomp.lua           # seccomp 能力探测/门禁
-│   ├── cache.lua             # 内容寻址缓存
-│   ├── fault.lua             # 故障注入
-│   ├── bench.lua             # 性能基准
-│   ├── tool_spec.lua         # 工具影响类别声明
-│   └── wrapper.lua           # 执行门禁
+│   ├── init.lua              # 入口门面（gate/attach/commit/discard/list/probe）
+│   ├── execution/            # 隔离执行：wrapper/runtime/candidate/resident/container/cgroup/seccomp/privilege/...
+│   ├── systemd/              # systemd 门面：systemd/systemd_ipc/systemd_user
+│   ├── net/                  # 网络：network/net_gateway/gateway/broker/host_proxy/net_consent
+│   ├── secret/               # 密钥防护：secret/secret_alert/secret_egress/secret_flow
+│   ├── state/                # 持久化：store/cache
+│   ├── observe/              # 观测审计：observer/observe/diag/trace/audit/ai_audit/script_scan/conceal
+│   └── review/               # 审批策略：review/approval_hub/policy/policy_consent/risk/grant/evidence/replay/l3_warning
 │
 ├── utils/                      # 纯工具库（无业务依赖）
 │   ├── init.lua

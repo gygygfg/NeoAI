@@ -7,7 +7,7 @@ local tests = require("NeoAI.tests")
 
 tests.suite("approval_hub", function(_, it)
   it("提交/列举/决策/清理阻塞类条目", function(t)
-    local hub = require("NeoAI.sandbox.approval_hub")
+    local hub = require("NeoAI.sandbox.review.approval_hub")
     hub.reset()
     local decisions = {}
     local id = hub.submit("network", {
@@ -30,7 +30,7 @@ tests.suite("approval_hub", function(_, it)
   end)
 
   it("clear 移除条目不触发决策回调", function(t)
-    local hub = require("NeoAI.sandbox.approval_hub")
+    local hub = require("NeoAI.sandbox.review.approval_hub")
     hub.reset()
     local called = false
     local id = hub.submit("behavior", { title = "x", on_decision = function() called = true end })
@@ -41,14 +41,14 @@ tests.suite("approval_hub", function(_, it)
   end)
 
   it("未知页面被拒绝", function(t)
-    local hub = require("NeoAI.sandbox.approval_hub")
+    local hub = require("NeoAI.sandbox.review.approval_hub")
     hub.reset()
     t.throws(function() hub.submit("nope", { title = "x" }) end)
     hub.reset()
   end)
 
   it("观测类 provider 列举与降级", function(t)
-    local hub = require("NeoAI.sandbox.approval_hub")
+    local hub = require("NeoAI.sandbox.review.approval_hub")
     hub.reset()
     hub.register_provider("anomaly", function() return { { a = 1 }, { b = 2 } } end)
     t.eq(2, #hub.observe("anomaly"), "应返回 provider 结果")
@@ -60,7 +60,7 @@ tests.suite("approval_hub", function(_, it)
   end)
 
   it("UI 刷新回调与 open_page", function(t)
-    local hub = require("NeoAI.sandbox.approval_hub")
+    local hub = require("NeoAI.sandbox.review.approval_hub")
     hub.reset()
     local refreshes, opened = 0, nil
     hub.set_ui({
@@ -78,7 +78,7 @@ tests.suite("approval_hub", function(_, it)
   end)
 
   it("PAGES 顺序与页面 id 稳定", function(t)
-    local hub = require("NeoAI.sandbox.approval_hub")
+    local hub = require("NeoAI.sandbox.review.approval_hub")
     local ids = {}
     for _, p in ipairs(hub.PAGES) do ids[#ids + 1] = p.id end
     t.deep_eq({ "files", "behavior", "resource", "network", "anomaly" }, ids)

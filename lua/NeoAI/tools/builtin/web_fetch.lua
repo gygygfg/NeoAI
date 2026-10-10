@@ -24,7 +24,7 @@ local strx = require("NeoAI.utils.stringx")
 local config_store = require("NeoAI.kernel.config_store")
 local logger = require("NeoAI.kernel.logger")
 local helpers = require("NeoAI.tools.builtin.tool_helpers")
-local sandbox_exec = require("NeoAI.sandbox.exec")
+local sandbox_exec = require("NeoAI.sandbox.execution.exec")
 
 local M = {}
 

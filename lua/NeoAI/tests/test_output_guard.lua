@@ -9,7 +9,7 @@ tests.suite("output_guard", function(_, it, before_each)
 
   before_each(function()
     og = require("NeoAI.tools.builtin.output_guard")
-    guest_fs = require("NeoAI.sandbox.guest_fs")
+    guest_fs = require("NeoAI.sandbox.execution.guest_fs")
     config_store = require("NeoAI.kernel.config_store")
     stringx = require("NeoAI.utils.stringx")
     guest_fs.clear()

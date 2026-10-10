@@ -5,7 +5,7 @@ local tests = require("NeoAI.tests")
 tests.suite("grant", function(_, it, before_each)
   local grant
   before_each(function()
-    grant = require("NeoAI.sandbox.grant")
+    grant = require("NeoAI.sandbox.review.grant")
     grant.reset()
   end)
 

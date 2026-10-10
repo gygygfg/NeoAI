@@ -26,7 +26,7 @@ end
 
 tests.suite("sandbox_governance", function(_, it)
   it("风险分级：写路径/包/密钥/提权/危险命令映射到 L0-L3", function(t)
-    local risk = require("NeoAI.sandbox.risk")
+    local risk = require("NeoAI.sandbox.review.risk")
     local cwd = vim.fn.getcwd()
     t.eq(0, risk.classify({ effect = "fs_write", paths = { cwd .. "/a.lua" } }).level, "工作区写入应为 L0")
     t.eq(1, risk.classify({ effect = "fs_write", paths = { vim.fn.expand("~") .. "/x.txt" } }).level,
@@ -47,7 +47,7 @@ tests.suite("sandbox_governance", function(_, it)
   end)
 
   it("风险原因去重：大量同类写入路径只保留一个类别", function(t)
-    local risk = require("NeoAI.sandbox.risk")
+    local risk = require("NeoAI.sandbox.review.risk")
     local paths = {}
     for i = 1, 500 do paths[i] = "/usr/lib/pkg/file" .. i end
     local r = risk.classify({ effect = "process", paths = paths, package = true })
@@ -60,7 +60,7 @@ tests.suite("sandbox_governance", function(_, it)
   end)
 
   it("审批分级动作：默认 review；会话自动审批仅放行 L0/L1；包/密钥不自动", function(t)
-    local risk = require("NeoAI.sandbox.risk")
+    local risk = require("NeoAI.sandbox.review.risk")
     t.eq("review", risk.action(0, {}), "默认 L0 应待审")
     t.eq("auto", risk.action(0, { session_auto = true }), "会话自动审批应放行 L0")
     t.eq("auto", risk.action(1, { session_auto = true }), "会话自动审批应放行 L1")
@@ -79,7 +79,7 @@ tests.suite("sandbox_governance", function(_, it)
   end)
 
   it("结果分级：权限/网络/包变更信号被识别", function(t)
-    local risk = require("NeoAI.sandbox.risk")
+    local risk = require("NeoAI.sandbox.review.risk")
     local r = risk.from_result({ code = 1, stderr = "bash: /x: Permission denied" })
     t.eq(2, r.level, "Permission denied 应为 L2")
     t.true_(#r.signals > 0, "应记录信号")
@@ -90,7 +90,7 @@ tests.suite("sandbox_governance", function(_, it)
   end)
 
   it("结果分级：超大输出仅扫描首尾窗口（不全量主线程扫描）", function(t)
-    local risk = require("NeoAI.sandbox.risk")
+    local risk = require("NeoAI.sandbox.review.risk")
     local config_store = require("NeoAI.kernel.config_store")
     local saved = config_store.get("tools.sandbox.risk.result_scan_bytes")
     config_store.set("tools.sandbox.risk.result_scan_bytes", 1024)
@@ -112,7 +112,7 @@ tests.suite("sandbox_governance", function(_, it)
   end)
 
   it("容器受控：podman 注入命名空间共享，docker 走受控 socket", function(t)
-    local container = require("NeoAI.sandbox.container")
+    local container = require("NeoAI.sandbox.execution.container")
     local plan = container.plan("podman run -it ubuntu bash")
     t.eq("podman", plan.manager, "应识别 podman")
     t.true_(plan.rewritten, "应重写命令")
@@ -138,7 +138,7 @@ tests.suite("sandbox_governance", function(_, it)
   end)
 
   it("容器门面：podman 沙箱内、docker 默认拒绝、远程/宿主子命令拒绝", function(t)
-    local container = require("NeoAI.sandbox.container")
+    local container = require("NeoAI.sandbox.execution.container")
     -- podman/buildah 无守护进程 → 沙箱内支持
     t.eq("sandbox", container.facade("podman run ubuntu true").mode)
     t.eq("sandbox", container.facade("buildah bud .").mode)
@@ -177,7 +177,7 @@ tests.suite("sandbox_governance", function(_, it)
   end)
 
   it("容器门面：docker 改写为 podman（沙箱内），保留引号与参数", function(t)
-    local container = require("NeoAI.sandbox.container")
+    local container = require("NeoAI.sandbox.execution.container")
     container._set_podman_available(true)
     local p = container.facade("docker run -e \"A=b c\" ubuntu true")
     t.eq("sandbox", p.mode)
@@ -230,7 +230,7 @@ tests.suite("sandbox_governance", function(_, it)
   end)
 
   it("行为审计：记录观测、累计风险分与异常", function(t)
-    local audit = require("NeoAI.sandbox.audit")
+    local audit = require("NeoAI.sandbox.observe.audit")
     audit.reset()
     audit.observe({ kind = "read", tool = "read_file", level = 0 })
     audit.observe({ kind = "secret", tool = "read_file", level = 3, reasons = { "SECRET_OPERATION" } })
@@ -244,7 +244,7 @@ tests.suite("sandbox_governance", function(_, it)
   end)
 
   it("敏感信息脱敏：具名规则 token 化且可还原，redact 破坏性脱敏", function(t)
-    local secret = require("NeoAI.sandbox.secret")
+    local secret = require("NeoAI.sandbox.secret.secret")
     secret.reset()
     local key = "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA1234abcd\n-----END RSA PRIVATE KEY-----"
     local tok, used = secret.tokenize("data: " .. key)
@@ -263,7 +263,7 @@ tests.suite("sandbox_governance", function(_, it)
   end)
 
   it("会话自动审批：默认关闭，可显式开启", function(t)
-    local review = require("NeoAI.sandbox.review")
+    local review = require("NeoAI.sandbox.review.review")
     review.reset()
     with_config({ tools = { sandbox = { review = { session_auto_approve = false } } } }, function()
       t.false_(review.session_auto(), "默认应关闭")
@@ -289,7 +289,7 @@ tests.suite("sandbox_governance", function(_, it)
   end)
 
   it("主机操作提案入队即标注 L3 高危（供界面/审计正确分级）", function(t)
-    local review = require("NeoAI.sandbox.review")
+    local review = require("NeoAI.sandbox.review.review")
     review.reset()
     local item = review.enqueue_host_op({
       host_op_id = "ho_test", tool = "run_shell", command = "systemctl restart nginx", tier = 2,
@@ -301,8 +301,8 @@ tests.suite("sandbox_governance", function(_, it)
   end)
 
   it("包安装绝不冻结为主机提案（沙箱失败不回退到宿主机安装）", function(t)
-    local hostop = require("NeoAI.sandbox.hostop")
-    local store = require("NeoAI.sandbox.store")
+    local hostop = require("NeoAI.sandbox.execution.hostop")
+    local store = require("NeoAI.sandbox.state.store")
     -- 显式初始化独立存储根，避免依赖其他套件是否已初始化（顺序无关）。
     local saved_root = store.root()
     store.init(vim.fn.tempname() .. "-hostop-store")
@@ -329,7 +329,7 @@ tests.suite("sandbox_governance", function(_, it)
 
   it("包安装失败不升级 T2、不冻结主机提案（绝不宿主机安装）", function(t)
     local sandbox = require("NeoAI.sandbox")
-    local hostop = require("NeoAI.sandbox.hostop")
+    local hostop = require("NeoAI.sandbox.execution.hostop")
     local fs = require("NeoAI.utils.fs")
     local probe = "/etc/neoai_sandbox_hostop_probe"
     -- 包管理器段（pip）+ 写只读系统路径（/etc 在沙箱内只读）→ 退出非零且含
@@ -350,7 +350,7 @@ tests.suite("sandbox_governance", function(_, it)
   end)
 
   it("沙箱 CPU 亲和性：绑定到 nvim 之外的核（可显式/关闭）", function(t)
-    local runtime = require("NeoAI.sandbox.runtime")
+    local runtime = require("NeoAI.sandbox.execution.runtime")
     if runtime.backend() ~= "bwrap" then return end
     if vim.fn.executable("taskset") ~= 1 then return end
     with_config({ tools = { sandbox = { limits = { cpu_affinity = "2,3" } } } }, function()
@@ -371,7 +371,7 @@ tests.suite("sandbox_governance", function(_, it)
   end)
 
   it("内核/危险命令硬拒绝；普通命令放行", function(t)
-    local risk = require("NeoAI.sandbox.risk")
+    local risk = require("NeoAI.sandbox.review.risk")
     for _, c in ipairs({
       "modprobe nvidia", "insmod x.ko", "sysctl -w vm.swappiness=0",
       "iptables -F", "reboot", "kexec -e", "setcap cap_net_raw+ep /bin/x",
@@ -413,7 +413,7 @@ tests.suite("sandbox_governance", function(_, it)
   end)
 
   it("包识别：python -m pip 计为包安装并注入 PEP668 覆盖", function(t)
-    local privilege = require("NeoAI.sandbox.privilege")
+    local privilege = require("NeoAI.sandbox.execution.privilege")
     local c = privilege.classify("run_command",
       { command = "python3 -m pip install --quiet build" }, { effect = "process" })
     t.true_(c.package, "python3 -m pip 应识别为包安装")
@@ -430,7 +430,7 @@ tests.suite("sandbox_governance", function(_, it)
   end)
 
   it("包能力：含包管理器的链式命令也授予 packages.cap_add", function(t)
-    local privilege = require("NeoAI.sandbox.privilege")
+    local privilege = require("NeoAI.sandbox.execution.privilege")
     local c = privilege.classify("run_command",
       { command = "apt-get install -y cowsay >/tmp/apt.log 2>&1; echo exit=$?; tail -4 /tmp/apt.log" },
       { effect = "process" })
@@ -445,7 +445,7 @@ tests.suite("sandbox_governance", function(_, it)
   end)
 
   it("无害查询：systemctl/mount --version/--help 不提升权限档", function(t)
-    local privilege = require("NeoAI.sandbox.privilege")
+    local privilege = require("NeoAI.sandbox.execution.privilege")
     local spec = { effect = "process" }
     for _, cmd in ipairs({
       "systemctl --version", "systemctl --version 2>&1 | head -1",
@@ -462,7 +462,7 @@ tests.suite("sandbox_governance", function(_, it)
   end)
 
   it("系统管理：useradd/chown 按需加回窄能力并解除账户库遮蔽；普通命令不受影响", function(t)
-    local privilege = require("NeoAI.sandbox.privilege")
+    local privilege = require("NeoAI.sandbox.execution.privilege")
     local spec = { effect = "process" }
     local function resolved(cmd)
       local c = privilege.classify("run_command", { command = cmd }, spec)
@@ -502,7 +502,7 @@ tests.suite("sandbox_governance", function(_, it)
   end)
 
   it("系统管理：沙箱内 useradd 可用，且普通命令读不到真实 /etc/shadow", function(t)
-    local runtime = require("NeoAI.sandbox.runtime")
+    local runtime = require("NeoAI.sandbox.execution.runtime")
     if runtime.backend() ~= "bwrap" then return end
     local diag = runtime.overlay_diagnosis("/")
     if not (diag and diag.available) then return end
@@ -528,7 +528,7 @@ tests.suite("sandbox_governance", function(_, it)
   end)
 
   it("并发进程命令并行执行：并行 run_command 互不阻塞（常驻实例多路复用）", function(t)
-    local runtime = require("NeoAI.sandbox.runtime")
+    local runtime = require("NeoAI.sandbox.execution.runtime")
     if runtime.backend() ~= "bwrap" then return end
     local sandbox = require("NeoAI.sandbox")
     -- /tmp 视为真正的临时根（不产生候选）：避免「测试把 /tmp 当工作区」引入的物化竞争干扰并行时序。
@@ -559,7 +559,7 @@ tests.suite("sandbox_governance", function(_, it)
 
   it("staged_roots：已暂存包产物使后续命令也覆盖该根（安装后可见）", function(t)
     local sandbox = require("NeoAI.sandbox")
-    local candidate = require("NeoAI.sandbox.candidate")
+    local candidate = require("NeoAI.sandbox.execution.candidate")
     local fs = require("NeoAI.utils.fs")
     local root = vim.fn.tempname()
     fs.ensure_dir(root)
@@ -577,8 +577,8 @@ tests.suite("sandbox_governance", function(_, it)
 
   it("materialize_overlay：命令执行层拿到真实内容（密钥不被遮蔽，程序可正常运行）", function(t)
     local sandbox = require("NeoAI.sandbox")
-    local candidate = require("NeoAI.sandbox.candidate")
-    local secret = require("NeoAI.sandbox.secret")
+    local candidate = require("NeoAI.sandbox.execution.candidate")
+    local secret = require("NeoAI.sandbox.secret.secret")
     local fs = require("NeoAI.utils.fs")
     secret.reset()
     local root = vim.fn.tempname()
@@ -605,7 +605,7 @@ tests.suite("sandbox_governance", function(_, it)
   end)
 
   it("降权为专用非 root uid 时以 ambient 保留窄能力（否则包安装锁失败）", function(t)
-    local runtime = require("NeoAI.sandbox.runtime")
+    local runtime = require("NeoAI.sandbox.execution.runtime")
     if runtime.backend() ~= "bwrap" or vim.uv.getuid() ~= 0 then return end
     with_config({ tools = { sandbox = { run_as = { uid = 65534, gid = 65534 } } } }, function()
       local prefix = runtime.process_prefix({
@@ -658,7 +658,7 @@ tests.suite("sandbox_governance", function(_, it)
   it("包安装走额外规则：commit 模式下仍强制待审且不落盘", function(t)
     local fs = require("NeoAI.utils.fs")
     local sandbox = require("NeoAI.sandbox")
-    local runtime = require("NeoAI.sandbox.runtime")
+    local runtime = require("NeoAI.sandbox.execution.runtime")
     if runtime.backend() ~= "bwrap" then return end
     local dir = vim.fn.tempname()
     fs.ensure_dir(dir)
@@ -720,7 +720,7 @@ tests.suite("sandbox_governance", function(_, it)
   end)
 
   it("overlay 诊断：返回可用性布尔，不可用时给出原因", function(t)
-    local runtime = require("NeoAI.sandbox.runtime")
+    local runtime = require("NeoAI.sandbox.execution.runtime")
     local diag = runtime.overlay_diagnosis(vim.fn.getcwd())
     t.eq("table", type(diag), "应返回诊断表")
     t.eq("boolean", type(diag.available), "available 应为布尔")
@@ -732,7 +732,7 @@ tests.suite("sandbox_governance", function(_, it)
   end)
 
   it("代理策略：默认清除宿主代理，passthrough 保留，显式代理写入 env", function(t)
-    local runtime = require("NeoAI.sandbox.runtime")
+    local runtime = require("NeoAI.sandbox.execution.runtime")
     -- 关闭本机拦截（host_local_block）后，代理策略按 strip/passthrough/显式生效
     local function cfg(net)
       return { tools = { sandbox = { network = vim.tbl_extend("force", { host_local_block = false }, net or {}) } } }
@@ -761,7 +761,7 @@ tests.suite("sandbox_governance", function(_, it)
   end)
 
   it("工具直通：expose_tool_paths 开启后沙箱 PATH 含宿主工具目录", function(t)
-    local runtime = require("NeoAI.sandbox.runtime")
+    local runtime = require("NeoAI.sandbox.execution.runtime")
     local prev = vim.env.PATH
     vim.env.PATH = "/usr/bin:/bin"
     with_config({ tools = { sandbox = { expose_tool_paths = true, expose_paths = {} } } }, function()
@@ -777,7 +777,7 @@ tests.suite("sandbox_governance", function(_, it)
   end)
 
   it("代理清除：run_command 内不泄露宿主代理变量", function(t)
-    local runtime = require("NeoAI.sandbox.runtime")
+    local runtime = require("NeoAI.sandbox.execution.runtime")
     if runtime.backend() ~= "bwrap" then return end
     local sandbox = require("NeoAI.sandbox")
     local prev = vim.env.HTTPS_PROXY
@@ -813,7 +813,7 @@ tests.suite("sandbox_governance", function(_, it)
   end)
 
   it("不继承宿主 fd：沙箱内看不到宿主目录 fd（防 chroot 逃逸）", function(t)
-    local runtime = require("NeoAI.sandbox.runtime")
+    local runtime = require("NeoAI.sandbox.execution.runtime")
     if runtime.backend() ~= "bwrap" then return end
     local fs = require("NeoAI.utils.fs")
     local sandbox = require("NeoAI.sandbox")

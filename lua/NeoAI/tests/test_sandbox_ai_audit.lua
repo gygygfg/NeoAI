@@ -7,7 +7,7 @@ local _provide_sandbox = require("NeoAI.tests.sandbox_stub").provide
 
 tests.suite("sandbox_ai_audit", function(_, it)
   it("user_messages 仅保留真实用户消息（排除运行上下文与压缩检查点）", function(t)
-    local ai = require("NeoAI.sandbox.ai_audit")
+    local ai = require("NeoAI.sandbox.observe.ai_audit")
     local agent = {
       messages = {
         { role = "system", content = "sys" },
@@ -28,7 +28,7 @@ tests.suite("sandbox_ai_audit", function(_, it)
   end)
 
   it("build_text 含分级、文件与修改 diff", function(t)
-    local ai = require("NeoAI.sandbox.ai_audit")
+    local ai = require("NeoAI.sandbox.observe.ai_audit")
     local path = vim.fn.tempname() .. ".txt"
     local fh = io.open(path, "w")
     fh:write("line1\nline2\n")
@@ -65,7 +65,7 @@ tests.suite("sandbox_ai_audit", function(_, it)
   end)
 
   it("build_text 对 create 无差异时回退为内容，delete 显示删除", function(t)
-    local ai = require("NeoAI.sandbox.ai_audit")
+    local ai = require("NeoAI.sandbox.observe.ai_audit")
     local items = {
       {
         change_set_id = "cs_create",
@@ -87,7 +87,7 @@ tests.suite("sandbox_ai_audit", function(_, it)
   end)
 
   it("build_text 覆盖主机操作命令", function(t)
-    local ai = require("NeoAI.sandbox.ai_audit")
+    local ai = require("NeoAI.sandbox.observe.ai_audit")
     local items = {
       {
         change_set_id = "cs_host",
@@ -106,7 +106,7 @@ tests.suite("sandbox_ai_audit", function(_, it)
   end)
 
   it("build_text 按 max_total_chars 截断", function(t)
-    local ai = require("NeoAI.sandbox.ai_audit")
+    local ai = require("NeoAI.sandbox.observe.ai_audit")
     local items = {}
     for i = 1, 200 do
       items[i] = {
@@ -122,7 +122,7 @@ tests.suite("sandbox_ai_audit", function(_, it)
   end)
 
   it("build_messages 含系统提示、用户消息与结构化文本", function(t)
-    local ai = require("NeoAI.sandbox.ai_audit")
+    local ai = require("NeoAI.sandbox.observe.ai_audit")
     local items = {
       { change_set_id = "cs_m", tool = "edit_file", risk_level = 1,
         files = { { path = "/tmp/x", action = "create", content = "y" } } },
@@ -139,7 +139,7 @@ tests.suite("sandbox_ai_audit", function(_, it)
   end)
 
   it("parse_notes 解析并截断到 50 字", function(t)
-    local ai = require("NeoAI.sandbox.ai_audit")
+    local ai = require("NeoAI.sandbox.observe.ai_audit")
     local notes = ai.parse_notes("/a/b.lua => 允许应用，无风险\n[create] /x.txt => 需人工确认")
     t.eq("允许应用，无风险", notes["/a/b.lua"])
     t.eq("需人工确认", notes["/x.txt"])
@@ -149,7 +149,7 @@ tests.suite("sandbox_ai_audit", function(_, it)
   end)
 
   it("build_text 高危变更优先排列且要求安全/不安全结论", function(t)
-    local ai = require("NeoAI.sandbox.ai_audit")
+    local ai = require("NeoAI.sandbox.observe.ai_audit")
     local text = ai.build_text({
       { change_set_id = "low", tool = "edit_file", risk_level = 0,
         files = { { path = "/tmp/low", action = "create", content = "a" } } },
@@ -165,7 +165,7 @@ tests.suite("sandbox_ai_audit", function(_, it)
   end)
 
   it("verdict 汇总安全/不安全结论", function(t)
-    local ai = require("NeoAI.sandbox.ai_audit")
+    local ai = require("NeoAI.sandbox.observe.ai_audit")
     t.eq("unsafe", ai.verdict({ ["/a"] = "不安全：写入系统路径" }), "含不安全应判 unsafe")
     t.eq("unsafe", ai.verdict({ ["/a"] = "安全：新增", ["/b"] = "不安全：越权" }), "任一不安全即 unsafe")
     t.eq("safe", ai.verdict({ ["/a"] = "安全：工作区内新增", ["/b"] = "安全：可回滚" }), "全安全判 safe")
@@ -175,7 +175,7 @@ tests.suite("sandbox_ai_audit", function(_, it)
   end)
 
   it("generate 通过注入生成器返回说明与错误", function(t)
-    local ai = require("NeoAI.sandbox.ai_audit")
+    local ai = require("NeoAI.sandbox.observe.ai_audit")
     ai.reset()
     local got, got_err
     ai.set_generator(function(_, _, on_done)
@@ -196,7 +196,7 @@ tests.suite("sandbox_ai_audit", function(_, it)
   end)
 
   it("generate 全局并发上限（max_concurrent）", function(t)
-    local ai = require("NeoAI.sandbox.ai_audit")
+    local ai = require("NeoAI.sandbox.observe.ai_audit")
     ai.reset()
     local started = 0
     local pending = {}
@@ -304,7 +304,7 @@ tests.suite("sandbox_ai_audit", function(_, it)
     local services = require("NeoAI.kernel.services")
     local config_store = require("NeoAI.kernel.config_store")
     local sr = require("NeoAI.ui.components.sandbox_review")
-    local ai = require("NeoAI.sandbox.ai_audit")
+    local ai = require("NeoAI.sandbox.observe.ai_audit")
     sr.reset()
     ai.reset()
     local called = false

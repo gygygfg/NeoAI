@@ -152,7 +152,7 @@ tests.suite("sandbox_boundary_consistency", function(_, it)
   it("[opt-in] 真实 OOM：小内存限额触发 SIGKILL 与归因", function(t)
     if os.getenv("NEOAI_TEST_HEAVY") ~= "1" then return end
     if not H.bwrap() or not H.has("python3") then return end
-    local cgroup = require("NeoAI.sandbox.cgroup")
+    local cgroup = require("NeoAI.sandbox.execution.cgroup")
     if not cgroup.probe().available then return end
     local dir = vim.fn.tempname()
     fs.ensure_dir(dir)
@@ -185,7 +185,7 @@ tests.suite("sandbox_boundary_consistency", function(_, it)
   it("[opt-in] 双 nvim 实例：常驻沙箱与待审队列互不可见", function(t)
     if os.getenv("NEOAI_TEST_HEAVY") ~= "1" then return end
     -- 端到端起两个 headless nvim 成本高且环境敏感；此处仅校验实例作用域 store 根隔离。
-    local instance = require("NeoAI.sandbox.instance")
+    local instance = require("NeoAI.sandbox.execution.instance")
     local base = vim.fn.tempname() .. "/sb"
     instance.set_id("aaaa_1")
     local r1 = instance.root(base)
@@ -203,7 +203,7 @@ tests.suite("sandbox_boundary_consistency", function(_, it)
     local saved_cfg = config_store.get_all()
     local saved_sandbox = services.use("services.sandbox")
     local saved_pty = services.use("services.pty")
-    local cg = require("NeoAI.sandbox.cgroup")
+    local cg = require("NeoAI.sandbox.execution.cgroup")
     local oa, ob = cg.oom_attribution, cg.oom_baseline
     config_store.load({ tools = { approval = { mode = "auto_allow" },
       run_command = { interactive = { enabled = true, engine = "auto" } } } })

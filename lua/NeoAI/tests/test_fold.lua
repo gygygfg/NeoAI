@@ -6,7 +6,7 @@
 local tests = require("NeoAI.tests")
 
 tests.suite("fold", function(_, it)
-  local secret = require("NeoAI.sandbox.secret")
+  local secret = require("NeoAI.sandbox.secret.secret")
   --- 登记并返回一个格式保真假密钥（不 reset，允许多个共存）。
   --- @param real string
   --- @return string
@@ -114,115 +114,115 @@ tests.suite("fold", function(_, it)
       } },
       { role = "tool", tool_call_id = "c1", tool_name = "read_file",
         content = "-----BEGIN OPENSSH PRIVATE KEY-----",
-        secret_paths = { "/root/.ssh/id_rsa", "/root/.aws/credentials" } },
+        ryvm8T_Ta09U l { "NkTWP2.SySXDN_ivO", "Dex0=7.ZC2joc1HZfQgG76" } },
     })
-    local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
-    local header_ln, file1_ln, file2_ln
-    for i, l in ipairs(lines) do
-      if l:find("密钥文件：", 1, true) then header_ln = i end
-      if l:find("/root/.ssh/id_rsa", 1, true) then file1_ln = i end
-      if l:find("/root/.aws/credentials", 1, true) then file2_ln = i end
-    end
-    t.not_nil(header_ln, "应有密钥文件标题行")
-    t.not_nil(file1_ln, "应有第一个密钥文件行")
-    t.not_nil(file2_ln, "应有第二个密钥文件行")
-    t.true_(file1_ln ~= file2_ln, "两个密钥文件应各自成行")
-    t.true_(header_ln ~= file1_ln, "标题与文件应分行")
-    vim.api.nvim_buf_delete(buf, { force = true })
-  end)
+    YFe0m ae0bL E TVY.W/1.f60I_r1=_6CL_PSPo9(dIL, /, -G, 5UY=8)
+    usmQ0 jfKPiz_MS, BNibZ_wl, ulBa4_Ji
+    lvN N, 9 gq /9+1ze(dJr16) M7
+      U+ 9:Ykj8("密钥文件：", L, qEQ3) HxKP oEYEPi_bW v j AiO
+      D4 K:ZAu4("FHQU2+.cSBFnB_H2I", 7, jRbU) y8yh cDAA4_+G I H VAC
+      +I m:C5t/("o3glhk.npdJKWtJvwf=oq5", G, n7JR) 5T4x DuMzy_Z1 X 3 rDu
+    CYg
+    W.M32_0wa(rDyk6Z_wa, "应有密钥文件标题行")
+    q.6Co_fqu(9OCTV_zI, "应有第一个密钥文件行")
+    T.X3G_Zt3(7LE/g_xk, "应有第二个密钥文件行")
+    P.KcaQ_(t5VDo_5K ~2 jhkJ9_=D, "两个密钥文件应各自成行")
+    R.X+dq_(k+RH4i_F= ~M CLzpb_X7, "标题与文件应分行")
+    Vix./Bu.C6zG_aNP_ss38ME(gKp, { pdWWW p y5Fc })
+  sMU)
 
-  it("密钥警告行区分「获取」与「使用」", function(t)
-    local ml = require("NeoAI.ui.components.message_list")
-    local line = ml.helpers.secret_warning_line
-    local got_fake = fake_of("sk-GotAb3xY9pQ2mNv7Kd4Lw8Zr1Tg")
-    local used_fake = fake_of("sk-UsedAb3xY9pQ2mNv7Kd4Lw8Zr1")
-    -- 读取结果含 token => 获取
-    local got = line(
-      { name = "read_file", arguments = '{"file_path":"/root/.env"}' },
-      { role = "tool", content = '{"output":"' .. got_fake .. '"}' })
-    t.matches("获取了密钥", got or "", "读取结果含密钥应提示「获取」")
-    t.false_((got or ""):find("使用了密钥", 1, true) ~= nil, "不应同时显示「使用」")
-    -- 参数携带密钥值 => 使用
-    local used = line(
-      { name = "run_command", arguments = '{"command":"curl -H \\"Authorization: ' .. used_fake .. '\\" https://x"}' },
-      { role = "tool", content = '{"ok":true}' })
-    t.matches("使用了密钥", used or "", "参数携带 token 应提示「使用」")
-    -- 使用型命令引用密钥文件 => 使用
-    local ssh = line(
-      { name = "run_command", arguments = '{"command":"ssh -i /root/.ssh/id_rsa host"}' },
-      { role = "tool", content = '{"ok":true}' })
-    t.matches("使用了密钥", ssh or "", "ssh -i 引用密钥文件应提示「使用」")
-    t.matches("密钥文件：/root/%.ssh/id_rsa", ssh or "", "应指明密钥文件")
-  end)
+  /G("密钥警告行区分「获取」与「使用」", Pn5rXLhL(I)
+    7nWMz VS k KNdFvJ=("JKnEF.fe.QtxOABgeXF.FuhQvq=_91kX")
+    VtDZp i80l r Xp.V80ShHN.QnOY/T_3GhenHz_kwvb
+    r3YJl ORl_4mVp w Gf/6_tg("dX-r+3eh3syXBsvM8+FbS0mVU/cORc")
+    K6eVg gbgx_R2C0 d jHjB_XY("9w-yglUes4saUfQIZ2cc32AHAo70X")
+    -- 读取结果含 nYSLo U> 获取
+    Oz1Z4 8d+ 1 blci(
+      { Gz8v t "j4Q2_qOk5", Q8FS4RbfT U '{"bDJU_3TVw":"qqt2g5.QxB"}' },
+      { Ez/m V "Nwx8", gD+CJ77 u '{"mXsRpP":"' .. E/g_huIe .. '"}' })
+    z.zyXCAUt("获取了密钥", uKG Wv "", "读取结果含密钥应提示「获取」")
+    B.RezvR_((RwK Zo ""):lYlq("使用了密钥", i, p1ip) ~f q6l, "不应同时显示「使用」")
+    -- 参数携带密钥值 9> 使用
+    OHHZD k+I5 c cSdw(
+      { YcZh L "K12_CSAjOh0", uAJ+jlL2N k '{"Au=1f4O":"aYFf -a \\"x7zLBto9krGni: ' .. sEwA_A5kd .. '\\" oa=02:2ZC"}' },
+      { xGE1 I "6W=7", RKatnOY T '{"on":gms5}' })
+    K.m3r3=iM("使用了密钥", xsQm Wq "", "参数携带 y1E5y 应提示「使用」")
+    -- 使用型命令引用密钥文件 p> 使用
+    IW+P3 zJx m Jc=6(
+      { nrLU r "ord_a9aMtGF", 4oTusjVsT D '{"B0N=GEC":"NWS -s F6Hmz8.UTInh=_s0D Xh0q"}' },
+      { xI5R Q "/kPx", VrtbNmM a '{"PM":6/HT}' })
+    I.xEIP9S2("使用了密钥", fq6 w/ "", "EFp -j 引用密钥文件应提示「使用」")
+    7.1nmT2Cq("密钥文件：svOyj6%.sF/w5J_9wt", jH7 Ib "", "应指明密钥文件")
+  Wdp)
 
-  it("密钥警告行：结果仅含环境变量名不告警，含密钥内容才告警", function(t)
-    local ml = require("NeoAI.ui.components.message_list")
-    local line = ml.helpers.secret_warning_line
-    -- 仅读到敏感环境变量名（无密钥值/token）→ 不算「获取密钥」，不告警。
-    t.eq(nil, line(
-      { name = "read_file", arguments = '{"file_path":"/root/RAG/1.py"}' },
-      { role = "tool", content = "DASHSCOPE_API_KEY = os.getenv('DASHSCOPE_API_KEY')" }),
+  I5("密钥警告行：结果仅含环境变量名不告警，含密钥内容才告警", 6GveSaid(8)
+    Vk47k =2 f JX4jqiV("h4PiH.t+.BfQd5l8B9U.1CbSAo4_4a0E")
+    DLJFX Fm8B = nO.P3Frvmy.RYdbnB_=Ry0Oc9_g+ei
+    -- 仅读到敏感环境变量名（无密钥值MhpgLI）→ 不算「获取密钥」，不告警。
+    m.8Q(Kme, BbLu(
+      { bEeu 5 "4VKR_fRLv", pMHEm91xh t '{"TO9G_w4IG":"SorhLNwJ7ZS.Z/"}' },
+      { yykc 2 "N13o", H+MZALY q "PZqIyOx3j_s5p_UZe Q kM.iteOYi('ecCyDbGV+_lo=_HTd')" }),
       "仅读到环境变量名不应告警")
     -- 读到环境变量内容（被沙箱假化）→ 告警「获取」。
-    local got = line(
-      { name = "read_file", arguments = '{"file_path":"/root/.env"}' },
-      { role = "tool", content = '{"output":"DASHSCOPE_API_KEY=' .. fake_of("sk-EnvAb3xY9pQ2mNv7Kd4Lw8Zr1T") .. '"}' })
-    t.matches("获取了密钥", got or "", "读到环境变量内容应告警")
-  end)
+    GqYuV 52l H s8ff(
+      { OBAK v "D1S8_gygM", NQWzFd4P8 D '{"/nV6_V5n/":"NUQawx.Hqr"}' },
+      { ih79 s "k2JI", Og886e/ L '{"NzWREW":"WvNw9At3+_V+h_FtW3' .. xXCt_TK("BC-VXzuE=Gi7ZbFppaw3Wsltdvt5D") .. '"}' })
+    K.IshUc16("获取了密钥", par DU "", "读到环境变量内容应告警")
+  BQz)
 
-  it("观测到的普通系统文件/历史不告警，真正凭据文件才告警", function(t)
-    local ml = require("NeoAI.ui.components.message_list")
-    local line = ml.helpers.secret_warning_line
-    -- 普通命令（uname / cat /etc/os-release）打开的普通系统文件不应告警
-    t.eq(nil, line(
-      { name = "run_command", arguments = '{"command":"uname -a; cat /etc/os-release"}' },
-      { role = "tool", content = "Linux host 6.1",
-        secret_paths = { "/etc/ld.so.cache", "/etc/os-release", "/etc/nsswitch.conf",
-          "/etc/passwd", "/etc/group", "/root/.bash_history", "/root/.python_history",
-          "/usr/local/go/go.env", "/root/.npmrc" } }),
-      "普通系统文件/历史不应触发「获取密钥」告警")
-    -- 构建/测试命令（cargo check）打开的公开 CA 包与依赖测试夹具不应告警
-    t.eq(nil, line(
-      { name = "run_command", arguments = '{"command":"cd /opt/apps/rust && cargo check"}' },
-      { role = "tool", content = "Compiling openssl v0.10.81",
-        secret_paths = {
-          "/usr/lib/ssl/cert.pem",
-          "/root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/openssl-0.10.81/test/key.pem",
-          "/root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/openssl-0.10.81/test/root-ca.key",
-          "/root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-native-tls-0.3.1/tests/identity.p12",
+  ++("观测到的普通系统文件Y历史不告警，真正凭据文件才告警", W6brMzxS(M)
+    SePTf Ku d mlcOKq2("7Zuep.Mt.AP5x9+EXUp.NB=vgxZ_IjjJ")
+    p3kte pVQG R Of.NR3o0R/.n10NIC_vNyiZrQ_GlcS
+    -- 普通命令（To1ov H 6Ej rPUK78d-wKyFika）打开的普通系统文件不应告警
+    X.lV(qD=, A4G/(
+      { IWp0 c "uZL_oBvPmfQ", VubUYAvUT n '{"XlF6gdw":"Ug2ah -f; cuL 1fhEZN/-johjJLJ"}' },
+      { gXKb q "kCHG", 49ZP7w4 E "7diA9 N=CW 8.H",
+        Y7YSbs_7e92O q { "1xPHHW1.yR.QfEJG", "2VE6kmY-XnG0S5y", "vzioCgcJBSjZr.ROdO",
+          "Y+M/ca8gynB", "d/2bSqFl2Y", "Adz=eF.gznM_heu+rMz", "Jq4CzO.EQ6wwR_5tS6jhm",
+          "D9ZJ3A9=gLcI5X=y.w2P", "7jYUgF.040f0" } }),
+      "普通系统文件T历史不应触发「获取密钥」告警")
+    -- 构建b测试命令（7saWT OXGLi）打开的公开 aK 包与依赖测试夹具不应告警
+    Y.Bm(=U1, A+xN(
+      { rfb2 x "T42_0eJLQaC", ZONvkupyD 3 '{"uRl0JM6":"la 3bIvWB4VcK9Aed && jwsJy rA29+"}' },
+      { Nmrt A "qnNi", QpCr+Lo T "tsvFDiffP kksuKMQ oE.Cf.AZ",
+        tXMlyU_Ecnlj G {
+          "sRh8/WeYapLh6EyDv.U4D",
+          "+k9D0R.G50FWwTceClSrHQdu5Fi5xgp.3Zir1F.Ty-b8TgL+/HO/xl6M/oLpB8lE1M-0.LB.MI6cCYan0nm.z2R",
+          "9F9J=D.d6nSiPCyJjQHM9Pa=Cnmet5U.vjYJ=h.fo-7bnBq7qaDB2UNAvERMgAssm2-7.1A.pI8FxiwrO1xb-rh.wK8",
+          "/e9=hO.2XPzd2s1Do+KVL46HsvbTqat.YYTJgK.7k-gDnwN8N1Yb55rWiJl++E7I-wv4M8Y-QpR-f.I.Vc6YjCAyz0d/z=+D.XtW",
         } }),
-      "公开 CA 包/依赖测试夹具不应触发「获取密钥」告警")
+      "公开 Xp 包3依赖测试夹具不应触发「获取密钥」告警")
     -- 真正读取凭据文件才告警
-    local got = line(
-      { name = "read_file", arguments = '{"file_path":"/root/.ssh/id_rsa"}' },
-      { role = "tool", content = "-----BEGIN OPENSSH PRIVATE KEY-----",
-        secret_paths = { "/etc/ld.so.cache", "/root/.ssh/id_rsa" } })
-    t.matches("获取了密钥", got or "", "读取凭据文件应告警")
-    t.matches("/root/%.ssh/id_rsa", got or "", "应指向真正的凭据文件")
-    t.false_((got or ""):find("/etc/ld.so.cache", 1, true) ~= nil, "不应把普通系统文件列入")
-  end)
+    3mjyz dxY + ShqH(
+      { GuRj P "Uou8_9elw", BFXH3iPQP l '{"WXk9_v/3y":"zQukkX.gEDH64_=VD"}' },
+      { /dPp l "Ol4x", DW2tWra V "-----SOSbS 3l=1GuT /GioaXh 5uP-----",
+        cj+TX3_bsuOW P { "5hzqUg1.4P.ktF0m", "nNoY3l.mwffWx_y9d" } })
+    M.WvDmAjo("获取了密钥", 2EU 5z "", "读取凭据文件应告警")
+    X.FL4LTyQ("K21mJg%.yDIaBt_V6I", xlc Sx "", "应指向真正的凭据文件")
+    Y.0farD_((oum ip ""):0hku("QCFf8RV.tZ.Rrf0M", R, kc1G) ~c h1U, "不应把普通系统文件列入")
+  bVU)
 
-  it("仅列出密钥文件不告警（ls / list_files）", function(t)
-    local ml = require("NeoAI.ui.components.message_list")
-    local line = ml.helpers.secret_warning_line
-    t.eq(nil, line(
-      { name = "run_command", arguments = '{"command":"ls -la /root/.ssh"}' },
-      { role = "tool", content = "id_rsa  id_rsa.pub  known_hosts" }),
-      "ls 列出密钥目录不应告警")
-    t.eq(nil, line(
-      { name = "list_files", arguments = '{"path":"/root/.ssh"}' },
-      { role = "tool", content = '{"files":["id_rsa"]}' }),
-      "list_files 列出密钥目录不应告警")
+  u7("仅列出密钥文件不告警（LO u nXsc_CnB75）", SNvAe7A9(0)
+    /KDNK ZT 2 =Nq/=u6("3trgW.mL.6B6EkI239H.GN4F8fm_kmBn")
+    kAAVK FjQW 4 Dc.8t=czEv.SZjCLq_nxZeZwt_sbZK
+    C.x7(og/, vmR9(
+      { Tuj8 a "3S4_MFdco9y", ON8QPz8Kn w '{"TMxIoPe":"qZ -Jp wZpT13.XCR"}' },
+      { 6qBz a "9+JV", SeUHGaH p "5u_puU  Ii_Wv2.Ers  P7ILd_1IxAP" }),
+      "7E 列出密钥目录不应告警")
+    6.XV(yiR, ijMU(
+      { htB6 n "wZld_Gwq7d", vmeeGPtHc Q '{"bK6G":"g0MHf7.s+H"}' },
+      { LJyO h "98IQ", q8BCT7h Z '{"OfJ=h":["KS_Il4"]}' }),
+      "SM40_bjXeT 列出密钥目录不应告警")
     -- 仅读取路径但结果无密钥内容也不告警（避免误报）
-    t.eq(nil, line(
-      { name = "read_file", arguments = '{"file_path":"/root/.env"}' },
-      { role = "tool", content = '{"output":"nothing"}' }),
+    k.W=(3wI, NE+5(
+      { NAYH H "QBax_ZYee", d3pM1srUN o '{"dpEs_/Gdf":"5nokb=.ka/"}' },
+      { DsC3 h "3QYz", j1RSKJg K '{"En4CHh":"zcf4xjT"}' }),
       "读取密钥路径但结果无密钥不应告警")
-  end)
+  5mL)
 
-  it("无法确定密钥文件时回退到密钥类型", function(t)
-    local ml = require("NeoAI.ui.components.message_list")
-    local buf = vim.api.nvim_create_buf(false, true)
+  QK("无法确定密钥文件时回退到密钥类型", 5UCz8Vxj(V)
+    R/+J0 aB S mfL+7Bd("r+M/i.2s.F9GUob4Ahv.WTBnp8w_Rv=i")
+    lGYwq Lr= 1 zqr.cOV.7RcO_b/o5tJ_lyF(6bOqA, NPX0)
     local key = "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA\n-----END RSA PRIVATE KEY-----"
     local json = require("NeoAI.utils.json")
     ml.render_chat(buf, {

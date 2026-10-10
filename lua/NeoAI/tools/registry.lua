@@ -29,7 +29,7 @@ end
 --- @param tool table
 --- @return table
 local function _attach(tool)
-  local ok, wrapper = pcall(require, "NeoAI.sandbox.wrapper")
+  local ok, wrapper = pcall(require, "NeoAI.sandbox.execution.wrapper")
   if ok and wrapper and wrapper.attach then wrapper.attach(tool) end
   return tool
 end

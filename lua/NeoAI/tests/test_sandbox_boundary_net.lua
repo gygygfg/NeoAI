@@ -36,8 +36,8 @@ end
 
 tests.suite("sandbox_boundary_net", function(_, it)
   it("宿主过滤代理：本机目标弹窗展示服务进程身份，批准后放行", function(t)
-    local hp = require("NeoAI.sandbox.host_proxy")
-    local nc = require("NeoAI.sandbox.net_consent")
+    local hp = require("NeoAI.sandbox.net.host_proxy")
+    local nc = require("NeoAI.sandbox.net.net_consent")
     hp.reset(); nc.reset()
     local port, close_srv = host_echo()
     local seen
@@ -78,7 +78,7 @@ tests.suite("sandbox_boundary_net", function(_, it)
 
   it("反向暴露：沙箱内监听的端口宿主可连接（共享 netns）", function(t)
     if not H.bwrap() or not H.has("python3") then return end
-    local resident = require("NeoAI.sandbox.resident")
+    local resident = require("NeoAI.sandbox.execution.resident")
     if not resident.available() then return end
     local port = 38991
     with_config({ tools = { approval = { mode = "auto_allow" },
@@ -110,10 +110,10 @@ tests.suite("sandbox_boundary_net", function(_, it)
 
   it("端口+服务进程粒度弹窗端到端：拒绝拦截 / 批准放行", function(t)
     if not H.bwrap() or not H.has("python3") or not H.has("curl") then return end
-    local resident = require("NeoAI.sandbox.resident")
+    local resident = require("NeoAI.sandbox.execution.resident")
     if not resident.available() then return end
-    local hp = require("NeoAI.sandbox.host_proxy")
-    local nc = require("NeoAI.sandbox.net_consent")
+    local hp = require("NeoAI.sandbox.net.host_proxy")
+    local nc = require("NeoAI.sandbox.net.net_consent")
     -- 宿主侧 HTTP 服务（python3），comm 可识别
     local port = 38992
     local srv = vim.fn.jobstart({ "python3", "-m", "http.server", tostring(port), "--bind", "127.0.0.1" },

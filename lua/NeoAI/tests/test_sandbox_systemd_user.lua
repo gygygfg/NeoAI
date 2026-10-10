@@ -22,7 +22,7 @@ end
 
 tests.suite("sandbox_systemd_user", function(_, it)
   it("伪造 systemd --user：解析器处理 start/is-active/stop，且不落宿主机", function(t)
-    local runtime = require("NeoAI.sandbox.runtime")
+    local runtime = require("NeoAI.sandbox.execution.runtime")
     if runtime.backend() ~= "bwrap" then return end
     local fs = require("NeoAI.utils.fs")
     local sandbox = require("NeoAI.sandbox")
@@ -37,7 +37,7 @@ tests.suite("sandbox_systemd_user", function(_, it)
         },
       },
     }, function()
-      local sduser = require("NeoAI.sandbox.systemd_user")
+      local sduser = require("NeoAI.sandbox.systemd.systemd_user")
       t.true_(sduser.available(), "伪造 systemd --user 应可用（无需 dbus/systemd 二进制）")
       sandbox.reset()
       local dir = vim.fn.tempname()
@@ -81,12 +81,12 @@ tests.suite("sandbox_systemd_user", function(_, it)
         end)
       t.true_(vim.wait(60000, function() return done end, 100), "命令应完成")
       vim.fn.chdir(prev)
-      require("NeoAI.sandbox.resident").stop({ timeout_ms = 3000 })
+      require("NeoAI.sandbox.execution.resident").stop({ timeout_ms = 3000 })
     end)
   end)
 
   it("systemctl --user 由伪造解析器处理（route=facade, scope=user）", function(t)
-    local systemd = require("NeoAI.sandbox.systemd")
+    local systemd = require("NeoAI.sandbox.systemd.systemd")
     local plan = systemd.parse_command("systemctl --user status foo")
     t.not_nil(plan, "应解析")
     t.eq("facade", plan.route, "--user 应走伪造门面")

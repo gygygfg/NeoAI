@@ -110,7 +110,7 @@ end)
 
 tests.suite("overlay_lock", function(_, it)
   it("overlay_lock_keys：解析 bwrap --overlay 三元组", function(t)
-    local runtime = require("NeoAI.sandbox.runtime")
+    local runtime = require("NeoAI.sandbox.execution.runtime")
     local keys = runtime.overlay_lock_keys({
       "bwrap", "--overlay-src", "/", "--overlay", "/u", "/w", "/", "--", "true",
     })
@@ -118,7 +118,7 @@ tests.suite("overlay_lock", function(_, it)
   end)
 
   it("overlay_lock_keys：无 overlay 返回空", function(t)
-    local runtime = require("NeoAI.sandbox.runtime")
+    local runtime = require("NeoAI.sandbox.execution.runtime")
     t.deep_eq({}, runtime.overlay_lock_keys({ "bwrap", "--ro-bind", "/", "/", "--", "true" }))
   end)
 end)

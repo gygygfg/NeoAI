@@ -106,13 +106,13 @@ local function _service_specs()
         -- 组合根注入沙箱能力桥：core 侧（密钥泄漏告警 / 附件缩放）经 kernel.sandbox_bridge 访问
         -- 沙箱能力，不直接依赖 sandbox，保持 core → kernel 单向。
         require("NeoAI.kernel.sandbox_bridge").set({
-          secret_alert = require("NeoAI.sandbox.secret_alert"),
+          secret_alert = require("NeoAI.sandbox.secret.secret_alert"),
           record_secret_flow = function(event, meta)
-            require("NeoAI.sandbox.secret_flow").record(event, meta)
+            require("NeoAI.sandbox.secret.secret_flow").record(event, meta)
           end,
-          exec = require("NeoAI.sandbox.exec"),
+          exec = require("NeoAI.sandbox.execution.exec"),
           candidate_read_path = function(path)
-            return require("NeoAI.sandbox.candidate").read_path(path)
+            return require("NeoAI.sandbox.execution.candidate").read_path(path)
           end,
         })
         require("NeoAI.sandbox").init()

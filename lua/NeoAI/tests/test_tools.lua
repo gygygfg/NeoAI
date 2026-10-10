@@ -511,7 +511,7 @@ tests.suite("tools", function(_, it)
   end)
 
   it("沙箱新建目录树对 list_files/file_exists/search_files 一致可见（不逃逸）", function(t)
-    local runtime = require("NeoAI.sandbox.runtime")
+    local runtime = require("NeoAI.sandbox.execution.runtime")
     if runtime.backend() ~= "bwrap" then return end
     local registry = require("NeoAI.tools.registry")
     registry.reset()
@@ -732,7 +732,7 @@ tests.suite("tools", function(_, it)
 
   it("shell run_command 出错/超时也回传终端输出", function(t)
     -- run_command 必须过沙箱门禁；无可用后端（如嵌套容器 userns 受限）时跳过。
-    if require("NeoAI.sandbox.runtime").backend() == nil then return end
+    if require("NeoAI.sandbox.execution.runtime").backend() == nil then return end
     local tools = require("NeoAI.tools")
     local registry = require("NeoAI.tools.registry")
     local shell = require("NeoAI.tools.builtin.shell")
@@ -789,7 +789,7 @@ tests.suite("tools", function(_, it)
 
   it("tool_service 把 ctx.ui_notice 作为 UI-only 元数据回传（不进入结果内容）", function(t)
     -- 工具执行需过沙箱门禁；无可用后端时跳过（否则被门禁拒绝，无法验证 ui_notice）。
-    if require("NeoAI.sandbox.runtime").backend() == nil then return end
+    if require("NeoAI.sandbox.execution.runtime").backend() == nil then return end
     local config_store = require("NeoAI.kernel.config_store")
     config_store.load({ tools = { approval = { mode = "auto_allow" } } })
     local tool_service = require("NeoAI.services.tool_service")

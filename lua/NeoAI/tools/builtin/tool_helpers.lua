@@ -226,7 +226,7 @@ function M.sync_buffer_from_sandbox(bufnr, filepath)
   if not vim.api.nvim_buf_is_loaded(bufnr) then return true end
   if vim.bo[bufnr].modified then return true end -- 有未保存改动，绝不覆盖
   if not bg_loaded[bufnr] then return true end -- 仅后台加载的 buffer
-  local ok, cand = pcall(require, "NeoAI.sandbox.candidate")
+  local ok, cand = pcall(require, "NeoAI.sandbox.execution.candidate")
   if not ok or not cand or type(cand.read_path) ~= "function" then return true end
   local staged = cand.read_path(filepath)
   if not staged then return true end

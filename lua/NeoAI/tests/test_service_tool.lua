@@ -9,10 +9,10 @@ tests.suite("service_tool", function(_, it)
   for _, tl in ipairs(tool_mod.get_tools()) do tools[tl.name] = tl end
 
   local function with_fake(fake, fn)
-    local real = package.loaded["NeoAI.sandbox.service"]
-    package.loaded["NeoAI.sandbox.service"] = fake
+    local real = package.loaded["NeoAI.sandbox.execution.service"]
+    package.loaded["NeoAI.sandbox.execution.service"] = fake
     local ok, err = pcall(fn)
-    package.loaded["NeoAI.sandbox.service"] = real
+    package.loaded["NeoAI.sandbox.execution.service"] = real
     if not ok then error(err, 0) end
   end
 
