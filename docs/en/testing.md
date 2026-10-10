@@ -76,6 +76,25 @@ For custom integration: parallel API `require("NeoAI.tests.parallel").run(opts)`
 sequential-isolated API `require("NeoAI.tests").run_isolated(names, { on_done = fn })`; suite
 manifest discovery `require("NeoAI.tests").list_suites()`.
 
+### 1.2 CI (GitHub Actions)
+
+The `.github/workflows/ci.yml` workflow runs two jobs on push / PR:
+
+- **Invariant gate** (sub-second): `bash scripts/ci_invariants.sh` enforces repo-level hard
+  rules — no `TODO/FIXME/HACK/XXX` in non-test code; `event_bus.(emit|on|once)` must not use
+  literal event names (reference `kernel/events.lua` constants instead); business code must not
+  `require("NeoAI.services.*")` directly (allowlist: `services/`, `plugins/`, `init.lua`, the
+  `lualine` integration).
+- **Headless regression**: installs Neovim stable and runs the parallel command from 1.1;
+  fails the job when `failed>0`.
+
+The regression **skips environment-capability suites** (they inevitably fail on unprivileged
+runners — the failure is environmental, not code): `gateway`, `multimodal`, `integration`,
+`timer`, `pty`, `sandbox`, `sandbox_governance`, `sandbox_hardening`, `sandbox_service`,
+`sandbox_systemd` — these need systemd init / unshare-userns / netns / interactive approval /
+PTY capabilities. All remaining suites must be green. The skip list lives in the workflow's
+inline `-c` script; for the local equivalent see 1.1 (remove the filter to run the full set).
+
 ## 2. Test Organization
 
 ```lua

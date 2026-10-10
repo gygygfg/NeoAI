@@ -67,6 +67,22 @@ opts.wait / opts.on_done / opts.timings_path / opts.verbose`）；顺序隔离�
 `require("NeoAI.tests").run_isolated(names, { on_done = fn })`；套件清单发现
 `require("NeoAI.tests").list_suites()`。
 
+### 1.2 CI（GitHub Actions）
+
+工作流 `.github/workflows/ci.yml` 在 push / PR 上运行两个 job：
+
+- **不变量门禁**（秒级）：`bash scripts/ci_invariants.sh` 校验仓库级硬性约定——
+  非测试代码无 `TODO/FIXME/HACK/XXX`；`event_bus.(emit|on|once)` 不得使用字面量事件名
+  （须引用 `kernel/events.lua` 常量）；业务代码禁止直接 `require("NeoAI.services.*")`
+  （allowlist：`services/`、`plugins/`、`init.lua`、`lualine` 集成）。
+- **headless 回归**：安装 Neovim stable，按 1.1 的并行命令运行，`failed>0` 即红。
+
+回归会**跳过环境能力依赖套件**（无特权 runner 上必然失败，失败源于环境而非代码）：
+`gateway`、`multimodal`、`integration`、`timer`、`pty`、`sandbox`、`sandbox_governance`、
+`sandbox_hardening`、`sandbox_service`、`sandbox_systemd`——它们需要 systemd init /
+unshare-userns / netns / 交互式审批 / PTY 等能力。其余套件必须全绿。跳过清单直接写在
+workflow 的 `-c` 内联脚本中；本地等价运行见 1.1（去掉过滤即为本机全量）。
+
 ## 2. 测试组织
 
 ```lua

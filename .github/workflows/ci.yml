@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+# 秒级不变量门禁 + headless 全量回归。
+# 回归跳过「环境能力依赖」套件（需 systemd init / unshare-userns / netns / 交互式审批 / PTY），
+# 这些在无特权 runner 上必然失败，见 docs/testing.md「CI」一节。
+jobs:
+  invariants:
+    name: 不变量门禁
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 校验仓库级不变量
+        run: bash scripts/ci_invariants.sh
+
+  tests:
+    name: headless 回归
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: 安装 Neovim（stable）
+        uses: rhysd/action-setup-vim@v1
+        with:
+          neovim: true
+          version: stable
+      - name: 运行测试（跳过环境能力依赖套件，其余失败即红）
+        run: |
+          nvim --headless --clean -u NONE \
+            --cmd "set rtp+=$PWD" \
+            --cmd "lua require('NeoAI').setup({ log={level='ERROR'}, session={auto_save=false} })" \
+            -c 'lua local skip={gateway=1,multimodal=1,integration=1,timer=1,pty=1,sandbox=1,sandbox_governance=1,sandbox_hardening=1,sandbox_service=1,sandbox_systemd=1}; local keep={}; for _,s in ipairs(require("NeoAI.tests").list_suites()) do if not skip[s.name] then keep[#keep+1]=s.name end end; local r=require("NeoAI.tests.parallel").run({suites=keep}); print("SUMMARY passed="..r.passed.." failed="..r.failed); vim.cmd(r.failed>0 and "cquit 1" or "qa!")'
