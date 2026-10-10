@@ -252,7 +252,7 @@ Read-only: `git_status` / `git_diff` / `git_log` / `git_commit_detail` / `git_br
 `git_file_history` / `git_auto_commit_config` (executed in the sandbox namespace, seeing the staged view).
 
 Mutations (run **inside the sandbox**, `effect=process`; changes are **staged atomically into the
-review window**): `git_add` / `git_commit` / `git_stash` / `git_restore` / `git_rollback`. `.git` is a
+review window**): `git_add` / `git_commit` / `git_stash` / `git_restore`. `.git` is a
 tightly coupled "index ↔ object store ↔ refs" database, applied atomically in
 `object → normal file → pointer` order so nothing ever dangles (see [sandbox.md](sandbox.md)); git
 mutation subcommands in `run_command` are refused (`SANDBOX_GIT_MUTATION_VIA_COMMAND`) and must use the

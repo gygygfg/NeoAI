@@ -16,7 +16,7 @@ local GIT_DEPENDENT_TOOLS = {
   "git_commit_detail",
   "git_branch",
   "git_file_history",
-  "git_rollback",
+  "git_restore",
 }
 
 -- 依赖工作区（cwd）的工具（workspace 不可获取时禁用）

@@ -749,11 +749,10 @@ NeoAI 内置了 40+ 工具，AI 可在对话中自动调用，涵盖以下类别
 | `git_commit_detail`     | 查看某次提交详情         | `ref`（必填）提交引用（如 `HEAD`/`abc123`） |
 | `git_branch`            | 查看分支列表（-a）       | 无参数 |
 | `git_file_history`      | 查看文件历史             | `file_path`（必填）文件路径；`max`（可选）条数 |
-| `git_rollback`          | 回滚文件到指定提交（改动暂存待审） | `file_path`（必填）文件；`commit`（可选，默认 `HEAD`）目标提交 |
 | `git_add`               | 暂存文件（改动暂存待审） | `paths`（可选）路径数组；`all`（可选）暂存全部改动 |
 | `git_commit`            | 提交已暂存改动（改动暂存待审） | `message`（必填）提交信息；`all`（可选）先 `-a` 暂存已跟踪文件 |
 | `git_stash`             | 管理 stash（改动暂存待审） | `action`（必填）`push`/`pop`/`apply`/`drop`/`list`；`message`/`include_untracked`（仅 push） |
-| `git_restore`           | 还原文件到指定提交（改动暂存待审） | `file_path`（必填）；`commit`（可选，默认 `HEAD`） |
+| `git_restore`           | 回滚/还原文件到指定提交（改动暂存待审；默认 `HEAD` 仅丢弃未提交改动，跨多个版本必须 `confirm_multi` 且经用户确认） | `file_path`（必填）文件；`commit`（可选，默认 `HEAD`）目标精确修订；`confirm_multi`（可选，默认 `false`）用户已明确点名版本时置 true |
 | `git_auto_commit_config`| 查看/设置自动提交配置    | `auto_commit`（可选）布尔，省略则仅查询当前配置 |
 
 ### 🤖 子 Agent 工具

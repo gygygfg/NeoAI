@@ -227,7 +227,7 @@ M.execute(agent, name, args, tool_call_id, opts)
 `git_file_history` / `git_auto_commit_config`（在沙箱命名空间内执行，看到暂存视图）。
 
 变更（在**沙箱内**执行 `effect=process`，改动**原子暂存进审批悬浮窗**）：`git_add` /
-`git_commit` / `git_stash` / `git_restore` / `git_rollback`。`.git` 是「索引↔对象库↔refs」强耦合
+`git_commit` / `git_stash` / `git_restore`。`.git` 是「索引↔对象库↔refs」强耦合
 数据库，按 `object → 普通文件 → pointer` 有序原子应用，绝不产生悬空引用（见
 [sandbox.md](sandbox.md)）；`run_command` 中的 git 变更子命令会被拒绝
 （`SANDBOX_GIT_MUTATION_VIA_COMMAND`），须改用上述专用工具。

@@ -762,11 +762,10 @@ one does). For risk levels and allowlists see the `approval` config and [docs/en
 | `git_commit_detail`     | View the details of a given commit         | `ref` (required) commit reference (e.g. `HEAD`/`abc123`) |
 | `git_branch`            | View the branch list (-a)       | no parameters |
 | `git_file_history`      | View a file's history             | `file_path` (required); `max` (optional) entries |
-| `git_rollback`          | Roll a file back to a given commit (staged for review) | `file_path` (required); `commit` (optional, default `HEAD`) target commit |
 | `git_add`               | Stage files (staged for review) | `paths` (optional) path array; `all` (optional) stage all changes |
 | `git_commit`            | Commit staged changes (staged for review) | `message` (required); `all` (optional) `-a` stage tracked files first |
 | `git_stash`             | Manage stash (staged for review) | `action` (required) `push`/`pop`/`apply`/`drop`/`list`; `message`/`include_untracked` (push only) |
-| `git_restore`           | Restore a file to a given commit (staged for review) | `file_path` (required); `commit` (optional, default `HEAD`) |
+| `git_restore`           | Roll/restore a file back to a given commit (staged for review; default `HEAD` only discards uncommitted changes; rolling back more than one version requires `confirm_multi` and user confirmation) | `file_path` (required); `commit` (optional, default `HEAD`) exact revision; `confirm_multi` (optional, default `false`) set true only when the user explicitly named the version |
 | `git_auto_commit_config`| View/set the auto-commit configuration    | `auto_commit` (optional) boolean; omit to just query the current setting |
 
 ### 🤖 Sub-Agent Tools

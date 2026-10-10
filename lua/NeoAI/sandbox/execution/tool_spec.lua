@@ -42,7 +42,6 @@ local SPECS = {
   git_file_history = { effect = "process", read_only = true },
   -- git 变更：在沙箱内执行（看到暂存工作区），`.git` 改动由候选管线**原子化**捕获
   -- （对象先于指针，见 `runtime.git_path_class`）后进入审批悬浮窗，用户确认后原子应用。
-  git_rollback = { effect = "process" },
   git_add = { effect = "process" },
   git_commit = { effect = "process" },
   git_stash = { effect = "process" },

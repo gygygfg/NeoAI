@@ -560,7 +560,7 @@
       `other`（config/hooks/info）。`transient`/`other` 与**对象删除**（gc/prune 剪枝）不纳入候选。
     - 应用顺序固定为 **对象 → 普通文件 → 指针**（`_apply_order`）：任何被写入的索引/refs 所引用
       的对象都已存在，绝不悬空；对象库已存在时按内容寻址幂等跳过，不做 CAS。因此 `git_add` /
-      `git_commit` / `git_stash` / `git_restore` / `git_rollback` 的 `.git` 改动与工作区改动一起
+      `git_commit` / `git_stash` / `git_restore` 的 `.git` 改动与工作区改动一起
       进入审批悬浮窗，用户确认后原子应用（`SANDBOX_GIT_INTERNAL` 仅兜底拒绝瞬态/配置类目标）。
     - 这些 git 变更工具在**沙箱内**执行（`effect=process`，看到暂存工作区），改动冻结为候选、
       dry_run 下不改真实 `.git`。`run_command` 中的 git **变更**子命令被守卫拒绝
@@ -570,8 +570,8 @@
       头行与各文件行都映射到**整组**——`<CR>` 通过、`d` 丢弃均作用于整组，禁止逐文件选择性
       应用/丢弃（`apply`/`reject_file` 也强制整组），避免只写索引或只写对象导致损坏。
     - 文件写入工具（`edit_file` 等）以 `.git` 为目标仍直接拒绝（AI 不应直接改仓库内部）。
-    - **只有 git 写类工具可发布 `.git` 指针**：`git_add`/`git_commit`/`git_stash`/`git_restore`/
-      `git_rollback` 之外的任何工具，其候选即使因 `.git` mtime 新鲜被「全量遍历捕获」而看到
+    - **只有 git 写类工具可发布 `.git` 指针**：`git_add`/`git_commit`/`git_stash`/`git_restore`
+      之外的任何工具，其候选即使因 `.git` mtime 新鲜被「全量遍历捕获」而看到
       `.git/index` 等指针变化，那也只是**前置 git 工具遗留在 overlay 的残留**，冻结时一律剔除
       （仅保留对象库）。否则该候选会写出「引用了尚未物化对象」的悬空指针，被发布闸门以
       `GIT_REFERENTIAL_INTEGRITY: index -> <oid>` fail-closed 拒绝，令本无问题的工具整单失败。

@@ -707,7 +707,7 @@ detection) and `risk.classify` (security level), so `pip install`, `sudo modprob
     - Application order is fixed to **objects → normal files → pointers** (`_apply_order`): any index/ref
       written references objects that already exist, so nothing dangles; objects already present are
       skipped idempotently by content address (no CAS). Hence the `.git` changes of `git_add` /
-      `git_commit` / `git_stash` / `git_restore` / `git_rollback` enter the review window together with
+      `git_commit` / `git_stash` / `git_restore` enter the review window together with
       the worktree changes and are applied atomically on confirmation (`SANDBOX_GIT_INTERNAL` only
       backstops transient/config targets).
     - These git mutation tools run **inside the sandbox** (`effect=process`, seeing the staged
@@ -723,7 +723,7 @@ detection) and `risk.classify` (security level), so `pip install`, `sudo modprob
     - File-writing tools (`edit_file`, …) targeting `.git` are still refused outright (the AI should
       not edit repository internals directly).
     - **Only git-write tools may publish `.git` pointers**: any tool other than `git_add`/`git_commit`/
-      `git_stash`/`git_restore`/`git_rollback` whose candidate happens to contain `.git/index`
+      `git_stash`/`git_restore` whose candidate happens to contain `.git/index`
       (e.g. because a fresh `.git` mtime forced a full traversal) is only seeing a **leftover pointer
       from a preceding git tool**; it is dropped at freeze time (only the object store is kept).
       Otherwise the candidate would publish a dangling pointer to a not-yet-materialized object, which

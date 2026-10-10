@@ -253,7 +253,7 @@ function M.sync_buffer_from_sandbox(bufnr, filepath)
 end
 
 --- AI 工具直写磁盘后，同步所有已加载且指向该文件的 buffer（仅当无未保存改动）。
---- 解决 edit_file/write_file/append_file/git_rollback 改盘后，已打开 buffer 展示
+--- 解决 edit_file/write_file/append_file/git_restore 改盘后，已打开 buffer 展示
 --- 过期内容（看不见 AI 的修改、按旧行号操作读错位置）的问题。
 --- @param filepath string
 function M.reload_buffers_for(filepath)

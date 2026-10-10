@@ -34,7 +34,7 @@ local M = {}
 -- 相对整仓很小，全量遍历代价可接受。
 local GIT_WRITE_TOOLS = {
   git_add = true, git_commit = true, git_stash = true,
-  git_restore = true, git_rollback = true,
+  git_restore = true,
 }
 
 -- ========== 性能埋点（tools.sandbox.diagnostics.enabled） ==========

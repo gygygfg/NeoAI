@@ -47,7 +47,7 @@ function M.get_pack_for_tool(tool_name)
     ensure_dir = "file", delete_file = "file", confirm_file_change = "file",
     run_command = "system",
     git_diff = "git", git_log = "git", git_status = "git",
-    git_commit_detail = "git", git_rollback = "git", git_file_history = "git",
+    git_commit_detail = "git", git_restore = "git", git_file_history = "git",
     git_branch = "git", git_auto_commit_config = "git",
     parse_file = "treesitter", query_tree = "treesitter",
     get_node_at_position = "treesitter", get_node_type = "treesitter",

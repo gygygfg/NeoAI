@@ -210,7 +210,7 @@ approval = {
     cancel_sub_agent    = { auto_allow = true },
     git_diff / git_log / git_status / git_commit_detail /
     git_file_history / git_branch / git_auto_commit_config = { auto_allow = true },
-    git_rollback = { auto_allow = false },
+    git_restore = { auto_allow = false },
     log_message / get_log_levels = { auto_allow = true },
     lsp_rename / lsp_format / delete_node = { auto_allow = false },
   },

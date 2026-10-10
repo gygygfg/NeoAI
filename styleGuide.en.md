@@ -1143,7 +1143,7 @@ async.all({ deferred1, deferred2 })
 | ---- | ---- |
 | `file_ops.lua` | `read_file` / `edit_file` / `list_files` / `search_files` / `file_exists` / `create_directory` / `ensure_dir` / `delete_file` / `confirm_file_change` |
 | `shell.lua`    | `run_command` |
-| `git_ops.lua`  | `git_status` / `git_diff` / `git_log` / `git_commit_detail` / `git_branch` / `git_file_history` / `git_rollback` / `git_auto_commit_config` |
+| `git_ops.lua`  | `git_status` / `git_diff` / `git_log` / `git_commit_detail` / `git_branch` / `git_file_history` / `git_restore` / `git_auto_commit_config` |
 | `lsp_ops.lua`  | `lsp_hover` / `lsp_definition` / `lsp_references` / `lsp_document_symbols` / `lsp_workspace_symbols` / `lsp_diagnostics` / `lsp_client_info` / `lsp_code_action` / `lsp_rename` / `lsp_format` / `lsp_signature_help` / `lsp_completion` / `lsp_type_definition` / `lsp_declaration` / `lsp_implementation` / `lsp_service_info` |
 | `tree_ops.lua` | `parse_file` / `get_node_at_position` / `get_node_type` / `get_node_range` / `is_named_node` / `get_parent_node` / `get_child_nodes` / `get_node_code` / `query_tree` / `delete_node` |
 | `log_ops.lua`  | `log_message` / `get_log_levels` |

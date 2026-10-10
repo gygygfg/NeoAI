@@ -2676,7 +2676,7 @@ end
 -- 剔除指针**：指针只能由其真正的产出工具（git 写类工具）随其对象一起发布。
 local GIT_WRITE_TOOLS = {
   git_add = true, git_commit = true, git_stash = true,
-  git_restore = true, git_rollback = true,
+  git_restore = true,
 }
 
 --- 本次 attempt 是否为 git 写类工具。

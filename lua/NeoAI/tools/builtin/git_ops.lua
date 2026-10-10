@@ -129,6 +129,45 @@ local function _git_text(r)
   return ("git 退出码 %d\n%s"):format(r.code, body)
 end
 
+--- 计算 `<commit>` 相对 HEAD 落后的提交数（只读，走沙箱只读通道）。
+--- 用于回退前的「多版本越界」守卫：数值越大表示目标越久远。
+--- 解析失败（非法修订 / rev-list 报错）时返回 0，交由真正的 checkout 抛出可读错误。
+--- @param commit string 目标修订
+--- @param ctx table|nil 工具上下文
+--- @param repo string|nil 目标仓库目录
+--- @return Deferred resolve(number)
+local function _commit_distance(commit, ctx, repo)
+  if commit == "HEAD" then return async.resolve(0) end
+  return _git({ "rev-list", "--count", commit .. "..HEAD" }, ctx, repo):then_(function(r)
+    if r.code ~= 0 then return 0 end
+    return tonumber((r.output or ""):match("%d+")) or 0
+  end, function() return 0 end)
+end
+
+--- 回退前的「多版本越界」守卫：当 commit 比 HEAD 落后超过 1 个提交且未显式确认时拒绝。
+--- 默认 HEAD（丢弃未提交改动）与 HEAD~1（回退恰好一个版本）始终放行；更久远的目标必须
+--- 由调用方在用户明确点名版本后传入 confirm_multi=true，避免模型臆测旧提交而一次回退多个版本。
+--- @param commit string 目标修订
+--- @param confirm_multi boolean|nil 调用方是否已获用户明确确认
+--- @param ctx table|nil
+--- @param repo string|nil
+--- @return Deferred resolve(true) 放行 / reject({kind,message}) 拒绝
+local function _guard_multi_version(commit, confirm_multi, ctx, repo)
+  if commit == "HEAD" or confirm_multi == true then return async.resolve(true) end
+  return _commit_distance(commit, ctx, repo):then_(function(n)
+    if n and n > 1 then
+      return async.reject({
+        kind = "multi_version",
+        message = ("拒绝跨 %d 个版本回退：目标 `%s` 比 HEAD 落后 %d 个提交。"
+          .. "除非用户已明确点名该版本，否则请改用默认 commit=HEAD（仅丢弃该文件未提交的改动）；"
+          .. "确需回退到该历史版本时，先用 git_file_history/git_log 查出精确提交、"
+          .. "向用户复述（哈希+信息）并确认，再用 confirm_multi=true 重试。"):format(n, commit, n),
+      })
+    end
+    return true
+  end)
+end
+
 -- ========== 工具定义 ==========
 
 local git_tools = {}
@@ -365,12 +404,20 @@ git_tools.git_stash = helpers.define_tool(
 
 git_tools.git_restore = helpers.define_tool(
   "git_restore",
-  "还原文件到指定提交（git checkout <commit> -- <file_path>）。file_path 必填；commit 可选（默认 HEAD）；repo 可选（目标仓库目录，缺省=当前会话仓库）。改动进入审批待确认。",
+  "将单个文件回滚/还原到指定提交（git checkout <commit> -- <file_path>）。"
+    .. "file_path 必填；commit 可选（默认 HEAD）：必须是精确的 git 修订（提交哈希 / HEAD / HEAD~N / 标签 / 分支）。"
+    .. "默认 HEAD 仅丢弃该文件在 HEAD 之后尚未提交的工作区改动，是最安全的默认值。"
+    .. "除非用户明确指定目标版本，一律使用默认 HEAD；禁止臆测或用 HEAD~N、旧提交回退多个版本。"
+    .. "若用户要求回退到某历史版本但未给哈希，先用 git_file_history / git_log 查出精确提交，"
+    .. "向用户复述该提交（哈希+信息）并确认，再用 confirm_multi=true 重试。"
+    .. "跨多个版本（落后 HEAD 超过 1 个提交）而未置 confirm_multi=true 会被拒绝。"
+    .. "repo 可选（目标仓库目录，缺省=当前会话仓库）。改动进入审批待确认。",
   {
     type = "object",
     properties = {
-      file_path = { type = "string" },
-      commit = { type = "string" },
+      file_path = { type = "string", description = "要还原的文件路径（相对会话仓库或绝对路径）" },
+      commit = { type = "string", description = "目标精确修订（默认 HEAD=仅丢弃未提交改动）；禁止臆测旧版本" },
+      confirm_multi = { type = "boolean", description = "仅当用户已明确点名目标版本、确认跨多个版本回退时才置 true" },
       repo = { type = "string", description = "目标 git 仓库目录（缺省=当前会话仓库）" },
     },
     required = { "file_path" },
@@ -378,42 +425,16 @@ git_tools.git_restore = helpers.define_tool(
   function(args, on_success, on_error, ctx)
     local commit = args.commit or "HEAD"
     local repo = _repo(args)
-    _git_write({ "checkout", commit, "--", args.file_path }, ctx, repo):then_(function(r)
-      if r.code == 0 then
-        local target = (repo and not args.file_path:match("^/")) and (repo .. "/" .. args.file_path) or args.file_path
-        helpers.reload_buffers_for(target)
-        on_success(_git_text(r))
-      else
-        on_error(_git_text(r))
-      end
-    end, function(e) on_error(e.message) end)
-  end,
-  { category = "git", approval = { auto_allow = false } }
-)
-
-git_tools.git_rollback = helpers.define_tool(
-  "git_rollback",
-  "回滚文件到指定提交。file_path 必填；commit 可选（默认 HEAD）；repo 可选（目标仓库目录，缺省=当前会话仓库）。改动进入审批待确认。",
-  {
-    type = "object",
-    properties = {
-      file_path = { type = "string" },
-      commit = { type = "string" },
-      repo = { type = "string", description = "目标 git 仓库目录（缺省=当前会话仓库）" },
-    },
-    required = { "file_path" },
-  },
-  function(args, on_success, on_error, ctx)
-    local commit = args.commit or "HEAD"
-    local repo = _repo(args)
-    _git_write({ "checkout", commit, "--", args.file_path }, ctx, repo):then_(function(r)
-      if r.code == 0 then
-        local target = (repo and not args.file_path:match("^/")) and (repo .. "/" .. args.file_path) or args.file_path
-        helpers.reload_buffers_for(target)
-        on_success(("已回滚 %s 到 %s"):format(args.file_path, commit))
-      else
-        on_error(_git_text(r))
-      end
+    _guard_multi_version(commit, args.confirm_multi, ctx, repo):then_(function()
+      _git_write({ "checkout", commit, "--", args.file_path }, ctx, repo):then_(function(r)
+        if r.code == 0 then
+          local target = (repo and not args.file_path:match("^/")) and (repo .. "/" .. args.file_path) or args.file_path
+          helpers.reload_buffers_for(target)
+          on_success(_git_text(r))
+        else
+          on_error(_git_text(r))
+        end
+      end, function(e) on_error(e.message) end)
     end, function(e) on_error(e.message) end)
   end,
   { category = "git", approval = { auto_allow = false } }
