@@ -149,6 +149,22 @@ tests.suite("net_consent", function(_, it)
     nc.reset()
   end)
 
+  it("同意弹窗在沙箱服务晚于 UI 就绪时仍注册（与其它审批弹窗一致）", function(t)
+    local services = require("NeoAI.kernel.services")
+    local ui = require("NeoAI.ui.components.net_consent")
+    local saved = services.use("services.sandbox")
+    services.revoke("services.sandbox")
+    ui.reset()
+    local captured = nil
+    ui.init() -- 沙箱服务尚未就绪（phase 2 晚于 ui phase 1）
+    t.eq(nil, captured, "沙箱未就绪时无目标可注册")
+    services.provide("services.sandbox", { set_net_consent_ui = function(u) captured = u end })
+    t.not_nil(captured, "沙箱服务就绪后应自动注册弹窗 UI")
+    t.eq("function", type(captured.show), "应注册 show 回调")
+    ui.reset()
+    services.provide("services.sandbox", saved)
+  end)
+
   it("外部目标按策略处理：allow 放行、deny 拒绝", function(t)
     local hp = require("NeoAI.sandbox.host_proxy")
     local nc = require("NeoAI.sandbox.net_consent")

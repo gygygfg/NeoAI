@@ -462,7 +462,7 @@ tests.suite("sandbox_review", function(_, it)
     services.provide("services.sandbox", saved)
   end)
 
-  it("应用后 reveal_applied 展开「已应用」区使条目可见（不改变默认折叠）", function(t)
+  it("应用后 fold_all 使整个审批窗全部折叠（已应用区回到默认收起）", function(t)
     local services = require("NeoAI.kernel.services")
     local sr = require("NeoAI.ui.components.sandbox_review")
     sr.reset()
@@ -472,7 +472,7 @@ tests.suite("sandbox_review", function(_, it)
       list_traces = function() return {} end,
       list_saved = function()
         return {
-          { change_set_id = "csRA", tool = "edit_file", apply_state = "APPLIED",
+          { change_set_id = "csFA", tool = "edit_file", apply_state = "APPLIED",
             saved_files = { { path = "/root/a.txt" } } },
         }
       end,
@@ -480,9 +480,29 @@ tests.suite("sandbox_review", function(_, it)
       reject = function() end,
     })
     sr.open()
-    t.eq(0, sr.get_foldlevel(), "默认仍整体折叠")
-    sr.reveal_applied()
-    t.eq(2, sr.get_foldlevel(), "reveal 后应展开到条目级（条目头行可见）")
+    local buf = sr.get_buf()
+    local win = vim.fn.bufwinid(buf)
+    t.true_(win ~= -1, "审批 buffer 应在窗口中显示")
+
+    local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+    local title_ln
+    for i, l in ipairs(lines) do
+      if l:find("已应用", 1, true) and l:find("──", 1, true) then title_ln = i end
+    end
+    t.not_nil(title_ln, "应有已应用区标题")
+    local function closed(ln)
+      return vim.api.nvim_win_call(win, function() return vim.fn.foldclosed(ln) end)
+    end
+    -- 模拟用户/既往状态：把折叠级别抬到 2 并手动展开
+    vim.wo[win].foldlevel = 2
+    vim.api.nvim_win_set_cursor(win, { title_ln, 0 })
+    vim.api.nvim_win_call(win, function() vim.cmd("normal! zo") end)
+    t.eq(-1, closed(title_ln), "抬升 foldlevel + zo 后区标题应展开")
+
+    sr.fold_all()
+    t.eq(0, sr.get_foldlevel(), "fold_all 后折叠级别应回到 0（整体收起）")
+    t.eq(title_ln, closed(title_ln), "fold_all 后已应用区标题应处于折叠状态")
+
     sr.close()
     services.provide("services.sandbox", saved)
   end)

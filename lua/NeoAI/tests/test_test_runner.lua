@@ -92,4 +92,44 @@ tests.suite("test_runner", function(_, it)
     t.eq("--headless", captured_cmd[2], "argv 应为 headless nvim")
     t.eq(0, vim.fn.filereadable(captured_script), "回调后应清理脚本")
   end)
+
+  it("隔离运行器：预置脚本注入 SIGTERM 自清处理器", function(t)
+    local script = tests._isolated_script({ "fixture" })
+    t.matches("new_signal", script, "应创建 uv 信号")
+    t.matches("sigterm", script, "应监听 SIGTERM")
+    t.matches("stop_all", script, "SIGTERM 时应自清插件（关闭沙箱/PTY 后代）")
+  end)
+
+  it("进程树清理：_kill_proc_tree 结束 job 及其后代", function(t)
+    if vim.fn.isdirectory("/proc") ~= 1 then return end
+    -- worker(bash) 派生两个子 sleep；kill 前扫描应能发现后代并全部回收
+    local job = vim.fn.jobstart({ "bash", "-c", "sleep 120 & sleep 120" }, { stdout_buffered = true })
+    t.true_(job > 0, "应能启动测试 job")
+    local pid = vim.fn.jobpid(job)
+    tests._track_job(job)
+    vim.wait(700, function() return false end)
+    local desc = tests._descendants(pid)
+    local nd = 0
+    for _ in pairs(desc) do nd = nd + 1 end
+    t.true_(nd >= 2, "应发现 worker 的两个后代 sleep（实际 " .. nd .. "）")
+    tests._kill_proc_tree(job, pid, true)
+    vim.wait(700, function() return false end)
+    t.false_(tests._pid_alive(pid), "worker 应被结束")
+    for dpid in pairs(desc) do
+      t.false_(tests._pid_alive(dpid), "后代 " .. dpid .. " 应被结束")
+    end
+    tests._untrack_job(job)
+  end)
+
+  it("进程树清理：_abort_all 结束所有在跑子进程", function(t)
+    if vim.fn.isdirectory("/proc") ~= 1 then return end
+    local job = vim.fn.jobstart({ "bash", "-c", "sleep 120" }, { stdout_buffered = true })
+    local pid = vim.fn.jobpid(job)
+    tests._track_job(job)
+    vim.wait(300, function() return false end)
+    t.true_(tests._pid_alive(pid), "worker 应已启动")
+    tests._abort_all()
+    vim.wait(600, function() return false end)
+    t.false_(tests._pid_alive(pid), "_abort_all 应结束在跑子进程")
+  end)
 end)

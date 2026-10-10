@@ -320,9 +320,9 @@ is only kept for other `approval.mode` values (`prompt`/`strict`).
     that with `read_all=true` (default) masked dirs are inactive (read-only pass + out-of-bounds trace
     instead), and clearing the list falls back to the defaults (`/home`, `/root`). **The "applied" section is
     collapsed by default** (whole section collapsed via `za`/`zo`, then each item collapsed again);
-    **after a successful apply the section is auto-revealed to entry level** (`reveal_applied`, fold
-    level raised to 2: item headers visible, files still individually folded) so every applied item
-    stays visible after a one-key approve-all instead of looking "gone" because of the default fold;
+    **after any successful apply the whole review window is folded** (`fold_all`: fold level reset to 0
+    and `zM` closes any manually opened folds), so the "applied" section returns to its default collapsed
+    state and does not push away what the user is currently viewing (re-expand with `za`/`zo` any time);
     **a pending item shows its header line with the rest folded** (the header — tool / risk badge /
     file count / `待审` — stays visible and is the whole-unit approval entry; the secret warning, risk
     reasons, git hint and file list start collapsed, `za`/`zo` expands), avoiding a flood from package

@@ -9,6 +9,8 @@
 ---   否则模块为惰性空转，不订阅事件、不产生任何副作用。
 --- - **多会话聚合**：单个 neovim pane 内可能有多个 AI 会话（含子 Agent）。对每个
 ---   agent 独立跟踪，聚合出 pane 级状态：blocked > working > idle。
+--- - **PTY 不参与**：`run_command` 的交互式 PTY 会话等待输入**不影响** pane 生命周期
+---   状态（不由本模块镜像为 blocked/红）；pane 状态始终按 agent 作态显示。
 --- - **并发安全**：所有上报带严格递增的 --seq，令 Herder 忽略同一 source 的旧包。
 --- - **权威接管**：首个非 idle 信号才接管该 pane 的 lifecycle 权威；此后上报含回到
 ---   idle 的后续变化；最后一个 agent 被移除时清除展示元数据并调用 release-agent 释放权威。
@@ -33,7 +35,6 @@ local state = {
   auto_install = true, -- 启动时是否异步自动安装 Herder 展示增强片段（幂等）
   metadata_sent = false, -- 本次权威生命周期内是否已上报过展示元数据
   agents = {}, -- agent_id -> { state, blocked, ask_user_waiting }
-  pty_waiting = {}, -- session_id -> true（pty 会话正在等待用户输入；占位即 pane 级 blocked）
   seq = 0, -- 单调递增信号序号（init/reset 时用挂钟基数 _seq_base() 起始，见下）
   last_reported = nil, -- 上次已上报的 pane 状态；nil = 尚未接管权威
 }
@@ -195,11 +196,10 @@ local function _schedule_auto_install()
 end
 
 --- 聚合所有已跟踪 agent 的 pane 级状态：blocked > working > idle
---- pty 会话等待用户输入（占位即等待）同样视为 pane 级 blocked（渲染为红）。
+--- 注：交互式 PTY 会话等待输入不参与聚合（不镜像为 blocked/红），pane 状态始终按 agent 作态显示。
 --- @return string
 local function _aggregate()
   local blocked, working = false, false
-  for _ in pairs(state.pty_waiting) do blocked = true; break end
   for _, e in pairs(state.agents) do
     if e.blocked > 0 or e.ask_user_waiting then
       blocked = true
@@ -345,19 +345,6 @@ local function _subscribe()
   on(ev.TOOL_APPROVAL_CANCELLED, function(d) _blocked_dec(d and d.agent_id) end)
   on(ev.ASK_USER_WAITING, function(d) _ask_waiting(d and d.agent_id, true) end)
   on(ev.ASK_USER_ANSWERED, function(d) _ask_waiting(d and d.agent_id, false) end)
-  -- pty 会话等待用户输入：pane 级 blocked（渲染为红），直到输入送达或会话结束。
-  on(ev.PTY_WAITING_INPUT, function(d)
-    local id = d and d.id
-    if id then state.pty_waiting[id] = true; _recompute() end
-  end)
-  on(ev.PTY_INPUT_SENT, function(d)
-    local id = d and d.id
-    if id and state.pty_waiting[id] then state.pty_waiting[id] = nil; _recompute() end
-  end)
-  on(ev.PTY_EXITED, function(d)
-    local id = d and d.id
-    if id and state.pty_waiting[id] then state.pty_waiting[id] = nil; _recompute() end
-  end)
 end
 
 -- ========== 公开 API ==========
@@ -509,7 +496,6 @@ function M.reset()
     auto_install = true,
     metadata_sent = false,
     agents = {},
-    pty_waiting = {},
     seq = _seq_base(),
     last_reported = nil,
   }

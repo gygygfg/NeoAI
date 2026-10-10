@@ -1578,13 +1578,18 @@ tests.suite("chat_ui", function(_, it)
     local h2 = find_line("调用工具: read_file")
     local fp = find_line('"file_path"')
     t.true_(h2 > 0 and fp > h2, "应找到仍在执行的 read_file 首行与内容行")
-    local close = fp + 1
-    t.true_(vim.api.nvim_buf_get_lines(opened.buf, close - 1, close, false)[1]:find("}", 1, true) ~= nil,
-      "read_file 参数应在下一行以 } 收尾")
+    -- 新格式下参数按顶层字段逐行展示（不再是多行 JSON 块），参数行即该工具折叠的最后一行。
+    local close = fp
+    t.true_(close > h2, "参数行应位于首行之后")
     t.eq(vim.fn.foldclosed(h2), vim.fn.foldclosed(close),
       "仍在执行的工具折叠边界不应被截断（内容不泄漏到折叠外）")
     for i = h2, close do
       t.eq(h2, vim.fn.foldclosed(i), "折叠内第 " .. i .. " 行应与首行同属一个折叠")
+    end
+    -- 参数行之后的下一行不应仍属于 read_file 折叠（边界正确闭合）
+    local nxt = vim.api.nvim_buf_get_lines(opened.buf, close, close + 1, false)[1]
+    if nxt ~= nil and nxt ~= "" then
+      t.true_(vim.fn.foldclosed(close + 1) ~= h2, "read_file 折叠应在参数行后闭合")
     end
 
     chat_view.reset()
@@ -1627,6 +1632,32 @@ tests.suite("chat_ui", function(_, it)
 
     chat_view.reset()
     chat_service.reset()
+  end)
+
+  it("工具参数结构化展示按字段截断（字段数 >50 省略、值 >50 字符截断）", function(t)
+    local msglist = require("NeoAI.ui.components.message_list")
+    local args_lines = msglist.helpers.tool_arguments_lines
+    local json = require("NeoAI.utils.json")
+
+    -- 60 个顶层字段：只展示前 50 条并追加省略提示
+    local many = {}
+    for i = 1, 60 do many["k" .. i] = i end
+    local lines = args_lines({ name = "x", arguments = json.encode(many) })
+    t.not_nil(lines, "应产生参数展示行")
+    t.eq(51, #lines, "字段过多应只展示前 50 条 + 1 行省略提示")
+    local joined = table.concat(lines, "\n")
+    t.matches('"k%d+":', joined, "应展示 JSON 引号格式的字段名")
+    t.true_(joined:find("其余 10 个参数已省略", 1, true) ~= nil, "应提示省略 10 个参数")
+
+    -- 单字段超长值：截断并加省略号
+    local long = args_lines({ name = "y", arguments = json.encode({ blob = string.rep("a", 200) }) })
+    t.eq(1, #long, "单字段应一行")
+    t.true_(#long[1] < 120, "超长值应被截断（不倾倒 200 字符）")
+    t.matches("…", long[1], "截断应追加省略号")
+
+    -- 含密钥（full）：完整多行美化、不按字段截断
+    local full = args_lines({ name = "z", arguments = json.encode(many) }, { full = true })
+    t.true_(#full > 51, "full 模式应完整多行展示（不截断）")
   end)
 
   it("思考悬浮窗禁用折叠（不被全局 fold 收起内容）", function(t)

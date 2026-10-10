@@ -34,6 +34,11 @@
 - **为什么能安全并行**：分片以「文件」为单位——各测试文件固定监听端口互不重复、文件内固定
   临时路径仅自用，故文件级分片天然无跨进程冲突；每个 worker 是独立 nvim，互不共享注册表/
   沙箱/会话状态；子进程注入独立 `mcp.cache_path`。请勿在上一轮并行尚未结束时重复启动。
+- **worker 生命周期与退出清理**：在跑 worker 登记到运行器进程表；分片超时/中止时按**进程树**
+  清理（先 `jobstop`=SIGTERM，宽限后补 SIGKILL，含脱离 job 进程组的沙箱常驻/PTY 后代）。worker
+  侧注入 SIGTERM 处理器：收到信号即 `plugins.stop_all()` 自清后代再退出（nvim 在 SIGTERM 下不执行
+  `VimLeavePre`）。父 nvim 退出（含交互式 `:NeoAITest` 后 `:qa`）时经 `lifecycle.on_shutdown` 调
+  `_abort_all()` 兜底结束遗留 worker 进程树，避免后台进程残留。
 
 **隔离运行（重要）**：`:NeoAITest` 会在一个**全新 headless 子进程**（`nvim --headless --clean
 -u NONE --cmd "set rtp+=<插件根>"`）中执行，结果经 `SUMMARY passed=.. failed=..`

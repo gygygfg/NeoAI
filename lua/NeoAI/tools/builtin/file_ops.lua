@@ -5,6 +5,7 @@
 --- 不占用 nvim 主线程，避免工具调用时主界面卡住。
 
 local fs = require("NeoAI.utils.fs")
+local lock = require("NeoAI.utils.lock")
 local helpers = require("NeoAI.tools.builtin.tool_helpers")
 local config_store = require("NeoAI.kernel.config_store")
 local stringx = require("NeoAI.utils.stringx")
@@ -304,6 +305,23 @@ end
 --- @return string
 local function _abs_norm(p)
   return fs.canonical(p)
+end
+
+--- 以「同一文件串行化」的方式执行异步写操作。
+--- 工具调用可并行发起（tool_loop），而 `edit_file` 的替换分支为「读→改→写」；同一文件若
+--- 不加锁会并发读到旧内容，导致后写覆盖先写、丢更新（write/append 亦需互斥）。这里以
+--- `edit_file:<规范化路径>` 为 key 复用 `utils.lock` 的**跨进程**文件锁（等待而非失败，
+--- 多 nvim 实例编辑同一文件也互斥），并在 work 完成后必释放（finally，异常亦释放）。
+--- @param filepath string 目标文件（用于派生锁 key）
+--- @param work function 返回 Deferred 的写操作
+--- @return table Deferred 结果
+local function _with_file_lock(filepath, work)
+  local key = "edit_file:" .. _abs_norm(filepath)
+  return lock.acquire_async(key):then_(function(h)
+    return work():finally(function()
+      lock.release(h)
+    end)
+  end)
 end
 
 --- 路径 abs 是否等于 dir 或位于 dir 之下（前缀 + 边界判定，避免 `/a/bc` 误配 `/a/b`）。
@@ -693,14 +711,18 @@ file_tools.edit_file = helpers.define_tool(
     end
 
     if mode == "write" then
-      _pipe(fs.write_file_async(filepath, args.content or ""), function()
+      _pipe(_with_file_lock(filepath, function()
+        return fs.write_file_async(filepath, args.content or "")
+      end), function()
         helpers.reload_buffers_for(filepath)
         on_success(("文件已写入: %s (%d 字节)"):format(filepath, #(args.content or "")))
       end, on_error)
       return
     end
     if mode == "append" then
-      _pipe(fs.append_file_async(filepath, args.content or ""), function()
+      _pipe(_with_file_lock(filepath, function()
+        return fs.append_file_async(filepath, args.content or "")
+      end), function()
         helpers.reload_buffers_for(filepath)
         on_success("已追加到: " .. filepath)
       end, on_error)
@@ -731,46 +753,47 @@ file_tools.edit_file = helpers.define_tool(
       on_error("edits 需要包含有效的 old_text/new_text")
       return
     end
-    fs.read_file_async(filepath)
-      :then_(function()
-        local work = require("NeoAI.utils.work")
-        return work.run(function(payload)
-          local path, edits_blob = payload:match("^(.-)\3(.*)$")
-          if not path then
-            error("编辑负载格式错误")
-          end
-          local f = io.open(path, "rb")
-          if not f then
-            error("无法读取文件: " .. path)
-          end
-          local text = f:read("*a")
-          f:close()
-          for entry in edits_blob:gmatch("[^\2]+") do
-            local old, new = entry:match("^(.-)\1(.*)$")
-            if old and new ~= nil then
-              -- new 作为替换串会被 gsub 解析其中的 % 转义（如 %d/%s 被吞），
-              -- 用函数替换使 new 按字面写入，避免破坏含 % 的内容。
-              local escaped = old:gsub("([%(%)%.%%%+%-%*%?%[%]%^%$])", "%%%1")
-              text = text:gsub(escaped, function()
-                return new
-              end)
+    -- 整条「读→改→写」链在文件锁内执行：并发发起的两处替换会串行化，避免二者
+    -- 都读到旧内容导致后写覆盖先写（丢更新）。锁 key 按规范化路径派生。
+    _pipe(_with_file_lock(filepath, function()
+      return fs.read_file_async(filepath)
+        :then_(function()
+          local work = require("NeoAI.utils.work")
+          return work.run(function(payload)
+            local path, edits_blob = payload:match("^(.-)\3(.*)$")
+            if not path then
+              error("编辑负载格式错误")
             end
-          end
-          local w = io.open(path, "wb")
-          if not w then
-            error("无法写入文件: " .. path)
-          end
-          w:write(text)
-          w:close()
-          return "ok"
-        end, filepath .. "\3" .. table.concat(packed, "\2"))
-      end)
-      :then_(function()
-        helpers.reload_buffers_for(filepath)
-        on_success("文件已编辑: " .. filepath)
-      end, function(e)
-        on_error(e.message or tostring(e))
-      end)
+            local f = io.open(path, "rb")
+            if not f then
+              error("无法读取文件: " .. path)
+            end
+            local text = f:read("*a")
+            f:close()
+            for entry in edits_blob:gmatch("[^\2]+") do
+              local old, new = entry:match("^(.-)\1(.*)$")
+              if old and new ~= nil then
+                -- new 作为替换串会被 gsub 解析其中的 % 转义（如 %d/%s 被吞），
+                -- 用函数替换使 new 按字面写入，避免破坏含 % 的内容。
+                local escaped = old:gsub("([%(%)%.%%%+%-%*%?%[%]%^%$])", "%%%1")
+                text = text:gsub(escaped, function()
+                  return new
+                end)
+              end
+            end
+            local w = io.open(path, "wb")
+            if not w then
+              error("无法写入文件: " .. path)
+            end
+            w:write(text)
+            w:close()
+            return "ok"
+          end, filepath .. "\3" .. table.concat(packed, "\2"))
+        end)
+    end), function()
+      helpers.reload_buffers_for(filepath)
+      on_success("文件已编辑: " .. filepath)
+    end, on_error)
   end,
   { category = "file", approval = { auto_allow = false } }
 )

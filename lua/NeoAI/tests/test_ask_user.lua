@@ -101,6 +101,51 @@ tests.suite("ask_user", function(_, it)
     ask.reset()
   end)
 
+  it("Esc：仅 NORMAL 模式取消提问，INSERT 模式保留原义", function(t)
+    local au = require("NeoAI.ui.components.ask_user")
+    local focus = require("NeoAI.ui.focus")
+    au.reset()
+    focus.reset()
+    focus._set_force_ui(true) -- headless 下模拟 attached UI，使焦点门控生效
+    focus.install()
+    -- 聚焦到 NeoAI 界面 buffer，使提问窗真正弹出（而非暂存等待）
+    local neo = vim.api.nvim_create_buf(false, true)
+    vim.bo[neo].filetype = "neoai_ask_user"
+    vim.api.nvim_set_current_buf(neo)
+    focus.refresh()
+    t.true_(focus.is_focused())
+
+    local cancelled = false
+    au.show({
+      question = "Q?",
+      options = { "A" },
+      on_answer = function() end,
+      on_cancel = function() cancelled = true end,
+    })
+    local buf = au.get_buf()
+    t.not_nil(buf, "聚焦时应弹出提问窗")
+
+    local function esc_cb(mode)
+      for _, m in ipairs(vim.api.nvim_buf_get_keymap(buf, mode)) do
+        if m.lhs == "<Esc>" and type(m.callback) == "function" then return m.callback end
+      end
+      return nil
+    end
+    local cb_n = esc_cb("n")
+    local cb_i = esc_cb("i")
+    t.not_nil(cb_n, "NORMAL 模式应存在 <Esc> 映射")
+    t.nil_(cb_i, "INSERT 模式不应存在 <Esc> 映射（保留退出插入模式原义）")
+
+    -- 触发 NORMAL 的 <Esc> 回调 → 取消并关窗
+    cb_n()
+    t.true_(cancelled, "NORMAL 模式 <Esc> 应触发取消")
+    t.nil_(au.get_buf(), "取消后弹窗应关闭")
+
+    vim.api.nvim_buf_delete(neo, { force = true })
+    au.reset()
+    focus.reset()
+  end)
+
   it("并行第二次提问排队等待，回答后再展示（不失败）", function(t)
     local ask = require("NeoAI.tools.builtin.ask_user")
     local async = require("NeoAI.utils.async")

@@ -61,6 +61,51 @@ tests.suite("lock", function(_, it)
     t.not_nil(h, "with 结束后应已释放")
     lock.release(h)
   end)
+
+  it("acquire_async：空闲时立即 resolve", function(t)
+    local k = key()
+    local h = t.await(lock.acquire_async(k, 1000))
+    t.not_nil(h, "空闲时应立即 resolve 锁句柄")
+    t.nil_(lock.try_acquire(k), "异步已持有期间不应再获取")
+    lock.release(h)
+    local h2 = lock.try_acquire(k)
+    t.not_nil(h2, "释放后应可再获取")
+    lock.release(h2)
+  end)
+
+  it("acquire_async：被同步持有时异步等待，释放后 resolve", function(t)
+    local k = key()
+    local held = lock.try_acquire(k)
+    t.not_nil(held, "应先同步持有")
+    local settled, got, rejected = false, nil, false
+    lock.acquire_async(k, 2000):then_(function(h)
+      got, settled = h, true
+    end, function()
+      rejected, settled = true, true
+    end)
+    -- 尚未释放：不应立即完成
+    vim.wait(60)
+    t.false_(settled, "锁被持有时异步获取不应立刻完成")
+    lock.release(held)
+    t.true_(vim.wait(2000, function() return settled end, 10), "释放后应完成")
+    t.false_(rejected, "应成功而非拒绝")
+    t.not_nil(got, "应获得锁句柄")
+    lock.release(got)
+  end)
+
+  it("acquire_async：已被持有 + 极小超时 → reject(lock_timeout)", function(t)
+    local k = key()
+    local held = lock.try_acquire(k)
+    t.not_nil(held, "应先同步持有")
+    local settled, err = false, nil
+    lock.acquire_async(k, 40, { interval_ms = 5 }):then_(nil, function(e)
+      err, settled = e, true
+    end)
+    t.true_(vim.wait(2000, function() return settled end, 10), "超时应 settle")
+    t.not_nil(err, "超时应有错误对象")
+    t.eq("lock_timeout", type(err) == "table" and err.kind or nil, "错误类型应为 lock_timeout")
+    lock.release(held)
+  end)
 end)
 
 tests.suite("overlay_lock", function(_, it)

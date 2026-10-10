@@ -6,7 +6,7 @@
 ---   风险徽标配色：L0 灰 / L1·L2 黄 / L3 红（仅 L3 用红色危险高亮）。
 --- 审批单位为单个文件：<CR> 仅应用光标所在文件 / d 仅拒绝该文件（其余文件保留待审）。
 --- 「已应用」区默认整体折叠（区标题一级 / 条目头行二级，za/zo 逐级展开），
---- 刷新后重新收起；待审区与越界留痕区不折叠。
+--- 刷新后重新收起；任何应用成功后**整个审批窗全部折叠**（fold_all），待审区与越界留痕区不折叠。
 --- 沙箱广播事件驱动自动刷新（窗口打开期间订阅，关闭时退订）；q 关闭。
 --- 经 kernel.services.use 获取 sandbox 服务，缺失时降级提示。
 
@@ -183,6 +183,7 @@ local state = {
   applying_all = false, -- 一键同意批量应用进行中（防重入；逐项让出主循环）
   unsubs = {}, -- 窗口打开期间的沙箱事件订阅取消函数（关闭时清理）
   refresh_pending = false, -- 已排队一次自动刷新（同一 tick 内的事件合并）
+  unwait = nil, -- services.wait 取消句柄（hub UI 延迟注册）
 }
 
 -- 广播自动刷新订阅的沙箱事件：待审/已应用/越界留痕/主机操作任一变化都会重绘审批窗。
@@ -975,7 +976,7 @@ local function _apply_target(target, ok_msg, fail_msg)
       vim.notify(fail_msg(res), vim.log.levels.ERROR)
     end
     M.refresh()
-    if res and res.ok then M.reveal_applied() end
+    if res and res.ok then M.fold_all() end
   end
   local res = _do_apply_async(target)
   if _is_deferred(res) then
@@ -1061,7 +1062,7 @@ local function _apply_all_workspace()
       end
       _set_review_title("🗂 沙箱待审/已保存")
       M.refresh()
-      if items_n > 0 then M.reveal_applied() end
+      if items_n > 0 then M.fold_all() end
       return
     end
     i = i + 1
@@ -1856,7 +1857,7 @@ local function _confirm_l3()
         vim.log.levels.ERROR)
     end
     M.refresh()
-    if res2 and res2.ok then M.reveal_applied() end
+    if res2 and res2.ok then M.fold_all() end
   end
   if _is_deferred(res) then
     res:then_(function(r)
@@ -2462,17 +2463,21 @@ function M.open_page(page)
 end
 
 --- 注册审批分流中心窗口（ui/init.lua 调用）。
+--- 沙箱服务属 phase 2、UI 属 phase 1：UI 初始化时沙箱尚未就绪，直接 `_sb()` 会得到 nil。
+--- 经 `services.wait` 延迟登记（就绪即回调），保证审批悬浮窗的事件订阅/刷新最终注册。
 function M.setup()
-  local sb = _sb()
-  if not sb then return end
-  sb.set_hub_ui({
-    refresh = function()
-      if state.win_id and vim.api.nvim_win_is_valid(state.win_id) then _schedule_refresh() end
-    end,
-    open_page = function(page)
-      M.open_page(page)
-    end,
-  })
+  if state.unwait then state.unwait() end
+  state.unwait = services.wait("services.sandbox", function(sb)
+    if not sb or not sb.set_hub_ui then return end
+    sb.set_hub_ui({
+      refresh = function()
+        if state.win_id and vim.api.nvim_win_is_valid(state.win_id) then _schedule_refresh() end
+      end,
+      open_page = function(page)
+        M.open_page(page)
+      end,
+    })
+  end)
 end
 
 -- ========== 公开 API ==========
@@ -2718,15 +2723,16 @@ function M.get_line_map()
   return state.line_to_target
 end
 
---- 应用后展开「已应用」区：一次性展示全部已应用条目，使刚应用的条目不再因默认折叠而看似「消失」。
---- 「已应用」区两级折叠：区标题一级 / 条目头行二级，默认 foldlevel=0 整体收起。这里把折叠级别
---- 提升到 **2（条目头行可见、文件仍各自折叠）**，让「一键同意」后多条已应用条目逐条可见；
---- 仅在当前级别 < 2 时提升，不干扰用户已手动展开的层级。
-function M.reveal_applied()
-  if state.win_id and vim.api.nvim_win_is_valid(state.win_id) then
-    local cur = tonumber(vim.wo[state.win_id].foldlevel) or 0
-    if cur < 2 then vim.wo[state.win_id].foldlevel = 2 end
-  end
+--- 应用后折叠整个审批窗：任何应用操作成功后，把折叠级别复位到 0（整体收起）并关闭所有
+--- 手动 za/zo 打开的折叠，使「已应用」区回到默认整体收起，避免自动展开把用户正在查看的
+--- 位置顶走。「已应用」区两级折叠（区标题一级 / 条目头行二级），foldlevel=0 即整区收起；
+--- 用户仍可随时 za/zo 再展开。
+function M.fold_all()
+  if not (state.win_id and vim.api.nvim_win_is_valid(state.win_id)) then return end
+  vim.wo[state.win_id].foldlevel = 0
+  pcall(vim.api.nvim_win_call, state.win_id, function()
+    pcall(vim.cmd, "silent! normal! zM")
+  end)
 end
 
 --- 获取当前审批窗折叠级别（测试用）
@@ -2775,6 +2781,10 @@ function M.reset()
   state.fold_levels = {}
   state.page = "files"
   state.line_to_hub = {}
+  if state.unwait then
+    pcall(state.unwait)
+    state.unwait = nil
+  end
   pcall(function() local sb = _sb(); if sb then sb.reset_approval_hub() end end)
   _close_root_prompt()
   _close_dirs_editor()

@@ -162,6 +162,12 @@ M.execute(agent, name, args, tool_call_id, opts)
 > 模型先看到「预览」结果，再调 `confirm_file_change(action='confirm'/'abandon'/'retry')` 确认。
 > 阻塞式文件 I/O（读大文件/递归搜索/写盘）经 `utils.work` 在线程池执行，不占用主线程。
 >
+> **同一文件的并发修改经文件锁串行化**：`tool_loop` 会并行发起工具调用，而替换分支是「读→改→写」，
+> 并发发起同一文件的多处修改会都读到旧内容，导致后写覆盖先写、丢更新。故写（覆写/追加）与整条
+> 「读→改→写」链都在**跨进程文件锁**（`utils.lock`）内执行：以 `edit_file` 与规范化路径拼接为锁 key，
+> 经 `lock.acquire_async` **非阻塞**（`vim.defer_fn` 轮询，不卡主线程）等待而非失败；多 nvim 实例编辑
+> 同一文件亦互斥。work 完成（含异常）必释放锁（`finally`）。
+>
 > **`read_file` 大文件保护**：未指定 `start_line`/`end_line` 且文件字符数超过阈值（默认
 > `tools.read_file.outline_threshold_chars=500`）时，不返回全文，而先尝试返回该文件的 tree-sitter
 > **语法树节点大纲**（用 `get_string_parser` 从字符串解析，不加载 buffer，仅输出有命名子节点的结构节点，
@@ -267,7 +273,9 @@ M.execute(agent, name, args, tool_call_id, opts)
 
 `ask_user`：暂停生成向用户提问，回答回传为工具结果。发射 `ASK_USER_WAITING`/`ASK_USER_ANSWERED`，
 等待期间暂停可暂停计时器。选项既可以是字符串，也可以是 `{ label, description }`（label 为选项简介，
-description 为选项描述，二者在弹窗中分别展示并高亮）。同一时刻只展示一个提问弹窗，并行发起的
+description 为选项描述，二者在弹窗中分别展示并高亮）。弹窗按键：数字键 `1-9` 直接选择选项，
+`i`/回车进入自由输入；**仅 NORMAL 模式按 `<Esc>` 取消**（INSERT 模式 `<Esc>` 保留退出插入模式的原义，
+避免编辑时误触取消整次提问；需放弃时先 `<Esc>` 回 NORMAL 再按一次）。同一时刻只展示一个提问弹窗，并行发起的
 多次提问按序排队（前一个回答/取消后再展示下一个），不会直接失败。**焦点不在 NeoAI 界面时不立即弹出**：
 暂存待展示配置并进入等待（`ASK_USER_WAITING` 照常发射，Herder 生命周期显示 `blocked`），
 待用户切回 NeoAI 界面（`UI_FOCUS_CHANGED` focused=true）时再弹。同机制同样适用于工具审批

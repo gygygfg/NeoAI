@@ -15,6 +15,7 @@ local state = {
   buf = nil,
   decide = nil,
   has_fake = false,
+  unwait = nil, -- services.wait 取消句柄（延迟注册）
 }
 
 -- ========== 私有函数 ==========
@@ -157,18 +158,27 @@ function M.hide()
   _close()
 end
 
---- 注册到 sandbox.secret_alert
+--- 注册到 sandbox.secret_alert。
+--- 沙箱服务属 phase 2、UI 属 phase 1：UI 初始化时 `services.sandbox` 往往尚未就绪，
+--- 直接 `use` 会拿到 nil 而静默跳过注册。经 `services.wait` 延迟登记（已就绪则立即回调），
+--- 保证弹窗 UI 最终一定注册，避免真密钥告警回退到 nvim 原生 `vim.fn.confirm`。
 function M.init()
-  local sandbox = services.use("services.sandbox")
-  if sandbox and sandbox.set_secret_alert_ui then
-    sandbox.set_secret_alert_ui({ show = M.show, hide = M.hide })
-  end
+  if state.unwait then state.unwait() end
+  state.unwait = services.wait("services.sandbox", function(sandbox)
+    if sandbox and sandbox.set_secret_alert_ui then
+      sandbox.set_secret_alert_ui({ show = M.show, hide = M.hide })
+    end
+  end)
 end
 
 --- 重置（测试用）
 function M.reset()
   _close()
   pcall(function() require("NeoAI.ui.focus").cancel_gate("secret_alert") end)
+  if state.unwait then
+    pcall(state.unwait)
+    state.unwait = nil
+  end
   pcall(function()
     local sandbox = services.use("services.sandbox")
     if sandbox and sandbox.set_secret_alert_ui then sandbox.set_secret_alert_ui(nil) end

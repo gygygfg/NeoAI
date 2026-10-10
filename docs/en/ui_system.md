@@ -227,6 +227,13 @@ strikethrough) are applied per span via lazily created highlight groups (`NeoAIA
 (cursor, erase, window title) are stripped as well. The model-visible result content is unchanged — colors affect
 display only.
 
+**For ordinary tool calls the `参数:` (arguments) block is shown one top-level field per line, each truncated**:
+after dropping the boilerplate `description` field, top-level fields are sorted by name, one line each keeping the
+JSON quoting; when there are more than 50 top-level fields only the first 50 are shown followed by an omission hint,
+and a single field value whose one-line JSON text exceeds 50 code points is truncated with an ellipsis (UTF-8 safe,
+split by code point). This avoids floods from oversized/over-numerous arguments. In the secret-bearing case the block
+is **not** truncated per field — it is still shown in full, multi-line, pretty-printed form.
+
 ### 4.5 Reasoning and Tool Arguments Floating Windows
 
 - **Reasoning process floating window** (`reasoning_panel`): `REASONING_CHUNK` appends streaming content; it closes

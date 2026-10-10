@@ -153,6 +153,8 @@ vim.api.nvim_create_autocmd("User", {
 | `PTY_EXITED` | `pty:exited` | 会话退出 | `{ id, code }` |
 
 > 仅当 `tools.run_command.interactive.enabled` 时触发。检测基于 `/proc` 阻塞读终端状态，非终端文字匹配。
+> 注：Herder 状态服务**不再消费** `PTY_*` 事件——pty 等待输入不影响 pane 生命周期状态（不标红），
+> 这些事件仍由 pty 服务发射，供悬浮终端等其它订阅者使用。
 
 ### 用户提问（ask_user）
 

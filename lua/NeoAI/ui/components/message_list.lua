@@ -8,6 +8,7 @@ local fold = require("NeoAI.ui.components.fold")
 local config_store = require("NeoAI.kernel.config_store")
 local json = require("NeoAI.utils.json")
 local ansi = require("NeoAI.utils.ansi")
+local textmetrics = require("NeoAI.utils.textmetrics")
 local display_modes = require("NeoAI.ui.components.display_modes")
 local incremental = require("NeoAI.ui.components.incremental")
 
@@ -989,6 +990,54 @@ end
 local PRETTY_TRUNC_BYTES = 500
 local PRETTY_BOUNDED_BUDGET = 512
 
+-- 「参数:」结构化展示的按字段截断预算：顶层字段最多展示 ARG_MAX_FIELDS 条（超出追加省略提示），
+-- 每个字段的单行 JSON 值文本超过 ARG_MAX_VALUE_CHARS 个码点则截断加「…」。
+-- 目的是让超长/超多参数不刷屏，同时保留 `"key": value` 的 JSON 引号格式。
+local ARG_MAX_FIELDS = 50
+local ARG_MAX_VALUE_CHARS = 50
+
+--- 按码点截断：超过 max_chars 个码点时截断并追加省略号「…」（UTF-8 安全）。
+--- @param s string
+--- @param max_chars number
+--- @return string
+local function _char_truncate(s, max_chars)
+  if type(s) ~= "string" then s = tostring(s) end
+  local n = textmetrics.strchars(s)
+  if n <= max_chars then return s end
+  return textmetrics.strcharpart(s, 0, max_chars) .. "…"
+end
+
+--- 「参数:」结构化展示（按顶层字段逐行、各自截断）。
+--- 字段按名排序后逐条一行 `  "key": <单行 JSON 值>`；字段数 > ARG_MAX_FIELDS 只展示前 N 条
+--- 并追加「… 其余 M 个参数已省略」；每个字段值的单行 JSON 文本超过 ARG_MAX_VALUE_CHARS 个
+--- 码点则截断加「…」。保持 `"key": value` 的 JSON 引号格式。
+--- @param decoded table 已解析的参数表
+--- @return table 行数组
+local function _arg_lines(decoded)
+  local keys, numeric = {}, {}
+  for k in pairs(decoded) do
+    if type(k) == "string" then keys[#keys + 1] = k else numeric[#numeric + 1] = k end
+  end
+  table.sort(keys)
+  table.sort(numeric, function(a, b) return tostring(a) < tostring(b) end)
+  for _, k in ipairs(numeric) do keys[#keys + 1] = k end
+
+  local total = #keys
+  local limit = math.min(total, ARG_MAX_FIELDS)
+  local out = {}
+  for i = 1, limit do
+    local k = keys[i]
+    local key_text = (type(k) == "string") and json.encode(k) or tostring(k)
+    local val_text = json.encode(decoded[k])
+    if type(val_text) ~= "string" then val_text = tostring(val_text) end
+    out[#out + 1] = "  " .. key_text .. ": " .. _char_truncate(val_text, ARG_MAX_VALUE_CHARS)
+  end
+  if total > limit then
+    out[#out + 1] = ("  … 其余 %d 个参数已省略"):format(total - limit)
+  end
+  return out
+end
+
 --- 展示用美化打印：full=true 全量（含密钥场景需完整展示）；否则有界生成后截断。
 --- @param value any
 --- @param full boolean|nil
@@ -1022,7 +1071,12 @@ local function _tool_arguments_lines(fn, opts)
       if k ~= "description" then filtered[k] = v end
     end
     if not next(filtered) then return nil end
-    return _split_lines(_pretty_for_display(filtered, opts and opts.full))
+    -- 含密钥（full）：完整多行美化、不截断，保证密钥值可见
+    if opts and opts.full then
+      return _split_lines(_pretty_json(filtered))
+    end
+    -- 普通场景：按顶层字段逐行展示，字段数 / 值长度各自截断，避免超长参数刷屏
+    return _arg_lines(filtered)
   end
   return { json.encode(decoded) }
 end

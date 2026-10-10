@@ -179,6 +179,14 @@ approval is allowed by default and a notify is sent.
 > Blocking file I/O (reading large files / recursive search / writing to disk) runs in a thread pool via `utils.work`,
 > without occupying the main thread.
 >
+> **Concurrent edits to the same file are serialized via a file lock**: `tool_loop` fires tool calls in parallel, and
+> the replace branch is "read → modify → write"; concurrent edits to the same file would all read the stale content
+> and the last writer would clobber the others (lost update). So writes (overwrite/append) and the whole
+> "read → modify → write" chain run inside a **cross-process file lock** (`utils.lock`): the key is `edit_file` combined
+> with the canonicalized path, and `lock.acquire_async` waits **non-blockingly** (polled via `vim.defer_fn`, never
+> blocking the main thread) instead of failing; multiple nvim instances editing the same file are mutually exclusive
+> too. The lock is always released (`finally`) once the work finishes (even on error).
+>
 > **`read_file` large-file protection**: when `start_line`/`end_line` is not specified and the file's character count
 > exceeds the threshold (default `tools.read_file.outline_threshold_chars=500`), the full text is not returned;
 > instead, a tree-sitter **syntax tree node outline** of the file is returned (parsed from the string via
@@ -293,7 +301,10 @@ dedicated tools above.
 `ask_user`: pauses generation to ask the user a question; the answer comes back as the tool result. It emits
 `ASK_USER_WAITING`/`ASK_USER_ANSWERED`, and pauses the pausable timer while waiting. Options can be either strings
 or `{ label, description }` (label is a short option summary, description is the option description; the two are
-displayed separately in the popup and highlighted). Only one question popup is shown at a time; multiple questions
+displayed separately in the popup and highlighted). Popup keys: digits `1-9` select an option directly,
+`i`/Enter opens free-text input; **`<Esc>` cancels only in NORMAL mode** (in INSERT mode `<Esc>` keeps its
+original meaning of leaving insert mode, so editing does not accidentally cancel the whole question — to give up,
+press `<Esc>` back to NORMAL and then `<Esc>` again). Only one question popup is shown at a time; multiple questions
 issued in parallel are queued in order (the next is shown after the previous is answered/cancelled), and they do not
 fail outright. **It does not pop up immediately when focus is not on the NeoAI UI**: the config is stashed and it
 waits (`ASK_USER_WAITING` is still emitted, so the Herder lifecycle shows `blocked`), then pops once the user

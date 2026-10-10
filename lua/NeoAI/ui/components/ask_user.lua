@@ -121,11 +121,13 @@ local function _set_keymaps()
       close_win_only()
       _ask_free_text(question)
     end)
-    -- 取消
-    bind(mode, "<Esc>", function()
-      close_then(state.on_cancel, "用户取消")
-    end)
   end
+
+  -- 取消：仅在 NORMAL 模式由 <Esc> 关闭弹窗。INSERT 模式保留 <Esc> 原义（退出插入模式），
+  -- 避免用户在自由输入/编辑时误触 <Esc> 直接取消整次提问；需放弃时先 <Esc> 回 NORMAL 再按一次。
+  bind("n", "<Esc>", function()
+    close_then(state.on_cancel, "用户取消")
+  end)
 end
 
 -- ========== 公开 API ==========

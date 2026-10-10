@@ -40,6 +40,14 @@ local function _register_shutdown_hooks()
       pcall(chat.persist_active_sessions)
     end
   end)
+  -- 测试 worker 兜底：父 nvim（含交互式 :NeoAITest）退出时，结束仍在跑的子进程及其后代。
+  -- 仅在测试模块确已加载时生效（不在生产中加载测试代码）。
+  kernel.lifecycle.on_shutdown(function()
+    local parallel = package.loaded["NeoAI.tests.parallel"]
+    if parallel and parallel._abort_all then pcall(parallel._abort_all) end
+    local t = package.loaded["NeoAI.tests"]
+    if t and t._abort_all then pcall(t._abort_all) end
+  end)
 end
 
 --- 清空并回调等待队列

@@ -293,24 +293,30 @@ tests.suite("herder", function(_, it)
     restore_env(orig)
   end)
 
-  it("pty 会话等待输入触发 blocked，输入送达后回到 working/idle", function(t)
+  it("pty 会话等待输入不影响 pane 状态（不标红）", function(t)
     local orig = reset_herder_env()
     local herder = init_herder()
     local eb = require("NeoAI.kernel.event_bus")
     local ev = require("NeoAI.kernel.events")
 
     emit_created("a1")
-    -- pty 等待用户输入：pane 级 blocked（渲染为红）
+    t.eq("idle", herder.get_state(), "空闲 agent 应为 idle")
+    -- pty 等待用户输入：不应把 pane 变成 blocked（不标红）
     eb.emit(ev.PTY_WAITING_INPUT, { id = "pty1" })
-    t.eq("blocked", herder.get_state(), "pty 等待输入应上报 blocked")
-    -- 输入送达：回到 idle（无其他活动）
-    eb.emit(ev.PTY_INPUT_SENT, { id = "pty1" })
-    t.eq("idle", herder.get_state(), "输入送达后应回到 idle")
-    -- 会话退出也应清除等待态
+    t.eq("idle", herder.get_state(), "pty 等待输入不应改变 pane 状态")
+    -- agent 正在生成时，pty 等待同样不应把它改写为 blocked
+    emit_state("a1", "generating")
+    t.eq("working", herder.get_state(), "generating agent 应为 working")
     eb.emit(ev.PTY_WAITING_INPUT, { id = "pty2" })
-    t.eq("blocked", herder.get_state())
+    t.eq("working", herder.get_state(), "pty 等待输入不应把 working agent 标为 blocked")
+    -- 输入送达 / 会话退出：pane 状态仍按 agent 作态显示
+    eb.emit(ev.PTY_INPUT_SENT, { id = "pty2" })
+    t.eq("working", herder.get_state())
     eb.emit(ev.PTY_EXITED, { id = "pty2" })
-    t.eq("idle", herder.get_state(), "pty 退出后应回到 idle")
+    t.eq("working", herder.get_state(), "pty 退出不应改变 pane 状态")
+    -- agent 回 idle 后 pane 才回 idle
+    emit_state("a1", "idle")
+    t.eq("idle", herder.get_state(), "agent 回 idle 后 pane 应为 idle")
     restore_env(orig)
   end)
 

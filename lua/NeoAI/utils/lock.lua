@@ -5,6 +5,10 @@
 --- 会打印 "workdir is in-use as upperdir/workdir of another mount" 并进入未定义行为（可死锁，
 --- 进而触发硬件看门狗整机复位）。
 ---
+--- 亦用于**串行化同一文件的编辑工具**（`edit_file` 的读-改-写 / 覆写 / 追加）：工具调用并行
+--- 发起时，同一文件若不加锁会并发读到旧内容，导致「后写覆盖先写」丢更新。edit 侧以
+--- `edit_file:<规范化路径>` 为 key 复用本锁，保证同一文件的多次修改串行化（多 nvim 实例亦然）。
+---
 --- 持有者进程崩溃时锁文件会残留，通过记录 PID 并检测其存活来自动清理陈旧锁。
 --- 锁通过文件描述符持有；调用方须在操作结束后 `release()`。
 
@@ -100,9 +104,9 @@ function M.try_acquire(key, depth)
   if depth < 3 then
     local pid, boot, existed = _read_owner(path)
     if existed and not pid then
-      -- 内容尚未写入（写入窗口）：短暂视为占用，稍后重试
-      vim.wait(5)
-      return M.try_acquire(key, depth + 1)
+      -- 内容尚未写入（写入窗口）：视为占用，交由上层轮询重试
+      -- （此处不做同步 vim.wait，避免异步获取路径阻塞主线程）。
+      return nil
     end
     local cur_boot = _boot_id()
     local boot_mismatch = boot ~= nil and cur_boot ~= "" and boot ~= cur_boot
@@ -128,6 +132,41 @@ function M.acquire(key, timeout_ms)
     if _uv().hrtime() / 1e6 > deadline then return nil end
     vim.wait(20)
   end
+end
+
+--- 非阻塞异步获取锁（轮询）。成功 resolve(handle)，超时 reject(错误对象)。
+--- 与 `acquire` 的区别：不使用同步 `vim.wait`，经 `vim.defer_fn` 让出主循环，
+--- 适合在异步工具（如 `edit_file` 的线程池写盘）中等待锁而不卡住 nvim 主线程。
+--- @param key string
+--- @param timeout_ms number|nil 默认 60000
+--- @param opts table|nil { interval_ms?: number } 轮询间隔（默认 20ms）
+--- @return table Deferred 句柄（成功值为锁 handle { fd, path, key }）
+function M.acquire_async(key, timeout_ms, opts)
+  local async = require("NeoAI.utils.async")
+  opts = opts or {}
+  local interval = opts.interval_ms or 20
+  local timeout = timeout_ms or 60000
+  local deadline = _uv().hrtime() / 1e6 + timeout
+  return async.new(function(resolve, reject)
+    local function poll()
+      local h = M.try_acquire(key)
+      if h then
+        resolve(h)
+        return
+      end
+      if _uv().hrtime() / 1e6 > deadline then
+        reject({
+          kind = "lock_timeout",
+          key = key,
+          timeout_ms = timeout,
+          message = ("获取文件锁超时（%d ms）：%s"):format(timeout, tostring(key)),
+        })
+        return
+      end
+      vim.defer_fn(poll, interval)
+    end
+    poll()
+  end)
 end
 
 --- 一次获取多个 key（排序去重后按序获取，避免不同调用方以不同顺序加锁造成死锁）。

@@ -14,6 +14,7 @@ local state = {
   win_id = nil,
   buf = nil,
   decide = nil,
+  unwait = nil, -- services.wait 取消句柄（延迟注册）
 }
 
 -- ========== 私有函数 ==========
@@ -162,18 +163,26 @@ function M.hide()
   _close()
 end
 
---- 注册到 sandbox.net_consent
+--- 注册到 sandbox.net_consent。
+--- 沙箱服务属 phase 2、UI 属 phase 1：UI 初始化时沙箱尚未就绪，直接 `use` 会得到 nil。
+--- 经 `services.wait` 延迟登记（就绪即回调），保证同意弹窗最终注册，与其它审批弹窗一致。
 function M.init()
-  local sandbox = services.use("services.sandbox")
-  if sandbox and sandbox.set_net_consent_ui then
-    sandbox.set_net_consent_ui({ show = M.show, hide = M.hide })
-  end
+  if state.unwait then state.unwait() end
+  state.unwait = services.wait("services.sandbox", function(sandbox)
+    if sandbox and sandbox.set_net_consent_ui then
+      sandbox.set_net_consent_ui({ show = M.show, hide = M.hide })
+    end
+  end)
 end
 
 --- 重置（测试用）
 function M.reset()
   _close()
   pcall(function() require("NeoAI.ui.focus").cancel_gate("net_consent") end)
+  if state.unwait then
+    pcall(state.unwait)
+    state.unwait = nil
+  end
   pcall(function()
     local sandbox = services.use("services.sandbox")
     if sandbox and sandbox.set_net_consent_ui then sandbox.set_net_consent_ui(nil) end

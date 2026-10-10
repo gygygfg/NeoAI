@@ -484,6 +484,21 @@ function M._isolated_script(names, opts)
     "-- NeoAI 隔离测试子进程（自动生成，勿手改）",
     setup,
     "local names = {" .. table.concat(quoted, ", ") .. "}",
+    "-- SIGTERM 兜底：父进程超时/中止（jobstop）时，nvim 在信号下不执行 VimLeavePre，",
+    "-- 需显式自清插件（关闭沙箱常驻/PTY 等后代），否则脱离父进程组的后代被 init 收养而残留。",
+    "do",
+    "  local ok_sig, sig = pcall(vim.uv.new_signal)",
+    "  if ok_sig and sig then",
+    "    pcall(function()",
+    "      sig:start('sigterm', function()",
+    "        pcall(function() require('NeoAI.kernel.plugins').stop_all() end)",
+    "        pcall(function() io.stdout:flush() end)",
+    "        pcall(function() io.stderr:flush() end)",
+    "        os.exit(0)",
+    "      end)",
+    "    end)",
+    "  end",
+    "end",
     'local r = require("NeoAI.tests").run_all(unpack(names))',
     'print(("SUMMARY passed=%d failed=%d"):format(r.passed, r.failed))',
     "for _, e in ipairs(r.errors or {}) do",
@@ -543,6 +558,144 @@ function M._parse_child_output(stdout, stderr, code)
   }
 end
 
+-- ========== 子进程进程树清理（超时/中止/退出兜底） ==========
+-- 为什么要进程树：worker 内起的沙箱常驻 bwrap / PTY 会话经 --new-session/detach 进入独立
+-- 会话，不再是 job 的直系子进程；jobstop 只杀直系进程，脱离父进程组的后代会被 init 收养而
+-- 残留。这里按 /proc 父子关系回溯整棵树并强杀。
+
+local active_jobs = {} -- job_id -> pid（在跑子进程，供超时/退出清理）
+local leave_registered = false -- VimLeavePre 兜底钩子是否已登记
+
+--- pid 是否存活
+--- @param pid number|nil
+--- @return boolean
+function M._pid_alive(pid)
+  if not pid then return false end
+  local ok, res = pcall(vim.uv.kill, pid, 0)
+  return ok and res ~= nil and res ~= false
+end
+
+--- 某 pid 的直接子进程（扫 /proc/<pid>/status 的 PPid 匹配）
+--- @param pid number|nil
+--- @return number[]
+local function _children_of(pid)
+  local out = {}
+  if not pid then return out end
+  local ok, scan = pcall(vim.uv.fs_scandir, "/proc")
+  if not ok or not scan then return out end
+  while true do
+    local name = vim.uv.fs_scandir_next(scan)
+    if not name then break end
+    local cpid = tonumber(name)
+    if cpid then
+      local f = io.open("/proc/" .. cpid .. "/status", "r")
+      if f then
+        local ppid
+        for line in f:lines() do
+          local p = line:match("^PPid:%s*(%d+)")
+          if p then ppid = tonumber(p) break end
+        end
+        f:close()
+        if ppid == pid then out[#out + 1] = cpid end
+      end
+    end
+  end
+  return out
+end
+
+--- 递归收集某 pid 的全部后代（set：pid -> true）
+--- @param pid number|nil
+--- @return table<number, boolean>
+function M._descendants(pid)
+  local res = {}
+  if not pid then return res end
+  local stack = _children_of(pid)
+  while #stack > 0 do
+    local p = table.remove(stack)
+    if p and not res[p] then
+      res[p] = true
+      for _, c in ipairs(_children_of(p)) do stack[#stack + 1] = c end
+    end
+  end
+  return res
+end
+
+--- 结束某 job/pid 的整个进程树。
+--- 顺序：先捕获后代（jobstop 后父子关系可能丢失）→ jobstop（SIGTERM，令 worker 自清）
+--- →（非 immediate）宽限 500ms → 对 pid 与后代补 SIGKILL（回收脱离 job 进程组的后代）。
+--- @param job number
+--- @param pid number|nil
+--- @param immediate boolean|nil 为 true 时跳过宽限立即强杀（VimLeavePre 下定时器不触发）
+function M._kill_proc_tree(job, pid, immediate)
+  local desc = pid and M._descendants(pid) or {}
+  pcall(vim.fn.jobstop, job)
+  local function hard_kill()
+    if M._pid_alive(pid) then pcall(vim.uv.kill, pid, 9) end
+    for dpid in pairs(desc) do
+      if M._pid_alive(dpid) then pcall(vim.uv.kill, dpid, 9) end
+    end
+  end
+  if immediate then
+    hard_kill()
+    return
+  end
+  local timer = vim.uv.new_timer()
+  if not timer then
+    hard_kill()
+    return
+  end
+  timer:start(500, 0, function()
+    timer:stop()
+    timer:close()
+    hard_kill()
+  end)
+end
+
+--- 结束某在跑 job 的进程树（查 registry 拿 pid）
+--- @param job number
+--- @param immediate boolean|nil
+function M._kill_job(job, immediate)
+  M._kill_proc_tree(job, active_jobs[job], immediate)
+end
+
+--- 登记 VimLeavePre 兜底钩子（幂等）：父 nvim 退出时强杀所有在跑子进程树。
+local function _install_leave_hook()
+  if leave_registered then return end
+  leave_registered = true
+  vim.api.nvim_create_autocmd("VimLeavePre", {
+    group = vim.api.nvim_create_augroup("NeoAITestChildLeave", { clear = true }),
+    callback = function()
+      for job in pairs(active_jobs) do
+        pcall(M._kill_proc_tree, job, active_jobs[job], true)
+      end
+    end,
+    desc = "NeoAI: 结束遗留的隔离测试子进程树",
+  })
+end
+
+--- 登记在跑子进程（供超时与退出兜底清理）
+--- @param job number
+function M._track_job(job)
+  if job and job > 0 then
+    active_jobs[job] = vim.fn.jobpid(job)
+    _install_leave_hook()
+  end
+end
+
+--- 注销在跑子进程
+--- @param job number
+function M._untrack_job(job)
+  if job then active_jobs[job] = nil end
+end
+
+--- 结束本模块当前所有在跑子进程树（父端退出兜底；幂等）
+function M._abort_all()
+  for job in pairs(active_jobs) do
+    pcall(M._kill_proc_tree, job, active_jobs[job], true)
+    active_jobs[job] = nil
+  end
+end
+
 --- 测试可注入的子进程执行器：fn(cmd, script_path, opts)；须调用 opts.on_done(result)。
 local test_spawner = nil
 
@@ -560,7 +713,8 @@ local function _default_child_spawn(cmd, script_path, opts)
   local stdout, stderr = {}, {}
   local done = false
   local timer = nil
-  local job = vim.fn.jobstart(cmd, {
+  local job = nil
+  job = vim.fn.jobstart(cmd, {
     stdout_buffered = true,
     stderr_buffered = true,
     on_stdout = function(_, data)
@@ -578,6 +732,7 @@ local function _default_child_spawn(cmd, script_path, opts)
     on_exit = function(_, code)
       if done then return end
       done = true
+      M._untrack_job(job)
       if timer then pcall(function() timer:stop(); timer:close() end) timer = nil end
       local res = M._parse_child_output(table.concat(stdout, "\n"), table.concat(stderr, "\n"), code)
       opts.on_done(res)
@@ -588,17 +743,20 @@ local function _default_child_spawn(cmd, script_path, opts)
     opts.on_done(res)
     return
   end
+  M._track_job(job)
   local timeout_ms = tonumber(opts.timeout_ms) or 900000
   if timeout_ms > 0 then
     timer = vim.uv.new_timer()
     if timer then
       timer:start(timeout_ms, 0, function()
         if done then return end
-        pcall(vim.fn.jobstop, job)
+        -- 超时：结束整个进程树（worker 收 SIGTERM 后自清插件再退出）。
+        M._kill_job(job)
         -- jobstop 触发 on_exit；若未触发则兜底回调
         vim.schedule(function()
           if done then return end
           done = true
+          M._untrack_job(job)
           opts.on_done(M._parse_child_output(table.concat(stdout, "\n"), table.concat(stderr, "\n") .. "\n测试超时", -1))
         end)
       end)

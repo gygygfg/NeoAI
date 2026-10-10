@@ -38,6 +38,13 @@
   file-local temp paths are only self-used, so file-level shards have no cross-process conflict.
   Each worker is its own nvim (no shared registry/sandbox/session state), and workers get an
   injected per-worker `mcp.cache_path`. Do not start a second run before the previous one finishes.
+- **Worker lifecycle & exit cleanup**: running workers register into the runner's process table; on
+  shard timeout/abort the runner cleans the **process tree** (first `jobstop` = SIGTERM, then a SIGKILL
+  after a grace period, including sandbox-resident / PTY descendants that left the job's process group).
+  Each worker injects a SIGTERM handler: on signal it runs `plugins.stop_all()` to self-clean its
+  descendants before exiting (nvim does not run `VimLeavePre` under SIGTERM). When the parent nvim exits
+  (including interactive `:NeoAITest` followed by `:qa`), `lifecycle.on_shutdown` calls `_abort_all()` as a
+  fallback to terminate leftover worker trees, so no background processes are left behind.
 
 **Isolated execution (important)**: `:NeoAITest` runs inside a **fresh headless child
 process** (`nvim --headless --clean -u NONE --cmd "set rtp+=<plugin root>"`) and reports the result

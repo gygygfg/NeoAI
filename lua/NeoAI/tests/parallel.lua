@@ -27,6 +27,38 @@ local SERIAL_PATTERNS = { "^sandbox", "^pty$" }
 -- ========== 私有状态 ==========
 
 local spawner = nil -- 可注入的子进程执行器：fn(req, opts)；测试用
+local active_jobs = {} -- job_id -> pid（在跑 worker，供超时/退出时做进程树清理）
+local leave_registered = false -- VimLeavePre 兜底钩子是否已登记
+
+-- ========== 私有工具函数 ==========
+
+--- 结束某 worker 及其整个进程树（底层委托 tests._kill_proc_tree 复用同一实现）。
+--- @param job number
+--- @param immediate boolean|nil
+local function _kill_tree(job, immediate)
+  local pid = active_jobs[job]
+  active_jobs[job] = nil
+  if tests._kill_proc_tree then
+    tests._kill_proc_tree(job, pid, immediate)
+  else
+    pcall(vim.fn.jobstop, job)
+  end
+end
+
+--- 登记 VimLeavePre 兜底钩子（幂等）：父 nvim 退出时强杀所有在跑 worker 的进程树。
+local function _install_leave_hook()
+  if leave_registered then return end
+  leave_registered = true
+  vim.api.nvim_create_autocmd("VimLeavePre", {
+    group = vim.api.nvim_create_augroup("NeoAITestWorkersLeave", { clear = true }),
+    callback = function()
+      for job in pairs(active_jobs) do
+        pcall(_kill_tree, job, true)
+      end
+    end,
+    desc = "NeoAI: 结束遗留的并行测试 worker 进程树",
+  })
+end
 
 -- ========== 私有工具函数 ==========
 
@@ -171,9 +203,11 @@ local function _default_spawn(req, opts)
   local stdout, stderr = {}, {}
   local done = false
   local timer = nil
+  local job = nil
   local function finish(code)
     if done then return end
     done = true
+    if job then active_jobs[job] = nil end
     if timer then
       pcall(function() timer:stop(); timer:close() end)
       timer = nil
@@ -181,7 +215,7 @@ local function _default_spawn(req, opts)
     pcall(os.remove, script_path)
     opts.on_done(tests._parse_child_output(table.concat(stdout, "\n"), table.concat(stderr, "\n"), code))
   end
-  local job = vim.fn.jobstart(cmd, {
+  job = vim.fn.jobstart(cmd, {
     stdout_buffered = true,
     stderr_buffered = true,
     on_stdout = function(_, data)
@@ -204,13 +238,17 @@ local function _default_spawn(req, opts)
     finish(-1)
     return
   end
+  active_jobs[job] = vim.fn.jobpid(job)
+  _install_leave_hook()
   local timeout_ms = tonumber(opts.timeout_ms) or DEFAULT_TIMEOUT_MS
   if timeout_ms > 0 then
     timer = vim.uv.new_timer()
     if timer then
       timer:start(timeout_ms, 0, function()
         if done then return end
-        pcall(vim.fn.jobstop, job)
+        -- 超时：结束整个进程树（含脱离 job 进程组的沙箱常驻/PTY 后代），
+        -- worker 收到 SIGTERM 后自清插件再退出（见 _isolated_script 注入的 SIGTERM 处理器）。
+        _kill_tree(job)
         vim.schedule(function()
           if done then return end
           stderr[#stderr + 1] = "测试分片超时（>" .. timeout_ms .. "ms）"
@@ -530,6 +568,13 @@ function M.run(opts)
     vim.wait(total_timeout_ms, function() return finished end, 20)
   end
   return agg
+end
+
+--- 结束所有在跑 worker 的进程树（父端退出/中止时兜底；幂等）。
+function M._abort_all()
+  for job in pairs(active_jobs) do
+    pcall(_kill_tree, job, true)
+  end
 end
 
 --- 重置注入状态（测试用）

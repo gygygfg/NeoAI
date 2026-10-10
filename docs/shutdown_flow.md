@@ -84,6 +84,13 @@ ensure_started() -- 阶段 2：tools/sandbox/tool_service/skills/mcp/herder + �
 `release-agent`，令 Herder 立即回退屏幕启发式绘制、不残留 `working`/`blocked` 状态。
 `:restart` 与 `:NeoAIReloadAll` 走同一条卸载路径，因此同样即时释放。
 
+**测试 worker 兜底**：`:NeoAITest`（并行 `parallel.run` 或隔离 `run_isolated`）起的子进程会登记到
+运行器的进程表；父 nvim 退出时经 `lifecycle.on_shutdown` 调用 `parallel._abort_all()` /
+`tests._abort_all()`，结束在跑 worker 及其**整个进程树**（按 `/proc` 父子关系回溯，含脱离 job
+进程组的沙箱常驻 bwrap / PTY 会话后代）。分片超时/中止时运行器同样做进程树清理（先 `jobstop`
+=SIGTERM，宽限后补 SIGKILL）；worker 侧注入 SIGTERM 处理器，收到信号即 `plugins.stop_all()`
+自清后代再退出（nvim 在 SIGTERM 下不执行 `VimLeavePre`，亟需此自清）。
+
 ### 5.2 窗口关闭
 
 `chat_view.close()` → `chat_service.detach_window(win_id)`：

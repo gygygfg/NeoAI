@@ -86,6 +86,14 @@ local function _fmt_pct(x)
   return string.format("%d%%", math.floor(x * 100 + 0.5))
 end
 
+--- 百分比（0..1 -> "82.35%"），保留两位小数
+--- @param x number
+--- @return string
+local function _fmt_pct2(x)
+  x = tonumber(x) or 0
+  return string.format("%.2f%%", x * 100)
+end
+
 --- 转义 statusline 中的 %（lualine 对函数组件返回值不做转义，否则 % 会被当作
 --- statusline 的格式项触发 E539）。只作用于文本段，不影响 lualine 注入的 %#/#/%z 等标记。
 --- @param s string
@@ -126,14 +134,14 @@ local function _build_part(info, part)
     return _fmt_model(info.model)
   elseif part == "usage" then
     if not info.usage then return nil end
-    -- 优先展示最近一次请求的 API 真实用量（当前上下文规模），无则回退累计
-    local p = info.usage.last_prompt or info.usage.prompt
-    local c = info.usage.last_completion or info.usage.completion
+    -- 累计用量：会话内所有请求的输入/输出 token 之和（合计口径，非最近一次）
+    local p = info.usage.prompt or 0
+    local c = info.usage.completion or 0
     return "↑" .. _fmt_tokens(p) .. " ↓" .. _fmt_tokens(c)
   elseif part == "cache" then
     if not info.usage or (not info.usage.requests or info.usage.requests == 0) then return nil end
-    -- 只显示命中率，简洁不堆 token 数
-    return "缓存命中" .. _fmt_pct(info.usage.cache_ratio or 0)
+    -- 只显示累计命中率（保留两位小数），简洁不堆 token 数
+    return "缓存命中" .. _fmt_pct2(info.usage.cache_ratio or 0)
   elseif part == "capacity" then
     if not info.capacity or not info.capacity.total or info.capacity.total <= 0 then return nil end
     if info.capacity.level == "over" then return "上下文超限" end

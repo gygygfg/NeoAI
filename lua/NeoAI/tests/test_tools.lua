@@ -685,6 +685,39 @@ tests.suite("tools", function(_, it)
     t.eq(nil, content:find("n=d s=s", 1, true), "不应出现被吞后的 n=d s=s")
   end)
 
+  it("edit_file 并发修改同一文件不丢更新（文件锁串行化）", function(t)
+    local file_ops = require("NeoAI.tools.builtin.file_ops")
+    local def
+    for _, d in ipairs(file_ops.get_tools()) do
+      if d.name == "edit_file" then def = d end
+    end
+    t.not_nil(def, "应注册 edit_file")
+    local fs = require("NeoAI.utils.fs")
+    local path = vim.fn.tempname() .. ".txt"
+    fs.write_file(path, "AAA\nBBB\nCCC\n")
+    -- 并发发起两处不同替换（等价 tool_loop 并行发起）：无锁时二者都读到旧内容，
+    -- 后写覆盖先写 → 丢一个更新；文件锁会按规范化路径串行化，两处都应落地。
+    local done, errs = 0, {}
+    local function run(old, new)
+      def.func({ file_path = path, description = "并发替换 " .. old, edits = { { old_text = old, new_text = new } } },
+        function()
+          done = done + 1
+        end, function(e)
+          errs[#errs + 1] = tostring(e)
+          done = done + 1
+        end)
+    end
+    run("AAA", "A1")
+    run("BBB", "B1")
+    t.true_(vim.wait(5000, function() return done >= 2 end, 10), "两处编辑应完成")
+    t.eq(0, #errs, "不应有失败: " .. table.concat(errs, "; "))
+    local content = fs.read_file(path) or ""
+    t.matches("A1", content, "第一处替换应生效（未被并发覆盖）")
+    t.matches("B1", content, "第二处替换应生效（未被并发覆盖）")
+    t.eq(nil, content:find("AAA", 1, true), "旧文本 AAA 应已被替换")
+    t.eq(nil, content:find("BBB", 1, true), "旧文本 BBB 应已被替换")
+  end)
+
   it("shell run_command", function(t)
     local tools = require("NeoAI.tools")
     local registry = require("NeoAI.tools.registry")

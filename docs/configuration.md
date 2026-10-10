@@ -135,7 +135,7 @@ context_cache = {
 | `input_box` | `{idle_height=1, min_height=5, max_ratio=0.8}` | 输入框高度（空闲/聚焦/增长上限） |
 | `chat` | `{mousescroll_max_blank=3, incremental=true}` | 鼠标滚轮滚到底时末行下方允许的最大空白行数（0=严格贴底）；`incremental` 开启增量刷新（只重渲染变化的消息块且只写差异行），设为 `false` 降级回整 buffer 全量重写 |
 | `trajectory` | `{log_dir=".../NeoAI/logs"}` | 轨迹显示模式的日志保存目录 |
-| `statusline` | `{enabled=true, winbar=true, parts={mode,model,usage,cache,capacity,sandbox}, separator=" ", colors=...}` | lualine 状态栏；`sandbox` 段在沙箱待审数 > 0 时显示 `待审N`（`N` 为待审**文件**总数，审批单位为单个文件），默认链接醒目高亮组 `NeoAISandboxPending`（黄底加粗，可在 `colors.sandbox` 覆盖）；待审队列含 **L3（高危）** 时该段追加 `⚠危险` 并切换为红色危险高亮组 `NeoAISandboxDanger`（可在 `colors.sandbox_danger` 覆盖）；存在**越界访问留痕**时该段追加 `越界N`（`N` 为去重文件数，两者都有时并列显示，如 `待审2 越界3`） |
+| `statusline` | `{enabled=true, winbar=true, parts={mode,model,usage,cache,capacity,sandbox}, separator=" ", colors=...}` | lualine 状态栏；`sandbox` 段在沙箱待审数 > 0 时显示 `待审N`（`N` 为待审**文件**总数，审批单位为单个文件），默认链接醒目高亮组 `NeoAISandboxPending`（黄底加粗，可在 `colors.sandbox` 覆盖）；待审队列含 **L3（高危）** 时该段追加 `⚠危险` 并切换为红色危险高亮组 `NeoAISandboxDanger`（可在 `colors.sandbox_danger` 覆盖）；存在**越界访问留痕**时该段追加 `越界N`（`N` 为去重文件数，两者都有时并列显示，如 `待审2 越界3`）；`usage` 段显示**会话累计**输入/输出 token（`↑` 输入合计、`↓` 输出合计，不随单次请求跳变），`cache` 段显示**累计**缓存命中率并保留**两位小数**（如 `缓存命中95.32%`） |
 
 > **窄屏浮窗留白（无需配置）**：以「聊天主窗口宽度」为基准，宽度 `< 40` 时浮窗左右占满该窗口、
 > `40 ≤ 宽度 < 100` 时左右各留 5 格、`≥ 100` 时维持按屏幕比例居中。阈值 `40/100` 与留白 `5`
@@ -171,7 +171,7 @@ session = {
 | `read_file` | `{outline_threshold_chars=500, outline_max_nodes=200, outline_max_depth=4, outline_preview_lines=50, max_read_bytes=5242880}` | read_file 大文件保护：未指定行范围且超阈值时返回语法树大纲；无解析器/解析失败时返回文件头尾并把完整文件落盘到沙箱私有 /tmp（路径可回读）；超过 `max_read_bytes` 则拒绝整读并只给预览，避免 OOM。所有回传文本另受 `output_guard` 限流 |
 | `output_guard` | `{enabled=true, max_chars=20000, head_chars=14000, tail_chars=4000, spill=true, spill_dir="neoai-out"}` | 工具输出「AI 上下文限流」：`run_command` + 只读 `git_*` + `read_file` 回传文本超过 `max_chars`（字符数）时，只回传「头 `head_chars` + 截断标记 + 尾 `tail_chars`」，并把完整输出写入沙箱私有 `/tmp/<spill_dir>/`（默认 `/tmp/neoai-out/…`，提示中给出路径，可用 `read_file` 的 `start_line/end_line` 分段回读）。`head_chars+tail_chars` 须 `< max_chars`（否则自动按比例钳制）。`spill=false` 只截断不落盘；未启用沙箱（无 `/tmp` 映射）时自动降级为仅截断。`enabled=false` 一键停止限流（仅保留 `run_command.max_output_bytes` 等硬限）。与 `max_output_bytes`（16 MiB 防冻结硬杀限，保护主线程）职责分离 |
 | `search_files` | `{max_file_bytes=8388608}` | 搜索时单文件扫描上限（字节），超过则跳过；二进制文件（含 NUL）跳过，避免大文件 OOM |
-| `run_command` | `{max_output_bytes=16777216, max_wall_ms=0, interactive={enabled=true, engine="auto", poll_ms=80, show_window="on_wait", show_window_delay_ms=2000, judge={enabled=true, model=nil, max_rounds=12, timeout_ms=120000, output_tail_lines=80}}}` | 命令 stdout/stderr 合计上限（字节）：超出则截断并终止命令，避免超大输出逐行处理冻结主线程；0 = 不限制。`max_wall_ms>0` 为墙钟安全网：命令最长运行该毫秒数（同样约束 `timeout_ms=-1` 的「不限」命令），到时经沙箱资源域真正终止进程树；0 = 不限制。`interactive`（**默认开启**）：`run_command` 以 **PTY** 运行，轮询 `/proc` 检测「进程阻塞读终端 = 等待输入」（OS 级判据，非文字匹配；用 `/proc/<pid>/io` 的 `rchar` 增长区分连续两次读取），每轮等待由**判官**（**单轮大模型请求**：模型返回 `{"action":"text"|"keys"|"kill"|"none",...}` JSON 决策，直接注入文本/按键/结束进程；非子 agent、无工具循环）或用户在悬浮终端手动输入作答；`poll_ms` 轮询间隔，`show_window` 控制悬浮终端弹出时机（always=会话启动即开 / on_wait=命令运行超过 `show_window_delay_ms`（默认 2000ms）仍未结束才开，短命令一闪而过的窗口不打扰 / never=不开；**均要求聊天光标跟随，不跟随时不弹**），`engine="off"` 等价不启用。普通前台命令走**一次性**沙箱路径（常驻命令服务器 stdin 为 /dev/null 无法交互）；但带后台意图（`&`/nohup/setsid）的命令、以及**已有常驻实例在运行时**的后续命令仍走常驻实例，保证后台进程跨调用存活且同命名空间内 `ps`/`kill`/日志可见可管。`enabled=false` 则所有命令都走常驻实例 |
+| `run_command` | `{max_output_bytes=16777216, max_wall_ms=0, interactive={enabled=true, engine="auto", poll_ms=80, show_window="on_wait", show_window_delay_ms=2000, judge={enabled=true, model=nil, max_rounds=12, timeout_ms=120000, output_tail_lines=80}}}` | 命令 stdout/stderr 合计上限（字节）：超出则截断并终止命令，避免超大输出逐行处理冻结主线程；0 = 不限制。`max_wall_ms>0` 为墙钟安全网：命令最长运行该毫秒数（同样约束 `timeout_ms=-1` 的「不限」命令），到时经沙箱资源域真正终止进程树；0 = 不限制。`interactive`（**默认开启**）：`run_command` 以 **PTY** 运行，轮询 `/proc` 检测「进程阻塞读终端 = 等待输入」（OS 级判据，非文字匹配；用 `/proc/<pid>/io` 的 `rchar` 增长区分连续两次读取），每轮等待由**判官**（**单轮大模型请求**：模型返回 `{"action":"text"|"keys"|"kill"|"none",...}` JSON 决策，直接注入文本/按键/结束进程；非子 agent、无工具循环）或用户在悬浮终端手动输入作答；`poll_ms` 轮询间隔，`show_window` 控制悬浮终端弹出时机（always=会话启动即开 / on_wait=命令运行超过 `show_window_delay_ms`（默认 2000ms）仍未结束才开，短命令一闪而过的窗口不打扰 / never=不开；**均要求聊天光标跟随，不跟随时不弹**），`engine="off"` 等价不启用。悬浮终端以**折叠态**（屏幕右上角小窗）打开，焦点进入终端窗时自动展开为全尺寸、移出时回落到折叠态。普通前台命令走**一次性**沙箱路径（常驻命令服务器 stdin 为 /dev/null 无法交互）；但带后台意图（`&`/nohup/setsid）的命令、以及**已有常驻实例在运行时**的后续命令仍走常驻实例，保证后台进程跨调用存活且同命名空间内 `ps`/`kill`/日志可见可管。`enabled=false` 则所有命令都走常驻实例 |
 | `lsp` | `{timeout_ms=10000, attach_timeout_ms=3000}` | LSP 请求超时（服务器无响应快速失败）；`attach_timeout_ms` 为等待客户端附加的超时：后台加载 buffer / 服务器启动或重启期间客户端尚未附加时，`lsp_diagnostics` 等待其就绪再取诊断，而非立即报「无 LSP 客户端」 |
 | `guard.repeat_tool` | `{enabled=true, thresholds={3,5,8}, messages=...}` | 连续重复工具调用提醒 |
 | `todo.enabled` | `true` | 待办工具 + 系统提示注入 |
@@ -657,10 +657,10 @@ herder = {
 - 识别走 Herdr 的**主动上报**通道（`pane report-agent` / `pane report-metadata`）：Herdr 的 agent 身份为
   编译期固定集合，本地检测清单只能**覆盖已有** agent、无法新增。
 - 多会话聚合优先级 `blocked > working > idle`，`--seq` 严格递增防旧包回退。
-- **`blocked` 来源**：工具审批（`TOOL_APPROVAL_REQUESTED`）、`ask_user` 提问等待
-  （`ASK_USER_WAITING`）、以及 **pty 会话等待输入**（`PTY_WAITING_INPUT`：悬浮终端等待用户键入/
-  判官注入期间，pane 生命周期显示为 `blocked`/红），输入送达（`PTY_INPUT_SENT`）或会话结束
-  （`PTY_EXITED`）后回落到 `working`/`idle`。
+- **`blocked` 来源**：工具审批（`TOOL_APPROVAL_REQUESTED`）与 `ask_user` 提问等待
+  （`ASK_USER_WAITING`）。**pty 会话等待输入不参与**（`run_command` 的交互式 PTY 等待输入/判官
+  注入**不**影响 pane 生命周期状态，pane 始终按 agent 作态显示，不因此标红）；`PTY_*` 事件仍由 pty
+  服务发射，仅不再被 Herder 消费。
 - 展示增强片段：`auto_install = true` 时启动即**异步、静默、幂等**写入 `~/.config/herdr/config.toml`
   （已安装跳过、写入前备份、`herdr config check` 失败回滚），无需手动执行。
 - 详见 [README 的 Herder 章节](../README.md) 与 [`integrations/herdr/`](../integrations/herdr/README.md)。

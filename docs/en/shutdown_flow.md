@@ -85,6 +85,14 @@ The exit cleanup triggers `plugins.stop_all()` → each side-effect plugin's `st
 and sends `release-agent`, so Herder immediately falls back to screen heuristics and does not retain this session's
 `working`/`blocked` state. `:restart` and `:NeoAIReloadAll` share the same unload path, so they release just as promptly.
 
+**Test worker fallback**: the child processes spawned by `:NeoAITest` (parallel `parallel.run` or isolated
+`run_isolated`) register into the runner's process table; when the parent nvim exits, `lifecycle.on_shutdown`
+calls `parallel._abort_all()` / `tests._abort_all()` to terminate the running workers and their **entire process
+tree** (walked via `/proc` parent links, including sandbox-resident bwrap / PTY descendants that left the job's
+process group). On shard timeout/abort the runner does the same tree cleanup (first `jobstop` = SIGTERM, then a
+SIGKILL after a grace period); the worker injects a SIGTERM handler that runs `plugins.stop_all()` to self-clean
+its descendants before exiting (nvim does not run `VimLeavePre` under SIGTERM, so this self-clean is required).
+
 ### 5.2 Window Close
 
 `chat_view.close()` → `chat_service.detach_window(win_id)`:
