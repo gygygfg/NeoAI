@@ -26,31 +26,31 @@ Invariants:
 | Module | Responsibility |
 | --- | --- |
 | `sandbox/init.lua` | Control-plane facade: `init/probe/gate/attach/commit/discard/list/show` |
-| `sandbox/control.lua` | IDs/digests, state machine, idempotency keys, leases, fencing tokens |
-| `sandbox/policy.lua` | Rule evaluation/aggregation (`DENY > NEEDS_CONFIRMATION > ALLOW`) and a restricted Lua rule sandbox |
-| `sandbox/runtime.lua` | External backend probe and process prefix (bwrap preferred, unshare fallback) |
-| `sandbox/candidate.lua` | Private staging, candidate freeze, CAS publish |
-| `sandbox/store.lua` | Candidate/receipt persistence (queryable reconciliation) |
-| `sandbox/review.lua` | Async review: change-set queue and review/apply states |
-| `sandbox/observe.lua` | Impact records (fs/process/network, unknown = null) and decision envelope (decision/severity/stats/asks/evidence); merges former `impact`+`envelope` (old files are compat shims) |
-| `sandbox/evidence.lua` | Evidence storage, redaction, paging |
-| `sandbox/grant.lua` | Narrow task grants (scope/operations/budget/ttl/revocation) |
-| `sandbox/writer.lua` | Publish writer: tries non-root first, `NEEDS_ROOT` on permission error, then root/`sudo`(tty) after approval |
-| `sandbox/network.lua` | Controlled network gateway (allowed by default; declared endpoints when enabled) |
-| `sandbox/broker.lua` | External-operation adapter protocol (idempotency/query/compensation capability declarations and reconcile) |
-| `sandbox/replay.lua` | Policy replay (reproduce a decision from the same rules and facts) |
-| `sandbox/cgroup.lua` | cgroup v2 resource domain (memory/PID/CPU), one per attempt |
-| `sandbox/disk.lua` | Sandbox staging disk usage measurement and cap gate (async cached; rejects write/process tools when over) |
-| `sandbox/background.lua` | Background-command detection (`&`/nohup/setsid) for gate promotion to a long-lived service |
-| `sandbox/seccomp.lua` | seccomp capability probe and require_seccomp gate |
-| `sandbox/cache.lua` | Content-addressed cache (isolated writes, prunable) |
-| `sandbox/diag.lua` | Fault injection (backend/freeze/publish/store) and critical-path benchmarks; merges former `fault`+`bench` (old files are compat shims) |
-| `sandbox/tool_spec.lua` | Per-tool effect class and staged path declaration |
-| `sandbox/wrapper.lua` | Enforcement gate: `attach` specs, `gate` all executions |
-| `sandbox/risk.lua` | Security-level assessment (L0-L3), graded approval action, result grading |
-| `sandbox/script_scan.lua` | Static scan of indirect script execution (shell bodies + embedded shell in high-level languages, recursion, opaque detection) |
-| `sandbox/audit.lua` | AI read/call behavior monitoring, risk score and anomaly events |
-| `sandbox/container.lua` | Controlled container runtimes: same namespace as sandbox (podman) or controlled socket (docker) |
+| `sandbox/execution/control.lua` | IDs/digests, state machine, idempotency keys, leases, fencing tokens |
+| `sandbox/review/policy.lua` | Rule evaluation/aggregation (`DENY > NEEDS_CONFIRMATION > ALLOW`) and a restricted Lua rule sandbox |
+| `sandbox/execution/runtime.lua` | External backend probe and process prefix (bwrap preferred, unshare fallback) |
+| `sandbox/execution/candidate.lua` | Private staging, candidate freeze, CAS publish |
+| `sandbox/state/store.lua` | Candidate/receipt persistence (queryable reconciliation) |
+| `sandbox/review/review.lua` | Async review: change-set queue and review/apply states |
+| `sandbox/observe/observe.lua` | Impact records (fs/process/network, unknown = null) and decision envelope (decision/severity/stats/asks/evidence); merges former `impact`+`envelope` (old files are compat shims) |
+| `sandbox/review/evidence.lua` | Evidence storage, redaction, paging |
+| `sandbox/review/grant.lua` | Narrow task grants (scope/operations/budget/ttl/revocation) |
+| `sandbox/execution/writer.lua` | Publish writer: tries non-root first, `NEEDS_ROOT` on permission error, then root/`sudo`(tty) after approval |
+| `sandbox/net/network.lua` | Controlled network gateway (allowed by default; declared endpoints when enabled) |
+| `sandbox/net/broker.lua` | External-operation adapter protocol (idempotency/query/compensation capability declarations and reconcile) |
+| `sandbox/review/replay.lua` | Policy replay (reproduce a decision from the same rules and facts) |
+| `sandbox/execution/cgroup.lua` | cgroup v2 resource domain (memory/PID/CPU), one per attempt |
+| `sandbox/execution/disk.lua` | Sandbox staging disk usage measurement and cap gate (async cached; rejects write/process tools when over) |
+| `sandbox/execution/background.lua` | Background-command detection (`&`/nohup/setsid) for gate promotion to a long-lived service |
+| `sandbox/execution/seccomp.lua` | seccomp capability probe and require_seccomp gate |
+| `sandbox/state/cache.lua` | Content-addressed cache (isolated writes, prunable) |
+| `sandbox/observe/diag.lua` | Fault injection (backend/freeze/publish/store) and critical-path benchmarks; merges former `fault`+`bench` (old files are compat shims) |
+| `sandbox/execution/tool_spec.lua` | Per-tool effect class and staged path declaration |
+| `sandbox/execution/wrapper.lua` | Enforcement gate: `attach` specs, `gate` all executions |
+| `sandbox/review/risk.lua` | Security-level assessment (L0-L3), graded approval action, result grading |
+| `sandbox/observe/script_scan.lua` | Static scan of indirect script execution (shell bodies + embedded shell in high-level languages, recursion, opaque detection) |
+| `sandbox/observe/audit.lua` | AI read/call behavior monitoring, risk score and anomaly events |
+| `sandbox/execution/container.lua` | Controlled container runtimes: same namespace as sandbox (podman) or controlled socket (docker) |
 
 ## 3. Enforcement points (loader + executor)
 
@@ -269,7 +269,7 @@ is only kept for other `approval.mode` values (`prompt`/`strict`).
   - **Wall-clock safety net**: `tools.run_command.max_wall_ms` (default 0 = unlimited) > 0 bounds
     every command (including `timeout_ms=-1` "unlimited" ones); on expiry the resource domain is
     killed, so long tasks cannot occupy resources forever or leave the tool never returning.
-  - **Benchmark**: `require("NeoAI.sandbox.diag").bench_capture({ files = N })` returns
+  - **Benchmark**: `require("NeoAI.sandbox.observe.diag").bench_capture({ files = N })` returns
     materialize cold/warm and capture main-thread timings for regression comparison (resets the
     sandbox; diagnostic only).
 - **Model visibility**: the tool result is returned to the model **unchanged**, with no
@@ -285,7 +285,7 @@ is only kept for other `approval.mode` values (`prompt`/`strict`).
     with the `待审` state label **colored by security level** (L0 gray / L1 yellow / L2 orange / L3 red),
     and shows a **high/medium/low** risk grade (`[L0]低危` …
     `[L2]/[L3]高危`) plus risk reasons (duplicate categories are **merged and counted**, e.g.
-    `SYSTEM_PATH_WRITE×2797`, so package installs do not flood the view per file; `sandbox/risk.lua`
+    `SYSTEM_PATH_WRITE×2797`, so package installs do not flood the view per file; `sandbox/review/risk.lua`
     already dedupes by category at the source). Risk badges are colored **L0 gray / L1·L2 yellow /
     L3 red** — only L3 uses the red danger highlight. Items are **sectioned into "unapplied" and
     "applied"**: pending (unapplied) changes come first, already-published (snapshotted, revertible)
@@ -309,7 +309,7 @@ is only kept for other `approval.mode` values (`prompt`/`strict`).
     host operations; multiple events in the same tick are coalesced into one redraw) — no manual
     refresh. The review window uses **multi-level pages** whose header splits into
     **Files / Tool Behavior / Resource Access / Network Requests / Out-of-bounds·Anomaly**, switched
-    with `h`/`l` (or `←`/`→`), each page counting its items (`sandbox/approval_hub.lua` aggregates all
+    with `h`/`l` (or `←`/`→`), each page counting its items (`sandbox/review/approval_hub.lua` aggregates all
     blocking/observe entries). On the **Resource Access** page, a **directory-settings section** shows
     the workspace allowlist and masked-dir list; press `E` to open a directory editor (`a` add a
     workspace dir → `tools.approval.allowed_directories`, `A` add a masked dir →
@@ -514,7 +514,7 @@ is only kept for other `approval.mode` values (`prompt`/`strict`).
     - **High-risk second confirmation** (`tools.sandbox.review.l3_warning.enabled`, on by default):
       for items with `risk_level=3`, and for **L2 package/sensitive installs** (`package_confirm`,
       on by default; e.g. `apt-key`, `gpg --import`, repo changes), the first `<CR>` does **not**
-      apply directly. Instead the model (`sandbox/l3_warning.lua` via `core/agent/request`) generates
+      apply directly. Instead the model (`sandbox/review/l3_warning.lua` via `core/agent/request`) generates
       a short consequence warning and the item's **diff** opens automatically with the warning shown
       at the top (a placeholder is shown while generating). The confirm window title is level-aware
       (`⚠ L2 high-risk · Confirm apply` / `⚠ L3 critical · Confirm apply`) and the key-hint line is
@@ -527,7 +527,7 @@ is only kept for other `approval.mode` values (`prompt`/`strict`).
     - **AI audit** (`tools.sandbox.review.ai_audit`, on by default, press `a` in the review UI;
       `key` is configurable): builds a **structured text** from the source session's **user
       messages** (excluding runtime-context snapshots and compaction checkpoints) plus the
-      **risk-graded pending changes/modifications** (`sandbox/ai_audit.lua`: change-set id, tool,
+      **risk-graded pending changes/modifications** (`sandbox/observe/ai_audit.lua`: change-set id, tool,
       privilege tier, risk level and reasons, secret/package/command info, per-file diffs) and asks
       the model for **one ≤50-character Chinese risk note per file (or host-op command)**. Each
       note **leads with a safe/unsafe verdict** — it must start with `安全` or `不安全`, followed by
@@ -610,7 +610,7 @@ is only kept for other `approval.mode` values (`prompt`/`strict`).
 
 When a command delegates execution to a script/interpreter, the command string itself hides the
 real operations (`bash deploy.sh`, `python setup.py`, `node x.js`, `./run.sh`, `bash -c '…'`,
-`python -c '…'`). Before execution, `sandbox/script_scan.lua`:
+`python -c '…'`). Before execution, `sandbox/observe/script_scan.lua`:
 
 - detects interpreter invocations and directly-executable scripts (language from the shebang),
   including `source`/`.` references;
@@ -713,7 +713,7 @@ detection) and `risk.classify` (security level), so `pip install`, `sudo modprob
     - These git mutation tools run **inside the sandbox** (`effect=process`, seeing the staged
       worktree); their changes freeze as candidates and dry_run does not touch the real `.git`.
       git **mutation** subcommands inside `run_command` are refused by a guard
-      (`SANDBOX_GIT_MUTATION_VIA_COMMAND`, `sandbox/git_guard.lua`) and must use those dedicated tools.
+      (`SANDBOX_GIT_MUTATION_VIA_COMMAND`, `sandbox/observe/git_guard.lua`) and must use those dedicated tools.
     - **The review window presents the operation as one group**: candidates touching `.git`
       objects/pointers are tagged as an atomic group (`atomic_group="git"` in `review`) and rendered
       as "git operation · N files · atomic group"; the header and every file line map to the **whole
@@ -901,7 +901,7 @@ detection) and `risk.classify` (security level), so `pip install`, `sudo modprob
   (bash reading requests from stdin) inside one persistent mount+pid+net+ipc+uts+cgroup namespace.
   Commands execute inside the server, so `&`/nohup/setsid background processes **survive across tool
   calls and across turns (agentEnd session rotation)** and `ps`/`kill` see them within the session —
-  close to normal bash (`sandbox/resident.lua`).
+  close to normal bash (`sandbox/execution/resident.lua`).
 - **Concurrent execution**: the command server **multiplexes by request id** — each command runs
   independently under `setsid` in the background with output written to its own file, and on
   completion emits a `BEGIN/content/END` block atomically under `flock`; the client demultiplexes by
@@ -1000,8 +1000,8 @@ detection) and `risk.classify` (security level), so `pip install`, `sudo modprob
 - **Invisible to the AI**: `service_start`/`service_logs`/`service_status`/`service_stop` are no longer
   registered as tools. Background processes are carried by the resident instance above; the AI manages
   them with plain shell commands (`ps`/`kill`/redirect logs).
-- **Internal reuse**: `sandbox/service.lua` is kept as an internal capability for the systemctl facade
-  (`sandbox/systemd`) to start/stop unit processes in-sandbox (own overlay + resource domain; changes
+- **Internal reuse**: `sandbox/execution/service.lua` is kept as an internal capability for the systemctl facade
+  (`sandbox/systemd/systemd`) to start/stop unit processes in-sandbox (own overlay + resource domain; changes
   captured as candidates on stop).
 - **Isolation / boundary sync / graceful stop**: as before — own overlay attempt, one-way staging
   materialization at start, capture-and-merge into staging at stop with async review (reusing
@@ -1021,19 +1021,19 @@ namespace (reusing `sandbox.service`'s own overlay + cgroup) and its writes are 
 on stop — the **host systemd is never called and the host is never modified**.
 
 **Architecture (all parsing/implementation in Lua, only a thin entry inside the sandbox)**: all
-parsing and implementation live in `sandbox/systemd.lua`'s `M.exec(argv)` (returning
+parsing and implementation live in `sandbox/systemd/systemd.lua`'s `M.exec(argv)` (returning
 `{stdout, stderr, code}`). Inside the sandbox, `/usr/bin/systemctl`, `/usr/bin/journalctl`,
 `/usr/bin/systemd-run`, `/usr/bin/systemd-analyze`, `hostnamectl`, `timedatectl` and `dmesg` are
 overridden by a **thin entry** generated
 in `runtime._maintscript_stubs` (`--ro-bind` over the real binary paths; no more PATH-prepending
 `/tmp/.dynbin`). The entry is a bash file-IPC client: it writes
 argv (NUL-separated) into the host-bound inbox `/run/systemd/units`, waits for the response, then
-prints stdout/stderr and exits with the real code. On the host, `sandbox/systemd_ipc.lua` scans it via
+prints stdout/stderr and exits with the real code. On the host, `sandbox/systemd/systemd_ipc.lua` scans it via
 fs_event (+ fallback timer) and calls the facade. So **standalone calls and script/pipeline calls run
 the same implementation and behave identically**, and the entry file itself carries no logic or
 sandbox-identifying comments/strings.
 
-- **Interception**: `sandbox/systemd.lua`'s `parse_command` recognizes **standalone calls**
+- **Interception**: `sandbox/systemd/systemd.lua`'s `parse_command` recognizes **standalone calls**
   (skipping `sudo`/`doas`/`env` prefixes). The gate routes standalone calls directly to the facade
   in the `effect="process"` branch via `wrapper._maybe_systemd`, next to `container.plan`. Compound
   commands (`a && systemctl …`), pipelines and calls inside scripts cannot be split by the gate and
@@ -1224,7 +1224,7 @@ sandbox-identifying comments/strings.
 **Background**: the sandbox environment is temporary (containers/eval hosts usually lack a working
 dbus and `systemd --user`; booting a real user instance is flaky and depends on cgroup delegation and
 `/run/systemd`). So `systemctl --user` **no longer starts a real `systemd --user`**; it is handled by
-the facade (`sandbox/systemd.lua`) with a **fake parser** covering only simple
+the facade (`sandbox/systemd/systemd.lua`) with a **fake parser** covering only simple
 `start`/`stop`/`restart`/`is-active`/`status`/`show`/`cat`/`list-units`/`daemon-reload` and
 `enable`/`disable`.
 
@@ -1590,7 +1590,7 @@ defense-in-depth to the bwrap prefix by default (`--cap-drop ALL` plus the tier 
   In both modes dangerous/sensitive subpaths are still masked by `mask_paths` (e.g.
   `/var/lib/docker`, `/var/lib/containerd`; add `/usr/share/doc|man|info` to `mask_paths` to hide the
   software inventory). The same read surface is used by the LSP namespace overlay (see §5).
-- **Tool child processes go through the sandbox (`NeoAI.sandbox.exec`)**: every child process a tool
+- **Tool child processes go through the sandbox (`NeoAI.sandbox.execution.exec`)**: every child process a tool
   spawns internally (the `run_command` shell, `git` operations, `read_image`'s curl download,
   `web_fetch`'s bash/node rendering and dependency install, MCP stdio servers, …) is created inside
   the bwrap namespace rather than on the host. These helper processes do not freeze candidates (they
@@ -1677,7 +1677,7 @@ commands (SSRF, e.g. host admin panels, internal ports, cloud metadata):
 
 - **Mechanism**: sandbox external commands get `HTTP_PROXY`/`HTTPS_PROXY` (HTTP proxy) and
   `ALL_PROXY` (`socks5h://`) pointing at the host-side pure-Lua filtering proxy
-  `sandbox/host_proxy.lua` (listening on a random `127.0.0.1` port; pin it with
+  `sandbox/net/host_proxy.lua` (listening on a random `127.0.0.1` port; pin it with
   `host_local_proxy_port`). The proxy supports **HTTP CONNECT + absolute form + SOCKS5**: targets
   hitting the host-local set (`127/8`, `::1`, host NIC IPs, `169.254/16`, `fe80::/10`,
   `169.254.169.254`) are denied and recorded; other external targets are forwarded bidirectionally
@@ -1693,13 +1693,13 @@ commands (SSRF, e.g. host admin panels, internal ports, cloud metadata):
 - **T0 allows network by default**: `tools.sandbox.privilege.tiers[0].network = true`, so T0 no
   longer passes `--unshare-net`; `offline=true` still hard-isolates (taking precedence over tiers).
 - **Access policy (`network.access`)**: processes/ports created inside the sandbox (loopback +
-  `allow_localhost_ports` + the service-port registry, see `sandbox/net_consent.lua`) are
+  `allow_localhost_ports` + the service-port registry, see `sandbox/net/net_consent.lua`) are
   accessible within the sandbox **without permission**; access to outside the sandbox (other
   host-local ports, host NIC IPs, external hosts) follows `access`: `"ask"` (default) prompts the
   user for consent, `"allow"` allows directly and records (previous behaviour), `"deny"` denies
   directly. The prompt is provided by `ui/components/net_consent.lua` (`<CR>` once / `S` always for
   this session / `Esc` deny); decisions are remembered in a server-side session allowlist in
-  `sandbox/net_consent`. Headless / no UI fails closed (deny). A `sandbox:net_consent_requested`
+  `sandbox/net/net_consent`. Headless / no UI fails closed (deny). A `sandbox:net_consent_requested`
   event is emitted on each request. Long-lived services auto-register internal ports declared via
   `PORT`/`--port` etc. (`net_consent.register_from_command`).
   - **Per "port + service process" granularity** (`network.consent_process_granularity`, on by
@@ -1735,7 +1735,7 @@ commands (SSRF, e.g. host admin panels, internal ports, cloud metadata):
   under a shared netns and is not covered. Hard-interception of raw TCP requires either root +
   iptables/nft (destination-based filtering) or rootless `slirp4netns`/`passt` (native userspace
   network stacks, not installed here) — this plugin does not add those dependencies. So this is a
-  **non-hard boundary**; see the `sandbox/host_proxy.lua` module header.
+  **non-hard boundary**; see the `sandbox/net/host_proxy.lua` module header.
 - **Proxy-evasion confirmation**: explicitly clearing/bypassing the proxy (`unset *proxy`,
   `env -u *proxy`, `curl --noproxy`, `--proxy ""`/`-x ''`, `export *proxy=`) defeats the filter above;
   the gate detects it on the **folded effective command** before entering the sandbox
@@ -1924,13 +1924,13 @@ ports are discoverable), then **never relays real service data** and returns the
 - closed port: `HTTP 502` + `{"open":false,"reason":"port_not_open:…"}`;
 - non-host-local address: `HTTP 403` + `only_host_local_addresses_allowed`.
 
-Implemented as a host-side HTTP proxy (`sandbox/gateway.lua`, pure Lua/vim.uv); `run_command` injects
+Implemented as a host-side HTTP proxy (`sandbox/net/gateway.lua`, pure Lua/vim.uv); `run_command` injects
 `HTTP(S)_PROXY` pointing at the gateway, so proxy-aware tools (`curl`/`wget`/`git`/`nmap --proxies`)
 can probe and receive the reason; raw direct TCP (not via a proxy) cannot reach the host in the
 isolated netns and thus does not work. The `run_command` result is annotated with this command's probe
 summary (open/closed ports + reason) for the AI.
 
-Orchestration (`sandbox/net_gateway.lua`): creates a veth pair and netns, sets the default route to
+Orchestration (`sandbox/net/net_gateway.lua`): creates a veth pair and netns, sets the default route to
 the gateway, and inserts a host-firewall (e.g. ufw) inbound allow rule **scoped to that veth and
 limited to the gateway's destination address and port** (`-i <veth> -d <gw_ip> -p tcp --dport
 <gateway port>`, not a blanket per-interface allow — otherwise the netns could reach arbitrary
@@ -2135,7 +2135,7 @@ then execs bwrap.
 
 ### Content-addressed cache
 
-`sandbox/cache.lua` caches dependencies/artifacts by a content key covering inputs/runtime/rules/facts;
+`sandbox/state/cache.lua` caches dependencies/artifacts by a content key covering inputs/runtime/rules/facts;
 writes are isolated and atomic, with `prune(days)`. Authorization/revocation state cannot be bypassed
 via stale cache.
 
@@ -2143,7 +2143,7 @@ via stale cache.
 
 ### Fault injection
 
-`sandbox/fault.lua` injects controllable faults at key points: `backend` (backend unavailable),
+`sandbox/observe/fault.lua` injects controllable faults at key points: `backend` (backend unavailable),
 `freeze` (candidate freeze failure), `publish` (CAS publish failure), `store` (persistence failure).
 Test/diagnostic only; nothing is injected by default. It verifies:
 - publish failure produces **no partial write** (the real workspace is untouched);
@@ -2152,7 +2152,7 @@ Test/diagnostic only; nothing is injected by default. It verifies:
 
 ### Performance benchmarks
 
-`sandbox/bench.run({ iterations })` measures policy evaluation, digests, attempt issuance and envelope
+`sandbox/observe/bench.run({ iterations })` measures policy evaluation, digests, attempt issuance and envelope
 building, returning `{ iterations, total_ms, per_op_ms }` for performance regression and capacity checks.
 
 ### Revision derivation (file/hunk split)
@@ -2173,7 +2173,7 @@ extensions.
 
 ## 15. Sandbox concealment (conceal, always on)
 
-`sandbox/conceal.lua` reduces the AI's ability to tell, via external commands, that it is inside a
+`sandbox/observe/conceal.lua` reduces the AI's ability to tell, via external commands, that it is inside a
 sandbox. It is **always on, with no config switch**. It only raises the detection bar; it does not
 claim to make the sandbox undetectable. Inherent traces (namespace inodes, capability bits, the
 host's own container info) cannot be erased without breaking isolation.
@@ -2211,7 +2211,7 @@ support). Tests live in the "concealment" cases of `tests/test_sandbox.lua`.
 
 ## 16. Secret guard (secrets, always on)
 
-`sandbox/secret.lua` ensures the AI can neither see nor use real secrets: entropy-based detection,
+`sandbox/secret/secret.lua` ensures the AI can neither see nor use real secrets: entropy-based detection,
 encryption into a random token on the way into the sandbox, decryption only when committing to the
 real workspace. **Encrypted keys (tokens) and sensitive env-var names** are only traced and
 **escalated** in the review floating window (classified as a secret operation — L2 inside the
@@ -2549,8 +2549,8 @@ Sandboxed processes may not use the host's SSH service (ssh-agent / sshd):
 
 By default every external command runs with **least privilege**; when it lacks privilege the
 sandbox **automatically requests an escalation** (recorded, never silent) and tightens review
-per tier. Core modules: `sandbox/privilege.lua` (classify/resolve/record) and
-`sandbox/hostop.lua` (T2 host-effect proposals).
+per tier. Core modules: `sandbox/execution/privilege.lua` (classify/resolve/record) and
+`sandbox/execution/hostop.lua` (T2 host-effect proposals).
 
 ### Tiers
 
@@ -2675,7 +2675,7 @@ otherwise it degrades to a bind-mounted private writable dir. Diagnose via `:Neo
 `runtime.overlay_diagnosis()`.
 
 **All writes staged + privilege-first publish**: command writes always go to the overlay/staging
-(never the real disk). The actual publish (CAS) goes through `sandbox/writer.lua`: it first attempts
+(never the real disk). The actual publish (CAS) goes through `sandbox/execution/writer.lua`: it first attempts
 as the non-root payload (the root process drops via `setpriv`), yielding `writer=nonroot`; on a
 permission error (EACCES/EPERM/EROFS) it returns `NEEDS_ROOT`, and `review.apply` marks
 `apply_state=NEEDS_ROOT` and queues it in `:NeoAISandboxReview` (no auto-escalation). After the user
@@ -2700,7 +2700,7 @@ refuses package installs — never install on the host).
 
 ## 18. Security grading, controlled containers and behavior audit
 
-### 18.1 Approval graded by security level (`sandbox/risk.lua`)
+### 18.1 Approval graded by security level (`sandbox/review/risk.lua`)
 
 Every effectful call is graded L0-L3 and shown in the review UI with a colored `[L0]`-`[L3]`
 badge, recorded as evidence (`kind="risk"`) and emitted as `SANDBOX_RISK_ASSESSED`:
@@ -2787,7 +2787,7 @@ After an external command, `risk.from_result({code,stdout,stderr})` parses resul
 takes the max with the pre-call grade, records evidence and drives auto-escalation detection (§17).
 Read-only process tools record result grading too.
 
-### 18.3 Container facade (`sandbox/container.lua`)
+### 18.3 Container facade (`sandbox/execution/container.lua`)
 
 When the AI invokes a container runtime, it is managed **inside the sandbox and never changes the
 host**. The facade (`container.facade`) intercepts the command in the `effect="process"` branch:
@@ -2836,11 +2836,11 @@ freeze time to avoid whole-unit publish conflicts.
 
 ### 18.6 Full sensitive-info redaction and behavior audit
 
-- **Named sensitive rules** (`sandbox/secret.lua` `rules`/`extra_rules`): beyond entropy, Lua
+- **Named sensitive rules** (`sandbox/secret/secret.lua` `rules`/`extra_rules`): beyond entropy, Lua
   patterns detect private-key blocks, `AKIA…`, `ghp_…`, `sk-…`, `xox…`, JWT, `Bearer`/`Basic`, etc.,
   tokenizing them (losslessly restorable) and recording traces. `secret.redact()` offers destructive
   redaction for logs/evidence and emits `SANDBOX_SENSITIVE_REDACTED`.
-- **Behavior audit** (`sandbox/audit.lua`): records read/call/process/network/secret/privilege/
+- **Behavior audit** (`sandbox/observe/audit.lua`): records read/call/process/network/secret/privilege/
   container/package observations, accumulating a weighted risk score and anomaly count;
   `:NeoAISandboxAudit` shows the summary. High-risk observations emit `SANDBOX_AUDIT_ANOMALY`.
 

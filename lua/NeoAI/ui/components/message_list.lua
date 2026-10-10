@@ -199,7 +199,7 @@ end
 --- @return boolean
 local function _contains_secret(v)
   if v == nil then return false end
-  local ok, secret = pcall(require, "NeoAI.sandbox.secret")
+  local ok, secret = pcall(require, "NeoAI.sandbox.secret.secret")
   if not ok or type(secret) ~= "table" then return false end
   if secret.enabled and not secret.enabled() then return false end
   if secret.contains_token and secret.contains_token(v) then return true end
@@ -216,7 +216,7 @@ end
 local function _secret_info(v)
   local info = { has = false, rules = {} }
   if v == nil then return info end
-  local ok, secret = pcall(require, "NeoAI.sandbox.secret")
+  local ok, secret = pcall(require, "NeoAI.sandbox.secret.secret")
   if not ok or type(secret) ~= "table" then return info end
   if secret.enabled and not secret.enabled() then return info end
   if secret.contains_token and secret.contains_token(v) then info.has = true end
@@ -240,7 +240,7 @@ end
 --- @param p string
 --- @return boolean
 local function _is_secret_path(p)
-  local ok, secret = pcall(require, "NeoAI.sandbox.secret")
+  local ok, secret = pcall(require, "NeoAI.sandbox.secret.secret")
   if ok and secret.is_sensitive_path then return secret.is_sensitive_path(p) end
   return false
 end
@@ -321,7 +321,7 @@ local function _secret_paths(args, tool_name)
   local seen, out = {}, {}
   local function add(p)
     if type(p) ~= "string" then return end
-    p = p:gsub("^%s+", ""):gsub("%s+$", "")
+    p = stringx.trim(p)
     if p == "" or seen[p] or not _is_secret_path(p) then return end
     seen[p] = true
     out[#out + 1] = p
@@ -348,7 +348,7 @@ end
 --- @param values table
 --- @return table
 local function _secret_names(values)
-  local ok, secret = pcall(require, "NeoAI.sandbox.secret")
+  local ok, secret = pcall(require, "NeoAI.sandbox.secret.secret")
   if not ok or type(secret) ~= "table" or not secret.scan_names then return {} end
   local seen, out = {}, {}
   for _, v in ipairs(values or {}) do
@@ -375,7 +375,7 @@ end
 --- @return table|nil { name, command, verb, observed, paths, rules, names }
 local function _secret_warning_data(fn, result_msg, provided)
   if not fn then return nil end
-  local ok, secret = pcall(require, "NeoAI.sandbox.secret")
+  local ok, secret = pcall(require, "NeoAI.sandbox.secret.secret")
   if not ok or type(secret) ~= "table" then return nil end
   if secret.enabled and not secret.enabled() then return nil end
 
@@ -521,7 +521,7 @@ end
 local function _secret_spans(text)
   local out = {}
   if type(text) ~= "string" or text == "" then return out end
-  local ok, secret = pcall(require, "NeoAI.sandbox.secret")
+  local ok, secret = pcall(require, "NeoAI.sandbox.secret.secret")
   if not ok or type(secret) ~= "table" then return out end
   if secret.enabled and not secret.enabled() then return out end
   if secret.detect_named then
@@ -564,7 +564,7 @@ local function _with_secret_spans_bulk(rows, enabled)
   end
   local joined = table.concat(texts, "\n")
   local hits = {}
-  local ok, secret = pcall(require, "NeoAI.sandbox.secret")
+  local ok, secret = pcall(require, "NeoAI.sandbox.secret.secret")
   if ok and type(secret) == "table" and not (secret.enabled and not secret.enabled()) then
     if secret.detect_named then
       local ok2, dh = pcall(secret.detect_named, joined)

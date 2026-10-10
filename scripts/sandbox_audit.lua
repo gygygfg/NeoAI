@@ -9,8 +9,8 @@ local function main()
   require("NeoAI").setup({ log = { level = "ERROR" }, session = { auto_save = false } })
   -- 启动插件与工具（同步等待）：末尾的 conceal 旁路检查需要 read_file 工具已注册。
   pcall(function() require("NeoAI").ensure_started_sync(120000) end)
-  local runtime = require("NeoAI.sandbox.runtime")
-  local store = require("NeoAI.sandbox.store")
+  local runtime = require("NeoAI.sandbox.execution.runtime")
+  local store = require("NeoAI.sandbox.state.store")
   store.init(vim.fn.stdpath("cache") .. "/NeoAI/sandbox")
   local backend = runtime.backend()
   print("BACKEND=" .. tostring(backend))
@@ -166,7 +166,7 @@ python3 /tmp/audit_r3.py 2>&1
 
   print("AUDIT_DONE")
   pcall(function() srv:close() end)
-  pcall(function() require("NeoAI.sandbox.host_proxy").stop() end)
+  pcall(function() require("NeoAI.sandbox.net.host_proxy").stop() end)
 end
 
 main()

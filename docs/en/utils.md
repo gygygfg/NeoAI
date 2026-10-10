@@ -177,7 +177,7 @@ log = {
   worker thread (the thread has a fresh Lua state and cannot `require` this module).
 
 > Purpose: move sandbox candidate base/after hash computation off the main thread
-> (`sandbox/candidate` computes them in a `utils.work` thread). `bit` is available in LuaJIT
+> (`sandbox/execution/candidate` computes them in a `utils.work` thread). `bit` is available in LuaJIT
 > worker threads, so `vim.fn` is not needed. Consistency is cross-checked by `test_sha256`
 > against `vim.fn.sha256`.
 
