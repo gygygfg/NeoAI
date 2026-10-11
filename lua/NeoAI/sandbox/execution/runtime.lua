@@ -547,6 +547,49 @@ end
 -- `-s` 指向；文件名无沙箱特征（见 conceal）。
 local MAVEN_SETTINGS_GUEST = "/tmp/.mvn-settings.xml"
 
+-- 容器运行时（podman）配置在沙箱内的挂载点：置于会话私有 /tmp（始终可写），以
+-- `CONTAINERS_CONF` 指向。内容关闭 AppArmor profile 装配并使用 cgroupfs（沙箱内无
+-- AppArmor/systemd 会话总线）。文件名无沙箱特征（见 conceal）。
+local CONTAINERS_CONF_GUEST = "/tmp/.containers.conf"
+-- 容器存储配置在沙箱内的挂载点：以 `CONTAINERS_STORAGE_CONF` 指向。graphroot/runroot 落在
+-- 会话私有 /tmp（跨命令/跨轮次持久，会话结束即销毁），避免写入被遮蔽的 /var/lib/containers
+-- 且在多次工具调用间保持已加载/已构建的镜像。
+local CONTAINERS_STORAGE_CONF_GUEST = "/tmp/.storage.conf"
+
+--- 生成 podman containers.conf（宿主私有文件）：关闭 AppArmor、使用 cgroupfs。
+--- 缓存；无法写入时返回 nil（调用方跳过注入，容器运行时退回默认配置，通常会在
+--- AppArmor/cgroup 装配处失败——真实原因只进用户 UI/审计）。
+--- @return string|nil 宿主路径
+local function _containers_conf()
+  local cached = state.containers_conf
+  if cached and vim.uv.fs_stat(cached) then return cached end
+  local p = _private_dir() .. "/containers.conf"
+  local f = io.open(p, "w")
+  if not f then return nil end
+  f:write('[containers]\napparmor_profile = "unconfined"\n\n[engine]\ncgroup_manager = "cgroupfs"\n')
+  f:close()
+  pcall(vim.uv.fs_chmod, p, 420) -- 0644：非 root 载荷需可读
+  state.containers_conf = p
+  return p
+end
+
+--- 生成 podman storage.conf（宿主私有文件）：vfs 驱动，graphroot/runroot 落在会话私有 /tmp。
+--- 缓存；无法写入时返回 nil。
+--- @return string|nil 宿主路径
+local function _containers_storage_conf()
+  local cached = state.containers_storage_conf
+  if cached and vim.uv.fs_stat(cached) then return cached end
+  local p = _private_dir() .. "/storage.conf"
+  local f = io.open(p, "w")
+  if not f then return nil end
+  f:write("[storage]\ndriver = \"vfs\"\n"
+    .. "graphroot = \"/tmp/.podman/storage\"\nrunroot = \"/tmp/.podman/run\"\n")
+  f:close()
+  pcall(vim.uv.fs_chmod, p, 420) -- 0644：非 root 载荷需可读
+  state.containers_storage_conf = p
+  return p
+end
+
 -- systemctl/journalctl 入口（极薄客户端）：把 argv 经文件 IPC 转发给宿主 Lua 门面
 -- （`NeoAI.sandbox.systemd.systemd.exec`，见 systemd_ipc），按真实 stdout/stderr/退出码返回。
 -- 全部解析与实现都在 Lua，入口不含任何逻辑，也不携带可识别沙箱的注释/字样。
@@ -632,12 +675,25 @@ local function _container_stubs()
     return true
   end
   if podman then
-    if not write("docker", "#!/bin/sh\nexec " .. podman .. " \"$@\"\n") then return nil end
-    write("nerdctl", "#!/bin/sh\nexec " .. podman .. " \"$@\"\n")
+    -- docker/nerdctl 入口桩：转发到 podman。对 run/create 子命令补充与沙箱共享命名空间的标志
+    -- （与门面 container.plan 一致），使**复合/脚本命令**中的容器调用（如 `cd x && docker run`）
+    -- 也能复用沙箱 net/pid/ipc/uts，而非只依赖门面对命令首个 token 的改写。若标志已存在则
+    -- 直接透传，避免与门面改写重复注入。
+    local share = "--net=host --pid=host --ipc=host --uts=host"
+    local body = "#!/bin/sh\n"
+      .. "real=" .. podman .. "\n"
+      .. "if [ \"$1\" = run ] || [ \"$1\" = create ]; then\n"
+      .. "  for a in \"$@\"; do [ \"$a\" = --net=host ] && exec \"$real\" \"$@\"; done\n"
+      .. "  sub=\"$1\"; shift\n"
+      .. "  exec \"$real\" \"$sub\" " .. share .. " \"$@\"\n"
+      .. "fi\n"
+      .. "exec \"$real\" \"$@\"\n"
+    if not write("docker", body) then return nil end
+    write("nerdctl", body)
     if compose then
-      local body = "#!/bin/sh\nexec " .. compose .. " \"$@\"\n"
-      write("docker-compose", body)
-      write("podman-compose", body)
+      local cbody = "#!/bin/sh\nexec " .. compose .. " \"$@\"\n"
+      write("docker-compose", cbody)
+      write("podman-compose", cbody)
     end
     state.container_stubs = { dir = dir, podman = podman, compose = compose, disabled = false }
     return state.container_stubs
@@ -1900,6 +1956,13 @@ function M.sandbox_env(privileges)
     and privileges.apt_sandbox_user ~= "" and _apt_conf(privileges.apt_sandbox_user) then
     env.APT_CONFIG = APT_CONF_GUEST
   end
+  -- 容器运行时：CONTAINERS_CONF / CONTAINERS_STORAGE_CONF 指向只读绑定的配置（关闭 AppArmor
+  -- 装配、cgroupfs，存储落会话私有 /tmp，见 _containers_conf / process_prefix 的绑定）。
+  -- 仅容器命令注入。
+  if privileges and privileges.containers_conf then
+    if _containers_conf() then env.CONTAINERS_CONF = CONTAINERS_CONF_GUEST end
+    if _containers_storage_conf() then env.CONTAINERS_STORAGE_CONF = CONTAINERS_STORAGE_CONF_GUEST end
+  end
   return env
 end
 
@@ -2835,6 +2898,19 @@ function M.process_prefix(opts)
         table.insert(argv, "--ro-bind"); table.insert(argv, ap); table.insert(argv, APT_CONF_GUEST)
       end
     end
+    -- 容器运行时 containers.conf / storage.conf：只读绑定到会话私有 /tmp，并以
+    -- CONTAINERS_CONF / CONTAINERS_STORAGE_CONF 指向（见 sandbox_env）。关闭 AppArmor 装配、
+    -- 使用 cgroupfs；存储落会话私有 /tmp（跨命令持久、会话结束销毁）。
+    if priv and priv.containers_conf then
+      local cc = _containers_conf()
+      if cc then
+        table.insert(argv, "--ro-bind"); table.insert(argv, cc); table.insert(argv, CONTAINERS_CONF_GUEST)
+      end
+      local sc = _containers_storage_conf()
+      if sc then
+        table.insert(argv, "--ro-bind"); table.insert(argv, sc); table.insert(argv, CONTAINERS_STORAGE_CONF_GUEST)
+      end
+    end
     -- systemd 门面入口：把极薄入口（systemctl/journalctl）只读绑定**覆盖真实二进制路径**，
     -- 对所有进程命令生效（独立调用仍由门面优先拦截；脚本/管道调用经入口转发到同一 Lua 门面）。
     -- 同时绑定宿主 IPC 目录与 /run/systemd/private 占位 socket，使外观与真实 systemd 一致。
@@ -2965,7 +3041,9 @@ function M.process_prefix(opts)
     -- seccomp 基线：bwrap 在载荷 exec 前装载过滤器（须在 `--` 之前，作为 bwrap 选项）。
     local seccomp = require("NeoAI.sandbox.execution.seccomp")
     local filter
-    if seccomp.enabled() then
+    -- 容器命令（`priv.seccomp == false`）跳过基线：podman/runc 需 unshare/clone(CLONE_NEW*)/
+    -- mount 创建并进入容器命名空间，基线会拦截。其余命令照常施加。
+    if seccomp.enabled() and not (priv and priv.seccomp == false) then
       local f, ferr = seccomp.ensure_filter()
       if not f then
         return nil, ferr or "SANDBOX_SECCOMP_UNAVAILABLE"

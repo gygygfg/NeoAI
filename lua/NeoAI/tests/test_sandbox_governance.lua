@@ -240,7 +240,9 @@ tests.suite("sandbox_governance", function(_, it)
     if st.disabled then
       t.matches("Cannot connect to the Docker daemon", body, "无 podman 时应为禁用桩")
     else
-      t.matches("exec .*podman", body, "有 podman 时 docker 应链接到 podman")
+      t.matches(st.podman, body, "有 podman 时 docker 应链接到 podman")
+      t.matches("--net=host", body, "run/create 应补充命名空间共享标志（复合命令也生效）")
+      t.matches("exec", body, "应 exec 真实 podman")
     end
     t.true_(vim.uv.fs_stat(st.dir .. "/docker") ~= nil, "入口桩文件应存在")
   end)

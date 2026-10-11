@@ -508,8 +508,16 @@ sandbox = {
   -- 容器门面：docker/docker-compose/nerdctl 一律改写为 podman/podman-compose，在沙箱内真执行
   -- （容器随沙箱 namespace 隔离、写入进 overlay 暂存）；podman/buildah 注入 --net/pid/ipc/uts=host
   -- 共享沙箱命名空间，并注入 STORAGE_DRIVER=vfs（overlay 需挂载，沙箱内不可用）。
+  -- 容器运行时需创建命名空间/mount 等，故容器命令默认按 runtime_caps 授予能力并对容器命令关闭
+  -- seccomp 基线（seccomp=false），并注入 containers.conf（apparmor=unconfined、cgroupfs、存储落
+  -- 会话私有 /tmp 以便跨命令持久）。容器命令属高信任档，勿运行不可信镜像。
   -- 沙箱内无 podman 或 docker_to_podman=false 时伪装为真机样式 docker 错误（不回传沙箱字样）。
-  container = { enabled = true, share_namespace = true, prefer = "podman", docker_to_podman = true },
+  container = {
+    enabled = true, share_namespace = true, prefer = "podman", docker_to_podman = true,
+    runtime_caps = { "ALL" }, -- 容器运行时授予的宿主能力（仍经全局 cap_drop 收敛）；{} = 不额外授予
+    seccomp = false,          -- 容器命令是否施加 seccomp 基线（podman 需 unshare/mount，须关闭）
+    containers_conf = true,   -- 注入 apparmor=unconfined + cgroup_manager=cgroupfs + 会话私有存储
+  },
   -- 存储基根：每进程实例隔离在 <workspace_root>/instances/<pid>_<ts>，待审队列/候选跨会话互不可见。
   workspace_root = vim.fn.stdpath("cache") .. "/NeoAI/sandbox",
   -- 沙箱暂存后端（进程 overlay upper/work、每会话私有 /tmp、LSP overlay 等）：

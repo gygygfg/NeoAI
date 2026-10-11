@@ -566,9 +566,19 @@ sandbox = {
   -- Container facade: docker/docker-compose/nerdctl are always rewritten to podman/podman-compose and
   -- really executed inside the sandbox (containers follow the sandbox namespaces; writes go to the
   -- overlay). podman/buildah get --net/pid/ipc/uts=host to share the sandbox namespaces and
-  -- STORAGE_DRIVER=vfs (overlay needs a mount, unavailable inside the sandbox). With no podman or
-  -- docker_to_podman=false, docker commands are disguised as authentic docker errors (no sandbox wording).
-  container = { enabled = true, share_namespace = true, prefer = "podman", docker_to_podman = true },
+  -- STORAGE_DRIVER=vfs (overlay needs a mount, unavailable inside the sandbox). Container runtimes
+  -- must create namespaces/mounts, so container commands are granted runtime_caps and have the seccomp
+  -- baseline disabled (seccomp=false) by default, and a containers.conf is injected
+  -- (apparmor=unconfined, cgroupfs, storage under the session-private /tmp so it persists across
+  -- runs). Container commands are a high-trust profile — do not run untrusted images.
+  -- With no podman or docker_to_podman=false, docker commands are disguised as authentic docker errors
+  -- (no sandbox wording).
+  container = {
+    enabled = true, share_namespace = true, prefer = "podman", docker_to_podman = true,
+    runtime_caps = { "ALL" }, -- host caps granted to container runtimes (still trimmed by global cap_drop); {} = none
+    seccomp = false,          -- apply the seccomp baseline to container commands (podman needs unshare/mount, so off)
+    containers_conf = true,   -- inject apparmor=unconfined + cgroup_manager=cgroupfs + session-private storage
+  },
   -- Store base root: each process is isolated under <workspace_root>/instances/<pid>_<ts>; pending queue/candidates are not shared across sessions.
   workspace_root = vim.fn.stdpath("cache") .. "/NeoAI/sandbox",
   -- Sandbox staging backend (process overlay upper/work, per-session private /tmp, LSP overlay, ...):

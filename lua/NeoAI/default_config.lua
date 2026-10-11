@@ -1226,6 +1226,20 @@ local DEFAULT_CONFIG = {
         -- docker/docker-compose/nerdctl 在沙箱内改写为 podman/podman-compose（无守护进程，
         -- 容器受沙箱约束）；设为 false 则 docker 命令伪装为真机样式错误（不连接宿主 daemon）。
         docker_to_podman = true,
+        -- 容器运行时（rootful podman/runc）在沙箱内创建容器所需的宿主能力：创建 mount/pid/net
+        -- 命名空间、mount/pivot_root 组装 rootfs、mknod 设备节点、chown 镜像层等。默认 `ALL`
+        -- （仍经全局 `cap_drop` 收敛掉改宿主路由/时钟/内核模块等宿主全局能力）。
+        -- 因此容器命令属于**高信任档**：写入仍全部进 overlay 暂存、敏感路径仍遮蔽，但请勿在
+        -- 沙箱内运行不可信镜像。`{}` 表示不额外授予（此时容器运行时通常无法创建容器）。
+        runtime_caps = { "ALL" },
+        -- 容器命令是否施加 seccomp 基线。podman/runc 需要 `unshare`/`clone(CLONE_NEW*)`/`mount`
+        -- 以创建并进入容器命名空间，基线会拦截（表现为 `cannot re-exec process`），故默认对
+        -- **容器命令**关闭基线；其余命令仍照常施加基线（`tools.sandbox.seccomp.enabled`）。
+        seccomp = false,
+        -- 为容器命令注入 containers.conf（`apparmor_profile = "unconfined"`、
+        -- `cgroup_manager = "cgroupfs"`）：沙箱内无 AppArmor/systemd 会话总线，podman 装配
+        -- AppArmor profile / 连接 systemd cgroup 会失败（`wait for AppArmor command`）。
+        containers_conf = true,
       },
       -- 存储基根。每进程实例隔离在 workspace_root/instances/<pid>_<启动时间>，
       -- 待审队列/候选/回执/证据不跨 nvim 会话共享（多个会话互不可见对方的审批）。

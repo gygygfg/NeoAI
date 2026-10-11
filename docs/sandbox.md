@@ -54,7 +54,7 @@
 | `sandbox/review/risk.lua` | 安全级别评估（L0-L3）、审批分级动作与结果分级 |
 | `sandbox/observe/script_scan.lua` | 脚本间接执行静态扫描（Shell 正文 + 高级语言内嵌 shell、递归、不透明判定） |
 | `sandbox/observe/audit.lua` | AI 读取/调用行为监视、风险分与异常事件 |
-| `sandbox/execution/container.lua` | 容器运行时受控：与沙箱同 namespace（podman）或受控 socket（docker） |
+| `sandbox/execution/container.lua` | 容器运行时受控：与沙箱同 namespace（podman），docker/nerdctl 改写为 podman |
 
 ### 2.1 命名空间文件桥（进程内工具 I/O）
 
@@ -2249,13 +2249,23 @@ UI 未注册但为**交互式 Neovim** 时，回退到内建 `confirm` **暂停�
   无法被命名空间约束，挂载路径改写也不是安全边界，故**永不连接宿主 daemon**——一律改写为
   `podman` / `podman-compose`（无守护进程，容器是沙箱内 CLI 的子进程，随沙箱命名空间隔离）。
   **入口桩（文件链接）**：`process_prefix` 把 `docker`/`docker-compose`/`nerdctl` 入口桩
-  （`#!/bin/sh; exec <podman> "$@"`）**只读绑定覆盖真实二进制路径**（`/usr/local/bin`、
-  `/usr/bin`、`/bin`），使**脚本/管道/复合命令中的容器调用**（如 `echo x; docker ps`）也一律走
-  podman，而非仅靠命令首个 token 改写；`which docker` 命中入口桩。
+  （`#!/bin/sh; exec <podman> "$@"`，并对 `run`/`create` 补齐共享命名空间标志）**只读绑定覆盖
+  真实二进制路径**（`/usr/local/bin`、`/usr/bin`、`/bin`），使**脚本/管道/复合命令中的容器调用**
+  （如 `echo x; docker ps`）也一律走 podman，而非仅靠命令首个 token 改写；`which docker` 命中入口桩。
 - `podman` / `buildah`：注入 `--net/pid/ipc/uts=host` 共享沙箱命名空间；容器写入落 overlay 暂存、
   冻结为候选，用户审批后由既有候选发布管线应用回真实盘（**无需单独的“替换回来”机制**）。
-  沙箱内 overlay graph driver 需挂载（被 seccomp 拦截），故为容器命令注入 `STORAGE_DRIVER=vfs`
-  （容器层落在暂存 overlay 内，写入仍进候选）。
+  容器运行时需创建 mount/pid/net 命名空间、`mount`/`pivot_root` 组装 rootfs、`mknod` 设备节点、
+  `chown` 镜像层，故对**容器命令**：按 `tools.sandbox.container.runtime_caps`（默认 `ALL`，仍经全局
+  `cap_drop` 收敛宿主全局能力）授予能力、关闭 seccomp 基线（`container.seccomp=false`；否则
+  `unshare`/`clone(CLONE_NEW*)`/`mount` 被拦截，表现为 `cannot re-exec process`），并注入
+  `STORAGE_DRIVER=vfs`（沙箱内 overlay graph driver 需挂载）。同时注入 `containers.conf`
+  （`apparmor_profile="unconfined"`、`cgroup_manager="cgroupfs"`）与 `storage.conf`
+  （`graphroot`/`runroot` 落**会话私有 `/tmp`**，跨命令/跨轮次持久、会话结束销毁），使无
+  AppArmor/systemd 会话总线的沙箱内 podman 可正常装配与保留镜像。**容器命令属高信任档**：写入仍
+  全部进 overlay 暂存、敏感路径仍遮蔽，但请勿在沙箱内运行不可信镜像。
+- **入口桩**对 `run`/`create` 子命令补充 `--net/pid/ipc/uts=host`（幂等，已存在则透传），使
+  **复合/脚本命令**中的容器调用（如 `cd x && docker run`）也能复用沙箱命名空间，而非只依赖门面对
+  命令首个 token 的改写。
 - **环境无 podman 时禁用容器内操作**：改为绑定**禁用桩**（`docker`/`nerdctl`/`docker-compose` 一律
   报真机样式错误 `Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker
   daemon running?` 并 `exit 1`），复合命令中的容器调用同样被禁用；真实原因只进用户 UI / 审计 /
@@ -2427,13 +2437,14 @@ AI 调用容器运行时（docker/podman 等）时，**在沙箱内管理、容�
 - **远程/连接型选项**（`--remote`/`-r`/`-H`/`--host`/`--connection`/`--url`）与**宿主 VM 子命令**
   （`podman machine`）拒绝（`CONTAINER_REMOTE_UNSUPPORTED` / `CONTAINER_SUBCOMMAND_UNSUPPORTED`），
   同样以真机样式文本呈现。
-- 门面只识别**独立调用**（可跳过 `sudo`/`env` 等前缀）；复合命令中的容器调用不拦截（但也只跑
-  沙箱内的真实二进制，连不到宿主 daemon）。
+- 门面只识别**独立调用**（可跳过 `sudo`/`env` 等前缀）。复合命令中的容器调用不经过门面改写，
+  但由**入口桩**回退（真实二进制仍是沙箱内 podman，且桩对 `run`/`create` 补齐共享标志），连不到宿主
+  daemon。
 
 受控计划写入 `kind="container"` 证据并发出 `SANDBOX_CONTAINER_PLANNED`；被拒绝的调用发出
 `SANDBOX_CONTAINER_UNSUPPORTED` 并写入审计（真实原因仅进审计/UI，不回传模型）。配置：
-`tools.sandbox.container`（`enabled`/`share_namespace`/`docker_to_podman`）；`tools.sandbox.docker`
-（`mode`/`socket`）**已弃用**、不再读取。
+`tools.sandbox.container`（`enabled`/`share_namespace`/`docker_to_podman`/`runtime_caps`/`seccomp`/
+`containers_conf`）；`tools.sandbox.docker`（`mode`/`socket`）**已弃用**、不再读取。
 
 ### 18.4 新会话自动审批（默认关闭）
 

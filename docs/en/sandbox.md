@@ -2808,14 +2808,27 @@ The sandbox **never binds the host `/var/run/docker.sock`** (always masked). Con
   security boundary either. So they are **rewritten to `podman` / `podman-compose`** (daemonless; the
   container is a child of the sandbox CLI and stays inside the sandbox namespaces).
   **Entry shims (file links)**: `process_prefix` **read-only binds** `docker`/`docker-compose`/`nerdctl`
-  shims (`#!/bin/sh; exec <podman> "$@"`) **over the real binary paths** (`/usr/local/bin`, `/usr/bin`,
-  `/bin`), so container calls inside scripts / pipelines / compound commands (e.g. `echo x; docker ps`)
-  also go through podman, not only a leading-token rewrite; `which docker` resolves to the shim.
+  shims (`#!/bin/sh; exec <podman> "$@"`, adding the shared namespace flags for `run`/`create`)
+  **over the real binary paths** (`/usr/local/bin`, `/usr/bin`, `/bin`), so container calls inside
+  scripts / pipelines / compound commands (e.g. `echo x; docker ps`) also go through podman, not only a
+  leading-token rewrite; `which docker` resolves to the shim.
 - `podman` / `buildah`: `--net/pid/ipc/uts=host` is injected to share the sandbox namespaces; container
   writes land in the overlay, are frozen as candidates, and are published to the real disk by the
   existing candidate pipeline only after approval (**no separate "swap back" mechanism is needed**).
-  The overlay graph driver needs a mount (blocked by seccomp) inside the sandbox, so container commands
-  get `STORAGE_DRIVER=vfs` (container layers stay in the staged overlay; writes still become candidates).
+  Container runtimes must create mount/pid/net namespaces, `mount`/`pivot_root` the rootfs, `mknod`
+  device nodes and `chown` image layers, so **container commands** are granted the caps in
+  `tools.sandbox.container.runtime_caps` (default `ALL`, still trimmed by the global `cap_drop`), have
+  the seccomp baseline disabled (`container.seccomp=false`; otherwise `unshare`/`clone(CLONE_NEW*)`/
+  `mount` are blocked, surfacing as `cannot re-exec process`), and get `STORAGE_DRIVER=vfs` (the overlay
+  graph driver needs a mount). A `containers.conf` (`apparmor_profile="unconfined"`,
+  `cgroup_manager="cgroupfs"`) and `storage.conf` (`graphroot`/`runroot` under the **session-private
+  `/tmp`**, persisting across commands/shifts and destroyed with the session) are injected so podman can
+  assemble and keep images in a sandbox with no AppArmor and no systemd session bus. **Container
+  commands are a high-trust profile**: writes still all go into the overlay staging and sensitive paths
+  stay masked, but do not run untrusted images inside the sandbox.
+- **Entry shims** add `--net/pid/ipc/uts=host` for `run`/`create` (idempotent: passed through when
+  already present), so container calls in **compound/script commands** (e.g. `cd x && docker run`) also
+  reuse the sandbox namespaces, not only the facade's leading-token rewrite.
 - **With no podman installed, in-container operations are disabled**: a **disabled shim** is bound
   instead (`docker`/`nerdctl`/`docker-compose` all print the authentic error `Cannot connect to the
   Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?` and `exit 1`), so
@@ -3022,15 +3035,16 @@ host**. The facade (`container.facade`) intercepts the command in the `effect="p
 - **Remote/connection options** (`--remote`/`-r`/`-H`/`--host`/`--connection`/`--url`) and **host VM
   subcommands** (`podman machine`) are rejected (`CONTAINER_REMOTE_UNSUPPORTED` /
   `CONTAINER_SUBCOMMAND_UNSUPPORTED`), likewise rendered in authentic docker style.
-- The facade only recognizes **standalone calls** (skipping `sudo`/`env` prefixes); container calls
-  inside compound commands are not intercepted (but they still only run the real binaries inside the
-  sandbox and cannot reach the host daemon).
+- The facade only recognizes **standalone calls** (skipping `sudo`/`env` prefixes). Container calls
+  inside compound commands are not rewritten by the facade, but fall back to the **entry shims** (the
+  real binary is still the in-sandbox podman, and the shim adds the shared flags for `run`/`create`), so
+  they cannot reach the host daemon.
 
 A controlled plan is stored as `kind="container"` evidence and emits `SANDBOX_CONTAINER_PLANNED`;
 rejected calls emit `SANDBOX_CONTAINER_UNSUPPORTED` and are audited (the real reason goes only to
 audit/UI, never to the model). Config: `tools.sandbox.container`
-(`enabled`/`share_namespace`/`docker_to_podman`); `tools.sandbox.docker` (`mode`/`socket`) is
-**deprecated** and no longer read.
+(`enabled`/`share_namespace`/`docker_to_podman`/`runtime_caps`/`seccomp`/`containers_conf`);
+`tools.sandbox.docker` (`mode`/`socket`) is **deprecated** and no longer read.
 
 ### 18.4 Auto-approval for new sessions (default off)
 
