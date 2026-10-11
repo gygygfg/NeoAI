@@ -1351,6 +1351,10 @@ local DEFAULT_CONFIG = {
       seccomp = {
         enabled = true, -- 是否施加 seccomp 基线（仅 bwrap 后端）
         filter_path = "", -- 自定义过滤器路径；空则使用内置 denylist 生成
+        -- 是否允许载荷创建**嵌套命名空间**（unshare/setns/clone(CLONE_NEW*)）。默认 true：
+        -- 嵌套命名空间不改变宿主可见面（载荷仍受沙箱 mount/pid/遮蔽/overlay 约束），且容器运行时
+        -- （podman/runc/buildah）依赖它。设为 false 恢复「拦截嵌套命名空间」的纵深防御。
+        allow_namespaces = true,
       },
       -- 权限档位与自动提权（见 docs/sandbox.md §17）：命令默认以最小权限（T0）运行，
       -- 权限不足时自动「发起」升级请求（不静默执行）；T1 在隔离内自动执行并留痕，

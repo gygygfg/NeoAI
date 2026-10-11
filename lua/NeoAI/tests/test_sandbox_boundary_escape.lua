@@ -11,23 +11,27 @@ tests.suite("sandbox_boundary_escape", function(_, it)
   it("seccomp：denylist 危险 syscall 真实拦截（EPERM）", function(t)
     if not H.bwrap() or not H.has("python3") then return end
     if not H.is_x86_64() then return end
-    local script = H.syscall_script(H.SYS_DENY)
-    local out = H.python({ cwd = "/tmp" }, script)
-    local got = {}
-    for name, errno in tostring(out):gmatch("([%w_]+)=(%d+)") do got[name] = tonumber(errno) end
-    local missing, wrong = {}, {}
-    for name in pairs(H.SYS_DENY) do
-      if got[name] == nil then missing[#missing + 1] = name
-      elseif got[name] ~= 1 then wrong[#wrong + 1] = name .. "=" .. got[name] end
-    end
-    t.eq(0, #missing, "探测脚本应覆盖全部 syscall，缺失: " .. table.concat(missing, ","))
-    t.eq(0, #wrong, "denylist syscall 应全部返回 EPERM(1)，异常: " .. table.concat(wrong, ","))
+    -- unshare/setns 仅在 `allow_namespaces=false`（关闭嵌套命名空间）时被拦截；本用例验证该模式。
+    H.with_config({ tools = { sandbox = { seccomp = { allow_namespaces = false } } } }, function()
+      local script = H.syscall_script(H.SYS_DENY)
+      local out = H.python({ cwd = "/tmp" }, script)
+      local got = {}
+      for name, errno in tostring(out):gmatch("([%w_]+)=(%d+)") do got[name] = tonumber(errno) end
+      local missing, wrong = {}, {}
+      for name in pairs(H.SYS_DENY) do
+        if got[name] == nil then missing[#missing + 1] = name
+        elseif got[name] ~= 1 then wrong[#wrong + 1] = name .. "=" .. got[name] end
+      end
+      t.eq(0, #missing, "探测脚本应覆盖全部 syscall，缺失: " .. table.concat(missing, ","))
+      t.eq(0, #wrong, "denylist syscall 应全部返回 EPERM(1)，异常: " .. table.concat(wrong, ","))
+    end)
   end)
 
-  it("seccomp：clone3 返回 ENOSYS、clone 带命名空间标志被拒", function(t)
+  it("seccomp：clone3 返回 ENOSYS、clone 带命名空间标志被拒（allow_namespaces=false）", function(t)
     if not H.bwrap() or not H.has("python3") then return end
     if not H.is_x86_64() then return end
-    local script = [[
+    H.with_config({ tools = { sandbox = { seccomp = { allow_namespaces = false } } } }, function()
+      local script = [[
 import ctypes
 libc = ctypes.CDLL(None, use_errno=True)
 libc.syscall.restype = ctypes.c_long
@@ -39,9 +43,24 @@ ctypes.set_errno(0)
 libc.syscall(56, 0x10000000, 0, 0, 0, 0, 0)  # clone(CLONE_NEWUSER)
 print("clone_newuser=%d" % ctypes.get_errno())
 ]]
-    local out = H.python({ cwd = "/tmp" }, script)
-    t.matches("clone3=38", out, "clone3 应返回 ENOSYS(38)")
-    t.matches("clone_newuser=1", out, "clone(CLONE_NEWUSER) 应 EPERM(1)")
+      local out = H.python({ cwd = "/tmp" }, script)
+      t.matches("clone3=38", out, "clone3 应返回 ENOSYS(38)")
+      t.matches("clone_newuser=1", out, "clone(CLONE_NEWUSER) 应 EPERM(1)")
+    end)
+  end)
+
+  it("seccomp：allow_namespaces 改变过滤器内容（默认允许嵌套命名空间）", function(t)
+    local seccomp = require("NeoAI.sandbox.execution.seccomp")
+    local with_ns, without_ns
+    H.with_config({ tools = { sandbox = { seccomp = { allow_namespaces = true } } } }, function()
+      with_ns = seccomp.build_filter("x86_64")
+    end)
+    H.with_config({ tools = { sandbox = { seccomp = { allow_namespaces = false } } } }, function()
+      without_ns = seccomp.build_filter("x86_64")
+    end)
+    t.not_nil(with_ns, "应能生成过滤器")
+    t.true_(with_ns ~= without_ns, "allow_namespaces 应改变过滤器内容")
+    t.true_(#with_ns < #without_ns, "允许命名空间时过滤器应更短（省略 ns 拦截块）")
   end)
 
   it("seccomp：socket 地址族白名单（AF_UNIX 放行，AF_VSOCK/AF_ALG 拒绝）", function(t)

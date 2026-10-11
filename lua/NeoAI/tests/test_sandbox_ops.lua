@@ -525,7 +525,7 @@ tests.suite("sandbox_ops", function(_, it)
     t.not_nil(seccomp.build_filter("x86_64"), "应能生成 x86_64 过滤器")
     t.not_nil(seccomp.build_filter("aarch64"), "应能生成 aarch64 过滤器")
     if require("NeoAI.sandbox.execution.runtime").backend() ~= "bwrap" then return end
-    with_config({ tools = { approval = { mode = "async" }, sandbox = { mode = "dry_run", seccomp = { enabled = true } } } }, function()
+    with_config({ tools = { approval = { mode = "async" }, sandbox = { mode = "dry_run", seccomp = { enabled = true, allow_namespaces = false } } } }, function()
       local sandbox = require("NeoAI.sandbox")
       sandbox.reset()
       seccomp.reset()
@@ -601,7 +601,7 @@ tests.suite("sandbox_ops", function(_, it)
     local runtime = require("NeoAI.sandbox.execution.runtime")
     if runtime.backend() ~= "bwrap" or vim.fn.executable("python3") ~= 1 then return end
     local sandbox = require("NeoAI.sandbox")
-    with_config({ tools = { approval = { mode = "async" }, sandbox = { mode = "dry_run", seccomp = { enabled = true } } } }, function()
+    with_config({ tools = { approval = { mode = "async" }, sandbox = { mode = "dry_run", seccomp = { enabled = true, allow_namespaces = false } } } }, function()
       sandbox.reset()
       require("NeoAI.sandbox.execution.seccomp").reset()
       local py = table.concat({

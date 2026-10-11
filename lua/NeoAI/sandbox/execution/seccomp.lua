@@ -61,6 +61,8 @@ local ARCH = {
     x32_guard = true,
     mknod = 133,
     mknodat = 259,
+    -- 创建/进入命名空间的 syscall 号（unshare, setns）：允许嵌套命名空间时从 denylist 移除。
+    ns = { 272, 308 },
     blocked = {
       101, -- ptrace
       155, -- pivot_root
@@ -100,6 +102,8 @@ local ARCH = {
     clone = 220,
     clone3 = 435,
     socket = 198,
+    -- 创建/进入命名空间的 syscall 号（unshare, setns）：允许嵌套命名空间时从 denylist 移除。
+    ns = { 97, 268 },
     -- arm64 无 mknod（glibc 经 mknodat(AT_FDCWD,…) 实现）；号码见 asm-generic/unistd.h。
     mknodat = 33,
     blocked = {
@@ -161,6 +165,14 @@ local function _configured_filter()
   return p
 end
 
+--- 是否允许载荷创建**嵌套命名空间**（unshare/setns/clone(CLONE_NEW*)）。
+--- 默认 true：嵌套命名空间不改变宿主可见面（载荷仍受沙箱 mount/pid/遮蔽/overlay 约束），
+--- 且容器运行时（podman/runc/buildah）依赖它。设为 false 恢复「拦截嵌套命名空间」的纵深防御。
+--- @return boolean
+local function _allow_namespaces()
+  return config_store.get("tools.sandbox.seccomp.allow_namespaces") ~= false
+end
+
 -- ========== 公开 API ==========
 
 --- 生成指定架构的 denylist BPF 过滤器字节
@@ -169,6 +181,7 @@ end
 function M.build_filter(arch)
   local spec = ARCH[arch]
   if not spec then return nil end
+  local allow_ns = _allow_namespaces()
   local parts = {}
   parts[#parts + 1] = _insn(BPF_LD_ABS, 0, 0, 4)            -- LD arch
   parts[#parts + 1] = _insn(BPF_JEQ_K, 1, 0, spec.audit)    -- JEQ arch ? skip kill : kill
@@ -192,7 +205,8 @@ function M.build_filter(arch)
     parts[#parts + 1] = _insn(BPF_RET_K, 0, 0, SECCOMP_RET_ERRNO_EPERM)
   end
   -- clone：仅当带命名空间标志时拒绝（否则放行，供 fork/线程正常创建）。
-  if spec.clone then
+  -- 允许嵌套命名空间（`seccomp.allow_namespaces`，默认）时整段省略。
+  if spec.clone and not allow_ns then
     parts[#parts + 1] = _insn(BPF_JEQ_K, 0, 3, spec.clone)   -- nr==clone ? LD args0 : skip 3
     parts[#parts + 1] = _insn(BPF_LD_ABS, 0, 0, ARG0_OFFSET) -- LD args[0] (flags)
     parts[#parts + 1] = _insn(BPF_JSET_K, 0, 1, CLONE_NS_MASK) -- (flags & mask) ? errno : skip
@@ -200,7 +214,8 @@ function M.build_filter(arch)
   end
   -- clone3：flags 在指针参数中，经典 seccomp 无法解引用 → 返回 ENOSYS 促使 glibc 回退到
   -- clone（回退后即受上面的 flags 过滤），避免直接 EPERM 打断线程创建。
-  if spec.clone3 then
+  -- 允许嵌套命名空间时不再需要（clone3 直接放行）。
+  if spec.clone3 and not allow_ns then
     parts[#parts + 1] = _insn(BPF_JEQ_K, 0, 1, spec.clone3)
     parts[#parts + 1] = _insn(BPF_RET_K, 0, 0, SECCOMP_RET_ERRNO_ENOSYS)
   end
@@ -219,8 +234,11 @@ function M.build_filter(arch)
     parts[#parts + 1] = _insn(BPF_RET_K, 0, 0, SECCOMP_RET_ERRNO_EPERM)
   end
   for _, nr in ipairs(spec.blocked) do
-    parts[#parts + 1] = _insn(BPF_JEQ_K, 0, 1, nr)          -- JEQ nr ? ret errno : skip
-    parts[#parts + 1] = _insn(BPF_RET_K, 0, 0, SECCOMP_RET_ERRNO_EPERM)
+    -- 允许嵌套命名空间时跳过 unshare/setns（其余危险 syscall 仍拦截）。
+    if not (allow_ns and vim.tbl_contains(spec.ns, nr)) then
+      parts[#parts + 1] = _insn(BPF_JEQ_K, 0, 1, nr)          -- JEQ nr ? ret errno : skip
+      parts[#parts + 1] = _insn(BPF_RET_K, 0, 0, SECCOMP_RET_ERRNO_EPERM)
+    end
   end
   parts[#parts + 1] = _insn(BPF_RET_K, 0, 0, SECCOMP_RET_ALLOW)
   return table.concat(parts)
@@ -245,8 +263,9 @@ function M.ensure_filter()
   -- 版本化文件名：过滤器内容变更时避免命中旧缓存
   -- （v3：clone/clone3 命名空间过滤 + socket 地址族白名单；
   --   v4：mknod/mknodat 设备节点屏障，CHR/BLK 模式拒绝、FIFO 放行；
-  --   v5：时钟（adjtimex/settimeofday/clock_settime/clock_adjtime）与裸端口 I/O（iopl/ioperm）拦截）。
-  local path = dir .. "/baseline-v5-" .. name .. ".bpf"
+  --   v5：时钟（adjtimex/settimeofday/clock_settime/clock_adjtime）与裸端口 I/O（iopl/ioperm）拦截；
+  --   v6：`seccomp.allow_namespaces`（默认）时省略嵌套命名空间拦截，故文件名带 ns0/ns1）。
+  local path = dir .. "/baseline-v6-ns" .. (_allow_namespaces() and "1" or "0") .. "-" .. name .. ".bpf"
   if vim.fn.filereadable(path) == 1 then
     return path
   end
