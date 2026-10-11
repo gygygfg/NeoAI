@@ -275,18 +275,15 @@ function M.start()
     for _, k in ipairs({ "bwrap", "unshare", "userns", "cgroup2", "overlayfs", "seccomp", "cgroup", "seccomp_filter" }) do
       parts[#parts + 1] = k .. "=" .. tostring(caps[k])
     end
-    -- 权限档位与受控 docker 可用性
+    -- 权限档位与容器门面（只走 podman；宿主 docker daemon 永不连接）
     local pcfg = require("NeoAI.kernel.config_store").get("tools.sandbox.privilege") or {}
-    local dcfg = require("NeoAI.kernel.config_store").get("tools.sandbox.docker") or {}
-    local dstat = "off"
-    if dcfg.mode == "controlled" then
-      dstat = (type(dcfg.socket) == "string" and vim.uv.fs_stat(dcfg.socket) ~= nil) and "ready" or "socket-missing"
-    elseif dcfg.mode == "host" then
-      dstat = "host"
-    end
+    local ccfg = require("NeoAI.kernel.config_store").get("tools.sandbox.container") or {}
+    local podman_ok = vim.fn.executable("podman") == 1
+    local cstat = not (ccfg.enabled ~= false) and "off"
+      or (podman_ok and "podman-ready" or "podman-missing")
     parts[#parts + 1] = "privilege=" .. tostring(pcfg.enabled ~= false)
     parts[#parts + 1] = "max_tier=" .. tostring(pcfg.max_tier or 0)
-    parts[#parts + 1] = "docker=" .. tostring(dcfg.mode or "?") .. "(" .. dstat .. ")"
+    parts[#parts + 1] = "container=" .. tostring(cstat)
     -- overlay 可用性诊断：不可用时给出原因（默认 fail-closed 会拒绝 process 工具）
     local diag = sandbox.overlay_diagnosis(vim.fn.getcwd())
     parts[#parts + 1] = "overlay=" .. (diag.available and "ready"

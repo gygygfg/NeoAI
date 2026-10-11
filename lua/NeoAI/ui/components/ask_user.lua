@@ -1,12 +1,15 @@
---- 向用户提问弹窗（多 Tab / 多选 / 汇总确认）
+--- 向用户提问弹窗（多 Tab / 多选 / 最右确认标签；对齐 opencode）
 --- @module 'NeoAI.ui.components.ask_user'
 --- 注册到 NeoAI.tools.builtin.ask_user。同一轮的多次提问聚合为一个多 Tab 弹窗：
----   - 顶部 Tab 栏：`[n]✓/○` 标记该题是否已答，当前题高亮；`<Tab>`/`<S-Tab>`（或 `]`/`[`）切题
----   - 题目正文 + 选项：单选显示 `[n]`，多选显示 `[x]/[ ]` 复选框（`multi_select=true`）
----   - `1-9` 单选选择 / 多选切换勾选；`i` / `<CR>` 进入自由输入（vim.ui.input）覆盖本题答案
----   - 全部作答后进入汇总页：列出 `Q → A`，`<CR>`/`y` 提交、`e` 返回编辑、`Esc` 取消
----   - 汇总页提交时若仍有未作答项，提示并跳回首个未作答 Tab
----   - `require_confirm=false` 时跳过汇总页，全部作答后直接提交
+---   - 顶部 Tab 栏：`[n]✓/○` 标记该题是否已答，**当前标签反显加粗**、已答绿色、未答暗灰，
+---     多选/多题时最右侧追加**「确认」标签**（多选二次确认集中于此）
+---   - 切页：`h/l` 或 `←/→`（并保留 `<Tab>`/`<S-Tab>`、`]`/`[`）
+---   - 题目正文 + 选项：单选显示 `[n]`，多选显示 `[x]/[ ]` 复选框（`multi_select=true`）；
+---     `k/j`/`↑/↓` 移动选项焦点（焦点行背景高亮），`1-9` 或 `<CR>` 选择/切换，已选项高亮
+---   - **单题单选选中即提交**（不二次确认、无确认标签）；多选/多题在最右确认标签二次确认
+---     （列出 `Q → A`，`<CR>`/`y` 提交、`h`/`←` 返回编辑、`Esc` 取消）
+---   - `i` 进入自由输入（vim.ui.input）覆盖本题答案
+---   - `require_confirm=false` 时不展示确认标签，全部作答后直接提交
 --- 焦点门控（focus.gate）：焦点不在 NeoAI 界面时暂存，切回再弹。
 
 local ui_hooks = require("NeoAI.kernel.ui_hooks")
@@ -22,22 +25,28 @@ local state = {
   questions = {}, -- { question, options, multi_select }
   picks = {}, -- picks[i] = { [option_index]=true }（单选至多一个）
   free = {}, -- free[i] = 自由输入覆盖文本
-  active = 1, -- 当前 tab（1-based）
-  mode = "tab", -- "tab" | "summary"
+  cursor = {}, -- cursor[i] = 当前高亮的选项序号（1-based）
+  active = 1, -- 当前 tab（1..#questions，或最右的确认 tab = #questions+1）
+  mode = "tab", -- "tab" | "confirm"（仅用于 get_state 快照）
   require_confirm = true,
   on_submit = nil, -- function(answers) answers[i] = 第 i 题最终答案字符串
   on_cancel = nil, -- function(reason)
 }
 
--- 高亮命名空间：选项简介 / 选项描述 / Tab / 未作答各用一组高亮
+-- 高亮命名空间：选项简介 / 选项描述 / Tab / 未作答 / 焦点 / 已选各用一组高亮
 local HL_NS = vim.api.nvim_create_namespace("neoai_ask_user_hi")
 
 --- 定义高亮组（default=true，不覆盖用户自定义；兼容无外网/无主题环境）
+--- 对齐 opencode：顶部 tab 醒目高亮（当前 tab 反显加粗）、选项行焦点高亮、已选项高亮。
 local function _setup_hl()
   vim.api.nvim_set_hl(0, "NeoAIAskUserOptionLabel", { default = true, bold = true })
   vim.api.nvim_set_hl(0, "NeoAIAskUserOptionDesc", { default = true, fg = "#8a8a8a" })
-  vim.api.nvim_set_hl(0, "NeoAIAskUserTabActive", { default = true, bold = true, underline = true })
-  vim.api.nvim_set_hl(0, "NeoAIAskUserTabAnswered", { default = true, fg = "#9ece6a" })
+  vim.api.nvim_set_hl(0, "NeoAIAskUserTabActive", { default = true, bold = true, reverse = true })
+  vim.api.nvim_set_hl(0, "NeoAIAskUserTabAnswered", { default = true, bold = true, fg = "#9ece6a" })
+  vim.api.nvim_set_hl(0, "NeoAIAskUserTabPending", { default = true, fg = "#8a8a8a" })
+  vim.api.nvim_set_hl(0, "NeoAIAskUserTabConfirm", { default = true, bold = true, fg = "#7aa2f7" })
+  vim.api.nvim_set_hl(0, "NeoAIAskUserOptionFocus", { default = true, bg = "#3b4252" })
+  vim.api.nvim_set_hl(0, "NeoAIAskUserOptionPicked", { default = true, bold = true, fg = "#9ece6a" })
   vim.api.nvim_set_hl(0, "NeoAIAskUserUnanswered", { default = true, fg = "#e0af68" })
   vim.api.nvim_set_hl(0, "NeoAIAskUserHint", { default = true, fg = "#8a8a8a" })
 end
@@ -80,11 +89,39 @@ local function _close()
   state.questions = {}
   state.picks = {}
   state.free = {}
+  state.cursor = {}
   state.active = 1
   state.mode = "tab"
   state.require_confirm = true
   state.on_submit = nil
   state.on_cancel = nil
+end
+
+--- 是否为「单题单选」：仅一题且非多选。对齐 opencode：单题单选**选中即提交**（不二次确认）。
+--- @return boolean
+local function _form_single()
+  return #state.questions == 1 and not (state.questions[1] and state.questions[1].multi_select)
+end
+
+--- 是否展示最右侧「确认」标签：需二次确认（require_confirm）且非单题单选。
+--- 多选/多题时在最右标签集中确认（多选二次确认放最右侧标签）。
+--- @return boolean
+local function _has_confirm()
+  if state.require_confirm == false then return false end
+  return not _form_single()
+end
+
+--- 确认标签序号（1-based；无则返回 nil）
+--- @return number|nil
+local function _confirm_index()
+  if not _has_confirm() then return nil end
+  return #state.questions + 1
+end
+
+--- tab 总数（题目数 + 可能的确认标签）
+--- @return number
+local function _tab_total()
+  return #state.questions + (_has_confirm() and 1 or 0)
 end
 
 --- 第 i 题最终答案（nil = 未作答）；自由输入优先于选项勾选
@@ -141,33 +178,34 @@ local function _cancel(reason)
   if cb then cb(reason or "用户取消") end
 end
 
---- 作答后推进：全部作答则进汇总页（或 require_confirm=false 直接提交），否则重渲染
+--- 作答后推进：单题单选选中即提交；无确认标签且全部作答直接提交；否则重渲染。
 local function _after_answer()
-  if _all_answered() then
-    if state.require_confirm == false then
-      _do_submit()
-    else
-      state.mode = "summary"
-      _render()
-    end
-  else
-    _render()
+  if _form_single() then
+    _do_submit()
+    return
   end
+  if not _has_confirm() and _all_answered() then
+    _do_submit()
+    return
+  end
+  _render()
 end
 
---- 选择/切换选项
+--- 选择/切换选项（并移动焦点光标到该项）
 --- @param oi number 选项序号（1-based）
 local function _pick(oi)
-  local q = state.questions[state.active]
+  local idx = state.active
+  local q = state.questions[idx]
   if not q or not q.options or not q.options[oi] then return end
-  local picks = state.picks[state.active]
-  if not picks then picks = {}; state.picks[state.active] = picks end
+  state.cursor[idx] = oi
+  local picks = state.picks[idx]
+  if not picks then picks = {}; state.picks[idx] = picks end
   if q.multi_select then
     picks[oi] = (not picks[oi]) or nil
   else
-    state.picks[state.active] = { [oi] = true }
+    state.picks[idx] = { [oi] = true }
   end
-  state.free[state.active] = nil -- 勾选覆盖自由输入
+  state.free[idx] = nil -- 勾选覆盖自由输入
   _after_answer()
 end
 
@@ -183,14 +221,32 @@ local function _free_input()
   end)
 end
 
---- 切换 Tab（delta 为 +1/-1，循环）
+--- 切换 Tab（delta 为 +1/-1，循环；含最右确认标签）
 --- @param delta number
 local function _switch_tab(delta)
-  local n = #state.questions
-  if n == 0 then return end
-  state.mode = "tab"
-  state.active = ((state.active - 1 + delta) % n) + 1
+  local total = _tab_total()
+  if total == 0 then return end
+  state.active = ((state.active - 1 + delta) % total) + 1
   _render()
+end
+
+--- 移动选项焦点光标（delta 为 +1/-1，循环）；对齐 opencode 的 ↑/↓、k/j。
+--- @param delta number
+local function _move_cursor(delta)
+  local idx = state.active
+  local q = state.questions[idx]
+  if not q or not q.options or #q.options == 0 then return end
+  local cur = state.cursor[idx] or 1
+  state.cursor[idx] = ((cur - 1 + delta) % #q.options) + 1
+  _render()
+end
+
+--- 选中当前焦点选项（<CR> 在题目标签上）。
+local function _pick_focused()
+  local idx = state.active
+  local q = state.questions[idx]
+  if not q then return end
+  _pick(state.cursor[idx] or 1)
 end
 
 --- 汇总页提交：有未作答则提示并跳回首个未作答 Tab
@@ -198,7 +254,6 @@ local function _try_submit()
   if not _all_answered() then
     local idx = _first_unanswered()
     if idx then state.active = idx end
-    state.mode = "tab"
     _render()
     pcall(vim.notify, "[NeoAI] 仍有题目未作答，请先完成", vim.log.levels.WARN)
     return
@@ -206,12 +261,14 @@ local function _try_submit()
   _do_submit()
 end
 
---- 汇总页返回编辑：跳到首个未作答 Tab（全答则留在原 tab）
-local function _back_to_edit()
-  state.mode = "tab"
-  local idx = _first_unanswered()
-  if idx then state.active = idx end
-  _render()
+--- <CR>：在确认标签上提交，否则选中焦点选项。
+local function _on_enter()
+  local ci = _confirm_index()
+  if ci and state.active == ci then
+    _try_submit()
+  else
+    _pick_focused()
+  end
 end
 
 --- 设置快捷键（普通模式 + 插入模式，理由同 tool_approval）
@@ -222,27 +279,27 @@ local function _set_keymaps()
     vim.keymap.set(mode, key, fn, { buffer = state.buf })
   end
 
-  if state.mode == "summary" then
-    for _, mode in ipairs({ "n", "i" }) do
-      bind(mode, "<CR>", _try_submit)
-      bind(mode, "y", _try_submit)
-      bind(mode, "e", _back_to_edit)
-    end
-    -- 取消：仅 NORMAL 模式 <Esc>（INSERT 保留退出插入模式原义）
-    bind("n", "<Esc>", function() _cancel("用户取消") end)
-    return
-  end
-
   for _, mode in ipairs({ "n", "i" }) do
     for i = 1, 9 do
       bind(mode, tostring(i), function() _pick(i) end)
     end
+    -- 切页：左右方向键 + h/l（对齐 opencode），并保留 Tab/S-Tab 与 ]/[
+    bind(mode, "<Left>", function() _switch_tab(-1) end)
+    bind(mode, "<Right>", function() _switch_tab(1) end)
+    bind(mode, "h", function() _switch_tab(-1) end)
+    bind(mode, "l", function() _switch_tab(1) end)
     bind(mode, "<Tab>", function() _switch_tab(1) end)
     bind(mode, "<S-Tab>", function() _switch_tab(-1) end)
     bind(mode, "]", function() _switch_tab(1) end)
     bind(mode, "[", function() _switch_tab(-1) end)
+    -- 选项焦点：上下方向键 + k/j
+    bind(mode, "<Up>", function() _move_cursor(-1) end)
+    bind(mode, "<Down>", function() _move_cursor(1) end)
+    bind(mode, "k", function() _move_cursor(-1) end)
+    bind(mode, "j", function() _move_cursor(1) end)
     bind(mode, "i", _free_input)
-    bind(mode, "<CR>", _free_input)
+    bind(mode, "<CR>", _on_enter)
+    bind(mode, "y", _try_submit)
   end
   -- 取消：仅 NORMAL 模式 <Esc>（INSERT 保留退出插入模式原义）
   bind("n", "<Esc>", function() _cancel("用户取消") end)
@@ -259,8 +316,44 @@ local function _build_lines()
     return #lines - 1 -- 0-based 行号
   end
 
-  if state.mode == "summary" then
-    push("【汇总确认】")
+  local ci = _confirm_index()
+  local on_confirm = ci ~= nil and state.active == ci
+
+  -- ===== 顶部 Tab 栏（各题 + 最右「确认」），当前标签反显加粗 =====
+  local bar = ""
+  local spans = {}
+  local function add_tab(seg, active, answered, pending, confirm)
+    if #bar > 0 then bar = bar .. "  " end
+    local col0 = #bar
+    bar = bar .. seg
+    spans[#spans + 1] = { col = col0, len = #seg, active = active, answered = answered, pending = pending, confirm = confirm }
+  end
+  for i = 1, #state.questions do
+    local answered = _answer_of(i) ~= nil
+    add_tab(string.format("[%d]%s", i, answered and "✓" or "○"), state.active == i, answered, not answered, false)
+  end
+  if ci then
+    add_tab("[确认]", on_confirm, _all_answered(), false, true)
+  end
+  local bar_line = push(bar)
+  for _, sp in ipairs(spans) do
+    local group
+    if sp.active then
+      group = "NeoAIAskUserTabActive"
+    elseif sp.confirm then
+      group = "NeoAIAskUserTabConfirm"
+    elseif sp.answered then
+      group = "NeoAIAskUserTabAnswered"
+    else
+      group = "NeoAIAskUserTabPending"
+    end
+    hl[#hl + 1] = { line = bar_line, col = sp.col, end_col = sp.col + sp.len, group = group }
+  end
+  push("")
+
+  -- ===== 最右确认标签页：汇总各题答案 =====
+  if on_confirm then
+    push("【确认提交】")
     push("")
     for i, q in ipairs(state.questions) do
       push(string.format("  Q%d: %s", i, q.question or ""))
@@ -274,35 +367,13 @@ local function _build_lines()
       end
     end
     push("")
-    push("快捷键: [回车/y] 提交    [e] 返回编辑    [Esc] 取消")
+    local hint = "快捷键: [回车/y] 提交    [h/←] 返回编辑    [Esc] 取消"
+    local hl_line = push(hint)
+    hl[#hl + 1] = { line = hl_line, col = 0, end_col = #hint, group = "NeoAIAskUserHint" }
     return lines, hl
   end
 
-  -- Tab 栏
-  local bar = ""
-  local spans = {}
-  for i = 1, #state.questions do
-    local mark = _answer_of(i) ~= nil and "✓" or "○"
-    local seg = string.format("[%d]%s", i, mark)
-    if #bar > 0 then bar = bar .. "  " end
-    local col0 = #bar
-    bar = bar .. seg
-    spans[i] = { col = col0, len = #seg }
-  end
-  local bar_line = push(bar)
-  for i, sp in ipairs(spans) do
-    local group
-    if i == state.active then
-      group = "NeoAIAskUserTabActive"
-    elseif _answer_of(i) ~= nil then
-      group = "NeoAIAskUserTabAnswered"
-    end
-    if group then
-      hl[#hl + 1] = { line = bar_line, col = sp.col, end_col = sp.col + sp.len, group = group }
-    end
-  end
-
-  push("")
+  -- ===== 题目标签页：题干 + 选项（焦点行高亮、已选项高亮） =====
   local q = state.questions[state.active]
   if q then
     for _, ln in ipairs(vim.split(q.question or "", "\n", { plain = true })) do
@@ -312,16 +383,23 @@ local function _build_lines()
     if #options > 0 then
       push("")
       push("选项:")
+      local cursor = state.cursor[state.active] or 1
       for oi, opt in ipairs(options) do
+        local picked = state.picks[state.active] and state.picks[state.active][oi]
         local box
         if q.multi_select then
-          box = (state.picks[state.active] and state.picks[state.active][oi]) and "[x]" or "[ ]"
+          box = picked and "[x]" or "[ ]"
         else
           box = string.format("[%d]", oi)
         end
-        local label_col = #("  " .. box .. " ")
         local l = push(string.format("  %s %s", box, opt.label))
-        hl[#hl + 1] = { line = l, col = label_col, end_col = label_col + #opt.label, group = "NeoAIAskUserOptionLabel" }
+        -- 焦点行：整行背景高亮（bg）
+        if oi == cursor then
+          hl[#hl + 1] = { line = l, col = 0, end_col = #lines[#lines], group = "NeoAIAskUserOptionFocus" }
+        end
+        local label_col = #("  " .. box .. " ")
+        local label_group = picked and "NeoAIAskUserOptionPicked" or "NeoAIAskUserOptionLabel"
+        hl[#hl + 1] = { line = l, col = label_col, end_col = label_col + #opt.label, group = label_group }
         if opt.description and opt.description ~= "" then
           local dl = push("        " .. opt.description)
           hl[#hl + 1] = { line = dl, col = 8, end_col = 8 + #opt.description, group = "NeoAIAskUserOptionDesc" }
@@ -333,9 +411,9 @@ local function _build_lines()
   push("")
   local hint
   if q and q.multi_select then
-    hint = "快捷键: [1-9] 勾选    [Tab/S-Tab] 切题    [i/回车] 自由输入    [Esc] 取消"
+    hint = "快捷键: [1-9] 勾选    [k/j/↑↓] 焦点    [h/l/←→] 切页    [i] 自由输入    [回车] 选中    [Esc] 取消"
   else
-    hint = "快捷键: [1-9] 选择    [Tab/S-Tab] 切题    [i/回车] 自由输入    [Esc] 取消"
+    hint = "快捷键: [1-9] 选择    [k/j/↑↓] 焦点    [h/l/←→] 切页    [i] 自由输入    [回车] 选中    [Esc] 取消"
   end
   local hl_line = push(hint)
   hl[#hl + 1] = { line = hl_line, col = 0, end_col = #hint, group = "NeoAIAskUserHint" }
@@ -378,8 +456,19 @@ end
 --- 重渲染 buffer（内容 + 高亮 + 快捷键 + 动态高度）
 _render = function()
   _ensure_window()
+  local total = _tab_total()
+  if total < 1 then total = 1 end
   if state.active < 1 then state.active = 1 end
-  if state.active > #state.questions then state.active = math.max(1, #state.questions) end
+  if state.active > total then state.active = total end
+  -- 确认标签页时 mode="confirm"（仅用于 get_state 快照）
+  local ci = _confirm_index()
+  state.mode = (ci ~= nil and state.active == ci) and "confirm" or "tab"
+  for i = 1, #state.questions do
+    local n = state.questions[i].options and #state.questions[i].options or 0
+    local cur = state.cursor[i] or 1
+    if n > 0 and (cur < 1 or cur > n) then cur = math.min(cur, n) end
+    if n > 0 then state.cursor[i] = cur end
+  end
   _setup_hl()
   local lines, hl = _build_lines()
   vim.bo[state.buf].modifiable = true
@@ -416,6 +505,7 @@ local function _present(config)
     state.questions = {}
     state.picks = {}
     state.free = {}
+    state.cursor = {}
     state.active = config.active or 1
     state.mode = config.mode or "tab"
   end
@@ -431,11 +521,13 @@ local function _present(config)
       multi_select = q.multi_select == true,
     }
     if not state.picks[i] then state.picks[i] = {} end
+    if not state.cursor[i] then state.cursor[i] = 1 end
   end
   for i = #questions + 1, #state.questions do
     state.questions[i] = nil
     state.picks[i] = nil
     state.free[i] = nil
+    state.cursor[i] = nil
   end
   _render()
 end

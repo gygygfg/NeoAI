@@ -4,7 +4,10 @@
 --- 共享网络命名空间下为沙箱外部命令提供应用层代理：
 ---   * 拦截向宿主本机（回环 127/8、::1、宿主各网卡 IP、链路本地 169.254/16 与 fe80::/10、
 ---     云元数据 169.254.169.254）的访问；
----   * 放行其余外部目标并逐条记录。
+---   * 放行其余外部目标并逐条记录；
+---   * **链式出网**：当宿主本身依赖 HTTP(S)/SOCKS 上游代理出网时（`network.upstream_proxy`，
+---     默认自动沿用宿主 `*_PROXY`），外部目标经上游代理 CONNECT/SOCKS5 转发，使沙箱遵循宿主
+---     网络策略/白名单（企业白名单代理下直连会被拦）。本机目标/回环与 `no_proxy` 命中者仍直连。
 ---
 --- 边界（见 docs/sandbox.md）：这是**应用层**过滤。不认代理的裸 TCP（nc/ssh/数据库客户端等）
 --- 不经代理即可直连，不受拦截——共享 netns 下无法在内核层按目的地过滤（那需要 iptables/nft
@@ -107,10 +110,17 @@ end
 -- 代理启动失败只告警一次（ensure 会被每条沙箱外部命令调用，避免刷屏）。
 local _warned_no_proxy = false
 
---- 宿主各网卡地址集合（回环 + inet/inet6），键为规范化形式
+-- 代理启动失败只告警一次（ensure 会被每条沙箱外部命令调用，避免刷屏）。
+local _warned_no_proxy = false
+
+--- 宿主各网卡地址集合（回环 + inet/inet6），键为规范化形式。
+--- 通过 `vim.fn.systemlist` 读取，故**只能在主线程/非快速事件上下文调用**：连接分类发生在
+--- libuv 回调（快速事件）中，故由 `M.start`/`M.ensure` 在主线程预热缓存；快速事件里若尚未
+--- 预热则返回空集（后续主线程会补全），避免抛 E5560。
 --- @return table ip -> true
 local function _host_addrs()
   if state.host_addrs then return state.host_addrs end
+  if vim.in_fast_event and vim.in_fast_event() then return {} end
   local set = {}
   local ok, lines = pcall(vim.fn.systemlist, { "ip", "-o", "addr", "show" })
   if ok and type(lines) == "table" then
@@ -252,6 +262,94 @@ end
 local function _internal_port(port)
   local ok, nc = pcall(require, "NeoAI.sandbox.net.net_consent")
   return ok and nc.is_internal_port(port) or false
+end
+
+-- ========== 宿主上游代理（链式出网） ==========
+-- 宿主本身依赖 HTTP(S)/SOCKS 代理出网时（企业白名单代理、mihomo/clash 等），沙箱经本过滤
+-- 代理出网若仍「直连」，会因环境无直连出口而被拦/挂起（表现为 github.com:443 CONNECT 403/
+-- 超时，而 api.github.com/codeload 等白名单主机在宿主侧其实可达）。故此处把「直连」改为
+-- 「链到宿主上游代理」，使沙箱外命令遵循宿主网络策略/白名单。
+
+--- 取第一个非空环境变量值。
+--- 用 `os.getenv`（纯 Lua/C）而非 `vim.env`：后者经 Vimscript `getenv`，在 libuv 快速事件
+--- 回调（DNS/连接回调）中会抛 `E5560: ... must not be called in a fast event context`。
+--- @param keys string[]
+--- @return string|nil
+local function _first_env(keys)
+  for _, k in ipairs(keys) do
+    local v = os.getenv(k)
+    if type(v) == "string" and v ~= "" then return v end
+  end
+  return nil
+end
+
+--- 解析代理 URL -> { scheme, host, port, key(userinfo), auth(header) }；非法返回 nil。
+--- 支持 http/https/socks5/socks5h 与 `host:port`（默认 http）。
+--- @param url string|nil
+--- @return table|nil
+local function _parse_proxy_url(url)
+  if type(url) ~= "string" then return nil end
+  url = url:gsub("^%s+", ""):gsub("%s+$", "")
+  if url == "" then return nil end
+  local scheme = url:match("^(%a[%w+%.%-]*)://")
+  local rest = scheme and url:sub(#scheme + 4) or url
+  scheme = scheme and scheme:lower() or "http"
+  if scheme == "socks" then scheme = "socks5" end
+  if scheme ~= "http" and scheme ~= "https" and scheme ~= "socks5" and scheme ~= "socks5h" then
+    return nil
+  end
+  local userinfo, hp = rest:match("^([^@/]*)@(.*)$")
+  if not userinfo then hp = rest end
+  hp = hp:gsub("/.*$", "")
+  local host, port = hp:match("^%[([^%]]+)%]:(%d+)$")
+  if not host then host, port = hp:match("^(.-):(%d+)$") end
+  if not host then host = hp:match("^([^:/]+)$") end
+  if not host or host == "" then return nil end
+  local defport = (scheme == "http" and 80) or (scheme == "https" and 443) or 1080
+  local auth
+  if userinfo and userinfo ~= "" then
+    auth = "Basic " .. (vim.base64 and vim.base64.encode(userinfo) or userinfo)
+  end
+  return { scheme = scheme, host = host, port = tonumber(port) or defport, auth = auth }
+end
+
+--- 宿主上游代理配置。`tools.sandbox.network.upstream_proxy`：
+---   nil/true = 自动（沿用宿主 *_PROXY 环境）；false/"" = 不链（直连）；字符串 = 显式 URL。
+--- @return table|nil
+local function _upstream_proxy()
+  if state.opts.upstream_proxy ~= nil then
+    local up = state.opts.upstream_proxy
+    if up == false or up == "" then return nil end
+    if up == true then return _parse_proxy_url(_first_env({
+      "https_proxy", "HTTPS_PROXY", "all_proxy", "ALL_PROXY", "http_proxy", "HTTP_PROXY",
+    })) end
+    return _parse_proxy_url(up)
+  end
+  local ok, cfg = pcall(function()
+    return require("NeoAI.kernel.config_store").get("tools.sandbox.network")
+  end)
+  cfg = (ok and type(cfg) == "table") and cfg or {}
+  local up = cfg.upstream_proxy
+  if up == false or up == "" then return nil end
+  if type(up) == "string" then return _parse_proxy_url(up) end
+  return _parse_proxy_url(_first_env({
+    "https_proxy", "HTTPS_PROXY", "all_proxy", "ALL_PROXY", "http_proxy", "HTTP_PROXY",
+  }))
+end
+
+--- 目标是否命中宿主 NO_PROXY（免代理直连）。
+--- @param host string
+--- @return boolean
+local function _proxy_bypass(host)
+  local no = _first_env({ "no_proxy", "NO_PROXY" }) or ""
+  if no == "" then return false end
+  local h = tostring(host):lower():gsub("%.$", "")
+  for pat in no:gmatch("[^,%s]+") do
+    pat = pat:lower():gsub("^%.", "")
+    if pat == "*" then return true end
+    if h == pat or h:sub(-(#pat + 1)) == "." .. pat then return true end
+  end
+  return false
 end
 
 --- 访问门禁：沙箱内部（回环白名单/内部端口）免权限；其余按策略 ask/allow/deny。
@@ -424,14 +522,129 @@ local function _close(c)
   if c then pcall(function() c:close() end) end
 end
 
---- 向上游建连。连接**已校验过的 IP**（由 `_classify` 单次解析返回），不再重复解析，
---- 避免 DNS rebinding 在校验与连接之间切换答案。
---- @param host string 原始主机名（无 IP 时兜底）
---- @param ips table 已校验的规范化 IP 数组
+--- 经上游 HTTP 代理建立到 host:port 的 CONNECT 隧道。回调 `cb(ok)`。
+--- @param up userdata
+--- @param host string
+--- @param port number
+--- @param proxy table { auth? }
+--- @param cb function(ok: boolean)
+local function _http_connect_tunnel(up, host, port, proxy, cb)
+  local buf = ""
+  up:read_start(function(err, data)
+    if err or not data then return cb(false) end
+    buf = buf .. data
+    local idx = buf:find("\r\n\r\n", 1, true)
+    if not idx then
+      if #buf > 65536 then cb(false) end
+      return
+    end
+    up:read_stop()
+    local code = tonumber(buf:match("^HTTP/%d%.%d%s+(%d+)"))
+    cb(code ~= nil and code >= 200 and code < 300)
+  end)
+  local auth = proxy.auth and ("Proxy-Authorization: " .. proxy.auth .. "\r\n") or ""
+  local req = ("CONNECT %s:%d HTTP/1.1\r\nHost: %s:%d\r\n%sProxy-Connection: keep-alive\r\n\r\n")
+    :format(host, port, host, port, auth)
+  pcall(function() up:write(req) end)
+end
+
+--- 经上游 SOCKS5 代理建立到 host:port 的连接（域名交给代理解析，socks5h 语义）。回调 `cb(ok)`。
+--- @param up userdata
+--- @param host string
+--- @param port number
+--- @param cb function(ok: boolean)
+local function _socks5_client_connect(up, host, port, cb)
+  local stage, buf = "greet", ""
+  up:read_start(function(err, data)
+    if err or not data then return cb(false) end
+    buf = buf .. data
+    if stage == "greet" then
+      if #buf < 2 then return end
+      if buf:byte(1) ~= 5 then return cb(false) end
+      local method = buf:byte(2)
+      buf = buf:sub(3)
+      if method ~= 0 then return cb(false) end
+      if #host > 255 then return cb(false) end
+      local req = string.char(5, 1, 0, 3, #host) .. host
+        .. string.char(math.floor(port / 256) % 256, port % 256)
+      pcall(function() up:write(req) end)
+      stage = "reply"
+    elseif stage == "reply" then
+      if #buf < 4 then return end
+      local ver, rep, atyp = buf:byte(1), buf:byte(2), buf:byte(4)
+      local need
+      if atyp == 1 then need = 4 + 4 + 2
+      elseif atyp == 3 then
+        if #buf < 5 then return end
+        need = 5 + buf:byte(5) + 2
+      elseif atyp == 4 then need = 4 + 16 + 2
+      else return cb(false) end
+      if #buf < need then return end
+      up:read_stop()
+      cb(ver == 5 and rep == 0)
+    end
+  end)
+  pcall(function() up:write(string.char(5, 1, 0)) end)
+end
+
+--- 经上游代理建连（链式出网）。回调 `on_ok(up)` / `on_err()`。
+--- @param proxy table { scheme, host, port, auth? }
+--- @param host string
 --- @param port number
 --- @param on_ok function(up userdata)
 --- @param on_err function()
-local function _open_upstream(host, ips, port, on_ok, on_err)
+local function _open_via_proxy(proxy, host, port, on_ok, on_err)
+  local up = vim.uv.new_tcp()
+  local done = false
+  local timer = vim.uv.new_timer()
+  local function finish(ok)
+    if done then return end
+    done = true
+    pcall(function() timer:stop() end)
+    pcall(function() timer:close() end)
+    if ok then on_ok(up) else _close(up); on_err() end
+  end
+  timer:start(15000, 0, function() finish(false) end)
+  local okc = pcall(function()
+    up:connect(proxy.host, proxy.port, function(err)
+      if err then return finish(false) end
+      if proxy.scheme == "socks5" or proxy.scheme == "socks5h" then
+        _socks5_client_connect(up, host, port, finish)
+      elseif proxy.scheme == "http" then
+        _http_connect_tunnel(up, host, port, proxy, finish)
+      else
+        -- https:// 上游（TLS 到代理）暂不支持：fail-closed，不静默直连。
+        finish(false)
+      end
+    end)
+  end)
+  if not okc then finish(false) end
+end
+
+--- 向上游建连。默认连接**已校验过的 IP**（由 `_classify` 单次解析返回），不再重复解析，
+--- 避免 DNS rebinding 在校验与连接之间切换答案。**外部目标**且配置/宿主存在上游代理时，
+--- 改为链到上游代理（遵循宿主网络策略/白名单）；本机目标与 NO_PROXY 命中者仍直连。
+--- @param host string 原始主机名（无 IP 时兜底）
+--- @param ips table 已校验的规范化 IP 数组
+--- @param port number
+--- @param local_ boolean 目标是否宿主本机
+--- @param on_ok function(up userdata)
+--- @param on_err function()
+local function _open_upstream(host, ips, port, local_, on_ok, on_err)
+  -- 仅**外部**目标链式出网；本机目标（含 host_local_fn 判定为外部但实际是回环地址的测试场景）
+  -- 与 NO_PROXY 命中者始终直连——回环不应经外部上游代理绕行。
+  local loop = _is_loopback(host)
+  if not loop and type(ips) == "table" then
+    for _, ip in ipairs(ips) do
+      if _is_loopback(ip) then loop = true; break end
+    end
+  end
+  if not local_ and not loop then
+    local proxy = _upstream_proxy()
+    if proxy and not _proxy_bypass(host) then
+      return _open_via_proxy(proxy, host, port, on_ok, on_err)
+    end
+  end
   local up = vim.uv.new_tcp()
   local done = false
   local target = (#ips > 0) and ips[1] or host
@@ -522,7 +735,7 @@ local function _handle_http(ctx, client, header, rest)
           return
         end
         ctx.state = "connecting"
-        _open_upstream(h, ips, p, function(up)
+        _open_upstream(h, ips, p, local_, function(up)
           _record(h, p, "http", reason)
           pcall(function() client:write("HTTP/1.1 200 Connection Established\r\n\r\n") end)
           _start_piping(ctx, client, up, rest)
@@ -556,7 +769,7 @@ local function _handle_http(ctx, client, header, rest)
         return
       end
       ctx.state = "connecting"
-      _open_upstream(h, ips, p, function(up)
+      _open_upstream(h, ips, p, local_, function(up)
         _record(h, p, "http", reason)
         pcall(function() up:write(rewritten .. "\r\n\r\n") end)
         _start_piping(ctx, client, up, rest)
@@ -648,7 +861,7 @@ local function _process_socks(ctx, client)
           return
         end
         ctx.state = "connecting"
-        _open_upstream(host, ips, port, function(up)
+        _open_upstream(host, ips, port, local_, function(up)
           _record(host, port, "socks5", reason)
           _socks_reply(client, 0)
           _start_piping(ctx, client, up, rest)
@@ -717,6 +930,8 @@ end
 function M.start(host, port, opts)
   M.stop()
   state.opts = opts or {}
+  -- 主线程预热网卡地址缓存（连接分类在 libuv 回调里读取，不能在那里调用 Vimscript）。
+  pcall(_host_addrs)
   local server = vim.uv.new_tcp()
   local ok, err = pcall(function() server:bind(host or "127.0.0.1", port or 0) end)
   if not ok then
@@ -840,6 +1055,26 @@ end
 --- 测试/内部：访问门禁（异步回调 allow/reason）
 function M._gate(local_, host, port, ips, proto, cb)
   return _gate(local_, host, port, ips, proto, cb)
+end
+
+--- 测试/内部：解析代理 URL
+function M._parse_proxy_url(url)
+  return _parse_proxy_url(url)
+end
+
+--- 测试/内部：NO_PROXY 判定
+function M._proxy_bypass(host)
+  return _proxy_bypass(host)
+end
+
+--- 测试/内部：当前生效的宿主上游代理（state.opts.upstream_proxy 优先）
+function M._upstream_proxy()
+  return _upstream_proxy()
+end
+
+--- 测试/内部：经上游代理建连
+function M._open_via_proxy(proxy, host, port, on_ok, on_err)
+  return _open_via_proxy(proxy, host, port, on_ok, on_err)
 end
 
 --- 重置（测试用）

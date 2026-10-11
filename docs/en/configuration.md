@@ -165,6 +165,23 @@ session = {
   save_path = ".../NeoAI",
   max_history_per_session = 1000,
   file = "sessions.jsonl",   -- Append-only JSONL
+  -- Redact secrets when persisting history: real/fake secrets are both replaced with
+  -- `<密钥占位符>` before writing, so no secret ever reaches disk. Only the on-disk copy is
+  -- affected; the in-memory session keeps tokens (for detokenize / UI display). `false` disables.
+  redact_secrets = true,
+  -- Working-directory root detection (session creation only; never changes the global cwd):
+  -- walks up from cwd by markers to locate the workspace root and store it in metadata.cwd.
+  -- Tries git_markers first (default .git, dir or file, covering a worktree's .git file), then
+  -- falls back to root_markers (project config files). Falls back to cwd when nothing matches.
+  -- Child sessions always inherit the parent's working directory. detect_root=false disables
+  -- detection (legacy behavior: use cwd directly). The resource-access page lists this session
+  -- working directory as its first entry (auto-allowed, non-removable).
+  detect_root = true,
+  git_markers = { ".git" },
+  root_markers = { ".luarc.json", ".luarc.jsonc", "package.json", "tsconfig.json",
+    "deno.json", "pyproject.toml", "setup.py", "requirements.txt", "Cargo.toml",
+    "go.mod", "pom.xml", "build.gradle", "CMakeLists.txt", "Makefile",
+    "composer.json", "Gemfile", "project.godot", ".project" },
 }
 ```
 
@@ -465,6 +482,7 @@ sandbox = {
     host_local_block = true,
     block_proxy_evasion = true,      -- proxy-evasion handling (when host_local_block is active): true (default) = pause and prompt (allow once / always this session / deny); "deny" = reject outright (old hard reject); false = do not intercept (bypass allowed, filter boundary defeated). Clearing/bypassing includes unset *proxy, env -u, --noproxy, --proxy "", etc.
     host_local_proxy_port = 0,       -- host filtering proxy port (0 = random loopback port)
+    upstream_proxy = nil,            -- host upstream proxy (chained egress): nil (default) = auto-use the host's https_proxy/http_proxy/all_proxy; false or "" = no chaining (direct); string = explicit URL (http://127.0.0.1:7890 / socks5h://127.0.0.1:1080). When the host itself egresses via an allowlisting proxy, sandbox traffic goes through the filtering proxy and is chained to this upstream, following the host's network policy; host-local targets and no_proxy matches still connect directly
     allow_localhost_ports = {},      -- localhost port allowlist (empty = block all): only loopback + these ports are allowed (e.g. self-testing a service inside the sandbox on 5432/6379); host NIC IPs / link-local / cloud metadata are never allowed. Temporary listeners started by sandbox commands are auto-registered by cgroup membership and need not be listed here
     -- Sandbox network access policy: processes/ports created inside the sandbox (loopback +
     -- allow_localhost_ports + registered service ports) are accessible within the sandbox without
@@ -513,7 +531,7 @@ sandbox = {
     enabled = true, auto_escalate = true, max_tier = 2, record = true,
     tiers = {                       -- per-tier network/extra caps/mounts/unmask/review strictness
       [0] = { name = "minimal", review = "auto", network = true, cap_add = { "CAP_DAC_OVERRIDE", "CAP_SETUID", "CAP_SETGID" }, mounts = {}, unmask = {} }, -- least privilege: `--cap-drop ALL` + baseline CAP_DAC_OVERRIDE (root payload reaches foreign-owner 0700 dirs) + CAP_SETUID/SETGID (drop privileges inside the sandbox for PostgreSQL etc. / runuser / setpriv). network allowed (recorded); host-local intercepted via host_proxy
-      [1] = { name = "elevated", review = "auto", network = true, cap_add = { "CAP_DAC_OVERRIDE", "CAP_SETUID", "CAP_SETGID" }, mounts = {}, unmask = {} }, -- docker.sock is unmasked only for docker commands
+      [1] = { name = "elevated", review = "auto", network = true, cap_add = { "CAP_DAC_OVERRIDE", "CAP_SETUID", "CAP_SETGID" }, mounts = {}, unmask = {} }, -- docker.sock stays masked (the host daemon is never contacted)
       [2] = { name = "privileged", review = "approve", network = true, userns = true, cap_add = { "ALL" }, mounts = {}, unmask = {} }, -- full caps inside the nested userns (scoped); seccomp still applies
     },
     -- System-administration commands (useradd/chown/passwd, ...): on a match, narrowly add back
@@ -534,7 +552,7 @@ sandbox = {
       -- classification so the wrapped command decides the tier (`sudo mount` is still T2); their
       -- privilege-drop need is handled as sysadmin (above).
       { tier = 2, name = "privileged", bins = { "mount", "modprobe", "iptables", "systemctl", "unshare", "nsenter" } },
-      { tier = 1, name = "docker", bins = { "docker", "docker-compose", "nerdctl" } }, -- daemon-backed: controlled socket
+      { tier = 1, name = "docker", bins = { "docker", "docker-compose", "nerdctl" } }, -- fallback classification (the facade normally rewrites these to podman; no socket mounted)
       { tier = 1, name = "container", bins = { "podman", "podman-compose", "buildah", "skopeo" } }, -- daemonless: can share the sandbox namespace
       { tier = 1, name = "network", bins = { "curl", "wget", "ssh", "rsync", "ping", "socat" } },
       { tier = 1, name = "network", bin = "git", subs = { "push", "pull", "fetch", "clone" } },
@@ -542,14 +560,14 @@ sandbox = {
       { tier = 1, name = "package", bins = { "apt", "apt-get", "dnf", "yum", "pacman", "apk", "brew" } }, -- package install: extra rules
     },
   },
-  -- Container facade: docker/nerdctl need a host daemon, so the default is off (explicitly reported as
-  -- "unsupported in the sandbox", never touching the host). Set to controlled with a socket (rootless /
-  -- socket-proxy / dind) to allow a controlled socket explicitly.
-  docker = { mode = "off", socket = "" }, -- off | controlled
-  -- Container facade: daemonless runtimes (podman/buildah) get --net/pid/ipc/uts=host to share the
-  -- sandbox namespace and run containers inside the sandbox; docker/docker-compose are rewritten to
-  -- podman/podman-compose inside the sandbox by default (docker_to_podman=false rejects them); nerdctl
-  -- is rejected by default.
+  -- Deprecated: the sandbox never contacts a host docker daemon; no socket is mounted/connected
+  -- regardless of the value (kept only for backward compatibility).
+  docker = { mode = "off", socket = "" },
+  -- Container facade: docker/docker-compose/nerdctl are always rewritten to podman/podman-compose and
+  -- really executed inside the sandbox (containers follow the sandbox namespaces; writes go to the
+  -- overlay). podman/buildah get --net/pid/ipc/uts=host to share the sandbox namespaces and
+  -- STORAGE_DRIVER=vfs (overlay needs a mount, unavailable inside the sandbox). With no podman or
+  -- docker_to_podman=false, docker commands are disguised as authentic docker errors (no sandbox wording).
   container = { enabled = true, share_namespace = true, prefer = "podman", docker_to_podman = true },
   -- Store base root: each process is isolated under <workspace_root>/instances/<pid>_<ts>; pending queue/candidates are not shared across sessions.
   workspace_root = vim.fn.stdpath("cache") .. "/NeoAI/sandbox",

@@ -161,6 +161,20 @@ session = {
   save_path = ".../NeoAI",
   max_history_per_session = 1000,
   file = "sessions.jsonl",   -- 追加式 JSONL
+  -- 落盘历史对密钥脱敏：真/假密钥一律替换为 `<密钥占位符>` 后再写入，杜绝把密钥持久化到磁盘。
+  -- 仅影响磁盘副本，内存会话仍保留 token（供 detokenize / 界面展示）。false 关闭（不推荐）。
+  redact_secrets = true,
+  -- 工作目录根检测（仅创建会话时；不改变编辑器全局 cwd）：
+  -- 从 cwd 向上按标记定位工作区根写入 metadata.cwd。先找 git_markers（默认 .git，目录或文件，
+  -- 覆盖 worktree 的 .git 文件），未命中再回退 root_markers（工程配置文件）。全部未命中用 cwd。
+  -- 子会话始终继承父会话工作目录；detect_root=false 关闭检测（等价旧行为：直接用 cwd）。
+  -- 资源访问页「工作目录列表」以该会话工作目录为首项（自动放行、不可删除）。
+  detect_root = true,
+  git_markers = { ".git" },
+  root_markers = { ".luarc.json", ".luarc.jsonc", "package.json", "tsconfig.json",
+    "deno.json", "pyproject.toml", "setup.py", "requirements.txt", "Cargo.toml",
+    "go.mod", "pom.xml", "build.gradle", "CMakeLists.txt", "Makefile",
+    "composer.json", "Gemfile", "project.godot", ".project" },
 }
 ```
 
@@ -424,6 +438,7 @@ sandbox = {
     host_local_block = true,
     block_proxy_evasion = true,      -- 代理规避处理（host_local_block 生效时）：true（默认）= 暂停并弹窗询问（仅本次允许/本次会话始终允许/拒绝）；"deny" = 直接拒绝（旧硬拒绝）；false = 不拦截（允许绕过，过滤边界失效）。清除/绕过代理包括 unset *proxy、env -u、--noproxy、--proxy "" 等
     host_local_proxy_port = 0,       -- 宿主过滤代理端口（0 = 自动分配 loopback 随机端口）
+    upstream_proxy = nil,            -- 宿主上游代理（链式出网）：nil（默认）= 自动沿用宿主 https_proxy/http_proxy/all_proxy；false 或 "" = 不链（直连）；字符串 = 显式 URL（http://127.0.0.1:7890 / socks5h://127.0.0.1:1080）。宿主依赖白名单代理出网时，沙箱经过滤代理出网会链到该上游，遵循宿主网络策略；本机目标与 no_proxy 命中者仍直连
     allow_localhost_ports = {},      -- 本机端口白名单（默认空=全拦）：仅放行「回环地址 + 这些端口」的本机访问（如沙箱内服务自测 5432/6379）；宿主网卡 IP/链路本地/云元数据永不放行。沙箱内命令启动的临时监听端口会按 cgroup 归属自动登记免权限，无需在此列出
     -- 沙箱网络访问策略：沙箱内部创建的进程/端口（回环 + allow_localhost_ports + 服务端口登记表）
     -- 在沙箱内访问免权限；访问沙箱外（宿主本机其他端口、宿主网卡、外部主机）按此策略处理：
@@ -463,7 +478,7 @@ sandbox = {
     enabled = true, auto_escalate = true, max_tier = 2, record = true,
     tiers = {                       -- 各档位的网络/额外 cap/挂载/解除遮蔽/审查严格度
       [0] = { name = "minimal", review = "auto", network = true, cap_add = { "CAP_DAC_OVERRIDE", "CAP_SETUID", "CAP_SETGID" }, mounts = {}, unmask = {} }, -- 默认最小权限：cap-drop ALL + 基线 CAP_DAC_OVERRIDE（root 载荷访问他人属主 0700 目录）+ CAP_SETUID/SETGID（沙箱内降权到非 root，供 PostgreSQL 等拒绝 root 的服务/runuser/setpriv）。默认放行网络（仅记录）；本机访问经 host_proxy 拦截
-      [1] = { name = "elevated", review = "auto", network = true, cap_add = { "CAP_DAC_OVERRIDE", "CAP_SETUID", "CAP_SETGID" }, mounts = {}, unmask = {} }, -- docker.sock 仅 docker 命令按需解除遮蔽
+      [1] = { name = "elevated", review = "auto", network = true, cap_add = { "CAP_DAC_OVERRIDE", "CAP_SETUID", "CAP_SETGID" }, mounts = {}, unmask = {} }, -- docker.sock 始终遮蔽（永不连宿主 daemon）
       [2] = { name = "privileged", review = "approve", network = true, userns = true, cap_add = { "ALL" }, mounts = {}, unmask = {} }, -- 嵌套 userns 内完整能力（作用域受限）；seccomp 仍生效
     },
     -- 系统管理命令（useradd/chown/passwd 等）：命中即按需加回窄能力并解除账户库遮蔽，
@@ -480,7 +495,7 @@ sandbox = {
       -- 注：sudo/doas 不在此列——它们是降权包装器，分类时被跳过、由被包裹命令决定档位
       -- （`sudo mount` 仍为 T2）；其降权需求按 sysadmin 处理（见上）。
       { tier = 2, name = "privileged", bins = { "mount", "modprobe", "iptables", "systemctl", "unshare", "nsenter" } },
-      { tier = 1, name = "docker", bins = { "docker", "docker-compose", "nerdctl" } }, -- 有守护进程：受控 socket
+      { tier = 1, name = "docker", bins = { "docker", "docker-compose", "nerdctl" } }, -- 兜底分类（容器门面通常已改写为 podman；不再挂载 socket）
       { tier = 1, name = "container", bins = { "podman", "podman-compose", "buildah", "skopeo" } }, -- 无守护进程：可与沙箱同 namespace
       { tier = 1, name = "network", bins = { "curl", "wget", "ssh", "rsync", "ping", "socat" } },
       { tier = 1, name = "network", bin = "git", subs = { "push", "pull", "fetch", "clone" } },
@@ -488,12 +503,12 @@ sandbox = {
       { tier = 1, name = "package", bins = { "apt", "apt-get", "dnf", "yum", "pacman", "apk", "brew" } }, -- 包安装：额外规则
     },
   },
-  -- 容器门面：docker/nerdctl 依赖宿主守护进程，默认 off（明确报错「沙箱环境不支持」，不碰宿主）。
-  -- 需要时显式设为 controlled 并给出受控 socket（rootless / socket-proxy / dind）。
-  docker = { mode = "off", socket = "" }, -- off | controlled
-  -- 容器门面：podman/buildah 无守护进程运行时注入 --net/pid/ipc/uts=host，与沙箱同 namespace，
-  -- 容器在沙箱内运行；docker/docker-compose 默认改写为 podman/podman-compose 在沙箱内执行
-  -- （docker_to_podman=false 则直接拒绝）；nerdctl 默认拒绝（见上）。
+  -- 已弃用：沙箱永不连宿主 docker daemon，无论取值都不再挂载/连接任何 socket（保留仅为兼容）。
+  docker = { mode = "off", socket = "" },
+  -- 容器门面：docker/docker-compose/nerdctl 一律改写为 podman/podman-compose，在沙箱内真执行
+  -- （容器随沙箱 namespace 隔离、写入进 overlay 暂存）；podman/buildah 注入 --net/pid/ipc/uts=host
+  -- 共享沙箱命名空间，并注入 STORAGE_DRIVER=vfs（overlay 需挂载，沙箱内不可用）。
+  -- 沙箱内无 podman 或 docker_to_podman=false 时伪装为真机样式 docker 错误（不回传沙箱字样）。
   container = { enabled = true, share_namespace = true, prefer = "podman", docker_to_podman = true },
   -- 存储基根：每进程实例隔离在 <workspace_root>/instances/<pid>_<ts>，待审队列/候选跨会话互不可见。
   workspace_root = vim.fn.stdpath("cache") .. "/NeoAI/sandbox",

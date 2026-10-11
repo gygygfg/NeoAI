@@ -611,6 +611,49 @@ local function _maintscript_stubs()
   return state.maint_stubs
 end
 
+--- 生成容器运行时门面入口桩（宿主私有目录）：沙箱内**没有 docker 守护进程**，容器一律走
+--- 无守护进程的 podman。把 `docker`/`docker-compose`/`nerdctl` 链接到 `podman`/`podman-compose`，
+--- 使脚本/管道/复合命令中的容器调用也命中门面（不再只拦命令首个 token）。podman 不可用时，
+--- 注入**禁用桩**：容器命令按真机「docker 守护进程未运行」样式报错，从而禁用容器内操作。
+--- @return table|nil { dir, podman, compose, disabled }
+local function _container_stubs()
+  if state.container_stubs and vim.uv.fs_stat(state.container_stubs.dir) then return state.container_stubs end
+  local podman = (vim.fn.executable("podman") == 1) and vim.fn.exepath("podman") or nil
+  if podman == "" then podman = nil end
+  local compose = (vim.fn.executable("podman-compose") == 1) and vim.fn.exepath("podman-compose") or nil
+  local dir = _private_dir() .. "/container-bin"
+  pcall(vim.fn.mkdir, dir, "p")
+  local function write(name, body)
+    local f = io.open(dir .. "/" .. name, "w")
+    if not f then return false end
+    f:write(body)
+    f:close()
+    pcall(vim.uv.fs_chmod, dir .. "/" .. name, 493) -- 0755
+    return true
+  end
+  if podman then
+    if not write("docker", "#!/bin/sh\nexec " .. podman .. " \"$@\"\n") then return nil end
+    write("nerdctl", "#!/bin/sh\nexec " .. podman .. " \"$@\"\n")
+    if compose then
+      local body = "#!/bin/sh\nexec " .. compose .. " \"$@\"\n"
+      write("docker-compose", body)
+      write("podman-compose", body)
+    end
+    state.container_stubs = { dir = dir, podman = podman, compose = compose, disabled = false }
+    return state.container_stubs
+  end
+  -- 无 podman：禁用容器操作（真机 docker「无守护进程」样式，不含沙箱字样）。
+  local disabled = "#!/bin/sh\n"
+    .. "echo \"Cannot connect to the Docker daemon at unix:///var/run/docker.sock. "
+    .. "Is the docker daemon running?\" >&2\nexit 1\n"
+  if not write("docker", disabled) then return nil end
+  write("nerdctl", disabled)
+  write("docker-compose", disabled)
+  state.container_stubs = { dir = dir, podman = nil, compose = nil, disabled = true }
+  return state.container_stubs
+end
+M._container_stubs = _container_stubs
+
 -- apk（Alpine/musl）镜像 repositories 在沙箱内的挂载点：必须落在 /etc/apk/repositories
 -- （apk 只读该路径），故直接以只读绑定覆盖；/etc 在 read_all 模式下可写，挂载点可创建。
 local APK_REPOS_GUEST = "/etc/apk/repositories"
@@ -1329,7 +1372,8 @@ local function _dir_masks(cwd)
         while true do
           local name = vim.uv.fs_scandir_next(handle)
           if not name then break end
-          if name:sub(1, 1) == "." and name ~= "." and name ~= ".." then
+          -- `.git` 是项目元数据（git 工具必需），不是凭据；不遮蔽，避免「git_add 不生效 / git 操作回退」。
+          if name:sub(1, 1) == "." and name ~= "." and name ~= ".." and name ~= ".git" then
             out[#out + 1] = scope .. "/" .. name
           end
         end
@@ -1344,7 +1388,8 @@ local function _dir_masks(cwd)
           while true do
             local name = vim.uv.fs_scandir_next(handle)
             if not name then break end
-            if name ~= next_child then out[#out + 1] = node .. "/" .. name end
+            -- 同 `_dir_masks`：`.git` 永不遮蔽（git 工具必需，非凭据）。
+            if name ~= next_child and name ~= ".git" then out[#out + 1] = node .. "/" .. name end
           end
         end
         node = node .. "/" .. next_child
@@ -1370,9 +1415,9 @@ local function _mask_entry(path, cwd)
   for _, scope in ipairs(_mask_scopes(cwd)) do
     if _under(path, scope) then
       if scope == cwd then
-        -- cwd 即作用域：仅隐藏子条目被遮蔽
+        -- cwd 即作用域：仅隐藏子条目被遮蔽（`.git` 除外：git 工具必需，非凭据）
         local first = path:sub(#scope + 2):match("^([^/]+)")
-        if first and first:sub(1, 1) == "." then return scope .. "/" .. first end
+        if first and first:sub(1, 1) == "." and first ~= ".git" then return scope .. "/" .. first end
         return nil
       end
       if path == cwd or _under(path, cwd) or _under(cwd, path) then return nil end
@@ -1383,6 +1428,8 @@ local function _mask_entry(path, cwd)
         local child = path:sub(#node + 2):match("^([^/]+)")
         if child == next_child then
           node = node .. "/" .. next_child
+        elseif child == ".git" then
+          return nil -- `.git` 永不遮蔽
         else
           return node .. "/" .. (child or path:sub(#node + 2))
         end
@@ -2822,6 +2869,27 @@ function M.process_prefix(opts)
         local sock = ipc.ensure_private_socket()
         if sock and vim.uv.fs_stat(sock) then
           table.insert(argv, "--ro-bind"); table.insert(argv, sock); table.insert(argv, "/run/systemd/private")
+        end
+      end
+    end
+    -- 容器门面：把 docker/docker-compose/nerdctl 入口桩只读绑定覆盖真实二进制路径（**沙箱内无
+    -- docker 守护进程**，一律走 podman）。如此 `docker …`（含脚本/管道/复合命令）都实际执行 podman，
+    -- 而非仅靠命令首个 token 改写。podman 不可用时不注入（容器操作由门面禁用）。
+    do
+      local cstubs = _container_stubs()
+      if cstubs then
+        for _, name in ipairs({ "docker", "docker-compose", "nerdctl", "podman-compose" }) do
+          local src = cstubs.dir .. "/" .. name
+          if vim.uv.fs_stat(src) then
+            for _, dir in ipairs({ "/usr/local/bin", "/usr/bin", "/bin" }) do
+              local dst = dir .. "/" .. name
+              -- 目标已存在（覆盖真实二进制）或整机根可写（read_all overlay，可新建挂载点）时才绑定；
+              -- 只读根/T2 下不新建挂载点，避免 bwrap 因无法创建目标让整条命令失败。
+              if vim.uv.fs_stat(dst) or (_read_all() and vim.uv.fs_stat(dir)) then
+                table.insert(argv, "--ro-bind"); table.insert(argv, src); table.insert(argv, dst)
+              end
+            end
+          end
         end
       end
     end

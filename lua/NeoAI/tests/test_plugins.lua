@@ -148,6 +148,10 @@ tests.suite("plugins", function(_, it)
   it("services 未知服务名告警一次（拼写诊断），已知未提供不告警", function(t)
     local services = require("NeoAI.kernel.services")
     local logger = require("NeoAI.kernel.logger")
+    -- services.reset() 是全局清空（会注销 chat_service 等本套件后续用例依赖的服务），
+    -- 故此处先快照全部提供方，测试结束后原样恢复。
+    local saved = {}
+    for _, name in ipairs(services.list()) do saved[name] = services.use(name) end
     services.reset()
     local warns = {}
     local orig = logger.warn
@@ -175,6 +179,7 @@ tests.suite("plugins", function(_, it)
     t.eq(0, n3, "非 services.* 前缀不告警")
     logger.warn = orig
     services.reset()
+    for name, impl in pairs(saved) do services.provide(name, impl) end
   end)
 
   it("catalog 禁用插件并移除依赖闭包", function(t)

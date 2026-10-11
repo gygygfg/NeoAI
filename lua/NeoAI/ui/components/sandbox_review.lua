@@ -2013,13 +2013,48 @@ local function _norm_dir(p)
   return fs.canonical(p)
 end
 
+--- 当前会话绑定工作目录（`session.metadata.cwd` / `agent.cwd`）；无会话或未启动时回退编辑器 cwd。
+--- 该目录是工具/命令的缺省工作基准（相对路径解析、遮蔽/越界判定），故在资源访问页作为
+--- 工作目录列表的首项展示（不可删除）。经服务定位器获取 chat_service，缺失时安全降级。
+--- @return string
+local function _session_cwd()
+  local ok, chat = pcall(function() return services.use("services.chat_service") end)
+  if ok and chat and type(chat.get_current_agent) == "function" then
+    local aok, agent = pcall(chat.get_current_agent)
+    local cwd = aok and agent and agent.cwd
+    if type(cwd) == "string" and cwd ~= "" then return _norm_dir(cwd) end
+  end
+  return _norm_dir(vim.fn.getcwd())
+end
+
+--- 工作目录列表的有效条目：会话工作目录（隐式首项，自动放行、不可删除）+ 显式配置项（去重）。
+--- @param snap table `_dirs_snapshot()` 结果
+--- @return table 数组 { path = string, session = boolean, index = number|nil }
+local function _workspace_entries(snap)
+  local entries, seen = {}, {}
+  local sc = snap.session_cwd
+  if type(sc) == "string" and sc ~= "" then
+    seen[sc] = true
+    entries[#entries + 1] = { path = sc, session = true }
+  end
+  for i, d in ipairs(snap.workspace or {}) do
+    local nd = _norm_dir(d)
+    if nd ~= "" and not seen[nd] then
+      seen[nd] = true
+      entries[#entries + 1] = { path = nd, session = false, index = i }
+    end
+  end
+  return entries
+end
+
 --- 当前目录快照（只读）
---- @return table { workspace, mask, mask_enabled, read_all }
+--- @return table { session_cwd, workspace, mask, mask_enabled, read_all }
 local function _dirs_snapshot()
   local cfg = require("NeoAI.kernel.config_store")
   local ws = cfg.get(CFG_DIRS_WS)
   local mask = cfg.get(CFG_DIRS_MASK)
   return {
+    session_cwd = _session_cwd(),
     workspace = type(ws) == "table" and vim.deepcopy(ws) or {},
     mask = type(mask) == "table" and vim.deepcopy(mask) or {},
     mask_enabled = cfg.get(CFG_MASK_ENABLED) ~= false,
@@ -2048,12 +2083,14 @@ local function _build_dirs_section()
   end
   local lvl_ctx = { cwd = _canon_base(vim.fn.getcwd()), home = _canon_base(vim.fn.expand("~")) }
   add("── 目录设置（仅本会话，E 编辑）──", "note")
-  add(string.format("工作目录列表（命令审批自动放行，共 %d）:", #snap.workspace))
-  if #snap.workspace == 0 then
+  local ws_entries = _workspace_entries(snap)
+  add(string.format("工作目录列表（命令审批自动放行，共 %d）:", #ws_entries))
+  if #ws_entries == 0 then
     add("  （空，E 编辑器内按 a 添加）")
   else
-    for i, d in ipairs(snap.workspace) do
-      add(string.format("  %d. %s", i, _one_line(d)), M.level_of(tostring(d), lvl_ctx))
+    for i, e in ipairs(ws_entries) do
+      local suffix = e.session and "（会话工作目录）" or ""
+      add(string.format("  %d. %s%s", i, _one_line(e.path), suffix), M.level_of(e.path, lvl_ctx))
     end
   end
   add(string.format("遮蔽目录列表（命中触发本页审批，共 %d，%s）:", #snap.mask, _mask_state_text(snap)))
@@ -2079,11 +2116,17 @@ local function _refresh_dirs_editor()
   end
   add("⚙ 目录设置（仅本会话，重开 nvim 后恢复默认）")
   add("")
-  add(string.format("─ 工作目录列表（命令审批自动放行，共 %d）─", #snap.workspace))
-  if #snap.workspace == 0 then
+  local ws_entries = _workspace_entries(snap)
+  add(string.format("─ 工作目录列表（命令审批自动放行，共 %d）─", #ws_entries))
+  if #ws_entries == 0 then
     add("  （空，按 a 添加）")
   else
-    for i, d in ipairs(snap.workspace) do add("  " .. _one_line(d), { kind = "workspace", index = i }) end
+    for i, e in ipairs(ws_entries) do
+      local suffix = e.session and "（会话工作目录）" or ""
+      local text = string.format("  %d. %s%s", i, _one_line(e.path), suffix)
+      local entry = e.session and { kind = "session" } or { kind = "workspace", index = e.index }
+      add(text, entry)
+    end
   end
   add("")
   add(string.format("─ 遮蔽目录列表（命中触发资源访问审批，共 %d，%s）─", #snap.mask, _mask_state_text(snap)))
@@ -2100,7 +2143,7 @@ local function _refresh_dirs_editor()
   if dirs_editor.ns then
     vim.api.nvim_buf_clear_namespace(dirs_editor.buf, dirs_editor.ns, 0, -1)
     for ln, e in pairs(map) do
-      local lvl = e.kind == "workspace" and "workspace" or "system"
+      local lvl = (e.kind == "workspace" or e.kind == "session") and "workspace" or "system"
       vim.api.nvim_buf_add_highlight(dirs_editor.buf, dirs_editor.ns, LEVEL_HL[lvl], ln - 1, 2, -1)
     end
   end
@@ -2158,6 +2201,10 @@ local function _edit_remove_dir()
   local entry = dirs_editor.line_map[ln]
   if not entry then
     vim.notify("[NeoAI] 请将光标移到目录行再按 d", vim.log.levels.WARN)
+    return
+  end
+  if entry.kind == "session" then
+    vim.notify("[NeoAI] 会话工作目录不可删除（由会话绑定）", vim.log.levels.WARN)
     return
   end
   local ok, err = M.remove_dir(entry.kind, entry.index)

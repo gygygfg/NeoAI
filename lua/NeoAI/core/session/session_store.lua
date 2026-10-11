@@ -54,6 +54,29 @@ local function _record(log, id, size)
   end
 end
 
+--- 落盘前对会话对象做密钥脱敏：真/假密钥一律替换为 `<密钥占位符>`。
+--- 仅作用于写盘的副本，内存中的会话仍保留 token（供 detokenize 与界面展示）。
+--- 沙箱密钥模块不可用或未启用时原样返回。
+--- @param session table
+--- @return table
+local function _redact_session(session)
+  local cfg = config_store.get("session") or {}
+  if cfg.redact_secrets == false then return session end
+  local ok, secret = pcall(require, "NeoAI.sandbox.secret.secret")
+  if not ok or type(secret) ~= "table" or type(secret.redact_copy) ~= "function" then return session end
+  if secret.enabled and not secret.enabled() then return session end
+  local ok2, out = pcall(secret.redact_copy, session)
+  if ok2 and type(out) == "table" then return out end
+  return session
+end
+
+--- 序列化并脱敏（JSON 编码前统一走此处，杜绝真/假密钥写入历史文件）。
+--- @param session table
+--- @return table
+local function _serialize_redacted(session)
+  return _redact_session(session_mod.serialize(session))
+end
+
 --- 原子重写整个文件（删除/更新时用）
 --- @param path string
 --- @param sessions table
@@ -63,7 +86,7 @@ local function _rewrite_all(path, sessions)
   local sizes = {}
   for id, s in pairs(sessions) do
     if s then
-      local line = json.encode_fast(session_mod.serialize(s))
+      local line = json.encode_fast(_serialize_redacted(s))
       lines[#lines + 1] = line
       sizes[id] = #line + 1
     end
@@ -161,7 +184,8 @@ function M.create(opts)
     end
   end
   -- 会话绑定工作目录（metadata.cwd）：显式 opts.cwd/metadata.cwd 优先；子会话继承父会话；
-  -- 否则记录创建时的 cwd。此后从其他路径重开该会话时以其为工作区基准，不跟随当前 cwd。
+  -- 否则从 cwd 向上按标记（.git 优先，其次工程配置文件）定位工作区根，仍未命中则用 cwd。
+  -- 此后从其他路径重开该会话时以其为工作区基准，不跟随当前 cwd，也不改编辑器全局 cwd。
   opts.metadata = opts.metadata or {}
   if opts.metadata.cwd == nil then
     local cwd = opts.cwd
@@ -169,7 +193,10 @@ function M.create(opts)
       local parent = state.sessions[opts.parent_id]
       cwd = parent and parent.metadata and parent.metadata.cwd
     end
-    opts.metadata.cwd = cwd or vim.fn.getcwd()
+    if not cwd then
+      cwd = require("NeoAI.core.session.workspace_root").detect_from_context() or vim.fn.getcwd()
+    end
+    opts.metadata.cwd = cwd
   end
   if opts.metadata.tags == nil then opts.metadata.tags = {} end
   if opts.metadata.usage == nil then opts.metadata.usage = { prompt = 0, completion = 0 } end
@@ -196,7 +223,7 @@ local function _prepare_persist(session)
   local ok, err = fs.ensure_dir(fs.dirname(path))
   if not ok then return nil, nil, nil, err end
   local json = require("NeoAI.utils.json")
-  local line = json.encode_fast(session_mod.serialize(session)) .. "\n"
+  local line = json.encode_fast(_serialize_redacted(session)) .. "\n"
   local log = state.logs[path]
   if not log then
     local stat = vim.uv.fs_stat(path)

@@ -1663,6 +1663,38 @@ tests.suite("sandbox_review", function(_, it)
     services.provide("services.sandbox", saved)
   end)
 
+  it("资源访问页工作目录列表同步会话工作目录（不可删除）", function(t)
+    local services = require("NeoAI.kernel.services")
+    local sr = require("NeoAI.ui.components.sandbox_review")
+    local config_store = require("NeoAI.kernel.config_store")
+    sr.reset()
+    config_store.load({ tools = { approval = { allowed_directories = {} } } })
+    local saved_sb = services.use("services.sandbox")
+    local saved_chat = services.use("services.chat_service")
+    _provide_sandbox({
+      list_reviews = function() return {} end,
+      list_traces = function() return {} end,
+      list_saved = function() return {} end,
+      apply = function() return { ok = true } end,
+      reject = function() end,
+    })
+    services.provide("services.chat_service", {
+      get_current_agent = function() return { cwd = "/tmp/session-ws" } end,
+    })
+    sr.open()
+    sr.open_page("resource")
+    local text = table.concat(vim.api.nvim_buf_get_lines(sr.get_buf(), 0, -1, false), "\n")
+    t.matches("/tmp/session%-ws", text, "应展示会话工作目录")
+    t.matches("会话工作目录", text, "应标注会话工作目录")
+    local snap = sr.list_dirs()
+    t.eq(0, #snap.workspace, "显式配置列表应为空（会话工作目录单独呈现）")
+    t.eq("/tmp/session-ws", snap.session_cwd, "快照应含会话工作目录")
+    sr.close()
+    services.provide("services.sandbox", saved_sb)
+    services.provide("services.chat_service", saved_chat)
+    config_store.load({})
+  end)
+
   it("资源访问页目录管理 API：增删改生效且去重", function(t)
     local sr = require("NeoAI.ui.components.sandbox_review")
     local config_store = require("NeoAI.kernel.config_store")

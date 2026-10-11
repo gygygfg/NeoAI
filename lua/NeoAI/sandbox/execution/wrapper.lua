@@ -29,6 +29,25 @@ local _rewrite_value, _enc_root, _is_sudo_bin, _split_shell, _cand_paths, _packa
 
 local M = {}
 
+-- 后台命令保活：`run_command` 后台意图（`&`/nohup/setsid）的命令结束后**不回收**其资源域，
+-- 使后台进程跨工具调用 / 跨轮次存活（PID 命名空间不隔离，bwrap 退出也不销毁后台进程）。
+-- 保留的资源域在会话结束 / 沙箱关闭 / 测试重置时统一回收（kill + 删除）。
+local persistent_cgroups = {}
+
+--- 登记一个需保活的资源域（不回收）。
+--- @param handle table cgroup handle
+local function _keep_persistent_cgroup(handle)
+  if handle then persistent_cgroups[#persistent_cgroups + 1] = handle end
+end
+
+--- 回收所有保活的后台资源域（会话结束 / 沙箱关闭 / reset 时调用）。
+function M.release_persistent_backgrounds()
+  if #persistent_cgroups == 0 then return end
+  local cgroup = require("NeoAI.sandbox.execution.cgroup")
+  for _, h in ipairs(persistent_cgroups) do pcall(cgroup.release, h) end
+  persistent_cgroups = {}
+end
+
 --- vim.defer_fn 返回的 libuv 定时器句柄（这里仅用 stop/close）。
 ---@class NeoAIPrewarmTimer
 ---@field stop fun(self: NeoAIPrewarmTimer, ...): any
@@ -43,6 +62,72 @@ local GIT_WRITE_TOOLS = {
   git_restore = true, git_worktree = true,
   git_fetch = true, git_pull = true,
 }
+
+-- 需要访问远程认证的 git 工具：按 `tools.sandbox.git.credentials` 策略只读放开宿主凭据
+-- （`~/.ssh` / git-credentials 等）。这些工具在沙箱内运行且已获用户审批（auto_allow=false）。
+local GIT_HOST_CRED_TOOLS = { git_fetch = true, git_pull = true }
+
+--- git 远程工具可只读访问的宿主凭据路径（按策略；isolate 返回空）。
+--- @return string[] paths
+local function _git_cred_unmask()
+  local cfg = config_store.get("tools.sandbox.git") or {}
+  local mode = cfg.credentials
+  if mode == "isolate" then return {} end
+  local home = vim.fn.expand("~")
+  if home == "" then return {} end
+  local out = { home .. "/.ssh" }
+  -- 未显式配置时默认 host_ssh（只放开 ~/.ssh）；"host" 额外放开 git 凭据存储。
+  if mode == "host" then
+    out[#out + 1] = home .. "/.git-credentials"
+    out[#out + 1] = home .. "/.git-credential-cache"
+    out[#out + 1] = home .. "/.config/git"
+    out[#out + 1] = home .. "/.netrc"
+    out[#out + 1] = home .. "/.config/gh"
+  end
+  return out
+end
+
+--- 构造经沙箱 SOCKS 入口的 SSH `ProxyCommand`（使 `git@github.com:...` 等裸 TCP 也经宿主
+--- 过滤代理出网/受检查）。仅在 `tools.sandbox.git.ssh_proxy` 允许且存在可用中继时返回：
+--- `ssh_proxy=false`/`""` = 关闭；字符串 = 自定义 ProxyCommand；nil/true = auto（优先 socat，
+--- 其次 ncat，均需支持 SOCKS5 且能连到 host_proxy 的 loopback SOCKS 入口）。
+--- @return string|nil
+local function _git_ssh_proxy_command()
+  local cfg = config_store.get("tools.sandbox.git") or {}
+  if cfg.credentials == "isolate" then return nil end
+  local sp = cfg.ssh_proxy
+  if sp == false or sp == "" then return nil end
+  if type(sp) == "string" then return sp end
+  local ok, hp = pcall(require, "NeoAI.sandbox.net.host_proxy")
+  if not ok or not hp or type(hp.address) ~= "function" then return nil end
+  local addr = hp.address()
+  if not addr then return nil end
+  if vim.fn.executable("socat") == 1 then
+    return ("socat - SOCKS5-CONNECT:%s:%d:%%h:%%p"):format(addr.host, addr.port)
+  end
+  if vim.fn.executable("ncat") == 1 then
+    return ("ncat --proxy %s:%d --proxy-type socks5 %%h %%p"):format(addr.host, addr.port)
+  end
+  return nil
+end
+
+--- 为 git 远程工具构造 `GIT_SSH_COMMAND`（使用宿主 ~/.ssh，未知主机按配置 accept-new/严格；
+--- 可选经宿主过滤代理的 SSH ProxyCommand，使 SSH remote 在共享 netns 下也走代理出网）。
+--- @return string|nil
+local function _git_ssh_command()
+  local cfg = config_store.get("tools.sandbox.git") or {}
+  local mode = cfg.credentials
+  if mode == "isolate" then return nil end
+  local home = vim.fn.expand("~")
+  if home == "" then return nil end
+  local check = cfg.ssh_accept_new == false and "yes" or "accept-new"
+  local cmd = ("ssh -F %s -o StrictHostKeyChecking=%s -o UserKnownHostsFile=%s"):format(
+    vim.fn.shellescape(home .. "/.ssh/config"), check,
+    vim.fn.shellescape(home .. "/.ssh/known_hosts"))
+  local pc = _git_ssh_proxy_command()
+  if pc then cmd = cmd .. " -o ProxyCommand=" .. vim.fn.shellescape(pc) end
+  return cmd
+end
 
 -- ========== 性能埋点（tools.sandbox.diagnostics.enabled） ==========
 -- 仅写 NeoAI 日志，不改变行为、不进入模型可见结果。用于定位 run_command 固定开销
@@ -213,6 +298,7 @@ end
 -- 供测试直接验证路径还原与「无暂存路径快速跳过」语义。
 M._rewrite_value = _rewrite_value
 M._rewrite_result = _rewrite_result
+M._git_ssh_command = _git_ssh_command
 
 
 --- 包安装命令的宿主状态目录（可写 overlay 暂存）。仅当命令被判定为包安装时加入可写根，
@@ -1273,7 +1359,7 @@ end
 --- @param _ table
 --- @param spec table
 --- @return Deferred|nil
-local function _maybe_container(attempt, args, _, spec)
+local function _maybe_container(attempt, args, ctx, spec)
   if spec.effect ~= "process" then return nil end
   local cfg = config_store.get("tools.sandbox.container") or {}
   if cfg.enabled == false then return nil end
@@ -1281,7 +1367,7 @@ local function _maybe_container(attempt, args, _, spec)
   local container = require("NeoAI.sandbox.execution.container")
   local plan = container.facade(args.command)
   if not plan then return nil end
-  -- docker → podman 改写：改写在沙箱内执行，容器随沙箱 namespace 隔离。
+  -- docker/docker-compose/nerdctl → podman 改写：改写在沙箱内执行，容器随沙箱 namespace 隔离。
   if plan.mode == "sandbox" and plan.rewritten and plan.command then
     args.command = plan.command
     pcall(function()
@@ -1311,7 +1397,12 @@ local function _maybe_container(attempt, args, _, spec)
       reasons = { plan.reason }, command_id = attempt.command_id,
     })
   end)
-  return async.resolve(container.unsupported_text(plan))
+  -- 真实原因仅用户可见（伪装：不回传模型）。
+  if ctx then
+    ctx.ui_notice = "[NeoAI] 容器门面拒绝（仅用户可见）：manager=" .. tostring(plan.manager)
+      .. " sub=" .. tostring(plan.sub) .. " reason=" .. tostring(plan.reason)
+  end
+  return async.resolve(container.result_text(plan))
 end
 
 --- 会话级常驻沙箱是否适用：仅 `run_command` 的 T0 非包安装进程命令，且运行时可用。
@@ -2021,6 +2112,10 @@ local function _gate_inner(tool, args, ctx, call_original)
       local extra_unmask = {}
       for _, p in ipairs(spec.writable_roots or {}) do extra_unmask[#extra_unmask + 1] = p end
       for _, p in ipairs(attempt.package_roots or {}) do extra_unmask[#extra_unmask + 1] = p end
+      -- git 远程工具：按策略只读放开宿主凭据（SSH 私钥 / known_hosts / git-credentials）。
+      if GIT_HOST_CRED_TOOLS[attempt.tool_name] then
+        for _, p in ipairs(_git_cred_unmask()) do extra_unmask[#extra_unmask + 1] = p end
+      end
       if (type(approved) == "table" and #approved > 0)
         or #extra_unmask > 0 then
         eff_priv = {}
@@ -2058,10 +2153,22 @@ local function _gate_inner(tool, args, ctx, call_original)
           require("NeoAI.kernel.logger").warn("[sandbox] 委派 cgroup 不可用，跳过：%s", tostring(derr))
         end
       end
+      -- 后台命令保活：`run_command` 带后台意图（`&`/nohup/setsid）且未走常驻实例（特权档/常驻
+      -- 不可用）时，**不回收进程树**——命令结束后保留进程（含后台子进程）。做法：不隔离 PID
+      -- 命名空间（否则 bwrap 退出即销毁命名空间、杀死后台进程），并在命令结束后拒绝
+      -- `cgroup.release`（其内含 `cgroup.kill`）。保留的资源域在会话结束/沙箱关闭时统一回收。
+      local persist_bg = false
+      if attempt.tool_name == "run_command" and type(args and args.command) == "string" then
+        local okb, bmod = pcall(require, "NeoAI.sandbox.execution.background")
+        if okb and bmod and type(bmod.parse) == "function" then
+          persist_bg = bmod.parse(args.command) ~= nil
+        end
+      end
+      if persist_bg then attempt.persist_background = true end
       local prefix, perr, eff_cwd = runtime.process_prefix({
         cwd = real_cwd, overlays = active_specs, fallback_cwd = staging,
         session_dir = session_dir, session_tmp_dir = tmp_base, tmpfs_base = tmp_base,
-        privileges = eff_priv,
+        privileges = eff_priv, no_pid_ns = persist_bg,
       })
       if not prefix then return nil, perr end
       if cg_handle then
@@ -2088,6 +2195,14 @@ local function _gate_inner(tool, args, ctx, call_original)
       ctx.sandbox_prefix = prefix
       ctx.sandbox_cwd = eff_cwd
       ctx.sandbox_env = runtime.sandbox_env(eff_priv)
+      -- git 远程工具：注入 GIT_SSH_COMMAND（使用宿主 ~/.ssh；未知主机 accept-new/严格）。
+      if GIT_HOST_CRED_TOOLS[attempt.tool_name] then
+        local sshcmd = _git_ssh_command()
+        if sshcmd then
+          ctx.sandbox_env = ctx.sandbox_env or {}
+          ctx.sandbox_env.GIT_SSH_COMMAND = sshcmd
+        end
+      end
       -- 资源域路径（诊断/归因用）：shell 工具在命令退出（137）时读取 memory/pids 事件判定 OOM。
       ctx.sandbox_cgroup_path = cg_handle and cg_handle.path or nil
       -- token→真实密钥的还原仅限沙箱内部进程：把命令参数中的 NEOKEY_ 还原为真实值后执行，
@@ -2193,7 +2308,15 @@ local function _gate_inner(tool, args, ctx, call_original)
           tostring(res and res.aborted), tostring(res and res.truncated), tostring(ctx.sandbox_oom),
           snap and (" events=" .. vim.inspect(snap)) or "")
       end
-      if cg_handle then cgroup.release(cg_handle) end
+      if cg_handle then
+        if attempt.persist_background and not err and res and not res.timed_out and not res.aborted then
+          -- 后台命令：保留资源域（含后台进程），跨轮次存活；统一在会话结束/关闭时回收。
+          _keep_persistent_cgroup(cg_handle)
+          cg_handle = nil
+        else
+          cgroup.release(cg_handle)
+        end
+      end
       if deleg_handle then cgroup.release_delegated(deleg_handle); deleg_handle = nil end
       if err then
         local mapping = candidate.mapping(attempt.attempt_id)

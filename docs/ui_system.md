@@ -56,7 +56,7 @@
 `M.init()` 幂等，注册三类 UI 实现：
 
 - **审批 UI**：`ui/components/tool_approval.init()`（经 `tool_service.set_approval_ui` 注入）。
-- **向用户提问 UI**：`ui/components/ask_user.init()`（经 `ask_user.set_ui` 注入）。同一轮的多次提问聚合成**一个多 Tab 弹窗**统一作答（顶部 Tab 栏 `✓/○` 标记已答/未答，`<Tab>`/`<S-Tab>` 或 `]`/`[` 切题；`1-9` 选择/多选切换勾选；`i`/回车自由输入；`multi_select` 题目以 `[x]/[ ]` 复选框展示），全部作答后进入**汇总页**（`y`/回车提交、`e` 返回编辑、`Esc` 取消整批）。
+- **向用户提问 UI**：`ui/components/ask_user.init()`（经 `ask_user.set_ui` 注入）。同一轮的多次提问聚合成**一个多 Tab 弹窗**统一作答（对齐 opencode）：顶部 Tab 栏 `✓/○` 标记已答/未答、**当前标签反显加粗**、最右为**「确认」标签**；`h/l`/`←/→`（或 `<Tab>`/`<S-Tab>`、`]`/`[`）切页；`1-9` 选择/多选切换勾选（单选选中不自动跳转），`k/j`/`↑/↓` 移动选项焦点（焦点行背景高亮），`<CR>` 选中焦点选项，`i` 自由输入；`multi_select` 题目以 `[x]/[ ]` 复选框展示。**单题单选选中即提交（不二次确认、无确认标签）**；多选/多题在最右「确认」标签二次确认（`y`/`<CR>` 提交、`h`/`←` 返回编辑、`Esc` 取消整批）。
 - **子 Agent 监控**：`ui/components/sub_agent_dock.init()`。
 
 `open_default()` 按 `ui.default_view`（chat/tree）打开对应界面。
@@ -364,7 +364,7 @@ NeoAI 的聊天/输入框/悬浮窗等都是纯 UI 文本，若 LSP 客户端（
 | `lsp_guard` | 界面 buffer 的 LSP 隔离。`install()`/`uninstall()`/`disable(buf)`；按 `neoai*` filetype 关闭 LSP/Copilot 并解绑已挂载客户端（见 §4.8）。 |
 | `model_picker` | 模型选择器（异步加载模型列表）。`open(callback)`。 |
 | `tool_approval` | 工具审批弹窗。`init()`；串行单槽位展示。 |
-| `ask_user` | 向用户提问弹窗。`init()`；经 `ask_user.set_ui` 注入。同轮多次提问聚合为单窗口多 Tab（Tab 栏 `✓/○` 标记已答），`multi_select` 题以复选框展示，全部作答后进入汇总页二次确认（`e` 返回编辑、`y`/回车提交、Esc 取消整批，见 `ui.ask_user.*` 配置）。 |
+| `ask_user` | 向用户提问弹窗。`init()`；经 `ask_user.set_ui` 注入。同轮多次提问聚合为单窗口多 Tab（Tab 栏 `✓/○` 标记已答、当前标签反显、最右「确认」标签），`multi_select` 题以复选框展示；**单题单选选中即提交**，多选/多题在最右确认标签二次确认（`y`/`<CR>` 提交、`h`/`←` 返回编辑、`Esc` 取消整批，见 `ui.ask_user.*` 配置）。 |
 | `sub_agent_dock` | 子 Agent 状态监控。`init()`。winbar 身份行同时展示子 Agent 名字（超出窗口宽度折叠为 `N个子agent正在运行`，见 `services/status.sub_agents_segment`）；`keymaps.chat.switch_sub_agent`（默认 `<leader>as`）在新窗口打开子 Agent 会话。 |
 | `sub_agent_list` | 子 Agent 列表弹出窗（无边框悬浮窗，相对聊天主窗口顶部居中、`<leader>al` 切换）。`↑/↓`(k/j) 移动、`<CR>` 进入会话、`q`/`<Esc>` 关闭；窗口尺寸变化时重算几何跟随。`open`/`close`/`toggle`/`is_open`/`reset`。 |
 | `terminal_window` | 交互式命令的悬浮**可交互**终端（`nvim_open_term` 渲染，焦点在内时可手动键入转发给命令）。按会话 id 开窗；**仅在聊天光标跟随时弹出**（`show_window` 控制时机：always=会话启动即弹 / on_wait=命令运行超过 `show_window_delay_ms`（默认 2000ms）仍未结束才弹，短命令不弹），跟随跳变时随 `UI_FOLLOW_CHANGED` 隐藏 / 重弹（见 `services.pty`；每次开窗都用新的 `nvim_open_term` 通道，开窗时重放累计输出，避免空白窗口）；headless 下为 no-op。由 `services.pty` 驱动。 |

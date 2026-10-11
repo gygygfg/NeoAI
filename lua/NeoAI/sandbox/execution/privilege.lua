@@ -46,15 +46,9 @@ local TIER_DEFAULTS = {
   },
 }
 
--- 提权失败模式：T0 命令失败时据此建议升级档位（仅发起请求，不静默执行）
+-- 提权失败模式：T0 命令失败时据此建议升级档位（仅发起请求，不静默执行）。
+-- 注：不再有「docker 连接失败 → 升 T1」模式——沙箱永不连宿主 daemon，T1 也不提供 socket。
 local ESCALATION_PATTERNS = {
-  {
-    tier = M.TIER.ELEVATED, reason = "DOCKER_SOCKET_UNAVAILABLE",
-    pats = {
-      "cannot connect to the docker daemon", "is the docker daemon running",
-      "dial unix /var/run/docker.sock", "docker.sock: connect",
-    },
-  },
   {
     tier = M.TIER.ELEVATED, reason = "NETWORK_UNREACHABLE",
     pats = {
@@ -242,10 +236,6 @@ local function _cfg()
   return config_store.get("tools.sandbox.privilege") or {}
 end
 
-local function _docker_cfg()
-  return config_store.get("tools.sandbox.docker") or {}
-end
-
 --- 切分前归一化 shell 重定向语法（仅用于分类，不影响真实执行）：
 --- `2>&1`/`>&2` 的 `&`、`&> file` 的 `&`、`|&` 管道都是重定向符号而非命令分隔符，
 --- 不归一化会把 `apt update 2>&1` 撕成两段、误判为「非纯包安装」而不授予能力。
@@ -372,38 +362,6 @@ local function _tier_cfg(tier)
   for k, v in pairs(d) do out[k] = vim.deepcopy(v) end
   for k, v in pairs(t) do out[k] = vim.deepcopy(v) end
   return out
-end
-
---- 解析 docker 档位应挂载的 socket（受控优先，宿主仅 T2）
---- @param tier number
---- @param want_docker boolean
---- @return table|nil mount
---- @return string|nil err
---- @return string|nil docker_host
-local function _docker_mount(tier, want_docker)
-  if not want_docker then return nil, nil, nil end
-  local d = _docker_cfg()
-  local mode = d.mode or "controlled"
-  if mode == "off" then
-    return nil, "DOCKER_DISABLED", nil
-  end
-  if mode == "host" then
-    if tier < M.TIER.PRIVILEGED then
-      return nil, "DOCKER_HOST_REQUIRES_TIER2", nil
-    end
-    return { src = "/var/run/docker.sock", dst = "/var/run/docker.sock", mode = "rw" }, nil,
-      "unix:///var/run/docker.sock"
-  end
-  -- controlled：指向外部受控 socket（rootless / socket-proxy / dind）
-  local sock = d.socket
-  if type(sock) ~= "string" or sock == "" then
-    return nil, "DOCKER_SOCKET_NOT_CONFIGURED", nil
-  end
-  if vim.uv.fs_stat(sock) == nil then
-    return nil, "DOCKER_SOCKET_UNAVAILABLE: " .. sock, nil
-  end
-  return { src = sock, dst = "/var/run/docker.sock", mode = "rw" }, nil,
-    "unix:///var/run/docker.sock"
 end
 
 -- ========== 公开 API ==========
@@ -642,16 +600,14 @@ function M.resolve(tier, req)
     userns = t.userns == true,
     env = {},
   }
-  if req and req.docker then
-    local mount, err, host = _docker_mount(tier, true)
-    if err then return { ok = false, reason = err } end
-    if mount then priv.mounts[#priv.mounts + 1] = mount end
-    if host then priv.env.DOCKER_HOST = host end
-    -- docker socket 的 rw bind 挂在遮蔽之前，需解除遮蔽才不被空 tmpfs 覆盖。
-    -- 仅 docker 命令（req.docker）解除，不随 T1 档位连带放行（如 pip install）。
-    for _, sock in ipairs({ "/run/docker.sock", "/var/run/docker.sock" }) do
-      if not vim.tbl_contains(priv.unmask, sock) then priv.unmask[#priv.unmask + 1] = sock end
-    end
+  -- 容器命令：沙箱内只走 podman/buildah（无守护进程）。**永不连接宿主 docker daemon**——
+  -- 容器由宿主 daemon 在沙箱外创建、无法约束，且挂载路径改写不是安全边界，故不再挂载/解除
+  -- docker.sock 遮蔽（保持遮蔽；真实 docker 二进制自然报「daemon 未运行」）。
+  -- podman/buildah 在沙箱内运行需要无 mount 的存储后端：overlay graph driver 需挂载（被
+  -- seccomp 拦截），故注入 vfs（容器层落在暂存 overlay 内，写入仍冻结为候选）。
+  if req and (req.container or req.docker) then
+    priv.env.STORAGE_DRIVER = priv.env.STORAGE_DRIVER or "vfs"
+    priv.env.BUILDAH_ISOLATION = priv.env.BUILDAH_ISOLATION or "chroot"
   end
   -- 包安装（受控启动）：dpkg/apt/pip/npm 需要 root 能力（--cap-drop ALL 下 root 失去
   -- DAC_OVERRIDE，连 `_apt` 拥有的 0700 目录都不可写；apt 还需 CAP_CHOWN/SETUID/SETGID 才能

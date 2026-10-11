@@ -111,7 +111,7 @@ tests.suite("sandbox_governance", function(_, it)
     if not ok then error(err, 0) end
   end)
 
-  it("容器受控：podman 注入命名空间共享，docker 走受控 socket", function(t)
+  it("容器受控：podman 注入命名空间共享，docker 标记不可共享", function(t)
     local container = require("NeoAI.sandbox.execution.container")
     local plan = assert(container.plan("podman run -it ubuntu bash"))
     t.eq("podman", plan.manager, "应识别 podman")
@@ -123,9 +123,9 @@ tests.suite("sandbox_governance", function(_, it)
     local plan2 = assert(container.plan("podman run --net=host ubuntu true"))
     t.false_(plan2.rewritten, "已有标志不应重复注入")
     t.true_(plan2.share_namespace, "应识别为共享")
-    -- docker 依赖外部 daemon，无法共享命名空间
+    -- docker 依赖外部 daemon，无法共享命名空间（门面会先改写为 podman）
     local d = assert(container.plan("docker run ubuntu true"))
-    t.eq("controlled", d.mode, "docker 应走受控 socket")
+    t.eq("no_share", d.mode, "docker 标记为不可共享命名空间")
     t.eq("DOCKER_NAMESPACE_NOT_SHARABLE", d.reason)
     t.false_(d.rewritten, "docker 不应重写")
     -- 非容器命令
@@ -137,13 +137,13 @@ tests.suite("sandbox_governance", function(_, it)
     end)
   end)
 
-  it("容器门面：podman 沙箱内、docker 默认拒绝、远程/宿主子命令拒绝", function(t)
+  it("容器门面：podman 沙箱内、docker 无 podman 时伪装为真机错误、远程/宿主子命令拒绝", function(t)
     local container = require("NeoAI.sandbox.execution.container")
     -- podman/buildah 无守护进程 → 沙箱内支持
     t.eq("sandbox", container.facade("podman run ubuntu true").mode)
     t.eq("sandbox", container.facade("buildah bud .").mode)
     t.eq("sandbox", container.facade("sudo podman ps").mode, "应跳过 sudo 前缀")
-    -- docker/nerdctl 默认（docker.mode=off、无 podman）→ 明确拒绝
+    -- docker/nerdctl 且沙箱内无 podman → 拒绝（改写不可用）
     container._set_podman_available(false)
     with_config({ tools = { sandbox = { container = { docker_to_podman = false } } } }, function()
       local d0 = assert(container.facade("docker run ubuntu true"))
@@ -152,7 +152,7 @@ tests.suite("sandbox_governance", function(_, it)
     end)
     local d = assert(container.facade("docker run ubuntu true"))
     t.eq("unsupported", d.mode)
-    t.eq("CONTAINER_PODMAN_UNAVAILABLE", d.reason, "无 podman 时应提示不可替代")
+    t.eq("CONTAINER_PODMAN_UNAVAILABLE", d.reason, "无 podman 时应拒绝（不连宿主 daemon）")
     t.eq("unsupported", container.facade("nerdctl run ubuntu").mode)
     container._set_podman_available(nil)
     -- 远程/连接型与宿主 VM 子命令 → 拒绝
@@ -161,22 +161,26 @@ tests.suite("sandbox_governance", function(_, it)
     t.eq("CONTAINER_SUBCOMMAND_UNSUPPORTED", container.facade("podman machine ls").reason)
     -- 非容器命令
     t.nil_(container.facade("ls -la"))
-    -- 拒绝文案
-    t.matches("沙箱环境不支持", container.unsupported_text(d))
-    t.matches("podman", container.unsupported_text(d))
-    -- 显式受控 socket 时 docker 放行
+    -- 拒绝文案：与真机 docker「daemon 未运行」一致，不含沙箱字样
+    local txt = container.unsupported_text(d)
+    t.matches("Cannot connect to the Docker daemon", txt)
+    t.eq(nil, txt:find("沙箱", 1, true), "不得泄露沙箱字样")
+    t.eq(nil, txt:find("NeoAI", 1, true), "不得泄露 NeoAI 字样")
+    -- 已弃用的 docker.mode/socket 不再影响门面：仍走 podman 改写/拒绝
     local dir = vim.fn.tempname()
     vim.fn.mkdir(dir, "p")
     local sock = dir .. "/docker.sock"
     local f = assert(io.open(sock, "w")); f:close()
     with_config({ tools = { sandbox = { docker = { mode = "controlled", socket = sock } } } }, function()
+      container._set_podman_available(false)
       local c = assert(container.facade("docker ps"))
-      t.eq("controlled", c.mode, "配置受控 socket 后应放行")
+      t.eq("unsupported", c.mode, "弃用的 controlled socket 不再放行")
+      container._set_podman_available(nil)
     end)
     vim.fn.delete(dir, "rf")
   end)
 
-  it("容器门面：docker 改写为 podman（沙箱内），保留引号与参数", function(t)
+  it("容器门面：docker/nerdctl 改写为 podman（沙箱内），保留引号与参数", function(t)
     local container = require("NeoAI.sandbox.execution.container")
     container._set_podman_available(true)
     local p = container.facade("docker run -e \"A=b c\" ubuntu true")
@@ -191,23 +195,18 @@ tests.suite("sandbox_governance", function(_, it)
     t.matches("^podman%-compose up", c.command)
     local s = assert(container.facade("sudo docker ps"))
     t.matches("podman", s.command)
-    -- 关闭改写则拒绝
+    -- nerdctl 同样改写为 podman（不连宿主 containerd/docker daemon）
+    local n = assert(container.facade("nerdctl run ubuntu"))
+    t.eq("podman", n.manager)
+    t.matches("^podman run", n.command)
+    -- 关闭改写则拒绝（伪装为真机错误，不连宿主 daemon）
     with_config({ tools = { sandbox = { container = { docker_to_podman = false } } } }, function()
       t.eq("unsupported", container.facade("docker ps").mode)
     end)
-    -- 显式受控 socket 优先于改写
-    local dir = vim.fn.tempname()
-    vim.fn.mkdir(dir, "p")
-    local sock = dir .. "/docker.sock"
-    local f = assert(io.open(sock, "w")); f:close()
-    with_config({ tools = { sandbox = { docker = { mode = "controlled", socket = sock } } } }, function()
-      t.eq("controlled", container.facade("docker ps").mode)
-    end)
-    vim.fn.delete(dir, "rf")
     container._set_podman_available(nil)
   end)
 
-  it("容器门面：门禁拒绝 docker 且不落宿主机", function(t)
+  it("容器门面：docker 门禁拒绝且回传真机样式错误（不落宿主机、不泄露沙箱）", function(t)
     with_config({
       tools = {
         approval = { mode = "auto_allow" },
@@ -225,9 +224,25 @@ tests.suite("sandbox_governance", function(_, it)
         :then_(function(v) text = v; done = true end, function(e) err = e; done = true end)
       t.true_(vim.wait(15000, function() return done end, 50), "应返回")
       t.eq(nil, err, tostring(err and (err.message or err)))
-      t.matches("不支持", text or "")
-      t.matches("宿主机", text or "")
+      t.matches("Cannot connect to the Docker daemon", text or "")
+      t.eq(nil, (text or ""):find("沙箱", 1, true), "不得泄露沙箱字样")
+      t.eq(nil, (text or ""):find("宿主机", 1, true), "不得泄露宿主机字样")
     end)
+  end)
+
+  it("容器门面：docker/nerdctl 入口桩链接到 podman（脚本/复合命令也走 podman）", function(t)
+    local runtime = require("NeoAI.sandbox.execution.runtime")
+    local st = runtime._container_stubs()
+    t.not_nil(st, "应生成容器运行时入口桩")
+    local f = io.open(st.dir .. "/docker", "r")
+    t.not_nil(f, "应有 docker 入口")
+    local body = f:read("*a"); f:close()
+    if st.disabled then
+      t.matches("Cannot connect to the Docker daemon", body, "无 podman 时应为禁用桩")
+    else
+      t.matches("exec .*podman", body, "有 podman 时 docker 应链接到 podman")
+    end
+    t.true_(vim.uv.fs_stat(st.dir .. "/docker") ~= nil, "入口桩文件应存在")
   end)
 
   it("行为审计：记录观测、累计风险分与异常", function(t)

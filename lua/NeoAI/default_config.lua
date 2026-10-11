@@ -325,6 +325,30 @@ local DEFAULT_CONFIG = {
     save_path = vim.fn.stdpath("cache") .. "/NeoAI",
     max_history_per_session = 1000,
     file = "sessions.jsonl",
+    -- 落盘历史时对密钥脱敏：真/假密钥一律替换为 `<密钥占位符>` 后再写入 `sessions.jsonl`，
+    -- 杜绝把密钥（含沙箱格式保真假密钥）持久化到磁盘。仅影响磁盘副本，内存会话保留 token
+    -- （供 detokenize 与聊天界面展示假/真密钥及值）。`false` 关闭（不推荐）。
+    redact_secrets = true,
+    -- 工作目录根检测（仅创建会话时）：从 cwd 向上查找标记定位工作区根，写入 `metadata.cwd`，
+    -- 作为工具/沙箱的工作基准（相对路径解析、遮蔽/越界判定、run_command overlay cwd）。
+    -- 找到根后**不改变编辑器全局 cwd**。两级有序检测：
+    --   1) `git_markers`（优先）：命中即返回其所在祖先目录（标记可为目录或文件，覆盖 worktree
+    --      的 `.git` 文件）；典型用于把工作目录绑定到 git 仓库根，而非 cwd 子目录。
+    --   2) `root_markers`（回退）：git 未命中时，用工程配置文件定位项目根（如 package.json /
+    --      pyproject.toml 等）。同层多标记命中取先声明者。
+    -- 全部未命中时回退当前 cwd（同关闭检测）。子会话始终继承父会话工作目录，不做检测。
+    detect_root = true, -- 总开关；false 则直接使用 cwd（旧行为）
+    git_markers = { ".git" },
+    root_markers = {
+      ".luarc.json", ".luarc.jsonc",
+      "package.json", "tsconfig.json", "deno.json",
+      "pyproject.toml", "setup.py", "setup.cfg", "requirements.txt",
+      "Cargo.toml", "go.mod",
+      "pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle",
+      "CMakeLists.txt", "Makefile", "meson.build",
+      "composer.json", "Gemfile", "mix.exs",
+      "project.godot", ".project",
+    },
     log_compaction = {
       enabled = true,
       max_redundant_records = 64, -- 旧快照达到此条数时原子合并
@@ -814,6 +838,16 @@ local DEFAULT_CONFIG = {
         block_proxy_evasion = true,
         -- 宿主过滤代理监听端口（0 = 自动分配 loopback 随机端口）。
         host_local_proxy_port = 0,
+        -- 宿主上游代理（链式出网）：沙箱经宿主过滤代理出网时，若宿主本身依赖 HTTP(S)/SOCKS
+        -- 代理出网（企业白名单代理、mihomo/clash 等），直连会因环境无直连出口而失败（表现为
+        -- `github.com:443` CONNECT 403/挂起，而 `api.github.com`/`codeload.github.com` 等
+        -- 白名单主机在宿主侧其实可达）。取值：
+        --   nil（默认）= 自动沿用宿主 `https_proxy`/`http_proxy`/`all_proxy` 环境变量；
+        --   false 或 "" = 不链（直连，旧行为）；
+        --   字符串 = 显式代理 URL，如 "http://127.0.0.1:7890" / "socks5h://127.0.0.1:1080"。
+        -- 本机目标与宿主 `no_proxy` 命中者仍直连；经此链式后，沙箱外命令（含裸 TCP 经
+        -- host_proxy 的 SOCKS5 入口）遵循宿主网络策略/白名单。
+        upstream_proxy = nil,
         -- 本机端口白名单（默认空 = 拦截所有本机目标）：仅放行**回环地址 + 这些端口**的
         -- 本机访问，供沙箱内启动的服务自测（如 DB/Redis：5432/6379）。宿主网卡 IP、链路本地、
         -- 云元数据（169.254.169.254）永不放行。例：{ 5432, 6379 }。
@@ -1176,17 +1210,21 @@ local DEFAULT_CONFIG = {
           "~/.cargo/registry/cache", "~/.cache/go-build",
         },
       },
-      -- 容器门面：AI 调用 docker/podman 等时在沙箱内管理，容器不改变宿主机。
-      --   * podman/buildah（无守护进程）：容器是 CLI 子进程，注入 --net/pid/ipc/uts=host
-      --     共享沙箱命名空间 → 容器在沙箱内运行、写入进 overlay 暂存；
-      --   * docker/nerdctl（依赖宿主守护进程）：默认明确报错「沙箱环境不支持」，不碰宿主；
-      --     仅当显式配置 docker.mode="controlled" 且 socket 存在时才放行受控 socket。
+      -- 容器门面：AI 调用容器运行时一律**在沙箱内真执行**，容器不改变宿主机。
+      --   * docker / docker-compose / nerdctl（依赖宿主守护进程）：**永不连接宿主 daemon**
+      --     （容器由宿主 daemon 在沙箱外创建、无法被命名空间约束，挂载路径改写不是安全边界），
+      --     一律改写为 podman / podman-compose（无守护进程，容器随沙箱命名空间隔离）；
+      --   * podman / buildah（无守护进程）：容器是 CLI 子进程，注入
+      --     `--net/pid/ipc/uts=host` 共享沙箱命名空间 → 容器在沙箱内运行、写入进 overlay 暂存、
+      --     审批后由候选管线应用回真实盘（无需单独的“替换回来”机制）；
+      --   * 沙箱内无 podman 时，docker 命令伪装为真机样式错误（“Cannot connect to the Docker
+      --     daemon …”），真实原因仅进用户 UI/审计，不回传模型。
       container = {
         enabled = true,
         share_namespace = true, -- 对无守护进程运行时注入命名空间共享标志
-        prefer = "podman", -- 优先使用的无守护进程运行时（供提示/文档）
-        -- docker/docker-compose 在沙箱内改写为 podman/podman-compose（无守护进程，容器受沙箱
-        -- 约束）；沙箱内无 podman 时明确报错。设为 false 则 docker 直接拒绝（不改写）。
+        prefer = "podman", -- 无守护进程运行时（供提示/文档）
+        -- docker/docker-compose/nerdctl 在沙箱内改写为 podman/podman-compose（无守护进程，
+        -- 容器受沙箱约束）；设为 false 则 docker 命令伪装为真机样式错误（不连接宿主 daemon）。
         docker_to_podman = true,
       },
       -- 存储基根。每进程实例隔离在 workspace_root/instances/<pid>_<启动时间>，
@@ -1209,6 +1247,32 @@ local DEFAULT_CONFIG = {
       --   "reject"（默认）= 拒绝执行（命令会读到真实磁盘、与只读工具的暂存视图分裂）；
       --   "warn" = 降级执行（提示仅用户可见）。播种覆盖到的根内暂存不算分裂。
       staging_uncovered = "reject",
+      -- git 远程工具（git_fetch/git_pull）的宿主凭据策略。这些工具在沙箱内经宿主网络访问
+      -- 远程（SSH 直连 / HTTPS 经过滤代理），认证需要宿主凭据；取值：
+      --   "host_ssh"（默认）：只读暴露宿主 `~/.ssh`（含 known_hosts/config/私钥），使
+      --             SSH remote（`git@github.com:...`）可在沙箱内认证；并注入
+      --             `GIT_SSH_COMMAND`（accept-new 由 ssh_accept_new 控制）。注意：这会把宿主
+      --             SSH 私钥以只读方式暴露给该次（已获用户审批的）git 工具调用。
+      --   "host"   ：另暴露 `~/.git-credentials`、`~/.config/git`、`~/.git-credential-cache`、
+      --             `~/.netrc`、`~/.config/gh`（HTTPS/token 认证）。
+      --   "isolate"：完全隔离宿主凭据——SSH/凭据类远程将认证失败（改走 HTTPS 公共匿名仓库）。
+      credentials = "host_ssh",
+      -- 使用宿主 `~/.ssh` 时对未知主机名（known_hosts 未收录）的处理：
+      --   true（默认）= `accept-new`（首次自动信任并写入本次会话的 known_hosts 副本）；
+      --   false = `yes`（严格，仅信任宿主 known_hosts 中已有主机）。
+      ssh_accept_new = true,
+      -- SSH 经宿主过滤代理出网（`ProxyCommand`）：使 `git@github.com:...` 等**裸 TCP** SSH
+      -- remote 也经 host_proxy（SOCKS5）出网并受同意门禁/网络策略约束。取值：
+      --   nil/true（默认）= auto：存在 `socat`（优先）或 `ncat` 时注入
+      --             `socat - SOCKS5-CONNECT:<proxy_host>:<port>:%h:%p`；
+      --   false 或 "" = 关闭（SSH 直连，不经代理）；
+      --   字符串 = 自定义 ProxyCommand（`%h`/`%p` 由 ssh 替换）。
+      -- 仅当 `network.host_local_block` 生效（host_proxy 已启动）时 auto 才可用。
+      ssh_proxy = true,
+      -- git 远程名 / 分支名允许字符白名单（Lua pattern，整串匹配）。用于在暴露宿主凭据时
+      -- 防止 `ext::`/URL 等注入形态（git 远程可为外部命令 URL）。默认仅允许安全字符。
+      remote_pattern = "^[%w%._%-]+$",
+      branch_pattern = "^[%w%._/%-]+$",
       -- 无 overlay 播种视图（`true` 时，overlay 不可用的降级/bind 视图会先把可写根的**真实
       -- 内容**复制进会话私有目录，使命令既能看到真实磁盘文件、写入又落私有副本并冻结为候选；
       -- 真实盘保持只读）。仅对配置的可写根（process_roots/包根/cwd）生效，不播种整机 `/`。
@@ -1337,6 +1401,8 @@ local DEFAULT_CONFIG = {
             -- 本机 SSH 服务控制：启动/管理 sshd 或 agent 属特权操作（T2，主机效果需审批）
             "sshd", "ssh-agent", "ssh-add", "ssh-keysign", "gpg-agent",
           } },
+          -- docker/docker-compose/nerdctl：通常在容器门面已被改写为 podman，此处兜底分类
+          -- （复合/脚本内未改写时），使其仍为 T1 网络档；不再挂载/解除 docker.sock 遮蔽。
           { tier = 1, name = "docker", bins = {
             "docker", "docker-compose", "nerdctl",
           } },
@@ -1374,11 +1440,13 @@ local DEFAULT_CONFIG = {
           } },
         },
       },
-      -- 受控 docker：不绑定宿主 /var/run/docker.sock。controlled 指向外部受控 socket
-      -- （rootless dockerd / docker-socket-proxy / dind），仅提权档位挂载。
+      -- 受控 docker（已弃用/无效果）：沙箱**永不连接宿主 docker daemon**——容器由宿主 daemon
+      -- 在沙箱外创建、无法被命名空间约束，挂载路径改写也不是安全边界。docker/docker-compose/
+      -- nerdctl 一律改写为 podman/podman-compose 在沙箱内真执行（见 `container`）。保留键仅为
+      -- 兼容既有配置；socket/mode 均不再被读取。
       docker = {
-        mode = "controlled", -- off（禁用）| controlled（外部受控 socket）| host（宿主 socket，仅 T2）
-        socket = "/run/neoai-docker/docker.sock", -- controlled 模式使用的受控 socket 路径
+        mode = "off", -- 已弃用；无论取值都不再挂载 socket
+        socket = "/run/neoai-docker/docker.sock", -- 已弃用；不再读取
       },
       -- AI 专用沙箱 LSP：AI 的 lsp_* 工具按需克隆编辑器同名 server（名称加 @neoai-sandbox
       -- 后缀），把克隆体放进 bwrap + overlay（工作区根 lower=真实只读，upper=沙箱私有层），

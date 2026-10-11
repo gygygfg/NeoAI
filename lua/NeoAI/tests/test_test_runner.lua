@@ -5,10 +5,15 @@ tests.suite("test_runner", function(_, it)
     local source = debug.getinfo(tests.run_all, "S").source:sub(2)
     local runner = assert(loadfile(source))()
     local glob = vim.fn.glob
+    -- 隔离运行器模拟「全量运行器」：并行运行器在 shard worker 内会设 NEOAI_TEST_MODULES 限定
+    -- 仅加载本分片模块，会旁路掉本套件对「加载任意指定文件」的断言；此处临时清除该过滤。
+    local saved_modules = vim.env.NEOAI_TEST_MODULES
+    vim.env.NEOAI_TEST_MODULES = nil
     ---@diagnostic disable-next-line: duplicate-set-field
     vim.fn.glob = function() return files end
     local ok, err = xpcall(function() fn(runner) end, function(e) return e end)
     vim.fn.glob = glob
+    vim.env.NEOAI_TEST_MODULES = saved_modules
     if not ok then error(err, 0) end
   end
 

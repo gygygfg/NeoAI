@@ -446,14 +446,14 @@ local shell_tools = {}
 local RUN_COMMAND_DESC_BASE =
   "执行 Shell 命令（前台，单次调用内完成）。同 opencode bash（command, timeout_ms；默认 30000ms，-1 不限时）。"
   .. "长任务（安装/编译/下载）请在同一次调用内显式传较大 timeout_ms（如 600000），不要靠重试规避超时。"
-  .. "`&`/nohup/setsid 后台进程仅在会话使用常驻沙箱时跨轮次存活，否则命令结束即回收，输出请重定向到文件。"
+  .. "`&`/nohup/setsid 后台进程跨轮次存活（命令结束不回收进程树），输出请重定向到文件。"
 
 -- 交互式（PTY）：标明可交互。
 local RUN_COMMAND_DESC_INTERACTIVE =
   "执行 Shell 命令（交互式 PTY，可自动应答等待输入）。同 opencode bash（command, timeout_ms；默认 30000ms，-1 不限时）。"
   .. "命令一旦等待输入，系统按 description 自动应答（输入/按键/结束），也可用 terminal_send_text/terminal_send_keys/terminal_kill 精确控制。"
   .. "description 请写清目标与预期（如“安装依赖，提示是否继续选 y”）。多轮交互请传足够大 timeout_ms（如 120000~600000）。"
-  .. "后台进程（&/nohup/setsid）不跨调用存活，输出请重定向到文件。"
+  .. "后台进程（&/nohup/setsid）跨轮次存活（命令结束不回收进程树），输出请重定向到文件。"
 
 shell_tools.run_command = helpers.define_tool(
   "run_command",
@@ -471,17 +471,9 @@ shell_tools.run_command = helpers.define_tool(
     -- 优先使用它，`args.command`（UI/证据）仍保留 token。
     local command = (ctx and ctx.sandbox_command) or args.command
     local signal = ctx and ctx.signal
-    -- 后台意图提示：常驻实例可用时后台进程跨调用存活；否则命令在一次性 pid 命名空间 +
-    -- 资源域内运行，命令结束即 `cgroup.kill` 回收整个进程树，后台进程不会存活。明确告知
-    -- 用户（仅 UI，不写入模型可见结果），避免误以为后台任务仍在运行。
-    if ctx and not ctx.sandbox_resident then
-      local bg = require("NeoAI.sandbox.execution.background").parse(command)
-      if bg then
-        ctx.ui_notice = "[NeoAI] 注意：本次命令请求后台执行（`&`/nohup/setsid），但当前会话未使用"
-          .. "常驻沙箱（如 overlay 不可用或特权档），命令结束后后台进程会被回收，不会跨调用存活。"
-          .. "请改用前台命令，或在同一次调用内完成长任务。"
-      end
-    end
+    -- 后台命令保活：`&`/nohup/setsid 后台进程跨工具调用 / 跨轮次存活——常驻实例路径在会话级
+    -- 命名空间内执行；非常驻路径（特权档/常驻不可用）不隔离 PID 命名空间且不回收进程树，
+    -- 后台进程同样跨轮次保活（由沙箱在会话结束/关闭时统一回收）。此处不再提示「会被回收」。
     -- 代理策略：默认不把宿主代理（如不可达的 127.0.0.1:7890）传入沙箱，
     -- 避免 pip/npm 等按代理配置走网络时 Connection refused；仅 opencode 自身用代理。
     local unset_proxy = require("NeoAI.sandbox.execution.runtime").proxy_unset_snippet()

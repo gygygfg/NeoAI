@@ -176,6 +176,8 @@ function M.shutdown()
   pcall(function() require("NeoAI.sandbox.execution.service").stop_all({ timeout_ms = 10000 }) end)
   -- 停止会话级常驻沙箱实例（连同其命名空间内的后台进程）。
   pcall(function() require("NeoAI.sandbox.execution.resident").stop({ timeout_ms = 2000 }) end)
+  -- 回收保活的后台命令资源域（run_command 后台意图命令跨轮次存活，仅在关闭时统一回收）。
+  pcall(function() require("NeoAI.sandbox.execution.wrapper").release_persistent_backgrounds() end)
   -- 卸载用户态 overlay（fuse-overlayfs）兜底挂载，避免残留挂载点影响后续/清理。
   pcall(function() require("NeoAI.sandbox.execution.runtime").fuse_release_all() end)
   -- 先等后台后处理（异步模式下命令结果已返回、捕获/冻结/结算未完成）与异步写入落盘，
@@ -931,6 +933,8 @@ function M.reset()
   pcall(function() require("NeoAI.sandbox.execution.service").reset() end)
   -- 停止会话级常驻沙箱实例（连同其后台进程与资源域）。
   pcall(function() require("NeoAI.sandbox.execution.resident").reset() end)
+  -- 回收保活的后台命令资源域（先于 `cgroup.reset()`，以便在句柄状态被清空前 kill + 删除）。
+  pcall(function() require("NeoAI.sandbox.execution.wrapper").release_persistent_backgrounds() end)
   candidate.reset()
   control.reset()
   store.reset()

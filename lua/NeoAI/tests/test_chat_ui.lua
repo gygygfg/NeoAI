@@ -1838,7 +1838,7 @@ tests.suite("chat_ui", function(_, it)
     return false
   end
 
-  it("ask_user 多 Tab：切题、多选勾选、汇总页提交", function(t)
+  it("ask_user 多 Tab：左右/hl 切页、选项焦点、最右确认标签提交", function(t)
     local au = require("NeoAI.ui.components.ask_user")
     au.reset()
     local got = {}
@@ -1859,28 +1859,39 @@ tests.suite("chat_ui", function(_, it)
     local st = au.get_state()
     t.eq("tab", st.mode)
     t.eq(1, st.active, "初始激活第 1 题")
+    -- 顶部 tab 栏含题目与最右「确认」标签
+    local bar = table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n")
+    t.true_(bar:find("[确认]", 1, true) ~= nil, "最右侧应有确认标签")
 
-    -- 单选第 1 题选项 1（A）
+    -- 单选第 1 题选项 1（A）——选中不自动跳转，留在本题
     t.true_(invoke_map(buf, "n", "1"), "应绑定数字键")
     t.eq("A", au.get_state().answers[1], "单选应记录选中 label")
-    t.eq("tab", au.get_state().mode, "尚有未答题，不进汇总页")
+    t.eq(1, au.get_state().active, "单选后留在本题（手动切页）")
+    t.eq("tab", au.get_state().mode)
 
-    -- 切到第 2 题（<Tab>），多选勾选 X 与 Z
-    t.true_(invoke_map(buf, "n", "<Tab>"))
-    t.eq(2, au.get_state().active, "<Tab> 应切到下一题")
+    -- 右方向键切到第 2 题，多选勾选 X 与 Z
+    t.true_(invoke_map(buf, "n", "<Right>"), "应绑定右方向键")
+    t.eq(2, au.get_state().active, "<Right> 应切到下一题")
     invoke_map(buf, "n", "1") -- X
     t.eq("X", au.get_state().answers[2], "多选首项即当前答案")
     invoke_map(buf, "n", "3") -- Z
     t.eq("X, Z", au.get_state().answers[2], "多选答案以 ', ' 连接")
+    t.eq("tab", au.get_state().mode, "多选不自动确认，留在本题")
 
-    -- 全部作答 → 汇总页
-    t.eq("summary", au.get_state().mode, "全部作答后进入汇总页")
+    -- h 左切回第 1 题；l 右切到最右确认标签
+    t.true_(invoke_map(buf, "n", "h"), "应绑定 h 切页")
+    t.eq(1, au.get_state().active, "h 应切到上一题")
+    invoke_map(buf, "n", "l")
+    invoke_map(buf, "n", "l")
+    t.eq("confirm", au.get_state().mode, "l 应切到最右确认标签")
+    t.eq(3, au.get_state().active, "确认标签位于题目之后")
+
     local lines = table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n")
-    t.true_(lines:find("汇总", 1, true) ~= nil, "汇总页应展示标题")
-    t.true_(lines:find("X, Z", 1, true) ~= nil, "汇总页应展示各题答案")
+    t.true_(lines:find("确认提交", 1, true) ~= nil, "确认页应展示标题")
+    t.true_(lines:find("X, Z", 1, true) ~= nil, "确认页应展示各题答案")
 
-    -- 汇总页提交
-    t.true_(invoke_map(buf, "n", "<CR>"), "汇总页应绑定提交键")
+    -- 确认页提交
+    t.true_(invoke_map(buf, "n", "<CR>"), "确认页应绑定提交键")
     t.not_nil(got.answers, "提交应回传答案数组")
     t.eq("A", got.answers[1])
     t.eq("X, Z", got.answers[2])
@@ -1888,12 +1899,37 @@ tests.suite("chat_ui", function(_, it)
     au.reset()
   end)
 
-  it("ask_user 汇总页返回编辑并保持未作答状态", function(t)
+  it("ask_user 单题单选：选中即提交（无二次确认、无确认标签）", function(t)
     local au = require("NeoAI.ui.components.ask_user")
     au.reset()
     local got = {}
     au.show({
-      batch_id = "summary_edit",
+      batch_id = "single_direct",
+      questions = { { question = "Q", options = { "A", "B" }, multi_select = false } },
+      active = 1,
+      mode = "tab",
+      require_confirm = true,
+      on_submit = function(a) got.answers = a end,
+      on_cancel = function() end,
+    })
+    local buf = au.get_buf()
+    t.not_nil(buf)
+    local lines = table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n")
+    t.true_(lines:find("[确认]", 1, true) == nil, "单题单选不应有确认标签")
+    -- 选中第 2 项 → 立即提交
+    t.true_(invoke_map(buf, "n", "2"))
+    t.not_nil(got.answers, "单题单选应直接提交")
+    t.eq("B", got.answers[1])
+    t.nil_(au.get_buf(), "提交后应关闭弹窗")
+    au.reset()
+  end)
+
+  it("ask_user 最右确认标签可返回编辑并保持未作答状态", function(t)
+    local au = require("NeoAI.ui.components.ask_user")
+    au.reset()
+    local got = {}
+    au.show({
+      batch_id = "confirm_edit",
       questions = {
         { question = "Q1", options = { "A", "B" } },
         { question = "Q2", options = { "X", "Y" }, multi_select = true },
@@ -1906,16 +1942,18 @@ tests.suite("chat_ui", function(_, it)
     })
     local buf = au.get_buf()
     invoke_map(buf, "n", "1") -- Q1 = A
-    invoke_map(buf, "n", "<Tab>")
-    invoke_map(buf, "n", "1") -- Q2 = X
-    t.eq("summary", au.get_state().mode)
-    -- 汇总页 e 返回编辑
-    t.true_(invoke_map(buf, "n", "e"), "汇总页应绑定返回编辑键")
-    t.eq("tab", au.get_state().mode, "e 应返回编辑页")
+    invoke_map(buf, "n", "<Tab>") -- 切到 Q2
+    invoke_map(buf, "n", "1") -- Q2 = X（多选勾选）
+    invoke_map(buf, "n", "l") -- 到确认标签
+    t.eq("confirm", au.get_state().mode)
+    -- h 返回编辑（回到 Q2）
+    t.true_(invoke_map(buf, "n", "h"), "确认页应可 h 返回编辑")
+    t.eq(2, au.get_state().active, "h 应回到 Q2")
+    t.eq("tab", au.get_state().mode, "应返回题目标签页")
     -- 取消已勾选（多选再点一次 X）→ Q2 变为未作答
     invoke_map(buf, "n", "1")
     t.nil_(au.get_state().answers[2], "取消勾选后该题应为未作答")
-    t.eq("tab", au.get_state().mode, "存在未答题时不进汇总页")
+    t.eq("tab", au.get_state().mode, "存在未答题时不应在确认页")
     au.reset()
   end)
 

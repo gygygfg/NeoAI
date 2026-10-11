@@ -311,7 +311,7 @@ tests.suite("sandbox_background", function(_, it)
     end)
   end)
 
-  it("run_command：非常驻（resident 关闭）时后台意图给出 UI 提示", function(t)
+  it("run_command：非常驻（resident 关闭）时后台进程仍跨调用存活（不回收进程树）", function(t)
     local runtime = require("NeoAI.sandbox.execution.runtime")
     if runtime.backend() ~= "bwrap" then return end
     with_config({
@@ -321,14 +321,19 @@ tests.suite("sandbox_background", function(_, it)
       },
     }, function()
       require("NeoAI.sandbox").reset()
-      local ctx = {}
-      local done = false
-      require("NeoAI.tools").execute("run_command",
-        { command = "sleep 1 &", description = "t" }, ctx)
-        :then_(function() done = true end, function() done = true end)
-      t.true_(vim.wait(20000, function() return done end, 50), "应返回")
-      t.not_nil(ctx.ui_notice, "应给出后台进程不存活的 UI 提示")
-      t.matches("后台", ctx.ui_notice)
+      local function run(cmd)
+        local out, done = nil, false
+        require("NeoAI.tools").execute("run_command", { command = cmd, description = "t" }, {})
+          :then_(function(v) out = v; done = true end, function() done = true end)
+        t.true_(vim.wait(20000, function() return done end, 50), "应返回")
+        return out
+      end
+      -- 非常驻路径：命令结束不回收进程树，后台进程应在宿主侧仍存活（未被 cgroup.kill）。
+      run("setsid sh -c 'sleep 45 neoai_bg_keepalive' & echo started")
+      local alive = tostring(vim.fn.system("pgrep -af 'sleep 45 neoai_bg_keepalive' 2>/dev/null"))
+      t.matches("sleep 45", alive, "非常驻时后台进程也应保活（未被回收）")
+      -- 清理：统一回收保活资源域（kill 掉残留 sleep）。
+      pcall(function() require("NeoAI.sandbox.execution.wrapper").release_persistent_backgrounds() end)
     end)
   end)
 end)

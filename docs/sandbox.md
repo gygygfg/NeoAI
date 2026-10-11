@@ -481,7 +481,9 @@ token（`NEOKEY_…`）或格式保真假密钥时**拒绝写盘**（`SECRET_TOK
     （命令 → 涉及文件，`i` 查看该命令越界访问的文件）及行为审计异常（L2+，仅记录）。阻塞类条目由来源模块
     （`tool_service` / `net_consent`）提交并镜像；独立弹窗仍作即时通道，窗口内亦可决策
     （`<CR>` 仅本次 / `S` 本次会话 / `d` 拒绝，决策幂等）。
-    - **资源访问页的「目录设置」区**（仅本会话）：页内可见工作目录/遮蔽目录列表，按 `E` 打开目录
+    - **资源访问页的「目录设置」区**（仅本会话）：页内可见工作目录/遮蔽目录列表。工作目录列表首项为
+      **会话工作目录**（`session.metadata.cwd` / `agent.cwd`，创建会话时按 `.git`/工程配置文件定位，
+      自动放行、不可删除），其后为显式配置项；按 `E` 打开目录
       编辑器浮窗——`a` 加工作目录（`tools.approval.allowed_directories`，命令审批自动放行）、`A` 加
       遮蔽目录（`tools.sandbox.mask_dirs`，命中触发本页审批）、`d` 删除光标处目录、`t` 切换遮蔽目录
       总开关（`tools.sandbox.mask_dirs_enabled`）、`q`/`Esc` 关闭。改动经 `config_store.set` 热更新
@@ -1393,7 +1395,10 @@ seccomp（含设备节点屏障）**——沙箱内进程看到的是一份「�
   （默认 `/home`、`/root`）下时，仅把「含 cwd 的用户 home」以只读暴露
   （`/home` 取一级用户子目录，其他遮蔽目录取自身），并沿 cwd 祖先链遮蔽其兄弟条目
   （含隐藏文件/目录）；cwd 子树自身豁免，cwd 即作用域时遮蔽其隐藏子条目（凭据类 dotfile）。
-  其他用户 home 不在白名单内，默认不可见。总开关 `mask_dirs_enabled`（默认开）。
+  **项目 `.git` 永不遮蔽**：`.git` 是 git 工具必需的仓库元数据（非凭据），沿祖先链遮蔽兄弟条目时
+  以及 cwd 即作用域遮蔽隐藏条目时均跳过 `.git`（否则 cwd 为仓库子目录时 `.git` 被遮蔽，导致
+  `git_add` 写入索引失败/ git 操作回退）。其他用户 home 不在白名单内，默认不可见。总开关
+  `mask_dirs_enabled`（默认开）。
   - **审批放行**：工具参数命中遮蔽条目时，即使处于 `async` 模式也弹窗审批
     （复用 `tool_service` / `ui/components/tool_approval`）；批准后仅对该次调用解除对应
     遮蔽条目（`ctx.sandbox_unmask` → 运行时 unmask），拒绝则终止该工具调用。
@@ -1464,6 +1469,15 @@ seccomp（含设备节点屏障）**——沙箱内进程看到的是一份「�
   `network.extra_package_sources` 追加私有源域名后缀（子域自动匹配）；`auto_allow_sources=false`
   关闭该放行。内置列表另含代码托管 `github.com`/`githubusercontent.com`（子域自动匹配），
   `git_fetch`/`git_pull`/`git clone` 等对 GitHub 的访问默认免弹窗。
+- **宿主上游代理链式出网（`network.upstream_proxy`，默认自动）**：当宿主本身依赖
+  HTTP(S)/SOCKS 白名单代理出网（企业代理、mihomo/clash 等）时，沙箱经 `host_proxy` 出网若仍
+  「直连」，会因环境无直连出口而失败（典型表现：`github.com:443` CONNECT 403/挂起，而
+  `api.github.com`/`codeload.github.com` 等白名单主机在宿主侧其实可达）。此时 `host_proxy`
+  会链到宿主上游代理（`http`/`socks5h`；`https://` 上游暂不支持，fail-closed），使**所有**经
+  代理出网的沙箱命令（含经 SOCKS5 入口的裸 TCP 感知工具）遵循宿主网络策略/白名单。取值：
+  `nil`（默认）= 自动沿用宿主 `https_proxy`/`http_proxy`/`all_proxy`；`false`/`""` = 不链
+  （直连）；字符串 = 显式 URL（`http://127.0.0.1:7890` / `socks5h://127.0.0.1:1080`）。
+  本机目标与宿主 `no_proxy` 命中者始终直连。
 - **边界（重要）**：这是**应用层**过滤。**不认代理的裸 TCP**（`nc`/`ssh`/数据库客户端、
   忽略代理变量的工具）在共享 netns 下可直连宿主本机，不受此层约束。要硬拦截裸 TCP 只能：
   root + iptables/nft（按目的地过滤），或无 root 的 `slirp4netns`/`passt`（原生用户态
@@ -1563,6 +1577,7 @@ require("NeoAI").setup({
       network = {
         host_local_block = true,     -- 拦截向宿主本机的访问（应用层；裸 TCP 不覆盖，见 §6.1）
         host_local_proxy_port = 0,   -- 宿主过滤代理端口（0 = 自动分配 loopback 随机端口）
+        upstream_proxy = nil,        -- 宿主上游代理链式出网：nil=自动沿用宿主 *_PROXY；false/""=不链；字符串=显式 URL
         proxy = "strip",             -- strip | passthrough | { http, https, all, no_proxy }
       },
       seccomp = { enabled = true, filter_path = "" }, -- 内置 denylist 过滤器；仅 bwrap 后端
@@ -1988,8 +2003,13 @@ UI 未注册但为**交互式 Neovim** 时，回退到内建 `confirm` **暂停�
 > 渲染出「密钥环境变量：SANDBOX_SECRET_BLOCKED」这类无意义告警。
 > 折叠标题保持干净（不再追加 `⚠ 密钥`），收起状态也能看到独立的高亮警告行。含密钥时工具调用的
 > **参数与结果完整展示（不截断）**，行内命中的密钥值（假密钥 / 具名规则原始密钥）以同组
-> 高亮；轨迹显示模式在工具行追加同款文本标记并同样行内高亮。见
-> `ui/components/message_list.lua`、`ui/components/fold.lua`。
+> 高亮；轨迹显示模式在工具行追加同款文本标记并同样行内高亮。告警额外**逐条列出命中的密钥值并
+> 标明真伪**：`· 假密钥：<沙箱 token 值>` / `· 真密钥：<未假化的原始凭据值>`（如私钥块等超长值
+> 单行化并限长）；界面直接展示「使用的是假密钥还是真密钥及密钥值」。
+> **落盘历史脱敏**：`session_store` 写 `sessions.jsonl` 前对会话对象做深拷贝脱敏
+> （`secret.redact_copy`），命中的真/假密钥**一律**替换为 `<密钥占位符>`（`session.redact_secrets`，
+> 默认开）；仅磁盘副本被脱敏，内存会话仍保留 token 供 detokenize 与界面展示。见
+> `ui/components/message_list.lua`、`ui/components/fold.lua`、`core/session/session_store.lua`。
 >
 > **观测优先（eBPF/strace/procfs）**：默认由 `tools.sandbox.observe` 在内核层观测沙箱进程
 > 真实打开的密钥文件（`openat/open`，按 attempt cgroup 精确归属），命中即在对应工具块告警并
@@ -2196,7 +2216,7 @@ UI 未注册但为**交互式 Neovim** 时，回退到内建 `confirm` **暂停�
 | 档 | 名称 | 用途 | 隔离 | 审查 |
 |---|---|---|---|---|
 | **T0** | minimal | 普通命令 | `--cap-drop ALL` + 档位基线 `CAP_DAC_OVERRIDE`，按命令**窄范围**加回（包安装 `packages.cap_add`、系统管理 `privilege.sysadmin.cap_add`）+ 主机全局能力收敛（`cap_drop`：网络/时钟/模块/裸 I/O/重启/MAC/审计）+ seccomp（含设备节点屏障）+ 遮蔽 + overlay 暂存 + **默认放行网络（经 host_proxy 拦截本机，见 §6.1）** | 无逐命令审查；fs 改动进待审队列 |
-| **T1** | elevated | 网络访问、受控 docker、包安装、系统管理 | 隔离内执行，网络放行；基线 `CAP_DAC_OVERRIDE`；含包管理器的命令（`req.package`，含链式）按 `packages.cap_add` 加回窄能力；系统管理命令（`useradd`/`chown`/`passwd` 等，`req.sysadmin`）按 `privilege.sysadmin.cap_add` 加回窄能力并解除账户库遮蔽；docker.sock 仅 docker 命令解除遮蔽 | 自动授权、留痕；fs 改动进待审队列 |
+| **T1** | elevated | 网络访问、容器（podman）、包安装、系统管理 | 隔离内执行，网络放行；基线 `CAP_DAC_OVERRIDE`；含包管理器的命令（`req.package`，含链式）按 `packages.cap_add` 加回窄能力；系统管理命令（`useradd`/`chown`/`passwd` 等，`req.sysadmin`）按 `privilege.sysadmin.cap_add` 加回窄能力并解除账户库遮蔽；`docker.sock` 始终遮蔽（永不连宿主 daemon） | 自动授权、留痕；fs 改动进待审队列 |
 | **T2** | privileged | cap_add、宿主 socket、宿主挂载 | **嵌套 userns** 内执行并授予完整能力（cap 被 userns 作用域限制，够不到宿主；seccomp 基线仍生效） | 主机效果冻结为**提案**，异步审批后 replay |
 
 - 分类：`privilege.classify()` 解析命令，`docker/podman`→T1，`curl/git push/pip/npm`→T1 网络，
@@ -2221,33 +2241,32 @@ UI 未注册但为**交互式 Neovim** 时，回退到内建 `confirm` **暂停�
   `auto_escalate=false` 关闭。
 - 留痕：每次档位裁决/升级记录证据（`record=true` 默认开）与事件。
 
-### 受控 docker（方案：外部受控 socket）
+### 容器（方案：只走 podman，永不连宿主 docker daemon）
 
-沙箱**不绑定宿主 `/var/run/docker.sock`**（默认遮蔽）。`tools.sandbox.docker.mode="controlled"`
-时，T1 把 `docker.socket` 指向的**受控 socket** bind 到沙箱内 `/var/run/docker.sock`，并注入
-`DOCKER_HOST=unix:///var/run/docker.sock`。受控 socket 由部署侧提供：
+沙箱**永不绑定宿主 `/var/run/docker.sock`**（始终遮蔽）。容器命令一律在沙箱内**真执行**：
 
-```bash
-# 1) rootless dockerd（推荐：容器 root ≠ 宿主 root）
-dockerd-rootless-setuptool.sh install
-# socket 通常位于 /run/user/<uid>/docker.sock
-#   tools.sandbox.docker.socket = "/run/user/1000/docker.sock"
-
-# 2) docker-socket-proxy（对宿主 socket 做 API 白名单过滤，仅暴露只读/受限端点）
-docker run -d --name neoai-docker-proxy \
-  -v /var/run/docker.sock:/var/run/docker.sock:ro \
-  -e CONTAINERS=1 -e IMAGES=1 -e EXEC=0 -e POST=0 -e VOLUMES=0 \
-  -p 127.0.0.1:2375:2375 tecnativa/docker-socket-proxy
-#   docker.socket = "/path/to/exposed/docker.sock"（经 TCP→unix 转发）
-
-# 3) DinD 边车（独立 daemon，隔离于宿主）
-#   docker.socket = "<dind 容器挂载出的 docker.sock>"
-```
-
-`mode="off"`（**默认**）：容器门面直接拒绝 docker/nerdctl，返回「沙箱环境不支持 docker…请改用
-podman」，不碰宿主、不回退 hostop（见 §18.3）。`mode="controlled"`：显式提供受控 socket 时按
-上表 bind 到沙箱内（容器由受控 daemon 创建，属部署侧显式选择）。`mode="host"` 已不再由容器门面
-放行（会触及宿主）；如需宿主 daemon 请在宿主手动执行。
+- `docker` / `docker-compose` / `nerdctl`（依赖宿主守护进程）：容器由宿主 daemon 在沙箱外创建、
+  无法被命名空间约束，挂载路径改写也不是安全边界，故**永不连接宿主 daemon**——一律改写为
+  `podman` / `podman-compose`（无守护进程，容器是沙箱内 CLI 的子进程，随沙箱命名空间隔离）。
+  **入口桩（文件链接）**：`process_prefix` 把 `docker`/`docker-compose`/`nerdctl` 入口桩
+  （`#!/bin/sh; exec <podman> "$@"`）**只读绑定覆盖真实二进制路径**（`/usr/local/bin`、
+  `/usr/bin`、`/bin`），使**脚本/管道/复合命令中的容器调用**（如 `echo x; docker ps`）也一律走
+  podman，而非仅靠命令首个 token 改写；`which docker` 命中入口桩。
+- `podman` / `buildah`：注入 `--net/pid/ipc/uts=host` 共享沙箱命名空间；容器写入落 overlay 暂存、
+  冻结为候选，用户审批后由既有候选发布管线应用回真实盘（**无需单独的“替换回来”机制**）。
+  沙箱内 overlay graph driver 需挂载（被 seccomp 拦截），故为容器命令注入 `STORAGE_DRIVER=vfs`
+  （容器层落在暂存 overlay 内，写入仍进候选）。
+- **环境无 podman 时禁用容器内操作**：改为绑定**禁用桩**（`docker`/`nerdctl`/`docker-compose` 一律
+  报真机样式错误 `Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker
+  daemon running?` 并 `exit 1`），复合命令中的容器调用同样被禁用；真实原因只进用户 UI / 审计 /
+  证据，不回传模型。
+- 改写关闭（`container.docker_to_podman=false`）时：docker 命令同样**伪装**为真机样式错误
+  （`Cannot connect to the Docker daemon …`，结构化 `ok=false` + `exit_code=1`）。即使 AI 察觉，
+  也只会以为「本机没跑 docker daemon」或「docker 被路由到了 podman」，而非「我在沙箱里」。
+- 远程/连接型（`--remote`/`-H`/`--connection`）与宿主 VM 子命令（`machine`）：出于安全拒绝，同样以
+  真机样式文本呈现，不含沙箱字样。
+- `tools.sandbox.docker`（`mode`/`socket`）**已弃用**：无论取值都不再挂载/连接任何 socket，保留仅为
+  兼容既有配置。
 
 ### T2 主机效果提案
 
@@ -2400,21 +2419,21 @@ AI 调用容器运行时（docker/podman 等）时，**在沙箱内管理、容�
   命令重写为注入 `--net=host --pid=host --ipc=host --uts=host`，容器复用沙箱的
   pid/net/ipc/uts 命名空间，被沙箱隔离边界一并约束，写入进 overlay 暂存
   （`tools.sandbox.container.share_namespace`，默认开）。
-- **docker / docker-compose**：默认**改写为 `podman` / `podman-compose`** 在沙箱内执行
+- **docker / docker-compose / nerdctl**：一律**改写为 `podman` / `podman-compose`** 在沙箱内执行
   （`tools.sandbox.container.docker_to_podman`，默认开）——podman 无守护进程，容器随沙箱
-  namespace 隔离、写入进 overlay，**不碰宿主**。沙箱内无 podman 时**明确拒绝**
-  （`CONTAINER_PODMAN_UNAVAILABLE`，提示安装 podman），**不回退 hostop**。
-- **nerdctl / 有守护进程运行时**：容器由宿主侧 daemon 创建，默认**明确拒绝**
-  （`CONTAINER_REQUIRES_HOST_DAEMON`，**不碰宿主、不回退 hostop**）。仅当显式配置
-  `tools.sandbox.docker.mode="controlled"` 且 `socket` 存在时，才放行受控 socket
-  （rootless / socket-proxy / dind，见 §17；显式配置优先于改写）。
+  namespace 隔离、写入进 overlay，**永不连接宿主 daemon、不碰宿主**。沙箱内无 podman 或改写关闭时
+  **拒绝**（`CONTAINER_PODMAN_UNAVAILABLE` / `CONTAINER_REQUIRES_HOST_DAEMON`），并以**真机样式**
+  docker 错误呈现（`Cannot connect to the Docker daemon …`，结构化 `ok=false`），**不回退 hostop**。
 - **远程/连接型选项**（`--remote`/`-r`/`-H`/`--host`/`--connection`/`--url`）与**宿主 VM 子命令**
-  （`podman machine`）明确拒绝（`CONTAINER_REMOTE_UNSUPPORTED` / `CONTAINER_SUBCOMMAND_UNSUPPORTED`）。
-- 门面只识别**独立调用**（可跳过 `sudo`/`env` 等前缀）；复合命令中的容器调用不拦截。
+  （`podman machine`）拒绝（`CONTAINER_REMOTE_UNSUPPORTED` / `CONTAINER_SUBCOMMAND_UNSUPPORTED`），
+  同样以真机样式文本呈现。
+- 门面只识别**独立调用**（可跳过 `sudo`/`env` 等前缀）；复合命令中的容器调用不拦截（但也只跑
+  沙箱内的真实二进制，连不到宿主 daemon）。
 
 受控计划写入 `kind="container"` 证据并发出 `SANDBOX_CONTAINER_PLANNED`；被拒绝的调用发出
-`SANDBOX_CONTAINER_UNSUPPORTED` 并写入审计。配置：`tools.sandbox.container`
-（`enabled`/`share_namespace`）与 `tools.sandbox.docker`（`mode="off"|"controlled"`、`socket`）。
+`SANDBOX_CONTAINER_UNSUPPORTED` 并写入审计（真实原因仅进审计/UI，不回传模型）。配置：
+`tools.sandbox.container`（`enabled`/`share_namespace`/`docker_to_podman`）；`tools.sandbox.docker`
+（`mode`/`socket`）**已弃用**、不再读取。
 
 ### 18.4 新会话自动审批（默认关闭）
 
@@ -2468,7 +2487,11 @@ L2+ 与包/密钥仍进入待审。目的是即便仅靠本地模型的智能水
   （`git_add`/`git_commit`/`git_stash`/`git_restore`/`git_worktree`/`git_fetch`/`git_pull`）。
   `git_fetch`/`git_pull` 在沙箱内经宿主过滤代理访问远程，`.`git` 对象/跟踪 refs（`pull` 另含
   工作区改动）原子暂存进审批悬浮窗；`github.com`/`githubusercontent.com` 默认静默放行，其余远程
-  按 `tools.sandbox.network.access` 弹窗同意。
+  按 `tools.sandbox.network.access` 弹窗同意。远程认证按 `tools.sandbox.git.credentials`：
+  `host_ssh`（默认，只读放开宿主 `~/.ssh`）| `host`（另含 `~/.git-credentials` 等）| `isolate`。
+  SSH remote（`git@host:...`）为裸 TCP，默认注入经沙箱 SOCKS 入口的 `ProxyCommand`
+  （`tools.sandbox.git.ssh_proxy`，auto 时优先 `socat` 其次 `ncat`；`false` 关闭；字符串自定义），
+  使 SSH 也经宿主过滤代理出网/受检查。
 - **`git stash`**：仅 `list` / `show` 只读子动作放行（只读、不碰工作区与 refs/index）；
   裸 `stash`（=push）及 `push`/`pop`/`apply`/`drop`/`clear`/`save`/`store` 等仍拦截，
   改走 `git_stash` 工具（改动原子暂存并进审批悬浮窗）。

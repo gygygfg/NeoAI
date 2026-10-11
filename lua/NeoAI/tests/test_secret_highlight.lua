@@ -86,8 +86,9 @@ tests.suite("secret_highlight", function(_, it)
     local marks = secret_extmarks(buf)
     local wl = warning_line(buf)
     t.not_nil(wl, "应找到警告行")
-    -- 多行警告：每行整行高亮（主行 + 密钥文件标题 + 路径），外加结果行内 NEOKEY_ token 一处
-    t.eq(4, #marks, "应有 3 行警告整行高亮 + 行内密钥一处（实际 " .. #marks .. "）")
+    -- 多行警告：每行整行高亮（主行 + 密钥文件标题 + 路径 + 假密钥值行），外加结果行内 token 一处
+    t.eq(5, #marks, "应有 4 行警告整行高亮 + 行内密钥一处（实际 " .. #marks .. "）")
+    t.matches("假密钥：", text, "应标明使用的是假密钥并给出值")
     local on_warning, inline = false, false
     for _, m in ipairs(marks) do
       t.eq("NeoAISecretWarning", m[4] and m[4].hl_group or nil, "高亮组应为 NeoAISecretWarning")
@@ -123,8 +124,8 @@ tests.suite("secret_highlight", function(_, it)
       { role = "tool", tool_call_id = "t1", tool_name = "run_command", content = '{"ok":true}' },
     })
     t.matches("⚠ 密钥：run_command", buffer_text(buf), "参数含密钥应有警告行并指明命令")
-    -- 3 行警告（主行 + 执行命令 + 通用提示）整行高亮 + 参数行内 token 一处
-    t.eq(4, #secret_extmarks(buf), "多行警告 + 参数行内 token 高亮")
+    -- 4 行警告（主行 + 执行命令 + 假密钥值 + 通用提示）整行高亮 + 参数行内 token 一处
+    t.eq(5, #secret_extmarks(buf), "多行警告 + 参数行内 token 高亮")
     t.false_(fold_text(buf, 2):find("⚠ 密钥", 1, true) ~= nil, "折叠文本不应含 ⚠ 密钥")
   end)
 
@@ -184,6 +185,7 @@ tests.suite("secret_highlight", function(_, it)
     })
     local text = buffer_text(buf)
     t.matches("⚠ 密钥：read_file", text, "原始具名密钥也应告警")
+    t.matches("真密钥：AKIAIOSFODNN7EXAMPLE", text, "应标明真密钥并给出值")
     local marks = secret_extmarks(buf)
     t.true_(#marks >= 2, "应有告警行与行内密钥高亮（实际 " .. #marks .. "）")
   end)
@@ -255,8 +257,8 @@ tests.suite("secret_highlight", function(_, it)
     updated[2].content = '{"output":"TOKEN=' .. fake_of("Zx9Kd-Qm2Lp5Zr8Tv1Wn4Bc") .. '"}'
     message_list.render_chat(buf, updated, {})
     t.matches("⚠ 密钥：read_file", buffer_text(buf), "更新后应有警告行并指明工具")
-    -- 3 行警告整行高亮 + 结果行内 token 一处
-    t.eq(4, #secret_extmarks(buf), "更新后多行警告 + 结果行内 token 高亮")
+    -- 4 行警告整行高亮 + 结果行内 token 一处
+    t.eq(5, #secret_extmarks(buf), "更新后多行警告 + 结果行内 token 高亮")
   end)
 
   it("被密钥硬拦截的错误结果：不渲染内部标识告警行", function(t)
@@ -282,5 +284,28 @@ tests.suite("secret_highlight", function(_, it)
     t.false_(text:find("⚠ 密钥", 1, true) ~= nil, "被拦截的错误结果不应再触发密钥告警")
     t.false_(text:find("密钥环境变量", 1, true) ~= nil, "不应把内部标识当作密钥环境变量名")
     t.eq(0, #secret_extmarks(buf), "不应有密钥高亮")
+  end)
+
+  it("detect_keys 区分真/假密钥；redact 一律替换为占位符", function(t)
+    secret.reset()
+    local real = "ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
+    local _, used = secret.tokenize(real)
+    local fake = used[1] or real
+    local keys = secret.detect_keys("use " .. fake .. " then raw " .. real)
+    local kind_of = {}
+    for _, k in ipairs(keys) do kind_of[k.value] = k.kind end
+    t.eq("fake", kind_of[fake], "已知 token 应判为假密钥")
+    t.eq("real", kind_of[real], "未假化的原始凭据应判为真密钥")
+    -- 真/假一律替换为占位符
+    local red = secret.redact_placeholder("a=" .. fake .. " b=" .. real)
+    t.false_(red:find(fake, 1, true) ~= nil, "假密钥应被替换")
+    t.false_(red:find(real, 1, true) ~= nil, "真密钥应被替换")
+    t.matches("<密钥占位符>", red, "应替换为占位符")
+    t.eq(2, select(2, red:gsub("<密钥占位符>", "")), "两处密钥都应替换")
+    -- 深拷贝脱敏不修改原表
+    local src = { msg = "x" .. fake }
+    local out = secret.redact_copy(src)
+    t.matches("<密钥占位符>", out.msg, "拷贝应脱敏")
+    t.true_(src.msg:find(fake, 1, true) ~= nil, "原表不应被修改")
   end)
 end)

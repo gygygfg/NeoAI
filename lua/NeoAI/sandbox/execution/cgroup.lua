@@ -24,6 +24,24 @@ local function _base()
   return require("NeoAI.kernel.config_store").get("tools.sandbox.limits.cgroup_base") or "/sys/fs/cgroup"
 end
 
+--- 进程内稳定的唯一短标签（跨 nvim 进程唯一）。
+--- cgroup 目录名在宿主机上是**全局共享**的（/sys/fs/cgroup），而调用方传入的
+--- `session_id`/`attempt_id` 可能在不同 nvim 进程间同值（例如两个进程同时启动、同一秒的
+--- `s<time>_1`）。若直接用作目录名，并发进程的沙箱实例会挂到同一 cgroup 子树，彼此的
+--- `cgroup.kill`/限额写入会互相干扰（表现为并发跑测试时「常驻实例不可用」）。
+--- 故在目录名中并入本进程的沙箱实例 id（`<pid>_<started_at>`）。
+--- @return string
+local function _proc_tag()
+  local ok, inst = pcall(require, "NeoAI.sandbox.execution.instance")
+  if ok and inst and type(inst.id) == "function" then
+    local id = inst.id()
+    if type(id) == "string" and id ~= "" then
+      return "_" .. id:gsub("[^%w]", "")
+    end
+  end
+  return "_" .. tostring(vim.fn.getpid())
+end
+
 local function _write_file(path, content)
   local f = io.open(path, "w")
   if not f then return false end
@@ -463,7 +481,7 @@ function M.prepare(attempt_id, limits)
       _write_file(parent .. "/cpu.max", tostring(global_us) .. " 100000")
     end
   end
-  local path = parent .. "/neoai_" .. _safe_id(attempt_id)
+  local path = parent .. "/neoai" .. _proc_tag() .. "_" .. _safe_id(attempt_id)
   vim.fn.mkdir(path, "p")
   if vim.fn.isdirectory(path) ~= 1 then
     return nil, "SANDBOX_CGROUP_CREATE_FAILED: " .. path
@@ -653,7 +671,7 @@ function M.prepare_delegated(id, limits)
     pcall(_write_file, caps.base .. "/cgroup.subtree_control", spec)
     pcall(_write_file, parent .. "/cgroup.subtree_control", spec)
   end
-  local path = parent .. "/neoai_deleg_" .. _safe_id(id)
+  local path = parent .. "/neoai_deleg" .. _proc_tag() .. "_" .. _safe_id(id)
   vim.fn.mkdir(path, "p")
   if vim.fn.isdirectory(path) ~= 1 then
     return nil, "SANDBOX_CGROUP_CREATE_FAILED: " .. path
@@ -737,14 +755,27 @@ end
 --- 重置（测试用）
 function M.reset()
   local parent = _parent_path()
-  pcall(_write_file, parent .. "/cgroup.kill", "1")
+  local tag = _proc_tag()
   for _, h in pairs(state.handles) do
     pcall(_write_file, h.path .. "/cgroup.kill", "1")
     vim.fn.delete(h.path, "d")
   end
   state.handles = {}
-  -- 子域清空后删除共享父域（cgroupfs 目录须为空才能 rmdir）
-  vim.fn.delete(parent, "d")
+  -- 仅清理**本进程**的残留子域。父域 `neoai` 是**跨进程共享**的（所有并存 nvim 的沙箱任务
+  -- 都挂在它下面）；绝不能向其写 `cgroup.kill` 或删除它，否则会连带杀死其它并存进程的常驻
+  -- 沙箱实例（表现为并发跑测试时 `exit 137`、常驻实例「不可用」）。子域目录名内嵌了本进程
+  -- 的实例标签（见 `_proc_tag`），据此只清理自己遗留的（如崩溃残留）。
+  local handle = vim.uv.fs_scandir(parent)
+  if handle then
+    while true do
+      local name, t = vim.uv.fs_scandir_next(handle)
+      if not name then break end
+      if t == "directory" and name:find(tag, 1, true) then
+        pcall(_write_file, parent .. "/" .. name .. "/cgroup.kill", "1")
+        pcall(_rmdir_tree, parent .. "/" .. name)
+      end
+    end
+  end
   state.caps = nil
 end
 

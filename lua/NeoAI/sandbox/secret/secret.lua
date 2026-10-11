@@ -2305,6 +2305,106 @@ function M.load_stale_fakes(fakes)
   end
 end
 
+--- 历史落盘时替换密钥的占位符（真/假密钥一律替换，避免把密钥写入文件）。
+M.REDACT_PLACEHOLDER = "<密钥占位符>"
+
+-- 关键词 token 的字面量前缀（stale token 未必在映射表内，按前缀兜底识别）。
+local TOKEN_LITERAL_PAT = "NEOKEY_[%w_%-%+%=/]+"
+
+--- 文本中命中的密钥：区分「假密钥（沙箱 token）」与「真密钥（未假化的原始凭据）」。
+--- 去重、按出现顺序返回。供聊天界面告警展示「使用的是假密钥还是真密钥」及密钥值。
+--- @param text string
+--- @return table 数组 { { value = string, kind = "fake"|"real" } }
+function M.detect_keys(text)
+  local out, seen = {}, {}
+  if type(text) ~= "string" or text == "" then return out end
+  if _cfg().enabled == false then return out end
+  -- 沙箱已知假密钥（格式保真 token，未必含 NEOKEY_ 前缀）。
+  for _, tk in ipairs(M.detect_tokens(text)) do
+    local v = tk.value
+    if v and v ~= "" and not seen[v] then
+      seen[v] = true
+      out[#out + 1] = { value = v, kind = "fake" }
+    end
+  end
+  -- 具名规则命中的原始凭据：命中已知假密钥映射则为「假」，否则为「真」。
+  for _, hit in ipairs(M.detect_named(text)) do
+    local v = hit.value
+    if v and v ~= "" and not seen[v] then
+      seen[v] = true
+      out[#out + 1] = { value = v, kind = M.has_token(v) and "fake" or "real" }
+    end
+  end
+  return out
+end
+
+--- 文本中所有需遮蔽的密钥区间（0-based 不适用，此处返回 1-based 闭区间）：
+--- 已知假 token + 具名规则命中 + 裸 `NEOKEY_` 前缀（stale token 兜底）。
+--- @param text string
+--- @return table 数组 { { start, stop } }（1-based，已排序）
+local function _redact_spans(text)
+  local spans = {}
+  for _, tk in ipairs(M.detect_tokens(text)) do
+    if tk.start and tk.stop then spans[#spans + 1] = { tk.start, tk.stop } end
+  end
+  for _, hit in ipairs(M.detect_named(text)) do
+    if hit.start and hit.stop then spans[#spans + 1] = { hit.start, hit.stop } end
+  end
+  local pos = 1
+  while true do
+    local s, e = text:find(TOKEN_LITERAL_PAT, pos)
+    if not s then break end
+    spans[#spans + 1] = { s, e }
+    pos = e + 1
+  end
+  table.sort(spans, function(a, b)
+    if a[1] == b[1] then return a[2] < b[2] end
+    return a[1] < b[1]
+  end)
+  return spans
+end
+
+--- 把文本中的密钥（真/假一律）替换为 `REDACT_PLACEHOLDER`。用于历史落盘脱敏。
+--- 与具名规则破坏性脱敏 `M.redact`（`[REDACTED:<rule>]`）不同：此处同时覆盖沙箱假 token 与
+--- 具名规则命中的原始密钥，统一替换为固定占位符。
+--- @param text string
+--- @return string
+function M.redact_placeholder(text)
+  if type(text) ~= "string" or text == "" then return text end
+  if _cfg().enabled == false then return text end
+  local spans = _redact_spans(text)
+  if #spans == 0 then return text end
+  local out, last_end = {}, 0
+  for _, sp in ipairs(spans) do
+    local s, e = sp[1], sp[2]
+    if s > last_end then
+      out[#out + 1] = text:sub(last_end + 1, s - 1)
+      out[#out + 1] = M.REDACT_PLACEHOLDER
+      last_end = e
+    elseif e > last_end then
+      last_end = e
+    end
+  end
+  out[#out + 1] = text:sub(last_end + 1)
+  return table.concat(out)
+end
+
+--- 深拷贝 value，并把其中所有字符串（含字符串键）的密钥替换为占位符。
+--- 返回新结构，不修改入参（内存中的会话仍保留 token 供 detokenize / 展示）。
+--- @param value any
+--- @return any
+function M.redact_copy(value)
+  local t = type(value)
+  if t == "string" then return M.redact_placeholder(value) end
+  if t ~= "table" then return value end
+  local out = {}
+  for k, v in pairs(value) do
+    local nk = (type(k) == "string") and M.redact_placeholder(k) or k
+    out[nk] = M.redact_copy(v)
+  end
+  return out
+end
+
 --- 重置（测试用）
 function M.reset()
   state.by_secret = {}

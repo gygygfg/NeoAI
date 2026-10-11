@@ -73,6 +73,27 @@ tests.suite("sandbox_privilege", function(_, it)
     vim.fn.delete(home, "rf")
   end)
 
+  it("加固：遮蔽目录永不遮蔽项目 .git（cwd 为子目录时 git 工具仍可用）", function(t)
+    local runtime = require("NeoAI.sandbox.execution.runtime")
+    local fs = require("NeoAI.utils.fs")
+    local home = "/root/neoai_mask_git_test"
+    local proj = home .. "/proj"
+    fs.ensure_dir(proj .. "/.git/objects")
+    fs.ensure_dir(proj .. "/sub")
+    fs.write_file(proj .. "/other.txt", "x")
+    with_config({ tools = { sandbox = {
+      read_all = false, mask_dirs_enabled = true, mask_dirs = { "/root" },
+    } } }, function()
+      local cwd_sub = proj .. "/sub"
+      -- 兄弟条目（父目录下的普通文件）仍被遮蔽
+      t.not_nil(runtime.mask_entry(proj .. "/other.txt", cwd_sub), "普通兄弟条目应被遮蔽")
+      -- 项目 .git（父目录下的兄弟）不被遮蔽，且其内部也不被遮蔽
+      t.nil_(runtime.mask_entry(proj .. "/.git", cwd_sub), "项目 .git 不应被遮蔽")
+      t.nil_(runtime.mask_entry(proj .. "/.git/objects", cwd_sub), ".git 内部不应被遮蔽")
+    end)
+    fs.delete_file(home)
+  end)
+
   it("加固：进程内工具硬拦截宿主敏感遮蔽路径（mask_paths）", function(t)
     local runtime = require("NeoAI.sandbox.execution.runtime")
     local fs = require("NeoAI.utils.fs")
@@ -304,7 +325,7 @@ tests.suite("sandbox_privilege", function(_, it)
     end)
   end)
 
-  it("受控 docker：T1 挂载受控 socket 而非宿主 socket", function(t)
+  it("容器档位：docker 命令不挂载/不解除 docker.sock 遮蔽；容器命令注入 vfs 存储", function(t)
     local runtime = require("NeoAI.sandbox.execution.runtime")
     local privilege = require("NeoAI.sandbox.execution.privilege")
     if runtime.backend() ~= "bwrap" then return end
@@ -313,22 +334,23 @@ tests.suite("sandbox_privilege", function(_, it)
     fs.ensure_dir(dir)
     local sock = dir .. "/docker.sock"
     fs.write_file(sock, "")
+    -- 即便显式配了 controlled socket，也不再挂载宿主/受控 socket（永不连宿主 daemon）。
     with_config({ tools = { sandbox = { docker = { mode = "controlled", socket = sock } } } }, function()
-      local res = privilege.resolve(1, { tier = 1, docker = true, network = true })
-      t.true_(res.ok, "受控 socket 存在时应可解析 T1")
-      t.eq(sock, res.privileges.mounts[1] and res.privileges.mounts[1].src, "应挂载受控 socket")
-      t.eq("/var/run/docker.sock", res.privileges.mounts[1].dst, "应挂载到 docker.sock")
-      t.eq("unix:///var/run/docker.sock", res.privileges.env.DOCKER_HOST, "应注入 DOCKER_HOST")
-      local pre = table.concat(assert(runtime.process_prefix({ cwd = "/tmp", privileges = res.privileges })), " ")
-      t.true_(pre:find("--bind " .. sock .. " /var/run/docker.sock", 1, true) ~= nil, "前缀应绑定受控 socket")
-      t.true_(pre:find("--bind /dev/null /var/run/docker.sock", 1, true) == nil, "不应遮蔽受控 socket")
+      local d = privilege.resolve(1, { tier = 1, docker = true, network = true })
+      t.true_(d.ok, "docker 的 T1 应可解析（但不挂载 socket）")
+      t.eq(nil, d.privileges.env.DOCKER_HOST, "不应注入 DOCKER_HOST")
+      for _, m in ipairs(d.privileges.mounts) do
+        t.true_(m.dst ~= "/var/run/docker.sock", "不应挂载任何 docker.sock")
+      end
+      t.false_(vim.tbl_contains(d.privileges.unmask, "/var/run/docker.sock"),
+        "不应解除 docker.sock 遮蔽（保持遮蔽）")
+      local pre = table.concat(assert(runtime.process_prefix({ cwd = "/tmp", privileges = d.privileges })), " ")
+      t.true_(pre:find(sock, 1, true) == nil, "前缀不应绑定受控 socket")
     end)
-    -- socket 缺失 → 明确拒绝
-    with_config({ tools = { sandbox = { docker = { mode = "controlled", socket = "/nonexistent/docker.sock" } } } }, function()
-      local res = privilege.resolve(1, { tier = 1, docker = true })
-      t.false_(res.ok, "受控 socket 缺失应拒绝")
-      t.matches("DOCKER_SOCKET", tostring(res.reason))
-    end)
+    -- 容器运行时：注入无 mount 的存储后端（overlay 需挂载，沙箱内不可用）。
+    local c = privilege.resolve(1, { tier = 1, container = true, network = true })
+    t.true_(c.ok, "容器命令 T1 应可解析")
+    t.eq("vfs", c.privileges.env.STORAGE_DRIVER, "容器命令应注入 vfs 存储驱动")
     vim.fn.delete(dir, "rf")
   end)
 

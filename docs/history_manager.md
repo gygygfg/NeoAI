@@ -27,8 +27,10 @@
 
 - `parent_id`：父会话 id（根会话为 nil）。
 - `root_id`：根会话 id（子会话未显式指定时以父为根）。
-- `metadata.cwd`：**会话绑定工作目录**。创建时记录当时 cwd（`session_store.create`，子会话继承父会话）；
-  重开旧会话（`chat_service.load_session`）时 `agent.cwd` 取自该值，工具与沙箱以它为工作区基准
+- `metadata.cwd`：**会话绑定工作目录**。创建时定位工作区根（`session_store.create`：从 cwd 向上按
+  `session.git_markers`（默认 `.git`，优先）→ `session.root_markers`（工程配置文件）查找，未命中回退
+  cwd；`session.detect_root=false` 则直接用 cwd；子会话继承父会话）；重开旧会话
+  （`chat_service.load_session`）时 `agent.cwd` 取自该值，工具与沙箱以它为工作区基准
   （相对路径解析、遮蔽/越界判定、run_command overlay cwd），**不跟随编辑器当前 cwd、也不改全局 cwd**。
   旧会话无该字段时回退当前 cwd（向后兼容）。
 - `fork(session, {copy_messages})`：派生新会话（`parent_id = session.id`）。

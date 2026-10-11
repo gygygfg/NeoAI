@@ -476,6 +476,40 @@ tests.suite("sandbox_core", function(_, it)
     t.false_(rt.is_git_internal("/a/b.lua"))
   end)
 
+  it("git SSH：ProxyCommand 经宿主过滤代理（显式 / 关闭 / auto）", function(t)
+    local wrapper = require("NeoAI.sandbox.execution.wrapper")
+    local hp = require("NeoAI.sandbox.net.host_proxy")
+    -- 显式字符串：直接注入
+    with_config({ tools = { sandbox = { git = {
+      credentials = "host_ssh", ssh_proxy = "nc -X 5 -x 1.2.3.4:5 %h %p",
+    } } } }, function()
+      local cmd = wrapper._git_ssh_command()
+      t.matches("ProxyCommand=", cmd)
+      t.matches("nc %-X 5", cmd)
+    end)
+    -- 关闭：无 ProxyCommand
+    with_config({ tools = { sandbox = { git = { credentials = "host_ssh", ssh_proxy = false } } } }, function()
+      local cmd = wrapper._git_ssh_command()
+      t.not_nil(cmd)
+      t.true_(cmd:find("ProxyCommand=", 1, true) == nil, "关闭时不应含 ProxyCommand")
+    end)
+    -- isolate：整体不注入
+    with_config({ tools = { sandbox = { git = { credentials = "isolate" } } } }, function()
+      t.nil_(wrapper._git_ssh_command(), "isolate 不应注入 GIT_SSH_COMMAND")
+    end)
+    -- auto：host_proxy 已启动且存在 socat/ncat 时应含 ProxyCommand
+    if vim.fn.executable("socat") == 1 or vim.fn.executable("ncat") == 1 then
+      hp.reset()
+      local addr = assert(hp.start("127.0.0.1", 0))
+      with_config({ tools = { sandbox = { git = { credentials = "host_ssh", ssh_proxy = true } } } }, function()
+        local cmd = wrapper._git_ssh_command()
+        t.matches("ProxyCommand=", cmd, "auto 应注入 ProxyCommand")
+        t.matches(tostring(addr.port), cmd, "应指向 host_proxy 端口")
+      end)
+      hp.stop(); hp.reset()
+    end
+  end)
+
   it("git 路径分类：对象/指针/瞬态/配置", function(t)
     local rt = require("NeoAI.sandbox.execution.runtime")
     t.eq("object", rt.git_path_class("/repo/.git/objects/ab/cdef"))
@@ -1147,6 +1181,75 @@ tests.suite("sandbox_core", function(_, it)
           done = true
         end)
       t.true_(vim.wait(20000, function() return done end), "应完成")
+    end)
+    vim.fn.chdir(prev)
+    vim.fn.delete(dir, "rf")
+  end)
+
+  it("run_command 修改已有文件冻结为候选并可 apply（不回退）", function(t)
+    local fs = require("NeoAI.utils.fs")
+    local sandbox = require("NeoAI.sandbox")
+    local runtime = require("NeoAI.sandbox.execution.runtime")
+    if runtime.backend() ~= "bwrap" then return end
+    local dir = "/root/neoai_modify_cand_test"
+    vim.fn.delete(dir, "rf")
+    fs.ensure_dir(dir)
+    fs.write_file(dir .. "/f.txt", "base\n")
+    local prev = vim.fn.getcwd()
+    vim.fn.chdir(dir)
+    with_config({ tools = { approval = { mode = "async" }, sandbox = { mode = "dry_run", review = { enabled = true }, ephemeral_roots = {} } } }, function()
+      sandbox.reset()
+      local done = false
+      require("NeoAI.tools").execute("run_command", { command = "echo appended >> f.txt", description = "t" }, {})
+        :then_(function() done = true end, function(e) t.true_(false, tostring(e and e.message or e)); done = true end)
+      t.true_(vim.wait(20000, function() return done end), "应完成")
+      local item
+      for _, it in ipairs(sandbox.list_reviews({ review_state = "PENDING" })) do
+        for _, f in ipairs(it.files or {}) do
+          if f.path == dir .. "/f.txt" then item = it end
+        end
+      end
+      t.not_nil(item, "修改已有文件应冻结为候选")
+      t.matches("base", fs.read_file(dir .. "/f.txt") or "", "dry_run 下真实文件不应改动")
+      local res = sandbox.apply(item.change_set_id, { auto_approve = true })
+      t.true_(res.ok, "apply 应成功")
+      t.matches("appended", fs.read_file(dir .. "/f.txt") or "", "apply 后真实文件应含改动（不回退）")
+    end)
+    vim.fn.chdir(prev)
+    vim.fn.delete(dir, "rf")
+  end)
+
+  it("git_add 新文件冻结 .git/index+object 并可 apply（暂存生效）", function(t)
+    local fs = require("NeoAI.utils.fs")
+    local sandbox = require("NeoAI.sandbox")
+    local runtime = require("NeoAI.sandbox.execution.runtime")
+    if runtime.backend() ~= "bwrap" then return end
+    if vim.fn.executable("git") ~= 1 then return end
+    local dir = "/root/neoai_gitadd_test"
+    vim.fn.delete(dir, "rf")
+    fs.ensure_dir(dir)
+    vim.fn.system("cd " .. dir .. " && git init -q && git config user.email t@t && git config user.name t")
+    fs.write_file(dir .. "/tracked.txt", "base\n")
+    vim.fn.system("cd " .. dir .. " && git add tracked.txt && git commit -qm init")
+    fs.write_file(dir .. "/newfile.txt", "hello\n")
+    local prev = vim.fn.getcwd()
+    vim.fn.chdir(dir)
+    with_config({ tools = { approval = { mode = "async" }, sandbox = { mode = "dry_run", review = { enabled = true }, ephemeral_roots = {} } } }, function()
+      sandbox.reset()
+      local done = false
+      require("NeoAI.tools").execute("git_add", { paths = { "newfile.txt" }, description = "t" }, {})
+        :then_(function() done = true end, function(e) t.true_(false, tostring(e and e.message or e)); done = true end)
+      t.true_(vim.wait(20000, function() return done end), "应完成")
+      local item
+      for _, it in ipairs(sandbox.list_reviews({ review_state = "PENDING" })) do
+        for _, f in ipairs(it.files or {}) do
+          if f.path == dir .. "/.git/index" then item = it end
+        end
+      end
+      t.not_nil(item, "git_add 应冻结 .git/index（.git 不得被遮蔽）")
+      local res = sandbox.apply(item.change_set_id, { auto_approve = true })
+      t.true_(res.ok, "apply 应成功")
+      t.matches("newfile%.txt", vim.fn.system("cd " .. dir .. " && git ls-files"), "新文件应已暂存")
     end)
     vim.fn.chdir(prev)
     vim.fn.delete(dir, "rf")

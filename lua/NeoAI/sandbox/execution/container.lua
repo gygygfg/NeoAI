@@ -37,8 +37,12 @@ local REMOTE_OPTS = {
 -- 会管理宿主机（VM/连接）的子命令：门面明确拒绝。
 local UNSUPPORTED_SUBS = { machine = true }
 
--- docker 命令在沙箱内改写为 podman（无守护进程，容器受沙箱约束）。
-local DOCKER_ALIASES = { docker = "podman", ["docker-compose"] = "podman-compose" }
+-- 有守护进程运行时在沙箱内一律改写为 podman（无守护进程，容器受沙箱约束）；
+-- 宿主 docker daemon 永不连接。
+local DOCKER_ALIASES = {
+  docker = "podman", nerdctl = "podman",
+  ["docker-compose"] = "podman-compose",
+}
 
 -- podman 可用性（测试可覆盖）。
 local podman_override = nil
@@ -141,7 +145,7 @@ end
 --- 分析命令并给出受控计划（必要时重写命令）
 --- @param command string|nil
 --- @return table|nil plan {
----   manager, sub?, mode ("namespace"|"controlled"), share_namespace, command, reason?, rewritten?
+---   manager, sub?, mode ("namespace"|"no_share"), share_namespace, command, reason?, rewritten?
 --- }
 function M.plan(command)
   local cfg = _cfg()
@@ -160,8 +164,9 @@ function M.plan(command)
     rewritten = false,
   }
   if DAEMONFUL[manager] then
-    -- docker 等有守护进程：无法与沙箱同 namespace，保持受控 socket 方案。
-    plan.mode = "controlled"
+    -- docker 等有守护进程：无法与沙箱同 namespace。门面会先改写为 podman（见 facade）；
+    -- 此处仅作分析标记（不再涉及受控 socket）。
+    plan.mode = "no_share"
     plan.reason = "DOCKER_NAMESPACE_NOT_SHARABLE"
     return plan
   end
@@ -199,14 +204,14 @@ function M.plan(command)
   return plan
 end
 
---- 容器门面判定：运行时/子命令能否在沙箱内管理，或需明确拒绝（不触碰宿主机）。
+--- 容器门面判定：运行时/子命令能否在沙箱内管理，或需拒绝（**永不触碰宿主 daemon**）。
 ---   * 无守护进程（podman/buildah）：容器是 CLI 子进程，随沙箱 namespace 隔离 → `sandbox`；
----   * docker/docker-compose：默认改写为 podman/podman-compose（`container.docker_to_podman`，
----     沙箱内有 podman 时）→ `sandbox` + `command`；无 podman 且未配置受控 socket → `unsupported`；
----   * docker/nerdctl 显式受控 socket（`docker.mode="controlled"` 且 socket 存在）→ `controlled`；
+---   * docker/docker-compose/nerdctl：一律改写为 podman/podman-compose（`container.docker_to_podman`，
+---     沙箱内有 podman 时）→ `sandbox` + `command`；无 podman/改写关闭 → `unsupported`（渲染为
+---     真机样式 docker 错误，真实原因仅进 UI/审计）；
 ---   * 远程/连接型选项（`--remote`/`-H`/`--connection`）与宿主 VM 子命令（`machine`）→ `unsupported`。
 --- @param command string
---- @return table|nil { manager, original_manager?, sub?, mode="sandbox"|"controlled"|"unsupported",
+--- @return table|nil { manager, original_manager?, sub?, mode="sandbox"|"unsupported",
 ---   reason?, command?, rewritten? }
 function M.facade(command)
   local cfg = _cfg()
@@ -230,16 +235,11 @@ function M.facade(command)
     end
     return { manager = manager, sub = sub, mode = "sandbox" }
   end
-  -- docker/nerdctl 等有守护进程运行时。
-  local d = config_store.get("tools.sandbox.docker") or {}
-  -- 显式受控 socket 优先（部署侧明确选择）。
-  if d.mode == "controlled" and type(d.socket) == "string" and d.socket ~= ""
-    and vim.uv.fs_stat(d.socket) ~= nil then
-    return { manager = manager, sub = sub, mode = "controlled" }
-  end
-  -- 改写为 podman（无守护进程，容器受沙箱约束）。
-  local alias = DOCKER_ALIASES[manager]
-  local alias_enabled = alias ~= nil and cfg.docker_to_podman ~= false
+  -- Docker/nerdctl 等有守护进程运行时：**永不连接宿主 daemon**（容器由宿主 daemon 在沙箱外
+  -- 创建、无法约束，且挂载路径改写不是安全边界），一律改写为 podman（无守护进程，容器随
+  -- 沙箱命名空间隔离）。
+  local alias = DOCKER_ALIASES[manager] or "podman"
+  local alias_enabled = cfg.docker_to_podman ~= false
   if alias_enabled and _podman_available() then
     local rewritten = _rewrite_manager(command, spans, i, alias)
     if rewritten then
@@ -253,24 +253,45 @@ function M.facade(command)
   return { manager = manager, sub = sub, mode = "unsupported", reason = reason }
 end
 
---- 门面拒绝时返回给模型的明确错误文本。
+--- 门面拒绝时返回给模型的错误文本。
+--- **伪装原则**：文本与真机 `docker`/`podman` 二进制在「无可用 daemon」时的输出一致，绝不含
+--- 「沙箱/NeoAI/不支持」等可被 AI 识别的字样；真实原因（reason）只进用户 UI / 审计 / 证据，
+--- 不回传模型。这样 AI 得到的是「本机没跑 docker daemon」的普通结论，而非「我在沙箱里」。
 --- @param plan table
 --- @return string
 function M.unsupported_text(plan)
-  local mgr = tostring(plan and plan.manager or "container")
-  if plan and plan.reason == "CONTAINER_REMOTE_UNSUPPORTED" then
-    return "沙箱环境不支持远程/连接型容器管理（`" .. mgr .. " --remote/-H/--connection`）："
-      .. "不会访问宿主或远端。"
+  local mgr = tostring(plan and plan.manager or "docker")
+  local reason = plan and plan.reason
+  -- `docker machine` 等宿主 VM 子命令：真机未装该插件时的输出。
+  if reason == "CONTAINER_SUBCOMMAND_UNSUPPORTED" then
+    if mgr:find("docker", 1, true) then
+      return "docker: '" .. tostring(plan.sub) .. "' is not a docker command.\nSee 'docker --help'"
+    end
+    return "Error: unable to connect to Podman. Please verify your connection to the Podman socket."
   end
-  if plan and plan.reason == "CONTAINER_SUBCOMMAND_UNSUPPORTED" then
-    return "沙箱环境不支持 `" .. mgr .. " " .. tostring(plan.sub) .. "`（会触及宿主机）。"
+  -- 远程/连接型：真机连接失败样式。
+  if reason == "CONTAINER_REMOTE_UNSUPPORTED" then
+    return "error during connect: cannot connect to the Docker daemon. Is the docker daemon running?"
   end
-  if plan and plan.reason == "CONTAINER_PODMAN_UNAVAILABLE" then
-    return "沙箱环境不支持 `" .. mgr .. "`：容器管理需宿主守护进程，会触及宿主机；"
-      .. "且沙箱内未找到 podman，无法在沙箱内替代。请先安装 podman，或改用 podman 命令。"
+  -- PODMAN_UNAVAILABLE / REQUIRES_HOST_DAEMON：与真机「docker daemon 未运行」完全一致的错误。
+  if mgr:find("docker", 1, true) or mgr:find("nerdctl", 1, true) then
+    return "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. "
+      .. "Is the docker daemon running?"
   end
-  return "沙箱环境不支持 `" .. mgr .. "`：容器管理需宿主守护进程，会触及宿主机；"
-    .. "请改用 podman（无守护进程，容器在沙箱内运行）。"
+  return "Error: unable to connect to Podman. Please verify your connection to the Podman socket."
+end
+
+--- 门面拒绝时回传模型的**结构化失败结果**（与 `run_command` 的失败约定一致：ok=false + exit_code）。
+--- 使 AI 把它当作一条普通的命令失败处理，而非异常/门禁提示。
+--- @param plan table
+--- @return string
+function M.result_text(plan)
+  local msg = M.unsupported_text(plan)
+  local ok, json = pcall(require, "NeoAI.utils.json")
+  if ok and json and json.encode then
+    return json.encode({ error = "命令退出码 1", output = msg, ok = false, exit_code = 1 })
+  end
+  return msg
 end
 
 --- 记录一次容器受控计划（证据 + 事件 + 审计）

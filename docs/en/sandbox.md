@@ -50,7 +50,7 @@ Invariants:
 | `sandbox/review/risk.lua` | Security-level assessment (L0-L3), graded approval action, result grading |
 | `sandbox/observe/script_scan.lua` | Static scan of indirect script execution (shell bodies + embedded shell in high-level languages, recursion, opaque detection) |
 | `sandbox/observe/audit.lua` | AI read/call behavior monitoring, risk score and anomaly events |
-| `sandbox/execution/container.lua` | Controlled container runtimes: same namespace as sandbox (podman) or controlled socket (docker) |
+| `sandbox/execution/container.lua` | Container facade: podman-only real execution in the sandbox; docker/docker-compose/nerdctl rewritten to podman (host daemon never contacted) |
 | `sandbox/execution/file_bridge.lua` | Namespaced file bridge: in-process tools read/write inside the mount namespace via the resident instance (`F` frame); writes land in the overlay staging layer, reads are the merged view |
 | `sandbox/execution/ns_fs.lua` | Namespaced view I/O adapter: detokenize before write, tokenize after read, so wired in-process file tools operate on the overlay-canonical staging layer |
 
@@ -348,7 +348,10 @@ is only kept for other `approval.mode` values (`prompt`/`strict`).
     **Files / Tool Behavior / Resource Access / Network Requests / Out-of-bounds·Anomaly**, switched
     with `h`/`l` (or `←`/`→`), each page counting its items (`sandbox/review/approval_hub.lua` aggregates all
     blocking/observe entries). On the **Resource Access** page, a **directory-settings section** shows
-    the workspace allowlist and masked-dir list; press `E` to open a directory editor (`a` add a
+    the workspace allowlist and masked-dir list. The first workspace entry is the **session working
+    directory** (`session.metadata.cwd` / `agent.cwd`, located at session creation via `.git`/project
+    config markers; auto-allowed and non-removable), followed by explicit entries; press `E` to open a
+    directory editor (`a` add a
     workspace dir → `tools.approval.allowed_directories`, `A` add a masked dir →
     `tools.sandbox.mask_dirs`, `d` delete the dir under the cursor, `t` toggle
     `tools.sandbox.mask_dirs_enabled`, `q`/`Esc` close). Changes go through `config_store.set` and are
@@ -1758,7 +1761,11 @@ defense-in-depth to the bwrap prefix by default (`--cap-drop ALL` plus the tier 
   directory (default `/home`, `/root`), only the user home containing cwd is exposed read-only
   (for `/home`, the first-level user dir; for others, the dir itself), and siblings along the cwd
   ancestor chain are masked (including hidden files/dirs); the cwd subtree is exempt, and when cwd
-  is the scope itself its hidden children (credential dotfiles) are masked. Other users' homes are
+  is the scope itself its hidden children (credential dotfiles) are masked. **A project `.git` is
+  never masked**: `.git` is required repository metadata (not a credential), so it is skipped both
+  when masking siblings along the ancestor chain and when masking hidden children of the cwd scope
+  (otherwise, with cwd a repo subdirectory, `.git` would be masked and `git_add` could not write the
+  index / git operations would roll back). Other users' homes are
   not in the allowlist and are unreachable. Master switch `mask_dirs_enabled` (on by default).
   - **Approval**: when a tool argument hits a masked entry, approval is requested even in `async`
     mode (reusing `tool_service` / `ui/components/tool_approval`); once approved, the masked entry
@@ -1852,6 +1859,17 @@ commands (SSRF, e.g. host admin panels, internal ports, cloud metadata):
   built-in list also contains the code hosts `github.com`/`githubusercontent.com` (subdomains match
   automatically), so `git_fetch`/`git_pull`/`git clone` to GitHub is allowed without a prompt by
   default.
+- **Host upstream proxy chaining (`network.upstream_proxy`, auto by default)**: when the host itself
+  egresses via an HTTP(S)/SOCKS allowlisting proxy (enterprise proxy, mihomo/clash, …), sandbox
+  traffic that goes through `host_proxy` but connects **directly** fails because there is no direct
+  egress (typical symptom: `github.com:443` CONNECT gets 403/hangs while allowlisted hosts such as
+  `api.github.com`/`codeload.github.com` are actually reachable from the host). `host_proxy` then
+  chains to the host upstream proxy (`http`/`socks5h`; `https://` upstreams are unsupported,
+  fail-closed), so **all** proxied sandbox commands (including bare-TCP-aware tools entering via the
+  SOCKS5 endpoint) follow the host's network policy/allowlist. Values: `nil` (default) = auto-use the
+  host `https_proxy`/`http_proxy`/`all_proxy`; `false`/`""` = no chaining (direct); a string = an
+  explicit URL (`http://127.0.0.1:7890` / `socks5h://127.0.0.1:1080`). Host-local targets and host
+  `no_proxy` matches always connect directly.
 - **Boundary (important)**: this is **application-layer** filtering. **Raw TCP that ignores the
   proxy** (`nc`/`ssh`/database clients, tools ignoring proxy env) can connect directly to the host
   under a shared netns and is not covered. Hard-interception of raw TCP requires either root +
@@ -1960,6 +1978,7 @@ require("NeoAI").setup({
       network = {
         host_local_block = true,     -- intercept host-local access (application-layer; raw TCP not covered, see §6.1)
         host_local_proxy_port = 0,   -- host filtering proxy port (0 = random loopback port)
+        upstream_proxy = nil,        -- host upstream proxy chaining: nil=auto-use host *_PROXY; false/""=no chaining; string=explicit URL
         proxy = "strip",             -- strip | passthrough | { http, https, all, no_proxy }
       },
       seccomp = { enabled = true, filter_path = "" }, -- built-in denylist filter; bwrap backend only
@@ -2428,8 +2447,15 @@ ordinary text is byte-identical to before.
 > remains visible while collapsed. For a tool call that contains a secret, its **arguments and result are
 > shown in full (no truncation)** and the matched secret values (fake keys / raw secrets matched
 > by named rules) are highlighted inline with the same group; the trajectory display mode appends the same
-> text marker to the tool line and highlights inline as well. See `ui/components/message_list.lua`,
-> `ui/components/fold.lua`.
+> text marker to the tool line and highlights inline as well. The warning additionally **lists each matched
+> key value and marks whether it is real or fake**: `· 假密钥：<sandbox token value>` /
+> `· 真密钥：<raw credential value>` (very long values such as private-key blocks are single-lined and
+> truncated), so the UI shows "whether a fake or real key was used, and its value".
+> **History redaction**: before writing `sessions.jsonl`, `session_store` deep-copies and redacts the
+> session (`secret.redact_copy`), replacing every matched real/fake secret with `<密钥占位符>`
+> (`session.redact_secrets`, on by default); only the on-disk copy is redacted — the in-memory session
+> keeps tokens for detokenize and UI display. See
+> `ui/components/message_list.lua`, `ui/components/fold.lua`, `core/session/session_store.lua`.
 >
 > **Observation first (eBPF/strace/procfs)**: by default `tools.sandbox.observe` watches the secret
 > files a sandboxed process actually opens (`openat/open`, attributed precisely to the attempt cgroup)
@@ -2743,7 +2769,7 @@ per tier. Core modules: `sandbox/execution/privilege.lua` (classify/resolve/reco
 | Tier | Name | Use | Isolation | Review |
 |---|---|---|---|---|
 | **T0** | minimal | normal commands | `--cap-drop ALL` + tier baseline `CAP_DAC_OVERRIDE`, added back **narrowly** per command (package installs via `packages.cap_add`, system administration via `privilege.sysadmin.cap_add`) + host-global capability narrowing (`cap_drop`: network/clock/modules/raw I/O/boot/MAC/audit) + seccomp (incl. device-node barrier) + masks + **network allowed by default (host-local intercepted via host_proxy, see §6.1)** | no per-command review; fs changes enter the pending queue |
-| **T1** | elevated | network access, controlled docker, package installs, system administration | runs isolated, network allowed; tier baseline `CAP_DAC_OVERRIDE`; commands containing a package manager (`req.package`, incl. chained) get narrow caps via `packages.cap_add`; system-administration commands (`useradd`/`chown`/`passwd`, …; `req.sysadmin`) get narrow caps via `privilege.sysadmin.cap_add` and lift account-DB masking; docker.sock is unmasked only for docker commands | auto-authorized, recorded; fs changes enter the pending queue |
+| **T1** | elevated | network access, containers (podman), package installs, system administration | runs isolated, network allowed; tier baseline `CAP_DAC_OVERRIDE`; commands containing a package manager (`req.package`, incl. chained) get narrow caps via `packages.cap_add`; system-administration commands (`useradd`/`chown`/`passwd`, …; `req.sysadmin`) get narrow caps via `privilege.sysadmin.cap_add` and lift account-DB masking; `docker.sock` stays masked (the host daemon is never contacted) | auto-authorized, recorded; fs changes enter the pending queue |
 | **T2** | privileged | cap_add, host sockets, host mounts | runs inside a **nested userns** with full capabilities (caps scoped to the userns, cannot reach the host; the seccomp baseline still applies) | host effects frozen as a **proposal**, replayed after async approval |
 
 - Classification: `privilege.classify()` parses the command; `docker/podman`→T1,
@@ -2772,33 +2798,37 @@ per tier. Core modules: `sandbox/execution/privilege.lua` (classify/resolve/reco
   `auto_escalate=false`.
 - Recording: every tier decision/escalation is recorded (`record=true` by default).
 
-### Controlled docker (external controlled socket)
+### Containers (podman-only; the host docker daemon is never contacted)
 
-The sandbox **never binds the host `/var/run/docker.sock`** (masked by default). With
-`tools.sandbox.docker.mode="controlled"`, T1 binds the socket at `docker.socket` into the sandbox
-at `/var/run/docker.sock` and injects `DOCKER_HOST=unix:///var/run/docker.sock`. The controlled
-socket is provided by the deployment:
+The sandbox **never binds the host `/var/run/docker.sock`** (always masked). Container commands always
+**really execute** inside the sandbox:
 
-```bash
-# 1) rootless dockerd (recommended: container root != host root)
-dockerd-rootless-setuptool.sh install
-#   tools.sandbox.docker.socket = "/run/user/1000/docker.sock"
-
-# 2) docker-socket-proxy (API allowlist over the host socket)
-docker run -d --name neoai-docker-proxy \
-  -v /var/run/docker.sock:/var/run/docker.sock:ro \
-  -e CONTAINERS=1 -e IMAGES=1 -e EXEC=0 -e POST=0 -e VOLUMES=0 \
-  -p 127.0.0.1:2375:2375 tecnativa/docker-socket-proxy
-
-# 3) DinD sidecar (separate daemon, isolated from the host)
-```
-
-`mode="off"` (**default**): the container facade rejects docker/nerdctl outright, returning "docker
-is unsupported in the sandbox — use podman", never touching the host and never falling back to hostop
-(see §18.3). `mode="controlled"`: with an explicit controlled socket, it is bound into the sandbox as
-above (containers are created by the controlled daemon, an explicit deployment choice). `mode="host"`
-is no longer allowed by the container facade (it touches the host); run it manually on the host if
-needed.
+- `docker` / `docker-compose` / `nerdctl` (daemon-backed): the container would be created by the host
+  daemon outside the sandbox and cannot be constrained by namespaces; rewriting mount paths is not a
+  security boundary either. So they are **rewritten to `podman` / `podman-compose`** (daemonless; the
+  container is a child of the sandbox CLI and stays inside the sandbox namespaces).
+  **Entry shims (file links)**: `process_prefix` **read-only binds** `docker`/`docker-compose`/`nerdctl`
+  shims (`#!/bin/sh; exec <podman> "$@"`) **over the real binary paths** (`/usr/local/bin`, `/usr/bin`,
+  `/bin`), so container calls inside scripts / pipelines / compound commands (e.g. `echo x; docker ps`)
+  also go through podman, not only a leading-token rewrite; `which docker` resolves to the shim.
+- `podman` / `buildah`: `--net/pid/ipc/uts=host` is injected to share the sandbox namespaces; container
+  writes land in the overlay, are frozen as candidates, and are published to the real disk by the
+  existing candidate pipeline only after approval (**no separate "swap back" mechanism is needed**).
+  The overlay graph driver needs a mount (blocked by seccomp) inside the sandbox, so container commands
+  get `STORAGE_DRIVER=vfs` (container layers stay in the staged overlay; writes still become candidates).
+- **With no podman installed, in-container operations are disabled**: a **disabled shim** is bound
+  instead (`docker`/`nerdctl`/`docker-compose` all print the authentic error `Cannot connect to the
+  Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?` and `exit 1`), so
+  container calls in compound commands are disabled too; the real reason only goes to the user UI /
+  audit / evidence, never to the model.
+- When rewriting is disabled (`container.docker_to_podman=false`): docker commands are likewise
+  **disguised** as authentic docker errors (`Cannot connect to the Docker daemon …`, structured
+  `ok=false` + `exit_code=1`). Even if the AI notices, it concludes "no docker daemon is running" or
+  "docker is routed to podman", not "I am in a sandbox".
+- Remote/connection options (`--remote`/`-H`/`--connection`) and host-VM subcommands (`machine`) are
+  rejected for safety, also rendered in authentic docker style with no sandbox wording.
+- `tools.sandbox.docker` (`mode`/`socket`) is **deprecated**: no socket is ever mounted/connected
+  regardless of its value; the keys are kept only for backward compatibility.
 
 ### T2 host-effect proposals
 
@@ -2983,25 +3013,24 @@ host**. The facade (`container.facade`) intercepts the command in the `effect="p
   `--net=host --pid=host --ipc=host --uts=host`, so the container reuses the sandbox's
   pid/net/ipc/uts namespaces and is confined by the sandbox boundary; writes go into the overlay
   staging (`tools.sandbox.container.share_namespace`, default on).
-- **docker / docker-compose**: by default they are **rewritten to `podman` / `podman-compose`** and run
+- **docker / docker-compose / nerdctl**: always **rewritten to `podman` / `podman-compose`** and run
   inside the sandbox (`tools.sandbox.container.docker_to_podman`, default on) — podman is daemonless,
   so containers follow the sandbox namespaces and writes go into the overlay, **never touching the
-  host**. When podman is absent, the call is **explicitly rejected** (`CONTAINER_PODMAN_UNAVAILABLE`,
-  suggesting installing podman), with **no hostop fallback**.
-- **nerdctl / daemon-backed runtimes**: containers are created by the host-side daemon, so by default
-  they are **explicitly rejected** (`CONTAINER_REQUIRES_HOST_DAEMON`; **no host fallback and no
-  hostop**). Only when `tools.sandbox.docker.mode="controlled"` and `socket` exist is a controlled
-  socket allowed (rootless / socket-proxy / dind, see §17; an explicit config wins over rewriting).
+  host daemon**. When podman is absent or rewriting is disabled, the call is **rejected** and rendered
+  as an authentic docker error (`Cannot connect to the Docker daemon …`, structured `ok=false`), with
+  **no hostop fallback** (`CONTAINER_PODMAN_UNAVAILABLE` / `CONTAINER_REQUIRES_HOST_DAEMON`).
 - **Remote/connection options** (`--remote`/`-r`/`-H`/`--host`/`--connection`/`--url`) and **host VM
-  subcommands** (`podman machine`) are explicitly rejected (`CONTAINER_REMOTE_UNSUPPORTED` /
-  `CONTAINER_SUBCOMMAND_UNSUPPORTED`).
+  subcommands** (`podman machine`) are rejected (`CONTAINER_REMOTE_UNSUPPORTED` /
+  `CONTAINER_SUBCOMMAND_UNSUPPORTED`), likewise rendered in authentic docker style.
 - The facade only recognizes **standalone calls** (skipping `sudo`/`env` prefixes); container calls
-  inside compound commands are not intercepted.
+  inside compound commands are not intercepted (but they still only run the real binaries inside the
+  sandbox and cannot reach the host daemon).
 
 A controlled plan is stored as `kind="container"` evidence and emits `SANDBOX_CONTAINER_PLANNED`;
-rejected calls emit `SANDBOX_CONTAINER_UNSUPPORTED` and are audited. Config:
-`tools.sandbox.container` (`enabled`/`share_namespace`) and `tools.sandbox.docker`
-(`mode="off"|"controlled"`, `socket`).
+rejected calls emit `SANDBOX_CONTAINER_UNSUPPORTED` and are audited (the real reason goes only to
+audit/UI, never to the model). Config: `tools.sandbox.container`
+(`enabled`/`share_namespace`/`docker_to_podman`); `tools.sandbox.docker` (`mode`/`socket`) is
+**deprecated** and no longer read.
 
 ### 18.4 Auto-approval for new sessions (default off)
 
@@ -3063,7 +3092,12 @@ freeze time to avoid whole-unit publish conflicts.
   `git_pull`). `git_fetch`/`git_pull` reach remotes from inside the sandbox through the host filtering
   proxy; `.git` objects/tracking refs (plus working-tree changes for `pull`) are staged atomically
   into the approval window. `github.com`/`githubusercontent.com` are silently allowed by default;
-  other remotes follow `tools.sandbox.network.access` (consent prompt).
+  other remotes follow `tools.sandbox.network.access` (consent prompt). Remote auth follows
+  `tools.sandbox.git.credentials`: `host_ssh` (default, exposes host `~/.ssh` read-only) | `host`
+  (also `~/.git-credentials`, …) | `isolate`. SSH remotes (`git@host:...`) are bare TCP, so a
+  `ProxyCommand` through the sandbox SOCKS endpoint is injected by default
+  (`tools.sandbox.git.ssh_proxy`; `auto` prefers `socat`, then `ncat`; `false` disables; a string is
+  a custom command), so SSH also egresses through the host filtering proxy and is checked.
 - **`git stash`**: only the read-only sub-actions `list` / `show` are allowed (pure reads; they do not
   touch the worktree, refs or index). Bare `stash` (= push) and `push`/`pop`/`apply`/`drop`/`clear`/
   `save`/`store` remain blocked and must use the `git_stash` tool (changes are staged atomically and

@@ -447,6 +447,23 @@ local function _secret_warning_data(fn, result_msg, provided)
       if not name_seen[n] then name_seen[n] = true; names[#names + 1] = n end
     end
   end
+  -- 实际命中的密钥值（区分真/假）——供界面直接展示「使用的是假密钥还是真密钥及密钥值」。
+  local keys, key_seen = {}, {}
+  local function add_keys(text)
+    if type(text) ~= "string" or text == "" then return end
+    if type(secret.detect_keys) ~= "function" then return end
+    local ok3, ks = pcall(secret.detect_keys, text)
+    if ok3 and type(ks) == "table" then
+      for _, k in ipairs(ks) do
+        if k and type(k.value) == "string" and k.value ~= "" and not key_seen[k.value] then
+          key_seen[k.value] = true
+          keys[#keys + 1] = k
+        end
+      end
+    end
+  end
+  add_keys(args_str)
+  if not result_failed then add_keys(result_content) end
   return {
     name = fn.name or "工具",
     command = (args and type(args.command) == "string" and args.command ~= "") and args.command or nil,
@@ -455,7 +472,16 @@ local function _secret_warning_data(fn, result_msg, provided)
     paths = paths,
     rules = rules,
     names = names,
+    keys = keys,
   }
+end
+
+--- 密钥值展示文本：单行化（换行折成空格）并限长，避免私钥块等超长值刷屏。
+--- @param v string
+--- @return string
+local function _key_value_text(v)
+  local s = tostring(v):gsub("%s+", " ")
+  return stringx.truncate(s, 120)
 end
 
 --- 密钥警告（单行文本，供测试 / 工具复用；明细以逗号分隔）。
@@ -481,6 +507,10 @@ local function _secret_warning_line(fn, result_msg, provided)
     parts[#parts + 1] = "（密钥环境变量：" .. table.concat(d.names, ", ") .. "）"
   else
     parts[#parts + 1] = "（模型上下文含密钥）"
+  end
+  for _, k in ipairs(d.keys or {}) do
+    local label = (k.kind == "fake") and "假密钥" or "真密钥"
+    parts[#parts + 1] = "（" .. label .. "：" .. _key_value_text(k.value) .. "）"
   end
   return table.concat(parts)
 end
@@ -511,6 +541,11 @@ local function _secret_warning_lines(fn, result_msg, provided)
       or _list("密钥类型：", d.rules)
       or _list("密钥环境变量：", d.names)) then
     out[#out + 1] = "· 模型上下文含密钥"
+  end
+  -- 命中的密钥值单独成行：标明是假密钥（沙箱 token）还是真密钥，并给出密钥值本身。
+  for _, k in ipairs(d.keys or {}) do
+    local label = (k.kind == "fake") and "假密钥" or "真密钥"
+    out[#out + 1] = "· " .. label .. "：" .. _key_value_text(k.value)
   end
   return out
 end

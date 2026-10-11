@@ -378,16 +378,22 @@ displayed separately in the popup and highlighted).
 **Same-round aggregation (multi-tab popup)**: multiple `ask_user` calls issued concurrently within the same round
 (same `agent.id` and same `agent._round_seq`) are aggregated into **a single multi-tab popup** answered together
 (a debounce window `ui.ask_user.batch_debounce_ms`, default 25ms, covers sibling-call arrival timing); the top tab
-bar marks each question as answered with `✓/○`. Questions from different rounds form separate batches shown in
-order (they do not fail outright). Once all are answered it goes to a **summary page** (listing each `Q → A`), where
-`e` returns to editing or `y`/Enter submits all at once; if any question is still unanswered on submit, it warns and
-jumps back to the first unanswered tab. With `ui.ask_user.require_confirm=false` the summary page is skipped and it
-submits directly once all are answered.
+bar marks each question as answered with `✓/○`, the **current tab is reverse-highlighted**, answered tabs are green,
+unanswered dim, and the **rightmost tab is the "Confirm" tab** (opencode-aligned). Questions from different rounds
+form separate batches shown in order (they do not fail outright).
+
+**Interaction (opencode-aligned)**: `1-9` selects/toggles an option (single-select records it; with multiple
+questions it does **not auto-advance** — switch tabs manually); `k/j` or `↑/↓` moves the option focus (the focused
+row is background-highlighted), `<CR>` selects the focused option; `h/l` or `←/→` switch tabs (keeping
+`<Tab>`/`<S-Tab>` and `]`/`[`); `i` opens free-text input for the current question. **A single single-select
+question submits on selection — no second confirmation, no confirm tab**; multi-select/multi-question batches
+confirm on the rightmost "Confirm" tab (listing each `Q → A`; unanswered items warn and jump to the first
+unanswered question), where `<CR>`/`y` submits and `h`/`←` returns to editing. With `ui.ask_user.require_confirm=false`
+the confirm tab is not shown and it submits directly once all are answered.
 
 Each question accepts an optional `multi_select` (boolean, default false): when true the question allows multiple
 selections, returning the selected labels joined with `", "`; a single-select question returns the label string; and
-free-text input overrides it with plain text. Popup keys: digits `1-9` select/toggle an option, `<Tab>`/`<S-Tab>` (or
-`]`/`[`) switch tabs, `i`/Enter opens free-text input; **`<Esc>` cancels the whole batch only in NORMAL mode** (in
+free-text input overrides it with plain text. **`<Esc>` cancels the whole batch only in NORMAL mode** (in
 INSERT mode `<Esc>` keeps its original meaning of leaving insert mode, so editing does not accidentally cancel — to
 give up, press `<Esc>` back to NORMAL and then `<Esc>` again). When no UI is registered it falls back to
 `vim.ui.input`, asking the multiple questions one by one in order. **It does not pop up immediately when focus is not
