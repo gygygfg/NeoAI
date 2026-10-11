@@ -782,19 +782,27 @@ detection) and `risk.classify` (security level), so `pip install`, `sudo modprob
     but lose the objects", producing dangling references (`fatal: unable to read <blob>`, i.e. a
     corrupted git index). So `.git` is handled with **atomic classification + ordered application**:
     - Freeze classifies each path via `runtime.git_path_class`: `object` (`.git/objects/**`,
-      content-addressed, immutable, additive), `pointer` (index/HEAD/refs/logs/packed-refs, …),
+      content-addressed, immutable, additive), `pointer` (index/HEAD/refs/logs/packed-refs/**worktrees**, …),
       `transient` (`*.lock`/`gc.log`) and `other` (config/hooks/info). `transient`/`other` and
-      **object deletions** (gc/prune pruning) are never candidates.
+      **object deletions** (gc/prune pruning) are never candidates. A worktree's own `.git` **file** is
+      treated as a normal path (it physically lives in the worktree directory and must be deleted
+      together with the parent `rmdir`, avoiding `RMDIR_NOT_EMPTY`).
     - Application order is fixed to **objects → normal files → pointers** (`_apply_order`): any index/ref
       written references objects that already exist, so nothing dangles; objects already present are
       skipped idempotently by content address (no CAS). Hence the `.git` changes of `git_add` /
-      `git_commit` / `git_stash` / `git_restore` enter the review window together with
+      `git_commit` / `git_stash` / `git_restore` / `git_worktree` enter the review window together with
       the worktree changes and are applied atomically on confirmation (`SANDBOX_GIT_INTERNAL` only
       backstops transient/config targets).
     - These git mutation tools run **inside the sandbox** (`effect=process`, seeing the staged
       worktree); their changes freeze as candidates and dry_run does not touch the real `.git`.
       git **mutation** subcommands inside `run_command` are refused by a guard
-      (`SANDBOX_GIT_MUTATION_VIA_COMMAND`, `sandbox/observe/git_guard.lua`) and must use those dedicated tools.
+      (`SANDBOX_GIT_MUTATION_VIA_COMMAND`, `sandbox/observe/git_guard.lua`) and must use those dedicated
+      tools; only read-only sub-actions such as `git worktree list` are allowed.
+    - **`git worktree` target guard (`sandbox/observe/worktree_guard.lua`)**: the worktree directory must
+      be under a writable root (`read_all=false`: cwd + `process_roots` + staged overlay roots) and must
+      not be inside `.git` or an ephemeral root (`ephemeral_roots`/`tmpfs_roots`) — otherwise a broken or
+      session-lost worktree is produced, so it is **fail-closed** rejected with guidance to adjust
+      `process_roots`/`read_all`.
     - **The review window presents the operation as one group**: candidates touching `.git`
       objects/pointers are tagged as an atomic group (`atomic_group="git"` in `review`) and rendered
       as "git operation · N files · atomic group"; the header and every file line map to the **whole
@@ -804,7 +812,7 @@ detection) and `risk.classify` (security level), so `pip install`, `sudo modprob
     - File-writing tools (`edit_file`, …) targeting `.git` are still refused outright (the AI should
       not edit repository internals directly).
     - **Only git-write tools may publish `.git` pointers**: any tool other than `git_add`/`git_commit`/
-      `git_stash`/`git_restore` whose candidate happens to contain `.git/index`
+      `git_stash`/`git_restore`/`git_worktree` whose candidate happens to contain `.git/index`
       (e.g. because a fresh `.git` mtime forced a full traversal) is only seeing a **leftover pointer
       from a preceding git tool**; it is dropped at freeze time (only the object store is kept).
       Otherwise the candidate would publish a dangling pointer to a not-yet-materialized object, which

@@ -46,6 +46,9 @@ local SPECS = {
   git_commit = { effect = "process" },
   git_stash = { effect = "process" },
   git_restore = { effect = "process" },
+  -- worktree 管理：在沙箱内执行（list 只读；add/remove/... 改写 `.git/worktrees/**` 与工作树
+  -- `.git` 文件，均为 pointer，由候选管线原子化捕获/发布）。落点经 `worktree_guard` 校验。
+  git_worktree = { effect = "process" },
   git_auto_commit_config = { effect = "in_process" },
   -- 日志
   log_message = { effect = "fs_write" },

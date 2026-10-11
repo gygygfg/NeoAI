@@ -238,10 +238,15 @@ M.execute(agent, name, args, tool_call_id, opts)
 `git_file_history` / `git_auto_commit_config`（在沙箱命名空间内执行，看到暂存视图）。
 
 变更（在**沙箱内**执行 `effect=process`，改动**原子暂存进审批悬浮窗**）：`git_add` /
-`git_commit` / `git_stash` / `git_restore`。`.git` 是「索引↔对象库↔refs」强耦合
+`git_commit` / `git_stash` / `git_restore` / `git_worktree`。`.git` 是「索引↔对象库↔refs」强耦合
 数据库，按 `object → 普通文件 → pointer` 有序原子应用，绝不产生悬空引用（见
 [sandbox.md](sandbox.md)）；`run_command` 中的 git 变更子命令会被拒绝
 （`SANDBOX_GIT_MUTATION_VIA_COMMAND`），须改用上述专用工具。
+
+`git_worktree` 管理 `git worktree`（`list`/`add`/`remove`/`move`/`prune`/`lock`/`unlock`/`repair`）：
+`list` 只读；变更改写主仓 `.git/worktrees/**` 与工作树 `.git` 文件（均为 pointer），与工作树文件
+一起作为**原子整组**进入审批。工作树落点须位于可写根内、且不在 `.git` 内部或临时根
+（`worktree_guard`，fail-closed）。
 
 ### 🔧 LSP（lsp_ops.lua，Neovim >= 0.12）
 

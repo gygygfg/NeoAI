@@ -40,7 +40,7 @@ local M = {}
 -- 相对整仓很小，全量遍历代价可接受。
 local GIT_WRITE_TOOLS = {
   git_add = true, git_commit = true, git_stash = true,
-  git_restore = true,
+  git_restore = true, git_worktree = true,
 }
 
 -- ========== 性能埋点（tools.sandbox.diagnostics.enabled） ==========
@@ -1473,9 +1473,20 @@ local function _gate_inner(tool, args, ctx, call_original)
         kind = "sandbox",
         message = "SANDBOX_GIT_MUTATION_VIA_COMMAND: 检测到 git 变更子命令 `" .. sub
           .. "`。`.git` 不可经命令修改，请改用专用 git 工具"
-          .. "（git_add / git_commit / git_stash / git_restore）。",
+          .. "（git_add / git_commit / git_stash / git_restore / git_worktree）。",
         command_id = attempt.command_id,
       })
+    end
+  end
+
+  -- git worktree 落点门禁（git_worktree）：限定在可写根内，拒绝 `.git` 内部与临时根
+  -- （fail-closed：未被可写根覆盖时拒绝，绝不静默降级为「工作树会随会话丢失」）。
+  if attempt.tool_name == "git_worktree" and type(args) == "table" then
+    local reason = require("NeoAI.sandbox.observe.worktree_guard").check(args, ctx)
+    if reason then
+      control.transition(attempt, "PARSED")
+      control.transition(attempt, "BLOCKED")
+      return async.reject({ kind = "sandbox", message = reason, command_id = attempt.command_id })
     end
   end
 
@@ -2453,7 +2464,7 @@ local function _gate_inner(tool, args, ctx, call_original)
       return async.reject({
         kind = "sandbox",
         message = "SANDBOX_GIT_INTERNAL: `.git` 内部不可用文件工具修改，"
-          .. "请使用专用 git 工具（git_add/git_commit/git_stash/git_restore）: " .. args[key],
+          .. "请使用专用 git 工具（git_add/git_commit/git_stash/git_restore/git_worktree）: " .. args[key],
         command_id = attempt.command_id,
       })
     end

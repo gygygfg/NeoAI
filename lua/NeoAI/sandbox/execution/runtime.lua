@@ -2155,8 +2155,8 @@ end
 --- 分类 `.git` 内部路径，用于**原子化**暂存/发布：
 ---   object    对象库（`.git/objects/**`）——内容寻址、不可变、可累加；**必须先于指针写入**，
 ---             且永不单独丢弃/删除，否则索引/refs 会指向不存在的对象（悬空引用）。
----   pointer   指针（index / HEAD / refs/** / logs/** / packed-refs / *_HEAD 等）——可变，
----             指向对象；**必须在对象之后写入**，可做 CAS 冲突检测。
+---   pointer   指针（index / HEAD / refs/** / logs/** / packed-refs / *_HEAD / worktrees/** 等）
+---             ——可变，指向对象；**必须在对象之后写入**，可做 CAS 冲突检测。
 ---   transient 瞬态文件（`*.lock`、`gc.log`）——绝不暂存/发布。
 ---   other     其它（config/hooks/info 等）——不纳入候选（AI 不应改仓库配置）。
 --- 返回 nil 表示不是 `.git` 内部路径。
@@ -2172,12 +2172,18 @@ function M.git_path_class(path)
     prefix_len = 6
   else
     -- 路径本身即 `.git`（目录/文件）本身，无内部相对路径。
-    if path == ".git" or path:sub(-5) == "/.git" then return "other" end
+    -- 工作树的 `.git` 是**文件**（`gitdir: ...` 反指主仓 `.git/worktrees/<name>`），物理上位于
+    -- 工作树目录内，须与普通文件同样参与「子路径先于父路径（删除）」排序——若误判为 pointer
+    -- 会在父目录 rmdir（rank 1）之后才删除，导致 RMDIR_NOT_EMPTY。故返回 nil（普通路径），
+    -- 整组原子性由包含它的 `.git/worktrees/**` 元数据（pointer）保证。
     return nil
   end
   local rel = path:sub(prefix_len + 1)
   if rel == "" then return "other" end
   if rel:match("%.lock$") or rel == "gc.log" then return "transient" end
+  -- 工作树元数据（`.git/worktrees/<name>/**`）：HEAD/index/ORIG_HEAD/gitdir/commondir/
+  -- locked/logs/refs 均为可变指针（共享对象库，不含 objects/），须在对象之后整组原子发布。
+  if rel:sub(1, 10) == "worktrees/" then return "pointer" end
   if rel == "index" or rel == "HEAD" or rel == "packed-refs" or rel == "ORIG_HEAD"
     or rel == "MERGE_HEAD" or rel == "CHERRY_PICK_HEAD" or rel == "REVERT_HEAD"
     or rel == "FETCH_HEAD" or rel == "COMMIT_EDITMSG" or rel == "MERGE_MSG"

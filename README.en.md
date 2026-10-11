@@ -770,6 +770,7 @@ one does). For risk levels and allowlists see the `approval` config and [docs/en
 | `git_commit`            | Commit staged changes (staged for review) | `message` (required); `all` (optional) `-a` stage tracked files first |
 | `git_stash`             | Manage stash (staged for review) | `action` (required) `push`/`pop`/`apply`/`drop`/`list`; `message`/`include_untracked` (push only) |
 | `git_restore`           | Roll/restore a file back to a given commit (staged for review; default `HEAD` only discards uncommitted changes; rolling back more than one version requires `confirm_multi` and user confirmation) | `file_path` (required); `commit` (optional, default `HEAD`) exact revision; `confirm_multi` (optional, default `false`) set true only when the user explicitly named the version |
+| `git_worktree`          | Manage git worktrees (staged for review; `.git/worktrees` metadata applied as one atomic group) | `action` (required) `list`/`add`/`remove`/`move`/`prune`/`lock`/`unlock`/`repair`; `path` (worktree dir, required except list/prune); `new_path` (move); `commit` (add, default `HEAD`); `detach`/`force`; `reason` (lock) |
 | `git_auto_commit_config`| View/set the auto-commit configuration    | `auto_commit` (optional) boolean; omit to just query the current setting |
 
 ### 🤖 Sub-Agent Tools

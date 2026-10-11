@@ -550,6 +550,7 @@ local DEFAULT_CONFIG = {
         git_status = { auto_allow = true },
         git_commit_detail = { auto_allow = true },
         git_restore = { auto_allow = false },
+        git_worktree = { auto_allow = false },
         git_file_history = { auto_allow = true },
         git_branch = { auto_allow = true },
         git_auto_commit_config = { auto_allow = true, auto_commit = false },

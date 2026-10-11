@@ -264,11 +264,17 @@ Read-only: `git_status` / `git_diff` / `git_log` / `git_commit_detail` / `git_br
 `git_file_history` / `git_auto_commit_config` (executed in the sandbox namespace, seeing the staged view).
 
 Mutations (run **inside the sandbox**, `effect=process`; changes are **staged atomically into the
-review window**): `git_add` / `git_commit` / `git_stash` / `git_restore`. `.git` is a
+review window**): `git_add` / `git_commit` / `git_stash` / `git_restore` / `git_worktree`. `.git` is a
 tightly coupled "index ↔ object store ↔ refs" database, applied atomically in
 `object → normal file → pointer` order so nothing ever dangles (see [sandbox.md](sandbox.md)); git
 mutation subcommands in `run_command` are refused (`SANDBOX_GIT_MUTATION_VIA_COMMAND`) and must use the
 dedicated tools above.
+
+`git_worktree` manages `git worktree` (`list`/`add`/`remove`/`move`/`prune`/`lock`/`unlock`/`repair`):
+`list` is read-only; mutations rewrite the main repo's `.git/worktrees/**` and the worktree `.git`
+file (both pointers), presented as an **atomic group** together with the worktree files. The worktree
+target must be under a writable root and outside `.git`/ephemeral roots (`worktree_guard`,
+fail-closed).
 
 ### 🔧 LSP (lsp_ops.lua, Neovim >= 0.12)
 

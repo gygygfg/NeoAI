@@ -460,6 +460,11 @@ tests.suite("sandbox_core", function(_, it)
     t.nil_(g.mutating("git clone https://github.com/o/r.git"), "clone 应放行")
     t.nil_(g.mutating("git -C /opt/pyenv init"), "init 应放行")
     t.eq("commit", g.mutating("git clone x && git commit -m y"), "clone 后接 commit 仍应拦 commit")
+    -- worktree：变更子命令仍拦（走专用 git_worktree 工具）；只读 `worktree list` 放行
+    t.eq("worktree", g.mutating("git worktree add /x HEAD"), "worktree add 应拦")
+    t.eq("worktree", g.mutating("git -C /repo worktree remove /x"), "worktree remove 应拦")
+    t.nil_(g.mutating("git worktree list"), "worktree list 应放行")
+    t.nil_(g.mutating("git worktree list --porcelain"), "worktree list 带选项应放行")
     local rt = require("NeoAI.sandbox.execution.runtime")
     t.true_(rt.is_git_internal("/a/.git/index"))
     t.true_(rt.is_git_internal("/repo/vendor/x/.git"))
@@ -476,7 +481,36 @@ tests.suite("sandbox_core", function(_, it)
     t.eq("transient", rt.git_path_class("/repo/.git/index.lock"))
     t.eq("transient", rt.git_path_class("/repo/.git/gc.log"))
     t.eq("other", rt.git_path_class("/repo/.git/config"))
+    -- worktree：`.git/worktrees/<name>/**` 元数据与工作树 `.git` 文件均为 pointer（可变指针）
+    t.eq("pointer", rt.git_path_class("/repo/.git/worktrees/feat/HEAD"))
+    t.eq("pointer", rt.git_path_class("/repo/.git/worktrees/feat/index"))
+    t.eq("pointer", rt.git_path_class("/repo/.git/worktrees/feat/gitdir"))
+    t.eq("transient", rt.git_path_class("/repo/.git/worktrees/feat/index.lock"))
+    -- 工作树 `.git` 文件本身按普通路径处理（物理位于工作树目录内，需随父目录 rmdir 一起删除）
+    t.nil_(rt.git_path_class("/ws/feat-wt/.git"))
     t.nil_(rt.git_path_class("/repo/a.lua"))
+  end)
+
+  it("worktree 落点门禁：.git 内部/临时根/未覆盖路径分别被拒", function(t)
+    local wg = require("NeoAI.sandbox.observe.worktree_guard")
+    -- `.git` 内部一律拒绝
+    t.matches("SANDBOX_WORKTREE_IN_GIT",
+      wg.check({ action = "add", path = "/repo/.git/wt" }, { cwd = "/repo" }) or "")
+    -- 临时根（/tmp，且不在 cwd 子树）拒绝（显式开启 ephemeral_roots）
+    with_config({ tools = { sandbox = { ephemeral_roots = { "/tmp" } } } }, function()
+      t.matches("SANDBOX_WORKTREE_EPHEMERAL",
+        wg.check({ action = "add", path = "/tmp/wt" }, { cwd = "/repo" }) or "")
+    end)
+    -- read_all=false 且落点不在 cwd/process_roots → fail-closed 拒绝
+    with_config({ tools = { sandbox = { read_all = false, ephemeral_roots = {}, process_roots = {} } } }, function()
+      t.matches("SANDBOX_WORKTREE_UNCOVERED",
+        wg.check({ action = "add", path = "/opt/elsewhere/wt" }, { cwd = "/repo" }) or "")
+      -- cwd 子树内放行
+      t.nil_(wg.check({ action = "add", path = "/repo/wt" }, { cwd = "/repo" }),
+        "cwd 子树内应放行")
+    end)
+    -- list 无落点：任何路径参数均忽略
+    t.nil_(wg.check({ action = "list", path = "/repo/.git" }, { cwd = "/repo" }), "list 应放行")
   end)
 
   it("git 变更：沙箱内执行，.git 改动原子暂存进审批悬浮窗（dry_run 不改真实 .git）", function(t)
@@ -518,6 +552,87 @@ tests.suite("sandbox_core", function(_, it)
     end)
     vim.fn.chdir(prev)
     vim.fn.delete(dir, "rf")
+  end)
+
+  it("git worktree：add 冻结工作树与 .git/worktrees 元数据为原子组，dry_run 不改真实仓库", function(t)
+    local runtime = require("NeoAI.sandbox.execution.runtime")
+    if runtime.backend() ~= "bwrap" then return end
+    if vim.fn.executable("git") ~= 1 then return end
+    local fs = require("NeoAI.utils.fs")
+    local sandbox = require("NeoAI.sandbox")
+    local base = vim.fn.tempname()
+    local repo = base .. "/repo"
+    local wt = base .. "/wt"
+    fs.ensure_dir(repo)
+    fs.write_file(repo .. "/a.txt", "hello\n")
+    vim.fn.system({ "git", "-C", repo, "init", "-q" })
+    vim.fn.system({ "git", "-C", repo, "config", "user.email", "t@t" })
+    vim.fn.system({ "git", "-C", repo, "config", "user.name", "t" })
+    vim.fn.system({ "git", "-C", repo, "add", "-A" })
+    vim.fn.system({ "git", "-C", repo, "commit", "-q", "-m", "init" })
+    local prev = vim.fn.getcwd()
+    vim.fn.chdir(base)
+    with_config({ tools = { approval = { mode = "async" }, sandbox = { mode = "dry_run", review = { enabled = true } } } }, function()
+      sandbox.reset()
+      local done, add_res, add_err = false, nil, nil
+      require("NeoAI.tools").execute("git_worktree",
+        { action = "add", path = wt, repo = repo, description = "t" }, {})
+        :then_(function(v) add_res, done = v, true end, function(e) add_err, done = e or true, true end)
+      t.true_(vim.wait(30000, function() return done ~= false end, 50), "git_worktree add 应完成")
+      t.nil_(add_err, "git_worktree add 不应被拒绝: " .. tostring(add_err and add_err.message or add_err))
+      if add_res and add_res.success == false then
+        t.true_(false, "git worktree add 应成功: " .. tostring(add_res.error))
+      end
+      t.true_(vim.wait(30000, function() return not sandbox.postprocess_pending() end, 50), "后处理应完成")
+      -- 待审候选：工作树 `.git` 文件与主仓 `.git/worktrees/**` 元数据均须出现（pointer）
+      local found_wt_git, found_meta, item_id = false, false, nil
+      for _, item in ipairs(sandbox.list_reviews({ review_state = "PENDING" })) do
+        if item.tool == "git_worktree" then
+          item_id = item.change_set_id
+          for _, f in ipairs(item.files or {}) do
+            if f.path == wt .. "/.git" then found_wt_git = true end
+            if f.path:find("/%.git/worktrees/") then found_meta = true end
+          end
+        end
+      end
+      t.true_(found_wt_git, "候选应包含工作树 .git 文件")
+      t.true_(found_meta, "候选应包含 .git/worktrees/** 元数据")
+      t.not_nil(item_id, "应存在待审的 git_worktree")
+      -- dry_run：真实仓库不得出现 worktrees 目录
+      t.false_(fs.exists(repo .. "/.git/worktrees"), "dry_run 下真实 .git/worktrees 不应存在")
+      -- 应用后 worktree list 可见、仓库一致
+      local res = sandbox.apply(item_id, { auto_approve = true })
+      t.true_(res and res.ok, "应用 git_worktree 应成功: "
+        .. tostring(res and res.state) .. " " .. tostring(res and res.reason))
+      local list = vim.fn.system({ "git", "-C", repo, "worktree", "list" })
+      t.true_(list:find("wt", 1, true) ~= nil, "应用后 worktree list 应含新工作树: " .. tostring(list))
+      local out = vim.fn.system({ "git", "-C", repo, "fsck", "--no-progress", "--strict" })
+      t.true_(out:find("missing") == nil, "fsck 不应报告 missing: " .. tostring(out))
+      -- remove：删除工作树目录与 `.git/worktrees` 元数据，应用后彻底移除
+      local done2, rm_res, rm_err2 = false, nil, nil
+      require("NeoAI.tools").execute("git_worktree",
+        { action = "remove", path = wt, repo = repo, description = "t" }, {})
+        :then_(function(v) rm_res, done2 = v, true end, function(e) rm_err2, done2 = e or true, true end)
+      t.true_(vim.wait(30000, function() return done2 ~= false end, 50), "git_worktree remove 应完成")
+      t.nil_(rm_err2, "git_worktree remove 不应被拒绝: " .. tostring(rm_err2 and rm_err2.message or rm_err2))
+      if rm_res and rm_res.success == false then
+        t.true_(false, "git worktree remove 应成功: " .. tostring(rm_res.error))
+      end
+      t.true_(vim.wait(30000, function() return not sandbox.postprocess_pending() end, 50), "后处理应完成")
+      local rm_id = nil
+      for _, item in ipairs(sandbox.list_reviews({ review_state = "PENDING" })) do
+        if item.tool == "git_worktree" then rm_id = item.change_set_id end
+      end
+      t.not_nil(rm_id, "应存在待审的 git_worktree remove")
+      local res2 = sandbox.apply(rm_id, { auto_approve = true })
+      t.true_(res2 and res2.ok, "应用 git_worktree remove 应成功: "
+        .. tostring(res2 and res2.state) .. " " .. tostring(res2 and res2.reason))
+      t.false_(fs.exists(wt) and vim.fn.isdirectory(wt) == 1, "工作树目录应被删除")
+      local list2 = vim.fn.system({ "git", "-C", repo, "worktree", "list" })
+      t.true_(list2:find("wt", 1, true) == nil, "removed worktree 不应再出现: " .. tostring(list2))
+    end)
+    vim.fn.chdir(prev)
+    vim.fn.delete(base, "rf")
   end)
 
   it("git 变更：应用 git_add 原子组不报错且 .git 一致（回归：整组审批报错/回退）", function(t)

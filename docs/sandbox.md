@@ -618,22 +618,29 @@ token（`NEOKEY_…`）或格式保真假密钥时**拒绝写盘**（`SECRET_TOK
     对象」而产生悬空引用（`fatal: unable to read <blob>`，即 git 索引损坏）。因此对 `.git`
     做**原子化分类 + 有序应用**：
     - 冻结阶段按 `runtime.git_path_class` 分类：`object`（`.git/objects/**`，内容寻址、不可变、
-      可累加）、`pointer`（index/HEAD/refs/logs/packed-refs 等）、`transient`（`*.lock`/`gc.log`）、
-      `other`（config/hooks/info）。`transient`/`other` 与**对象删除**（gc/prune 剪枝）不纳入候选。
+      可累加）、`pointer`（index/HEAD/refs/logs/packed-refs/**worktrees** 等）、
+      `transient`（`*.lock`/`gc.log`）、`other`（config/hooks/info）。`transient`/`other` 与
+      **对象删除**（gc/prune 剪枝）不纳入候选。工作树的 `.git` **文件**按普通路径处理（物理位于
+      工作树目录内，须随父目录 `rmdir` 一起删除，避免 `RMDIR_NOT_EMPTY`）。
     - 应用顺序固定为 **对象 → 普通文件 → 指针**（`_apply_order`）：任何被写入的索引/refs 所引用
       的对象都已存在，绝不悬空；对象库已存在时按内容寻址幂等跳过，不做 CAS。因此 `git_add` /
-      `git_commit` / `git_stash` / `git_restore` 的 `.git` 改动与工作区改动一起
+      `git_commit` / `git_stash` / `git_restore` / `git_worktree` 的 `.git` 改动与工作区改动一起
       进入审批悬浮窗，用户确认后原子应用（`SANDBOX_GIT_INTERNAL` 仅兜底拒绝瞬态/配置类目标）。
     - 这些 git 变更工具在**沙箱内**执行（`effect=process`，看到暂存工作区），改动冻结为候选、
       dry_run 下不改真实 `.git`。`run_command` 中的 git **变更**子命令被守卫拒绝
-      （`SANDBOX_GIT_MUTATION_VIA_COMMAND`，`sandbox/observe/git_guard.lua`），须改用上述专用工具。
+      （`SANDBOX_GIT_MUTATION_VIA_COMMAND`，`sandbox/observe/git_guard.lua`），须改用上述专用工具；
+      仅 `git worktree list` 等只读子动作放行。
+    - **`git worktree` 落点门禁（`sandbox/observe/worktree_guard.lua`）**：工作树目录必须位于
+      可写根内（`read_all=false` 时为 cwd + `process_roots` + 已暂存覆盖根），且不得在 `.git`
+      内部或临时根（`ephemeral_roots`/`tmpfs_roots`）——否则会产生「半残、git 不认」或随会话
+      丢失的工作树，故 **fail-closed** 拒绝并提示调整 `process_roots`/`read_all`。
     - **审批悬浮窗整组呈现**：涉及 `.git` 对象/指针的候选被标记为原子组
       （`review` 的 `atomic_group="git"`），界面渲染为「git 操作 · N 个文件 · 原子整组」，
       头行与各文件行都映射到**整组**——`<CR>` 通过、`d` 丢弃均作用于整组，禁止逐文件选择性
       应用/丢弃（`apply`/`reject_file` 也强制整组），避免只写索引或只写对象导致损坏。
     - 文件写入工具（`edit_file` 等）以 `.git` 为目标仍直接拒绝（AI 不应直接改仓库内部）。
-    - **只有 git 写类工具可发布 `.git` 指针**：`git_add`/`git_commit`/`git_stash`/`git_restore`
-      之外的任何工具，其候选即使因 `.git` mtime 新鲜被「全量遍历捕获」而看到
+    - **只有 git 写类工具可发布 `.git` 指针**：`git_add`/`git_commit`/`git_stash`/`git_restore`/
+      `git_worktree` 之外的任何工具，其候选即使因 `.git` mtime 新鲜被「全量遍历捕获」而看到
       `.git/index` 等指针变化，那也只是**前置 git 工具遗留在 overlay 的残留**，冻结时一律剔除
       （仅保留对象库）。否则该候选会写出「引用了尚未物化对象」的悬空指针，被发布闸门以
       `GIT_REFERENTIAL_INTEGRITY: index -> <oid>` fail-closed 拒绝，令本无问题的工具整单失败。

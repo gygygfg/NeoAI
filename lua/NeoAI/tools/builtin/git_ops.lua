@@ -431,6 +431,108 @@ git_tools.git_restore = helpers.define_tool(
   { category = "git", approval = { auto_allow = false } }
 )
 
+git_tools.git_worktree = helpers.define_tool(
+  "git_worktree",
+  "管理 git 工作树（git worktree）。"
+    .. "action: list（只读）/ add / remove / move / prune / lock / unlock / repair。"
+    .. "add 需要 path（工作树目录，须位于可写根内且不可在 .git 内），可选 commit（默认 HEAD）/ detach / force；"
+    .. "remove 需要 path（可选 force）；move 需要 path 与 new_path；"
+    .. "lock 需要 path（可选 reason）；unlock 需要 path；repair 可选 path。"
+    .. "变更在沙箱内执行并进入审批（.git 工作树元数据整组原子应用）。",
+  {
+    type = "object",
+    properties = {
+      action = {
+        type = "string",
+        enum = { "list", "add", "remove", "move", "prune", "lock", "unlock", "repair" },
+      },
+      path = { type = "string", description = "工作树目录（add/remove/move/lock/unlock/repair）" },
+      new_path = { type = "string", description = "move 的目标目录" },
+      commit = { type = "string", description = "add 的起点修订（默认 HEAD）；禁止臆测旧版本" },
+      detach = { type = "boolean", description = "add 时分离 HEAD（不新建分支）" },
+      force = { type = "boolean", description = "add/remove 时强制（谨慎）" },
+      reason = { type = "string", description = "lock 的原因" },
+      repo = { type = "string", description = "仓库目录（缺省=会话仓库）" },
+    },
+    required = { "action" },
+  },
+  function(args, on_success, on_error, ctx)
+    local action = args.action
+    local repo = _repo(args)
+    local function _need_path()
+      if type(args.path) ~= "string" or args.path == "" then
+        on_error("git_worktree action=" .. tostring(action) .. " 需要 path")
+        return nil
+      end
+      return args.path
+    end
+
+    if action == "list" then
+      _git({ "worktree", "list" }, ctx, repo):then_(function(r)
+        if r.code == 0 then
+          on_success(output_guard.cap(r.output ~= "" and r.output or "（无附加工作树）", { tool = "git_worktree" }))
+        else
+          on_error(_git_text(r))
+        end
+      end, function(e) on_error(e.message) end)
+      return
+    end
+
+    local argv
+    if action == "add" then
+      local p = _need_path(); if not p then return end
+      argv = { "worktree", "add" }
+      if args.force == true then argv[#argv + 1] = "--force" end
+      if args.detach == true then argv[#argv + 1] = "--detach" end
+      argv[#argv + 1] = p
+      argv[#argv + 1] = args.commit or "HEAD"
+    elseif action == "remove" then
+      local p = _need_path(); if not p then return end
+      argv = { "worktree", "remove" }
+      if args.force == true then argv[#argv + 1] = "--force" end
+      argv[#argv + 1] = p
+    elseif action == "move" then
+      local p = _need_path(); if not p then return end
+      if type(args.new_path) ~= "string" or args.new_path == "" then
+        on_error("git_worktree action=move 需要 new_path")
+        return
+      end
+      argv = { "worktree", "move", p, args.new_path }
+    elseif action == "prune" then
+      argv = { "worktree", "prune" }
+    elseif action == "lock" then
+      local p = _need_path(); if not p then return end
+      argv = { "worktree", "lock" }
+      if type(args.reason) == "string" and args.reason ~= "" then
+        argv[#argv + 1] = "--reason"; argv[#argv + 1] = args.reason
+      end
+      argv[#argv + 1] = p
+    elseif action == "unlock" then
+      local p = _need_path(); if not p then return end
+      argv = { "worktree", "unlock", p }
+    elseif action == "repair" then
+      argv = { "worktree", "repair" }
+      if type(args.path) == "string" and args.path ~= "" then argv[#argv + 1] = args.path end
+    else
+      on_error("git_worktree action 仅支持 list/add/remove/move/prune/lock/unlock/repair")
+      return
+    end
+
+    _git_write(argv, ctx, repo):then_(function(r)
+      if r.code == 0 then
+        -- 新增/移动工作树后刷新相关 buffer（幂等；缺失路径无副作用）。
+        if (action == "add" or action == "move") and type(args.path) == "string" then
+          pcall(helpers.reload_buffers_for, args.path)
+        end
+        on_success(_git_text(r))
+      else
+        on_error(_git_text(r))
+      end
+    end, function(e) on_error(e.message) end)
+  end,
+  { category = "git", approval = { auto_allow = false } }
+)
+
 git_tools.git_auto_commit_config = helpers.define_tool(
   "git_auto_commit_config",
   "查看/设置自动提交配置。auto_commit 可选。",

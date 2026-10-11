@@ -757,6 +757,7 @@ NeoAI 内置了 40+ 工具，AI 可在对话中自动调用，涵盖以下类别
 | `git_commit`            | 提交已暂存改动（改动暂存待审） | `message`（必填）提交信息；`all`（可选）先 `-a` 暂存已跟踪文件 |
 | `git_stash`             | 管理 stash（改动暂存待审） | `action`（必填）`push`/`pop`/`apply`/`drop`/`list`；`message`/`include_untracked`（仅 push） |
 | `git_restore`           | 回滚/还原文件到指定提交（改动暂存待审；默认 `HEAD` 仅丢弃未提交改动，跨多个版本必须 `confirm_multi` 且经用户确认） | `file_path`（必填）文件；`commit`（可选，默认 `HEAD`）目标精确修订；`confirm_multi`（可选，默认 `false`）用户已明确点名版本时置 true |
+| `git_worktree`          | 管理 git 工作树（改动暂存待审，`.git/worktrees` 元数据整组原子应用） | `action`（必填）`list`/`add`/`remove`/`move`/`prune`/`lock`/`unlock`/`repair`；`path`（工作树目录，除 list/prune 外必填）；`new_path`（move）；`commit`（add，默认 `HEAD`）；`detach`/`force`；`reason`（lock） |
 | `git_auto_commit_config`| 查看/设置自动提交配置    | `auto_commit`（可选）布尔，省略则仅查询当前配置 |
 
 ### 🤖 子 Agent 工具

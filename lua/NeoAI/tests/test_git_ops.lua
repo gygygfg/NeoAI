@@ -97,6 +97,25 @@ tests.suite("git_ops", function(_, it, before_each)
     t.matches("action 仅支持", err)
   end)
 
+  it("git_worktree：add/list/remove 生命周期", function(t)
+    local wt = vim.fn.tempname() .. "-neoai_wt"
+    local _, add_err = invoke(tools.git_worktree, { action = "add", path = wt })
+    t.nil_(add_err, "worktree add 不应报错: " .. tostring(add_err))
+    t.eq(1, vim.fn.isdirectory(wt), "工作树目录应存在")
+    t.eq(1, vim.fn.filereadable(wt .. "/.git"), "工作树应有 .git 文件")
+    t.matches("wt", invoke(tools.git_worktree, { action = "list" }), "list 应含新工作树")
+    local _, rm_err = invoke(tools.git_worktree, { action = "remove", path = wt })
+    t.nil_(rm_err, "worktree remove 不应报错: " .. tostring(rm_err))
+    t.eq(0, vim.fn.isdirectory(wt), "工作树目录应被删除")
+  end)
+
+  it("git_worktree：缺少 path / 非法 action 报错", function(t)
+    local _, err = invoke(tools.git_worktree, { action = "add" })
+    t.matches("需要 path", err)
+    local _, err2 = invoke(tools.git_worktree, { action = "bogus" })
+    t.matches("action 仅支持", err2)
+  end)
+
   -- 造出 HEAD=initial(c1) -> c2 -> c3 的历史，a.txt 内容依次 hello/v2/v3
   local function make_three_versions()
     write("a.txt", "v2\n")

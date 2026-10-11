@@ -3,9 +3,10 @@
 --- `.git` 是「索引↔对象库↔refs」强耦合的数据库，必须原子化处理（见 `runtime.git_path_class`
 --- 与 `candidate._apply_order`：对象先于指针），否则会「存了索引丢了对象」产生悬空引用。
 --- 因此外部命令中的 git **变更**子命令在此识别并拒绝，改由专用 git 工具
---- （`git_add`/`git_commit`/`git_stash`/`git_restore`，沙箱内执行、改动原子暂存
+--- （`git_add`/`git_commit`/`git_stash`/`git_restore`/`git_worktree`，沙箱内执行、改动原子暂存
 --- 进审批悬浮窗）处理。只读 git 子命令（status/diff/log/show/...）不拦截；
---- 变更子命令中的**纯只读子动作**（如 `git stash list` / `git stash show`）亦放行。
+--- 变更子命令中的**纯只读子动作**（如 `git stash list` / `git stash show` / `git worktree list`）
+--- 亦放行。
 
 local M = {}
 
@@ -35,6 +36,7 @@ local VALUE_OPTS = {
 --- 但 `git stash list` / `git stash show` 只读取、不改工作区与 refs/index。
 local READONLY_SUBACTION = {
   stash = { list = true, show = true },
+  worktree = { list = true },
 }
 
 --- 判断变更子命令 `sub`（`tokens[k]`）之后的第一个**位置参数**是否为只读子动作。
