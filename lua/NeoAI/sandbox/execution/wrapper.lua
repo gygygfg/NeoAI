@@ -180,15 +180,24 @@ end
 --     独立 attempt/overlay。
 --   * **捕获/冻结/合并/结算**经 `_serialize_capture` 串行：避免捕获互相覆盖；`state.materialized`
 --     的目标签名使后完成的捕获只处理尚未捕获的改动（按完成顺序归因，改动不丢失/不重复）。
+--   * **捕获屏障**：搭建阶段的物化（暂存 → overlay）必须等上一条命令的后台捕获/合并
+--     （overlay → 暂存）完成，否则会用陈旧暂存覆盖 overlay 中的命令改动（视图撕裂 / 命令产物
+--     回退）。见 `_serialize_setup`。
 local setup_mutex = { busy = false, queue = {} }
 local capture_mutex = { busy = false, queue = {} }
 
+-- 后台后处理链（命令进程退出后的捕获/冻结/合并/落盘/结算）。`postprocess = "async"`（默认）
+-- 时工具结果在进程退出后立即返回，此链在后台完成，由 `_serialize_capture` 串行化。
+-- 声明在 `_serialize_setup` 之前：搭建阶段的捕获屏障需要读它（Lua 局部作用域）。
+local postprocess = { pending = nil, seq = 0 }
+
 --- 串行执行同步搭建任务；`fn` 返回后**立即释放**槽位（命令执行不在锁内，可并发）。
+--- 物化前先等上一条命令的后台捕获/合并完成（捕获屏障），保证暂存镜像已并入命令改动。
 --- @param fn function() -> any
 --- @return Deferred
 local function _serialize_setup(fn)
   local out = async.Deferred.new()
-  local function run()
+  local function proceed()
     local ok, inner = pcall(fn)
     table.remove(setup_mutex.queue, 1)
     local nxt = setup_mutex.queue[1]
@@ -201,6 +210,18 @@ local function _serialize_setup(fn)
     -- 槽位已释放；out 继续跟随 inner（命令执行/捕获链）完成。
     inner:then_(function(v) out:resolve(v) end, function(e) out:reject(e) end)
   end
+  local run = function()
+    -- 捕获屏障：若上一条命令的捕获/合并仍在后台（async），先等其完成再物化，避免用陈旧暂存
+    -- 覆盖 overlay 中的命令改动。sync 模式或队列为空时 `pending` 为 nil，无额外等待。
+    local pending = postprocess.pending
+    if pending then
+      pending:then_(
+        function() vim.schedule(proceed) end,
+        function() vim.schedule(proceed) end)
+    else
+      proceed()
+    end
+  end
   setup_mutex.queue[#setup_mutex.queue + 1] = run
   if not setup_mutex.busy then
     setup_mutex.busy = true
@@ -208,10 +229,6 @@ local function _serialize_setup(fn)
   end
   return out
 end
-
--- 后台后处理链（命令进程退出后的捕获/冻结/合并/落盘/结算）。`postprocess = "async"`（默认）
--- 时工具结果在进程退出后立即返回，此链在后台完成，由 `_serialize_capture` 串行化。
-local postprocess = { pending = nil, seq = 0 }
 
 --- 登记后台后处理链（用于测试/关闭时等待）。
 --- @param def Deferred

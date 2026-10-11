@@ -1051,17 +1051,33 @@ function M.materialize_overlay(specs, opts)
               entry.fresh_ssig = nil
             end
             local rec = mat[real]
-            -- 跳过未改动的物化：暂存副本与上一次写入的 overlay 目标（mtime/大小）都未变，
-            -- 则无需再次读取+detokenize+写入。暂存堆积到数千时，避免每次 run_command
-            -- 开始都把所有暂存文件重写一遍。未变路径用数值字段直接比较，不做字符串格式化。
-            local unchanged = rec and rec.hash and sstat and sstat.mtime and dstat and dstat.mtime
-              and rec.s_sec == sstat.mtime.sec and rec.s_nsec == sstat.mtime.nsec
-              and rec.s_size == sstat.size
-              and rec.d_sec == dstat.mtime.sec and rec.d_nsec == dstat.mtime.nsec
-              and rec.d_size == dstat.size
-              -- 权限位变化（chmod，执行位等）也要重新物化：mtime/size 可能不变。
-              and (dstat.mode % 4096) == (entry.mode or 420)
-            if not unchanged then
+            -- 视图一致性判定（防「命令产物被陈旧暂存回退」）：
+            --   * 暂存副本与 overlay 目标都自上次物化未变 → 跳过（暂存量大时的主优化）。
+            --   * **暂存未变、overlay 目标变了** → 改动来自命令（overlay 权威），绝不回写：
+            --     否则会用陈旧暂存覆盖命令产物，表现为「就地修改被回退」。仅更新记录的目标签名，
+            --     交由 capture/merge 把 overlay 改动并入暂存。
+            --   * 其余（暂存变了 / 无记录）→ 把暂存物化进 overlay。
+            -- 未变路径用数值字段直接比较，不做字符串格式化。
+            local s_same, d_same = false, false
+            if rec and rec.hash and sstat and sstat.mtime and dstat and dstat.mtime then
+              s_same = rec.s_sec == sstat.mtime.sec and rec.s_nsec == sstat.mtime.nsec
+                and rec.s_size == sstat.size
+              d_same = rec.d_sec == dstat.mtime.sec and rec.d_nsec == dstat.mtime.nsec
+                and rec.d_size == dstat.size
+                -- 权限位变化（chmod，执行位等）也算目标改动：mtime/size 可能不变。
+                and (dstat.mode % 4096) == (entry.mode or 420)
+            end
+            if s_same and d_same then
+              -- 已物化且未改动：无需处理
+            elseif s_same and not d_same then
+              -- overlay 被命令改动、暂存未变：overlay 权威，不回写；更新目标签名以免反复判定。
+              rec.d_sec = dstat.mtime.sec
+              rec.d_nsec = dstat.mtime.nsec
+              rec.d_size = dstat.size
+              rec.dsig = string.format("%s:%s:%s:%s",
+                tostring(dstat.mtime.sec), tostring(dstat.mtime.nsec),
+                tostring(dstat.size), tostring(dstat.mode % 4096))
+            else
               -- 原子替换：同目录临时文件 + rename。原先「先 delete 再 copy」在并行运行的
               -- 命令读到该路径时会看到缺失/半写内容（暂存文件系统原子性）；rename 原子生效。
               local is_large = entry.large == true
