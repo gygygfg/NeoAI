@@ -1472,6 +1472,42 @@ tests.suite("sandbox_review", function(_, it)
     review.reset()
   end)
 
+  it("应用发布抛异常：结算为 FAILED 并回退待审（不卡 APPLYING，可重试）", function(t)
+    local review = require("NeoAI.sandbox.review.review")
+    local store = require("NeoAI.sandbox.state.store")
+    local candidate = require("NeoAI.sandbox.execution.candidate")
+    review.reset()
+    local dir = vim.fn.tempname()
+    local function make_cand()
+      return {
+        candidate_digest = "sha256:gitthrow-" .. tostring(vim.uv.hrtime()),
+        files = {
+          { path = dir .. "/.git/objects/ab/cd", action = "create", content = "obj", after_hash = "h1" },
+          { path = dir .. "/.git/index", action = "modify", content = "idx", after_hash = "h2" },
+        },
+      }
+    end
+    local item = assert(review.enqueue(make_cand(), { tool = "git_add" }))
+    local orig_read, orig_pub = store.read_candidate, candidate.publish
+    store.read_candidate = function() return make_cand() end
+    candidate.publish = function() error("boom-publish") end
+    local res = review.apply(item.change_set_id, { auto_approve = true })
+    t.true_(not res.ok, "抛异常应结算为失败而不是冒出异常")
+    t.eq("FAILED", res.state)
+    t.matches("PUBLISH_ERROR", res.reason)
+    local after = assert(review.get(item.change_set_id))
+    t.eq(review.APPLY.FAILED, after.apply_state, "应置为 FAILED")
+    t.eq(review.REVIEW.PENDING, after.review_state, "应回退待审（自动批准被撤销）")
+    -- 恢复后重试应成功（证明未卡在 APPLYING）。
+    candidate.publish = function()
+      return { ok = true, state = "COMMITTED", receipt = { operation_id = "op_retry" } }
+    end
+    local res2 = review.apply(item.change_set_id, { auto_approve = true })
+    t.true_(res2.ok, "重试应成功: " .. tostring(res2 and res2.reason))
+    store.read_candidate, candidate.publish = orig_read, orig_pub
+    review.reset()
+  end)
+
   it("多级页面：页头展示 5 个页面并可 h/l 切换", function(t)
     local services = require("NeoAI.kernel.services")
     local sr = require("NeoAI.ui.components.sandbox_review")

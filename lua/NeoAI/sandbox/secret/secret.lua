@@ -231,6 +231,9 @@ local function looks_like_assigned_secret(value)
   if type(value) ~= "string" or #value < 4 then return false end
   if looks_like_path(value) then return false end
   if looks_like_env_name_ref(value) then return false end
+  -- Neovim 按键记号（`<F5>` / `<C-a>` / `<leader>x` 等）是 UI 字面量，不是凭据。
+  -- 否则 `key = "<F5>"` 会被按名脱敏成 `<V1>`，使工具回传与磁盘字节不一致（幽灵改动错觉）。
+  if value:match("^<[%w%-_]+>$") then return false end
   if value:find("%d") then return true end
   if #value >= 8 and value:find("%u") then return true end
   if #value >= 8 and value:find("[%+/=:]") then return true end

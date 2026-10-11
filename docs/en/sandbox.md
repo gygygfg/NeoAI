@@ -2512,6 +2512,10 @@ explicit human confirmation** before publishing.
   `package-lock.json` integrity, `python -m build` sources, and Python traceback function names or
   paths in tool output are not corrupted/misread. Set to `false` to restore the old "any high-entropy
   run is a secret" behavior.
+- **UI key notation is excluded**: in name-based redaction (`NAME = value`), a value shaped like a
+  Neovim key notation (`<F5>`, `<C-a>`, `<F12>` …, matching `^<[%w%-_]+>$`) is not treated as a
+  credential, so a config `key = "<F5>"` is not faux-faked into `<V1>` (which would make tool output
+  diverge from on-disk bytes).
 - **Only suspected secret files get the entropy scan** (`entropy_secret_paths_only`, on by default):
   the full-text entropy scan runs only on content whose path matches a **suspected secret file**, so
   ordinary files and tool output skip the expensive per-character entropy computation. The check is

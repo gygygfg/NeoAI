@@ -63,6 +63,20 @@ tests.suite("secret_fake", function(_, it)
     secret.reset()
   end)
 
+  it("按键记号赋值不误假化：key = \"<F5>\" 保持原样，真实密钥仍假化", function(t)
+    secret.reset()
+    for _, x in ipairs({ 'key = "<F5>"', 'key = "<C-a>"', 'key = "<F12>"', 'key = "<leader>x"' }) do
+      t.eq(x, (secret.tokenize(x)), "UI 按键记号不应被假化: " .. x)
+      t.true_(not secret.has_token((secret.tokenize(x))), "不应产生假密钥: " .. x)
+    end
+    -- 反向：同名字段下的真实凭据仍须假化并可无损还原
+    local k = "dfe946fb66864c48927f31f2aa49164d.rwbWDAfnQjlHuMFt"
+    local out = secret.tokenize('key = "' .. k .. '"')
+    t.true_(secret.has_token(out), "真实凭据仍应被假化")
+    t.eq('key = "' .. k .. '"', (secret.detokenize(out)), "应可无损还原")
+    secret.reset()
+  end)
+
   it("JWT/私钥块结构保真", function(t)
     secret.reset()
     local jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"

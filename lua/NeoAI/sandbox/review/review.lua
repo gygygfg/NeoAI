@@ -1459,6 +1459,26 @@ local function _apply_publish_begin(ctx)
 end
 
 --- 应用变更单元（CAS 发布到真实工作区，同步）
+--- 发布过程抛出异常时的结算：转成结构化 FAILED 并回退待审，避免条目永久卡在 APPLYING
+--- （否则后续重试恒返回 CHANGE_SET_APPLYING，用户只能看到报错无法重试）。
+--- 顺序敏感单元（git 原子组/删除）会回落同步 `candidate.publish`，异常在此路径可达。
+--- @param ctx table
+--- @param err any
+--- @return table { ok=false, state="FAILED", reason }
+local function _settle_publish_error(ctx, err)
+  _release_paths(ctx)
+  local reason = "PUBLISH_ERROR: " .. tostring(err)
+  local failed = { ok = false, state = "FAILED", reason = reason }
+  -- 结算（回退待审 + 置 FAILED）；结算自身再抛异常时兜底手工回退，绝不遗留 APPLYING。
+  if not pcall(_apply_settle, ctx, failed) then
+    ctx.item.apply_state = M.APPLY.FAILED
+    ctx.item.fail_reason = reason
+    ctx.restore_pending()
+    pcall(_persist, ctx.item)
+  end
+  return failed
+end
+
 --- 支持选择性应用：opts.files 指定允许的文件子集（按单个文件审批）。
 --- @param id string
 --- @param opts table|nil { files?: string[], auto_approve?: boolean }
@@ -1472,7 +1492,7 @@ function M.apply(id, opts)
     local pub = candidate.publish(ctx.cand, pub_opts)
     return _apply_settle(ctx, pub)
   end)
-  if not ok then _release_paths(ctx); error(res, 0) end
+  if not ok then return _settle_publish_error(ctx, res) end
   return res
 end
 
@@ -1487,8 +1507,13 @@ function M.apply_async(id, opts)
   local ctx, early = _apply_begin(id, opts)
   if early then return async.resolve(early) end
   ctx = assert(ctx)
-  local pub_opts = _apply_publish_begin(ctx)
-  local d = candidate.publish_async(ctx.cand, pub_opts):then_(function(pub)
+  local ok_begin, pub_opts = pcall(_apply_publish_begin, ctx)
+  if not ok_begin then return async.resolve(_settle_publish_error(ctx, pub_opts)) end
+  -- `candidate.publish_async` 对顺序敏感单元（git 原子组/删除）内部回落同步 `M.publish`，
+  -- 可能同步抛异常；此处捕获并转成结构化 FAILED，而不是让异常冒泡把条目卡在 APPLYING。
+  local ok_pub, d = pcall(candidate.publish_async, ctx.cand, pub_opts)
+  if not ok_pub then return async.resolve(_settle_publish_error(ctx, d)) end
+  d = d:then_(function(pub)
     return _apply_settle(ctx, pub)
   end)
   -- 发布异常/被拒时同样释放路径占用，避免路径长期「发布中」而无法重试。

@@ -2023,6 +2023,9 @@ UI 未注册但为**交互式 Neovim** 时，回退到内建 `confirm` **暂停�
   `/opt/build_0abc…/lib`），避免把 `package-lock.json` 的 integrity、`python -m build`
   源码里的哈希、工具输出中的 Python 回溯函数名或路径写坏/读错。
   设 `false` 退回旧的「任意高熵串即密钥」行为。
+- **排除 UI 按键记号**：按名脱敏（`NAME = value`）中，值形如 Neovim 按键记号
+  （`<F5>`、`<C-a>`、`<F12>` 等，匹配 `^<[%w%-_]+>$`）时不视为凭据，避免把配置里的
+  `key = "<F5>"` 误假化成 `<V1>`，导致工具回传与磁盘字节不一致。
 - **仅疑似密钥文件做高熵扫描**（`entropy_secret_paths_only`，默认开）：全文熵扫描只对
   路径命中「疑似密钥文件」的内容执行，避免对普通文件/工具输出做昂贵的逐字符熵计算。判定见
   `sandbox.secret.is_secret_path`，覆盖 `~/.ssh/`、`~/.aws/`、`~/.gnupg/`、`~/.config/gcloud`、

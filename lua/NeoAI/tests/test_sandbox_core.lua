@@ -520,6 +520,87 @@ tests.suite("sandbox_core", function(_, it)
     vim.fn.delete(dir, "rf")
   end)
 
+  it("git 变更：应用 git_add 原子组不报错且 .git 一致（回归：整组审批报错/回退）", function(t)
+    local runtime = require("NeoAI.sandbox.execution.runtime")
+    if runtime.backend() ~= "bwrap" then return end
+    if vim.fn.executable("git") ~= 1 then return end
+    local fs = require("NeoAI.utils.fs")
+    local sandbox = require("NeoAI.sandbox")
+    local dir = vim.fn.tempname()
+    fs.ensure_dir(dir)
+    fs.write_file(dir .. "/a.txt", "hello\n")
+    vim.fn.system({ "git", "-C", dir, "init", "-q" })
+    vim.fn.system({ "git", "-C", dir, "config", "user.email", "t@t" })
+    vim.fn.system({ "git", "-C", dir, "config", "user.name", "t" })
+    local prev = vim.fn.getcwd()
+    vim.fn.chdir(dir)
+    with_config({ tools = { approval = { mode = "async" }, sandbox = { mode = "dry_run", review = { enabled = true } } } }, function()
+      sandbox.reset()
+      local done = false
+      require("NeoAI.tools").execute("git_add", { all = true, description = "t" }, {})
+        :then_(function() done = true end, function() done = true end)
+      t.true_(vim.wait(20000, function() return done end), "应完成")
+      t.true_(vim.wait(30000, function() return not sandbox.postprocess_pending() end, 50), "后处理应完成")
+      local applied = false
+      for _, item in ipairs(sandbox.list_reviews({ review_state = "PENDING" })) do
+        if item.tool == "git_add" then
+          local res = sandbox.apply(item.change_set_id, { auto_approve = true })
+          t.true_(res.ok, "应用 git_add 原子组应成功: "
+            .. tostring(res and res.state) .. " " .. tostring(res and res.reason))
+          applied = true
+        end
+      end
+      t.true_(applied, "应存在待审的 git_add")
+      local out = vim.fn.system({ "git", "-C", dir, "fsck", "--no-progress", "--strict" })
+      t.true_(out:find("missing") == nil, "fsck 不应报告 missing: " .. tostring(out))
+      t.true_(out:find("unable to read") == nil, "fsck 不应报告 unable to read: " .. tostring(out))
+    end)
+    vim.fn.chdir(prev)
+    vim.fn.delete(dir, "rf")
+  end)
+
+  it("git 变更：链式 add→apply→commit→apply 不冲突（回归：应用后冲突回退）", function(t)
+    local runtime = require("NeoAI.sandbox.execution.runtime")
+    if runtime.backend() ~= "bwrap" then return end
+    if vim.fn.executable("git") ~= 1 then return end
+    local fs = require("NeoAI.utils.fs")
+    local sandbox = require("NeoAI.sandbox")
+    local dir = vim.fn.tempname()
+    fs.ensure_dir(dir)
+    fs.write_file(dir .. "/a.txt", "hello\n")
+    vim.fn.system({ "git", "-C", dir, "init", "-q" })
+    vim.fn.system({ "git", "-C", dir, "config", "user.email", "t@t" })
+    vim.fn.system({ "git", "-C", dir, "config", "user.name", "t" })
+    local prev = vim.fn.getcwd()
+    vim.fn.chdir(dir)
+    with_config({ tools = { approval = { mode = "async" }, sandbox = { mode = "dry_run", review = { enabled = true } } } }, function()
+      sandbox.reset()
+      local function run(tool, args)
+        local done = false
+        require("NeoAI.tools").execute(tool, args, {}):then_(function() done = true end, function() done = true end)
+        t.true_(vim.wait(30000, function() return done end, 50), tool .. " 应完成")
+        t.true_(vim.wait(30000, function() return not sandbox.postprocess_pending() end, 50), "后处理应完成")
+      end
+      local function apply_tool(name)
+        for _, item in ipairs(sandbox.list_reviews({ review_state = "PENDING" })) do
+          if item.tool == name then
+            return sandbox.apply(item.change_set_id, { auto_approve = true })
+          end
+        end
+      end
+      run("git_add", { all = true, description = "t" })
+      local ra = apply_tool("git_add")
+      t.true_(ra and ra.ok, "应用 git_add 应成功: " .. tostring(ra and ra.state) .. " " .. tostring(ra and ra.reason))
+      run("git_commit", { message = "c1", description = "t" })
+      local rc = apply_tool("git_commit")
+      t.true_(rc and rc.ok, "链式应用 git_commit 应成功: " .. tostring(rc and rc.state) .. " " .. tostring(rc and rc.reason))
+      local out = vim.fn.system({ "git", "-C", dir, "fsck", "--no-progress", "--strict" })
+      t.true_(out:find("missing") == nil, "fsck 不应报告 missing: " .. tostring(out))
+    end)
+    vim.fn.chdir(prev)
+    vim.fn.delete(dir, "rf")
+  end)
+
   it("git 变更：git_add 未应用即被 git_commit 取代，应用 commit 不悬空（回归）", function(t)
     -- 回归：git_add 候选被 git_commit 整组取代（对象随旧候选丢弃），但 commit 的 index 仍引用
     -- git_add 产生的 blob。若捕获从暂存物化的对象时走 ws_skip 漏登记，发布闸门会以
