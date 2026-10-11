@@ -268,7 +268,7 @@ sandbox = {
   backend = "auto",                -- auto | bwrap | unshare
   offline = false,                 -- Network allowed by default (recorded only, not blocked); true hard-denies network and isolates process networking
   require_seccomp = true,          -- Reject external execution when seccomp is unavailable (default on, fail-closed)
-  seccomp = { enabled = true, filter_path = "" }, -- seccomp baseline (built-in denylist; default on; bwrap only)
+  seccomp = { enabled = true, filter_path = "", allow_namespaces = true }, -- seccomp baseline (built-in denylist; default on; bwrap only). allow_namespaces=true (default) no longer blocks nested namespaces (unshare/setns/clone(CLONE_NEW*)), required by container runtimes; set false to restore blocking
   cap_add = {},                    -- Global extra capabilities (empty by default); the tier baseline adds CAP_DAC_OVERRIDE (see privilege.tiers), package installs/system administration add more on demand. Set { "ALL" } only for debugging
   -- Payload identity (least privilege): sandboxed processes run as a non-root user by default.
   -- Payload identity: runs as root by default (uid=0) so the AI can use host toolchains inside the

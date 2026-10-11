@@ -86,6 +86,26 @@ format-preserving fake keys, the write is **refused** (`SECRET_TOKEN_SKIP`), so 
 secret layer is never written back to a real file (a past bug replaced a source file's contents with
 random fake values).
 
+**View consistency (preventing "command output rolled back by stale staging")**: the overlay upper
+(authoritative for commands) and the workspace staging mirror (authoritative for tools/LSP) are two
+stores kept in sync by copies (`mirror_overlay` overlay→staging; `capture_overlay_async`/
+`merge_candidate` overlay→staging after a command; `materialize_overlay` staging→overlay before a
+command). Guarantees:
+
+- **Setup capture barrier**: before materializing (staging→overlay), `_serialize_setup` first waits for
+  the previous command's background capture/merge to finish (`postprocess.pending`; no wait in `sync`
+  mode). Otherwise the next command would overwrite the overlay with stale staging (`wrapper.lua`).
+- **Materialize reconciliation**: when `materialize_overlay` finds "staging unchanged but overlay
+  target changed", it treats it as a **command change** (overlay wins), **does not write back**, and
+  only updates the recorded target signature; it writes staging into the overlay only when staging
+  itself changed (`candidate.lua`). This removes "in-place edit rolled back".
+
+> Remaining: LSP/treesitter are host processes and cannot read the bwrap overlay directly, so they
+> still read the staging mirror; the barrier ensures the mirror already includes command changes before
+> each tool/command, so the AI's read paths (`read_file` overlay / `list_files` mirror) agree at every
+> tool boundary. The session-rotation whiteout race is handled by `candidate.rotate_session`
+> (`rotate_when_idle`).
+
 ## 3. Enforcement points (loader + executor)
 
 - `plugins/catalog.lua` `_tool_spec` depends on `services.sandbox` and passes it to
@@ -1981,7 +2001,7 @@ require("NeoAI").setup({
         upstream_proxy = nil,        -- host upstream proxy chaining: nil=auto-use host *_PROXY; false/""=no chaining; string=explicit URL
         proxy = "strip",             -- strip | passthrough | { http, https, all, no_proxy }
       },
-      seccomp = { enabled = true, filter_path = "" }, -- built-in denylist filter; bwrap backend only
+      seccomp = { enabled = true, filter_path = "", allow_namespaces = true }, -- built-in denylist; allow_namespaces default true = allow nested namespaces (container runtimes need it)
       workspace_root = vim.fn.stdpath("cache") .. "/NeoAI/sandbox", -- base root; each process is isolated under <root>/instances/<pid>_<ts>
       review = { enabled = true, auto_apply = false }, -- async review: candidates enter a pending queue
       retention = { candidate_days = 7, max_pending = 20 },
@@ -2836,6 +2856,11 @@ The sandbox **never binds the host `/var/run/docker.sock`** (always masked). Con
   `unable to connect to Podman …`) instead of leaking `uid_map`/`chown` internals to the model
   (`tools.sandbox.container.allow_nonroot=true` forces an attempt). **To actually run containers, start
   NeoAI as root with `run_as.uid=0`.**
+- **Outer runtime forbids namespace creation** (the seccomp of the container/VM NeoAI itself runs in
+  blocks `unshare`/`clone(CLONE_NEW*)`): container runtimes (podman/runc/buildah) cannot start
+  containers (surfacing as `cannot clone: Operation not permitted`). The facade detects this with a
+  cached `unshare --user true` probe and **disguises** itself as authentic errors (as above) instead of
+  leaking the clone error to the model.
 - **With no podman installed, in-container operations are disabled**: a **disabled shim** is bound
   instead (`docker`/`nerdctl`/`docker-compose` all print the authentic error `Cannot connect to the
   Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?` and `exit 1`), so

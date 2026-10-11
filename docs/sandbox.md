@@ -78,6 +78,22 @@ overlay 成为权威暂存层；随后 `candidate.mirror_overlay` 把 overlay �
 不在私有 tmpfs 根下时**经桥读取 overlay 合并视图**（小文件快路径/存在性判定），其余只读工具
 （`list_files`/`search_files`）读取的是 overlay 镜像后的暂存副本（与 overlay 合并视图一致）；
 LSP/treesitter 的写盘仍走各自既有的暂存路径（`persist_target` → 暂存副本，发布前不改真实盘）。
+
+**视图一致性（防「命令产物被陈旧暂存回退」）**：overlay upper（命令权威）与工作区暂存镜像
+（工具/LSP 权威）是两套存储，靠拷贝同步（`mirror_overlay` overlay→暂存、`capture_overlay_async`/
+`merge_candidate` 命令后 overlay→暂存、`materialize_overlay` 命令前暂存→overlay）。为保证一致：
+
+- **搭建捕获屏障**：`_serialize_setup` 在物化（暂存→overlay）前**先等上一条命令的后台捕获/合并
+  完成**（`postprocess.pending`；`sync` 模式无需等待）。否则下一条命令会用陈旧暂存覆盖 overlay 中
+  的命令改动（`wrapper.lua`）。
+- **物化对账**：`materialize_overlay` 判定「暂存未变、overlay 目标变了」时视为**命令改动**
+  （overlay 权威），**不回写**，仅更新记录的目标签名；只有暂存自身变化才把暂存物化进 overlay
+  （`candidate.lua`）。这消除了「就地修改被回退」。
+
+> 遗留：LSP/treesitter 是宿主进程、无法直接读 bwrap overlay，仍读暂存镜像；屏障保证每次工具/
+> 命令前镜像已并入命令改动，故 AI 各读路径（`read_file` overlay / `list_files` 镜像）在同一
+> 工具边界一致。会话轮换的 whiteout 竞态见 `candidate.rotate_session`（`rotate_when_idle`）。
+
 另外，`persist_buffer` 回写**真实盘**（无沙箱激活时）前做 fail-closed 检查：buffer 内容含密钥
 token（`NEOKEY_…`）或格式保真假密钥时**拒绝写盘**（`SECRET_TOKEN_SKIP`），避免把密钥层假化后的
 内容写回真实文件（曾发生把含 PEM 样式文字的源码文件内容替换为随机假值的静默损坏）。
@@ -1265,7 +1281,10 @@ seccomp（含设备节点屏障）**——沙箱内进程看到的是一份「�
   用户 `hide_proc_paths` 只能**追加**、不能移除强制项。`unshare` 兜底后端无法 bind mount，
   故对 `process` 类 **fail-closed**（`SANDBOX_SYSCTL_MASK_UNAVAILABLE`），不静默降级。
 - **seccomp 基线默认开启**（见 §12）：即便未来出现 capability 相关内核缺陷，denylist
-  仍拦截 `mount`/`unshare`/`setns`/`bpf`/`init_module` 等危险 syscall。
+  仍拦截 `mount`/`bpf`/`init_module` 等危险 syscall。**嵌套命名空间默认放行**
+  （`tools.sandbox.seccomp.allow_namespaces = true`）：不再拦截 `unshare`/`setns`/
+  `clone(CLONE_NEW*)`——嵌套命名空间不改变宿主可见面（仍受沙箱 mount/pid/遮蔽/overlay 约束），
+  且容器运行时（podman/runc/buildah）依赖它；设为 `false` 恢复拦截。
 - **设备节点屏障（seccomp，纵深防御）**：`mknod`/`mknodat` 的 `mode` 含 `S_IFCHR`/
   `S_IFBLK` 位（字符/块设备）一律 `EPERM`——设备节点**不经 overlayfs**，`open` 直接触达
   真实设备，创建块设备即可裸读宿主磁盘、绕过暂存/遮蔽/审批（`mknod /tmp/d b 8 0 &&
@@ -1580,7 +1599,7 @@ require("NeoAI").setup({
         upstream_proxy = nil,        -- 宿主上游代理链式出网：nil=自动沿用宿主 *_PROXY；false/""=不链；字符串=显式 URL
         proxy = "strip",             -- strip | passthrough | { http, https, all, no_proxy }
       },
-      seccomp = { enabled = true, filter_path = "" }, -- 内置 denylist 过滤器；仅 bwrap 后端
+      seccomp = { enabled = true, filter_path = "", allow_namespaces = true }, -- 内置 denylist；allow_namespaces 默认 true＝放行嵌套命名空间（容器运行时依赖）
       workspace_root = vim.fn.stdpath("cache") .. "/NeoAI/sandbox", -- 基根；每进程实例隔离在 <root>/instances/<pid>_<ts>
       review = { enabled = true, auto_apply = false }, -- 异步审批：候选进入待审队列
       retention = { candidate_days = 7, max_pending = 20 },
@@ -2272,6 +2291,10 @@ UI 未注册但为**交互式 Neovim** 时，回退到内建 `confirm` **暂停�
   daemon …` / `unable to connect to Podman …`），不把 `uid_map`/`chown` 等沙箱内部报错透给模型
   （`tools.sandbox.container.allow_nonroot=true` 可强制尝试）。**要真正运行容器，请以 root 启动
   NeoAI 且 `run_as.uid=0`。**
+- **外层运行环境禁止创建命名空间**（NeoAI 自身所在容器/VM 的 seccomp 拦截
+  `unshare`/`clone(CLONE_NEW*)`）：容器运行时（podman/runc/buildah）无法起容器（表现为
+  `cannot clone: Operation not permitted`）。门面以一次 `unshare --user true` 探测（缓存）判定，
+  命中即**伪装**为真机样式错误（同上），而非把 clone 报错透给模型。
 - **环境无 podman 时禁用容器内操作**：改为绑定**禁用桩**（`docker`/`nerdctl`/`docker-compose` 一律
   报真机样式错误 `Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker
   daemon running?` 并 `exit 1`），复合命令中的容器调用同样被禁用；真实原因只进用户 UI / 审计 /

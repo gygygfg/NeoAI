@@ -257,7 +257,7 @@ sandbox = {
   backend = "auto",                -- auto | bwrap | unshare
   offline = false,                 -- 网络默认放行（仅记录，不拦截）；true 时硬拒绝网络并隔离进程网络
   require_seccomp = true,          -- 缺少 seccomp 能力时是否拒绝外部执行（默认开，fail-closed）
-  seccomp = { enabled = true, filter_path = "" }, -- seccomp 基线（内置 denylist；默认开；仅 bwrap）
+  seccomp = { enabled = true, filter_path = "", allow_namespaces = true }, -- seccomp 基线（内置 denylist；默认开；仅 bwrap）。allow_namespaces=true（默认）时不再拦截嵌套命名空间（unshare/setns/clone(CLONE_NEW*)），容器运行时依赖它；设为 false 恢复拦截
   cap_add = {},                    -- 全局额外 capability（默认空）；档位基线另加回 CAP_DAC_OVERRIDE + CAP_SETUID/CAP_SETGID（沙箱内降权，见 privilege.tiers），包安装/系统管理再按需加回。仅调试时才设 { "ALL" }
   -- 载荷运行身份：默认以 root 运行（uid=0），使 AI 能在沙箱内使用宿主工具链（/root 下的
   --   nvm/cargo/go 等 0700 目录非 root 不可遍历）与包管理（dpkg 硬检查 euid==0）。所有写入仍
