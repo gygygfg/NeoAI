@@ -1460,7 +1460,7 @@ local DEFAULT_CONFIG = {
       -- 兼容既有配置；socket/mode 均不再被读取。
       docker = {
         mode = "off", -- 已弃用；无论取值都不再挂载 socket
-        socket = "/run/neoai-docker/docker.sock", -- 已弃用；不再读取
+        socket = "", -- 已弃用；不再读取（历史上指向 /run/neoai-docker/docker.sock，勿依赖）
       },
       -- AI 专用沙箱 LSP：AI 的 lsp_* 工具按需克隆编辑器同名 server（名称加 @neoai-sandbox
       -- 后缀），把克隆体放进 bwrap + overlay（工作区根 lower=真实只读，upper=沙箱私有层），
