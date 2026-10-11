@@ -578,6 +578,7 @@ sandbox = {
     runtime_caps = { "ALL" }, -- host caps granted to container runtimes (still trimmed by global cap_drop); {} = none
     seccomp = false,          -- apply the seccomp baseline to container commands (podman needs unshare/mount, so off)
     containers_conf = true,   -- inject apparmor=unconfined + cgroup_manager=cgroupfs + session-private storage
+    allow_nonroot = false,    -- non-root (or run_as.uid>0): false = disguise as "daemon not running", true = force attempt
   },
   -- Store base root: each process is isolated under <workspace_root>/instances/<pid>_<ts>; pending queue/candidates are not shared across sessions.
   workspace_root = vim.fn.stdpath("cache") .. "/NeoAI/sandbox",

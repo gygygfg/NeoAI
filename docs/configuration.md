@@ -517,6 +517,7 @@ sandbox = {
     runtime_caps = { "ALL" }, -- 容器运行时授予的宿主能力（仍经全局 cap_drop 收敛）；{} = 不额外授予
     seccomp = false,          -- 容器命令是否施加 seccomp 基线（podman 需 unshare/mount，须关闭）
     containers_conf = true,   -- 注入 apparmor=unconfined + cgroup_manager=cgroupfs + 会话私有存储
+    allow_nonroot = false,    -- 非 root（或 run_as.uid>0）时：false=伪装为「daemon 未运行」，true=强制尝试
   },
   -- 存储基根：每进程实例隔离在 <workspace_root>/instances/<pid>_<ts>，待审队列/候选跨会话互不可见。
   workspace_root = vim.fn.stdpath("cache") .. "/NeoAI/sandbox",

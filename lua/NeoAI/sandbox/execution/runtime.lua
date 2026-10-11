@@ -1200,6 +1200,13 @@ local function _append_bwrap_base(argv, flags, priv, cwd, root_overlay, no_pid_n
       argv[#argv + 1] = cap
     end
   end
+  -- `cap_add` 含 `ALL` 时显式 `--cap-add ALL`：非 root（user namespace 内 guest root）场景下
+  -- bwrap 不会自动保留能力，必须显式授予，否则载荷无 CAP_SYS_ADMIN/MKNOD/CHOWN 等（容器运行时
+  -- 会退化为 rootless 并失败）。全局 cap_drop 紧随其后，仍会丢弃宿主全局能力。
+  if full then
+    argv[#argv + 1] = "--cap-add"
+    argv[#argv + 1] = "ALL"
+  end
   for _, cap in ipairs(_global_cap_drop()) do
     if not vim.tbl_contains(caps, cap) then
       argv[#argv + 1] = "--cap-drop"

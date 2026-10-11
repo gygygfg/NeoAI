@@ -47,6 +47,9 @@ local DOCKER_ALIASES = {
 -- podman 可用性（测试可覆盖）。
 local podman_override = nil
 
+-- 容器可运行性（测试可覆盖）。
+local runnable_override = nil
+
 -- 触发注入的子命令
 local RUN_SUBS = { run = true, create = true }
 
@@ -108,6 +111,22 @@ end
 local function _podman_available()
   if podman_override ~= nil then return podman_override end
   return vim.fn.executable("podman") == 1
+end
+
+--- 沙箱内能否实际运行标准容器。
+--- 容器运行时需创建命名空间、挂载 rootfs、按镜像层属主 chown。当载荷非 root（或
+--- `tools.sandbox.run_as.uid > 0`）时，bwrap 把真实用户单映射为 guest root：无法映射镜像层
+--- 的属主 uid/gid（lchown EINVAL），且沙箱内 overlay/嵌套 userns 不可用 → 无法运行标准镜像。
+--- 此时门面伪装为真机「daemon 未运行」，避免把 uid_map/chown 等沙箱内部报错透给模型。
+--- `tools.sandbox.container.allow_nonroot=true` 可强制尝试（届时可能暴露原始报错）。
+--- @return boolean
+local function _containers_runnable()
+  if runnable_override ~= nil then return runnable_override end
+  if _cfg().allow_nonroot == true then return true end
+  local euid = (vim.uv and vim.uv.getuid and vim.uv.getuid()) or vim.fn.getuid()
+  if euid ~= 0 then return false end
+  local run_as = config_store.get("tools.sandbox.run_as") or {}
+  return (tonumber(run_as.uid) or 0) == 0
 end
 
 --- 找到运行时命令 token 下标（跳过 VAR=val 与 SKIP_PREFIX）
@@ -233,6 +252,9 @@ function M.facade(command)
     if sub and UNSUPPORTED_SUBS[sub] then
       return { manager = manager, sub = sub, mode = "unsupported", reason = "CONTAINER_SUBCOMMAND_UNSUPPORTED" }
     end
+    if not _containers_runnable() then
+      return { manager = manager, sub = sub, mode = "unsupported", reason = "CONTAINER_REQUIRES_ROOT" }
+    end
     return { manager = manager, sub = sub, mode = "sandbox" }
   end
   -- Docker/nerdctl 等有守护进程运行时：**永不连接宿主 daemon**（容器由宿主 daemon 在沙箱外
@@ -240,7 +262,7 @@ function M.facade(command)
   -- 沙箱命名空间隔离）。
   local alias = DOCKER_ALIASES[manager] or "podman"
   local alias_enabled = cfg.docker_to_podman ~= false
-  if alias_enabled and _podman_available() then
+  if alias_enabled and _podman_available() and _containers_runnable() then
     local rewritten = _rewrite_manager(command, spans, i, alias)
     if rewritten then
       return {
@@ -249,7 +271,14 @@ function M.facade(command)
       }
     end
   end
-  local reason = alias_enabled and "CONTAINER_PODMAN_UNAVAILABLE" or "CONTAINER_REQUIRES_HOST_DAEMON"
+  local reason
+  if not alias_enabled then
+    reason = "CONTAINER_REQUIRES_HOST_DAEMON"
+  elseif not _podman_available() then
+    reason = "CONTAINER_PODMAN_UNAVAILABLE"
+  else
+    reason = "CONTAINER_REQUIRES_ROOT"
+  end
   return { manager = manager, sub = sub, mode = "unsupported", reason = reason }
 end
 
@@ -328,9 +357,16 @@ function M._set_podman_available(v)
   podman_override = v
 end
 
+--- 测试钩子：覆盖容器可运行性判定（nil 恢复真实探测）。
+--- @param v boolean|nil
+function M._set_containers_runnable(v)
+  runnable_override = v
+end
+
 --- 重置（测试用）
 function M.reset()
   podman_override = nil
+  runnable_override = nil
 end
 
 return M

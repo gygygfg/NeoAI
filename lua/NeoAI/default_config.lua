@@ -1240,6 +1240,11 @@ local DEFAULT_CONFIG = {
         -- `cgroup_manager = "cgroupfs"`）：沙箱内无 AppArmor/systemd 会话总线，podman 装配
         -- AppArmor profile / 连接 systemd cgroup 会失败（`wait for AppArmor command`）。
         containers_conf = true,
+        -- 非 root 运行（或 `run_as.uid > 0`）时，单映射 user namespace 无法运行标准镜像
+        -- （镜像层属主 uid/gid 不可映射 → lchown EINVAL；沙箱内 overlay 亦不可挂载）。默认
+        -- false：门面此时伪装为真机「docker daemon 未运行」，避免把 uid_map/chown 等沙箱内部
+        -- 报错透给模型。设为 true 可强制尝试（可能暴露原始报错、容器多半仍失败）。
+        allow_nonroot = false,
       },
       -- 存储基根。每进程实例隔离在 workspace_root/instances/<pid>_<启动时间>，
       -- 待审队列/候选/回执/证据不跨 nvim 会话共享（多个会话互不可见对方的审批）。

@@ -2266,6 +2266,12 @@ UI 未注册但为**交互式 Neovim** 时，回退到内建 `confirm` **暂停�
 - **入口桩**对 `run`/`create` 子命令补充 `--net/pid/ipc/uts=host`（幂等，已存在则透传），使
   **复合/脚本命令**中的容器调用（如 `cd x && docker run`）也能复用沙箱命名空间，而非只依赖门面对
   命令首个 token 的改写。
+- **非 root 运行（或 `run_as.uid > 0`）**：载荷处于单映射 user namespace（bwrap 把真实用户映射为
+  guest root），无法映射镜像层属主 uid/gid（`lchown` EINVAL），且沙箱内 overlay 不可挂载、嵌套
+  userns 受限 → 无法运行标准镜像。此时门面**伪装**为真机样式错误（`Cannot connect to the Docker
+  daemon …` / `unable to connect to Podman …`），不把 `uid_map`/`chown` 等沙箱内部报错透给模型
+  （`tools.sandbox.container.allow_nonroot=true` 可强制尝试）。**要真正运行容器，请以 root 启动
+  NeoAI 且 `run_as.uid=0`。**
 - **环境无 podman 时禁用容器内操作**：改为绑定**禁用桩**（`docker`/`nerdctl`/`docker-compose` 一律
   报真机样式错误 `Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker
   daemon running?` 并 `exit 1`），复合命令中的容器调用同样被禁用；真实原因只进用户 UI / 审计 /
@@ -2444,7 +2450,7 @@ AI 调用容器运行时（docker/podman 等）时，**在沙箱内管理、容�
 受控计划写入 `kind="container"` 证据并发出 `SANDBOX_CONTAINER_PLANNED`；被拒绝的调用发出
 `SANDBOX_CONTAINER_UNSUPPORTED` 并写入审计（真实原因仅进审计/UI，不回传模型）。配置：
 `tools.sandbox.container`（`enabled`/`share_namespace`/`docker_to_podman`/`runtime_caps`/`seccomp`/
-`containers_conf`）；`tools.sandbox.docker`（`mode`/`socket`）**已弃用**、不再读取。
+`containers_conf`/`allow_nonroot`）；`tools.sandbox.docker`（`mode`/`socket`）**已弃用**、不再读取。
 
 ### 18.4 新会话自动审批（默认关闭）
 

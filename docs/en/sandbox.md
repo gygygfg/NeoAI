@@ -2829,6 +2829,13 @@ The sandbox **never binds the host `/var/run/docker.sock`** (always masked). Con
 - **Entry shims** add `--net/pid/ipc/uts=host` for `run`/`create` (idempotent: passed through when
   already present), so container calls in **compound/script commands** (e.g. `cd x && docker run`) also
   reuse the sandbox namespaces, not only the facade's leading-token rewrite.
+- **Non-root profile (or `run_as.uid > 0`)**: the payload runs in a single-mapping user namespace
+  (bwrap maps the real user to guest root), so image-layer ownership uid/gid cannot be mapped
+  (`lchown` EINVAL), and overlay cannot be mounted inside the sandbox → standard images cannot run.
+  The facade then **disguises** itself as authentic errors (`Cannot connect to the Docker daemon …` /
+  `unable to connect to Podman …`) instead of leaking `uid_map`/`chown` internals to the model
+  (`tools.sandbox.container.allow_nonroot=true` forces an attempt). **To actually run containers, start
+  NeoAI as root with `run_as.uid=0`.**
 - **With no podman installed, in-container operations are disabled**: a **disabled shim** is bound
   instead (`docker`/`nerdctl`/`docker-compose` all print the authentic error `Cannot connect to the
   Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?` and `exit 1`), so
@@ -3043,8 +3050,8 @@ host**. The facade (`container.facade`) intercepts the command in the `effect="p
 A controlled plan is stored as `kind="container"` evidence and emits `SANDBOX_CONTAINER_PLANNED`;
 rejected calls emit `SANDBOX_CONTAINER_UNSUPPORTED` and are audited (the real reason goes only to
 audit/UI, never to the model). Config: `tools.sandbox.container`
-(`enabled`/`share_namespace`/`docker_to_podman`/`runtime_caps`/`seccomp`/`containers_conf`);
-`tools.sandbox.docker` (`mode`/`socket`) is **deprecated** and no longer read.
+(`enabled`/`share_namespace`/`docker_to_podman`/`runtime_caps`/`seccomp`/`containers_conf`/
+`allow_nonroot`); `tools.sandbox.docker` (`mode`/`socket`) is **deprecated** and no longer read.
 
 ### 18.4 Auto-approval for new sessions (default off)
 
