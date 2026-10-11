@@ -166,9 +166,31 @@ end
 --- @return boolean shown 是否已立即展示（false = 已登记待展示）
 function M.gate(key, present)
   if type(key) ~= "string" or key == "" or type(present) ~= "function" then return false end
+  M.refresh()
   if M.is_focused() then
     gated[key] = nil
-    present()
+    -- 在 libuv 快速事件回调（如 host_proxy 的连接回调）中不得直接调用 nvim API（E5560），
+    -- 否则弹窗抛错被吞、请求被静默拒绝。此时调度到主循环再展示。
+    if vim.in_fast_event and vim.in_fast_event() then vim.schedule(present) else present() end
+    return true
+  end
+  gated[key] = present
+  return false
+end
+
+--- 应用级焦点门控：仅在 nvim **确实失去 OS 焦点**时暂存；**不因当前窗口不是 NeoAI 界面而暂存**。
+--- 适用于 `ask_user` 这类「agent 正阻塞等待用户回答」的交互：必须尽快展示，不能因用户此刻在看
+--- 代码窗口就挂起（旧 `gate` 会因此把弹窗压到用户手动切回 NeoAI 界面才弹，表现为「要等好久」）。
+--- @param key string
+--- @param present function
+--- @return boolean shown
+function M.gate_app(key, present)
+  if type(key) ~= "string" or key == "" or type(present) ~= "function" then return false end
+  M.refresh()
+  -- 无 attached UI / 未安装监听 → 不做抑制；已安装且应用失焦 → 暂存待 VimResume/FocusGained。
+  if (not _has_ui()) or (not state.installed) or state.app_focused then
+    gated[key] = nil
+    if vim.in_fast_event and vim.in_fast_event() then vim.schedule(present) else present() end
     return true
   end
   gated[key] = present
@@ -192,7 +214,9 @@ end
 _flush_gated = function()
   local pending = gated
   gated = {}
-  for _, fn in pairs(pending) do pcall(fn) end
+  for _, fn in pairs(pending) do
+    if vim.in_fast_event and vim.in_fast_event() then vim.schedule(fn) else pcall(fn) end
+  end
 end
 
 --- 测试钩子：直接设置「应用是否有焦点」并重算（headless 下无法触发 FocusLost/Gained）。

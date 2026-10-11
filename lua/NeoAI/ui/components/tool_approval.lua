@@ -163,11 +163,12 @@ local function _present(config)
   _set_keymaps()
 end
 
---- 展示审批弹窗。焦点不在 NeoAI 界面（用户切到其他窗口）时不立即弹出，暂存并进入等待，
---- 待切回 NeoAI 界面再弹（经 `focus.gate`）。审批超时/经审批中心决策会调用 `hide()` 取消暂存。
+--- 展示审批弹窗。**应用级焦点门控**（`focus.gate_app`）：只要 nvim 有 OS 焦点即**立即弹出**，
+--- 不因当前窗口不是 NeoAI 界面而延迟（否则用户在看代码窗口时审批被压住、超时后静默拒绝/挂起）；
+--- 仅 nvim 失焦时暂存，回焦再弹。审批超时/经审批中心决策会调用 `hide()` 取消暂存。
 --- @param config table { text, tool_name, args, on_confirm, on_cancel, on_confirm_all, on_add_to_workspace }
 function M.show(config)
-  require("NeoAI.ui.focus").gate("tool_approval", function() _present(config) end)
+  require("NeoAI.ui.focus").gate_app("tool_approval", function() _present(config) end)
 end
 
 --- 隐藏弹窗

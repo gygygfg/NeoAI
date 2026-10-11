@@ -534,11 +534,12 @@ end
 
 -- ========== 公开 API ==========
 
---- 展示提问弹窗。焦点不在 NeoAI 界面（用户切到其他窗口）时不立即弹出，暂存并进入等待，
---- 待用户切回 NeoAI 界面时再弹（经 `focus.gate` 统一实现）。提问工具侧仍照常等待回答。
+--- 展示提问弹窗。仅在 nvim 应用**确实失去 OS 焦点**时暂存（切回再弹）；用户此刻在代码窗口
+--- 但 nvim 有焦点时**立即弹出**——ask_user 是 agent 阻塞等待回答的交互，不能压到用户切回
+--- NeoAI 界面才弹（旧 `focus.gate` 会因此表现为「要等好久才弹」）。
 --- @param config table 批次对象（见 tools/builtin/ask_user M.set_ui 注释）
 function M.show(config)
-  require("NeoAI.ui.focus").gate("ask_user", function() _present(config) end)
+  require("NeoAI.ui.focus").gate_app("ask_user", function() _present(config) end)
 end
 
 --- 隐藏提问弹窗（并复位状态）

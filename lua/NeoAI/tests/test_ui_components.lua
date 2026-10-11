@@ -52,39 +52,49 @@ tests.suite("ui_components", function(_, it)
     focus.reset()
   end)
 
-  it("ask_user：焦点不在 NeoAI 界面时延迟弹出，切回后弹出", function(t)
+  it("ask_user：应用有焦点即弹（不受当前窗口是否 NeoAI 界面影响），仅失焦时暂存", function(t)
     local au = require("NeoAI.ui.components.ask_user")
     local focus = require("NeoAI.ui.focus")
+    local function show()
+      au.show({
+        batch_id = "ui_components_focus",
+        questions = { { question = "Q?", options = { "A" }, multi_select = false } },
+        active = 1,
+        mode = "tab",
+        require_confirm = true,
+        on_submit = function() end,
+        on_cancel = function() end,
+      })
+    end
     au.reset()
     focus.reset()
     focus._set_force_ui(true) -- headless 下模拟 attached UI，使焦点门控生效
     focus.install()
-    -- 当前为普通 buffer → 未聚焦
+    -- 当前为普通 buffer（非 NeoAI 界面），但应用仍有焦点
     local plain = vim.api.nvim_create_buf(false, true)
     vim.api.nvim_set_current_buf(plain)
     focus.refresh()
-    t.false_(focus.is_focused())
-    au.show({
-      batch_id = "ui_components_focus",
-      questions = { { question = "Q?", options = { "A" }, multi_select = false } },
-      active = 1,
-      mode = "tab",
-      require_confirm = true,
-      on_submit = function() end,
-      on_cancel = function() end,
-    })
-    t.nil_(au.get_buf(), "未聚焦时不应建窗")
-    t.true_(au.has_deferred(), "应暂存待展示")
-    -- 切回 NeoAI 界面：广播聚焦 → 真正弹出
+    t.false_(focus.is_focused(), "普通缓冲区 is_focused 仍为 false")
+    show()
+    t.not_nil(au.get_buf(), "应用有焦点时应立即弹窗（不再因窗口非 NeoAI 而延迟）")
+    t.false_(au.has_deferred(), "应用有焦点时不应暂存")
+    au.reset()
+    -- 应用失焦 → 暂存待展示
+    focus._set_app_focused(false)
+    show()
+    t.nil_(au.get_buf(), "应用失焦时不应建窗")
+    t.true_(au.has_deferred(), "应用失焦时应暂存待展示")
+    -- 恢复焦点（切回/回焦）：广播聚焦 → 真正弹出
+    focus._set_app_focused(true)
     event_bus.emit(events.UI_FOCUS_CHANGED, { focused = true })
-    t.not_nil(au.get_buf(), "切回后应弹出提问窗")
+    t.not_nil(au.get_buf(), "回焦后应弹出提问窗")
     t.false_(au.has_deferred(), "弹出后应清除暂存")
     vim.api.nvim_buf_delete(plain, { force = true })
     au.reset()
     focus.reset()
   end)
 
-  it("tool_approval：焦点不在 NeoAI 界面时延迟弹出，切回后弹出", function(t)
+  it("tool_approval：应用有焦点即弹（不因窗口非 NeoAI 而延迟），仅失焦时暂存", function(t)
     local ta = require("NeoAI.ui.components.tool_approval")
     local focus = require("NeoAI.ui.focus")
     ta.reset()
@@ -93,18 +103,24 @@ tests.suite("ui_components", function(_, it)
     focus.install()
     local plain = vim.api.nvim_create_buf(false, true)
     vim.api.nvim_set_current_buf(plain)
-    focus.refresh()
+    focus._set_app_focused(true)
     ta.show({ text = "工具: run_command", tool_name = "run_command",
       on_confirm = function() end, on_cancel = function() end })
-    t.nil_(find_win_by_title("🔒 工具审批: run_command"), "未聚焦时不应建窗")
+    t.not_nil(find_win_by_title("🔒 工具审批: run_command"), "应用有焦点时应立即弹审批窗")
+    ta.reset()
+    focus._set_app_focused(false)
+    ta.show({ text = "工具: run_command", tool_name = "run_command",
+      on_confirm = function() end, on_cancel = function() end })
+    t.nil_(find_win_by_title("🔒 工具审批: run_command"), "失焦时不应建窗")
+    focus._set_app_focused(true)
     event_bus.emit(events.UI_FOCUS_CHANGED, { focused = true })
-    t.not_nil(find_win_by_title("🔒 工具审批: run_command"), "切回后应弹出审批窗")
+    t.not_nil(find_win_by_title("🔒 工具审批: run_command"), "回焦后应弹出审批窗")
     vim.api.nvim_buf_delete(plain, { force = true })
     ta.reset()
     focus.reset()
   end)
 
-  it("net_consent：焦点不在 NeoAI 界面时延迟弹出，切回后弹出", function(t)
+  it("net_consent：应用有焦点即弹（不因窗口非 NeoAI 而延迟），仅失焦时暂存", function(t)
     local nc = require("NeoAI.ui.components.net_consent")
     local focus = require("NeoAI.ui.focus")
     nc.reset()
@@ -113,11 +129,16 @@ tests.suite("ui_components", function(_, it)
     focus.install()
     local plain = vim.api.nvim_create_buf(false, true)
     vim.api.nvim_set_current_buf(plain)
-    focus.refresh()
+    focus._set_app_focused(true)
     nc.show({ host = "example.com", port = 443 }, function() end)
-    t.nil_(find_win_by_title("🌐 沙箱网络访问"), "未聚焦时不应建窗")
+    t.not_nil(find_win_by_title("🌐 沙箱网络访问"), "应用有焦点时应立即弹网络同意窗")
+    nc.reset()
+    focus._set_app_focused(false)
+    nc.show({ host = "example.com", port = 443 }, function() end)
+    t.nil_(find_win_by_title("🌐 沙箱网络访问"), "失焦时不应建窗")
+    focus._set_app_focused(true)
     event_bus.emit(events.UI_FOCUS_CHANGED, { focused = true })
-    t.not_nil(find_win_by_title("🌐 沙箱网络访问"), "切回后应弹出网络同意窗")
+    t.not_nil(find_win_by_title("🌐 沙箱网络访问"), "回焦后应弹出网络同意窗")
     vim.api.nvim_buf_delete(plain, { force = true })
     nc.reset()
     focus.reset()

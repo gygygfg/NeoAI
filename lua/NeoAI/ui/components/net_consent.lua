@@ -149,12 +149,14 @@ local function _present(ctx, decide)
   _set_keymaps()
 end
 
---- 展示同意弹窗。焦点不在 NeoAI 界面（用户切到其他窗口）时不立即弹出，暂存并进入等待，
---- 待切回 NeoAI 界面再弹（经 `focus.gate`）。同意超时/经审批中心决策会调用 `hide()` 取消暂存。
+--- 展示同意弹窗。**应用级焦点门控**（`focus.gate_app`）：只要 nvim 有 OS 焦点即**立即弹出**，
+--- 不因当前窗口不是 NeoAI 界面而延迟（否则用户在看代码窗口时弹窗被压住、连接超时后**静默拒绝**，
+--- 表现为「发送网络被直接拒绝且没弹窗」）；仅 nvim 失焦时暂存，回焦再弹。同意超时/经审批中心
+--- 决策会调用 `hide()` 取消暂存。
 --- @param ctx table { host, port, local_?, proto? }
 --- @param decide function(decision)
 function M.show(ctx, decide)
-  require("NeoAI.ui.focus").gate("net_consent", function() _present(ctx, decide) end)
+  require("NeoAI.ui.focus").gate_app("net_consent", function() _present(ctx, decide) end)
 end
 
 --- 隐藏弹窗
