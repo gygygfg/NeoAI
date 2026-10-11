@@ -2870,6 +2870,7 @@ end
 local GIT_WRITE_TOOLS = {
   git_add = true, git_commit = true, git_stash = true,
   git_restore = true, git_worktree = true,
+  git_fetch = true, git_pull = true,
 }
 
 --- 本次 attempt 是否为 git 写类工具。

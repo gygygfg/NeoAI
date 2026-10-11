@@ -560,6 +560,8 @@ local DEFAULT_CONFIG = {
         git_commit_detail = { auto_allow = true },
         git_restore = { auto_allow = false },
         git_worktree = { auto_allow = false },
+        git_fetch = { auto_allow = false },
+        git_pull = { auto_allow = false },
         git_file_history = { auto_allow = true },
         git_branch = { auto_allow = true },
         git_auto_commit_config = { auto_allow = true, auto_commit = false },
@@ -835,6 +837,8 @@ local DEFAULT_CONFIG = {
         consent_owner_ttl_ms = 2000,
         -- 软件源自动放行（默认开）：pip/uv/npm/go/cargo/apt 等**外部**软件源（PyPI、npm、crates、
         -- 清华/阿里/中科大等镜像）经代理访问时免弹窗直接放行，避免包安装被网络同意门禁拦截。
+        -- 内置列表另含代码托管 github.com / githubusercontent.com（子域自动匹配），使
+        -- git_fetch/git_pull/git clone 访问 GitHub 免弹窗。
         -- 仅对非本机目标生效（解析到本机或解析失败仍拒绝，SSRF 防护不削弱）；access="deny" 时仍拒绝。
         auto_allow_sources = true,
         -- 额外软件源域名后缀（私有源/自建镜像），如 { "pypi.mycorp.com" }。子域自动匹配。

@@ -624,8 +624,9 @@ token（`NEOKEY_…`）或格式保真假密钥时**拒绝写盘**（`SECRET_TOK
       工作树目录内，须随父目录 `rmdir` 一起删除，避免 `RMDIR_NOT_EMPTY`）。
     - 应用顺序固定为 **对象 → 普通文件 → 指针**（`_apply_order`）：任何被写入的索引/refs 所引用
       的对象都已存在，绝不悬空；对象库已存在时按内容寻址幂等跳过，不做 CAS。因此 `git_add` /
-      `git_commit` / `git_stash` / `git_restore` / `git_worktree` 的 `.git` 改动与工作区改动一起
-      进入审批悬浮窗，用户确认后原子应用（`SANDBOX_GIT_INTERNAL` 仅兜底拒绝瞬态/配置类目标）。
+      `git_commit` / `git_stash` / `git_restore` / `git_worktree` / `git_fetch` / `git_pull` 的
+      `.git` 改动与工作区改动一起进入审批悬浮窗，用户确认后原子应用（`SANDBOX_GIT_INTERNAL` 仅
+      兜底拒绝瞬态/配置类目标）。
     - 这些 git 变更工具在**沙箱内**执行（`effect=process`，看到暂存工作区），改动冻结为候选、
       dry_run 下不改真实 `.git`。`run_command` 中的 git **变更**子命令被守卫拒绝
       （`SANDBOX_GIT_MUTATION_VIA_COMMAND`，`sandbox/observe/git_guard.lua`），须改用上述专用工具；
@@ -640,8 +641,9 @@ token（`NEOKEY_…`）或格式保真假密钥时**拒绝写盘**（`SECRET_TOK
       应用/丢弃（`apply`/`reject_file` 也强制整组），避免只写索引或只写对象导致损坏。
     - 文件写入工具（`edit_file` 等）以 `.git` 为目标仍直接拒绝（AI 不应直接改仓库内部）。
     - **只有 git 写类工具可发布 `.git` 指针**：`git_add`/`git_commit`/`git_stash`/`git_restore`/
-      `git_worktree` 之外的任何工具，其候选即使因 `.git` mtime 新鲜被「全量遍历捕获」而看到
-      `.git/index` 等指针变化，那也只是**前置 git 工具遗留在 overlay 的残留**，冻结时一律剔除
+      `git_worktree`/`git_fetch`/`git_pull` 之外的任何工具，其候选即使因 `.git` mtime 新鲜被
+      「全量遍历捕获」而看到 `.git/index` 等指针变化，那也只是**前置 git 工具遗留在 overlay
+      的残留**，冻结时一律剔除
       （仅保留对象库）。否则该候选会写出「引用了尚未物化对象」的悬空指针，被发布闸门以
       `GIT_REFERENTIAL_INTEGRITY: index -> <oid>` fail-closed 拒绝，令本无问题的工具整单失败。
 - **buffer 写盘工具**（`delete_node` / `lsp_rename` / `lsp_format`）：
@@ -1460,7 +1462,8 @@ seccomp（含设备节点屏障）**——沙箱内进程看到的是一份「�
   证据中留痕），命令结果只回传**拦截/上游失败**。仅当目标判定为**非本机**时生效：解析到本机、
   或 DNS 解析失败（fail-closed）仍按本机拒绝，SSRF 防护不削弱；`access="deny"` 时仍拒绝。可用
   `network.extra_package_sources` 追加私有源域名后缀（子域自动匹配）；`auto_allow_sources=false`
-  关闭该放行。
+  关闭该放行。内置列表另含代码托管 `github.com`/`githubusercontent.com`（子域自动匹配），
+  `git_fetch`/`git_pull`/`git clone` 等对 GitHub 的访问默认免弹窗。
 - **边界（重要）**：这是**应用层**过滤。**不认代理的裸 TCP**（`nc`/`ssh`/数据库客户端、
   忽略代理变量的工具）在共享 netns 下可直连宿主本机，不受此层约束。要硬拦截裸 TCP 只能：
   root + iptables/nft（按目的地过滤），或无 root 的 `slirp4netns`/`passt`（原生用户态
@@ -2461,7 +2464,11 @@ L2+ 与包/密钥仍进入待审。目的是即便仅靠本地模型的智能水
 - **overlay 下层 `chown`**：即便有 `CAP_CHOWN`，overlayfs 对「合并目录」的 `chown` 在部分内核
   仍返回 `EPERM`（需 copy-up）。属内核限制，postinst 通常已容错；必要时在脚本里 `|| true`。
 - **`git clone`/`git init`**：放行（新建仓库，`.git` 由候选层按 `git_path_class` 原子捕获）；
-  `commit/checkout/fetch/pull/push/add/reset/…` 仍拦截，改走专用 git 工具。
+  `commit/checkout/fetch/pull/push/add/reset/…` 仍拦截，改走专用 git 工具
+  （`git_add`/`git_commit`/`git_stash`/`git_restore`/`git_worktree`/`git_fetch`/`git_pull`）。
+  `git_fetch`/`git_pull` 在沙箱内经宿主过滤代理访问远程，`.`git` 对象/跟踪 refs（`pull` 另含
+  工作区改动）原子暂存进审批悬浮窗；`github.com`/`githubusercontent.com` 默认静默放行，其余远程
+  按 `tools.sandbox.network.access` 弹窗同意。
 - **`git stash`**：仅 `list` / `show` 只读子动作放行（只读、不碰工作区与 refs/index）；
   裸 `stash`（=push）及 `push`/`pop`/`apply`/`drop`/`clear`/`save`/`store` 等仍拦截，
   改走 `git_stash` 工具（改动原子暂存并进审批悬浮窗）。

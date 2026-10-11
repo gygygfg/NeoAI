@@ -41,6 +41,7 @@ local M = {}
 local GIT_WRITE_TOOLS = {
   git_add = true, git_commit = true, git_stash = true,
   git_restore = true, git_worktree = true,
+  git_fetch = true, git_pull = true,
 }
 
 -- ========== 性能埋点（tools.sandbox.diagnostics.enabled） ==========
@@ -1473,7 +1474,8 @@ local function _gate_inner(tool, args, ctx, call_original)
         kind = "sandbox",
         message = "SANDBOX_GIT_MUTATION_VIA_COMMAND: 检测到 git 变更子命令 `" .. sub
           .. "`。`.git` 不可经命令修改，请改用专用 git 工具"
-          .. "（git_add / git_commit / git_stash / git_restore / git_worktree）。",
+          .. "（git_add / git_commit / git_stash / git_restore / git_worktree / "
+          .. "git_fetch / git_pull）。",
         command_id = attempt.command_id,
       })
     end
@@ -2464,7 +2466,7 @@ local function _gate_inner(tool, args, ctx, call_original)
       return async.reject({
         kind = "sandbox",
         message = "SANDBOX_GIT_INTERNAL: `.git` 内部不可用文件工具修改，"
-          .. "请使用专用 git 工具（git_add/git_commit/git_stash/git_restore/git_worktree）: " .. args[key],
+          .. "请使用专用 git 工具（git_add/git_commit/git_stash/git_restore/git_worktree/git_fetch/git_pull）: " .. args[key],
         command_id = attempt.command_id,
       })
     end

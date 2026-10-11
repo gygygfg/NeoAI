@@ -56,6 +56,10 @@ local PACKAGE_SOURCE_SUFFIXES = {
   "mirrors.cloud.tencent.com", "mirrors.bfsu.edu.cn",
   -- Conda / Ruby / PHP
   "repo.anaconda.com", "conda.anaconda.org", "rubygems.org", "repo.packagist.org",
+  -- 代码托管（git fetch/pull/clone、发布下载、Go module zip 等）：外部目标，静默放行。
+  -- `github.com` 覆盖 api./codeload./gist./objects. 等子域；`githubusercontent.com` 覆盖
+  -- raw./objects./github-releases. 等。注意：这会允许沙箱内命令向这些域名静默外发数据。
+  "github.com", "githubusercontent.com",
 }
 
 -- ========== 地址判定 ==========
@@ -99,6 +103,9 @@ local function _ipv6_first_hextet(ip)
   if not first then return nil end
   return tonumber(first, 16)
 end
+
+-- 代理启动失败只告警一次（ensure 会被每条沙箱外部命令调用，避免刷屏）。
+local _warned_no_proxy = false
 
 --- 宿主各网卡地址集合（回环 + inet/inet6），键为规范化形式
 --- @return table ip -> true
@@ -743,10 +750,26 @@ function M.ensure()
   if cfg.host_local_block == false then return nil end
   local port = tonumber(cfg.host_local_proxy_port) or 0
   local addr, err = M.start("127.0.0.1", port)
+  if not addr and port ~= 0 then
+    -- 固定端口被占用：回退随机端口，避免因端口冲突而静默失去网络门禁。
+    addr, err = M.start("127.0.0.1", 0)
+  end
   if not addr then
     pcall(function() require("NeoAI.kernel.logger").warn("host_proxy 启动失败: " .. tostring(err)) end)
+    if not _warned_no_proxy then
+      _warned_no_proxy = true
+      pcall(function()
+        vim.schedule(function()
+          vim.notify(
+            "[NeoAI] 沙箱网络过滤代理启动失败，外部网络请求将不经同意门禁（直连）。\n"
+              .. "原因：" .. tostring(err) .. "\n运行 :NeoAIDoctor 查看网络同意诊断。",
+            vim.log.levels.WARN, { title = "NeoAI 沙箱网络" })
+        end)
+      end)
+    end
     return nil
   end
+  _warned_no_proxy = false
   return addr
 end
 
@@ -825,6 +848,7 @@ function M.reset()
   state.records = {}
   state.host_addrs = nil
   state.opts = {}
+  _warned_no_proxy = false
 end
 
 return M

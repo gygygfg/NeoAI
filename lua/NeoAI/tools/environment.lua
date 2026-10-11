@@ -37,6 +37,8 @@ local GIT_DEPENDENT_TOOLS = {
   "git_file_history",
   "git_restore",
   "git_worktree",
+  "git_fetch",
+  "git_pull",
 }
 
 -- 依赖工作区（cwd）的工具（workspace 不可获取时禁用）

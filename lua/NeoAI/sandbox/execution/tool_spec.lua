@@ -46,6 +46,10 @@ local SPECS = {
   git_commit = { effect = "process" },
   git_stash = { effect = "process" },
   git_restore = { effect = "process" },
+  -- fetch/pull 经沙箱内网络（宿主过滤代理）访问远程，写 `.git` 对象/跟踪 refs；
+  -- 改动同样由候选管线原子化捕获后进审批（见下方 GIT_WRITE_TOOLS）。
+  git_fetch = { effect = "process" },
+  git_pull = { effect = "process" },
   -- worktree 管理：在沙箱内执行（list 只读；add/remove/... 改写 `.git/worktrees/**` 与工作树
   -- `.git` 文件，均为 pointer，由候选管线原子化捕获/发布）。落点经 `worktree_guard` 校验。
   git_worktree = { effect = "process" },

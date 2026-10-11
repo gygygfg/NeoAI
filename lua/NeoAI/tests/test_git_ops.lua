@@ -166,6 +166,60 @@ tests.suite("git_ops", function(_, it, before_each)
     t.eq("v2\n", read_a())
   end)
 
+  it("git_fetch：从本地远程拉取跟踪引用（离线）", function(t)
+    local origin = vim.fn.tempname() .. "-neoai_origin"
+    vim.fn.mkdir(origin, "p")
+    git_in(origin, "init -q")
+    git_in(origin, "config user.email o@example.com")
+    git_in(origin, "config user.name origin")
+    local f = assert(io.open(origin .. "/o.txt", "w"))
+    f:write("origin\n")
+    f:close()
+    git_in(origin, "add o.txt")
+    git_in(origin, "commit -qm origin-commit")
+    git("remote add origin " .. vim.fn.shellescape(origin))
+    local _, err = invoke(tools.git_fetch, { remote = "origin" })
+    t.nil_(err, "本地远程 fetch 不应报错: " .. tostring(err))
+    t.matches("origin/master", git("branch -r"), "应产生远程跟踪引用")
+  end)
+
+  it("git_fetch：无效远程报错（不静默成功）", function(t)
+    local _, err = invoke(tools.git_fetch, { remote = "no-such-remote-xyz" })
+    t.not_nil(err)
+    t.matches("git 退出码", err)
+  end)
+
+  it("git_pull：从本地远程快进（离线，--no-edit 非交互）", function(t)
+    local origin = vim.fn.tempname() .. "-neoai_origin_p"
+    vim.fn.mkdir(origin, "p")
+    git_in(origin, "init -q")
+    git_in(origin, "config user.email o@example.com")
+    git_in(origin, "config user.name origin")
+    local f = assert(io.open(origin .. "/p.txt", "w"))
+    f:write("v1\n")
+    f:close()
+    git_in(origin, "add p.txt")
+    git_in(origin, "commit -qm p1")
+    local work = vim.fn.tempname() .. "-neoai_pull_work"
+    git_in(origin, "clone -q " .. vim.fn.shellescape(origin) .. " " .. vim.fn.shellescape(work))
+    -- origin 前进一个提交
+    local f2 = assert(io.open(origin .. "/p.txt", "w"))
+    f2:write("v2\n")
+    f2:close()
+    git_in(origin, "add p.txt")
+    git_in(origin, "commit -qm p2")
+    -- 在 work 里 pull（临时改 ctx.sandbox_cwd）
+    local saved = ctx.sandbox_cwd
+    ctx.sandbox_cwd = work
+    local _, err = invoke(tools.git_pull, { remote = "origin", branch = "master" })
+    ctx.sandbox_cwd = saved
+    t.nil_(err, "本地远程 pull 不应报错: " .. tostring(err))
+    local rf = assert(io.open(work .. "/p.txt", "r"))
+    local content = rf:read("*a")
+    rf:close()
+    t.eq("v2\n", content, "pull 应快进到远程最新内容")
+  end)
+
   it("git_auto_commit_config：回显配置", function(t)
     local out = invoke(tools.git_auto_commit_config, { auto_commit = true })
     t.matches("自动提交配置: true", out)

@@ -264,11 +264,18 @@ Read-only: `git_status` / `git_diff` / `git_log` / `git_commit_detail` / `git_br
 `git_file_history` / `git_auto_commit_config` (executed in the sandbox namespace, seeing the staged view).
 
 Mutations (run **inside the sandbox**, `effect=process`; changes are **staged atomically into the
-review window**): `git_add` / `git_commit` / `git_stash` / `git_restore` / `git_worktree`. `.git` is a
-tightly coupled "index ↔ object store ↔ refs" database, applied atomically in
-`object → normal file → pointer` order so nothing ever dangles (see [sandbox.md](sandbox.md)); git
-mutation subcommands in `run_command` are refused (`SANDBOX_GIT_MUTATION_VIA_COMMAND`) and must use the
-dedicated tools above.
+review window**): `git_add` / `git_commit` / `git_stash` / `git_restore` / `git_worktree` /
+`git_fetch` / `git_pull`. `.git` is a tightly coupled "index ↔ object store ↔ refs" database, applied
+atomically in `object → normal file → pointer` order so nothing ever dangles (see
+[sandbox.md](sandbox.md)); git mutation subcommands in `run_command` are refused
+(`SANDBOX_GIT_MUTATION_VIA_COMMAND`) and must use the dedicated tools above.
+
+`git_fetch` (`remote?`/`all?`/`prune?`/`tags?`) and `git_pull` (`remote?`/`branch?`/`rebase?`/
+`ff_only?`) reach remotes from inside the sandbox through the host filtering proxy:
+`github.com`/`githubusercontent.com` are silently allowed by default, other remotes follow
+`tools.sandbox.network.access` (default `ask`, prompting for consent). Writes set
+`GIT_TERMINAL_PROMPT=0` (no hang without a TTY), `git pull` adds `--no-edit`; `pull`'s working-tree
+and `.git` changes enter review together.
 
 `git_worktree` manages `git worktree` (`list`/`add`/`remove`/`move`/`prune`/`lock`/`unlock`/`repair`):
 `list` is read-only; mutations rewrite the main repo's `.git/worktrees/**` and the worktree `.git`

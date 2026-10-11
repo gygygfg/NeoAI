@@ -212,6 +212,8 @@ approval = {
     git_file_history / git_branch / git_auto_commit_config = { auto_allow = true },
     git_restore = { auto_allow = false },
     git_worktree = { auto_allow = false },
+    git_fetch = { auto_allow = false },
+    git_pull = { auto_allow = false },
     log_message / get_log_levels = { auto_allow = true },
     lsp_rename / lsp_format / delete_node = { auto_allow = false },
   },
@@ -435,7 +437,7 @@ sandbox = {
     consent_process_granularity = true,
     consent_timeout_ms = 30000,      -- 网络访问弹窗无响应超时（毫秒；0=不限）；超时自动拒绝（fail-closed），避免连接无限悬挂
     consent_owner_ttl_ms = 2000,     -- 端口→宿主服务进程解析结果的短缓存 TTL（毫秒）；每次连接重校验，TTL 内复用避免频繁全扫 /proc
-    auto_allow_sources = true,       -- 软件源自动放行（默认开）：pip/uv/npm/go/cargo/apt 等**外部**软件源（PyPI、npm、crates、清华/阿里/中科大等镜像）经代理访问时免弹窗直接放行，避免包安装被网络同意门禁拦截。仅对非本机目标生效（解析到本机或解析失败仍拒绝，SSRF 防护不削弱）；access="deny" 时仍拒绝；自动放行不回传命令结果（仅回传拦截/失败）
+    auto_allow_sources = true,       -- 软件源自动放行（默认开）：pip/uv/npm/go/cargo/apt 等**外部**软件源（PyPI、npm、crates、清华/阿里/中科大等镜像）经代理访问时免弹窗直接放行，避免包安装被网络同意门禁拦截。仅对非本机目标生效（解析到本机或解析失败仍拒绝，SSRF 防护不削弱）；access="deny" 时仍拒绝；自动放行不回传命令结果（仅回传拦截/失败）。内置列表另含代码托管 github.com / githubusercontent.com（子域自动匹配），git_fetch/git_pull/git clone 访问 GitHub 免弹窗
     extra_package_sources = {},      -- 额外软件源域名后缀（私有源/自建镜像），如 { "pypi.mycorp.com" }；子域自动匹配
     -- 沙箱外部命令代理策略：strip（默认，不把宿主代理传入沙箱，如 mihomo 只代理 opencode 自身，
     -- 避免宿主 HTTPS_PROXY=127.0.0.1:7890 在沙箱内不可达导致 pip/npm 失败）| passthrough（沿用宿主）|

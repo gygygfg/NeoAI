@@ -481,6 +481,14 @@ function M.request(ctx)
   local standalone = M.available()
   local via_hub = hub.available() and _interactive()
   if not standalone and not via_hub then
+    -- 无任何可呈现界面：失败关闭（拒绝）。记录一次原因，便于区分「用户没看到弹窗」与
+    -- 「确实无法弹窗」（如 UI 未初始化 / headless / 焦点不可用）。
+    pcall(function()
+      require("NeoAI.kernel.logger").warn(
+        "[net_consent] 无可用同意界面，拒绝网络访问 %s:%s（standalone=%s hub=%s interactive=%s）",
+        tostring(ctx.host), tostring(ctx.port), tostring(standalone), tostring(hub.available()),
+        tostring(_interactive()))
+    end)
     d:resolve("deny")
     return d
   end

@@ -58,6 +58,20 @@ tests.suite("health", function(_, it)
     t.eq("warn", status, "默认 provider 缺 key 应为 warn")
   end)
 
+  it("含沙箱网络同意诊断项，host_local_block=false 时为 warn", function(t)
+    local config_store = require("NeoAI.kernel.config_store")
+    config_store.set("tools.sandbox.offline", false)
+    config_store.set("tools.sandbox.network.gateway.enabled", false)
+    config_store.set("tools.sandbox.network.host_local_block", false)
+    local h = require("NeoAI.health")
+    local found
+    for _, it2 in ipairs(h.collect()) do
+      if it2.name == "沙箱网络同意" then found = it2 end
+    end
+    t.not_nil(found, "应含沙箱网络同意检查")
+    t.eq("warn", found.status, "host_local_block=false 应为 warn（网络不经同意门禁）")
+  end)
+
   it("summary 为多行文本且含标题", function(t)
     local h = require("NeoAI.health")
     local s = h.summary()

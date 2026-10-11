@@ -238,10 +238,15 @@ M.execute(agent, name, args, tool_call_id, opts)
 `git_file_history` / `git_auto_commit_config`（在沙箱命名空间内执行，看到暂存视图）。
 
 变更（在**沙箱内**执行 `effect=process`，改动**原子暂存进审批悬浮窗**）：`git_add` /
-`git_commit` / `git_stash` / `git_restore` / `git_worktree`。`.git` 是「索引↔对象库↔refs」强耦合
-数据库，按 `object → 普通文件 → pointer` 有序原子应用，绝不产生悬空引用（见
-[sandbox.md](sandbox.md)）；`run_command` 中的 git 变更子命令会被拒绝
+`git_commit` / `git_stash` / `git_restore` / `git_worktree` / `git_fetch` / `git_pull`。`.git` 是
+「索引↔对象库↔refs」强耦合数据库，按 `object → 普通文件 → pointer` 有序原子应用，绝不产生
+悬空引用（见 [sandbox.md](sandbox.md)）；`run_command` 中的 git 变更子命令会被拒绝
 （`SANDBOX_GIT_MUTATION_VIA_COMMAND`），须改用上述专用工具。
+
+`git_fetch`（`remote?`/`all?`/`prune?`/`tags?`）与 `git_pull`（`remote?`/`branch?`/`rebase?`/
+`ff_only?`）在沙箱内经宿主过滤代理访问远程：`github.com`/`githubusercontent.com` 默认静默放行，
+其余远程按 `tools.sandbox.network.access`（默认 `ask` 弹窗同意）。写入带 `GIT_TERMINAL_PROMPT=0`
+（无 TTY 不挂起）、`git pull` 带 `--no-edit`；`pull` 的工作区与 `.git` 改动一并进入审批。
 
 `git_worktree` 管理 `git worktree`（`list`/`add`/`remove`/`move`/`prune`/`lock`/`unlock`/`repair`）：
 `list` 只读；变更改写主仓 `.git/worktrees/**` 与工作树 `.git` 文件（均为 pointer），与工作树文件

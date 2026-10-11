@@ -119,6 +119,45 @@ function M.collect()
     })
   end
 
+  -- 沙箱网络同意（诊断「网络请求不弹窗 / 审批悬浮窗无条目」）
+  do
+    local ok_nc, nc = pcall(require, "NeoAI.sandbox.net.net_consent")
+    local ok_hp, hp = pcall(require, "NeoAI.sandbox.net.host_proxy")
+    local ok_gw, gw = pcall(require, "NeoAI.sandbox.net.net_gateway")
+    local netcfg = config_store.get("tools.sandbox.network") or {}
+    local sandbox_cfg = config_store.get("tools.sandbox") or {}
+    local offline = sandbox_cfg.offline == true
+    local gateway_on = ok_gw and gw.enabled() == true
+    local hlb = netcfg.host_local_block ~= false
+    local proxy = ok_hp and hp.address() or nil
+    local avail = ok_nc and nc.available() == true
+    local can = ok_nc and nc.can_prompt() == true
+    local lines = {
+      ("策略 access=%s；host_local_block=%s；offline=%s；netns 网关=%s"):format(
+        tostring(ok_nc and nc.policy() or "?"), tostring(hlb), tostring(offline), tostring(gateway_on)),
+      proxy and ("宿主过滤代理已启动: %s:%s"):format(tostring(proxy.host), tostring(proxy.port))
+        or (hlb and not offline and "宿主过滤代理未启动（沙箱外命令不经过同意门禁）" or "宿主过滤代理未启用"),
+      ("网络同意 UI 可用=%s；可弹窗=%s"):format(tostring(avail), tostring(can)),
+    }
+    local status = "ok"
+    if offline then
+      lines[#lines + 1] = "offline=true：网络硬隔离，无需同意弹窗。"
+    elseif hlb and not gateway_on and not proxy then
+      status = "warn"
+      lines[#lines + 1] = "宿主过滤代理未启动（可能绑定失败）：外部网络请求不会弹窗，将直连。"
+    elseif hlb and not gateway_on and not avail then
+      status = "warn"
+      lines[#lines + 1] = "网络同意 UI 未注册（UI 未初始化？）：外部网络请求失败关闭且不弹窗。"
+    elseif gateway_on then
+      status = "warn"
+      lines[#lines + 1] = "netns 网关模式不接入网络同意弹窗（仅端口探针）；如需逐目标同意请关闭 gateway。"
+    elseif netcfg.host_local_block == false then
+      status = "warn"
+      lines[#lines + 1] = "host_local_block=false：沙箱外命令直连，无同意弹窗。"
+    end
+    add("沙箱网络同意", status, lines)
+  end
+
   -- 可选依赖
   local opt = {}
   if vim.fn.executable("git") == 1 then opt[#opt + 1] = "git" end

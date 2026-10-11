@@ -205,10 +205,15 @@ tests.suite("net_consent", function(_, it)
     t.true_(hp._is_package_source("registry.npmjs.org"), "npm")
     t.true_(hp._is_package_source("cache.npmmirror.com"), "npmmirror 子域")
     t.true_(hp._is_package_source("archive.ubuntu.com"), "apt")
+    -- 代码托管：GitHub 及其子域 / raw 域静默放行
+    t.true_(hp._is_package_source("github.com"), "github.com")
+    t.true_(hp._is_package_source("codeload.github.com"), "github 子域")
+    t.true_(hp._is_package_source("raw.githubusercontent.com"), "githubusercontent 子域")
     -- 边界：后缀/域名内嵌欺骗不匹配
     t.false_(hp._is_package_source("evilpypi.org"), "非子域后缀欺骗")
     t.false_(hp._is_package_source("pypi.org.evil.com"), "域名内嵌欺骗")
     t.false_(hp._is_package_source("example.com"), "普通外部")
+    t.false_(hp._is_package_source("notgithub.com"), "非 github 子域")
 
     -- 门禁：外部软件源免弹窗（无 UI）放行
     local allowed, reason

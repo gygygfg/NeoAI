@@ -790,9 +790,9 @@ detection) and `risk.classify` (security level), so `pip install`, `sudo modprob
     - Application order is fixed to **objects → normal files → pointers** (`_apply_order`): any index/ref
       written references objects that already exist, so nothing dangles; objects already present are
       skipped idempotently by content address (no CAS). Hence the `.git` changes of `git_add` /
-      `git_commit` / `git_stash` / `git_restore` / `git_worktree` enter the review window together with
-      the worktree changes and are applied atomically on confirmation (`SANDBOX_GIT_INTERNAL` only
-      backstops transient/config targets).
+      `git_commit` / `git_stash` / `git_restore` / `git_worktree` / `git_fetch` / `git_pull` enter the
+      review window together with the worktree changes and are applied atomically on confirmation
+      (`SANDBOX_GIT_INTERNAL` only backstops transient/config targets).
     - These git mutation tools run **inside the sandbox** (`effect=process`, seeing the staged
       worktree); their changes freeze as candidates and dry_run does not touch the real `.git`.
       git **mutation** subcommands inside `run_command` are refused by a guard
@@ -812,7 +812,8 @@ detection) and `risk.classify` (security level), so `pip install`, `sudo modprob
     - File-writing tools (`edit_file`, …) targeting `.git` are still refused outright (the AI should
       not edit repository internals directly).
     - **Only git-write tools may publish `.git` pointers**: any tool other than `git_add`/`git_commit`/
-      `git_stash`/`git_restore`/`git_worktree` whose candidate happens to contain `.git/index`
+      `git_stash`/`git_restore`/`git_worktree`/`git_fetch`/`git_pull` whose candidate happens to
+      contain `.git/index`
       (e.g. because a fresh `.git` mtime forced a full traversal) is only seeing a **leftover pointer
       from a preceding git tool**; it is dropped at freeze time (only the object store is kept).
       Otherwise the candidate would publish a dangling pointer to a not-yet-materialized object, which
@@ -1847,7 +1848,10 @@ commands (SSRF, e.g. host admin panels, internal ports, cloud metadata):
   surfaced. It only applies when the target is judged **non-host-local**: resolving to the host, or
   failed DNS (fail-closed), is still denied as host-local, so SSRF protection is unchanged;
   `access="deny"` still denies. Add private/self-hosted mirrors via `network.extra_package_sources`
-  (subdomains match automatically); set `auto_allow_sources=false` to disable the carve-out.
+  (subdomains match automatically); set `auto_allow_sources=false` to disable the carve-out. The
+  built-in list also contains the code hosts `github.com`/`githubusercontent.com` (subdomains match
+  automatically), so `git_fetch`/`git_pull`/`git clone` to GitHub is allowed without a prompt by
+  default.
 - **Boundary (important)**: this is **application-layer** filtering. **Raw TCP that ignores the
   proxy** (`nc`/`ssh`/database clients, tools ignoring proxy env) can connect directly to the host
   under a shared netns and is not covered. Hard-interception of raw TCP requires either root +
@@ -3055,7 +3059,11 @@ freeze time to avoid whole-unit publish conflicts.
   scripts usually tolerate it (`|| true`).
 - **`git clone`/`git init`**: allowed (they create a new repository; `.git` is captured atomically by
   `git_path_class`); `commit/checkout/fetch/pull/push/add/reset/...` remain blocked and must use the
-  dedicated git tools.
+  dedicated git tools (`git_add`/`git_commit`/`git_stash`/`git_restore`/`git_worktree`/`git_fetch`/
+  `git_pull`). `git_fetch`/`git_pull` reach remotes from inside the sandbox through the host filtering
+  proxy; `.git` objects/tracking refs (plus working-tree changes for `pull`) are staged atomically
+  into the approval window. `github.com`/`githubusercontent.com` are silently allowed by default;
+  other remotes follow `tools.sandbox.network.access` (consent prompt).
 - **`git stash`**: only the read-only sub-actions `list` / `show` are allowed (pure reads; they do not
   touch the worktree, refs or index). Bare `stash` (= push) and `push`/`pop`/`apply`/`drop`/`clear`/
   `save`/`store` remain blocked and must use the `git_stash` tool (changes are staged atomically and

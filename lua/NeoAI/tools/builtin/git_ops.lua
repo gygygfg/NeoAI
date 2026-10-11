@@ -93,6 +93,9 @@ local function _git_write(args, ctx, repo)
   if ctx and type(ctx.sandbox_env) == "table" then
     for k, v in pairs(ctx.sandbox_env) do env[k] = v end
   end
+  -- 非交互：避免凭据/编辑器提示在沙箱内阻塞（fetch/pull 无 TTY 时会挂起）。
+  env.GIT_TERMINAL_PROMPT = "0"
+  env.GIT_EDITOR = "true"
   local job = vim.fn.jobstart(_sandboxed_argv({ "git", unpack(_git_prefix(repo, args)) }, ctx), {
     cwd = ctx and ctx.sandbox_cwd or nil,
     env = next(env) ~= nil and env or nil,
@@ -529,6 +532,65 @@ git_tools.git_worktree = helpers.define_tool(
       else
         on_error(_git_text(r))
       end
+    end, function(e) on_error(e.message) end)
+  end,
+  { category = "git", approval = { auto_allow = false } }
+)
+
+git_tools.git_fetch = helpers.define_tool(
+  "git_fetch",
+  "从远程拉取引用与对象（git fetch）。remote 可选（缺省=当前分支上游）；"
+    .. "all=true 拉取全部远程；prune/tags 可选。改动（.git 对象/远程跟踪 refs）进入审批。",
+  {
+    type = "object",
+    properties = {
+      remote = { type = "string", description = "远程名（缺省=当前分支上游）" },
+      all = { type = "boolean", description = "拉取全部远程（--all）" },
+      prune = { type = "boolean", description = "清理远程已删除的跟踪分支（--prune）" },
+      tags = { type = "boolean", description = "同时拉取标签（--tags）" },
+      repo = { type = "string", description = "仓库目录（缺省=会话仓库）" },
+    },
+    required = {},
+  },
+  function(args, on_success, on_error, ctx)
+    local argv = { "fetch" }
+    if args.all == true then argv[#argv + 1] = "--all" end
+    if args.prune == true then argv[#argv + 1] = "--prune" end
+    if args.tags == true then argv[#argv + 1] = "--tags" end
+    -- --all 与显式远程互斥：all 时忽略 remote。
+    if args.all ~= true and type(args.remote) == "string" and args.remote ~= "" then
+      argv[#argv + 1] = args.remote
+    end
+    _git_write(argv, ctx, _repo(args)):then_(function(r)
+      if r.code == 0 then on_success(_git_text(r)) else on_error(_git_text(r)) end
+    end, function(e) on_error(e.message) end)
+  end,
+  { category = "git", approval = { auto_allow = false } }
+)
+
+git_tools.git_pull = helpers.define_tool(
+  "git_pull",
+  "从远程拉取并合并到当前分支（git pull）。remote/branch 可选；rebase/ff_only 可选。"
+    .. "默认 --no-edit 避免交互；改动（工作区 + .git）进入审批。",
+  {
+    type = "object",
+    properties = {
+      remote = { type = "string", description = "远程名（缺省=当前分支上游）" },
+      branch = { type = "string", description = "分支名（缺省=上游分支）" },
+      rebase = { type = "boolean", description = "用 rebase 代替 merge（--rebase）" },
+      ff_only = { type = "boolean", description = "仅允许快进（--ff-only）" },
+      repo = { type = "string", description = "仓库目录（缺省=会话仓库）" },
+    },
+    required = {},
+  },
+  function(args, on_success, on_error, ctx)
+    local argv = { "pull", "--no-edit" }
+    if args.rebase == true then argv[#argv + 1] = "--rebase" end
+    if args.ff_only == true then argv[#argv + 1] = "--ff-only" end
+    if type(args.remote) == "string" and args.remote ~= "" then argv[#argv + 1] = args.remote end
+    if type(args.branch) == "string" and args.branch ~= "" then argv[#argv + 1] = args.branch end
+    _git_write(argv, ctx, _repo(args)):then_(function(r)
+      if r.code == 0 then on_success(_git_text(r)) else on_error(_git_text(r)) end
     end, function(e) on_error(e.message) end)
   end,
   { category = "git", approval = { auto_allow = false } }
