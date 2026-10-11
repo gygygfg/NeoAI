@@ -61,9 +61,31 @@ The test case callback parameter `t` passed to `it` contains all assertion helpe
 
 1. **Session isolation**: redirects the default session path to a temporary directory (`~/.cache/NeoAI-test`),
    cleans up afterward, and restores the real in-memory session, preventing tests from polluting real history.
-2. Dynamically loads all `test_*.lua` files.
+2. Dynamically loads `test_*.lua` (a child may load **only its shard's modules** via `NEOAI_TEST_MODULES`).
 3. Runs each test case with `xpcall` (with `debug.traceback`), tallying `passed / failed / errors`.
-4. Returns `{ passed, failed, errors }`.
+   The first suite on a fresh worker skips the redundant `config_store.load` + `plugins.start_all` +
+   `tools.reload_tools` full reset; by default only failures + suite summaries are printed
+   (`NEOAI_TEST_VERBOSE=1` restores per-case detail).
+4. Returns `{ passed, failed, errors, timings }`; an isolated child also writes a **sidecar** (small JSON).
+
+### 2.4 Parallel runner structure (facade + submodules)
+
+`parallel.lua` is a **thin facade** (keeping the `run / shard / _discover / _set_spawner / reset /
+_abort_all` signatures); concurrency orchestration and result handling are split into
+`lua/NeoAI/tests/runner/` submodules:
+
+| Submodule | Responsibility |
+| --- | --- |
+| `runner/config.lua` | Constants, worker/heavy concurrency resolution, heavy classification |
+| `runner/timings.lua` | Timing-cache read/write and `TIMING` parsing |
+| `runner/shard.lua` | LPT sharding, discovery-manifest parsing (incl. name→module) |
+| `runner/spawn.lua` | Child execution: log-to-disk + result sidecar, process-tree cleanup |
+| `runner/scheduler.lua` | Bounded-concurrency pool (re-entrancy-safe trampoline) + dual-lane orchestration |
+| `runner/report.lua` | Result aggregation, lazy log-tail for failed shards, reporting |
+
+Dual lane: light (many suites/process, W lanes) and heavy (`sandbox*`/`pty`, one suite/process, H lanes)
+run **overlapped**, constrained by `#light<=W`, `#heavy<=H`, `W+H<=cores`; `NEOAI_TEST_HEAVY_WORKERS=1`
+falls back to the old serial channel.
 
 ## 3. List of Test Files
 

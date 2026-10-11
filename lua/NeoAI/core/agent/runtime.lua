@@ -131,7 +131,10 @@ local function _run_generation(agent, _)
             if not tool_service then
               return async.reject({ kind = "service", message = "工具服务未启用，无法执行工具调用" })
             end
-            return tool_loop.run(agent, calls, tool_service, {}):then_(function()
+            return tool_loop.run(agent, calls, tool_service, {
+              is_sub_agent = agent._sub_agent_id ~= nil,
+              sub_agent_id = agent._sub_agent_id,
+            }):then_(function()
               return _finish_idle(agent.messages[#agent.messages])
             end)
           end
@@ -220,7 +223,7 @@ end
 function M.spawn(parent, override)
   override = override or {}
   local child = agent_mod.create({
-    session_id = nil,
+    session_id = override.session_id,
     parent = parent.id,
     config = vim.deepcopy(parent.config),
     model = override.model or parent.model,
@@ -231,6 +234,10 @@ function M.spawn(parent, override)
   -- 子 Agent 继承父 Agent 的会话工作目录（子任务与父任务同一工作区）。
   child.cwd = override.cwd or parent.cwd
   state.agents[child.id] = child
+  -- 子 Agent 可拥有独立子会话（由 sub_agent 管理器创建并传入）：登记以便按会话反查。
+  if override.session_id then
+    state.sessions[override.session_id] = child.id
+  end
   event_bus.emit(events.AGENT_SPAWNED, { parent = parent.id, agent = child })
   if override.task then
     child.task = override.task
@@ -267,8 +274,9 @@ end
 --- 运行 Agent：添加用户消息并生成
 --- @param agent table
 --- @param content string
+--- @param opts table|nil { message_extra? table 附加到用户消息的字段（UI 标记用，不进入模型上下文） }
 --- @return Deferred resolve(响应)
-function M.run(agent, content)
+function M.run(agent, content, opts)
   -- 原子占用生成槽位：状态在 maybe_compact / 异步链中才置为 generating，若仅靠 state
   -- 判断（chat_service._is_busy 与这里此前都只看 state），同一 tick 内连续两次 send
   -- （模式切换、approve_plan 自动执行后立即发送等场景常触发）都会判为 idle 并并行
@@ -294,7 +302,7 @@ function M.run(agent, content)
   -- 易变运行态（todos/计划模式）以运行时上下文快照追加进历史：
   -- 系统提示保持逐字节稳定，前缀缓存不因它们变化而失效。
   require("NeoAI.core.session.runtime_context").ensure(agent)
-  agent_mod.add_message(agent, "user", content)
+  agent_mod.add_message(agent, "user", content, opts and opts.message_extra or nil)
   event_bus.emit(events.MESSAGE_SENT, { agent_id = agent.id, content = content })
   -- 上下文压缩改为后台异步：达到压力阈值时在后台生成摘要（折叠第一轮至倒数第二轮），
   -- 不阻塞本轮请求；完成后覆盖层对后续请求与再次压缩生效。压力提示保持原样。

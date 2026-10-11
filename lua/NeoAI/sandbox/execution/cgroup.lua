@@ -183,6 +183,60 @@ function M.oom_attribution(path, opts)
   return { oom = false }
 end
 
+--- 从 pids.events 文本读取「max」计数（fork 因触顶 pids.max 被拒绝的次数）。
+--- @param ev string|nil
+--- @return number
+local function _pids_max_count(ev)
+  if type(ev) ~= "string" then return 0 end
+  return tonumber(ev:match("max%s+(%d+)")) or 0
+end
+
+--- 采集资源域及其祖先的 pids「max」计数基线（供命令结束后差分归因）。
+--- 用途与 `oom_baseline` 一致：避免把命令前已有的历史拒绝数误判为本次所致。
+--- @param path string 子域目录
+--- @param opts table|nil { base?, reader? }
+--- @return table map[dir] = count
+function M.pids_baseline(path, opts)
+  opts = opts or {}
+  local base = (opts.base or _base()):gsub("/+$", "")
+  local read = opts.reader or _read_file
+  local out = {}
+  for _, dir in ipairs(_cgroup_chain(path, base)) do
+    out[dir] = _pids_max_count(read(dir .. "/pids.events"))
+  end
+  return out
+end
+
+--- 归因 PID/线程数超限：沿子域 → 父域 → 容器根查 pids.events 的「max」增量。
+--- 子域优先（命令自身的资源域）；子域无记录时再看祖先（容器/宿主 pids 限制）。
+--- @param path string 子域目录
+--- @param opts table|nil { baseline?, base?, reader? }
+--- @return table { hit=boolean, level?, path?, max? }
+function M.pids_attribution(path, opts)
+  opts = opts or {}
+  if type(path) ~= "string" or path == "" then return { hit = false } end
+  local base = (opts.base or _base()):gsub("/+$", "")
+  local read = opts.reader or _read_file
+  local baseline = opts.baseline or {}
+  local chain = _cgroup_chain(path, base)
+  for i, dir in ipairs(chain) do
+    local ev = read(dir .. "/pids.events")
+    if ev then
+      local n = _pids_max_count(ev)
+      local b = tonumber(baseline[dir]) or 0
+      if n > b then
+        return {
+          hit = true,
+          level = (i == 1) and "sandbox" or "ancestor",
+          path = dir,
+          max = n - b,
+        }
+      end
+    end
+  end
+  return { hit = false }
+end
+
 --- 共享父域路径（承载全局 CPU 预算）
 --- @return string
 local function _parent_path()

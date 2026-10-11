@@ -421,11 +421,15 @@ function M.render(text, opts)
     elseif line:match("^#+ ") then
       out[#out + 1] = { text = _clean_inline(line:gsub("^#+%s*", "")), style = "heading" }
       i = i + 1
-    elseif line:match("^[-*+] ") then
-      out[#out + 1] = { text = "• " .. _clean_inline(line:gsub("^[-*+]%s*", "")), style = "list" }
+    elseif line:match("^%s*[-*+] ") then
+      -- 支持嵌套：保留前导缩进（每 2 空格一级），深一级用空心圆点区分。
+      local indent = line:match("^(%s*)[-*+] ") or ""
+      local bullet = (#indent >= 2) and "◦ " or "• "
+      out[#out + 1] = { text = indent .. bullet .. _clean_inline(line:gsub("^%s*[-*+]%s*", "")), style = "list" }
       i = i + 1
-    elseif line:match("^%d+%. ") then
-      out[#out + 1] = { text = _clean_inline(line), style = "list" }
+    elseif line:match("^%s*%d+%. ") then
+      local indent = line:match("^(%s*)%d+%. ") or ""
+      out[#out + 1] = { text = indent .. _clean_inline(line:gsub("^%s*", "")), style = "list" }
       i = i + 1
     elseif line:match("^>") then
       out[#out + 1] = { text = _clean_inline(line:gsub("^>%s*", "")), style = "quote" }

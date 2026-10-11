@@ -145,6 +145,25 @@
 切换显示模式、窗口宽度变化（表格重排）时清空镜像，下一次渲染回退到全量替换，避免基于旧行位置
 做差分写入。旧行为可通过 `ui.chat.incremental = false` 降级回整 buffer 全量重写。
 
+### 4.3.2 正文 Markdown 渲染
+
+聊天 buffer 的 filetype 为 `neoai`（非 `markdown`），不挂载 treesitter / 外部 Markdown 插件
+（如 `render-markdown.nvim`、`edit-markdown-table.nvim`），正文由 `components.markdown_view`
+自行解析后以纯文本 + 高亮呈现。
+
+为让大段正文可读：
+
+- **保留段落空行**：`_append_content` 不再丢弃 Markdown 渲染结果中的空行，段落 / 列表 / 代码块
+  之间的分隔得以保留（此前空行被过滤，整段正文挤成一坨）。
+- **保留缩进**：正文内容行经 `fold.set_body_lines` 登记为「正文行」，`foldexpr` 对其直接返回 `0`
+  （不折叠），故代码块 / 嵌套列表的行首缩进得以原样保留，而不会被当成推理 / 工具折叠块；
+  文本本身不被改写（复制正文代码不会混入占位字符）。与推理块的登记（`set_reasoning_lines`）同批
+  在写入 buffer 前完成（`_sync_fold_kinds`）。
+- **样式高亮**（`MD_HL_NS`，`default=true` 可被配色覆盖）：标题 `NeoAIHeading`（link `Title`）、
+  列表标记 `NeoAIList`（仅圆点 / 序号区间，link `Special`）、引用 `NeoAIQuote`（link `Comment`）、
+  代码块 `NeoAICode`（随 Normal 背景微差的自适应底色）、围栏 `NeoAICodeFence`、分隔线 `NeoAIHr`。
+  表格样式（`tbl`）仍走斑马纹高亮命名空间，二者互不干扰。
+
 ### 4.4 折叠
 
 主窗口用 `expr` 折叠（`components.fold.foldexpr`），推理 / 每个工具调用块（调用+结果）各自独立成折叠。
@@ -346,12 +365,13 @@ NeoAI 的聊天/输入框/悬浮窗等都是纯 UI 文本，若 LSP 客户端（
 | `model_picker` | 模型选择器（异步加载模型列表）。`open(callback)`。 |
 | `tool_approval` | 工具审批弹窗。`init()`；串行单槽位展示。 |
 | `ask_user` | 向用户提问弹窗。`init()`；经 `ask_user.set_ui` 注入。 |
-| `sub_agent_dock` | 子 Agent 状态监控。`init()`。 |
+| `sub_agent_dock` | 子 Agent 状态监控。`init()`。winbar 身份行同时展示子 Agent 名字（超出窗口宽度折叠为 `N个子agent正在运行`，见 `services/status.sub_agents_segment`）；`keymaps.chat.switch_sub_agent`（默认 `<leader>as`）在新窗口打开子 Agent 会话。 |
+| `sub_agent_list` | 子 Agent 列表弹出窗（无边框悬浮窗，相对聊天主窗口顶部居中、`<leader>al` 切换）。`↑/↓`(k/j) 移动、`<CR>` 进入会话、`q`/`<Esc>` 关闭；窗口尺寸变化时重算几何跟随。`open`/`close`/`toggle`/`is_open`/`reset`。 |
 | `terminal_window` | 交互式命令的悬浮**可交互**终端（`nvim_open_term` 渲染，焦点在内时可手动键入转发给命令）。按会话 id 开窗；**仅在聊天光标跟随时弹出**（`show_window` 控制时机：always=会话启动即弹 / on_wait=命令运行超过 `show_window_delay_ms`（默认 2000ms）仍未结束才弹，短命令不弹），跟随跳变时随 `UI_FOLLOW_CHANGED` 隐藏 / 重弹（见 `services.pty`；每次开窗都用新的 `nvim_open_term` 通道，开窗时重放累计输出，避免空白窗口）；headless 下为 no-op。由 `services.pty` 驱动。 |
-| `sandbox_review` | 沙箱待审审批界面。`open()`（**无待审/审批/留痕事项时同样打开窗口并展示空界面，不弹提示、不自动关闭**；刷新到空队列也保持窗口，待新事项到达由事件订阅自动刷新）；按路径级别高亮（工作区绿/用户目录黄/系统红）、按安全级别显示高危/中危/低危风险档与原因；界面按「未应用（待审）/ 已应用（含快照，可撤销）」分区；审批单位为单个文件：`<CR>` 仅应用该文件、`A` 一键同意全部工作区内修改（工作区外文件与主机操作保留待审；逐项让出主循环、标题显示进度、进行中防重入）、`d` 仅拒绝该文件（其余文件保留待审）、`i` 临时关闭审批窗并打开该条目的修改 diff 预览（关闭后自动返回并恢复光标），头行仅作信息展示，`q` 关闭；在**越界访问留痕**行按 `i` 打开访问详情（汇总涉及工具/来源/涉及命令数/首末时间，逐条列出工具/类型/命令/时间），在**越界命令**行按 `i` 打开命令详情（列出该命令越界访问的文件）；**窗口打开期间订阅沙箱广播事件自动刷新**（待审/已应用/越界留痕/主机操作变化即时重绘，同一 tick 内事件合并），无需手动刷新。**「已应用」区默认折叠**：整区收起（`za`/`zo` 展开），展开后每条再各自收起（两级折叠），刷新后重新收起；**待审条目「头行显示、其余折叠」、`za`/`zo` 可展开**（头行保留整组审批入口与高亮，其后文件/风险列表默认收起），越界留痕区不折叠。**高危条目**（L3 critical，以及 `package_confirm` 开启时的 L2 包/敏感安装）首次 `<CR>` 不直接应用：调用模型生成一条后果警告并自动打开 diff（顶部展示警告，生成中显示占位；标题按级别区分 `⚠ L2 高危 · 确认应用` / `⚠ L3 严重 · 确认应用`，按键提示行高亮，若冻结时剔除了遮蔽/易变缓存文件会追加「将跳过 N 个」说明），用户在 diff 内再次 `<CR>` 才真正应用、`q`/`<Esc>` 取消；模型不可用时回退规则警告（见 `sandbox/review/l3_warning.lua`）。 |
+| `sandbox_review` | 沙箱待审审批界面。`open()`（**无待审/审批/留痕事项时同样打开窗口并展示空界面，不弹提示、不自动关闭**；刷新到空队列也保持窗口，待新事项到达由事件订阅自动刷新）；按路径级别高亮（工作区绿/用户目录黄/系统红）、按安全级别显示高危/中危/低危风险档与原因；界面按「未应用（待审）/ 已应用（含快照，可撤销）」分区；审批单位为单个文件：`<CR>` 仅应用该文件、`A` 一键同意全部工作区内修改（工作区外文件与主机操作保留待审；逐项让出主循环、标题显示进度、进行中防重入）、`d` 仅拒绝该文件（其余文件保留待审）、`i` 临时关闭审批窗并打开该条目的修改 diff 预览（关闭后自动返回并恢复光标），头行仅作信息展示，`q` 关闭；在**越界访问留痕**行按 `i` 打开访问详情（汇总涉及工具/来源/涉及命令数/首末时间，逐条列出工具/类型/命令/时间），在**越界命令**行按 `i` 打开命令详情（列出该命令越界访问的文件）；**临时写入留痕**行仅只读展示（会话私有临时根 /tmp、/var/tmp 等写入，按文件含工具/命令，不入待审/不发布）；**窗口打开期间订阅沙箱广播事件自动刷新**（待审/已应用/越界留痕/主机操作变化即时重绘，同一 tick 内事件合并），无需手动刷新。**「已应用」区默认折叠**：整区收起（`za`/`zo` 展开），展开后每条再各自收起（两级折叠），刷新后重新收起；**待审条目「头行显示、其余折叠」、`za`/`zo` 可展开**（头行保留整组审批入口与高亮，其后文件/风险列表默认收起），越界留痕区不折叠。**高危条目**（L3 critical，以及 `package_confirm` 开启时的 L2 包/敏感安装）首次 `<CR>` 不直接应用：调用模型生成一条后果警告并自动打开 diff（顶部展示警告，生成中显示占位；标题按级别区分 `⚠ L2 高危 · 确认应用` / `⚠ L3 严重 · 确认应用`，按键提示行高亮，若冻结时剔除了遮蔽/易变缓存文件会追加「将跳过 N 个」说明），用户在 diff 内再次 `<CR>` 才真正应用、`q`/`<Esc>` 取消；模型不可用时回退规则警告（见 `sandbox/review/l3_warning.lua`）。 |
 | `fold` | 折叠（推理/工具调用/结果共用实现）。`foldexpr`/`foldtext`/`record_start`/`record_end`/`has_running`/`set_live_timer`/`set_foldexpr_override`/`set_foldtext_override`/`set_reasoning_lines`/`is_reasoning_start`/`generic_label`。 |
 | `display_modes/` | 显示模式插件管理器 + `chat.lua`/`trajectory.lua`。 |
-| `markdown_view` | Markdown 渲染器。 |
+| `markdown_view` | Markdown 渲染器（代码块 / 行内代码 / 标题 / 列表（含嵌套）/ 引用 / 表格）。输出带 `style`（供 `message_list` 施加正文高亮）与 `tbl`（表格斑马纹）标签。 |
 
 ## 7. 键位（ui/keymap.lua）
 

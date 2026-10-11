@@ -153,7 +153,7 @@ without overwriting one another.
 
 ```
 M.execute(agent, name, args, tool_call_id, opts)
-  ├─ sub-agent boundary review _review_sub_agent (plan.review_tool_call)
+  ├─ sub-agent boundary review _review_sub_agent (sub_agent.review_tool_call)
   ├─ plan mode gate plan_mode.check_tool (mutating tools are rejected in plan mode)
   ├─ build ctx (including a pausable timer)
   └─ executor.execute(...)
@@ -227,7 +227,7 @@ When combined stdout/stderr exceeds `tools.run_command.max_output_bytes` (defaul
 truncated and terminated so huge outputs (hundreds of MB) cannot freeze the main thread with line-by-line
 processing; already-produced content is still returned and marked "truncated".
 When a command ends with exit code 137 (SIGKILL), the resource-domain events are read to distinguish
-"suspected OOM" from "forcibly terminated".
+"suspected OOM", "PID/thread-count limit exceeded (pids.events max)", and "forcibly terminated".
 
 ### ✂️ Tool-output "AI-context cap" (output_guard.lua)
 
@@ -340,7 +340,7 @@ dedicated tools above.
 
 ### 🤖 Sub-agent (plan.lua)
 
-`create_sub_agent` / `wait_sub_agent` / `get_sub_agent_status` / `cancel_sub_agent`. See
+`create_sub_agent` / `get_sub_agent_status` / `cancel_sub_agent` / `send_sub_agent_message` (no wait tool; results are delivered automatically). See
 [sub_agent_system.md](sub_agent_system.md) for details.
 
 ### 📋 Todo (todo.lua)

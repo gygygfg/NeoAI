@@ -287,14 +287,15 @@ Main Agent decides to create a sub-agent (create_sub_agent tool)
 agent_runtime.spawn(parent_agent, override)
   │
   ├── Create a fresh Agent instance (empty message queue, independent signal)
-  ├── Only pass from parent: task + restricted tool set (read-only tools by default)
+  ├── Only pass from parent: task + restricted tool set (read-only tools by default; dispatch tools excluded)
   ├── Sub-agent inherits none of the parent's message history
-  ├── When the sub-agent finishes, only the final result is returned to the parent
+  ├── Sub-agent owns a persistent child session
+  ├── When the sub-agent loop ends naturally, its final body is delivered back to the parent (auto-wake when idle; queued when busy)
   └── Sub-agent dispose → all resources fully released
 ```
 
-- Sub-agent boundary validation: `tool_service`, together with `plan.lua`, checks whether a tool is within `allowed_tools` and whether the `max_tool_calls` limit has been reached.
-- Execution mode: `background` (default, returns immediately) or `foreground` (waits for completion).
+- Sub-agent boundary validation: `tool_service`, together with `sub_agent.lua`, checks whether a tool is within `allowed_tools`, whether the `max_tool_calls` limit has been reached, and whether it is a dispatch tool.
+- No wait tool: results are delivered automatically; the main agent never polls.
 
 ### Decision 2: Asynchronous Model List Fetching
 
@@ -1147,7 +1148,7 @@ async.all({ deferred1, deferred2 })
 | `lsp_ops.lua`  | `lsp_hover` / `lsp_definition` / `lsp_references` / `lsp_document_symbols` / `lsp_workspace_symbols` / `lsp_diagnostics` / `lsp_client_info` / `lsp_code_action` / `lsp_rename` / `lsp_format` / `lsp_signature_help` / `lsp_completion` / `lsp_type_definition` / `lsp_declaration` / `lsp_implementation` / `lsp_service_info` |
 | `tree_ops.lua` | `parse_file` / `get_node_at_position` / `get_node_type` / `get_node_range` / `is_named_node` / `get_parent_node` / `get_child_nodes` / `get_node_code` / `query_tree` / `delete_node` |
 | `log_ops.lua`  | `log_message` / `get_log_levels` |
-| `plan.lua`     | `create_sub_agent` / `get_sub_agent_status` / `wait_sub_agent` / `cancel_sub_agent` |
+| `plan.lua`     | `create_sub_agent` / `get_sub_agent_status` / `cancel_sub_agent` / `send_sub_agent_message` |
 | `plan_mode.lua`| `enter_plan_mode` (switches the tool context to read-only/informational + asking questions) |
 | `ask_user.lua` | `ask_user` |
 | `todo.lua`     | `todo_write` / `todo_read` / `todo_clear` |

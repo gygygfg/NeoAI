@@ -173,7 +173,7 @@ tests.suite("parallel_runner", function(_, it, before_each)
     vim.fn.delete(tp)
   end)
 
-  it("run：资源重套件走串行通道（单独子进程）", function(t)
+  it("run：资源重套件走 heavy lane（一套件一子进程）", function(t)
     local suites = { { name = "sandbox_x", cases = 1 }, { name = "s1", cases = 1 } }
     local spawns = {}
     parallel._set_spawner(function(req, o)
@@ -220,5 +220,124 @@ tests.suite("parallel_runner", function(_, it, before_each)
     parallel.reset()
     t.eq(1, vim.fn.filereadable(tests._plugin_root() .. "/lua/NeoAI/tests/parallel.lua"),
       "插件根应可定位（回归定位能力）")
+  end)
+
+  it("run：heavy lane 有界并发（≤H）且与 light 重叠", function(t)
+    local suites = {}
+    for i = 1, 4 do suites[#suites + 1] = { name = "sandbox_" .. i, cases = 1 } end
+    suites[#suites + 1] = { name = "l1", cases = 1 }
+    local cur_heavy, cur_light, max_heavy, max_light = 0, 0, 0, 0
+    parallel._set_spawner(function(req, o)
+      if not req.names then
+        o.on_done({ output = manifest_output(suites), ok = true })
+        return
+      end
+      if req.serial then
+        cur_heavy = cur_heavy + 1
+        max_heavy = math.max(max_heavy, cur_heavy)
+      else
+        cur_light = cur_light + 1
+        max_light = math.max(max_light, cur_light)
+      end
+      local nm, heavy = #req.names, req.serial
+      vim.defer_fn(function()
+        if heavy then cur_heavy = cur_heavy - 1 else cur_light = cur_light - 1 end
+        o.on_done({ output = ("SUMMARY passed=%d failed=0\n"):format(nm), ok = true, passed = nm, failed = 0, errors = {}, exit_code = 0 })
+      end, 20)
+    end)
+    local tp = vim.fn.tempname() .. "_timings.json"
+    local r = parallel.run({ workers = 2, heavy_workers = 2, timings_path = tp })
+    t.eq(0, r.failed)
+    t.true_(max_heavy <= 2, "heavy 并发不超过 H=2")
+    t.true_(max_heavy >= 2, "heavy 应实际并发到 2")
+    t.true_(max_light >= 1, "light 与 heavy 应重叠执行")
+    t.eq(2, r.heavy_workers)
+    vim.fn.delete(tp)
+  end)
+
+  it("run：NEOAI_TEST_HEAVY_WORKERS=1 回退串行 heavy", function(t)
+    local old = vim.env.NEOAI_TEST_HEAVY_WORKERS
+    vim.env.NEOAI_TEST_HEAVY_WORKERS = "1"
+    local suites = {}
+    for i = 1, 3 do suites[#suites + 1] = { name = "sandbox_" .. i, cases = 1 } end
+    local cur, max_heavy = 0, 0
+    parallel._set_spawner(function(req, o)
+      if not req.names then
+        o.on_done({ output = manifest_output(suites), ok = true })
+        return
+      end
+      local heavy = req.serial
+      if heavy then cur = cur + 1; max_heavy = math.max(max_heavy, cur) end
+      vim.defer_fn(function()
+        if heavy then cur = cur - 1 end
+        o.on_done({ output = ("SUMMARY passed=%d failed=0\n"):format(#req.names), ok = true, passed = #req.names, failed = 0, errors = {}, exit_code = 0 })
+      end, 15)
+    end)
+    local tp = vim.fn.tempname() .. "_timings.json"
+    local r = parallel.run({ workers = 2, timings_path = tp })
+    t.eq(0, r.failed)
+    t.eq(1, max_heavy, "heavy 串行：同一时刻至多 1 个 heavy")
+    t.eq(1, r.heavy_workers)
+    vim.fn.delete(tp)
+    vim.env.NEOAI_TEST_HEAVY_WORKERS = old
+  end)
+
+  it("调度：同步回调不重入且每项恰好完成一次", function(t)
+    local scheduler = require("NeoAI.tests.runner.scheduler")
+    local started, done_count, inflight, max_inflight = 0, 0, 0, 0
+    local all_done = false
+    scheduler.pool({ 1, 2, 3, 4, 5 }, 2, function(_, done)
+      started = started + 1
+      inflight = inflight + 1
+      max_inflight = math.max(max_inflight, inflight)
+      -- 同步完成（模拟极快/注入执行器）触发 trampoline
+      inflight = inflight - 1
+      done_count = done_count + 1
+      done()
+    end, function() all_done = true end)
+    t.eq(5, started, "每项只启动一次")
+    t.eq(5, done_count, "每项完成一次")
+    t.true_(max_inflight <= 2, "并发不超过上限")
+    t.true_(all_done, "全部完成回调触发")
+  end)
+
+  it("sidecar：结果 JSON 解析", function(t)
+    local spawn = require("NeoAI.tests.runner.spawn")
+    local p = vim.fn.tempname() .. "_sidecar.json"
+    local f = io.open(p, "w")
+    f:write(vim.json.encode({ passed = 7, failed = 1, errors = { "e1" }, timings = { s1 = 123 } }))
+    f:close()
+    local data = spawn.read_sidecar(p)
+    t.not_nil(data)
+    t.eq(7, data.passed)
+    t.eq(1, data.failed)
+    t.eq(123, data.timings.s1)
+    t.nil_(spawn.read_sidecar(p .. ".missing"), "缺失 sidecar 返回 nil")
+    vim.fn.delete(p)
+  end)
+
+  it("报告：有日志路径时不驻留全量输出", function(t)
+    local report = require("NeoAI.tests.runner.report")
+    local agg = { passed = 0, failed = 0, errors = {}, shards = {} }
+    local lp = vim.fn.tempname() .. "_shard.log"
+    report.record(agg, 1, { "s1" }, vim.uv.hrtime(), {
+      exit_code = 0, passed = 2, failed = 0, errors = {}, timings = { s1 = 5 }, log_path = lp,
+    })
+    t.nil_(agg.shards[1].output, "有日志路径时不应驻留输出")
+    t.eq(lp, agg.shards[1].log_path)
+    t.eq(2, agg.shards[1].passed)
+    t.eq(5, agg.shards[1].timings.s1)
+  end)
+
+  it("报告：懒读日志仅取末尾 N 行", function(t)
+    local report = require("NeoAI.tests.runner.report")
+    local p = vim.fn.tempname() .. "_tail.log"
+    local f = io.open(p, "w")
+    for i = 1, 300 do f:write("line" .. i .. "\n") end
+    f:close()
+    local tail = report.read_tail(p, 5, 65536)
+    t.matches("line300", tail)
+    t.nil_(tail:find("line100\n", 1, true), "不应包含末尾 N 行之外的旧行")
+    vim.fn.delete(p)
   end)
 end)

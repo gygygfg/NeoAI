@@ -478,6 +478,19 @@ is only kept for other `approval.mode` values (`prompt`/`strict`).
       - **Idempotent delete/rmdir**: publishing no longer fails when the target is already gone
         (removed externally) — `delete`/`rmdir` succeed when the removal succeeded **or** the target
         no longer exists, avoiding spurious `WRITE_FAILED: ... rmdir` errors.
+      - **Recursive directory deletion capture completion**: `rm -rf <dir>` may leave only a whiteout
+        for the **directory itself** in the overlay upper, with no per-child whiteouts. Producing a
+        single `rmdir` from that makes the change unit disagree with the real disk: the review UI looks
+        like an "empty directory" while `rmdir` fails on a non-empty directory (`ENOTEMPTY`). Capture
+        (both sync `capture_overlay` and the worker `_capture_worker`) now **synthesizes whiteouts for
+        all descendants from the base tree** (directory→`rmdir`, file/link→`delete`), and the existing
+        "children-before-parent" publish ordering removes children first, then the parent; the UI also
+        lists the deleted children (folded beyond `max_display_files`, see above).
+      - **Explicit reason for non-empty rmdir**: `writer` returns `RMDIR_NOT_EMPTY: <path>` for a
+        non-empty directory (distinct from permission/other failures) instead of a generic failure.
+      - **Visible partial-apply failures**: the `PARTIAL` result's `reason` carries the **first**
+        failure reason, all reasons (up to 5) are logged, and the requeued pending unit carries
+        `fail_reason`, so repeated same-cause failures are diagnosable.
       - **Partial apply for non-atomic units**: non-atomic change units (no `atomic_group="git"`
         object/pointer) **allow partial writes** during the write phase — a single per-file write
         failure no longer fails the whole unit: successful files are applied and settled, failed files
@@ -651,8 +664,12 @@ is only kept for other `approval.mode` values (`prompt`/`strict`).
      `<stdpath data>/NeoAI`, plus the configured `log.path` and `tools.sandbox.workspace_root`
      (covering logs, sessions, caches, the sandbox store, ...). These live outside the user
      workspace and are written continuously by the plugin (the log grows in real time); under the
-     root overlay they get captured as candidates whose baseline always changed by apply time
-     (`BASELINE_CHANGED`), so the whole subtree is skipped during capture traversal and at freeze.
+      root overlay they get captured as candidates whose baseline always changed by apply time
+      (`BASELINE_CHANGED`), so the whole subtree is skipped during capture traversal and at freeze.
+      Likewise, artifacts the plugin generates inside the workspace (e.g. the parallel test runner's
+      timing cache `.neoai_test_timings.json`, gitignored) are matched by filename and skipped: it is
+      rewritten on every test run, so freezing it as a candidate would always fail apply with
+      `MERGE_CONFLICT/BASELINE_CHANGED`.
   The dropped count is recorded on the candidate's `dropped` field and surfaced in the review UI;
   the publish-time masked hard reject remains as defense in depth.
 - **Same-file supersede (per-file granularity + incremental)**: when the same file is edited again
@@ -840,6 +857,11 @@ detection) and `risk.classify` (security level), so `pip install`, `sudo modprob
     both in-process tools (`edit_file`/`create_directory`, which write the host directly) and external
     commands, so `/tmp` scratch is not repeatedly surfaced as a pending change. Set
     `ephemeral_roots = {}` to disable (then `/tmp` goes through normal review/approval).
+    - **Read-only trace**: although ephemeral-root writes produce no pending candidate and are never
+      published, they are shown per file under the **ephemeral-write trace** section of the
+      `:NeoAISandboxReview` window's "Out-of-bounds·Anomaly" page (with tool and command), and a
+      `sandbox:ephemeral_write` event is emitted for live refresh — visibility only; it changes
+      neither the effect nor the publish semantics (still no candidate, no publish).
   - Broad directories such as `/root`, `/home`, `/etc` are no longer overlaid by default, so host
     home/accounts/config are not exposed as read-only lowers; add them back explicitly to
     `process_roots` if needed, and tighten `mask_paths` accordingly.
@@ -1346,18 +1368,22 @@ the facade (`sandbox/systemd/systemd.lua`) with a **fake parser** covering only 
 
 ### 137 / OOM attribution and diagnostics (`tools.sandbox.diagnostics`)
 
-- **Exit code 137 = SIGKILL**: there are two sources — `cgroup.kill` (called by the gate on command
-  timeout/cancel/output truncation via `ctx.sandbox_kill`) or OOM (resource-domain `memory.max` or a
-  host/container memory shortage).
+- **Exit code 137 = SIGKILL**: there are three sources — `cgroup.kill` (called by the gate on command
+  timeout/cancel/output truncation via `ctx.sandbox_kill`), OOM (resource-domain `memory.max` or a
+  host/container memory shortage), or **PID/thread-count limit** (the process/thread count hits
+  `pids.max`, forks are rejected by the kernel and the process tree is reaped — also surfaced as
+  137/SIGKILL, typical for heavy forking workloads such as parallel builds/parallel tests run inside
+  the sandbox).
 - **Attribution**: when a command ends with 137, or with a "bare -1" (no timeout/cancel flag and the
   process tree was killed before the exit code could be returned), `run_command` scans the
-  `oom_kill` / `oom_group_kill` **delta** in `memory.events` along **resource domain → parent →
-  container root** (an ancestor counter baseline is recorded at command start and diffed, so a
-  pre-existing ancestor OOM is not misattributed to this command): a child hit reports "sandbox
-  resource domain out of memory", an ancestor-only hit reports "container/host out of memory (outer
-  cgroup OOM)", and no hit reports "forcibly terminated (137/SIGKILL)" with a hint to enable
-  diagnostics. With `tools.sandbox.diagnostics.enabled=true`, `cgroup.kill` records the caller
-  traceback and command end records resource-domain memory/pids events (log only, no behavior
+  `oom_kill` / `oom_group_kill` **delta** in `memory.events` and the `max` **delta** in `pids.events`
+  along **resource domain → parent → container root** (an ancestor counter baseline is recorded at
+  command start and diffed, so a pre-existing ancestor event is not misattributed to this command):
+  a child OOM hit reports "sandbox resource domain out of memory", an ancestor-only OOM hit reports
+  "container/host out of memory (outer cgroup OOM)", a `pids.events` `max` hit reports "resource-domain
+  PID/thread-count limit exceeded", and no hit reports "forcibly terminated (137/SIGKILL)" with a hint
+  to enable diagnostics. With `tools.sandbox.diagnostics.enabled=true`, `cgroup.kill` records the
+  caller traceback and command end records resource-domain memory/pids events (log only, no behavior
   change).
 - **Diagnostics command**: `:NeoAISandboxDiag` prints host/container cgroup limits (`memory.max` /
   `memory.events` / `pids.max`), load, PID1 (systemd detection), the container quota
@@ -1641,6 +1667,12 @@ defense-in-depth to the bwrap prefix by default (`--cap-drop ALL` plus the tier 
     caching the mask-dir list by config reference; outside-access evidence is written via
     **async write-behind** (`evidence.add_async`) instead of a synchronous per-record disk write on
     the main thread.
+  - **Ephemeral-write tracing (non-blocking)**: writes under the session-private ephemeral roots
+    (`/tmp`, `/var/tmp`, …; see `ephemeral_roots`) produce no pending candidate and are never
+    published, but they are recorded read-only (`sandbox/observe/ephemeral.lua`) and shown per file
+    under the **ephemeral-write trace** section of the "Out-of-bounds·Anomaly" page (with tool and
+    command), emitting a `sandbox:ephemeral_write` event for live refresh. Purely for visibility — no
+    candidate, no publish, no approval; deduped by `(tool, path)` and bounded in memory.
   - **Workspace on a separate mount (container volumes, etc.)**: the whole-root overlay's lower is
     `/`, and an overlay lower **does not cross mount points**. When the working directory lives on a
     separate mount outside `/` (e.g. a container volume `/mnt/<uuid>/...`), the root overlay cannot

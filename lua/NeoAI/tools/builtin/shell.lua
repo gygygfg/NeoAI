@@ -72,6 +72,31 @@ local function _oom_attribution(cgroup_path, baseline, code)
   return false, nil
 end
 
+--- 采集资源域 pids「max」计数基线（命令开始前调用；结束后差分归因 PID/线程数超限）。
+--- @param cgroup_path string|nil
+--- @return table|nil
+local function _pids_baseline(cgroup_path)
+  if not cgroup_path then return nil end
+  local ok, cg = pcall(require, "NeoAI.sandbox.execution.cgroup")
+  if not (ok and cg and cg.pids_baseline) then return nil end
+  local b
+  pcall(function() b = cg.pids_baseline(cgroup_path) end)
+  return b
+end
+
+--- 归因 PID/线程数超限：137/-1 结束时读资源域 pids.events「max」增量（子域→祖先）。
+--- @param cgroup_path string|nil
+--- @param baseline table|nil
+--- @param code number|nil
+--- @return boolean hit
+local function _pids_attribution(cgroup_path, baseline, code)
+  if not cgroup_path or (code ~= 137 and code ~= -1) then return false end
+  local ok, cg = pcall(require, "NeoAI.sandbox.execution.cgroup")
+  if not (ok and cg and cg.pids_attribution) then return false end
+  local attr = cg.pids_attribution(cgroup_path, { baseline = baseline }) or {}
+  return attr.hit == true
+end
+
 --- 执行 shell 命令（jobstart，实时累积 stdout/stderr）。
 --- 采用非缓冲输出：命令超时/被取消时也能回传「此刻终端已产生的内容」，
 --- 而不是只剩一句错误信息。始终 resolve 结果表（含 timed_out/aborted 标记），
@@ -127,6 +152,8 @@ local function _run_command(command, opts)
       end)
     end
   end
+  -- 命令开始时的 pids「max」计数基线：结束后差分归因 PID/线程数超限。
+  local cgroup_pids_baseline = _pids_baseline(cgroup_path)
   local max_out = tonumber(cfg_rc.max_output_bytes) or 0
   local out_bytes, err_bytes = 0, 0
   local truncated = false
@@ -246,6 +273,7 @@ local function _run_command(command, opts)
         truncated = truncated,
         oom = oom,
         oom_level = oom_level,
+        pids_max_hit = _pids_attribution(cgroup_path, cgroup_pids_baseline, code),
       })
     end,
   })
@@ -291,8 +319,9 @@ local function _run_interactive(command, opts)
   full[#full + 1] = _shell_bin()
   full[#full + 1] = "-c"
   full[#full + 1] = command
-  -- 命令开始时的资源域 OOM 计数基线：结束后差分归因（PTY 路径此前缺失，导致 137 无法归因）。
+  -- 命令开始时的资源域 OOM / pids 计数基线：结束后差分归因（PTY 路径此前缺失，导致 137 无法归因）。
   local cgroup_baseline = _oom_baseline(opts.cgroup_path)
+  local cgroup_pids_baseline = _pids_baseline(opts.cgroup_path)
   local session = pty.open({
     argv = full,
     cwd = opts.cwd,
@@ -332,6 +361,7 @@ local function _run_interactive(command, opts)
       message = result.message,
       oom = oom,
       oom_level = oom_level,
+      pids_max_hit = _pids_attribution(opts.cgroup_path, cgroup_pids_baseline, result.code),
     }
   end)
 end
@@ -526,6 +556,15 @@ shell_tools.run_command = helpers.define_tool(
               out,
               errout
             )
+          elseif result.pids_max_hit then
+            -- PID/线程数超限：pids.events「max」增量 > 0（fork 被 pids.max 拒绝后进程树回收）。
+            text = _with_status(
+              "命令被终止（资源域 PID/线程数超限）：进程/线程数触顶 pids.max，fork 被内核拒绝、"
+                .. "进程树被回收。请降低并发（并行 worker 数、构建 -j）或减少常驻/后台进程，"
+                .. "亦可在 tools.sandbox.limits.pids_max 调高上限后重试",
+              out,
+              errout
+            )
           elseif result.code == 137 then
             -- 非超时/取消/截断的 137：SIGKILL 来源不明（资源域终止、宿主 OOM 或外部信号）。
             local diag = ""
@@ -613,6 +652,8 @@ shell_tools.run_command = helpers.define_tool(
               reason = "命令被终止（疑似内存超限 OOM"
                 .. (result.oom_level == "ancestor" and "，容器/宿主内存不足" or "")
                 .. "）"
+            elseif result.pids_max_hit then
+              reason = "命令被终止（资源域 PID/线程数超限）"
             elseif result.code == 137 then
               reason = "命令被强制终止（退出码 137 / SIGKILL）"
             else
@@ -620,6 +661,8 @@ shell_tools.run_command = helpers.define_tool(
             end
             -- 显式机器可读的失败标记（ok=false + 退出码），避免下游把「无 rc 字段的伪 JSON」
             -- 当作 rc=0/成功（失败开放）。仍 resolve 以保留沙箱门禁的候选冻结与提权检测。
+            -- 终止归因字段（oom/oom_level/pids_max_hit）：供 UI/Agent/测试区分「资源受限终止」
+            -- （内存 OOM 或 PID/线程数超限）与普通非零退出，无需解析中文文案。
             on_success(require("NeoAI.utils.json").encode({
               error = reason,
               output = text,
@@ -627,6 +670,9 @@ shell_tools.run_command = helpers.define_tool(
               exit_code = tonumber(result.code) or -1,
               timed_out = result.timed_out or false,
               aborted = result.aborted or false,
+              oom = result.oom or false,
+              oom_level = result.oom_level or nil,
+              pids_max_hit = result.pids_max_hit or false,
             }))
           else
             on_success(text)

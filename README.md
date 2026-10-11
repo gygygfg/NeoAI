@@ -763,10 +763,10 @@ NeoAI 内置了 40+ 工具，AI 可在对话中自动调用，涵盖以下类别
 
 | 工具名                 | 描述                                                      | 参数说明 |
 | ---------------------- | --------------------------------------------------------- | -------- |
-| `create_sub_agent`     | 创建子 Agent 执行子任务（支持 `foreground` 前台等待结果）  | `task`（必填）子任务描述；`mode`（可选，`background` 默认/`foreground`）执行模式；`model`（可选）指定模型；`boundaries`（可选）约束 `{allowed_tools, allowed_directories, allowed_commands, max_tool_calls, max_iterations}`；`context`（可选）额外上下文 |
-| `wait_sub_agent`       | 等待子 Agent 完成并返回完整结果（若已完成则立即返回）     | `sub_agent_id`（必填）子 Agent 标识 |
-| `get_sub_agent_status` | 查询子 Agent 状态与结果                                   | `sub_agent_id`（必填）子 Agent 标识 |
-| `cancel_sub_agent`     | 取消子 Agent                                              | `sub_agent_id`（必填）子 Agent 标识 |
+| `create_sub_agent`     | 创建子 Agent 执行子任务（后台运行，立即返回；创建后**无需轮询等待**，完成后最终正文自动回传主 Agent）  | `task`（必填）子任务描述；`name`（可选）简短显示名；`model`（可选）指定模型；`boundaries`（可选）约束 `{allowed_tools, allowed_directories, allowed_commands, max_tool_calls, max_iterations}`；`context`（可选）额外上下文 |
+| `get_sub_agent_status` | 查询子 Agent 状态与结果（正常流程无需调用，仅用于确认是否仍在运行） | `sub_agent_id`（必填）子 Agent 标识 |
+| `cancel_sub_agent`     | 终止（取消）子 Agent                                      | `sub_agent_id`（必填）子 Agent 标识 |
+| `send_sub_agent_message` | 向子 Agent 发送消息（补充指令/追问）                    | `sub_agent_id`、`message`（均必填） |
 
 ### 📋 待办与计划
 

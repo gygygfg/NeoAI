@@ -1908,6 +1908,35 @@ function M.capture_overlay(attempt_id, real_root, upper_root)
   real_root = _abs(real_root):gsub("/$", "")
   local cap = _max_file_bytes()
   local runtime = require("NeoAI.sandbox.execution.runtime")
+  local session_name = require("NeoAI.sandbox.observe.conceal").session_basename()
+  --- 已展开的真实路径（避免多级 whiteout 重复登记同一后代）。
+  local expanded = {}
+  --- 递归登记被删目录的下层基线后代（目录→rmdir、文件/链接→delete）：overlay 可能只留目录本身
+  --- 的 whiteout，不逐子项留 whiteout，导致候选只有 rmdir 而真实目录非空（rmdir ENOTEMPTY 失败）。
+  --- @param real_dir string 基线（真实）目录绝对路径
+  --- @param rel_dir string 相对捕获根路径
+  local function capture_deleted_tree(real_dir, rel_dir)
+    local handle = vim.uv.fs_scandir(real_dir)
+    if not handle then return end
+    while true do
+      local name = vim.uv.fs_scandir_next(handle)
+      if not name then break end
+      if name ~= ".wh..wh..opq" and name ~= session_name then
+        local child_rel = rel_dir == "" and name or (rel_dir .. "/" .. name)
+        local real = real_root .. "/" .. child_rel
+        if not runtime.is_self_runtime_path(real) and not expanded[real] then
+          expanded[real] = true
+          local lst = vim.uv.fs_lstat(real)
+          if lst and lst.type == "directory" then
+            capture_deleted_tree(real, child_rel)
+            _capture_entry(attempt, real_root, upper_root .. "/" .. child_rel, child_rel, nil, cap)
+          else
+            _capture_entry(attempt, real_root, upper_root .. "/" .. child_rel, child_rel, nil, cap)
+          end
+        end
+      end
+    end
+  end
   local function walk(dir, rel)
     local handle = vim.uv.fs_scandir(dir)
     if not handle then return end
@@ -1916,7 +1945,7 @@ function M.capture_overlay(attempt_id, real_root, upper_root)
       if not name then break end
       -- 会话 shell 状态 bind 挂载点（无特征名）不视为命令的文件改动。
       -- `.git` 内部**不在此排除**：改为在冻结阶段按 `git_path_class` 原子分类（对象先于指针）。
-      if name ~= ".wh..wh..opq" and name ~= require("NeoAI.sandbox.observe.conceal").session_basename() then
+      if name ~= ".wh..wh..opq" and name ~= session_name then
         -- opaque 目录标记（.wh..wh..opq）仅表示上层目录内容被替换，跳过不产生候选
         local whiteout, real_name = _is_whiteout(name, t)
         local child_rel = rel == "" and real_name or (rel .. "/" .. real_name)
@@ -1924,6 +1953,13 @@ function M.capture_overlay(attempt_id, real_root, upper_root)
         -- 应用时基线必变（BASELINE_CHANGED），会否决**整个**变更单元。
         if not runtime.is_self_runtime_path(real_root .. "/" .. child_rel) then
           if whiteout then
+            -- 目录 whiteout：补出基线目录的下层后代（否则 rmdir 会命中非空目录失败）。
+            local real = real_root .. "/" .. child_rel
+            local base = vim.uv.fs_stat(real)
+            if base and base.type == "directory" and not expanded[real] then
+              expanded[real] = true
+              capture_deleted_tree(real, child_rel)
+            end
             _capture_entry(attempt, real_root, dir .. "/" .. name, child_rel, nil, cap)
           elseif t == "directory" then
             walk(dir .. "/" .. name, child_rel)
@@ -2186,13 +2222,51 @@ local function _capture_worker(upper_root, real_root, session_basename, expected
     end
   end
 
-  --- 处理 whiteout（命令删除 lower 中的文件）。
-  local function handle_whiteout(child_rel, real, dest)
+  --- 已展开的真实路径（避免多级 whiteout 重复登记同一后代）。
+  local whiteout_expanded = {}
+  --- 处理 whiteout（命令删除 lower 中的文件/目录）。前向声明以支持与目录展开互递归。
+  local handle_whiteout
+  --- 递归登记被删目录的下层基线后代（目录→rmdir、文件/链接→delete）。
+  --- overlayfs 对「非空 lower 目录的删除」可能只在上层留下**目录本身**的 whiteout，而**不逐子项**
+  --- 留 whiteout。若只据此发布，便会产生「候选只有一条 rmdir、真实目录却非空」的变更单元：
+  --- 应用时 rmdir 命中非空目录（ENOTEMPTY）失败，且审批界面误显示为「空目录」。此处按基线真实
+  --- 目录（仍然存在）补出全部后代 whiteout，使既有「子先于父」发布排序可正确先删子项再 rmdir。
+  --- @param real_dir string 基线（真实）目录绝对路径
+  --- @param rel_dir string 相对捕获根路径
+  local function emit_tree_whiteout(real_dir, rel_dir)
+    local handle = vim.uv.fs_scandir(real_dir)
+    if not handle then return end
+    while true do
+      local name, _ = vim.uv.fs_scandir_next(handle)
+      if not name then break end
+      if name ~= ".wh..wh..opq" and name ~= session_basename then
+        local child_rel = rel_dir == "" and name or (rel_dir .. "/" .. name)
+        local real = real_root .. "/" .. child_rel
+        if not is_self(real) and not whiteout_expanded[real] then
+          whiteout_expanded[real] = true
+          local lst = vim.uv.fs_lstat(real)
+          local dest = upper_root .. "/" .. child_rel
+          if lst and lst.type == "directory" then
+            emit_tree_whiteout(real, child_rel)
+            handle_whiteout(child_rel, real, dest)
+          else
+            handle_whiteout(child_rel, real, dest)
+          end
+        end
+      end
+    end
+  end
+  handle_whiteout = function(child_rel, real, dest)
     local exp = expected[real]
     if exp and exp.deleted then return end -- 期望即删除态且未被命令重建：未改动，跳过
     local sstat = vim.uv.fs_stat(dest)
     if ws_skip(real, dest, sstat) then return end
     local stat = vim.uv.fs_stat(real)
+    -- 被删的是目录：先补出全部后代（基线真实目录仍在），再登记目录本身。
+    if stat and stat.type == "directory" and not whiteout_expanded[real] then
+      whiteout_expanded[real] = true
+      emit_tree_whiteout(real, child_rel)
+    end
     -- whiteout 删除的是基线文件，base_hash 需与真实内容一致（CAS 冲突检测依赖）。
     enc(child_rel); enc(dest); enc("whiteout")
     enc(stat and "1" or "0"); enc(stat and stat.type or ""); enc("")
@@ -3623,6 +3697,38 @@ local function _publish_validate(candidate)
   return nil
 end
 
+--- 记录部分应用失败文件的逐条原因：UI 仅显示计数，真实原因（如非空目录 rmdir 的 ENOTEMPTY）
+--- 极易被掩盖；此处落日志便于诊断（上限 5 条 + 汇总）。
+--- @param failed table|nil { { path, reason } }
+local function _log_partial_failures(failed)
+  if not failed or #failed == 0 then return end
+  local logger = require("NeoAI.kernel.logger")
+  local shown = math.min(#failed, 5)
+  for i = 1, shown do
+    local x = failed[i] or {}
+    logger.warn("[sandbox] 部分应用失败：%s", tostring(x.reason or x.path or x))
+  end
+  if #failed > shown then
+    logger.warn("[sandbox] 部分应用失败：另有 %d 个文件失败（原因省略）", #failed - shown)
+  end
+end
+
+--- 构造 PARTIAL 结果：reason 带首条失败原因（便于通知/回队条目直接可见），并落逐条原因日志。
+--- @param applied table
+--- @param failed table
+--- @param receipt table|nil
+--- @return table
+local function _partial_result(applied, failed, receipt)
+  _log_partial_failures(failed)
+  local first = failed and failed[1]
+  local detail = (first and first.reason) and ("（首因：" .. tostring(first.reason) .. "）") or ""
+  return {
+    ok = false, state = "PARTIAL",
+    reason = ("PARTIAL_WRITE: %d 个文件失败"):format(#(failed or {})) .. detail,
+    applied = applied, failed = failed, receipt = receipt,
+  }
+end
+
 --- CAS 发布候选到真实工作区
 --- 仅当真实当前状态等于候选基线时应用；否则 CONFLICT（设计文档 §4.5）。
 --- @param candidate table
@@ -3830,10 +3936,7 @@ function M.publish(candidate, opts)
     file_count = #applied,
   }
   if #failed > 0 then
-    return {
-      ok = false, state = "PARTIAL", reason = ("PARTIAL_WRITE: %d 个文件失败"):format(#failed),
-      applied = applied, failed = failed, receipt = receipt,
-    }
+    return _partial_result(applied, failed, receipt)
   end
   return { ok = true, state = "COMMITTED", receipt = receipt, applied = applied }
 end
@@ -4081,8 +4184,7 @@ local function _worker_pub(res)
   elseif res.status == "secret_unresolved" then
     return { ok = false, state = "FAILED", reason = res.reason }
   elseif res.status == "partial" then
-    return { ok = false, state = "PARTIAL", reason = res.reason or "PARTIAL_WRITE",
-      applied = res.applied, failed = res.failed }
+    return _partial_result(res.applied or {}, res.failed or {}, nil)
   end
   return { ok = false, state = "FAILED", reason = res.reason or "PUBLISH_FAILED" }
 end
@@ -4275,9 +4377,7 @@ function M.publish_async(candidate, opts)
         file_count = #applied,
       }
       if #failed > 0 then
-        return { ok = false, state = "PARTIAL",
-          reason = ("PARTIAL_WRITE: %d 个文件失败"):format(#failed),
-          applied = applied, failed = failed, receipt = receipt }
+        return _partial_result(applied, failed, receipt)
       end
       return { ok = true, state = "COMMITTED", receipt = receipt, applied = applied }
     end, function(e)

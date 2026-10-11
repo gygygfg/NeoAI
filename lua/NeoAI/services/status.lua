@@ -48,6 +48,7 @@ local DEFAULTS = {
     state = "Function",
     brand = "Title",
     pending = "Warning",
+    sub_agents = "Function",
     sandbox = SANDBOX_HL,
     sandbox_danger = SANDBOX_DANGER_HL,
   },
@@ -149,6 +150,10 @@ local function _build_part(info, part)
     return "剩余容量" .. _fmt_pct(math.max(0, 1 - info.capacity.pct))
   elseif part == "state" then
     return info.state or "idle"
+  elseif part == "sub_agents" then
+    -- 子 Agent 名字平铺（无则 nil，不渲染）
+    if not info.sub_agents or #info.sub_agents.names == 0 then return nil end
+    return table.concat(info.sub_agents.names, " ")
   elseif part == "pending" then
     -- agent 正忙时暂存/待发消息数：>0 才显示徽标（0 时返回 nil，不渲染）
     if not info.pending or info.pending <= 0 then return nil end
@@ -364,6 +369,7 @@ function M.get_info()
     usage = nil,
     capacity = nil,
     pending = nil,
+    sub_agents = nil,
     sandbox_pending = nil,
     sandbox_traces = nil,
     sandbox_level = nil,
@@ -402,6 +408,19 @@ function M.get_info()
     }
     -- 上下文容量：优先 API 最近一次请求的真实输入 token，缺失回退完整请求估算
     info.capacity = M.capacity_for(agent)
+    -- 子 Agent（供 winbar：名字平铺 / 过长时折叠为「N个子agent正在运行」）
+    local ok_sa, sa = pcall(require, "NeoAI.core.agent.sub_agent")
+    if ok_sa and sa and sa.list_for then
+      local list = sa.list_for(agent.id)
+      if #list > 0 then
+        local names, running = {}, 0
+        for _, e in ipairs(list) do
+          names[#names + 1] = e.name or e.id
+          if e.status == "running" then running = running + 1 end
+        end
+        info.sub_agents = { names = names, running = running, total = #list }
+      end
+    end
   end
   -- 显示模式标签：由 UI 经 DISPLAY_MODE_CHANGED 事件（或 set_display 推送）上报；
   -- services 不反向 require ui 组件。
@@ -442,6 +461,38 @@ function M.has(part)
   return _build_part(M.get_info(), part) ~= nil
 end
 
+--- 子 Agent 段（宽度自适应）：平铺名字；若超出聊天窗口宽度则折叠为「N个子agent正在运行」。
+--- 供 lualine winbar 使用，使子 Agent 名字拼接后不会把 winbar 撑出窗口。
+--- @param opts table|nil { width?, prefix_parts?, separator? }
+--- @return string 已转义文本（无子 Agent 时空串）
+function M.sub_agents_segment(opts)
+  if not _enabled() then return "" end
+  opts = opts or {}
+  local info = M.get_info()
+  local sa = info.sub_agents
+  if not sa or #sa.names == 0 then return "" end
+  local sep = opts.separator or " "
+  local sepw = vim.fn.strdisplaywidth(sep)
+  local used = 0
+  for _, part in ipairs(opts.prefix_parts or {}) do
+    local t = _build_part(info, part)
+    if t and t ~= "" then used = used + vim.fn.strdisplaywidth(t) + sepw end
+  end
+  local width = tonumber(opts.width) or vim.o.columns
+  local avail = width - used
+  local full = table.concat(sa.names, sep)
+  if avail > 0 and vim.fn.strdisplaywidth(full) <= avail then
+    return _stl_escape(full)
+  end
+  local text
+  if sa.running and sa.running > 0 then
+    text = ("%d个子agent正在运行"):format(sa.running)
+  else
+    text = ("%d个子agent"):format(sa.total)
+  end
+  return _stl_escape(text)
+end
+
 --- 各段对应的 nvim 高亮组（config ui.statusline.colors 可覆盖）
 --- @return table part -> hl
 function M.colors()
@@ -478,6 +529,8 @@ function M.watch()
     events.SANDBOX_APPLIED, events.SANDBOX_COMMITTED,
     events.SANDBOX_DISCARDED, events.SANDBOX_OUTSIDE_ACCESS,
     events.SANDBOX_REVERTED,
+    events.SUB_AGENT_CREATED, events.SUB_AGENT_UPDATED,
+    events.SUB_AGENT_COMPLETED, events.SUB_AGENT_ERROR,
   }
   for _, ev in ipairs(subscribed) do
     state.unsubs[#state.unsubs + 1] = event_bus.on(ev, _refresh)

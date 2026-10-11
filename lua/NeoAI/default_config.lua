@@ -259,6 +259,7 @@ local DEFAULT_CONFIG = {
         state = "Function",
         brand = "Title",
         pending = "Warning",
+        sub_agents = "Function",
         sandbox = "NeoAISandboxPending",
         sandbox_danger = "NeoAISandboxDanger", -- 待审含 L3 高危时的红色危险高亮
       },
@@ -290,6 +291,8 @@ local DEFAULT_CONFIG = {
       toggle_reasoning = { key = "r", desc = "切换思考过程显示" },
       switch_model = { key = "M", desc = "切换模型" },
       cycle_mode = { key = "m", desc = "循环切换模式（CHAT/PLAN）" },
+      switch_sub_agent = { key = "<leader>as", desc = "切换到子 Agent 会话（新窗口）" },
+      sub_agent_list = { key = "<leader>al", desc = "子 Agent 列表弹出窗" },
       cycle_display = {
         insert = { key = "<C-t>", desc = "循环切换显示模式（对话/轨迹）" },
         normal = { key = "T", desc = "循环切换显示模式（对话/轨迹）" },
@@ -472,6 +475,12 @@ local DEFAULT_CONFIG = {
         max_bytes = 500 * 1024 * 1024, -- 缓存总大小上限（字节，默认 500MB；超出按最旧优先淘汰）
       },
     },
+    -- 子 Agent：每个子 Agent 独立持久化会话，完成后把最终正文自动回传给主 Agent。
+    sub_agent = {
+      -- 创建子 Agent 时自动追加到其任务提示末尾的收尾指令（要求最后总结工作）。
+      -- 设为 "" 可关闭该追加。
+      final_instruction = "最后请总结你的工作：用简洁的正文汇总你做了什么、得到的关键结论与证据（文件:行），以及任何未完成或需要注意的点。",
+    },
     plan_mode = {
       enabled = true, -- 计划模式
       auto_execute_on_approve = true, -- 计划经用户确认后自动转入 CHAT 并按任务清单开始执行
@@ -535,6 +544,7 @@ local DEFAULT_CONFIG = {
         create_sub_agent = { auto_allow = false },
         get_sub_agent_status = { auto_allow = true },
         cancel_sub_agent = { auto_allow = true },
+        send_sub_agent_message = { auto_allow = true },
         git_diff = { auto_allow = true },
         git_log = { auto_allow = true },
         git_status = { auto_allow = true },
@@ -878,6 +888,10 @@ local DEFAULT_CONFIG = {
           "~/.cargo", "~/.rustup", "~/go/pkg",
           "~/.gradle", "~/.m2", "~/.nuget/packages", "~/.gem",
           "~/.local/share/uv", "~/.local/share/pipx",
+          -- 官方 Neovim 二进制编译期烙入 `package.path`/`package.cpath` 的构建前缀（GitHub
+          -- Actions 检出目录），本机通常不存在：`require` 探测未安装模块时会命中这些模板。
+          -- 纯字符串前缀匹配（不 glob），故不存在的路径也能命中。
+          "/home/runner/work/neovim/neovim/.deps",
         },
       },
       -- 写日志增量捕获（默认 "auto"）：利用 eBPF 观测到的「本轮写入/删除路径」，capture 只处理

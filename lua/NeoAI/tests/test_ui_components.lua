@@ -190,6 +190,41 @@ tests.suite("ui_components", function(_, it)
     t.nil_(find_win_by_title("子 Agent"), "reset 应关闭面板")
   end)
 
+  it("sub_agent_list：打开/渲染/进入/reset", function(t)
+    local sub_agent_list = require("NeoAI.ui.components.sub_agent_list")
+    local manager = require("NeoAI.core.agent.sub_agent")
+    local chat_service = require("NeoAI.services.chat_service")
+    sub_agent_list.reset()
+    manager.reset()
+
+    -- 造一个聊天主窗口（filetype=neoai）作为定位基准
+    local buf = vim.api.nvim_create_buf(false, true)
+    vim.bo[buf].filetype = "neoai"
+    vim.cmd("split")
+    local win = vim.api.nvim_get_current_win()
+    vim.api.nvim_win_set_buf(win, buf)
+
+    local orig = chat_service.get_agent_for_buffer
+    ---@diagnostic disable-next-line: duplicate-set-field
+    chat_service.get_agent_for_buffer = function() return { id = "agentX" } end
+    manager._inject_for_test("sx", { parent_agent_id = "agentX", name = "探测器", session_id = "sess_sx" })
+
+    local w = sub_agent_list.open()
+    t.not_nil(w, "应打开列表浮窗")
+    t.true_(sub_agent_list.is_open())
+    local lb = vim.api.nvim_win_get_buf(w)
+    local text = table.concat(vim.api.nvim_buf_get_lines(lb, 0, -1, false), "\n")
+    t.matches("探测器", text)
+
+    sub_agent_list.close()
+    t.false_(sub_agent_list.is_open())
+
+    chat_service.get_agent_for_buffer = orig
+    manager.reset()
+    pcall(vim.api.nvim_win_close, win, true)
+    pcall(vim.api.nvim_buf_delete, buf, { force = true })
+  end)
+
   it("terminal_window：headless 无 UI 时为安全 no-op", function(t)
     local tw = require("NeoAI.ui.components.terminal_window")
     tw.reset()

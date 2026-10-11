@@ -13,13 +13,20 @@
 :NeoAITest flow_tools   " 顺序运行指定套件（按名字，便于调试）
 ```
 
-- **默认并行（无参数）**：`lua/NeoAI/tests/parallel.lua` 按「文件（套件）」把全部套件分片到
-  `min(nproc, 8)` 个隔离 headless 子进程并发执行（环境变量 `NEOAI_TEST_WORKERS` 可覆盖），
-  聚合 `passed/failed` 并打印各分片耗时。分片权重优先用实测耗时缓存
+- **默认并行（无参数）**：`lua/NeoAI/tests/parallel.lua`（薄门面）按「双 lane 有界并发」把全部
+  套件分派到隔离 headless 子进程：**light lane** 把非资源重套件按实测耗时 LPT 分片成
+  `min(nproc, 8)` 个进程并发执行（环境变量 `NEOAI_TEST_WORKERS` 可覆盖）；**heavy lane** 对
+  资源重/时序敏感套件（默认 `sandbox*`、`pty`）**一套件一子进程**并发执行（上限
+  `NEOAI_TEST_HEAVY_WORKERS`，默认 2；`=1` 等价旧串行通道）。两 lane **重叠执行**、任一子进程
+  结束即回填，约束 `#light≤W`、`#heavy≤H`、`W+H≤核数`。分片权重优先用实测耗时缓存
   `.neoai_test_timings.json`（gitignored，仓库根），无缓存时按用例数做 LPT 贪心均衡。
-- **串行通道**：资源重/时序敏感套件（默认 `sandbox*`、`pty`）不参与并行，改为逐个串行执行，
-  避免并发 bwrap/cgroup 资源争抢（137/SIGKILL、超时）与 PTY 时序 flaky。可用
-  `opts.serial_suites`（模式数组或判定函数）覆盖。
+  职责拆分为 `NeoAI.tests.runner.*` 子模块（config / timings / shard / spawn / scheduler / report）。
+  可用 `opts.serial_suites`（模式数组或判定函数）覆盖 heavy 判定。
+- **结果回传与主线程卸载**：每个 worker 把结果写入 **sidecar**（小 JSON：passed/failed/errors/timings），
+  并把 stdout/stderr 直接落盘为**日志文件**；父进程只读小 sidecar（O(分片数)），不再逐行缓冲或
+  全量扫描整段输出、不驻留分片全量输出；失败时按需**懒读日志尾部**（日志路径 + 末尾 N 行）定位。
+  为减轻子进程主线程：worker **按分片只加载本分片测试模块**、跳过 fresh worker 首套件的冗余全量
+  重置、默认仅打印失败用例 + 套件摘要（`NEOAI_TEST_VERBOSE=1` 还原逐用例明细打印）。
 - **顺序（带套件名）**：单进程 `run_isolated` 顺序执行，便于定位单个套件。
 - **过滤（隔离复现/跳过危险用例）**：`NEOAI_TEST_ONLY=<p1,p2>` 仅跑名字含任一子串的用例；
   `NEOAI_TEST_SKIP=<p1,p2>` 跳过。逗号分隔多模式。
@@ -179,7 +186,7 @@ end)
 | `test_tools / test_tool_pending` | 工具执行、工具待发/暂存 |
 | `test_pty` | 交互式 PTY：按键映射、/proc 阻塞读检测、判官注入、经门禁的 run_command 自动应答 |
 | `test_max_tokens / test_truncation` | max_tokens 发送策略、输出截断续写 |
-| `test_sub_agent_result` | 子 Agent 结果 |
+| `test_sub_agent_result` | 子 Agent 工具/管理器/结果回传 |
 | `test_pending_queue` | 待发消息队列 |
 | `test_services / test_status` | 服务层（chat/tool/model/status）、状态栏 |
 | `test_ask_user / test_herder` | 提问、Herder 上报 |
@@ -250,7 +257,8 @@ nvim --headless --clean -u NONE --cmd "set rtp+=$PWD" -c "luafile scripts/sandbo
 ### 5.3 沙箱边界测试套件（`test_sandbox_boundary_*`）
 
 在 `scripts/sandbox_audit.lua`（人工审计脚本）之外，把关键边界固化进标准回归套件
-（`test_sandbox*` 前缀自动走 `parallel.lua` 串行通道，避免 bwrap/cgroup 并发争抢）：
+（`test_sandbox*` 前缀自动走 `parallel.lua` 的 **heavy lane**——一套件一子进程，受
+`NEOAI_TEST_HEAVY_WORKERS` 并发上限约束，避免无界并发下 bwrap/cgroup 争抢）：
 
 - `test_sandbox_boundary_escape.lua`：seccomp denylist **全量真实** syscall 拦截（python
   ctypes）、clone/clone3 命名空间、socket 地址族白名单、mknod 设备节点屏障、`mount`/`chroot`/

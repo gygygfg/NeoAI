@@ -13,14 +13,24 @@
 :NeoAITest flow_tools   " run a specific suite sequentially (by name, for debugging)
 ```
 
-- **Parallel by default (no args)**: `lua/NeoAI/tests/parallel.lua` shards every suite by
-  **file (suite)** across `min(nproc, 8)` isolated headless child processes (override with
-  `NEOAI_TEST_WORKERS`), aggregates `passed/failed`, and prints per-shard timing. Shard weights
-  prefer the measured timing cache `.neoai_test_timings.json` (gitignored, repo root); without a
-  cache it falls back to case-count LPT balancing.
-- **Serial lane**: resource-heavy / timing-sensitive suites (default `sandbox*`, `pty`) do not run
-  in parallel; they run one at a time to avoid bwrap/cgroup contention (137/SIGKILL, timeouts) and
-  PTY timing flakiness. Override with `opts.serial_suites` (pattern list or predicate).
+- **Parallel by default (no args)**: `lua/NeoAI/tests/parallel.lua` (thin facade) dispatches every
+  suite across isolated headless child processes via **bounded-concurrency dual lanes**: the
+  **light lane** shards non-heavy suites by measured timing into `min(nproc, 8)` processes (override
+  with `NEOAI_TEST_WORKERS`); the **heavy lane** runs resource-heavy / timing-sensitive suites
+  (default `sandbox*`, `pty`) **one suite per child process**, capped by `NEOAI_TEST_HEAVY_WORKERS`
+  (default 2; `=1` reproduces the old serial channel). Both lanes run **overlapped** and refill as
+  soon as any child exits, constrained by `#light<=W`, `#heavy<=H`, `W+H<=cores`. Shard weights prefer
+  the measured timing cache `.neoai_test_timings.json` (gitignored, repo root); without a cache it
+  falls back to case-count LPT balancing. Responsibilities are split into `NeoAI.tests.runner.*`
+  submodules (config / timings / shard / spawn / scheduler / report). Override the heavy
+  classification with `opts.serial_suites` (pattern list or predicate).
+- **Result plumbing & main-thread offload**: each worker writes a **sidecar** (small JSON:
+  passed/failed/errors/timings) and streams stdout/stderr straight to a **log file**; the parent only
+  reads the small sidecar (O(shards)), never buffers/scans the whole output or retains per-shard full
+  output; on failure it **lazily tails the log** (path + last N lines). To offload the child main
+  thread: workers **load only their shard's test modules**, skip the redundant full reset for a fresh
+  worker's first suite, and default to printing only failures + suite summaries
+  (`NEOAI_TEST_VERBOSE=1` restores per-case detail).
 - **Sequential (with suite names)**: single-process `run_isolated`, sequential, for pinpointing one suite.
 - **Filters (isolated repro / skip risky cases)**: `NEOAI_TEST_ONLY=<p1,p2>` runs only cases whose
   name contains any pattern; `NEOAI_TEST_SKIP=<p1,p2>` skips them. Comma-separated.
@@ -190,7 +200,7 @@ ensures there are no leftover subscriptions or state between tests.
 | `test_tools / test_tool_pending` | Tool execution, pending/staged tools |
 | `test_pty` | Interactive PTY: key mapping, /proc blocked-read detection, judge injection, sandboxed run_command auto-answer |
 | `test_max_tokens / test_truncation` | max_tokens sending strategy, output truncation and continuation |
-| `test_sub_agent_result` | Sub-agent results |
+| `test_sub_agent_result` | Sub-agent tools/manager/result delivery |
 | `test_pending_queue` | Pending message queue |
 | `test_services / test_status` | Service layer (chat/tool/model/status), status line |
 | `test_ask_user / test_herder` | Asking questions, Herder reporting |
@@ -262,8 +272,9 @@ residual boundaries** (inherent to the shared netns / global procfs, see
 ### 5.3 Sandbox Boundary Test Suites (`test_sandbox_boundary_*`)
 
 Besides `scripts/sandbox_audit.lua` (a manual audit script), key boundaries are frozen into the
-standard regression suites (the `test_sandbox*` prefix routes them through the serial channel of
-`parallel.lua`, avoiding concurrent bwrap/cgroup contention):
+standard regression suites (the `test_sandbox*` prefix routes them through the **heavy lane** of
+`parallel.lua` — one suite per child process, capped by `NEOAI_TEST_HEAVY_WORKERS`, avoiding
+unbounded concurrent bwrap/cgroup contention):
 
 - `test_sandbox_boundary_escape.lua`: real full-denylist syscall interception (python ctypes),
   clone/clone3 namespaces, socket address-family allowlist, mknod device-node barrier, real

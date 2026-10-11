@@ -33,7 +33,7 @@ end
 
 -- ========== 私有函数 ==========
 
---- 子 Agent 边界审核（通过 plan 模块）
+--- 子 Agent 边界审核（通过子 Agent 管理器）
 --- @param ctx table
 --- @param tool_name string
 --- @return boolean, string|nil
@@ -41,10 +41,12 @@ local function _review_sub_agent(ctx, tool_name)
   if not ctx.is_sub_agent then return true end
   local sub_agent_id = ctx.sub_agent_id
   if not sub_agent_id then return true end
-  local plan = require("NeoAI.tools.builtin.plan")
-  local ok, reason = plan.review_tool_call(sub_agent_id, tool_name)
+  local bridge = require("NeoAI.kernel.core_bridge")
+  local manager = bridge.sub_agent and bridge.sub_agent()
+  if not manager then return true end
+  local ok, reason = manager.review_tool_call(sub_agent_id, tool_name)
   if ok then
-    plan.track_tool_call(sub_agent_id)
+    manager.track_tool_call(sub_agent_id)
   end
   return ok, reason
 end
@@ -330,12 +332,25 @@ function M.execute(agent, tool_name, args, tool_call_id, opts)
     return async.reject({ kind = "plan_mode", message = preason })
   end
 
+  -- 子 Agent 的审批申请路由目标：其父（主）Agent。用于非 async 模式下把审批
+  -- 归属/事件展示到主 Agent；执行仍使用子 Agent 自身 ctx（cwd/沙箱域不变）。
+  local approval_agent = nil
+  if opts.is_sub_agent and opts.sub_agent_id then
+    local bridge = require("NeoAI.kernel.core_bridge")
+    local manager = bridge.sub_agent and bridge.sub_agent()
+    local entry = manager and manager.get(opts.sub_agent_id)
+    if entry and entry.parent_agent_id and bridge.agent_get then
+      approval_agent = bridge.agent_get(entry.parent_agent_id)
+    end
+  end
+
   local ctx = {
     agent = agent,
     tool_call_id = tool_call_id,
     signal = opts.signal,
     is_sub_agent = opts.is_sub_agent,
     sub_agent_id = opts.sub_agent_id,
+    approval_agent = approval_agent,
     tool_service = M,
     approval_mode = _current_mode(),
     timer = opts.timer, -- 可暂停计时器（tool_loop 注入，用于展示活跃耗时并排除等待时间）

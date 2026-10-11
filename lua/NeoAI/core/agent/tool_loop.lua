@@ -196,7 +196,7 @@ function M._tool_definitions(agent)
   do
     -- 仅对「由注册表托管工具集」的主 Agent（chat_service 绑定，打 _tools_from_registry 标记）刷新；
     -- 合成/受限 Agent（单元测试、子 Agent）不刷新，避免越权或破坏隔离。
-    if agent and not agent.parent and agent._tools_from_registry then
+    if agent and not agent.parent and agent._tools_from_registry and not agent._sub_agent_session then
       local registry = require("NeoAI.tools.registry")
       if registry.count() > 0 then
         agent.tools = registry.list_as_map()

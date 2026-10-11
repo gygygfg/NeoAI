@@ -598,7 +598,19 @@ local function _settle_candidate(cand, attempt, ctx, cfg, spec, result, process_
       end
       local keep, dropped = {}, false
       for _, f in ipairs(cand.files) do
-        if ephemeral(f.path) then dropped = true else keep[#keep + 1] = f end
+        if ephemeral(f.path) then
+          dropped = true
+          -- 只读留痕：临时根写入不入待审/不发布，但登记以便审批悬浮窗「越界/异常」页展示
+          -- AI 在 /tmp 等写过哪些文件（不改变效果语义）。
+          pcall(function()
+            require("NeoAI.sandbox.observe.ephemeral").record({
+              path = f.path, tool = attempt.tool_name, command = attempt.command,
+              source = "ephemeral",
+            })
+          end)
+        else
+          keep[#keep + 1] = f
+        end
       end
       if dropped then
         cand.files = keep

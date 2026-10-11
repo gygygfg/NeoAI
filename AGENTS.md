@@ -17,8 +17,10 @@ NeoAI 是一个 Neovim AI 编程助手插件（Lua）。分层：
 ## 关键命令
 
 ```bash
-# 运行全部内置测试（并行，多 worker 隔离子进程，输出 SUMMARY passed/failed）
-# 可选环境变量 NEOAI_TEST_WORKERS 覆盖 worker 数（默认 min(nproc, 8)）
+# 运行全部内置测试（并行，双 lane 有界并发，输出 SUMMARY passed/failed）
+# 可选环境变量 NEOAI_TEST_WORKERS 覆盖 light 通道 worker 数（默认 min(nproc, 8)）
+#                 NEOAI_TEST_HEAVY_WORKERS 覆盖 heavy 通道并发上限（默认 2；=1 回退旧串行通道）
+#                 NEOAI_TEST_VERBOSE=1 还原逐用例明细打印（默认仅失败 + 套件摘要）
 nvim --headless --clean -u NONE --cmd "set rtp+=$PWD" \
   --cmd "lua require('NeoAI').setup({ log={level='ERROR'}, session={auto_save=false} })" \
   -c "lua local r=require('NeoAI.tests.parallel').run(); print('SUMMARY passed='..r.passed..' failed='..r.failed); vim.cmd(r.failed>0 and 'cquit 1' or 'qa!')"
@@ -30,11 +32,18 @@ nvim --headless --clean -u NONE --cmd "set rtp+=$PWD" \
 ```
 
 - 测试框架：`lua/NeoAI/tests/init.lua`，套件文件 `lua/NeoAI/tests/test_*.lua`，运行器自动加载。
-- 并行运行器：`lua/NeoAI/tests/parallel.lua`，按「文件（套件）」分片到多个隔离 headless
-  子进程；权重优先用实测耗时缓存 `.neoai_test_timings.json`（gitignored），无缓存按用例数。
-  文件级分片保证固定端口（各文件唯一）与文件内固定临时路径不跨 worker 冲突；子进程注入独立
-  `mcp.cache_path`。资源重/时序敏感套件（`sandbox*`、`pty`）自动走**串行通道**，避免并发下
-  bwrap/cgroup 争抢导致 137/SIGKILL 与 PTY 时序 flaky。
+- 并行运行器：`lua/NeoAI/tests/parallel.lua` 为**薄门面**（签名不变），职责拆到
+  `lua/NeoAI/tests/runner/{config,timings,shard,spawn,scheduler,report}.lua`。按「文件（套件）」
+  分派到隔离 headless 子进程，采用**双 lane 有界并发**：light（非资源重套件，LPT 分片成 W 个
+  进程）与 heavy（`sandbox*`/`pty`，一套件一进程，上限 H）**重叠执行**、任一子进程结束即回填，
+  约束 `#light≤W`、`#heavy≤H`、`W+H≤核数`。权重优先用实测耗时缓存 `.neoai_test_timings.json`
+  （gitignored），无缓存按用例数。文件级分片保证固定端口（各文件唯一）与文件内固定临时路径
+  不跨 worker 冲突；子进程注入独立 `mcp.cache_path`。
+- **主线程卸载（父进程 + worker 子进程）**：每个 worker 把结果写入 **sidecar**（小 JSON）并把
+  stdout/stderr 直接落盘为**日志文件**；父进程只读小 sidecar、不缓冲/扫描整段输出、不驻留分片
+  全量输出，失败时**懒读日志尾部**（路径 + 末尾 N 行）。worker **按分片只加载本分片测试模块**、
+  跳过 fresh worker 首套件的冗余全量重置、默认仅打印失败 + 套件摘要。heavy 并发之前必须先完成
+  结果处理卸载，否则父端输出回流会随 H 放大。
 - 过滤（隔离复现/跳过危险用例）：`NEOAI_TEST_ONLY=<p1,p2>`（仅跑含任一子串的用例）、
   `NEOAI_TEST_SKIP=<p1,p2>`（跳过）。`NEOAI_TEST_HEAVY=1` 开启重资源/环境敏感用例
   （真实 OOM、双实例并存等，见 `test_sandbox_boundary_consistency.lua`），默认跳过。`run_all` 每个套件前会恢复干净环境（配置默认 + 插件

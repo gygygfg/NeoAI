@@ -220,10 +220,10 @@ vim.api.nvim_create_autocmd("User", {
 
 | 常量 | 值 | 触发时机 | payload 关键字段 |
 | --- | --- | --- | --- |
-| `SUB_AGENT_CREATED` | `sub_agent:created` | 创建子 Agent | `{ sub_agent_id, task }` |
-| `SUB_AGENT_UPDATED` | `sub_agent:updated` | 子 Agent 更新 | `{ sub_agent_id, status }` |
-| `SUB_AGENT_COMPLETED` | `sub_agent:completed` | 子 Agent 完成 | `{ sub_agent_id }` |
-| `SUB_AGENT_ERROR` | `sub_agent:error` | 子 Agent 出错 | `{ sub_agent_id, error }` |
+| `SUB_AGENT_CREATED` | `sub_agent:created` | 创建子 Agent | `{ sub_agent_id, name, task, agent_id, session_id, parent_agent_id }` |
+| `SUB_AGENT_UPDATED` | `sub_agent:updated` | 子 Agent 更新（取消/续跑） | `{ sub_agent_id, status }` |
+| `SUB_AGENT_COMPLETED` | `sub_agent:completed` | 子 Agent 完成 | `{ sub_agent_id, name, status }` |
+| `SUB_AGENT_ERROR` | `sub_agent:error` | 子 Agent 出错 | `{ sub_agent_id, name, error }` |
 | `SUB_AGENT_RESULT_READY` | `sub_agent:result_ready` | 子 Agent 结果就绪 | `{ sub_agent_id }` |
 
 ### 配置 / 生命周期
@@ -283,6 +283,7 @@ vim.api.nvim_create_autocmd("User", {
 | `SANDBOX_GRANT_CREATED` | `sandbox:grant_created` | 创建任务授权 | `{ grant_id, scope, operations }` |
 | `SANDBOX_GRANT_REVOKED` | `sandbox:grant_revoked` | 撤销任务授权 | `{ grant_id }` |
 | `SANDBOX_OUTSIDE_ACCESS` | `sandbox:outside_access` | 越界访问留痕（访问 cwd 之外用户工作目录，非阻塞） | `{ trace_id, path, tool, kind, command? }` |
+| `SANDBOX_EPHEMERAL_WRITE` | `sandbox:ephemeral_write` | 临时写入留痕（写入会话私有临时根 /tmp、/var/tmp 等，仅记录，非阻塞；不入待审/不发布） | `{ trace_id, path, tool, command? }` |
 | `SANDBOX_SYSTEMD_ROUTED` | `sandbox:systemd_routed` | systemctl/journalctl 调用被门面路由到沙箱内长驻服务 | `{ verb, units, ok, command_id }` |
 | `SANDBOX_SYSTEMD_UNSUPPORTED` | `sandbox:systemd_unsupported` | 门面明确拒绝不支持的 systemd 语义（不落宿主机） | `{ verb, units, command_id }` |
 | `SANDBOX_CONTAINER_PLANNED` | `sandbox:container_planned` | 容器受控计划（命名空间共享 / 受控 socket） | `{ manager, mode, share_namespace, reason, command_id }` |

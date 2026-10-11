@@ -1,28 +1,60 @@
---- 子 Agent 计划与边界审核
+--- 子 Agent 工具
 --- @module 'NeoAI.tools.builtin.plan'
---- create_sub_agent / get_sub_agent_status / cancel_sub_agent。
---- 子 Agent 独立沙箱，零继承；边界审核由 tool_service 配合。
+--- 主 Agent 的调度类工具：create_sub_agent / get_sub_agent_status / cancel_sub_agent /
+--- send_sub_agent_message。全部委托 core.agent.sub_agent（经 kernel.core_bridge 访问）。
+--- 不提供等待工具：子 Agent 自然结束后由管理器把正文回传给主 Agent。
+--- 子 Agent 工具子集在此构建（用 registry），并排除调度类工具（避免无限递归）。
 
-local async = require("NeoAI.utils.async")
 local helpers = require("NeoAI.tools.builtin.tool_helpers")
-local event_bus = require("NeoAI.kernel.event_bus")
-local events = require("NeoAI.kernel.events")
-local stringx = require("NeoAI.utils.stringx")
 
 local M = {}
 
--- ========== 私有状态 ==========
+-- ========== 私有常量 ==========
 
-local state = {
-  sub_agents = {}, -- id -> { task, boundaries, status, started_at, tool_calls }
+-- 调度类工具：子 Agent 永不获得（避免无限递归派生 / 越权调度）
+local AGENT_TOOLS = {
+  create_sub_agent = true,
+  get_sub_agent_status = true,
+  cancel_sub_agent = true,
+  send_sub_agent_message = true,
+  wait_sub_agent = true,
 }
 
 -- ========== 私有函数 ==========
 
-local function _new_id()
-  local t = os.time()
-  local n = math.random(1, 2 ^ 31)
-  return string.format("sub_%x_%x", t, n)
+--- 取子 Agent 管理器（未启动时为 nil）
+--- @return table|nil
+local function _manager()
+  local bridge = require("NeoAI.kernel.core_bridge")
+  return bridge.sub_agent and bridge.sub_agent()
+end
+
+--- 构建子 Agent 可见工具子集：默认**主 Agent 的全部工具**，仅排除「Agent 类」工具
+--- （category == "agent"，含调度类 create/get/cancel/send、enter_plan_mode、ask_user、todo_*）。
+--- 显式给 boundaries.allowed_tools 时以其为准（同样排除 Agent 类工具）。
+--- @param allowed_tools table|nil
+--- @return table name -> def
+local function _build_tools(allowed_tools)
+  local registry = require("NeoAI.tools.registry")
+  local manager = _manager()
+  local dispatch = (manager and manager.agent_tool_names and manager.agent_tool_names()) or AGENT_TOOLS
+  local function _excluded(name, tool)
+    if dispatch[name] then return true end
+    return tool ~= nil and tool.category == "agent"
+  end
+  local out = {}
+  if allowed_tools and #allowed_tools > 0 then
+    for _, name in ipairs(allowed_tools) do
+      local tool = registry.get(name)
+      if tool and not _excluded(name, tool) then out[name] = tool end
+    end
+  else
+    out = registry.list_as_map()
+    for name, tool in pairs(out) do
+      if _excluded(name, tool) then out[name] = nil end
+    end
+  end
+  return out
 end
 
 -- ========== 工具定义 ==========
@@ -31,13 +63,16 @@ local plan_tools = {}
 
 plan_tools.create_sub_agent = helpers.define_tool(
   "create_sub_agent",
-  "创建子 Agent 执行独立子任务。task 必填；mode='background'（默认，立即返回）|'foreground'（等待完成）；boundaries 可选约束（allowed_tools/allowed_directories/max_tool_calls）。",
+  "创建子 Agent 执行独立子任务（后台运行，立即返回）。"
+    .. "创建后**无需等待或轮询**：子 Agent 循环结束后会把最终正文自动作为一条新消息回传给你，"
+    .. "请直接结束本轮或继续其它工作，切勿反复调用 get_sub_agent_status 查询进度。"
+    .. "参数：task 必填；name 可选（简短显示名）；model 可选；boundaries 可选（allowed_tools/allowed_directories/max_tool_calls 等约束）。",
   {
     type = "object",
     properties = {
       task = { type = "string", description = "子任务描述" },
+      name = { type = "string", description = "子 Agent 简短显示名（可选）" },
       model = { type = "string", description = "指定模型（可选）" },
-      mode = { type = "string", enum = { "background", "foreground" }, description = "执行模式（默认 background）" },
       boundaries = {
         type = "object",
         description = "边界约束",
@@ -56,274 +91,113 @@ plan_tools.create_sub_agent = helpers.define_tool(
   },
   function(args, on_success, on_error, ctx)
     local parent_agent = ctx and ctx.agent
-    local bridge = require("NeoAI.kernel.core_bridge")
-
-    local sub_id = _new_id()
-    local sub_agent = assert(bridge.agent_spawn(parent_agent, {
-      task = args.task,
-      model = args.model,
-      scenario = "agent",
-    }))
-
-    local boundaries = args.boundaries or {}
-    state.sub_agents[sub_id] = {
-      id = sub_id,
-      agent_id = sub_agent.id,
-      task = args.task,
-      boundaries = boundaries,
-      status = "running",
-      started_at = os.time(),
-      tool_calls = 0,
-      context = args.context or {},
-    }
-
-    event_bus.emit(events.SUB_AGENT_CREATED, { sub_agent_id = sub_id, task = args.task })
-
-    -- 启动子 Agent 执行
-    local tools_subset = M._allowed_tools(boundaries.allowed_tools)
-    sub_agent.tools = tools_subset
-
-    local function _finish(result)
-      local entry = state.sub_agents[sub_id]
-      if entry then
-        entry.status = "completed"
-        entry.result = result
-        entry.result_text = (result and result.content) or ""
-        event_bus.emit(events.SUB_AGENT_COMPLETED, { sub_agent_id = sub_id })
-        event_bus.emit(events.SUB_AGENT_RESULT_READY, { sub_agent_id = sub_id })
-      end
-    end
-    local function _fail(err)
-      local entry = state.sub_agents[sub_id]
-      if entry then
-        entry.status = "error"
-        entry.error = err
-        entry.result_text = tostring(err and err.message or err)
-        event_bus.emit(events.SUB_AGENT_ERROR, { sub_agent_id = sub_id, error = err })
-        event_bus.emit(events.SUB_AGENT_RESULT_READY, { sub_agent_id = sub_id })
-      end
-    end
-    bridge.agent_run(sub_agent, args.task):then_(_finish, _fail)
-
-    if args.mode == "foreground" then
-      -- 前台模式：等待子 Agent 完成后返回完整结果
-      M.wait(sub_id):then_(function(entry)
-        on_success(("【子 agent 执行完成】\n子 agent ID: %s\n状态: %s\n\n%s"):format(sub_id, entry.status, entry.result_text or ""))
-      end, function(err)
-        on_error("子 Agent 执行失败: " .. tostring(err and err.message or err))
-      end)
+    local manager = _manager()
+    if not manager then
+      on_error("子 Agent 运行时不可用")
       return
     end
-
-    on_success(("子 Agent 已创建: %s\n任务: %s"):format(sub_id, args.task))
+    local boundaries = args.boundaries or {}
+    local entry, err = manager.create(parent_agent, {
+      task = args.task,
+      name = args.name,
+      model = args.model,
+      boundaries = boundaries,
+      tools = _build_tools(boundaries.allowed_tools),
+      context = args.context,
+    })
+    if not entry then
+      on_error("创建子 Agent 失败: " .. tostring(err))
+      return
+    end
+    on_success(("子 Agent 已创建: %s（%s）\n任务: %s\n请勿轮询等待：完成后其最终正文会自动作为一条新消息回传给你。"):format(
+      entry.id, entry.name or "", args.task))
   end,
   { category = "agent", approval = { auto_allow = false }, timeout = -1 }
 )
 
 plan_tools.get_sub_agent_status = helpers.define_tool(
   "get_sub_agent_status",
-  "查询子 Agent 状态。sub_agent_id 必填。返回状态、任务与执行结果。",
+  "查询子 Agent 状态与结果。**正常流程无需调用**：子 Agent 完成后其最终正文会自动回传给你。"
+    .. "仅在需要确认某个子 Agent 是否仍在运行（例如长时间无回传、怀疑卡住）时使用。sub_agent_id 必填。",
   {
     type = "object",
     properties = { sub_agent_id = { type = "string" } },
     required = { "sub_agent_id" },
   },
   function(args, on_success)
-    local entry = state.sub_agents[args.sub_agent_id]
+    local manager = _manager()
+    local entry = manager and manager.get(args.sub_agent_id)
     if not entry then
       on_success("子 Agent 不存在: " .. tostring(args.sub_agent_id))
       return
     end
     local lines = {
+      ("名称: %s"):format(entry.name or ""),
       ("状态: %s"):format(entry.status),
       ("任务: %s"):format(entry.task),
       ("工具调用: %d"):format(entry.tool_calls or 0),
     }
     if entry.result_text and entry.result_text ~= "" then
-      lines[#lines + 1] = ("结果:\n%s"):format(stringx.truncate(entry.result_text, 2000))
+      lines[#lines + 1] = ("结果:\n%s"):format(entry.result_text)
     end
     on_success(table.concat(lines, "\n"))
   end,
   { category = "agent" }
 )
 
-plan_tools.wait_sub_agent = helpers.define_tool(
-  "wait_sub_agent",
-  "等待子 Agent 完成并返回完整结果。sub_agent_id 必填。若已完成则立即返回，否则阻塞直到完成/失败。",
-  {
-    type = "object",
-    properties = { sub_agent_id = { type = "string" } },
-    required = { "sub_agent_id" },
-  },
-  function(args, on_success, on_error)
-    M.wait(args.sub_agent_id):then_(function(entry)
-      on_success(("【子 agent 执行完成】\n子 agent ID: %s\n状态: %s\n\n%s"):format(
-        entry.id, entry.status, entry.result_text or ""))
-    end, function(err)
-      on_error(tostring(err and err.message or err))
-    end)
-  end,
-  { category = "agent", timeout = -1 }
-)
-
 plan_tools.cancel_sub_agent = helpers.define_tool(
   "cancel_sub_agent",
-  "取消子 Agent。sub_agent_id 必填。",
+  "终止（取消）一个正在运行的子 Agent。sub_agent_id 必填。",
   {
     type = "object",
     properties = { sub_agent_id = { type = "string" } },
     required = { "sub_agent_id" },
   },
   function(args, on_success, on_error)
-    local entry = state.sub_agents[args.sub_agent_id]
-    if not entry then
-      on_error("子 Agent 不存在: " .. tostring(args.sub_agent_id))
+    local manager = _manager()
+    if not manager then
+      on_error("子 Agent 运行时不可用")
       return
     end
-    local bridge = require("NeoAI.kernel.core_bridge")
-    local sub = bridge.agent_get(entry.agent_id)
-    if sub then
-      bridge.agent_abort(sub, "user_cancelled")
+    local ok, err = manager.cancel(args.sub_agent_id)
+    if not ok then
+      on_error(tostring(err))
+      return
     end
-    entry.status = "cancelled"
-    event_bus.emit(events.SUB_AGENT_UPDATED, { sub_agent_id = args.sub_agent_id, status = "cancelled" })
-    on_success("已取消子 Agent: " .. args.sub_agent_id)
+    on_success("已终止子 Agent: " .. args.sub_agent_id)
   end,
   { category = "agent" }
 )
 
--- ========== 内部接口（供 tool_service 调用） ==========
-
---- 根据 allowed_tools 构建工具子集
---- @param allowed_tools table|nil
---- @return table name -> tool
-function M._allowed_tools(allowed_tools)
-  local registry = require("NeoAI.tools.registry")
-  local out = {}
-  if allowed_tools and #allowed_tools > 0 then
-    for _, name in ipairs(allowed_tools) do
-      local tool = registry.get(name)
-      if tool then out[name] = tool end
+plan_tools.send_sub_agent_message = helpers.define_tool(
+  "send_sub_agent_message",
+  "向子 Agent 发送一条消息（补充指令/追问）。运行中会在其下一轮注入；已完成会据此续跑一轮。"
+    .. "sub_agent_id 与 message 必填。",
+  {
+    type = "object",
+    properties = {
+      sub_agent_id = { type = "string" },
+      message = { type = "string" },
+    },
+    required = { "sub_agent_id", "message" },
+  },
+  function(args, on_success, on_error)
+    local manager = _manager()
+    if not manager then
+      on_error("子 Agent 运行时不可用")
+      return
     end
-  else
-    -- 默认子 Agent 只给只读工具
-    local default_allow = { "read_file", "list_files", "search_files", "file_exists", "log_message", "get_log_levels", "git_status", "git_diff", "git_log", "lsp_diagnostics", "parse_file", "get_node_code" }
-    for _, name in ipairs(default_allow) do
-      local tool = registry.get(name)
-      if tool then out[name] = tool end
+    local ok, err = manager.send(args.sub_agent_id, args.message)
+    if not ok then
+      on_error(tostring(err))
+      return
     end
-  end
-  return out
-end
+    on_success("已向子 Agent " .. args.sub_agent_id .. " 发送消息。")
+  end,
+  { category = "agent" }
+)
 
---- 记录子 Agent 工具调用数（供 tool_service）
---- @param sub_agent_id string
-function M.track_tool_call(sub_agent_id)
-  local entry = state.sub_agents[sub_agent_id]
-  if entry then
-    entry.tool_calls = (entry.tool_calls or 0) + 1
-  end
-end
-
---- 子 Agent 是否达到工具调用上限
---- @param sub_agent_id string
---- @return boolean
-function M.maxed_tool_calls(sub_agent_id)
-  local entry = state.sub_agents[sub_agent_id]
-  if not entry then return false end
-  local max = entry.boundaries and entry.boundaries.max_tool_calls
-  if not max then return false end
-  return (entry.tool_calls or 0) >= max
-end
-
---- 边界审核：工具是否被允许
---- @param sub_agent_id string
---- @param tool_name string
---- @return boolean, string|nil
-function M.review_tool_call(sub_agent_id, tool_name)
-  local entry = state.sub_agents[sub_agent_id]
-  if not entry then return true end
-  local boundaries = entry.boundaries or {}
-  local allowed = boundaries.allowed_tools
-  if allowed and #allowed > 0 then
-    local hit = false
-    for _, t in ipairs(allowed) do
-      if t == tool_name then hit = true break end
-    end
-    if not hit then
-      return false, "[调度 agent 驳回] 工具 '" .. tool_name .. "' 的调用被拒绝。原因: 工具不在允许列表内"
-    end
-  end
-  if M.maxed_tool_calls(sub_agent_id) then
-    return false, "[调度 agent 驳回] 已达到最大工具调用次数"
-  end
-  return true
-end
-
---- 获取子 Agent 摘要（供主 Agent 回传）
---- @param sub_agent_id string
---- @return string
-function M.get_summary(sub_agent_id)
-  local entry = state.sub_agents[sub_agent_id]
-  if not entry then return "子 Agent 不存在" end
-  return string.format("【子 agent 执行完成】\n子 agent ID: %s\n状态: %s\n任务: %s", sub_agent_id, entry.status, entry.task)
-end
-
---- 清理子 Agent 状态
---- @param sub_agent_id string
-function M.cleanup_sub_agent(sub_agent_id)
-  state.sub_agents[sub_agent_id] = nil
-end
-
---- 等待子 Agent 完成（前台阻塞）
---- @param sub_agent_id string
---- @return Deferred resolve(entry), reject(不存在/取消)
-function M.wait(sub_agent_id)
-  local d = async.Deferred.new()
-  local entry = state.sub_agents[sub_agent_id]
-  if not entry then
-    d:reject({ message = "子 Agent 不存在: " .. tostring(sub_agent_id) })
-    return d
-  end
-  local status = entry.status
-  if status == "completed" or status == "error" or status == "cancelled" then
-    vim.schedule(function() d:resolve(entry) end)
-    return d
-  end
-
-  local unsubs = {}
-  local function _settle()
-    for _, u in ipairs(unsubs) do
-      if u then pcall(u) end
-    end
-    unsubs = {}
-    d:resolve(state.sub_agents[sub_agent_id] or entry)
-  end
-
-  unsubs[#unsubs + 1] = event_bus.on(events.SUB_AGENT_COMPLETED, function(data)
-    if data and data.sub_agent_id == sub_agent_id then _settle() end
-  end)
-  unsubs[#unsubs + 1] = event_bus.on(events.SUB_AGENT_ERROR, function(data)
-    if data and data.sub_agent_id == sub_agent_id then _settle() end
-  end)
-  unsubs[#unsubs + 1] = event_bus.on(events.SUB_AGENT_UPDATED, function(data)
-    if data and data.sub_agent_id == sub_agent_id and data.status == "cancelled" then _settle() end
-  end)
-  return d
-end
-
---- 测试辅助：直接构造子 Agent 条目
---- @param sub_agent_id string
---- @param allowed_tools table
-function M._allow_tools_for_test(sub_agent_id, allowed_tools)
-  state.sub_agents[sub_agent_id] = {
-    id = sub_agent_id,
-    task = "test",
-    boundaries = { allowed_tools = allowed_tools, max_tool_calls = 10 },
-    status = "running",
-    tool_calls = 0,
-  }
-end
+-- ========== 内部接口（供 tool_service / 测试） ==========
 
 --- 获取工具列表
 --- @return table 数组
@@ -335,9 +209,17 @@ function M.get_tools()
   return out
 end
 
---- 重置（测试用）
+--- 根据 allowed_tools 构建工具子集（供测试/兼容）
+--- @param allowed_tools table|nil
+--- @return table name -> tool
+function M._allowed_tools(allowed_tools)
+  return _build_tools(allowed_tools)
+end
+
+--- 重置（测试用）：转调子 Agent 管理器
 function M.reset()
-  state.sub_agents = {}
+  local manager = _manager()
+  if manager and manager.reset then manager.reset() end
 end
 
 return M

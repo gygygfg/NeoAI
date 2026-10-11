@@ -46,6 +46,7 @@ local STATUS_EMOJI = {
   running = "⏳",
   success = "✅",
   failure = "❌",
+  cancelled = "⏹",
 }
 
 -- ========== 工具执行计时 ==========
@@ -84,6 +85,38 @@ end
 --- @return boolean
 function M.is_reasoning_start(buf, line)
   local set = reasoning_lines[buf]
+  return (set ~= nil) and (set[line] == true)
+end
+
+-- ========== 正文行标记 ==========
+-- 由渲染层（message_list）登记「正文内容行」。正文中的代码块 / 嵌套列表带行首缩进，
+-- 但它们是排版而非折叠块，故 foldexpr 对已登记的正文明文返回 0（不折叠），
+-- 从而无需把缩进改写为非断空格等占位字符即可保留可视缩进。
+-- 以 buffer 为单位保存（弱键），随每次渲染全量重建。
+
+local body_lines = setmetatable({}, { __mode = "k" })
+
+--- 登记某 buffer 的正文行集合
+--- @param buf number
+--- @param set table<number, boolean>
+function M.set_body_lines(buf, set)
+  if buf and vim.api.nvim_buf_is_valid(buf) then
+    body_lines[buf] = set or {}
+  end
+end
+
+--- 清除某 buffer 的正文行标记
+--- @param buf number
+function M.clear_body_lines(buf)
+  body_lines[buf] = nil
+end
+
+--- 某行是否为已登记的正文行
+--- @param buf number
+--- @param line number
+--- @return boolean
+function M.is_body_line(buf, line)
+  local set = body_lines[buf]
   return (set ~= nil) and (set[line] == true)
 end
 
@@ -220,6 +253,7 @@ local function _tool_status(first)
   if first:find("⏳", 1, true) then return "running" end
   if first:find("✅", 1, true) then return "success" end
   if first:find("❌", 1, true) then return "failure" end
+  if first:find("⏹", 1, true) then return "cancelled" end
   return nil
 end
 
@@ -251,6 +285,11 @@ function M.detect(first)
     local desc = body:match("工具:%s*[^%s%(%·]+%s*·%s*(.-)%s*$")
     return "tool_result", status or "success", tool_name, desc
   end
+  -- 子 Agent 结果块：首行 "✅ 子 Agent: <名字>"
+  local sa_name = body:match("子 Agent[:：]%s*(.+)$")
+  if sa_name then
+    return "sub_agent", status or "success", vim.trim(sa_name), nil
+  end
   return "reasoning", nil, nil, nil
 end
 
@@ -271,6 +310,14 @@ end
 --- @return string
 function M.label(first, count, is_reasoning)
   local kind, status, name, desc = M.detect(first)
+  if kind == "sub_agent" then
+    local status_emoji = STATUS_EMOJI[status] or "🤖"
+    local time_str = _extract_time(first)
+    if time_str then
+      return string.format("  🤖 子 Agent %s %s %s", name or "", status_emoji, time_str)
+    end
+    return string.format("  🤖 子 Agent %s %s", name or "", status_emoji)
+  end
   if kind == "tool_call" or kind == "tool_result" then
     local status_emoji = STATUS_EMOJI[status] or "⏳"
     local desc_str = desc and (desc ~= "") and (" · " .. desc) or ""
@@ -317,7 +364,7 @@ function M.foldtext()
   local count = vim.v.foldend - start + 1
   local first = vim.fn.getline(start) or ""
   local kind = M.detect(first)
-  if kind == "tool_call" or kind == "tool_result" then
+  if kind == "tool_call" or kind == "tool_result" or kind == "sub_agent" then
     return M.label(first, count, true)
   end
   local buf = vim.api.nvim_get_current_buf()
@@ -332,10 +379,11 @@ end
 --- @return boolean
 local function _is_tool_block_start(text)
   local t = text:gsub("^%s+", "")
-  for _, e in ipairs({ "⏳", "✅", "❌", "⚡" }) do
+  for _, e in ipairs({ "⏳", "✅", "❌", "⏹", "⚡" }) do
     if t:sub(1, #e) == e then
       local rest = t:sub(#e + 1):gsub("^%s+", "")
       return rest:find("调用工具:", 1, true) == 1 or rest:find("工具:", 1, true) == 1
+        or rest:find("子 Agent:", 1, true) == 1
     end
   end
   return false
@@ -355,8 +403,14 @@ function M.foldexpr()
   end
   local ln = vim.v.lnum
   local text = vim.fn.getline(ln)
+  local buf = vim.api.nvim_get_current_buf()
   local prev = vim.fn.getline(ln - 1)
   local next = vim.fn.getline(ln + 1)
+
+  -- 已登记的正文行（含带缩进的代码块 / 嵌套列表）不折叠：其行首缩进是排版而非折叠块。
+  if M.is_body_line(buf, ln) then
+    return "0"
+  end
 
   -- 缩进内容行：属于某个折叠块
   if text:match("^  ") then
@@ -366,7 +420,6 @@ function M.foldexpr()
     -- 推理块起始行同样强制开启新折叠：否则当 AI 不输出正文时，上一工具块的结果行与
     -- 下一条 assistant 的推理行同处缩进层级、无正文/分隔行，会被并入同一个折叠，
     -- 表现为「思考过程被收进工具调用折叠里面」。
-    local buf = vim.api.nvim_get_current_buf()
     if M.is_reasoning_start(buf, ln) then
       return ">1"
     end
@@ -375,6 +428,10 @@ function M.foldexpr()
 
   -- 空白行：紧邻缩进内容（上一行或下一行缩进）时并入折叠，否则为普通空行
   if text:match("^%s*$") then
+    -- 邻接正文行（如代码块后的空行）不算折叠内空行
+    if M.is_body_line(buf, ln - 1) or M.is_body_line(buf, ln + 1) then
+      return "0"
+    end
     if prev:match("^  ") or next:match("^  ") then
       return "1"
     end

@@ -195,6 +195,7 @@ local WATCH_EVENTS = {
   events.SANDBOX_APPLIED, events.SANDBOX_COMMITTED,
   events.SANDBOX_DISCARDED, events.SANDBOX_REVERTED,
   events.SANDBOX_OUTSIDE_ACCESS,
+  events.SANDBOX_EPHEMERAL_WRITE,
   events.SANDBOX_HOST_OP_ENQUEUED, events.SANDBOX_HOST_OP_APPLIED,
   events.SANDBOX_HOST_OP_REJECTED,
   events.SANDBOX_APPROVAL_CHANGED,
@@ -979,8 +980,10 @@ local function _apply_target(target, ok_msg, fail_msg)
     if res and res.ok then
       vim.notify(ok_msg(res), vim.log.levels.INFO)
     elseif res and res.state == "PARTIAL" then
-      vim.notify(("[NeoAI] 部分应用：成功 %d 个文件，%d 个失败已回队待审（%s）")
-        :format(#(res.applied or {}), #(res.failed or {}), tostring(res.reason or "")),
+      local first = res.failed and res.failed[1]
+      local detail = (first and first.reason) and ("｜首因：" .. tostring(first.reason)) or ""
+      vim.notify(("[NeoAI] 部分应用：成功 %d 个文件，%d 个失败已回队待审（%s%s）")
+        :format(#(res.applied or {}), #(res.failed or {}), tostring(res.reason or ""), detail),
         vim.log.levels.WARN)
     elseif res and res.state == "CANCELLED" then
       vim.notify("[NeoAI] 已取消（需要 root 权限）", vim.log.levels.WARN)
@@ -2209,7 +2212,7 @@ end
 --- @return table ctx
 local function _gather_ctx()
   local sandbox = services.use("services.sandbox")
-  if not sandbox then return { items = {}, hostops = {}, traces = {}, saved = {}, rejected = {}, anomalies = {} } end
+  if not sandbox then return { items = {}, hostops = {}, traces = {}, ephemeral = {}, saved = {}, rejected = {}, anomalies = {} } end
   local pending = sandbox.list_reviews({ review_state = "PENDING" })
   local items, hostops = {}, {}
   for _, it in ipairs(pending) do
@@ -2231,6 +2234,8 @@ local function _gather_ctx()
     return fallback
   end
   local traces = _safe(function() return sandbox.list_traces and sandbox.list_traces() end, {}) or {}
+  -- 临时写入留痕（会话私有临时根 /tmp、/var/tmp 等；只读展示，不产生待审/发布）。
+  local ephemeral = _safe(function() return sandbox.list_ephemeral and sandbox.list_ephemeral() end, {}) or {}
   local saved = _safe(function() return sandbox.list_saved and sandbox.list_saved() end, {}) or {}
   -- 可恢复的已拒绝项（显式拒绝时另存了 /tmp 副本）：供「已拒绝」区展示、u 恢复。
   local rejected = _safe(function() return sandbox.list_rejected and sandbox.list_rejected() end, {}) or {}
@@ -2238,7 +2243,8 @@ local function _gather_ctx()
   local anomalies = _safe(function()
     return sandbox.audit_list({ min_level = 2, limit = 200 })
   end, {}) or {}
-  return { items = items, hostops = hostops, traces = traces, saved = saved, rejected = rejected, anomalies = anomalies }
+  return { items = items, hostops = hostops, traces = traces, ephemeral = ephemeral,
+    saved = saved, rejected = rejected, anomalies = anomalies }
 end
 
 --- 各页展示计数
@@ -2253,6 +2259,7 @@ local function _page_count(page, ctx)
   if page == "anomaly" then
     local n = 0
     for _ in ipairs(ctx.traces or {}) do n = n + 1 end
+    for _ in ipairs(ctx.ephemeral or {}) do n = n + 1 end
     return n + #(ctx.anomalies or {})
   end
   return 0
@@ -2392,6 +2399,30 @@ local function _build_anomaly_page(ctx)
     lines[#lines + 1] = text
     marks[#marks + 1] = { line = ln, start_col = 0, end_col = #text, level = "pending" }
     line_to_cmd[ln] = { command = g.command }
+  end
+  lines[#lines + 1] = ""
+  -- === 临时写入留痕（会话私有临时根 /tmp、/var/tmp 等，只读）===
+  -- 这些写入为会话私有、nvim 退出即丢弃：不入待审、不发布，仅在此展示 AI 写过哪些临时文件。
+  lines[#lines + 1] = "── 临时写入留痕（会话私有临时根，退出即丢弃，仅记录）──"
+  local eph = _group_traces(ctx.ephemeral or {})
+  if #eph == 0 then
+    lines[#lines + 1] = "（无）"
+  end
+  for _, tr in ipairs(eph) do
+    local path = _one_line(tr.path or "")
+    local tool = _one_line(table.concat(tr.tools or { tr.tool or "?" }, ", "))
+    if tool == "" then tool = "?" end
+    local cmds = tr.commands or {}
+    local suffix = ""
+    if #cmds == 1 then
+      suffix = "  ⟵ " .. _one_line(cmds[1])
+    elseif #cmds > 1 then
+      suffix = string.format("  ⟵ %d 条命令", #cmds)
+    end
+    local text = string.format("  [%s] %s%s", tool, path, suffix)
+    local ln = #lines + 1
+    lines[#lines + 1] = text
+    marks[#marks + 1] = { line = ln, start_col = 0, end_col = #text, level = "pending" }
   end
   lines[#lines + 1] = ""
   lines[#lines + 1] = "── 行为审计异常（L2+，仅记录）──"

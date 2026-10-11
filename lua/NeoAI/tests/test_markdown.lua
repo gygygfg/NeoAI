@@ -115,6 +115,29 @@ tests.suite("markdown", function(_, it)
     t.eq("normal", rendered[11].style, "普通段落应正常渲染")
   end)
 
+  it("嵌套列表保留缩进并用空心圆点区分层级", function(t)
+    local mv = require("NeoAI.ui.components.markdown_view")
+    local rendered = mv.render([[
+- 顶层
+  - 嵌套
+    - 更深
+1. 有序
+]])
+    t.eq("• 顶层", rendered[1].text, "一级列表用实心圆点")
+    t.eq("  ◦ 嵌套", rendered[2].text, "二级列表保留缩进并用空心圆点")
+    t.eq("    ◦ 更深", rendered[3].text, "三级列表累计缩进")
+    t.eq("1. 有序", rendered[4].text, "有序列表保持序号")
+    for i = 1, 4 do t.eq("list", rendered[i].style, "列表行应标记为 list") end
+  end)
+
+  it("空行被保留为 normal 样式（供正文恢复段落结构）", function(t)
+    local mv = require("NeoAI.ui.components.markdown_view")
+    local rendered = mv.render("第一段\n\n第二段")
+    t.eq(3, #rendered, "段落之间的空行不应被丢弃")
+    t.eq("", rendered[2].text, "空行文本为空")
+    t.eq("normal", rendered[2].style, "空行样式为 normal")
+  end)
+
   it("to_plain 输出带上下边框的对齐表格文本", function(t)
     local mv = require("NeoAI.ui.components.markdown_view")
     local plain = mv.to_plain("| A | B |\n|---|----|\n| 1 | 22 |")

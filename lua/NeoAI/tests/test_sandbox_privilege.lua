@@ -129,6 +129,14 @@ tests.suite("sandbox_privilege", function(_, it)
     t.true_(runtime.is_self_runtime_path(cache .. "/sandbox/instances/1_2/upper/x"), "沙箱 store 后代应命中")
     t.false_(runtime.is_self_runtime_path(cache .. "_other/x"), "前缀边界不应命中")
     t.false_(runtime.is_self_runtime_path("/tmp/neoai_project_file.lua"), "工作区普通文件不应命中")
+    -- 工作区内插件自生成产物（测试运行器耗时缓存）：按 basename 命中，避免被冻结为候选后
+    -- 与应用/测试重写基线冲突（MERGE_CONFLICT）。
+    t.true_(runtime.is_self_runtime_path("/root/NeoAI/.neoai_test_timings.json"),
+      "测试运行器耗时缓存应命中")
+    t.true_(runtime.is_self_runtime_path(vim.fn.getcwd() .. "/.neoai_test_timings.json"),
+      "工作区根的耗时缓存应命中")
+    t.false_(runtime.is_self_runtime_path("/root/NeoAI/.neoai_test_timings.json.bak"),
+      "同名前缀的普通文件不应命中")
     -- 可配置的 log.path 也纳入识别
     local dir = vim.fn.tempname()
     fs.ensure_dir(dir)

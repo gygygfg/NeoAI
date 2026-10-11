@@ -225,4 +225,30 @@ function M.is_root(session)
   return session.parent_id == nil or session.parent_id == session.id
 end
 
+-- ========== 子 Agent 会话 ==========
+
+--- 子 Agent 会话标记（写入 metadata.tags）
+M.SUB_AGENT_TAG = "sub_agent"
+
+--- 是否为子 Agent 会话（由子 Agent 管理器创建，metadata.tags 含 sub_agent）
+--- @param session table
+--- @return boolean
+function M.is_sub_agent(session)
+  local tags = session and session.metadata and session.metadata.tags
+  if type(tags) ~= "table" then return false end
+  for _, t in ipairs(tags) do
+    if t == M.SUB_AGENT_TAG then return true end
+  end
+  return false
+end
+
+--- 子 Agent 显示名（无则 nil）
+--- @param session table
+--- @return string|nil
+function M.sub_agent_name(session)
+  local md = session and session.metadata
+  if not md then return nil end
+  return md.name
+end
+
 return M

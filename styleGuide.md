@@ -275,14 +275,15 @@ agent 生命周期 = 窗口生命周期
 agent_runtime.spawn(parent_agent, override)
   │
   ├── 创建全新 Agent 实例（空消息队列、独立信号）
-  ├── parent 仅传入：task + 受限工具集（默认只读工具）
+  ├── parent 仅传入：task + 受限工具集（默认只读工具；排除调度类工具）
   ├── 子 Agent 不继承 parent 的任何消息历史
-  ├── 子 Agent 完成后，仅将最终结果回传 parent
+  ├── 子 Agent 拥有独立持久化子会话
+  ├── 子 Agent 循环自然结束后，最终正文自动回传 parent（空闲则唤醒；忙碌则入队）
   └── 子 Agent dispose → 所有资源彻底释放
 ```
 
-- 子 Agent 边界审核：`tool_service` 结合 `plan.lua` 校验工具是否在 `allowed_tools` 内、是否达到 `max_tool_calls` 上限。
-- 执行模式：`background`（默认，立即返回）或 `foreground`（等待完成）。
+- 子 Agent 边界审核：`tool_service` 结合 `sub_agent.lua` 校验工具是否在 `allowed_tools` 内、是否达到 `max_tool_calls` 上限、是否属于调度类工具。
+- 无等待工具：结果自动回传，主 Agent 无需轮询。
 
 ### 决策 2：模型列表异步获取
 
@@ -1133,7 +1134,7 @@ async.all({ deferred1, deferred2 })
 | `lsp_ops.lua`  | `lsp_hover` / `lsp_definition` / `lsp_references` / `lsp_document_symbols` / `lsp_workspace_symbols` / `lsp_diagnostics` / `lsp_client_info` / `lsp_code_action` / `lsp_rename` / `lsp_format` / `lsp_signature_help` / `lsp_completion` / `lsp_type_definition` / `lsp_declaration` / `lsp_implementation` / `lsp_service_info` |
 | `tree_ops.lua` | `parse_file` / `get_node_at_position` / `get_node_type` / `get_node_range` / `is_named_node` / `get_parent_node` / `get_child_nodes` / `get_node_code` / `query_tree` / `delete_node` |
 | `log_ops.lua`  | `log_message` / `get_log_levels` |
-| `plan.lua`     | `create_sub_agent` / `get_sub_agent_status` / `wait_sub_agent` / `cancel_sub_agent` |
+| `plan.lua`     | `create_sub_agent` / `get_sub_agent_status` / `cancel_sub_agent` / `send_sub_agent_message` |
 | `plan_mode.lua`| `enter_plan_mode`（工具上下文切换为只读/信息 + 提问） |
 | `ask_user.lua` | `ask_user` |
 | `todo.lua`     | `todo_write` / `todo_read` / `todo_clear` |

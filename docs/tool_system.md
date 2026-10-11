@@ -139,7 +139,7 @@ resolve_name（别名/模糊匹配）
 
 ```
 M.execute(agent, name, args, tool_call_id, opts)
-  ├─ 子 Agent 边界审核 _review_sub_agent（plan.review_tool_call）
+  ├─ 子 Agent 边界审核 _review_sub_agent（sub_agent.review_tool_call）
   ├─ 计划模式门禁 plan_mode.check_tool（修改类工具在计划模式下驳回）
   ├─ 构造 ctx（含可暂停 timer）
   └─ executor.execute(...)
@@ -205,7 +205,7 @@ M.execute(agent, name, args, tool_call_id, opts)
 
 命令 stdout/stderr 合计超过 `tools.run_command.max_output_bytes`（默认 16 MiB）时截断并终止命令，
 避免超大输出（数百 MB）逐行处理冻结主线程；已产生内容仍回传并标注「已截断」。
-命令以退出码 137（SIGKILL）结束时读取资源域事件区分「疑似 OOM」与「被强制终止」。
+命令以退出码 137（SIGKILL）结束时读取资源域事件区分「疑似 OOM」「PID/线程数超限（pids.events max）」与「被强制终止」。
 
 ### ✂️ 工具输出「AI 上下文限流」（output_guard.lua）
 
@@ -303,7 +303,7 @@ M.execute(agent, name, args, tool_call_id, opts)
 
 ### 🤖 子 Agent（plan.lua）
 
-`create_sub_agent` / `wait_sub_agent` / `get_sub_agent_status` / `cancel_sub_agent`。详见
+`create_sub_agent` / `get_sub_agent_status` / `cancel_sub_agent` / `send_sub_agent_message`（无等待工具，结果自动回传）。详见
 [sub_agent_system.md](sub_agent_system.md)。
 
 ### 📋 待办（todo.lua）

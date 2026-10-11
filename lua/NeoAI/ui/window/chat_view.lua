@@ -1018,6 +1018,34 @@ local function _build_chat_actions()
         vim.notify("[NeoAI] 显示模式已切换: " .. (plugin.label or plugin.name), vim.log.levels.INFO)
       end
     end,
+    switch_sub_agent = function()
+      local ok, manager = pcall(require, "NeoAI.core.agent.sub_agent")
+      local agent = chat_service.get_current_agent()
+      if not ok or not manager then
+        vim.notify("[NeoAI] 子 Agent 运行时不可用", vim.log.levels.WARN)
+        return
+      end
+      if not agent then
+        vim.notify("[NeoAI] 无当前会话", vim.log.levels.WARN)
+        return
+      end
+      local list = manager.list_for(agent.id)
+      if #list == 0 then
+        vim.notify("[NeoAI] 当前没有子 Agent", vim.log.levels.INFO)
+        return
+      end
+      state._sub_agent_cycle = ((state._sub_agent_cycle or 0) % #list) + 1
+      local entry = list[state._sub_agent_cycle]
+      if not entry or not entry.session_id then
+        vim.notify("[NeoAI] 子 Agent 会话不可用", vim.log.levels.WARN)
+        return
+      end
+      vim.notify(("[NeoAI] 打开子 Agent 会话: %s"):format(entry.name or entry.id), vim.log.levels.INFO)
+      require("NeoAI.ui.window.chat_view").open({ new_window = true, session_id = entry.session_id })
+    end,
+    sub_agent_list = function()
+      require("NeoAI.ui.components.sub_agent_list").toggle()
+    end,
     reload_display = function()
       local name = display_modes.get_current_name()
       if not name then

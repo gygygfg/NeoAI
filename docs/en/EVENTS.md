@@ -220,10 +220,10 @@ All event constants are defined in `NeoAI.kernel.events`. They are listed below 
 
 | Constant | Value | When it fires | Key payload fields |
 | --- | --- | --- | --- |
-| `SUB_AGENT_CREATED` | `sub_agent:created` | Sub-agent created | `{ sub_agent_id, task }` |
-| `SUB_AGENT_UPDATED` | `sub_agent:updated` | Sub-agent updated | `{ sub_agent_id, status }` |
-| `SUB_AGENT_COMPLETED` | `sub_agent:completed` | Sub-agent completed | `{ sub_agent_id }` |
-| `SUB_AGENT_ERROR` | `sub_agent:error` | Sub-agent errored | `{ sub_agent_id, error }` |
+| `SUB_AGENT_CREATED` | `sub_agent:created` | Sub-agent created | `{ sub_agent_id, name, task, agent_id, session_id, parent_agent_id }` |
+| `SUB_AGENT_UPDATED` | `sub_agent:updated` | Sub-agent updated (cancel/resume) | `{ sub_agent_id, status }` |
+| `SUB_AGENT_COMPLETED` | `sub_agent:completed` | Sub-agent completed | `{ sub_agent_id, name, status }` |
+| `SUB_AGENT_ERROR` | `sub_agent:error` | Sub-agent errored | `{ sub_agent_id, name, error }` |
 | `SUB_AGENT_RESULT_READY` | `sub_agent:result_ready` | Sub-agent result ready | `{ sub_agent_id }` |
 
 ### Config / Lifecycle

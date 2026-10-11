@@ -152,6 +152,7 @@ function M.resolve_name(raw_name)
     git = "run_command",
     webfetch = "web_fetch", fetch = "web_fetch",
     task = "create_sub_agent", agent = "create_sub_agent",
+    send_sub_agent = "send_sub_agent_message",
     todowrite = "todo_write", todoread = "todo_read",
   }
   local alias = aliases[raw_name]

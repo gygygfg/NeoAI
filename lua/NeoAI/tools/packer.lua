@@ -63,7 +63,7 @@ function M.get_pack_for_tool(tool_name)
     lsp_type_definition = "lsp", lsp_service_info = "lsp", lsp_check = "lsp",
     log_message = "log", get_log_levels = "log",
     create_sub_agent = "agent", get_sub_agent_status = "agent",
-    cancel_sub_agent = "agent",
+    cancel_sub_agent = "agent", send_sub_agent_message = "agent",
   }
   -- 已知工具优先用 fallback 映射（避免注册时未显式标类导致归类错误）
   local known = fallback[tool_name]

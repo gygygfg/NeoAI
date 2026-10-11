@@ -152,7 +152,7 @@ context_cache = {
 | --- | --- |
 | `global` | `toggle_ui`(<leader>aa), `open_chat`(<leader>ac), `open_tree`(<leader>at), `close_all`(<leader>aq) |
 | `tree` | `quit`(q), `select`(<CR>), `new_child`(n), `new_root`(N), `delete_dialog`(d, delete selected round), `delete_branch`(D, delete owning session and all descendants), `expand`(o), `collapse`(O) |
-| `chat` | `insert`(i), `quit`(q), `send`, `cancel`(<Esc>), `toggle_reasoning`(r), `switch_model`(M), `cycle_mode`(m), `cycle_display`(<C-t>/T), `reload_display`(<F5>), `tool_approval`(<C-a>), `sandbox_review`(<leader>ap, view and apply pending sandbox changes), `approval.*` |
+| `chat` | `insert`(i), `quit`(q), `send`, `cancel`(<Esc>), `toggle_reasoning`(r), `switch_model`(M), `cycle_mode`(m), `switch_sub_agent`(<leader>as, open a sub-agent session in a new window), `sub_agent_list`(<leader>al, sub-agent list popup), `cycle_display`(<C-t>/T), `reload_display`(<F5>), `tool_approval`(<C-a>), `sandbox_review`(<leader>ap, view and apply pending sandbox changes), `approval.*` |
 
 ### 2.4 `session`
 
@@ -182,6 +182,7 @@ session = {
 | `todo.enabled` | `true` | Todo tool + system prompt injection |
 | `web_fetch` | See below (`enabled=false` by default) | Web fetch: render dynamic pages in a headless browser and convert to Markdown |
 | `plan_mode` | `{enabled=true, auto_execute_on_approve=true, distill_on_execute=true, distill_parallel=true, distill_front=true, distill_max_attempts=2, extract_max_tokens=nil, extra_safe_tools={}, mutating_tools=...}` | Plan mode |
+| `sub_agent` | `{final_instruction="summarize your work at the end..."}` | Sub-agents: an instruction auto-appended to a sub-agent's task prompt (asks it to summarize its work); set to `""` to disable. On completion the sub-agent's final body is delivered back to the main agent automatically |
 | `approval` | See below | Tool approval |
 | `sandbox` | See below | Tool execution sandbox (dry-run/commit, isolation backend, policy) |
 

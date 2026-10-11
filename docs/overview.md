@@ -47,10 +47,11 @@ NeoAI 是一款面向 Neovim 的 AI 驱动聊天插件，可将 AI 助手直接�
    - 环境探测：依赖不可用 workspace/git 的工具将被禁用
 
 6. 子 Agent 系统
-   - 通过 `runtime.spawn()` 创建子 Agent（全新环境，零继承）
-   - 边界约束（允许的工具、目录、命令、max_tool_calls）
+   - 通过 `sub_agent.create()` → `runtime.spawn()` 创建子 Agent（全新环境，零继承 + 独立持久化子会话）
+   - 边界约束（允许的工具、目录、命令、max_tool_calls）；子 Agent 不获得调度类工具
    - 每个子 Agent 拥有独立的工具循环
-   - `foreground` 模式：等待完整结果
+   - 无等待工具：循环自然结束后最终正文自动回传主 Agent（空闲则自动唤醒）
+   - winbar 展示子 Agent 名字（超宽折叠为「N个子agent正在运行」），快捷键 `switch_sub_agent` 在新窗口切换
    - 子 Agent 停靠区 UI 监控状态
 
 7. 会话历史

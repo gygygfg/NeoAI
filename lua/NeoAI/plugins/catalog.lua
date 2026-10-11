@@ -87,9 +87,13 @@ local function _service_specs()
           end,
           prefix = require("NeoAI.core.agent.prefix"),
           attachment = require("NeoAI.core.attachment.attachment"),
+          sub_agent = require("NeoAI.core.agent.sub_agent"),
         })
       end,
-      stop = function() pcall(require("NeoAI.kernel.core_bridge").reset) end,
+      stop = function()
+        pcall(function() require("NeoAI.core.agent.sub_agent").shutdown() end)
+        pcall(require("NeoAI.kernel.core_bridge").reset)
+      end,
     },
     {
       id = "services.tools", module = "NeoAI.tools", service = "services.tools", phase = 2,

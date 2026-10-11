@@ -72,15 +72,49 @@ local function sandbox_comp()
   }
 end
 
+-- 子 Agent 段（宽度自适应）：平铺名字，超出聊天窗口宽度时折叠为「N个子agent正在运行」。
+-- prefix_parts 用于扣除同排其它段的显示宽度，避免 winbar 被子 Agent 名字撑出窗口。
+local function sub_agents_comp(prefix_parts)
+  local colors = status.colors()
+  return {
+    function()
+      return status.sub_agents_segment({
+        width = vim.api.nvim_win_get_width(0),
+        prefix_parts = prefix_parts,
+        separator = " ",
+      })
+    end,
+    color = colors.sub_agents or colors.state,
+  }
+end
+
 local function metrics()
   return { comp("usage"), comp("cache"), capacity_comp(), comp("pending"), sandbox_comp() }
 end
--- 身份（winbar 第一行）：模式 / 模型 / 状态
+-- 身份（winbar 第一行）：模式 / 模型 / 状态 / 子 Agent
 local function identity()
   return {
     comp("mode", { cond = main_cond() }),
     comp("model", { cond = main_cond() }),
     comp("state", { cond = main_cond() }),
+    (function()
+      local c = sub_agents_comp({ "mode", "model", "state" })
+      c.cond = main_cond()
+      return c
+    end)(),
+  }
+end
+
+local function identity_no_winbar()
+  return {
+    comp("mode", { cond = no_winbar_cond() }),
+    comp("model", { cond = no_winbar_cond() }),
+    (function()
+      local c = sub_agents_comp({ "mode", "model", "usage", "cache", "capacity" })
+      c.cond = no_winbar_cond()
+      return c
+    end)(),
+    comp("state", { cond = no_winbar_cond() }),
   }
 end
 
@@ -91,14 +125,14 @@ local M = {
     lualine_a = { comp("mode", { cond = no_winbar_cond() }) },
     lualine_b = { comp("model", { cond = no_winbar_cond() }) },
     lualine_c = metrics(),
-    lualine_y = { comp("state", { cond = no_winbar_cond() }) },
+    lualine_y = identity_no_winbar(),
     lualine_z = {},
   },
   inactive_sections = {
     lualine_a = { comp("mode", { cond = no_winbar_cond() }) },
     lualine_b = { comp("model", { cond = no_winbar_cond() }) },
     lualine_c = metrics(),
-    lualine_y = { comp("state", { cond = no_winbar_cond() }) },
+    lualine_y = identity_no_winbar(),
     lualine_z = {},
   },
   winbar = {

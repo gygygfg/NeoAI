@@ -208,6 +208,9 @@ local function _build_persist_session(agent)
         duration_ms = msg.duration_ms,
         notice = msg.notice,
         secret_paths = msg.secret_paths,
+        -- 子 Agent 结果标记（UI 折叠渲染用，不进入模型上下文）：随会话持久化，
+        -- 重开会话时仍按折叠块渲染而非用户消息。
+        sub_agent = msg.sub_agent,
       })
       synced[#synced + 1] = msg
     end
@@ -326,10 +329,10 @@ end
 --- @param agent table
 --- @param content string
 --- @return Deferred
-local function _do_run(agent, content, _)
+local function _do_run(agent, content, opts)
   _ensure_persist_hook()
   event_bus.emit(events.MESSAGE_SENT, { agent_id = agent.id, content = content })
-  local run_d = runtime.run(agent, content)
+  local run_d = runtime.run(agent, content, opts)
   -- 立即落盘用户消息：长回合/意外退出时不丢用户输入（runtime.run 同步写入用户消息后
   -- 才返回 Deferred）。后续每个工具循环轮末由 _ensure_persist_hook 注册的钩子继续增量保存。
   _persist_agent(agent)
@@ -399,7 +402,7 @@ local function _inject_pending(agent)
   end
   pending_queue[agent.id] = nil
   for _, item in ipairs(q) do
-    agent:add_message("user", item.content)
+    agent:add_message("user", item.content, item.opts and item.opts.message_extra or nil)
     event_bus.emit(events.MESSAGE_SENT, { agent_id = agent.id, content = item.content })
     -- 消息已插入对话即视为已发送；resolve 避免 UI await 挂起（UI 主要只关心 reject）。
     -- 若 Agent 中途被销毁，会由 detach_window 走 _flush_pending 的拒绝逻辑，不在此重复。
@@ -478,7 +481,7 @@ local mcp_observer_sub = nil
 --- 期间的瞬时空注册表把 Agent 工具集清空（否则本轮请求会缺失全部工具）。
 --- @param agent table|nil
 local function _sync_agent_tools(agent)
-  if not (agent and not agent.parent and agent._tools_from_registry) then return end
+  if not (agent and not agent.parent and agent._tools_from_registry and not agent._sub_agent_session) then return end
   local registry = require("NeoAI.tools.registry")
   if registry.count() > 0 then
     agent.tools = registry.list_as_map()
@@ -551,6 +554,64 @@ local function _enqueue_message(agent, content, opts)
   event_bus.emit(events.MESSAGE_QUEUED, { agent_id = agent.id, count = #q })
   -- 静默暂存：不提示失败、也不提示"正忙"，随下轮模型调用或本轮结束自动发送
   return d
+end
+
+-- ========== 子 Agent 集成 ==========
+
+--- 把一条消息投递给指定 Agent（不经过 UI）：空闲则直接起一轮生成（自动唤醒），
+--- 忙碌则入 pending 队列（在下一轮边界或 turn 结束后注入）；Agent 已销毁则回落到
+--- 该消息所属会话的存档（重开会话时可见）。供子 Agent 结果回传 / 向子 Agent 发送消息。
+--- @param agent table|nil
+--- @param content string
+--- @param fallback_session_id string|nil
+--- @param meta table|nil { sub_agent? = { id, name, status, task } } 子 Agent 结果标记
+local function _dispatch_agent(agent, content, fallback_session_id, meta)
+  local extra = meta and meta.sub_agent and { sub_agent = meta.sub_agent } or nil
+  if agent and not agent_mod_is_disposed(agent) then
+    local d
+    if _is_busy(agent) then
+      d = _enqueue_message(agent, content, { message_extra = extra })
+    else
+      d = _run_message(agent, content, { message_extra = extra })
+    end
+    -- 投递失败不应变成未处理拒绝（父会话可能刚被关闭）。
+    if d and type(d.catch) == "function" then pcall(function() d:catch(function() end) end) end
+    return
+  end
+  if fallback_session_id then
+    local s = session_store.get(fallback_session_id)
+    if s then
+      local msg = { role = "user", content = content }
+      if extra then msg.sub_agent = extra.sub_agent end
+      session_mod.add_message(s, msg)
+      session_store.persist(s)
+    end
+  end
+end
+
+-- 子 Agent 钩子是否已注册（幂等）
+local sub_agent_hooks_registered = false
+local sub_agent_created_sub = nil
+
+--- 懒加载地把投递/落盘钩子与子 Agent 创建订阅注册到子 Agent 管理器（幂等）。
+--- core 管理器不反向依赖服务：经 set_dispatch / set_persist 注入实现。
+local function _ensure_sub_agent_hooks()
+  if sub_agent_hooks_registered then return end
+  sub_agent_hooks_registered = true
+  local ok, manager = pcall(require, "NeoAI.core.agent.sub_agent")
+  if not ok or not manager then return end
+  manager.set_dispatch(_dispatch_agent)
+  manager.set_persist(function(child) _persist_agent(child) end)
+  -- 子 Agent 创建时登记其会话 → Agent 映射，使 load_session 复用运行中的子 Agent
+  -- （新窗口切换到子 Agent 会话时直接看到其实时内容，而不是另起一个空 Agent）。
+  sub_agent_created_sub = event_bus.on(events.SUB_AGENT_CREATED, function(data)
+    if not data or not data.agent_id or not data.session_id then return end
+    local agent = runtime.get(data.agent_id)
+    if agent then
+      state.sessions[data.session_id] = agent.id
+      state.agents[agent.id] = { session_id = data.session_id }
+    end
+  end)
 end
 
 --- 组装会话链消息：祖先链（根→父）全部消息 + 选中会话截止本轮 + 下游单子链全部消息。
@@ -757,6 +818,12 @@ function M.detach_window(win_id)
     -- 窗口关闭走同步持久化：保持失败时不 dispose 的既有语义。
     local ok, err = _persist_agent_sync(agent)
     if not ok then return false, err end
+    if agent._external_owner then
+      -- 外部托管（子 Agent）会话：只解绑窗口，不销毁 Agent——其生命周期由子 Agent
+      -- 管理器持有（运行中关闭查看窗口不能杀掉子 Agent）。
+      state.windows[win_id] = nil
+      return true
+    end
     local session_id = agent.session_id
     runtime.dispose(agent)
     if session_id then
@@ -994,10 +1061,26 @@ function M.load_session(session_id, opts)
   -- 会话绑定工作目录：重开旧会话时以会话记录的工作区为基准，不跟随当前编辑器 cwd。
   agent.cwd = (session.metadata and session.metadata.cwd) or vim.fn.getcwd()
   local registry = require("NeoAI.tools.registry")
-  agent.tools = registry.list_as_map()
-  agent._tools_from_registry = true
+  local is_sub_agent = require("NeoAI.core.session.session").is_sub_agent(session)
+  if is_sub_agent then
+    -- 识别为子 Agent 会话：标记 + 只给「非 Agent 类」工具（与子 Agent 一致），
+    -- 且不参与注册表自动刷新（否则会被刷新回全量含 Agent 类工具）。
+    agent._sub_agent_session = true
+    agent._sub_agent_name = session.metadata and session.metadata.name
+    local sub_tools = {}
+    for name, tool in pairs(registry.list_as_map()) do
+      if tool.category ~= "agent" then sub_tools[name] = tool end
+    end
+    agent.tools = sub_tools
+  else
+    agent.tools = registry.list_as_map()
+    agent._tools_from_registry = true
+  end
   -- 载入历史消息（标记已同步，避免 _persist_agent 把祖先/下游消息误写进选中会话）
-  local chain_messages = _build_chain_messages(session, opts.round)
+  -- 子 Agent 会话零继承：只载入该会话自身消息，不拼接祖先/下游链。
+  local chain_messages = is_sub_agent
+    and (session.messages or {})
+    or _build_chain_messages(session, opts.round)
   for _, msg in ipairs(chain_messages) do
     local copy = vim.deepcopy(msg)
     copy._synced = true
@@ -1082,6 +1165,17 @@ function M.reset()
   injector_registered = false
   persist_hook_registered = false
   mcp_pre_round_registered = false
+  -- 清理子 Agent 集成钩子，避免跨测试/重载残留
+  if sub_agent_created_sub then
+    sub_agent_created_sub()
+    sub_agent_created_sub = nil
+  end
+  sub_agent_hooks_registered = false
+  pcall(function()
+    local manager = require("NeoAI.core.agent.sub_agent")
+    manager.set_dispatch(nil)
+    manager.set_persist(nil)
+  end)
   if mcp_observer_sub then
     mcp_observer_sub()
     mcp_observer_sub = nil
@@ -1094,9 +1188,12 @@ function M.reset()
   pending_queue = {}
   -- 恢复 MCP 钩子（幂等）：reset 清空后重新注册，保证工具动态更新仍能被感知与刷新
   _ensure_mcp_hooks()
+  -- 恢复子 Agent 集成钩子（幂等）
+  _ensure_sub_agent_hooks()
 end
 
--- 模块加载即注册 MCP 钩子（幂等）：保证工具动态更新在任意时刻都能被感知与刷新。
+-- 模块加载即注册 MCP 钩子与子 Agent 集成钩子（幂等）。
 _ensure_mcp_hooks()
+_ensure_sub_agent_hooks()
 
 return M

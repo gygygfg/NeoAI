@@ -54,6 +54,16 @@ local function _message_preview(content)
   return content
 end
 
+--- 是否为子 Agent 结果消息（标记或投递包装文本，兼容旧数据）
+--- @param message table
+--- @return boolean
+local function _is_sub_agent_message(message)
+  if not message then return false end
+  if message.sub_agent then return true end
+  if message.role ~= "user" then return false end
+  return type(message.content) == "string" and message.content:match("^%s*【子 Agent ") ~= nil
+end
+
 --- 将一次 Agent 执行聚合为一个节点。
 --- user 开始、下一条 user 前的最后一条非空 assistant 结束；工具步骤不单列。
 --- @param session table
@@ -62,7 +72,9 @@ local function _conversation_rounds(session)
   local rounds = {}
   local current = nil
   for index, message in ipairs(session.messages or {}) do
-    if message.role == "user" then
+    if _is_sub_agent_message(message) then
+      -- 子 Agent 结果不是用户轮次：不作为新轮起点（归入当前轮的 AI 回复）
+    elseif message.role == "user" then
       if current then
         current.last = index - 1
         rounds[#rounds + 1] = current
@@ -84,11 +96,36 @@ local function _conversation_rounds(session)
   return rounds
 end
 
+--- 是否为子 Agent 会话（metadata.tags 含 sub_agent）
+--- @param session table
+--- @return boolean
+local function _is_sub_agent_session(session)
+  local tags = session and session.metadata and session.metadata.tags
+  if type(tags) ~= "table" then return false end
+  for _, t in ipairs(tags) do
+    if t == "sub_agent" then return true end
+  end
+  return false
+end
+
 --- 单轮会话树节点文本，不显示内部会话 ID。
+--- 子 Agent 会话不标记为「用户」（其首条消息是任务而非用户输入），改用专属前缀。
 --- @param round table
+--- @param session table
+--- @param is_root boolean 是否为会话节点（首轮）
 --- @return string
-local function _round_preview(round)
+local function _round_preview(round, session, is_root)
   local parts = {}
+  if _is_sub_agent_session(session) then
+    if is_root then
+      local name = session.metadata and session.metadata.name
+      parts[#parts + 1] = "🤖 子 Agent" .. (name and name ~= "" and ("：" .. name) or "")
+    elseif round.user then
+      parts[#parts + 1] = "📋 任务：" .. round.user
+    end
+    if round.assistant then parts[#parts + 1] = "🤖 " .. round.assistant end
+    return #parts > 0 and table.concat(parts, " | ") or "子 Agent"
+  end
   if round.user then parts[#parts + 1] = "👤 用户：" .. round.user end
   if round.assistant then parts[#parts + 1] = "🤖 AI：" .. round.assistant end
   return #parts > 0 and table.concat(parts, " | ") or "新会话"
@@ -154,7 +191,7 @@ local function _build_flat()
       prefix = prefix .. connector,
       is_last = false,
       round = nil, -- 会话节点 = 打开整个会话
-      label = _round_preview(rounds[1] or {}),
+      label = _round_preview(rounds[1] or {}, session, true),
     }
 
     if is_open then
@@ -176,7 +213,7 @@ local function _build_flat()
           prefix = child_prefix .. (entry_idx == entry_count and "└─ " or "├─ "),
           is_last = false,
           round = round_idx,
-          label = _round_preview(rounds[round_idx]),
+          label = _round_preview(rounds[round_idx], session, false),
         }
       end
       for _, child in ipairs(children) do

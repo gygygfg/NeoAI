@@ -141,7 +141,9 @@ local function _apply_table_hl(buf, marks, start_line, range_from, range_to)
     local mfrom = range_from - start_line + 1
     local mto = range_to - start_line + 1
     local from = math.max(1, mfrom)
-    local to = math.min(#(marks or {}), mto)
+    -- 不以 `#marks` 收边：marks 为带洞并行数组，`#` 边界不可靠（可能为 0 导致漏贴）；
+    -- 越界访问 marks[ln] 仅返回 nil，无副作用。
+    local to = mto
     local has = false
     for ln = from, to do
       local m = marks[ln]
@@ -159,17 +161,17 @@ local function _apply_table_hl(buf, marks, start_line, range_from, range_to)
     end
     return
   end
-  -- 全量：marks 与行并行，首行多为 nil（角色头等无高亮），不能用 ipairs（遇 nil 即止）。
+  -- 全量：marks 与行并行且存在空洞（角色头/空行/正文行为 nil），不能用 ipairs 或 `#marks`
+  -- 遍历——`#` 在带洞数组上返回的边界不可靠（可能为 0，导致表格高亮整段丢失）。
   local has = false
-  for i = 1, #(marks or {}) do
-    if marks[i] and marks[i].tbl then has = true break end
+  for _, m in pairs(marks or {}) do
+    if m and m.tbl then has = true break end
   end
   if not has then return end
   _ensure_table_hl()
   vim.api.nvim_buf_clear_namespace(buf, TABLE_HL_NS, 0, -1)
-  for ln = 1, #marks do
-    local m = marks[ln]
-    if m and m.tbl then
+  for ln, m in pairs(marks or {}) do
+    if type(ln) == "number" and m and m.tbl then
       paint(buf, TABLE_HL_NS, m, start_line - 1 + (ln - 1))
     end
   end
@@ -703,6 +705,86 @@ local function _apply_ansi_hl(buf, marks, start_line, range_from, range_to)
   end
 end
 
+-- ========== 正文 Markdown 高亮 ==========
+
+-- 正文（assistant 用户消息）经 markdown_view 转成纯文本后，仅剩样式标签（style）。
+-- 这里把标题 / 列表项标记 / 引用 / 代码块 / 分隔线施加高亮，避免大段正文挤成一片
+-- 晦涩难读的纯文本；表格样式（tbl）另有斑马纹高亮，不走此命名空间。
+local MD_HL_NS = vim.api.nvim_create_namespace("neoai_md_hi")
+local MD_HL_GROUP = {
+  heading = "NeoAIHeading",
+  list = "NeoAIList",
+  quote = "NeoAIQuote",
+  code = "NeoAICode",
+  code_fence = "NeoAICodeFence",
+  hr = "NeoAIHr",
+}
+
+--- 定义正文 Markdown 高亮组（default=true，用户可在 colorscheme 覆盖）。
+--- 标题/列表/引用/分隔线用 link 借用主题既有组；代码块用与 Normal 背景微差的自适应底色，
+--- 使整段代码在正文中可辨（深浅主题方向相反）。
+local function _ensure_md_hl()
+  vim.api.nvim_set_hl(0, "NeoAIHeading", { default = true, link = "Title" })
+  vim.api.nvim_set_hl(0, "NeoAIList", { default = true, link = "Special" })
+  vim.api.nvim_set_hl(0, "NeoAIQuote", { default = true, link = "Comment" })
+  vim.api.nvim_set_hl(0, "NeoAIHr", { default = true, link = "Comment" })
+  vim.api.nvim_set_hl(0, "NeoAICodeFence", { default = true, link = "Comment" })
+  local dark = vim.o.background ~= "light"
+  local normal = vim.api.nvim_get_hl_by_name("Normal", true)
+  local bg = normal.background
+  if type(bg) ~= "string" or not bg:match("^#%x%x%x%x%x%x$") then
+    bg = dark and "#1b1b2b" or "#f0f0f0"
+  end
+  local code_bg = dark and _shade(bg, 8, 10, 14) or _shade(bg, -8, -10, -14)
+  vim.api.nvim_set_hl(0, "NeoAICode", { default = true, bg = code_bg })
+end
+
+--- 对 buffer 应用正文 Markdown 高亮（标题/列表/引用/代码/分隔线）。
+--- `md_span` 存在时只高亮标记区间（如列表项的圆点/序号），否则整行高亮。
+--- range_from/range_to 语义与 `_apply_table_hl` 一致（增量重贴差异区间）。
+--- @param buf number
+--- @param marks table|nil
+--- @param start_line number|nil
+--- @param range_from number|nil
+--- @param range_to number|nil
+local function _apply_md_hl(buf, marks, start_line, range_from, range_to)
+  if not buf or not vim.api.nvim_buf_is_valid(buf) then return end
+  start_line = start_line or 1
+  local is_incremental = range_from and range_to and range_to >= range_from
+  if is_incremental then
+    pcall(vim.api.nvim_buf_clear_namespace, buf, MD_HL_NS, range_from - 1, range_to)
+  else
+    pcall(vim.api.nvim_buf_clear_namespace, buf, MD_HL_NS, 0, -1)
+  end
+  local has = false
+  local function paint(ln, m)
+    local group = MD_HL_GROUP[m.md]
+    if not group then return end
+    if not has then
+      _ensure_md_hl()
+      has = true
+    end
+    local row = start_line - 1 + (ln - 1)
+    if m.md_span then
+      pcall(vim.api.nvim_buf_add_highlight, buf, MD_HL_NS, group, row, m.md_span[1], m.md_span[2])
+    else
+      _set_line_hl(buf, MD_HL_NS, group, row)
+    end
+  end
+  if is_incremental then
+    local mfrom = math.max(1, range_from - start_line + 1)
+    local mto = range_to - start_line + 1
+    for ln = mfrom, mto do
+      local m = marks and marks[ln]
+      if m and m.md then paint(ln, m) end
+    end
+  else
+    for ln, m in pairs(marks or {}) do
+      if type(ln) == "number" and m and m.md then paint(ln, m) end
+    end
+  end
+end
+
 --- 追加一行渲染输出，并记录与该行并行的元数据（marks，供斑马纹高亮）。
 --- 注意：marks 与 lines 严格按下标对齐。必须用 lines 的长度做下标——
 --- 不能写 `marks[#marks + 1] = mark`：mark 为 nil（角色头/空行）时不会推进长度，
@@ -767,17 +849,36 @@ local function _append_fold_block(lines, marks, rows, kind, header_mark)
   end
 end
 
---- 把推理块起始行登记到 fold 组件，供 foldtext 区分「思考过程」与其它折叠。
+--- 把推理块起始行与正文行登记到 fold 组件：
+--- - 推理块起始行：供 foldtext 区分「思考过程」与其它折叠；
+--- - 正文行：供 foldexpr 豁免折叠，使带行首缩进的正文（代码块 / 嵌套列表）保持缩进而不被折叠。
 --- @param buf number
 --- @param marks table 与 lines 并行的元数据数组
 local function _sync_fold_kinds(buf, marks)
-  local set = {}
+  local reasoning = {}
+  local body = {}
   -- 用 pairs 而非 `#marks`：marks 与 lines 并行但多数元素为 nil（角色头/空行），
-  -- `#` 会在首个空洞处截断，漏掉靠后的推理/工具元数据。
+  -- `#` 会在首个空洞处截断，漏掉靠后的推理/工具/正文元数据。
   for i, m in pairs(marks or {}) do
-    if m and m.fold_kind == "reasoning" then set[i] = true end
+    if m then
+      if m.fold_kind == "reasoning" then reasoning[i] = true end
+      if m.body then body[i] = true end
+    end
   end
-  fold.set_reasoning_lines(buf, set)
+  fold.set_reasoning_lines(buf, reasoning)
+  fold.set_body_lines(buf, body)
+end
+
+--- 是否为子 Agent 结果消息：优先看标记 msg.sub_agent；兼容旧数据（无标记）按投递包装
+--- 文本前缀「【子 Agent …」识别，避免历史会话仍渲染成用户消息。
+--- @param msg table|nil
+--- @return boolean
+local function _is_sub_agent_result(msg)
+  if not msg then return false end
+  if msg.sub_agent then return true end
+  if msg.role ~= "user" then return false end
+  local c = msg.content
+  return type(c) == "string" and c:match("^%s*【子 Agent ") ~= nil
 end
 
 --- 判断消息是否为轮次边界（其后应绘制分割线）。
@@ -792,6 +893,10 @@ local function _is_turn_end(messages, i)
   if msg.runtime_context then
     return false
   end
+  -- 子 Agent 结果以折叠块渲染（非用户回合），不画轮次分割线
+  if _is_sub_agent_result(msg) then
+    return false
+  end
   if msg.role == "user" then
     return true -- 用户消息始终后接分割线（与 AI 回复的视觉分隔）
   end
@@ -800,8 +905,10 @@ local function _is_turn_end(messages, i)
   end
   -- assistant：仅当它是本轮的可见最后一条（后面是下一条用户消息或列表末尾）时画分割线
   for j = i + 1, #messages do
-    if not messages[j].runtime_context and messages[j].role ~= "system" then
-      return messages[j].role == "user"
+    local m = messages[j]
+    -- 子 Agent 结果块与运行时快照不构成轮次边界，继续向后找真正的下一条消息
+    if not m.runtime_context and m.role ~= "system" and not _is_sub_agent_result(m) then
+      return m.role == "user"
     end
   end
   return true
@@ -843,11 +950,30 @@ local function _append_content(lines, marks, message, opts)
   if message.role == "tool" or not message.content or message.content == "" then return end
   local rendered = markdown_view.render(message.content, opts)
   for _, l in ipairs(rendered) do
-    if l.text ~= "" then
-      -- 去掉行首空白：正文（含 Markdown 代码/缩进段落）不应因缩进被误判为推理或工具折叠块。
-      -- 只有推理/工具块由 _append_fold_block 统一添加缩进，才是 ex 折叠的目标；正文顶格不折叠。
-      local mark = l.tbl and { tbl = l.tbl } or nil
-      _push(lines, marks, l.text:gsub("^%s+", ""), mark)
+    local raw = l.text or ""
+    -- 保留段落间空行：Markdown 的段落/列表/代码块靠空行分隔，丢弃会让大段正文挤成一坨。
+    -- 代码块围栏行文本为空但带 code_fence 样式，需保留其视觉边界，故按样式区分。
+    local blank = raw:match("^%s*$") ~= nil
+    if blank and (l.style == nil or l.style == "normal") then
+      _push(lines, marks, "", { body = true })
+    else
+      -- 正文行标记 body=true：即使含行首缩进（代码块 / 嵌套列表）也不参与 expr 折叠——
+      -- 由 fold.foldexpr 依登记豁免（见 _sync_fold_kinds），正文缩进得以原样保留，
+      -- 无需改写文本（避免复制正文代码时混入非断空格）。
+      local mark = { body = true }
+      if l.tbl then
+        mark.tbl = l.tbl
+      elseif l.style and l.style ~= "normal" and l.style ~= "table" then
+        mark.md = l.style
+        if l.style == "list" then
+          local indent = raw:match("^[ \t]*") or ""
+          local body = raw:sub(#indent + 1)
+          -- 注意：多字节圆点在 Lua 字符类（[•◦]）里按单字节匹配会失效，用字面量前缀匹配。
+          local bullet = body:match("^(• )") or body:match("^(◦ )") or body:match("^(%d+%.%s)")
+          if bullet then mark.md_span = { #indent, #indent + #bullet } end
+        end
+      end
+      _push(lines, marks, raw, mark)
     end
   end
 end
@@ -1246,6 +1372,39 @@ local function _append_tool_block(lines, marks, tool_call, result_msg)
   end
 end
 
+--- 追加子 Agent 结果折叠块（与工具块一致：缩进 2 格，由 expr 折叠收起）。
+--- 不绘制角色头、不标记为用户消息。正文首行若为投递包装行（【子 Agent …】）则剥离。
+--- @param lines table
+--- @param marks table 与 lines 并行的元数据数组
+--- @param message table
+local function _append_sub_agent_block(lines, marks, message)
+  local sa = message.sub_agent
+  local name, status, task
+  if sa then
+    name, status, task = sa.name or sa.id, sa.status, sa.task
+  else
+    -- 旧数据兜底：从投递包装行解析名字与状态
+    local n, label = tostring(message.content or ""):match('^%s*【子 Agent "([^"]*)"%s*([^】]*)】')
+    name = n or "子 Agent"
+    status = "completed"
+    if label and label:find("取消") then status = "cancelled"
+    elseif label and label:find("失败") then status = "error" end
+  end
+  name = name or "子 Agent"
+  local emoji = status == "error" and "❌" or (status == "cancelled" and "⏹" or "✅")
+  local rows = { string.format("%s 子 Agent: %s", emoji, name) }
+  if task and task ~= "" then
+    rows[#rows + 1] = "任务: " .. (tostring(task):gsub("%s+", " "))
+  end
+  for _, l in ipairs(_split_lines(message.content or "")) do
+    -- 剥离投递包装行（首行 "【子 Agent "x" 已完成】"），避免与块标题重复
+    if not l:match("^【子 Agent") then
+      rows[#rows + 1] = l
+    end
+  end
+  _append_fold_block(lines, marks, rows, "sub_agent", { fold_kind = "sub_agent" })
+end
+
 --- 追加轮次分割线（仅在轮次边界出现）
 --- @param lines table
 --- @param marks table 与 lines 并行的元数据数组
@@ -1463,6 +1622,34 @@ local function _blocks(msgs, opts, prev, show)
         }
       end
       i = consumed_until + 1
+    elseif _is_sub_agent_result(msg) then
+      -- 子 Agent 结果：渲染为折叠块（同工具块），无角色头、无轮次分割线。
+      local snap = msg
+      local eopts = _msg_opts(false, opts)
+      local key = "sa:" .. idx
+      n = n + 1
+      local p = prev and prev[n]
+      local clen = #(snap.content or "")
+      local sa_status = (snap.sub_agent and snap.sub_agent.status) or ""
+      if p and p.key == key and p.in_msg == snap and p.in_clen == clen
+        and p.in_sa == sa_status and p.in_header == false then
+        blocks[n] = p
+      else
+        local sig = _sig(eopts, false,
+          { "sub_agent", _fingerprint(snap.content), sa_status }, show)
+        blocks[n] = {
+          key = key,
+          sig = sig,
+          in_msg = snap, in_clen = clen, in_sa = sa_status, in_header = false,
+          build = function()
+            local lines, marks = {}, {}
+            _append_sub_agent_block(lines, marks, snap)
+            return { lines = lines, marks = marks }
+          end,
+        }
+      end
+      assistant_header_shown = false
+      i = i + 1
     else
       local snap = msg
       local turn_end = _is_turn_end(msgs, idx)
@@ -1540,6 +1727,7 @@ local function _render_chat_full(buf, msgs, opts, show)
   _sync_fold_kinds(buf, marks)
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
   _apply_table_hl(buf, marks)
+  _apply_md_hl(buf, marks)
   _apply_secret_hl(buf, marks)
   _apply_ansi_hl(buf, marks)
   incremental.invalidate(buf)
@@ -1611,6 +1799,7 @@ function M.render_chat(buf, messages, opts)
   if diff.changed then
     local from, to = incremental.written_range(diff)
     _apply_table_hl(buf, marks, 1, diff.full and nil or from, diff.full and nil or to)
+    _apply_md_hl(buf, marks, 1, diff.full and nil or from, diff.full and nil or to)
     _apply_secret_hl(buf, marks, 1, diff.full and nil or from, diff.full and nil or to)
     _apply_ansi_hl(buf, marks, 1, diff.full and nil or from, diff.full and nil or to)
   end
@@ -1634,6 +1823,7 @@ function M.append(buf, message)
   local line_count = vim.api.nvim_buf_line_count(buf)
   vim.api.nvim_buf_set_lines(buf, line_count - 1, -1, false, lines)
   _apply_table_hl(buf, marks, line_count)
+  _apply_md_hl(buf, marks, line_count, line_count, line_count + #lines - 1)
   _apply_secret_hl(buf, marks, line_count, line_count, line_count + #lines - 1)
   _apply_ansi_hl(buf, marks, line_count, line_count, line_count + #lines - 1)
   -- 直接写入后块缓存的内容镜像过期：置无效，下次渲染走全量替换。
@@ -1677,6 +1867,7 @@ end
 M.helpers = {
   append_tool_block = _append_tool_block,
   apply_table_hl = _apply_table_hl,
+  apply_md_hl = _apply_md_hl,
   pretty_json = _pretty_json,
   split_lines = _split_lines,
   truncate = function(s, n) return stringx.truncate(s, n) end,

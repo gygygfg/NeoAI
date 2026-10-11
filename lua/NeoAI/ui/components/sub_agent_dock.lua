@@ -27,8 +27,9 @@ local function _render()
     lines[#lines + 1] = "（无运行中的子 Agent）"
   else
     for id, a in pairs(state.agents) do
-      local status_icon = a.status == "completed" and "✅" or (a.status == "error" and "❌" or "⏳")
-      lines[#lines + 1] = string.format("%s %s  %s  %s", status_icon, id, a.status, a.task or "")
+      local status_icon = a.status == "completed" and "✅"
+        or (a.status == "error" and "❌" or (a.status == "cancelled" and "⏹" or "⏳"))
+      lines[#lines + 1] = string.format("%s %s  %s  %s", status_icon, a.name or id, a.status, a.task or "")
     end
   end
   vim.api.nvim_buf_set_lines(state.buf, 0, -1, false, lines)
@@ -78,7 +79,12 @@ function M.init()
   state.unsub = true
   state.unsubs = {
     event_bus.on(events.SUB_AGENT_CREATED, function(data)
-      state.agents[data.sub_agent_id] = { task = data.task, status = "running" }
+      state.agents[data.sub_agent_id] = { name = data.name, task = data.task, status = "running" }
+      _render()
+    end),
+    event_bus.on(events.SUB_AGENT_UPDATED, function(data)
+      local a = state.agents[data.sub_agent_id]
+      if a then a.status = data.status or a.status end
       _render()
     end),
     event_bus.on(events.SUB_AGENT_COMPLETED, function(data)

@@ -558,6 +558,40 @@ tests.suite("sandbox_review", function(_, it)
     services.provide("services.sandbox", saved)
   end)
 
+  it("越界/异常页展示「临时写入留痕」（只读，不产生待审）", function(t)
+    local services = require("NeoAI.kernel.services")
+    local sr = require("NeoAI.ui.components.sandbox_review")
+    sr.reset()
+    local saved = services.use("services.sandbox")
+    _provide_sandbox({
+      list_reviews = function() return {} end,
+      list_traces = function() return {} end,
+      list_ephemeral = function()
+        return {
+          { tool = "run_command", path = "/tmp/build/out.o",
+            command = "cc -c a.c -o /tmp/build/out.o" },
+        }
+      end,
+      apply = function() return { ok = true } end,
+      reject = function() end,
+    })
+    sr.open()
+    sr.open_page("anomaly")
+    local buf = sr.get_buf()
+    t.not_nil(buf, "应打开审批窗")
+    local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+    local text = table.concat(lines, "\n")
+    t.matches("临时写入留痕", text, "应展示临时写入留痕区")
+    local line
+    for i, l in ipairs(lines) do
+      if l:find("/tmp/build/out.o", 1, true) then line = i end
+    end
+    t.not_nil(line, "应展示临时写入留痕行")
+    t.eq(nil, sr.get_line_map()[line], "临时写入留痕行不应是审批目标")
+    sr.close()
+    services.provide("services.sandbox", saved)
+  end)
+
   it("越界留痕行按 i 查看详情（工具/类型/命令/时间）", function(t)
     local services = require("NeoAI.kernel.services")
     local sr = require("NeoAI.ui.components.sandbox_review")

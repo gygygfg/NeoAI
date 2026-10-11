@@ -105,6 +105,65 @@ tests.suite("chat_ui", function(_, it)
     vim.api.nvim_buf_delete(buf, { force = true })
   end)
 
+  it("正文保留段落空行并施加 Markdown 高亮（标题/列表/引用/代码/分隔线）", function(t)
+    local message_list = require("NeoAI.ui.components.message_list")
+    message_list.reset()
+    local buf = vim.api.nvim_create_buf(false, true)
+    local md = table.concat({
+      "# 标题",
+      "",
+      "第一段。",
+      "",
+      "- 列表项",
+      "",
+      "> 引用",
+      "",
+      "```lua",
+      "local x = 1",
+      "  local y = 2",
+      "```",
+      "",
+      "---",
+    }, "\n")
+    message_list.render_chat(buf, {
+      { role = "assistant", content = md },
+    }, {})
+
+    local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+    -- 段落之间的空行必须保留，否则大段正文会挤成一坨
+    local title_line, para_line
+    for i, l in ipairs(lines) do
+      if l == "标题" then title_line = i end
+      if l == "第一段。" then para_line = i end
+    end
+    t.not_nil(title_line, "标题行应存在")
+    t.not_nil(para_line, "段落行应存在")
+    t.eq("", lines[title_line + 1], "标题与段落之间应保留空行")
+    t.eq("", lines[para_line + 1], "段落与列表之间应保留空行")
+
+    -- 代码块缩进原样保留（ASCII 空格），且该行被登记为正文行（foldexpr 不折叠）
+    local fold = require("NeoAI.ui.components.fold")
+    local code_indent_line
+    for i, l in ipairs(lines) do
+      if l == "  local y = 2" then code_indent_line = i end
+    end
+    t.not_nil(code_indent_line, "代码块缩进行应以两个 ASCII 空格原样保留")
+    t.true_(fold.is_body_line(buf, code_indent_line), "缩进的代码行应登记为正文行（不参与折叠）")
+
+    -- Markdown 高亮：按行样式施加到对应高亮组
+    local ns = vim.api.nvim_get_namespaces()["neoai_md_hi"]
+    t.not_nil(ns, "应创建正文 Markdown 高亮命名空间")
+    local groups = {}
+    for _, e in ipairs(vim.api.nvim_buf_get_extmarks(buf, ns, 0, -1, { details = true })) do
+      groups[e[4].hl_group] = true
+    end
+    for _, g in ipairs({ "NeoAIHeading", "NeoAIList", "NeoAIQuote", "NeoAICode", "NeoAICodeFence", "NeoAIHr" }) do
+      t.true_(groups[g] == true, "应施加 " .. g .. " 高亮")
+    end
+
+    vim.api.nvim_buf_delete(buf, { force = true })
+  end)
+
   it("打开已加载会话时主界面光标先定位到消息底部再聚焦输入框", function(t)
     local config_store = require("NeoAI.kernel.config_store")
     local fs = require("NeoAI.utils.fs")

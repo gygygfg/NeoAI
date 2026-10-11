@@ -54,10 +54,11 @@ and async-by-default (all I/O non-blocking).
    - Environment probing: tools depending on unavailable workspace/git disabled
 
 6. Sub-Agent System
-   - Create sub-agents via `runtime.spawn()` (fresh environment, zero inheritance)
-   - Boundary enforcement (allowed tools, directories, commands, max_tool_calls)
+   - Create sub-agents via `sub_agent.create()` → `runtime.spawn()` (fresh environment, zero inheritance + persistent child session)
+   - Boundary enforcement (allowed tools, directories, commands, max_tool_calls); sub-agents get no dispatch tools
    - Independent tool loops per sub-agent
-   - `foreground` mode: wait for complete result
+   - No wait tool: when the loop ends naturally the final body is delivered back to the main agent (auto-wake when idle)
+   - Winbar shows sub-agent names (collapsed to `N个子agent正在运行` when too wide); `switch_sub_agent` opens one in a new window
    - Sub-agent dock UI monitors status
 
 7. Session History

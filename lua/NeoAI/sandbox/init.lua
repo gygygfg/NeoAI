@@ -37,6 +37,7 @@ local audit = require("NeoAI.sandbox.observe.audit")
 local container = require("NeoAI.sandbox.execution.container")
 local secret = require("NeoAI.sandbox.secret.secret")
 local trace = require("NeoAI.sandbox.observe.trace")
+local ephemeral = require("NeoAI.sandbox.observe.ephemeral")
 local events = require("NeoAI.kernel.events")
 
 local M = {}
@@ -424,6 +425,24 @@ end
 --- @return number
 function M.trace_count()
   return trace.file_count()
+end
+
+--- 临时写入留痕（会话私有临时根 /tmp、/var/tmp 等；仅只读展示，不产生待审/发布）
+--- @return table 数组
+function M.list_ephemeral()
+  return ephemeral.list()
+end
+
+--- 临时写入留痕（按文件路径合并、排序；供审批悬浮窗展示）
+--- @return table 数组
+function M.list_ephemeral_grouped()
+  return ephemeral.list_grouped()
+end
+
+--- 临时写入留痕的去重文件数
+--- @return number
+function M.ephemeral_count()
+  return ephemeral.file_count()
 end
 
 --- 批准变更单元
@@ -934,6 +953,7 @@ function M.reset()
   pcall(function() require("NeoAI.sandbox.systemd.systemd").reset() end)
   require("NeoAI.sandbox.secret.secret").reset()
   trace.reset()
+  ephemeral.reset()
   pcall(function() require("NeoAI.sandbox.net.net_gateway").reset() end)
   pcall(function() require("NeoAI.sandbox.net.host_proxy").reset() end)
   pcall(function() require("NeoAI.sandbox.execution.disk").reset() end)

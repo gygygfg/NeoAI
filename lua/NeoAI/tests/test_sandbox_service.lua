@@ -143,6 +143,25 @@ tests.suite("sandbox_service", function(_, it)
     local attr3 = cgroup.oom_attribution("/cg/neoai/a", { base = "/cg", reader = reader, baseline = baseline })
     t.true_(attr3.oom, "子域新增 OOM 应归因")
     t.eq("sandbox", attr3.level, "子域 OOM 应标记为 sandbox")
+    -- pids 超限归因：pids.events「max」增量（子域→祖先），同样用基线差分。
+    local pfiles = {
+      ["/cg/neoai/a/pids.events"] = "max 0\n",
+      ["/cg/neoai/pids.events"] = "max 2\n",
+      ["/cg/pids.events"] = "max 9\n",
+    }
+    local preader = function(p) return pfiles[p] end
+    local pa = cgroup.pids_attribution("/cg/neoai/a", { base = "/cg", reader = preader })
+    t.true_(pa.hit, "子域无 pids 拒绝时应上溯父域")
+    t.eq("ancestor", pa.level, "父域 pids 拒绝应标记为 ancestor")
+    t.eq("/cg/neoai", pa.path, "应定位到父域路径")
+    local pbase = cgroup.pids_baseline("/cg/neoai/a", { base = "/cg", reader = preader })
+    t.eq(2, pbase["/cg/neoai"], "基线应记录父域当前 pids max 计数")
+    local pa2 = cgroup.pids_attribution("/cg/neoai/a", { base = "/cg", reader = preader, baseline = pbase })
+    t.false_(pa2.hit, "计数未变时不应归因为本次 pids 超限")
+    pfiles["/cg/neoai/a/pids.events"] = "max 1\n"
+    local pa3 = cgroup.pids_attribution("/cg/neoai/a", { base = "/cg", reader = preader, baseline = pbase })
+    t.true_(pa3.hit, "子域新增 pids 拒绝应归因")
+    t.eq("sandbox", pa3.level, "子域 pids 拒绝应标记为 sandbox")
     local diag = require("NeoAI.sandbox.observe.diag")
     local limits = diag.sandbox_limits()
     t.eq("table", type(limits))

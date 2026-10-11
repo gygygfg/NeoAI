@@ -61,9 +61,28 @@ end)
 
 1. **会话隔离**：把会话默认路径重定向到临时目录（`~/.cache/NeoAI-test`），结束后清理并
    恢复内存中的真实会话，防止测试污染真实历史。
-2. 动态加载所有 `test_*.lua`。
+2. 动态加载 `test_*.lua`（子进程可用 `NEOAI_TEST_MODULES` **按分片只加载本分片模块**）。
 3. 用 `xpcall` 逐个运行用例（带 `debug.traceback`），统计 `passed / failed / errors`。
-4. 返回 `{ passed, failed, errors }`。
+   首个套件在 fresh worker 上跳过冗余的 `config_store.load` + `plugins.start_all` +
+   `tools.reload_tools` 全量重置；默认仅打印失败用例 + 套件摘要（`NEOAI_TEST_VERBOSE=1` 还原明细）。
+4. 返回 `{ passed, failed, errors, timings }`；隔离子进程另把结果写入 **sidecar**（小 JSON）。
+
+### 2.4 并行运行器结构（门面 + 子模块）
+
+`parallel.lua` 退化为**薄门面**（保留 `run / shard / _discover / _set_spawner / reset / _abort_all`
+签名），并发编排与结果处理拆分为 `lua/NeoAI/tests/runner/` 子模块：
+
+| 子模块 | 职责 |
+| --- | --- |
+| `runner/config.lua` | 常量、worker/heavy 并发解析、heavy 判定 |
+| `runner/timings.lua` | 耗时缓存读写与 `TIMING` 解析 |
+| `runner/shard.lua` | LPT 分片、发现清单解析（含 name→module） |
+| `runner/spawn.lua` | 子进程执行：日志落盘 + 结果 sidecar、进程树清理 |
+| `runner/scheduler.lua` | 有界并发池（trampoline 防重入）与双 lane 编排 |
+| `runner/report.lua` | 结果聚合、失败分片懒读日志尾部、报告 |
+
+双 lane：light（多套件/进程，W 路）与 heavy（`sandbox*`/`pty` 一套件/进程，H 路）**重叠执行**，
+约束 `#light≤W`、`#heavy≤H`、`W+H≤核数`；`NEOAI_TEST_HEAVY_WORKERS=1` 回退为旧串行通道。
 
 ## 3. 测试文件清单
 

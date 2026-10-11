@@ -147,7 +147,7 @@ context_cache = {
 | --- | --- |
 | `global` | `toggle_ui`(<leader>aa)、`open_chat`(<leader>ac)、`open_tree`(<leader>at)、`close_all`(<leader>aq) |
 | `tree` | `quit`(q)、`select`(<CR>)、`new_child`(n)、`new_root`(N)、`delete_dialog`(d，删除当前轮次)、`delete_branch`(D，删除所属会话及全部子分支)、`expand`(o)、`collapse`(O) |
-| `chat` | `insert`(i)、`quit`(q)、`send`、`cancel`(<Esc>)、`toggle_reasoning`(r)、`switch_model`(M)、`cycle_mode`(m)、`cycle_display`(<C-t>/T)、`reload_display`(<F5>)、`tool_approval`(<C-a>)、`sandbox_review`(<leader>ap，查看并应用待审的沙箱修改)、`approval.*` |
+| `chat` | `insert`(i)、`quit`(q)、`send`、`cancel`(<Esc>)、`toggle_reasoning`(r)、`switch_model`(M)、`cycle_mode`(m)、`switch_sub_agent`(<leader>as，在新窗口打开子 Agent 会话)、`sub_agent_list`(<leader>al，子 Agent 列表弹出窗)、`cycle_display`(<C-t>/T)、`reload_display`(<F5>)、`tool_approval`(<C-a>)、`sandbox_review`(<leader>ap，查看并应用待审的沙箱修改)、`approval.*` |
 
 ### 2.4 `session`
 
@@ -177,6 +177,7 @@ session = {
 | `todo.enabled` | `true` | 待办工具 + 系统提示注入 |
 | `web_fetch` | 见下（默认 `enabled=false`） | 网页抓取：无头浏览器渲染动态页面并转 Markdown |
 | `plan_mode` | `{enabled=true, auto_execute_on_approve=true, distill_on_execute=true, distill_parallel=true, distill_front=true, distill_max_attempts=2, extract_max_tokens=nil, extra_safe_tools={}, mutating_tools=...}` | 计划模式 |
+| `sub_agent` | `{final_instruction="最后请总结你的工作：…"}` | 子 Agent：创建时自动追加到其任务提示末尾的收尾指令（要求最后总结工作）；设为 `""` 可关闭。子 Agent 完成后其最终正文会自动回传主 Agent |
 | `approval` | 见下 | 工具审批 |
 | `sandbox` | 见下 | 工具执行沙箱（dry-run/commit、隔离后端、策略） |
 
@@ -203,6 +204,7 @@ approval = {
     create_sub_agent    = { auto_allow = false },
     get_sub_agent_status= { auto_allow = true },
     cancel_sub_agent    = { auto_allow = true },
+    send_sub_agent_message = { auto_allow = true },
     git_diff / git_log / git_status / git_commit_detail /
     git_file_history / git_branch / git_auto_commit_config = { auto_allow = true },
     git_restore = { auto_allow = false },

@@ -785,15 +785,19 @@ function M.exec(command, opts)
   local out = async.Deferred.new()
 
   local function _run_on(cur)
-    -- 会话级资源域跨命令复用：记录命令开始时的 OOM 计数基线，结束后差分归因。
+    -- 会话级资源域跨命令复用：记录命令开始时的 OOM / pids 计数基线，结束后差分归因。
     local cg_baseline = nil
     if cur.cg and cur.cg.path and cgroup.oom_baseline then
       pcall(function() cg_baseline = cgroup.oom_baseline(cur.cg.path) end)
     end
+    local pids_baseline = nil
+    if cur.cg and cur.cg.path and cgroup.pids_baseline then
+      pcall(function() pids_baseline = cgroup.pids_baseline(cur.cg.path) end)
+    end
     return M.materialize():then_(function()
       return _request(cur, "X", command, opts)
     end):then_(function(res)
-      return { res = res, cur = cur, cg_baseline = cg_baseline }
+      return { res = res, cur = cur, cg_baseline = cg_baseline, pids_baseline = pids_baseline }
     end)
   end
 
@@ -824,12 +828,19 @@ function M.exec(command, opts)
       truncated = true
     end
     local oom, oom_level = false, nil
+    local pids_max_hit = false
     if c.cg and c.cg.path and (res.code == 137 or res.code == -1) then
       if cgroup.oom_attribution then
         local attr = cgroup.oom_attribution(c.cg.path, { baseline = ctx.cg_baseline })
         oom, oom_level = attr.oom, attr.level
       else
         oom = cgroup.snapshot_oom(cgroup.events_snapshot(c.cg.path))
+      end
+      -- PID/线程数超限（pids.events「max」增量）：大量并发进程/线程（构建、并行测试、常驻/
+      -- 后台进程）触顶 pids.max，fork 被拒后进程树被回收——非 OOM，但同样表现为 137/SIGKILL。
+      if cgroup.pids_attribution then
+        local pa = cgroup.pids_attribution(c.cg.path, { baseline = ctx.pids_baseline }) or {}
+        pids_max_hit = pa.hit == true
       end
     end
     -- 命令超时后主动探活：服务器忙（命令仍在后台并发执行）时读取循环空闲，探针会立即返回，
@@ -846,7 +857,7 @@ function M.exec(command, opts)
     end
     out:resolve({
       code = res.code, stdout = stdout, stderr = "", truncated = truncated,
-      oom = oom, oom_level = oom_level,
+      oom = oom, oom_level = oom_level, pids_max_hit = pids_max_hit,
       timed_out = res.timed_out, aborted = res.aborted, message = res.message,
     })
   end, function(e) out:reject(e) end)

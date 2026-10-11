@@ -54,7 +54,17 @@ local function _root_op(action, path, content, mode)
     return true
   elseif action == "rmdir" then
     -- 幂等：目标不存在即已达成「移除」意图，视为成功。
-    if vim.uv.fs_lstat(path) == nil then return true end
+    local lst = vim.uv.fs_lstat(path)
+    if lst == nil then return true end
+    -- 非空目录无法 rmdir：给出明确原因（区别于权限/其他失败），便于诊断与回队说明。
+    -- 候选正常应在删除子项后再 rmdir 父目录（子先于父排序）；此处非空说明仍有未捕获的子项。
+    local st = vim.uv.fs_stat(path)
+    if st and st.type == "directory" then
+      local scan = vim.uv.fs_scandir(path)
+      if scan and vim.uv.fs_scandir_next(scan) ~= nil then
+        return false, "RMDIR_NOT_EMPTY: " .. tostring(path)
+      end
+    end
     local r = vim.fn.delete(path, "d")
     return r == 0, r ~= 0 and ("rmdir 失败: " .. path) or nil
   elseif action == "symlink" then

@@ -869,21 +869,64 @@ tests.suite("tools", function(_, it)
   end)
 
   it("子 Agent 边界审核", function(t)
-    local plan = require("NeoAI.tools.builtin.plan")
+    local sub_agent = require("NeoAI.core.agent.sub_agent")
     local registry = require("NeoAI.tools.registry")
     local helpers = require("NeoAI.tools.builtin.tool_helpers")
     registry.register(helpers.define_tool("allowed_tool", "允许", nil, function() end))
-    plan.reset()
+    sub_agent.reset()
     -- 直接构造子 agent 条目
     local sub_id = "sub_test"
-    plan.get_tools() -- ensure loaded
-    -- 模拟边界
-    plan._allow_tools_for_test(sub_id, { "allowed_tool" })
-    local ok = plan.review_tool_call(sub_id, "allowed_tool")
+    sub_agent._inject_for_test(sub_id, { allowed_tools = { "allowed_tool" }, parent_agent_id = "p1" })
+    local ok = sub_agent.review_tool_call(sub_id, "allowed_tool")
     t.true_(ok)
-    local blocked, reason = plan.review_tool_call(sub_id, "not_allowed")
+    local blocked, reason = sub_agent.review_tool_call(sub_id, "not_allowed")
     t.false_(blocked)
     t.matches("驳回", reason or "missing")
+    -- 调度类工具永远被驳回
+    local blocked2 = sub_agent.review_tool_call(sub_id, "create_sub_agent")
+    t.false_(blocked2)
+    sub_agent.reset()
+  end)
+
+  it("非 async 模式下子 Agent 审批申请路由到主 Agent", function(t)
+    local config_store = require("NeoAI.kernel.config_store")
+    config_store.load({ tools = { approval = { mode = "prompt", per_tool = {}, timeout_ms = 0 } } })
+    local executor = require("NeoAI.tools.executor")
+    local tool_service = require("NeoAI.services.tool_service")
+    local registry = require("NeoAI.tools.registry")
+    local helpers = require("NeoAI.tools.builtin.tool_helpers")
+    local event_bus = require("NeoAI.kernel.event_bus")
+    local events = require("NeoAI.kernel.events")
+    tool_service.reset()
+    registry.register(helpers.define_tool(
+      "sub_approval_tool", "子 Agent 审批工具",
+      { type = "object", properties = {}, required = {} },
+      function(_, on_success) on_success("executed") end))
+
+    local shown, requested_agent = false, nil
+    tool_service.set_approval_ui({
+      show = function(cfg) shown = true if cfg.on_confirm then cfg.on_confirm() end end,
+      hide = function() end,
+    })
+    local sub = event_bus.on(events.TOOL_APPROVAL_REQUESTED, function(d)
+      requested_agent = d and d.agent_id
+    end)
+
+    local parent_agent = { id = "main_agent", cwd = "/tmp" }
+    local child_agent = { id = "child_agent", cwd = "/tmp", parent = "main_agent" }
+    local ran, done = false, false
+    executor.execute("sub_approval_tool", { description = "x" }, {
+      agent = child_agent, is_sub_agent = true, sub_agent_id = "sub_x",
+      approval_agent = parent_agent, tool_service = tool_service,
+      approval_mode = "prompt", cwd = "/tmp",
+    }):then_(function(v) ran = (v == "executed"); done = true end, function() done = true end)
+    vim.wait(2000, function() return done end)
+
+    t.true_(shown, "非 async 模式下子 Agent 工具应进入审批")
+    t.true_(ran, "审批通过后应执行")
+    t.eq("main_agent", requested_agent, "审批申请应归属/路由到主 Agent")
+    sub()
+    tool_service.reset()
   end)
 
   it("审批超时拒绝而非永久挂起", function(t)

@@ -137,6 +137,7 @@ function M.reset()
   pcall(function() require("NeoAI.ui.components.secret_alert").reset() end)
   pcall(function() require("NeoAI.ui.components.net_consent").reset() end)
   pcall(function() require("NeoAI.ui.components.sub_agent_dock").reset() end)
+  pcall(function() require("NeoAI.ui.components.sub_agent_list").reset() end)
   pcall(function() require("NeoAI.ui.components.sandbox_review").reset() end)
   pcall(function() require("NeoAI.ui.components.terminal_window").reset() end)
   state.initialized = false

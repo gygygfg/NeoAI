@@ -590,7 +590,10 @@ local function _execute_after_secret_guard(tool, resolved, args, ctx)
   -- 进程内读写（read/fs_write）不受 mount 遮蔽约束，必须显式拦截；外部进程（process/network）
   -- 由 mount 硬遮蔽。有审批界面且开启审批时弹窗放行，否则 fail-closed 拒绝。
   -- 命中宿主敏感遮蔽路径（mask_paths/沙箱存储）时不可审批放行，直接硬拒绝。
-  local can_approve = (not ctx.is_sub_agent) and ctx.tool_service ~= nil
+  -- 子 Agent：async 模式下无交互审批（越界场景 fail-closed）；非 async 模式下审批申请
+  -- 路由到主 Agent（用户经审批 UI 决策，approval_agent 见 tool_service.execute）。
+  local can_approve = ctx.tool_service ~= nil
+    and (not ctx.is_sub_agent or mode ~= "async")
   local in_process_fs = spec.effect == "read" or spec.effect == "fs_write"
   local needs_approval = false
   if masked_hit then
@@ -652,10 +655,16 @@ local function _execute_after_secret_guard(tool, resolved, args, ctx)
   end
 
   -- 入向 token 化：结果中的真实密钥替换为 token 后再回传模型。
-  if needs_approval and not ctx.is_sub_agent and ctx.tool_service then
+  if needs_approval and can_approve then
     -- 交由 tool_service 做审批 UI，审批通过后继续执行。
-    -- 计时器只在审批通过后才 start，因此等待审批的时间不计入耗时、也不消耗超时预算。
-    return _tokenize_out(ctx.tool_service.approve_and_execute(resolved, args, ctx, function()
+    -- 子 Agent 的审批申请路由到主 Agent：以 approval_agent 做归属/事件展示，实际执行仍用
+    -- 子 Agent 的 ctx（cwd/沙箱域不变）。计时器只在审批通过后才 start，因此等待审批的
+    -- 时间不计入耗时、也不消耗超时预算。
+    local approval_ctx = ctx
+    if ctx.is_sub_agent and ctx.approval_agent then
+      approval_ctx = vim.tbl_extend("force", {}, ctx, { agent = ctx.approval_agent })
+    end
+    return _tokenize_out(ctx.tool_service.approve_and_execute(resolved, args, approval_ctx, function()
       -- 审批通过：允许本次进程命令以跨挂载点兼容模式构建 overlay 前缀，并记住该挂载点，
       -- 本会话后续命令不再重复弹窗。
       if ctx.sandbox_cross_mount_root then

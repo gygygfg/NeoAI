@@ -959,6 +959,78 @@ tests.suite("sandbox_ops", function(_, it)
     vim.fn.delete(root, "rf")
   end)
 
+  it("捕获：目录 whiteout 自动补出下层子项删除（非空 rmdir 不再失败）", function(t)
+    local fs = require("NeoAI.utils.fs")
+    local sandbox = require("NeoAI.sandbox")
+    local candidate = require("NeoAI.sandbox.execution.candidate")
+    local control = require("NeoAI.sandbox.execution.control")
+    local store = require("NeoAI.sandbox.state.store")
+    with_config({ tools = { sandbox = { enabled = true, mode = "dry_run" } } }, function()
+      sandbox.reset()
+      local base = fs.canonical(vim.fn.tempname())
+      local dir = base .. "/app"
+      local upper = base .. "/upper"
+      fs.ensure_dir(dir .. "/sub")
+      fs.ensure_dir(upper)
+      fs.write_file(dir .. "/sub/a.txt", "a\n")
+      fs.write_file(dir .. "/sub/b.txt", "b\n")
+      -- 用 `.wh.sub` 命名白洞模拟「目录被删除，但 overlay 只在父目录留下目录本身的 whiteout，
+      -- 未逐子项留 whiteout」——这正是 `rm -rf <dir>` 的真实捕获形态。
+      fs.write_file(upper .. "/.wh.sub", "")
+      local attempt = control.new_attempt("run_command", { command = "rm -rf sub" }, {}, { effect = "process" })
+      candidate.begin(attempt, assert(store.root()))
+      candidate.capture_overlay(attempt.attempt_id, dir, upper)
+      local cand = candidate.finish(attempt.attempt_id)
+      local actions = {}
+      for _, f in ipairs(cand and cand.files or {}) do actions[f.path] = f.action end
+      t.eq("rmdir", actions[dir .. "/sub"], "应含目录 rmdir")
+      t.eq("delete", actions[dir .. "/sub/a.txt"], "应补出子文件 a 删除")
+      t.eq("delete", actions[dir .. "/sub/b.txt"], "应补出子文件 b 删除")
+      -- 修复前候选只有 rmdir，发布时命中非空目录失败；现应「先删子项再 rmdir」成功。
+      local pub = candidate.publish(cand, {})
+      t.true_(pub.ok, "递归目录删除应成功: " .. tostring(pub.reason))
+      t.false_(fs.exists(dir .. "/sub"), "目录树应被删除")
+      candidate.cleanup(attempt.attempt_id)
+      vim.fn.delete(base, "rf")
+    end)
+  end)
+
+  it("捕获(异步/工作线程)：目录 whiteout 自动补出下层子项删除", function(t)
+    local fs = require("NeoAI.utils.fs")
+    local sandbox = require("NeoAI.sandbox")
+    local candidate = require("NeoAI.sandbox.execution.candidate")
+    local control = require("NeoAI.sandbox.execution.control")
+    local store = require("NeoAI.sandbox.state.store")
+    with_config({ tools = { sandbox = { enabled = true, mode = "dry_run" } } }, function()
+      sandbox.reset()
+      local base = fs.canonical(vim.fn.tempname())
+      local dir = base .. "/app"
+      local upper = base .. "/upper"
+      fs.ensure_dir(dir .. "/sub")
+      fs.ensure_dir(upper)
+      fs.write_file(dir .. "/sub/a.txt", "a\n")
+      fs.write_file(dir .. "/sub/b.txt", "b\n")
+      fs.write_file(upper .. "/.wh.sub", "")
+      local attempt = control.new_attempt("run_command", { command = "rm -rf sub" }, {}, { effect = "process" })
+      candidate.begin(attempt, assert(store.root()))
+      local done = false
+      candidate.capture_overlay_async(attempt.attempt_id, dir, upper):then_(function()
+        done = true
+      end, function()
+        done = true
+      end)
+      t.true_(vim.wait(20000, function() return done end), "异步捕获应完成")
+      local cand = candidate.finish(attempt.attempt_id)
+      local actions = {}
+      for _, f in ipairs(cand and cand.files or {}) do actions[f.path] = f.action end
+      t.eq("rmdir", actions[dir .. "/sub"], "应含目录 rmdir")
+      t.eq("delete", actions[dir .. "/sub/a.txt"], "应补出子文件 a 删除")
+      t.eq("delete", actions[dir .. "/sub/b.txt"], "应补出子文件 b 删除")
+      candidate.cleanup(attempt.attempt_id)
+      vim.fn.delete(base, "rf")
+    end)
+  end)
+
   it("加固：发布前重规范化路径，拒绝 `..` 穿越与遮蔽目标", function(t)
     local fs = require("NeoAI.utils.fs")
     local candidate = require("NeoAI.sandbox.execution.candidate")
@@ -1103,6 +1175,21 @@ tests.suite("sandbox_ops", function(_, it)
     fs.delete_file(root)
   end)
 
+  it("发布：非空目录 rmdir 报明确 RMDIR_NOT_EMPTY，空目录照常成功", function(t)
+    local fs = require("NeoAI.utils.fs")
+    local writer = require("NeoAI.sandbox.execution.writer")
+    local root = fs.canonical(vim.fn.tempname())
+    fs.ensure_dir(root .. "/d")
+    fs.write_file(root .. "/d/x", "x\n")
+    local r = writer.apply("rmdir", root .. "/d", nil, {})
+    t.false_(r.ok, "非空目录 rmdir 应失败")
+    t.matches("RMDIR_NOT_EMPTY", tostring(r.err or r.reason), "应给出明确原因")
+    fs.ensure_dir(root .. "/empty")
+    local r2 = writer.apply("rmdir", root .. "/empty", nil, {})
+    t.true_(r2.ok, "空目录 rmdir 应成功: " .. tostring(r2.err or r2.reason))
+    vim.fn.delete(root, "rf")
+  end)
+
   it("发布：非原子整包部分写入失败仅失败该文件，其余照常应用", function(t)
     local fs = require("NeoAI.utils.fs")
     local candidate = require("NeoAI.sandbox.execution.candidate")
@@ -1126,6 +1213,7 @@ tests.suite("sandbox_ops", function(_, it)
     t.eq(ok_file, res.applied[1], "成功文件应为 ok_file")
     t.eq(1, #(res.failed or {}), "应有一个文件失败")
     t.eq(bad_path, res.failed[1].path, "失败文件应为 bad_path")
+    t.matches("WRITE_FAILED", tostring(res.reason), "PARTIAL reason 应带首条失败原因")
     t.true_(fs.exists(ok_file), "ok_file 应已落盘")
 
     -- 原子整组（如 git）：任一失败即整体失败，不写入其他文件。

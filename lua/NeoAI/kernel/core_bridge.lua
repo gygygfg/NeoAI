@@ -15,6 +15,7 @@ local impl = {}
 --- @param t table|nil {
 ---   agent_spawn?: function(parent, opts), agent_get?: function(id),
 ---   agent_abort?: function(agent, reason), prefix?: table, attachment?: table,
+---   sub_agent?: table,
 --- }
 function M.set(t)
   impl = t or {}
@@ -63,6 +64,13 @@ end
 --- @return table|nil
 function M.attachment()
   return impl.attachment
+end
+
+--- 子 Agent 管理器（core.agent.sub_agent；可用则返回，否则 nil）。
+--- tools 侧经此访问子 Agent 创建/查询/终止/发送，不直接依赖 core。
+--- @return table|nil
+function M.sub_agent()
+  return impl.sub_agent
 end
 
 --- 复位（插件卸载/测试用）。

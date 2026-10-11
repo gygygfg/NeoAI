@@ -790,6 +790,8 @@ function M.enqueue(cand, meta)
     package_sensitive = meta.package_sensitive,
     -- 冻结时剔除的不可发布文件（遮蔽/易变缓存），供审批界面提示。
     dropped = meta.dropped,
+    -- 上次失败原因（部分应用回队时携带）：新待审单元直接展示，避免「同因再失败」无从排查。
+    fail_reason = meta.fail_reason,
     review_state = M.REVIEW.PENDING,
     apply_state = M.APPLY.NOT_REQUESTED,
     created_at = os.time(),
@@ -1134,7 +1136,7 @@ end
 --- @param item table 原变更单元
 --- @param remaining table 剩余文件数组
 --- @return table|nil 新变更单元
-local function _requeue_remaining(item, remaining)
+local function _requeue_remaining(item, remaining, reason)
   if #remaining == 0 then return nil end
   local manifest = {}
   for _, f in ipairs(remaining) do
@@ -1158,6 +1160,7 @@ local function _requeue_remaining(item, remaining)
     stats = item.stats,
     depends_on = item.depends_on,
     atomic_group = item.atomic_group,
+    fail_reason = reason,
   })
 end
 
@@ -1369,11 +1372,13 @@ local function _apply_settle(ctx, pub)
     end
   end
   if pub.ok or partial then
+    local first_fail = partial and pub.failed and pub.failed[1]
     item.apply_state = M.APPLY.APPLIED
     item.applied_at = os.time()
     item.receipt = pub.receipt
     item.merge_conflict = nil
-    item.fail_reason = nil
+    -- 部分应用：保留首条失败原因（区别于完全成功时的 nil），供界面/日志与回队单元展示。
+    item.fail_reason = (first_fail and first_fail.reason) or nil
     if pub.receipt then store.write_receipt(pub.receipt) end
     -- 已应用：部分取代增量已完成使命，清理（被取代路径由新单元持有）。
     item.superseded_paths = nil
@@ -1390,7 +1395,7 @@ local function _apply_settle(ctx, pub)
     logger.try("delete_review_removed", store.delete_review_removed, item.change_set_id)
     -- 仅应用了部分文件：其余文件（未选中 + 写入失败）保留待审，供用户逐个确认/重试。
     if #ctx.remaining > 0 then
-      local requeued = _requeue_remaining(item, ctx.remaining)
+      local requeued = _requeue_remaining(item, ctx.remaining, item.fail_reason)
       if not requeued then
         -- 回队异常（例如新建候选落盘失败）：显式告警，避免剩余文件「静默消失」无从排查。
         require("NeoAI.kernel.logger").warn(

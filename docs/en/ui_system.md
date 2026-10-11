@@ -160,6 +160,28 @@ reorders history, switching display modes, and window-width changes (table reflo
 render falls back to a full rewrite, avoiding diff writes based on stale line positions. The old behavior can be
 restored by setting `ui.chat.incremental = false`.
 
+### 4.3.2 Body Markdown rendering
+
+The chat buffer has filetype `neoai` (not `markdown`), so it does not attach treesitter or external Markdown
+plugins (e.g. `render-markdown.nvim`, `edit-markdown-table.nvim`); the body is parsed by
+`components.markdown_view` and shown as plain text plus highlights.
+
+To keep large bodies readable:
+
+- **Paragraph blank lines are kept**: `_append_content` no longer drops blank lines from the Markdown render
+  result, so separations between paragraphs / lists / code blocks survive (previously they were filtered out and
+  the whole body collapsed into one dense block).
+- **Indentation is kept**: body content lines are registered as "body lines" via `fold.set_body_lines`, and
+  `foldexpr` returns `0` (no fold) for them, so the leading indentation of code blocks / nested lists is preserved
+  verbatim instead of being mistaken for a reasoning / tool fold. The text itself is not rewritten (copying body
+  code does not inject placeholder characters). Registration happens together with reasoning lines before the
+  buffer is written (`_sync_fold_kinds`).
+- **Style highlights** (`MD_HL_NS`, `default=true` so colorschemes can override): headings `NeoAIHeading`
+  (links `Title`), list markers `NeoAIList` (only the bullet / ordinal span, links `Special`), quotes
+  `NeoAIQuote` (links `Comment`), code blocks `NeoAICode` (adaptive background slightly offset from `Normal`),
+  fences `NeoAICodeFence`, rules `NeoAIHr`. Table styles (`tbl`) still use the zebra-stripe namespace, and the two
+  do not interfere.
+
 ### 4.4 Folds
 
 The main window uses `expr` folds (`components.fold.foldexpr`); reasoning / each tool call block (call + result)
@@ -395,12 +417,13 @@ Following deepseek-harness's Cordis plugin model, the chat view's "display modes
 | `model_picker` | Model picker (asynchronously loads the model list). `open(callback)`. |
 | `tool_approval` | Tool approval popup. `init()`; serial single-slot display. |
 | `ask_user` | User questioning popup. `init()`; injected via `ask_user.set_ui`. |
-| `sub_agent_dock` | Sub-agent status monitoring. `init()`. |
+| `sub_agent_dock` | Sub-agent status monitoring. `init()`. The winbar identity row also shows sub-agent names (collapsed to `N个子agent正在运行` when wider than the window, see `services/status.sub_agents_segment`); `keymaps.chat.switch_sub_agent` (default `<leader>as`) opens a sub-agent session in a new window. |
+| `sub_agent_list` | Sub-agent list popup (borderless float, top-centered relative to the chat main window, toggled by `<leader>al`). `↑/↓`(k/j) move, `<CR>` enters the session, `q`/`<Esc>` closes; recomputes geometry on window resize. `open`/`close`/`toggle`/`is_open`/`reset`. |
 | `terminal_window` | Floating **interactive** terminal for interactive commands (`nvim_open_term` rendering; typing when focused is forwarded to the command). Opens per session id; **pops only when the chat cursor is following** (`show_window` controls timing: always = at session start / on_wait = only after the command has been running longer than `show_window_delay_ms` (default 2000ms) without finishing, so a fast command never flashes a window), and hides / re-pops on follow flips via `UI_FOLLOW_CHANGED` (see `services.pty`; each open renders a fresh `nvim_open_term` channel, so accumulated output is replayed on open to avoid a blank window); no-op in headless. Driven by `services.pty`. |
 | `sandbox_review` | Sandbox pending-review UI. `open()` (**opens even with no pending / approval / trace items, showing an empty view — no notice and no auto-close**; refreshing into an empty queue keeps the window open and new items are picked up by the event subscription); highlights by path level (workspace green / user yellow / system red) and shows high/medium/low risk grades; items are sectioned into **unapplied (pending)** and **applied (snapshotted, revertible)**. Per-file approval: `<CR>` applies the file under the cursor, `A` approves every workspace change in one key (files outside the workspace and host-operation proposals stay pending; yields to the main loop between items, shows progress in the title, and refuses re-entry while running), `d` rejects only that file, `i` opens that item's diff preview (returns with cursor restored), `u` undoes/redoes the save, `q` closes; on an **outside-access trace** row `i` opens the access detail (summary of tools/source/command count/first-last time, then per-access tool/kind/command/time), and on an **outside-command** row `i` opens the command detail (files that command accessed out of bounds); while open the window subscribes to sandbox broadcast events and refreshes automatically (multiple events in the same tick are coalesced). The applied section is collapsed by default (two-level fold); **a pending item shows its header line with the rest folded and can be expanded with `za`/`zo`** (header keeps the whole-unit approval entry and highlight), while the trace section does not fold. High-risk items (L3, and L2 package/sensitive installs when `package_confirm` is on) require an AI consequence warning plus a second `<CR>` in the diff. |
 | `fold` | Folds (shared implementation for reasoning/tool calls/results). `foldexpr`/`foldtext`/`record_start`/`record_end`/`has_running`/`set_live_timer`/`set_foldexpr_override`/`set_foldtext_override`/`set_reasoning_lines`/`is_reasoning_start`/`generic_label`. |
 | `display_modes/` | Display mode plugin manager + `chat.lua`/`trajectory.lua`. |
-| `markdown_view` | Markdown renderer. |
+| `markdown_view` | Markdown renderer (code blocks / inline code / headings / lists (incl. nested) / quotes / tables). Emits `style` tags (used by `message_list` for body highlights) and `tbl` (table zebra stripes). |
 
 ## 7. Keymaps (ui/keymap.lua)
 

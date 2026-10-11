@@ -690,6 +690,10 @@ tests.suite("sandbox_session", function(_, it)
       "~/.npm 应忽略")
     t.nil_(runtime.outside_workspace(home .. "/.cargo/registry/cache/x", "/root/proj"),
       "~/.cargo 应忽略")
+    -- 官方 Neovim 二进制编译期烙入 package.path/cpath 的构建前缀（本机通常不存在）应忽略
+    t.nil_(runtime.outside_workspace(
+      "/home/runner/work/neovim/neovim/.deps/usr/share/lua/5.1/lualine.lua", "/root/proj"),
+      "Neovim 构建期 .deps 路径应忽略")
     t.eq(home .. "/other/x", runtime.outside_workspace(home .. "/other/x", "/root/proj"),
       "非缓存 home 路径仍应命中")
   end)
@@ -870,6 +874,13 @@ tests.suite("sandbox_session", function(_, it)
         { file_path = p, description = "t", mode = "write", content = "eph\n" }, {}):then_(function()
           t.false_(fs.exists(p), "临时根写入不应落到真实磁盘")
           t.eq(0, #sandbox.list_reviews({ review_state = "PENDING" }), "临时根不应产生待审候选")
+          -- 只读留痕：临时根写入应在 list_ephemeral 可见（仅记录，不产生待审/发布）
+          local found = false
+          for _, e in ipairs(sandbox.list_ephemeral()) do
+            if type(e.path) == "string" and e.path:find("_eph.txt", 1, true) then found = true end
+          end
+          t.true_(found, "临时根写入应产生只读留痕")
+          t.true_(sandbox.ephemeral_count() >= 1, "临时写入留痕文件数应 >= 1")
           done = true
         end, function(e) t.true_(false, tostring(e and e.message or e)); done = true end)
       t.true_(vim.wait(8000, function() return done end), "edit_file 应完成")

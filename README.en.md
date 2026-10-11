@@ -776,10 +776,10 @@ one does). For risk levels and allowlists see the `approval` config and [docs/en
 
 | Tool name                 | Description                                                      | Parameters |
 | ---------------------- | --------------------------------------------------------- | -------- |
-| `create_sub_agent`     | Create a sub-agent to run a subtask (supports `foreground` to wait for the result in the foreground) | `task` (required) subtask description; `mode` (optional, `background` default / `foreground`); `model` (optional); `boundaries` (optional) `{allowed_tools, allowed_directories, allowed_commands, max_tool_calls, max_iterations}`; `context` (optional) extra context |
-| `wait_sub_agent`       | Wait for a sub-agent to finish and return the complete result (returns immediately if already finished)     | `sub_agent_id` (required) |
-| `get_sub_agent_status` | Query a sub-agent's status and result                                   | `sub_agent_id` (required) |
+| `create_sub_agent`     | Create a sub-agent to run a subtask (runs in background, returns immediately; **no polling needed** — the final body is delivered back automatically) | `task` (required) subtask description; `name` (optional short label); `model` (optional); `boundaries` (optional) `{allowed_tools, allowed_directories, allowed_commands, max_tool_calls, max_iterations}`; `context` (optional) extra context |
+| `get_sub_agent_status` | Query a sub-agent's status and result (normally not needed; only to check whether it is still running) | `sub_agent_id` (required) |
 | `cancel_sub_agent`     | Cancel a sub-agent                                              | `sub_agent_id` (required) |
+| `send_sub_agent_message` | Send a message to a sub-agent (extra instruction/follow-up)   | `sub_agent_id`, `message` (both required) |
 
 ### 📋 Todos and Plans
 

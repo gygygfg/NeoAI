@@ -2007,10 +2007,19 @@ local function _stdpath(kind)
   return nil
 end
 
+--- NeoAI 自身在工作区根生成的产物文件名（按 basename 匹配，任意目录）。
+--- 这些文件由插件/测试运行器持续重写（如并行测试运行器的耗时缓存 `.neoai_test_timings.json`，
+--- gitignored），并非用户意图修改的工作区文件；纳入候选后应用时基线必变
+--- （BASELINE_CHANGED/MERGE_CONFLICT），故与自身运行时一样不捕获、不冻结。
+local SELF_ARTIFACT_BASENAMES = {
+  [".neoai_test_timings.json"] = true,
+}
+
 --- NeoAI 自身运行时/状态目录匹配器。这些目录位于用户工作区之外、属于插件自身的持续写入
 --- （日志实时增长、会话/缓存/chromium/包等），不应被整机根 overlay 捕获为候选。
 --- 组成：`<cache>/NeoAI`、`<state>/NeoAI`、`<data>/NeoAI`，以及可配置的 `log.path`、
---- `tools.sandbox.workspace_root`（沙箱 store 基根）。结果按相关配置缓存。
+--- `tools.sandbox.workspace_root`（沙箱 store 基根）；另含插件在工作区内生成的产物文件
+--- （`SELF_ARTIFACT_BASENAMES`，如测试运行器耗时缓存）。结果按相关配置缓存。
 --- @return function(path:string)->boolean
 local function _self_runtime_matcher()
   local log_cfg = config_store.get("log")
@@ -2041,15 +2050,19 @@ local function _self_runtime_matcher()
     for _, r in ipairs(roots) do
       if path == r or path:sub(1, #r + 1) == r .. "/" then return true end
     end
+    -- 工作区内插件自生成产物（按文件名）：持续重写，冻结为候选后基线必变（CONFLICT）。
+    local base = path:match("[^/]+$")
+    if base and SELF_ARTIFACT_BASENAMES[base] then return true end
     return false
   end
   state.self_runtime_cache = { key = key, fn = fn, roots = roots }
   return fn
 end
 
---- 路径是否属于 NeoAI 自身运行时/状态（日志、会话、缓存、沙箱 store 等）。
---- 这些路径绝不纳入沙箱候选：整机根 overlay 会捕获会话期间写入它们的内容，而日志/会话在持续
---- 增长，应用时 CAS 基线必然已变（CONFLICT/BASELINE_CHANGED），会否决**整个**变更单元。
+--- 路径是否属于 NeoAI 自身运行时/状态（日志、会话、缓存、沙箱 store 等），或插件在工作区内
+--- 生成的产物文件（如测试运行器耗时缓存 `.neoai_test_timings.json`）。
+--- 这些路径绝不纳入沙箱候选：整机根 overlay 会捕获会话期间写入它们的内容，而日志/会话/测试
+--- 缓存持续被重写，应用时 CAS 基线必然已变（CONFLICT/BASELINE_CHANGED），会否决**整个**变更单元。
 --- @param path string|nil 绝对路径
 --- @return boolean
 function M.is_self_runtime_path(path)
@@ -2312,6 +2325,9 @@ local DEFAULT_TRACE_IGNORE_PATHS = {
   "~/.cargo", "~/.rustup", "~/go/pkg",
   "~/.gradle", "~/.m2", "~/.nuget/packages", "~/.gem",
   "~/.local/share/uv", "~/.local/share/pipx",
+  -- 官方 Neovim 二进制编译期烙入 `package.path`/`package.cpath` 的构建前缀（GitHub Actions
+  -- 检出目录），本机通常不存在，`require` 探测未安装模块时会命中。
+  "/home/runner/work/neovim/neovim/.deps",
 }
 
 --- 越界留痕忽略匹配器：合并 `tools.sandbox.observe.trace_ignore_paths`（默认

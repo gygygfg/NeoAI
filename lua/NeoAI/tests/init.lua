@@ -165,6 +165,12 @@ end
 
 -- ========== 运行器 ==========
 
+--- 是否输出逐用例明细（默认安静：仅失败 + 套件摘要；NEOAI_TEST_VERBOSE=1 还原）。
+--- @return boolean
+local function _verbose()
+  return vim.env.NEOAI_TEST_VERBOSE == "1"
+end
+
 local function _run_suite(suite)
   local passed, failed = 0, 0
   local errors = {}
@@ -185,7 +191,7 @@ local function _run_suite(suite)
     if only and only ~= "" and not _matches_any(only, test.name) then selected = false end
     if skip and skip ~= "" and _matches_any(skip, test.name) then selected = false end
     if not selected then
-      print("  ↷ " .. test.name)
+      if _verbose() then print("  ↷ " .. test.name) end
     else
       local ok, err = xpcall(function()
         if suite.before_each then
@@ -200,7 +206,7 @@ local function _run_suite(suite)
       end, debug.traceback)
       if ok then
         passed = passed + 1
-        print(("  ✓ %s"):format(test.name))
+        if _verbose() then print(("  ✓ %s"):format(test.name)) end
       else
         failed = failed + 1
         local err_str = _fmt_err(err)
@@ -300,7 +306,27 @@ local function _install_test_defaults()
   return function() config_store.load = orig_config_load end
 end
 
---- 动态加载所有 test_*.lua 文件（幂等；require 缓存）。
+--- 读取按分片加载过滤器（子进程由 `_isolated_script` 注入 NEOAI_TEST_MODULES）。
+--- 未设置 → 返回 nil（加载全部）；设置 → 返回 { [模块名或基名] = true }。
+--- @return table|nil
+local function _module_filter()
+  local raw = vim.env.NEOAI_TEST_MODULES
+  if not raw or raw == "" then return nil end
+  local set = {}
+  for part in raw:gmatch("[^,]+") do
+    part = part:gsub("^%s+", ""):gsub("%s+$", "")
+    if part ~= "" then
+      set[part] = true
+      set["NeoAI.tests." .. part] = true
+    end
+  end
+  if next(set) == nil then return nil end
+  return set
+end
+
+--- 动态加载 test_*.lua 文件（幂等；require 缓存）。
+--- 子进程可通过 NEOAI_TEST_MODULES 限定「仅加载本分片套件文件」，避免每 worker 全量 require
+--- 全部测试模块（减轻子进程主线程的加载与内存开销）。
 --- @param all_errors table 收集加载失败消息
 --- @return number 加载失败的模块数
 local function _load_test_modules(all_errors)
@@ -310,13 +336,21 @@ local function _load_test_modules(all_errors)
     test_dir = "/root/NeoAI/lua/NeoAI/tests"
   end
   local files = vim.fn.glob(test_dir .. "/test_*.lua", false, true)
+  local only = _module_filter()
   local load_failed = 0
   for _, file in ipairs(files) do
-    local mod_name = "NeoAI.tests." .. vim.fn.fnamemodify(file, ":t:r")
-    if vim.fn.fnamemodify(file, ":t") ~= "init.lua" then
+    local base = vim.fn.fnamemodify(file, ":t:r")
+    local mod_name = "NeoAI.tests." .. base
+    if vim.fn.fnamemodify(file, ":t") ~= "init.lua"
+      and (only == nil or only[mod_name] or only[base]) then
       local suite_count = #state.suites
       local ok, err = pcall(require, mod_name)
-      if not ok then
+      if ok then
+        -- 记录套件来源模块，供发现阶段输出 name→module 映射（按分片加载）。
+        for i = suite_count + 1, #state.suites do
+          state.suites[i].module = mod_name
+        end
+      else
         -- 模块中途抛错时撤销已注册的半成品套件。
         while #state.suites > suite_count do table.remove(state.suites) end
         state.current_suite = nil
@@ -351,7 +385,7 @@ function M.list_suites()
   restore_defaults()
   local out = {}
   for _, suite in ipairs(state.suites) do
-    out[#out + 1] = { name = suite.name, cases = #suite.tests }
+    out[#out + 1] = { name = suite.name, cases = #suite.tests, module = suite.module }
   end
   return out, all_errors
 end
@@ -363,6 +397,7 @@ function M.run_all(...)
   local requested = { ... }
   local total_passed, total_failed = 0, 0
   local all_errors = {}
+  local suite_timings = {}
 
   local restore_defaults = _install_test_defaults()
 
@@ -416,7 +451,9 @@ function M.run_all(...)
 
   local ok_run, run_err = xpcall(function()
     print(string.format("\n=== NeoAI 测试 (%d 套件) ===", #suites_to_run))
+    local suite_index = 0
     for _, suite in ipairs(suites_to_run) do
+      suite_index = suite_index + 1
       print("▶ " .. suite.name)
       -- 每个套件独立重定向目录 + 清空内存会话，杜绝跨套件残留。
       local suite_dir = vim.fn.tempname() .. "-NeoAI-suite"
@@ -427,14 +464,19 @@ function M.run_all(...)
       --   1) 配置重置为测试默认（某些套件直接 config_store.load 改 providers/tools 后未恢复）；
       --   2) 重新启动被 stop_all 的插件（幂等，无操作时几乎零开销）；
       --   3) 重建工具注册表（某些套件 registry.reset 后未恢复，会掏空后续套件的工具集）。
-      pcall(function()
-        require("NeoAI.kernel.config_store").load({})
-        require("NeoAI.kernel.plugins").start_all()
-      end)
-      pcall(function() require("NeoAI.tools").reload_tools() end)
+      -- 首个套件运行在全新 worker 上（配置已是测试默认、插件已 start、工具表刚构建），
+      -- 此三重重置是冗余开销，跳过以减轻子进程主线程负担；后续套件仍逐套件重置。
+      if suite_index > 1 then
+        pcall(function()
+          require("NeoAI.kernel.config_store").load({})
+          require("NeoAI.kernel.plugins").start_all()
+        end)
+        pcall(function() require("NeoAI.tools").reload_tools() end)
+      end
       local suite_t0 = vim.uv.hrtime()
       local p, f, errs = _run_suite(suite)
       local suite_ms = (vim.uv.hrtime() - suite_t0) / 1e6
+      suite_timings[suite.name] = suite_ms
       print(("TIMING %s %.1f"):format(suite.name, suite_ms))
       total_passed = total_passed + p
       total_failed = total_failed + f
@@ -454,7 +496,7 @@ function M.run_all(...)
   end
 
   print(string.format("\n=== 结果: %d 通过, %d 失败 ===", total_passed, total_failed))
-  return { passed = total_passed, failed = total_failed, errors = all_errors }
+  return { passed = total_passed, failed = total_failed, errors = all_errors, timings = suite_timings }
 end
 
 -- ========== 隔离子进程运行 ==========
@@ -467,8 +509,11 @@ end
 
 --- 子进程预置脚本（注入套件名）
 --- @param names table 套件名数组
---- @param opts table|nil { mcp_cache_path?: string } 可选：为子进程注入独立 MCP 缓存路径，
----        避免并行 worker 争用同一 `mcp.cache_path`。
+--- @param opts table|nil {
+---   mcp_cache_path?: string, 为子进程注入独立 MCP 缓存路径，避免并行 worker 争用；
+---   modules?: string[],       仅加载这些测试模块（按分片加载，减轻子进程主线程开销）；
+---   result_path?: string,     结果 sidecar 落盘路径（JSON：passed/failed/errors/timings）；
+--- }
 --- @return string
 function M._isolated_script(names, opts)
   opts = opts or {}
@@ -481,10 +526,23 @@ function M._isolated_script(names, opts)
     setup = setup .. ', mcp = { cache_path = ' .. string.format("%q", tostring(opts.mcp_cache_path)) .. " }"
   end
   setup = setup .. " })"
+  -- 按分片加载：把本分片的测试模块名注入环境变量（逗号分隔）。
+  local modules_literal = "nil"
+  if opts.modules and #opts.modules > 0 then
+    local mq = {}
+    for _, m in ipairs(opts.modules) do
+      mq[#mq + 1] = string.format("%q", tostring(m))
+    end
+    modules_literal = "{" .. table.concat(mq, ", ") .. "}"
+  end
+  local result_literal = opts.result_path and string.format("%q", tostring(opts.result_path)) or "nil"
   return table.concat({
     "-- NeoAI 隔离测试子进程（自动生成，勿手改）",
     setup,
     "local names = {" .. table.concat(quoted, ", ") .. "}",
+    "local modules = " .. modules_literal,
+    "local result_path = " .. result_literal,
+    "if modules then vim.env.NEOAI_TEST_MODULES = table.concat(modules, ',') else vim.env.NEOAI_TEST_MODULES = nil end",
     "-- SIGTERM 兜底：父进程超时/中止（jobstop）时，nvim 在信号下不执行 VimLeavePre，",
     "-- 需显式自清插件（关闭沙箱常驻/PTY 等后代），否则脱离父进程组的后代被 init 收养而残留。",
     "do",
@@ -504,6 +562,17 @@ function M._isolated_script(names, opts)
     'print(("SUMMARY passed=%d failed=%d"):format(r.passed, r.failed))',
     "for _, e in ipairs(r.errors or {}) do",
     '  io.stdout:write("ERROR:: " .. tostring(e) .. "\\n")',
+    "end",
+    "-- 结果 sidecar：父端只读小 JSON，避免缓冲/扫描整段 stdout。",
+    "if result_path then",
+    "  local okj, enc = pcall(vim.json.encode, {",
+    "    passed = r.passed, failed = r.failed,",
+    "    errors = r.errors or {}, timings = r.timings or {},",
+    "  })",
+    "  if okj then",
+    "    local rf = io.open(result_path, 'w')",
+    "    if rf then rf:write(enc); rf:close() end",
+    "  end",
     "end",
   }, "\n")
 end
