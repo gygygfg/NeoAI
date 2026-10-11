@@ -39,16 +39,17 @@ local function _ensure_section()
   if ok then section_unregister = unreg end
 end
 
---- 持久化已装载技能为 agent 级提示段（config.skills.persist_loaded）
+--- 持久化已装载技能使其常驻上下文（config.skills.persist_loaded）。
+--- 不回写系统提示（那会让整段前缀缓存失效、历史每轮全量重算）；改为记录到 agent 状态，
+--- 由运行时上下文快照以「追加扩展」方式注入历史末尾（见 core/session/runtime_context）。
 --- @param ctx table
 --- @param skill table|nil
 local function _persist_agent_section(ctx, skill)
   if not ctx or not ctx.agent or not skill then return end
   local cfg = config_store.get("skills") or {}
   if not cfg.persist_loaded then return end
-  pcall(prefix.register_agent_section, ctx.agent, "agent:skill:" .. skill.name, 95, function()
-    return ("## 已装载技能：%s\n\n%s"):format(skill.name, skill.content)
-  end)
+  ctx.agent._loaded_skills = ctx.agent._loaded_skills or {}
+  ctx.agent._loaded_skills[skill.name] = skill.content
 end
 
 -- ========== 工具定义 ==========

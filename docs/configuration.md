@@ -21,7 +21,8 @@
 | `reset()` | 重置（测试用）。 |
 
 `load` 的校验逻辑：检查 `ai.default_provider`、`ai.providers` 各 provider 的 `base_url`、
-`ai.modes` 结构，收集错误并记日志（不阻断）。
+`ai.modes` 结构，收集错误并记日志（不阻断）。当存在校验错误时（且日志未静默），会额外
+以 `vim.notify` 提示一次并指引运行 `:NeoAIDoctor`；错误明细可用 `config_store.validation_errors()` 读取。
 
 ## 2. 配置结构
 
@@ -33,6 +34,7 @@
 | --- | --- | --- |
 | `default_provider` | `"deepseek"` | 默认提供商 |
 | `default_model` | `"auto"` | "auto" = 使用 registry 解析默认模型 |
+| `auto_select_provider` | `false` | 为 `true` 时，若 `default_provider` 未配置 `api_key` 而其他 provider 已配置，则自动回退到第一个已配置 Key 的 provider（按名排序，确定性）；原选择记录于 `ai._configured_provider` |
 | `providers` | 13+ 家 | provider 定义：`api_type`（openai/anthropic/google）、`base_url`、`api_key`、`fetch_models`、`models_override` |
 | `model_refresh` | `{on_startup=true, interval_sec=3600, timeout_ms=10000}` | 模型列表刷新 |
 | `modes` | `{chat, plan, auto}` | 按模式 → `{provider, model, temperature, stream}`（可选 `max_tokens`）；进入该模式时应用。`max_tokens` 缺省不配置即不发送 |
@@ -134,6 +136,7 @@ context_cache = {
 | `tree` | `{foldenable=false, ...auto_close_on_select=true}` | 会话树折叠/自动关闭 |
 | `input_box` | `{idle_height=1, min_height=5, max_ratio=0.8}` | 输入框高度（空闲/聚焦/增长上限） |
 | `chat` | `{mousescroll_max_blank=3, incremental=true}` | 鼠标滚轮滚到底时末行下方允许的最大空白行数（0=严格贴底）；`incremental` 开启增量刷新（只重渲染变化的消息块且只写差异行），设为 `false` 降级回整 buffer 全量重写 |
+| `ask_user` | `{batch_debounce_ms=25, require_confirm=true}` | 向用户提问弹窗：`batch_debounce_ms` 为同一轮多次提问的聚合去抖窗口（毫秒，覆盖兄弟调用到达时序；越大越全但首弹越慢）；`require_confirm` 为全部作答后是否展示汇总页二次确认（`false` 时直接提交） |
 | `trajectory` | `{log_dir=".../NeoAI/logs"}` | 轨迹显示模式的日志保存目录 |
 | `statusline` | `{enabled=true, winbar=true, parts={mode,model,usage,cache,capacity,sandbox}, separator=" ", colors=...}` | lualine 状态栏；`sandbox` 段在沙箱待审数 > 0 时显示 `待审N`（`N` 为待审**文件**总数，审批单位为单个文件），默认链接醒目高亮组 `NeoAISandboxPending`（黄底加粗，可在 `colors.sandbox` 覆盖）；待审队列含 **L3（高危）** 时该段追加 `⚠危险` 并切换为红色危险高亮组 `NeoAISandboxDanger`（可在 `colors.sandbox_danger` 覆盖）；存在**越界访问留痕**时该段追加 `越界N`（`N` 为去重文件数，两者都有时并列显示，如 `待审2 越界3`）；`usage` 段显示**会话累计**输入/输出 token（`↑` 输入合计、`↓` 输出合计，不随单次请求跳变），`cache` 段显示**累计**缓存命中率并保留**两位小数**（如 `缓存命中95.32%`） |
 

@@ -17,7 +17,7 @@ local CLEARED_TEXT = "当前运行上下文：无。更早的运行上下文快�
 
 -- ========== 私有函数 ==========
 
---- 渲染当前运行上下文（todos + 计划模式），空则返回 ""
+--- 渲染当前运行上下文（todos + 计划模式 + 已装载技能），空则返回 ""
 --- @param agent table
 --- @return string
 local function _render(agent)
@@ -31,6 +31,26 @@ local function _render(agent)
   local plan_mode = require("NeoAI.tools.builtin.plan_mode")
   if plan_mode.is_active(agent) then
     blocks[#blocks + 1] = plan_mode.policy_text()
+  end
+  -- 已装载技能（skills.persist_loaded）：以快照方式常驻而非改写系统提示——改写系统提示会让
+  -- 整段前缀缓存失效（历史每轮全量重算）。按技能名排序保证确定性。
+  local sk_cfg = require("NeoAI.kernel.config_store").get("skills") or {}
+  if sk_cfg.persist_loaded and agent and agent._loaded_skills then
+    local names = {}
+    for name in pairs(agent._loaded_skills) do names[#names + 1] = name end
+    if #names > 0 then
+      table.sort(names)
+      local parts = {}
+      for _, name in ipairs(names) do
+        local body = agent._loaded_skills[name]
+        if body and body ~= "" then
+          parts[#parts + 1] = ("### 技能 %s\n\n%s"):format(name, body)
+        end
+      end
+      if #parts > 0 then
+        blocks[#blocks + 1] = "已常驻技能（已装载，步骤指引随上下文常驻）：\n\n" .. table.concat(parts, "\n\n")
+      end
+    end
   end
   if #blocks == 0 then return "" end
   return SNAPSHOT_PREFIX .. "\n\n" .. table.concat(blocks, "\n\n")

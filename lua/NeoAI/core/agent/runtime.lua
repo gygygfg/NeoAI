@@ -86,10 +86,13 @@ local function _run_generation(agent, _)
     agent._turn_claim = nil
     agent:set_state("idle")
     -- 上下文压力提示（状态栏变色 + notify；同一级别去重）
-    pcall(function()
+    local ok_p, err_p = pcall(function()
       local status = services.use("services.status")
       if status then status.check_pressure(agent) end
     end)
+    if not ok_p then
+      require("NeoAI.kernel.logger").debug("[runtime] check_pressure 失败: %s", tostring(err_p))
+    end
     event_bus.emit(events.GENERATION_COMPLETED, { agent_id = agent.id, message = message })
     return message
   end
@@ -306,10 +309,13 @@ function M.run(agent, content, opts)
   event_bus.emit(events.MESSAGE_SENT, { agent_id = agent.id, content = content })
   -- 上下文压缩改为后台异步：达到压力阈值时在后台生成摘要（折叠第一轮至倒数第二轮），
   -- 不阻塞本轮请求；完成后覆盖层对后续请求与再次压缩生效。压力提示保持原样。
-  pcall(function()
+  local ok_p2, err_p2 = pcall(function()
     local status = services.use("services.status")
     if status then status.check_pressure(agent) end
   end)
+  if not ok_p2 then
+    require("NeoAI.kernel.logger").debug("[runtime] check_pressure 失败: %s", tostring(err_p2))
+  end
   local compactor = require("NeoAI.core.session.compactor")
   compactor.start_background(agent, { allow_busy = true })
   return _run_generation(agent, {}):finally(function()

@@ -63,11 +63,8 @@ local function _run_plan_extract(agent)
     agent._plan_distilled = true
     local steps = res.steps or {}
     if #steps > 0 then
+      -- 统一经服务定位器获取（缺失即降级，不回退默认模块——见 AGENTS §1）。
       local tool_service = services.use("services.tool_service")
-      if not tool_service then
-        local ok_req, ts = pcall(require, "NeoAI.services.tool_service")
-        if ok_req then tool_service = ts end
-      end
       if tool_service then
         local todos = {}
         for _, s in ipairs(steps) do todos[#todos + 1] = { content = s, status = "pending" } end

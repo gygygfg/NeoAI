@@ -336,9 +336,12 @@ local function _request(inst, kind, payload, opts)
   local id = tostring(inst.seq)
   local pending = { id = id, chunks = {} }
   local done = false
+  -- 取消订阅句柄：settle 时统一反注册，避免 agent.signal（长生命周期）上监听器无界增长。
+  local unsub = function() end
   local function settle(res)
     if done then return end
     done = true
+    unsub()
     if inst.pendings[id] == pending then inst.pendings[id] = nil end
     d:resolve(res)
   end
@@ -367,7 +370,7 @@ local function _request(inst, kind, payload, opts)
   end
 
   if opts.signal then
-    opts.signal:subscribe(function(reason)
+    unsub = opts.signal:subscribe(function(reason)
       if done then return end
       pending.aborted = true
       pending.abort_message = reason

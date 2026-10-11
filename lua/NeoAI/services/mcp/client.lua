@@ -30,6 +30,17 @@ local function _rpc_error(code, message, err_data)
   return { code = code, message = message or "", data = err_data }
 end
 
+--- 关闭挂起请求的超时定时器（stop + close，释放 libuv 句柄；幂等）。
+--- 若不关闭，每个请求都会让一个句柄滞留到 timeout_ms（默认 60s），高并发时会累积。
+--- @param entry table
+local function _close_timer(entry)
+  if not entry or not entry.timer then return end
+  local t = entry.timer
+  entry.timer = nil
+  pcall(function() t:stop() end)
+  pcall(function() t:close() end)
+end
+
 -- ========== 构造函数 ==========
 
 --- 创建 MCP 客户端
@@ -67,6 +78,7 @@ function M._on_transport_exit(self, code)
   self.initialized = false
   for id, entry in pairs(self.pending) do
     entry.cancelled = true
+    _close_timer(entry)
     if entry.d:is_pending() then
       entry.d:reject({ kind = "disconnected", code = -1, message = "MCP 传输已断开", method = entry.method })
     end
@@ -109,6 +121,7 @@ function M._handle_response(self, id, result, err)
   if not entry then return end
   self.pending[id] = nil
   entry.cancelled = true
+  _close_timer(entry)
   if err then
     local e = {
       kind = "mcp",
@@ -130,7 +143,10 @@ function M._dispatch_notification(self, method, params)
   local handlers = self.notification_handlers[method]
   if handlers then
     for _, h in ipairs(handlers) do
-      pcall(h, params or {})
+      local ok, err = pcall(h, params or {})
+      if not ok then
+        logger.warn("[mcp] 通知处理器异常 %s: %s", method, tostring(err))
+      end
     end
   else
     logger.debug("[mcp] %s 收到未处理通知: %s", self.name, method)
@@ -228,18 +244,19 @@ function M.request(self, method, params, opts)
   local entry = { d = d, method = method, timeout_ms = opts.timeout_ms or self.timeout_ms, cancelled = false }
   self.pending[id] = entry
 
-  -- 超时：发 cancelled 通知 + reject。
-  -- 注意：vim.defer_fn 返回 libuv 定时器（userdata），无法用 vim.fn.timer_stop 取消，
-  -- 故用 entry.cancelled 标志位兜底（响应到达/手动取消时置位，回调即成为 no-op）。
-  local timer = vim.defer_fn(function()
+  -- 超时：可取消的 libuv 定时器（响应到达/手动取消时 _close_timer 释放句柄），
+  -- 避免 defer_fn 的句柄滞留到 timeout_ms。
+  local timer = vim.uv.new_timer()
+  entry.timer = timer
+  timer:start(entry.timeout_ms, 0, vim.schedule_wrap(function()
+    _close_timer(entry)
     if entry.cancelled or not entry.d:is_pending() then return end
     entry.cancelled = true
     self.pending[id] = nil
     -- 通知服务器取消该请求
     self:notify("notifications/cancelled", { requestId = id, reason = "timeout" })
     d:reject({ kind = "timeout", code = -2, message = "MCP 请求超时: " .. tostring(method), method = method })
-  end, entry.timeout_ms)
-  entry.timer = timer
+  end))
 
   -- 绑定取消信号（AbortSignal）
   local unsubs = {}
@@ -249,6 +266,7 @@ function M.request(self, method, params, opts)
       if pending then
         pending.cancelled = true
         self.pending[id] = nil
+        _close_timer(pending)
         self:notify("notifications/cancelled", { requestId = id, reason = tostring(reason) })
         d:reject({ kind = "cancelled", code = -2, message = "MCP 请求已取消: " .. tostring(method), method = method })
       end
@@ -324,6 +342,7 @@ function M.close(self, opts)
   -- 拒绝所有挂起请求
   for id, entry in pairs(self.pending) do
     entry.cancelled = true
+    _close_timer(entry)
     if entry.d:is_pending() then
       entry.d:reject({ kind = "mcp", code = -1, message = "MCP 连接已关闭", method = entry.method })
     end

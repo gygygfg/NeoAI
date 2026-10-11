@@ -14,6 +14,20 @@ local M = {}
 
 -- ========== 私有函数 ==========
 
+--- 容错执行清理/副作用；失败记日志（这些 pcall 位于 spec.stop 内层，若不记录则会被
+--- plugins.stop 外层的 pcall 视为成功而静默吞没，令卸载残留难以定位）。
+--- @param label string 诊断标签
+--- @param fn function
+--- @param ... any
+--- @return boolean ok
+local function _safe(label, fn, ...)
+  local ok, err = pcall(fn, ...)
+  if not ok then
+    require("NeoAI.kernel.logger").warn("[catalog] %s 失败: %s", label, tostring(err))
+  end
+  return ok
+end
+
 --- 判断插件是否被配置禁用
 --- @param cfg table plugins 配置
 --- @param id string
@@ -91,8 +105,8 @@ local function _service_specs()
         })
       end,
       stop = function()
-        pcall(function() require("NeoAI.core.agent.sub_agent").shutdown() end)
-        pcall(require("NeoAI.kernel.core_bridge").reset)
+        _safe("sub_agent.shutdown", function() require("NeoAI.core.agent.sub_agent").shutdown() end)
+        _safe("core_bridge.reset", require("NeoAI.kernel.core_bridge").reset)
       end,
     },
     {
@@ -122,9 +136,9 @@ local function _service_specs()
         require("NeoAI.sandbox").init()
       end,
       stop = function()
-        pcall(require("NeoAI.kernel.llm_bridge").reset)
-        pcall(require("NeoAI.kernel.sandbox_bridge").reset)
-        pcall(require("NeoAI.sandbox").shutdown)
+        _safe("llm_bridge.reset", require("NeoAI.kernel.llm_bridge").reset)
+        _safe("sandbox_bridge.reset", require("NeoAI.kernel.sandbox_bridge").reset)
+        _safe("sandbox.shutdown", require("NeoAI.sandbox").shutdown)
       end,
     },
     { id = "services.model_service", module = "NeoAI.services.model_service", service = "services.model_service" },

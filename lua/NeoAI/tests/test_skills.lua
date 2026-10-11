@@ -87,6 +87,26 @@ tests.suite("skills", function(_, it, before_each)
     t.true_(s.body:find("first-body", 1, true) ~= nil, "路径在前者优先")
   end)
 
+  it("段文本记忆化：同索引复用，重扫描后刷新", function(t)
+    local root = _make_root({
+      { dir = "a", content = "---\nname: skill-a\ndescription: 技能A\n---\nbody-a" },
+    })
+    config_store.load({ skills = { paths = { root } } })
+    local skills = require("NeoAI.services.skills")
+    skills.reset()
+    skills.init()
+    local first = skills.summary_text()
+    t.eq(first, skills.summary_text(), "同索引应复用同一串")
+    t.true_(first:find("skill-a", 1, true) ~= nil)
+    -- 新增技能后重扫描：段文本应刷新（记忆化失效）
+    vim.fn.mkdir(root .. "/b", "p")
+    fs.write_file(root .. "/b/SKILL.md", "---\nname: skill-b\ndescription: 技能B\n---\nbody-b")
+    skills.reload()
+    local second = skills.summary_text()
+    t.true_(second:find("skill-b", 1, true) ~= nil, "重扫描后应含新技能")
+    t.ne(first, second)
+  end)
+
   it("max_skills_in_prompt 限制摘要列出数量", function(t)
     local root = _make_root({
       { dir = "s1", content = "---\nname: s1\n---\nbody1" },

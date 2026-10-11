@@ -17,7 +17,7 @@ local COMMANDS = {
   "NeoAISandboxApply", "NeoAISandboxApplyAll",
   "NeoAISandboxGrant", "NeoAISandboxRevoke", "NeoAISandboxPrune", "NeoAISandboxMetrics",
   "NeoAISandboxPublish", "NeoAISandboxReplay", "NeoAISandboxAudit", "NeoAISandboxAutoApprove",
-  "NeoAIHerderStatus", "NeoAIHerderConfig",
+  "NeoAIHerderStatus", "NeoAIHerderConfig", "NeoAIDoctor",
 }
 
 -- ========== 私有函数 ==========
@@ -571,6 +571,11 @@ function M.start()
     end
     vim.notify("[NeoAI] 用法: :NeoAIHerderConfig [show|install|uninstall]", vim.log.levels.WARN)
   end, { nargs = "?", desc = "查看/安装/卸载 Herder 展示增强配置片段" })
+
+  --- 环境诊断：Neovim 版本/curl/线程池/API key/沙箱能力/可选依赖 一站式汇总
+  _cmd("NeoAIDoctor", function()
+    require("NeoAI.health").doctor()
+  end, { desc = "NeoAI 环境诊断（等同 :checkhealth NeoAI 的摘要）" })
 
   return function()
     for _, name in ipairs(COMMANDS) do

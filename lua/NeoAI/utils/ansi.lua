@@ -32,6 +32,9 @@ end
 
 local hl_cache = {}
 local hl_count = 0
+-- 缓存上限：真彩/256 色输出可产生大量不同 SGR 组合，无上限会使缓存缓慢增长。
+-- 超限时整体清空（简单、低开销；高亮组名不复用亦无副作用——重解析会重建等价组）。
+local HL_CACHE_MAX = 512
 
 --- 由当前 SGR 状态构造（惰性创建）高亮组名；无任何属性时返回 nil（默认配色）。
 --- @param st table
@@ -48,6 +51,10 @@ local function _ensure_hl(st)
   }, "|")
   local cached = hl_cache[key]
   if cached then return cached end
+  if hl_count >= HL_CACHE_MAX then
+    -- 超限：清空缓存但保留递增计数（避免与既有高亮组名冲突）。
+    hl_cache = {}
+  end
   hl_count = hl_count + 1
   local name = "NeoAIAnsi_" .. tostring(hl_count)
   local spec = { default = true }

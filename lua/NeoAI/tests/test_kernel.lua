@@ -40,6 +40,36 @@ tests.suite("kernel", function(_, it, before_each)
     t.deep_eq({}, config.get("skills.paths"))
   end)
 
+  it("config_store 校验错误可读取（供 doctor/测试）", function(t)
+    local config_store = require("NeoAI.kernel.config_store")
+    -- 经合并引入一个缺 base_url 的 provider → 触发校验错误
+    config_store.load({ log = { level = "OFF" }, ai = { providers = { neoai_bad_provider = {} } } })
+    local errs = config_store.validation_errors()
+    t.true_(#errs > 0, "缺 base_url 的 provider 应产生校验错误")
+    config_store.load({ log = { level = "OFF" } })
+  end)
+
+  it("auto_select_provider：默认关闭不改写；开启后回退到有 key 的 provider", function(t)
+    local config_store = require("NeoAI.kernel.config_store")
+    local function providers()
+      return {
+        neoai_a = { api_type = "openai", base_url = "http://a", api_key = "" },
+        neoai_b = { api_type = "openai", base_url = "http://b", api_key = "kb" },
+      }
+    end
+    -- 默认（关闭）：不改写用户显式选择
+    config_store.load({ log = { level = "OFF" }, ai = { default_provider = "neoai_a", providers = providers() } })
+    t.eq("neoai_a", config_store.get("ai.default_provider"))
+    -- 开启：默认 provider 无 key → 回退到有 key 者，并保留原始选择
+    config_store.load({
+      log = { level = "OFF" },
+      ai = { default_provider = "neoai_a", auto_select_provider = true, providers = providers() },
+    })
+    t.ne("neoai_a", config_store.get("ai.default_provider"), "应回退到有 key 的 provider")
+    t.eq("neoai_a", config_store.get("ai._configured_provider"), "应保留用户原始选择")
+    config_store.load({ log = { level = "OFF" } })
+  end)
+
   it("config_store watch 触发", function(t)
     local config_store = require("NeoAI.kernel.config_store")
     local fired = false

@@ -133,8 +133,11 @@ local function _request_inner(method, params, target)
       return
     end
     called = true
-    if timer and timer:is_active() then
-      pcall(timer.stop, timer)
+    -- 关闭定时器句柄（stop 只停止触发、不释放 libuv 句柄）：否则每个 LSP 请求都会
+    -- 泄漏一个 uv timer，长会话可能耗尽句柄/fd。
+    if timer then
+      pcall(function() timer:stop() end)
+      pcall(function() timer:close() end)
     end
     if ok_ then
       d:resolve(value)

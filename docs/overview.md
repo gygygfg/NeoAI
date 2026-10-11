@@ -159,6 +159,10 @@ lua/NeoAI/
 
 ## 安装
 
+**前置要求**：Neovim ≥ 0.10（推荐 0.13+，依赖 `vim.uv` 多线程 API）；建议安装 `curl`
+（HTTP 传输）；可选 `git`、`node`/`npm`（`web_fetch`）与沙箱内核能力（`bwrap`/`unshare`/`docker`）。
+安装后运行 `:NeoAIDoctor` 或 `:checkhealth NeoAI` 可一站式自检。
+
 使用 lazy.nvim：
 
 ```lua
@@ -169,6 +173,26 @@ lua/NeoAI/
   end
 }
 ```
+
+### 配置 API Key
+
+在环境变量中设置至少一个提供商的 Key：
+
+```bash
+export DEEPSEEK_API_KEY="your-api-key"   # 或 OPENAI_API_KEY / ANTHROPIC_API_KEY / ...
+```
+
+```lua
+require("NeoAI").setup({
+  ai = {
+    default_provider = "deepseek",
+    providers = { deepseek = { api_key = os.getenv("DEEPSEEK_API_KEY") } },
+  },
+})
+```
+
+> 未配置任何 Key 时启动会提示一次；`ai.auto_select_provider = true` 可在默认提供商缺
+> Key 时自动回退到已配置 Key 的提供商。
 
 > **启动模型（懒加载，默认，无需配置）**：`setup()` 只加载配置、引导内核、登记插件，并
 > 注册全部 `:NeoAI*` 命令与全局快捷键的占位符。首次触发时由 `NeoAI.ensure_phase1/ensure_started`
@@ -193,6 +217,7 @@ lua/NeoAI/
 :NeoAIPlan          " 切换 plan mode
 :NeoAIApprovePlan   " 批准 plan 并切换到 CHAT 模式
 :NeoAIStatusline    " 预览 lualine 状态栏组件内容
+:NeoAIDoctor        " 环境诊断（版本/curl/API Key/沙箱能力/可选依赖）
 ```
 
 ## Herder 终端状态集成

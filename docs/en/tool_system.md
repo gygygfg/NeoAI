@@ -273,8 +273,11 @@ dedicated tools above.
 `git_worktree` manages `git worktree` (`list`/`add`/`remove`/`move`/`prune`/`lock`/`unlock`/`repair`):
 `list` is read-only; mutations rewrite the main repo's `.git/worktrees/**` and the worktree `.git`
 file (both pointers), presented as an **atomic group** together with the worktree files. The worktree
-target must be under a writable root and outside `.git`/ephemeral roots (`worktree_guard`,
-fail-closed).
+target must be under a writable root and outside `.git`; a target under an ephemeral root
+(session-private, e.g. `/tmp`) is allowed but auto-cleaned when nvim exits (`lifecycle` shutdown
+hook) — the worktree directory is deleted and `git worktree prune` runs on the main repo, so no
+dangling entry is left in `.git/worktrees` (`worktree_guard` + `worktree_cleanup`; still fail-closed
+when `read_all=false` and the target is not covered by a writable root).
 
 ### 🔧 LSP (lsp_ops.lua, Neovim >= 0.12)
 
@@ -363,16 +366,29 @@ fail-closed).
 `ask_user`: pauses generation to ask the user a question; the answer comes back as the tool result. It emits
 `ASK_USER_WAITING`/`ASK_USER_ANSWERED`, and pauses the pausable timer while waiting. Options can be either strings
 or `{ label, description }` (label is a short option summary, description is the option description; the two are
-displayed separately in the popup and highlighted). Popup keys: digits `1-9` select an option directly,
-`i`/Enter opens free-text input; **`<Esc>` cancels only in NORMAL mode** (in INSERT mode `<Esc>` keeps its
-original meaning of leaving insert mode, so editing does not accidentally cancel the whole question — to give up,
-press `<Esc>` back to NORMAL and then `<Esc>` again). Only one question popup is shown at a time; multiple questions
-issued in parallel are queued in order (the next is shown after the previous is answered/cancelled), and they do not
-fail outright. **It does not pop up immediately when focus is not on the NeoAI UI**: the config is stashed and it
-waits (`ASK_USER_WAITING` is still emitted, so the Herder lifecycle shows `blocked`), then pops once the user
-switches back to the NeoAI UI (`UI_FOCUS_CHANGED` focused=true). The same mechanism applies to the blocking
-tool-approval (tool_approval), secret-alert (secret_alert) and network-consent (net_consent) popups (see the
-"Focus-aware interactive popups" section in [sandbox.md](sandbox.md)).
+displayed separately in the popup and highlighted).
+
+**Same-round aggregation (multi-tab popup)**: multiple `ask_user` calls issued concurrently within the same round
+(same `agent.id` and same `agent._round_seq`) are aggregated into **a single multi-tab popup** answered together
+(a debounce window `ui.ask_user.batch_debounce_ms`, default 25ms, covers sibling-call arrival timing); the top tab
+bar marks each question as answered with `✓/○`. Questions from different rounds form separate batches shown in
+order (they do not fail outright). Once all are answered it goes to a **summary page** (listing each `Q → A`), where
+`e` returns to editing or `y`/Enter submits all at once; if any question is still unanswered on submit, it warns and
+jumps back to the first unanswered tab. With `ui.ask_user.require_confirm=false` the summary page is skipped and it
+submits directly once all are answered.
+
+Each question accepts an optional `multi_select` (boolean, default false): when true the question allows multiple
+selections, returning the selected labels joined with `", "`; a single-select question returns the label string; and
+free-text input overrides it with plain text. Popup keys: digits `1-9` select/toggle an option, `<Tab>`/`<S-Tab>` (or
+`]`/`[`) switch tabs, `i`/Enter opens free-text input; **`<Esc>` cancels the whole batch only in NORMAL mode** (in
+INSERT mode `<Esc>` keeps its original meaning of leaving insert mode, so editing does not accidentally cancel — to
+give up, press `<Esc>` back to NORMAL and then `<Esc>` again). When no UI is registered it falls back to
+`vim.ui.input`, asking the multiple questions one by one in order. **It does not pop up immediately when focus is not
+on the NeoAI UI**: the config is stashed and it waits (`ASK_USER_WAITING` is still emitted per item, so the Herder
+lifecycle shows `blocked`), then pops once the user switches back to the NeoAI UI (`UI_FOCUS_CHANGED` focused=true).
+The same mechanism applies to the blocking tool-approval (tool_approval), secret-alert (secret_alert) and
+network-consent (net_consent) popups (see the "Focus-aware interactive popups" section in
+[sandbox.md](sandbox.md)).
 
 ### 🖼 Images (read_image.lua)
 

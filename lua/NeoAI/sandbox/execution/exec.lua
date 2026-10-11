@@ -46,13 +46,16 @@ local function _spawn(argv, opts)
   local stdout_chunks, stderr_chunks = {}, {}
   local done = false
   local job
+  -- 取消订阅句柄：settle 时统一反注册，避免 agent.signal（长生命周期）上监听器无界增长。
+  local unsub = function() end
   local function settle(res)
     if done then return end
     done = true
+    unsub()
     d:resolve(res)
   end
   if opts.signal then
-    opts.signal:subscribe(function(reason)
+    unsub = opts.signal:subscribe(function(reason)
       if opts.kill then pcall(opts.kill) end
       if job then pcall(vim.fn.jobstop, job) end
       settle({ code = -1, stdout = table.concat(stdout_chunks, "\n"), stderr = table.concat(stderr_chunks, "\n"), aborted = true, message = reason })
@@ -84,6 +87,7 @@ local function _spawn(argv, opts)
   })
   if job <= 0 then
     done = true
+    unsub()
     return async.reject({ kind = "sandbox", message = "无法启动工具子进程" })
   end
   return d

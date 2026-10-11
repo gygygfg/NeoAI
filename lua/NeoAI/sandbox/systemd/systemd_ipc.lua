@@ -106,15 +106,18 @@ local function _handle(dir, id)
 end
 
 --- @param dir string
+--- @return number 本次处理（或清理）的条目数
 local function _scan(dir)
   local h = vim.uv.fs_scandir(dir)
-  if not h then return end
+  if not h then return 0 end
   local now = os.time()
+  local handled = 0
   while true do
     local name, t = vim.uv.fs_scandir_next(h)
     if not name then break end
     local id = name:match("^req%.(.+)$")
     if id and t == "file" then
+      handled = handled + 1
       _handle(dir, id)
     elseif t == "file" and (name:match("^tmp%.") or name:match("^out%.") or name:match("^err%.")
         or name:match("^code%.") or name:match("^done%.")) then
@@ -122,9 +125,33 @@ local function _scan(dir)
       local st = vim.uv.fs_stat(dir .. "/" .. name)
       if st and (now - (st.mtime.sec or now)) > 120 then
         pcall(vim.uv.fs_unlink, dir .. "/" .. name)
+        handled = handled + 1
       end
     end
   end
+  return handled
+end
+
+-- 兜底扫描自适应节流：正常路径由 fs_event 驱动扫描，兜底定时器仅防事件合并/丢失。
+-- 空闲时长时间无请求仍每秒唤醒属于无谓开销，故空闲越久间隔越大（退避到 FAST..MAX）。
+local SCAN_FAST_MS = 1000
+local SCAN_MAX_MS = 10000
+local state_scan_ms = SCAN_FAST_MS
+
+--- 重新调度兜底定时器（一次性；回调内按需再次调度）
+local function _reschedule(dir)
+  local t = state.timer
+  if not t then return end
+  t:start(state_scan_ms, 0, vim.schedule_wrap(function()
+    if not state.started then return end
+    local handled = _scan(dir)
+    if handled > 0 then
+      state_scan_ms = SCAN_FAST_MS -- 有活动：恢复快频，紧跟后续请求
+    else
+      state_scan_ms = math.min(state_scan_ms * 2, SCAN_MAX_MS) -- 空闲：退避
+    end
+    _reschedule(dir)
+  end))
 end
 
 --- 启动 IPC 服务（幂等）。返回宿主目录；失败返回 nil。
@@ -133,16 +160,20 @@ function M.ensure()
   if state.started then return state.host_dir end
   state.host_dir = _host_dir()
   local dir = state.host_dir
+  state_scan_ms = SCAN_FAST_MS
   pcall(function()
     local h = vim.uv.new_fs_event()
-    h:start(dir, {}, vim.schedule_wrap(function() _scan(dir) end))
+    h:start(dir, {}, vim.schedule_wrap(function()
+      -- 事件到达：说明有新活动，恢复快频并立即扫描。
+      state_scan_ms = SCAN_FAST_MS
+      _scan(dir)
+    end))
     state.fs_handle = h
   end)
-  -- 兜底定时器：fs_event 可能合并/丢失事件。
+  -- 兜底定时器：fs_event 可能合并/丢失事件；空闲时自适应退避降低唤醒频率。
   pcall(function()
-    local t = vim.uv.new_timer()
-    t:start(1000, 1000, vim.schedule_wrap(function() _scan(dir) end))
-    state.timer = t
+    state.timer = vim.uv.new_timer()
+    _reschedule(dir)
   end)
   state.started = true
   return dir
@@ -182,6 +213,7 @@ function M.stop()
   pcall(function() if state.timer then state.timer:stop(); state.timer:close() end end)
   pcall(function() if state.socket_handle then state.socket_handle:close() end end)
   state.fs_handle, state.timer, state.socket_handle, state.started = nil, nil, nil, false
+  state_scan_ms = SCAN_FAST_MS
   if state.socket_path then pcall(vim.uv.fs_unlink, state.socket_path) end
   state.socket_path = nil
 end

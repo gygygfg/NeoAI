@@ -3014,13 +3014,16 @@ function M.run(argv, opts)
   local stdout, stderr = {}, {}
   local done = false
   local job
+  -- 取消订阅句柄：settle 时统一反注册，避免 agent.signal（长生命周期）上监听器无界增长。
+  local unsub = function() end
   local function settle(res)
     if done then return end
     done = true
+    unsub()
     d:resolve(res)
   end
   if opts.signal then
-    opts.signal:subscribe(function()
+    unsub = opts.signal:subscribe(function()
       if job then pcall(vim.fn.jobstop, job) end
       settle({ code = -1, stdout = table.concat(stdout, "\n"), stderr = table.concat(stderr, "\n"), aborted = true })
     end)
@@ -3050,6 +3053,8 @@ function M.run(argv, opts)
     end,
   })
   if job <= 0 then
+    done = true
+    unsub()
     return async.reject({ kind = "sandbox", message = "无法启动隔离进程" })
   end
   return d

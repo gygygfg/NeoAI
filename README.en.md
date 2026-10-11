@@ -36,6 +36,22 @@
 
 ---
 
+## 📋 Prerequisites
+
+| Dependency | Requirement | Notes |
+| --- | --- | --- |
+| Neovim | **>= 0.10** (0.13+ recommended) | Uses the `vim.uv` multithreading API; 0.13+ gives better external-file autoread |
+| curl | Recommended | **HTTP transport dependency**; without it requests may fail |
+| git | Optional | `git_*` tools and worktree management |
+| node / npm | Optional | `web_fetch` headless-browser rendering (off by default, auto-installed on first use) |
+| Sandbox kernel capabilities | Optional | `bwrap` / `unshare` / `docker`, etc.; when missing, tool sandbox isolation is limited |
+
+> Not sure whether your environment is ready? After installing, run **`:NeoAIDoctor`** or
+> **`:checkhealth NeoAI`** for a one-stop check of version, curl, API keys, sandbox capabilities
+> and optional dependencies.
+
+---
+
 ## 📦 Installation
 
 ### Using lazy.nvim
@@ -97,6 +113,9 @@ export OPENAI_API_KEY="your-api-key"
 export ANTHROPIC_API_KEY="your-api-key"
 ```
 
+> If no key is configured, a one-time hint appears after `setup()` on first start; run
+> `:NeoAIDoctor` anytime to re-check.
+
 ### 2. Initialize the plugin
 
 ```lua
@@ -141,6 +160,7 @@ require("NeoAI").setup({
 | `:NeoAISandboxDiag`| Show sandbox resource-domain / load diagnostics (137/OOM attribution) |
 | `:NeoAISandboxAudit`| Show the sandbox behavior-audit and risk-assessment summary |
 | `:NeoAISandboxAutoApprove`| Set auto-approval for new AI sessions (`on`/`off`/`status`, off by default) |
+| `:NeoAIDoctor` | Environment diagnostics (Neovim version / curl / API keys / sandbox capability / optional deps; same summary as `:checkhealth NeoAI`) |
 | `:NeoAIStatusline` | Preview the content of the current lualine statusline components |
 
 ### 4. Default Keymaps

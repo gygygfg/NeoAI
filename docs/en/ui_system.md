@@ -53,7 +53,7 @@ column `base_col`); thresholds/padding are currently hard-coded:
 `M.init()` is idempotent and registers three kinds of UI implementations:
 
 - **Approval UI**: `ui/components/tool_approval.init()` (injected via `tool_service.set_approval_ui`).
-- **User questioning UI**: `ui/components/ask_user.init()` (injected via `ask_user.set_ui`).
+- **User questioning UI**: `ui/components/ask_user.init()` (injected via `ask_user.set_ui`). Multiple questions within the same round are aggregated into **a single multi-tab popup** (the top tab bar marks answered/unanswered with `✓/○`; `<Tab>`/`<S-Tab>` or `]`/`[` switch tabs; `1-9` select/toggle; `i`/Enter opens free-text input; `multi_select` questions render `[x]/[ ]` checkboxes); once all are answered it goes to a **summary page** (`y`/Enter submits, `e` returns to editing, `Esc` cancels the whole batch).
 - **Sub-agent monitoring**: `ui/components/sub_agent_dock.init()`.
 
 `open_default()` opens the corresponding view according to `ui.default_view` (chat/tree).
@@ -416,7 +416,7 @@ Following deepseek-harness's Cordis plugin model, the chat view's "display modes
 | `lsp_guard` | LSP isolation for UI buffers. `install()`/`uninstall()`/`disable(buf)`; disables LSP/Copilot for `neoai*` filetypes and detaches attached clients (see §4.8). |
 | `model_picker` | Model picker (asynchronously loads the model list). `open(callback)`. |
 | `tool_approval` | Tool approval popup. `init()`; serial single-slot display. |
-| `ask_user` | User questioning popup. `init()`; injected via `ask_user.set_ui`. |
+| `ask_user` | User questioning popup. `init()`; injected via `ask_user.set_ui`. Multiple questions in the same round are aggregated into a single multi-tab window (the tab bar marks answered with `✓/○`), `multi_select` questions render as checkboxes, and once all are answered a summary page asks for a second confirmation (`e` returns to editing, `y`/Enter submits, Esc cancels the whole batch; see `ui.ask_user.*` config). |
 | `sub_agent_dock` | Sub-agent status monitoring. `init()`. The winbar identity row also shows sub-agent names (collapsed to `N个子agent正在运行` when wider than the window, see `services/status.sub_agents_segment`); `keymaps.chat.switch_sub_agent` (default `<leader>as`) opens a sub-agent session in a new window. |
 | `sub_agent_list` | Sub-agent list popup (borderless float, top-centered relative to the chat main window, toggled by `<leader>al`). `↑/↓`(k/j) move, `<CR>` enters the session, `q`/`<Esc>` closes; recomputes geometry on window resize. `open`/`close`/`toggle`/`is_open`/`reset`. |
 | `terminal_window` | Floating **interactive** terminal for interactive commands (`nvim_open_term` rendering; typing when focused is forwarded to the command). Opens per session id; **pops only when the chat cursor is following** (`show_window` controls timing: always = at session start / on_wait = only after the command has been running longer than `show_window_delay_ms` (default 2000ms) without finishing, so a fast command never flashes a window), and hides / re-pops on follow flips via `UI_FOLLOW_CHANGED` (see `services.pty`; each open renders a fresh `nvim_open_term` channel, so accumulated output is replayed on open to avoid a blank window); no-op in headless. Driven by `services.pty`. |

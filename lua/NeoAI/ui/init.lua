@@ -6,6 +6,7 @@ local window_manager = require("NeoAI.ui.window.manager")
 local chat_view = require("NeoAI.ui.window.chat_view")
 local tree_view = require("NeoAI.ui.window.tree_view")
 local config_store = require("NeoAI.kernel.config_store")
+local logger = require("NeoAI.kernel.logger")
 
 local M = {}
 
@@ -14,6 +15,17 @@ local M = {}
 local state = {
   initialized = false,
 }
+
+--- 带日志的惰性初始化：失败时记录原因（避免「审批静默无弹窗」类问题难以定位）。
+--- @param name string 组件名
+--- @param fn function 初始化函数
+local function _try_init(name, fn)
+  local ok, err = pcall(fn)
+  if not ok then
+    logger.warn("[ui] 组件初始化失败 %s: %s", name, tostring(err))
+  end
+  return ok
+end
 
 -- ========== 公开 API ==========
 
@@ -25,18 +37,18 @@ function M.init()
   -- 隔离 LSP/Copilot：禁止其挂载到 NeoAI 界面 buffer（纯 UI 文本，挂载会空耗 CPU）
   require("NeoAI.ui.lsp_guard").install()
   -- 焦点信号：跟踪「用户是否在看 NeoAI 界面」，供 pty/ask_user 延迟弹窗与审批窗刷新。
-  pcall(function() require("NeoAI.ui.focus").install() end)
+  _try_init("focus", function() require("NeoAI.ui.focus").install() end)
   -- 注册审批 UI
   local approval_ui = require("NeoAI.ui.components.tool_approval")
   approval_ui.init()
   -- 注册向用户提问 UI
   require("NeoAI.ui.components.ask_user").init()
   -- 注册密钥告警 UI（真实密钥/非白名单发送时阻塞确认）
-  pcall(function() require("NeoAI.ui.components.secret_alert").init() end)
+  _try_init("secret_alert", function() require("NeoAI.ui.components.secret_alert").init() end)
   -- 注册网络访问同意 UI（沙箱外部命令访问沙箱外目标时阻塞确认）
-  pcall(function() require("NeoAI.ui.components.net_consent").init() end)
+  _try_init("net_consent", function() require("NeoAI.ui.components.net_consent").init() end)
   -- 注册审批分流中心（多级页面审批悬浮窗：待修改/工具行为/资源访问/网络请求/越界异常）
-  pcall(function() require("NeoAI.ui.components.sandbox_review").setup() end)
+  _try_init("sandbox_review", function() require("NeoAI.ui.components.sandbox_review").setup() end)
   -- 启动子 Agent 监控监听
   local sub_agent_dock = require("NeoAI.ui.components.sub_agent_dock")
   sub_agent_dock.init()

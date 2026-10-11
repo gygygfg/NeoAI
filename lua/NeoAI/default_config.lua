@@ -9,6 +9,10 @@ local DEFAULT_CONFIG = {
   ai = {
     default_provider = "deepseek",
     default_model = "auto", -- "auto" = 使用 registry 第一个可用模型
+    -- 当 default_provider 未配置 api_key、而其他 provider 已配置时，自动回退到第一个
+    -- 已配置 key 的 provider（按名排序，确定性），避免「配了 key 却用不了」。
+    -- 默认关闭（不改写用户显式选择）；需要时设为 true。诊断见 :NeoAIDoctor。
+    auto_select_provider = false,
     providers = {
       deepseek = {
         api_type = "openai",
@@ -170,7 +174,8 @@ local DEFAULT_CONFIG = {
         enabled = true, -- 显式缓存总开关
         -- anthropic = true, -- 分机制开关（缺省跟随总开关；可单独关闭某一家）
         -- gemini = true,
-        openai = false, -- OpenAI 显式断点默认关闭（隐式缓存已足够，避免误写缓存计费）
+        openai = false, -- OpenAI 显式缓存默认关闭（隐式缓存已足够；开启仅额外下发 prompt_cache_key 路由提示）
+        -- anthropic_history = true, -- Anthropic 是否在历史消息上打滚动断点（缺省开启；用满 max_breakpoints 提升长会话命中率）
       },
       -- 模型/提供商级能力覆盖：key 为模型 id 或 provider 名
       -- overrides = {
@@ -212,6 +217,10 @@ local DEFAULT_CONFIG = {
     -- 所有悬浮窗的最小尺寸兜底，避免小窗口下浮窗过窄过矮导致渲染糟糕。
     float = { min_width = 24, min_height = 4 },
     split = { size = 80, direction = "right" },
+    -- ask_user 多题聚合弹窗：
+    --   batch_debounce_ms：同轮多次提问的聚合去抖窗口（覆盖兄弟调用到达时序，越大越全但首弹越慢）
+    --   require_confirm：全部作答后是否展示汇总页二次确认（false 直接提交）
+    ask_user = { batch_debounce_ms = 25, require_confirm = true },
     colors = {
       background = "Normal",
       border = "FloatBorder",

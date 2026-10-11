@@ -14,6 +14,7 @@ local M = {}
 local state = {
   config = nil, -- 合并后的不可变配置
   watchers = {}, -- path -> { cb }
+  validation_errors = {}, -- 最近一次 load 的校验错误
 }
 
 -- ========== 私有函数 ==========
@@ -43,6 +44,37 @@ local function _deep_merge(base, override)
     end
   end
   return result
+end
+
+--- 默认 provider 无 api_key 时，自动回退到第一个有 key 的 provider（按名排序，确定性）。
+--- 目的：用户常只设置某一家的环境变量 key，而默认 provider 指向未配 key 的另一家，
+--- 表现为「明明配了 key 却用不了」。仅在两者同时满足时改写：默认无 key 且有其他可选。
+--- 可用 ai.auto_select_provider=false 关闭。返回被选中的 provider 名（未改动则 nil）。
+--- @param config table
+--- @return string|nil
+local function _auto_select_provider(config)
+  local ai = config and config.ai
+  if type(ai) ~= "table" then return nil end
+  if ai.auto_select_provider == false then return nil end
+  local providers = ai.providers
+  if type(providers) ~= "table" then return nil end
+  local function key_of(name)
+    local p = providers[name]
+    local k = type(p) == "table" and p.api_key or ""
+    return type(k) == "string" and k or ""
+  end
+  local default = ai.default_provider
+  if type(default) ~= "string" or default == "" then return nil end
+  if key_of(default) ~= "" then return nil end -- 默认已有 key：不动
+  local candidates = {}
+  for name in pairs(providers) do
+    if type(name) == "string" and key_of(name) ~= "" then candidates[#candidates + 1] = name end
+  end
+  if #candidates == 0 then return nil end -- 无任何可用 key：交由校验/doctor 提示
+  table.sort(candidates)
+  ai._configured_provider = default -- 保留用户原始选择，便于诊断
+  ai.default_provider = candidates[1]
+  return candidates[1]
 end
 
 --- 校验配置，收集错误
@@ -106,18 +138,39 @@ end
 function M.load(user_config)
   local base = default_config.get_default_config()
   state.config = _deep_merge(base, user_config)
+  local auto_selected = _auto_select_provider(state.config)
   local errors = _validate(state.config)
+  state.validation_errors = errors
   local logger = require("NeoAI.kernel.logger")
   if #errors > 0 then
     for _, e in ipairs(errors) do
       logger.warn("[config_store] 配置校验: %s", e)
     end
+    -- 校验问题不能只落日志（默认不可见）：在非静默模式下以 WARN 提示一次，指引用户。
+    -- 通过 ai.providers.*.base_url 缺失、providers 为空等属于「AI 会静默不可用」的高影响问题。
+    local log_cfg = state.config.log or {}
+    local silent = log_cfg.silent == true or log_cfg.level == "OFF"
+    if not silent then
+      pcall(vim.notify,
+        ("[NeoAI] 配置校验发现 %d 个问题：%s\n运行 :NeoAIDoctor 查看环境诊断。"):format(
+          #errors, errors[1]),
+        vim.log.levels.WARN, { title = "NeoAI 配置" })
+    end
+  end
+  if auto_selected then
+    logger.info("[config_store] 默认提供商无 api_key，已自动回退到 '%s'", auto_selected)
   end
   -- 触发配置加载事件
   local event_bus = require("NeoAI.kernel.event_bus")
   local events = require("NeoAI.kernel.events")
   event_bus.emit(events.CONFIG_LOADED, state.config)
   return state.config
+end
+
+--- 最近一次 load 的校验错误（供 doctor/测试读取）
+--- @return string[]
+function M.validation_errors()
+  return state.validation_errors or {}
 end
 
 --- 按点分路径读取配置

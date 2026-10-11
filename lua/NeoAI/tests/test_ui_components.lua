@@ -64,7 +64,15 @@ tests.suite("ui_components", function(_, it)
     vim.api.nvim_set_current_buf(plain)
     focus.refresh()
     t.false_(focus.is_focused())
-    au.show({ question = "Q?", options = { "A" }, on_answer = function() end, on_cancel = function() end })
+    au.show({
+      batch_id = "ui_components_focus",
+      questions = { { question = "Q?", options = { "A" }, multi_select = false } },
+      active = 1,
+      mode = "tab",
+      require_confirm = true,
+      on_submit = function() end,
+      on_cancel = function() end,
+    })
     t.nil_(au.get_buf(), "未聚焦时不应建窗")
     t.true_(au.has_deferred(), "应暂存待展示")
     -- 切回 NeoAI 界面：广播聚焦 → 真正弹出

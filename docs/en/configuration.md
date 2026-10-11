@@ -33,6 +33,7 @@ See `lua/NeoAI/default_config.lua` for the full configuration. The main sections
 | --- | --- | --- |
 | `default_provider` | `"deepseek"` | Default provider |
 | `default_model` | `"auto"` | "auto" = resolve the default model via the registry |
+| `auto_select_provider` | `false` | When `true`, if `default_provider` has no `api_key` while another provider does, fall back to the first configured provider (sorted by name, deterministic); the original choice is recorded in `ai._configured_provider` |
 | `providers` | 13+ providers | Provider definitions: `api_type` (openai/anthropic/google), `base_url`, `api_key`, `fetch_models`, `models_override` |
 | `model_refresh` | `{on_startup=true, interval_sec=3600, timeout_ms=10000}` | Model list refresh |
 | `modes` | `{chat, plan, auto}` | Per mode → `{provider, model, temperature, stream}` (optional `max_tokens`); applied when entering that mode. If `max_tokens` is not configured, nothing is sent |
@@ -138,6 +139,7 @@ context_cache = {
 | `tree` | `{foldenable=false, ...auto_close_on_select=true}` | Session tree folding/auto-close |
 | `input_box` | `{idle_height=1, min_height=5, max_ratio=0.8}` | Input box height (idle/focused/growth cap) |
 | `chat` | `{mousescroll_max_blank=3, incremental=true}` | Max blank lines allowed below the last line when the wheel reaches the bottom (0 = strictly bottom-aligned); `incremental` enables incremental refresh (re-render only changed message blocks and write only the diff lines). Set to `false` to fall back to a full buffer rewrite |
+| `ask_user` | `{batch_debounce_ms=25, require_confirm=true}` | User-question popup: `batch_debounce_ms` is the debounce window (ms) for aggregating multiple questions within the same round (covers sibling-call arrival timing; larger aggregates more but delays the first popup); `require_confirm` controls whether a summary page is shown for a second confirmation after all questions are answered (`false` submits directly) |
 | `trajectory` | `{log_dir=".../NeoAI/logs"}` | Log directory for the trajectory display mode |
 | `statusline` | `{enabled=true, winbar=true, parts={mode,model,usage,cache,capacity,sandbox}, separator=" ", colors=...}` | lualine statusline; the `sandbox` part shows `待审N` when pending reviews > 0 (`N` is the total number of pending **files**, since the approval unit is a single file), linked to the prominent `NeoAISandboxPending` highlight group by default (bold yellow, override via `colors.sandbox`); when the pending queue contains an **L3 (high-risk)** item, the part appends `⚠危险` and switches to the red `NeoAISandboxDanger` group (override via `colors.sandbox_danger`); when **outside-workspace traces** exist, the part appends `越界N` (`N` = distinct file count; both shown side by side, e.g. `待审2 越界3`); the `usage` part shows **session-cumulative** input/output tokens (`↑` total input, `↓` total output; it no longer jumps with a single request), and the `cache` part shows the **cumulative** cache-hit ratio with **two decimals** (e.g. `缓存命中95.32%`) |
 

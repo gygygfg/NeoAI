@@ -118,6 +118,65 @@ tests.suite("plugins", function(_, it)
     plugins.unregister("test.batch_good")
   end)
 
+  it("plugins.start 异常兜底：不卡在 starting，可再次启动", function(t)
+    local plugins = require("NeoAI.kernel.plugins")
+    local services = require("NeoAI.kernel.services")
+    plugins.unregister("test.boom")
+    services.revoke("test.boom_service")
+    plugins.register({
+      id = "test.boom",
+      service = "test.boom_service",
+      module = "NeoAI.tests.test_plugins",
+      start = function() end,
+    })
+    -- 令 provide 抛错，模拟启动期未捕获异常（provide/_emit 等位于 pcall 保护之外）
+    local orig = services.provide
+    services.provide = function() error("provide boom") end
+    local ok, err = plugins.start("test.boom")
+    services.provide = orig
+    t.false_(ok, "异常启动应返回失败")
+    t.matches("启动异常", err)
+    t.false_(plugins.is_started("test.boom"))
+    -- 关键：状态未卡死，异常后可正常启动
+    local ok2 = plugins.start("test.boom")
+    t.true_(ok2, "异常后应可正常启动（不卡在 starting）")
+    plugins.stop("test.boom")
+    plugins.unregister("test.boom")
+    services.revoke("test.boom_service")
+  end)
+
+  it("services 未知服务名告警一次（拼写诊断），已知未提供不告警", function(t)
+    local services = require("NeoAI.kernel.services")
+    local logger = require("NeoAI.kernel.logger")
+    services.reset()
+    local warns = {}
+    local orig = logger.warn
+    logger.warn = function(msg, ...)
+      warns[#warns + 1] = tostring(msg)
+      if orig then orig(msg, ...) end
+    end
+    -- 未知（形如 services.*，从未登记）：告警一次
+    t.nil_(services.use("services.typo_xyz"))
+    t.nil_(services.use("services.typo_xyz"))
+    local n = 0
+    for _, m in ipairs(warns) do if m:find("未知服务名", 1, true) then n = n + 1 end end
+    t.eq(1, n, "同一未知名应只告警一次")
+    -- 已知未提供（在 KNOWN 白名单内）：不告警
+    warns = {}
+    t.nil_(services.use("services.chat_service"))
+    local n2 = 0
+    for _, m in ipairs(warns) do if m:find("未知服务名", 1, true) then n2 = n2 + 1 end end
+    t.eq(0, n2, "已知服务未提供不应告警")
+    -- 非 services.* 前缀：不告警
+    warns = {}
+    t.nil_(services.use("test.missing_service"))
+    local n3 = 0
+    for _, m in ipairs(warns) do if m:find("未知服务名", 1, true) then n3 = n3 + 1 end end
+    t.eq(0, n3, "非 services.* 前缀不告警")
+    logger.warn = orig
+    services.reset()
+  end)
+
   it("catalog 禁用插件并移除依赖闭包", function(t)
     with_config({ plugins = { disabled = { "ui" } } }, function()
       local catalog = require("NeoAI.plugins.catalog")

@@ -38,6 +38,19 @@ tests.suite("ansi", function(_, it)
     t.true_(ansi.has_ansi("\27[0m"), "含转义应判 true")
   end)
 
+  it("高亮组缓存有上限：海量不同颜色不无界增长", function(t)
+    local ansi = require("NeoAI.utils.ansi")
+    ansi.reset()
+    -- 生成远超上限（512）的不同真彩色组合
+    for i = 0, 700 do
+      ansi.parse(("\27[38;2;%d;0;0mX\27[0m"):format(i % 256))
+    end
+    -- 缓存被清空过（内部计数继续递增），解析仍正常返回文本
+    local lines = ansi.parse("\27[38;2;1;2;3mY\27[0m")
+    t.eq("Y", lines[1].text)
+    t.eq(1, #lines[1].spans, "仍能生成高亮组")
+  end)
+
   it("控制字节与非法 UTF-8 被清洗（不渲染成 ^P / <f9> 乱码）", function(t)
     local ansi = require("NeoAI.utils.ansi")
     -- C0 控制字节（0x16 / DEL）应剥离，制表符保留。

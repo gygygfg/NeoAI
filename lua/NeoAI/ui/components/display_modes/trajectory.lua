@@ -673,8 +673,9 @@ local last_save_dir = nil
 --- 会话日志文件的稳定名（按 session_id 派生；缺省用默认名）
 --- @return string
 function M.log_filename()
-  local ok, chat_service = pcall(require, "NeoAI.services.chat_service")
-  if not ok then return "neoai-trajectory.log" end
+  -- 经服务定位器获取（UI 不直连服务实现；未就绪/禁用时降级为默认名）。
+  local chat_service = require("NeoAI.kernel.services").use("services.chat_service")
+  if not chat_service then return "neoai-trajectory.log" end
   local session_id = chat_service.get_current_session_id()
   if session_id then
     return "neoai-trajectory-" .. _safe_name(session_id) .. ".log"
@@ -875,8 +876,8 @@ function M.install_save_hook(buf, opts)
     group = vim.api.nvim_create_augroup(augroup, { clear = true }),
     buffer = buf,
     callback = function()
-      local ok, chat_service = pcall(require, "NeoAI.services.chat_service")
-      if ok then
+      local chat_service = require("NeoAI.kernel.services").use("services.chat_service")
+      if chat_service then
         -- 按该 buffer 绑定的聊天实例取 Agent（多实例：后台实例 :w 不应保存聚焦实例会话）。
         local agent = (type(chat_service.get_agent_for_buffer) == "function"
           and chat_service.get_agent_for_buffer(buf))

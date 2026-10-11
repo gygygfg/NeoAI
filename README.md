@@ -36,6 +36,21 @@
 
 ---
 
+## 📋 前置要求
+
+| 依赖 | 要求 | 说明 |
+| --- | --- | --- |
+| Neovim | **>= 0.10**（推荐 0.13+） | 依赖 `vim.uv` 多线程 API；0.13+ 的外部文件自动重载更佳 |
+| curl | 建议安装 | **HTTP 请求传输依赖**；缺失可能导致无法发送请求 |
+| git | 可选 | `git_*` 工具与工作树管理 |
+| node / npm | 可选 | `web_fetch` 无头浏览器渲染（默认关闭，首次启用自动安装） |
+| 沙箱内核能力 | 可选 | `bwrap` / `unshare` / `docker` 等；缺失时工具沙箱隔离能力受限 |
+
+> 不确定环境是否就绪？安装后运行 **`:NeoAIDoctor`** 或 **`:checkhealth NeoAI`**，
+> 一站式检查版本、curl、API Key、沙箱能力与可选依赖。
+
+---
+
 ## 📦 安装
 
 ### 使用 lazy.nvim
@@ -95,6 +110,8 @@ export OPENAI_API_KEY="your-api-key"
 export ANTHROPIC_API_KEY="your-api-key"
 ```
 
+> 若未配置任何 key，`setup()` 后首次启动会提示一次；随时可用 `:NeoAIDoctor` 复查。
+
 ### 2. 初始化插件
 
 ```lua
@@ -139,6 +156,7 @@ require("NeoAI").setup({
 | `:NeoAISandboxDiag`| 显示沙箱资源域/负载诊断（137/OOM 归因）            |
 | `:NeoAISandboxAudit`| 显示沙箱行为审计与风险评估摘要                     |
 | `:NeoAISandboxAutoApprove`| 设置 AI 新会话自动审批（`on`/`off`/`status`，默认关闭）|
+| `:NeoAIDoctor` | 环境诊断（Neovim 版本 / curl / API Key / 沙箱能力 / 可选依赖；等同 `:checkhealth NeoAI` 摘要） |
 | `:NeoAIStatusline` | 预览当前 lualine 状态栏组件内容                    |
 
 ### 4. 默认快捷键

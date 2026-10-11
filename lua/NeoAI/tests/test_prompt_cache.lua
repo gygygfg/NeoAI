@@ -44,7 +44,45 @@ tests.suite("prompt_cache", function(_, it)
     t.not_nil(body.tools[2].cache_control)
   end)
 
-  it("OpenAI：显式断点默认关闭，显式开启后注入", function(t)
+  it("Anthropic：历史消息滚动断点用满预算", function(t)
+    load()
+    local capabilities = require("NeoAI.core.model.capabilities")
+    local cache = require("NeoAI.core.model.prompt_cache")
+    cache.reset()
+    local caps = capabilities.resolve("claude-sonnet-4", "anthropic")
+    local body = {
+      model = "claude", system = "SYS", tools = { { name = "a" } },
+      messages = {
+        { role = "user", content = "u1" },
+        { role = "assistant", content = "a1" },
+        { role = "user", content = "u2" },
+        { role = "assistant", content = "a2" },
+      },
+    }
+    local done = false
+    cache.apply_async({ body = body, caps = caps, provider_name = "anthropic", model = "claude", system = "SYS", tools = body.tools }):then_(function() done = true end)
+    t.true_(wait_until(function() return done end))
+    -- system(1) + tools(1) + 消息(2) = 4 = max_breakpoints
+    t.not_nil(body.messages[4].content[1].cache_control, "最后一条消息应有断点")
+    t.not_nil(body.messages[3].content[1].cache_control, "倒数第二条消息应有断点")
+    t.eq("u1", body.messages[1].content, "预算用尽的前置消息应保持原样")
+    t.eq("a1", body.messages[2].content, "预算用尽的前置消息应保持原样")
+  end)
+
+  it("Anthropic：anthropic_history=false 时不动历史消息", function(t)
+    load({ ai = { model_policy = { explicit_cache = { anthropic_history = false } } } })
+    local capabilities = require("NeoAI.core.model.capabilities")
+    local cache = require("NeoAI.core.model.prompt_cache")
+    cache.reset()
+    local caps = capabilities.resolve("claude-sonnet-4", "anthropic")
+    local body = { model = "claude", system = "SYS", messages = { { role = "user", content = "u1" } } }
+    local done = false
+    cache.apply_async({ body = body, caps = caps, provider_name = "anthropic", model = "claude" }):then_(function() done = true end)
+    t.true_(wait_until(function() return done end))
+    t.eq("u1", body.messages[1].content, "历史消息不应被改写")
+  end)
+
+  it("OpenAI：显式开关默认关闭；开启后注入官方 prompt_cache_key", function(t)
     load()
     local capabilities = require("NeoAI.core.model.capabilities")
     local cache = require("NeoAI.core.model.prompt_cache")
@@ -55,16 +93,19 @@ tests.suite("prompt_cache", function(_, it)
     local d1 = false
     cache.apply_async({ body = b1, caps = caps, provider_name = "openai", model = "gpt-5.6" }):then_(function() d1 = true end)
     t.true_(wait_until(function() return d1 end))
-    t.nil_(b1.prompt_cache_options)
+    t.nil_(b1.prompt_cache_key)
 
     -- 显式开启
     require("NeoAI.kernel.config_store").set("ai.model_policy.explicit_cache.openai", true)
     local b2 = { model = "m", messages = { { role = "user", content = "x" } } }
     local d2 = false
-    cache.apply_async({ body = b2, caps = caps, provider_name = "openai", model = "gpt-5.6" }):then_(function() d2 = true end)
+    cache.apply_async({
+      body = b2, caps = caps, provider_name = "openai", model = "gpt-5.6",
+      system = nil, tools = { { type = "function", ["function"] = { name = "a", description = "d" } } },
+    }):then_(function() d2 = true end)
     t.true_(wait_until(function() return d2 end))
-    t.eq("explicit", b2.prompt_cache_options.mode)
-    t.not_nil(b2.messages[1].content[1].prompt_cache_breakpoint)
+    t.matches("^neoai%-", b2.prompt_cache_key)
+    t.nil_(b2.prompt_cache_options)
     require("NeoAI.kernel.config_store").set("ai.model_policy.explicit_cache.openai", false)
   end)
 

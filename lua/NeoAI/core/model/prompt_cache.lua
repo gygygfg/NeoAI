@@ -2,8 +2,8 @@
 --- @module 'NeoAI.core.model.prompt_cache'
 --- 按模型缓存机制（capabilities.cache_kind）在请求体上注入显式缓存指令；任一环节失败
 --- 静默降级为隐式缓存，绝不阻断请求。
----   - Anthropic：cache_control 断点（system / 最后一个工具），≤ max_breakpoints
----   - OpenAI：prompt_cache_options.mode="explicit" + 内容块 prompt_cache_breakpoint（默认关闭，需显式开启）
+---   - Anthropic：cache_control 断点（system / 最后一个工具 / 历史消息滚动断点），≤ max_breakpoints
+---   - OpenAI：prompt_cache_key（官方路由字段；隐式缓存本身自动生效，默认关闭）
 ---   - Gemini：cachedContents 资源生命周期（create / 复用 / 续期 / delete）
 --- 生命周期状态按 provider|model 维度缓存，指纹变化或 TTL 到期即重建。
 
@@ -62,7 +62,37 @@ local function _estimate_prefix_tokens(spec)
   return math.ceil(#raw / 4)
 end
 
---- Anthropic：cache_control 断点（system + 最后一个工具）
+--- 在消息的最后一个内容块上打缓存断点。
+--- - 字符串内容（非空）升级为单块数组后打点（Anthropic 协议允许）；
+--- - 数组内容在末块打点；末块为空文本块时跳过（Anthropic 会对空文本 cache_control 报 400）；
+--- - 返回是否成功打点（供调用方统计断点占用）。
+--- @param msg table
+--- @param cc function() -> table 断点构造器
+--- @return boolean
+local function _mark_message_breakpoint(msg, cc)
+  if type(msg) ~= "table" then return false end
+  local content = msg.content
+  if type(content) == "string" then
+    if content == "" then return false end
+    msg.content = { { type = "text", text = content, cache_control = cc() } }
+    return true
+  end
+  if type(content) == "table" and #content > 0 then
+    local last = content[#content]
+    if last and last.type == "text" and (last.text == nil or last.text == "") then
+      return false
+    end
+    last.cache_control = cc()
+    return true
+  end
+  return false
+end
+
+--- Anthropic：cache_control 断点（system + 最后一个工具 + 历史消息滚动断点）
+--- 只用满 max_breakpoints（默认 4）：system 与「最后一个工具」两段字节稳定，长期命中；
+--- 剩余预算打在**最后若干条消息**上，形成滚动断点——本轮在消息末尾写入的新缓存条目，
+--- 会在下一轮成为可命中的前缀，从而让增长最快的对话历史也逐轮增量命中（否则历史每轮
+--- 全量重算重新计费，命中率随历史增长急剧下降）。
 --- @param body table
 --- @param caps table
 local function _apply_anthropic(body, caps)
@@ -80,23 +110,42 @@ local function _apply_anthropic(body, caps)
   end
   if type(body.tools) == "table" and #body.tools > 0 and used < bp then
     body.tools[#body.tools].cache_control = cc()
+    used = used + 1
+  end
+  -- 历史消息滚动断点：默认开启，可用 ai.model_policy.explicit_cache.anthropic_history=false 关闭。
+  if config_store.get("ai.model_policy.explicit_cache.anthropic_history") ~= false
+    and type(body.messages) == "table" then
+    local msgs = body.messages
+    local budget = bp - used
+    for i = #msgs, 1, -1 do
+      if budget <= 0 then break end
+      if _mark_message_breakpoint(msgs[i], cc) then
+        budget = budget - 1
+      end
+    end
   end
 end
 
---- OpenAI：explicit 模式 + 断点（保守，默认关闭）
+--- OpenAI：官方 prompt_cache_key（路由提示）。
+--- OpenAI 的隐式前缀缓存本身自动生效（≥1024 token 的前缀自动缓存），显式开关仅额外
+--- 下发 `prompt_cache_key` 把同一前缀路由到同一缓存分片以提升命中率。key 由稳定前缀
+--- 指纹（system + tools）派生，可用 spec.cache_key 覆盖。
+--- 历史实现使用的 `prompt_cache_options` / 内容块 `prompt_cache_breakpoint` 并非官方字段，
+--- 开启后可能被端点忽略或触发 400，已移除。
 --- @param body table
 --- @param caps table
-local function _apply_openai(body, caps)
+--- @param spec table
+local function _apply_openai(body, caps, spec)
   if not caps.explicit_cache then return end
-  body.prompt_cache_options = { mode = "explicit" }
-  local msgs = body.messages
-  local last = msgs and msgs[#msgs]
-  if not last then return end
-  if type(last.content) == "string" then
-    last.content = { { type = "text", text = last.content } }
+  local key = spec and spec.cache_key
+  if not key and spec then
+    local ok, id = pcall(function()
+      return require("NeoAI.core.agent.prefix").prefix_id(spec.system, spec.tools)
+    end)
+    if ok and id then key = "neoai-" .. tostring(id) end
   end
-  if type(last.content) == "table" and #last.content > 0 then
-    last.content[#last.content].prompt_cache_breakpoint = { mode = "explicit" }
+  if type(key) == "string" and key ~= "" then
+    body.prompt_cache_key = key
   end
 end
 
@@ -216,7 +265,7 @@ function M.apply_async(spec)
     _apply_anthropic(spec.body, caps)
     return async.resolve(true)
   elseif kind == "openai" then
-    _apply_openai(spec.body, caps)
+    _apply_openai(spec.body, caps, spec)
     return async.resolve(true)
   elseif kind == "gemini" then
     return _apply_gemini(spec)

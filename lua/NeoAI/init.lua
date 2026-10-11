@@ -170,6 +170,11 @@ function M.setup(user_config)
     if lazy_cleanup then lazy_cleanup() end
   end)
 
+  -- 首次运行引导：未配置任何 provider api_key 时提示一次（异步，不阻塞 setup）。
+  vim.schedule(function()
+    pcall(function() require("NeoAI.health").first_run_hint() end)
+  end)
+
   return M
 end
 

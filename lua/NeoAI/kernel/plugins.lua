@@ -51,13 +51,17 @@ local function _emit(event, payload)
   event_bus.emit(event, payload)
 end
 
---- 递归启动插件及其依赖
+--- 递归启动插件及其依赖（异常兜底包装；先声明后定义，供 inner 递归调用）
+--- @type fun(id: string, newly: table, visiting: table): boolean, string|nil
+local _start_recursive
+
+--- 递归启动插件及其依赖（内部实现）
 --- @param id string
 --- @param newly table 本次调用中新启动的插件 id 列表
 --- @param visiting table 循环依赖检测
 --- @return boolean ok
 --- @return string|nil err
-local function _start_recursive(id, newly, visiting)
+local function _start_recursive_inner(id, newly, visiting)
   local p = state.plugins[id]
   if not p then return false, "未注册的插件: " .. tostring(id) end
   if p.status == "started" then return true end
@@ -128,6 +132,33 @@ local function _start_recursive(id, newly, visiting)
   newly[#newly + 1] = id
   _emit(events.PLUGIN_LOADED, { id = id, service = p.spec.service })
   return true
+end
+
+--- 递归启动插件及其依赖（异常兜底）
+--- 任何未捕获异常（如 services.provide 抛错、_emit 失败）都必须复位 `starting` 状态与
+--- visiting 标记，否则该插件会永久卡在 "starting"：其后 M.start 恒返回「检测到循环依赖」，
+--- 而 M.stop 只处理 started → cleanups 永不执行、插件永久不可用。
+--- @param id string
+--- @param newly table
+--- @param visiting table
+--- @return boolean ok
+--- @return string|nil err
+_start_recursive = function(id, newly, visiting)
+  local ok, res, err = pcall(_start_recursive_inner, id, newly, visiting)
+  if ok then return res, err end
+  local p = state.plugins[id]
+  if p and p.status == "starting" then
+    -- 仅当当前服务实现确实是本次提供的那份时才撤销（防止误撤他人服务）。
+    if p.spec and p.spec.service and p.impl then pcall(services.revoke, p.spec.service, p.impl) end
+    p.status = "registered"
+    p.impl = nil
+  end
+  visiting[id] = nil
+  local msg = "启动异常: " .. tostring(res)
+  if p then p.error = msg end
+  require("NeoAI.kernel.logger").warn("[plugins] %s (%s)", msg, tostring(id))
+  _emit(events.PLUGIN_FAILED, { id = id, error = msg })
+  return false, msg
 end
 
 --- 回滚本次调用中新启动的插件（逆序）

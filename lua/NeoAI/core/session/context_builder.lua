@@ -8,6 +8,44 @@ local config_store = require("NeoAI.kernel.config_store")
 
 local M = {}
 
+-- ========== 私有状态 ==========
+
+-- 工具定义 token 估算记忆化：状态栏/压缩压力评估会频繁触发 used_tokens → estimate_request，
+-- 其中对全部工具 schema 做 JSON 编码是较重且大多重复的步骤。按「工具名 + 描述长度 +
+-- 参数组数」签名缓存编码后长度；签名未变即复用（工具 schema 仅在 MCP 刷新/环境翻转时变化）。
+local _tools_tokens_cache = { sig = nil, tokens = 0 }
+
+--- 计算工具定义的 token 估算（记忆化）。
+--- @param tools table 工具定义数组
+--- @param divisor number 字符/token 系数
+--- @return number
+local function _tools_tokens(tools, divisor)
+  local sig_parts = {}
+  for _, d in ipairs(tools) do
+    local fn = d and d["function"] or {}
+    local name = fn.name or ""
+    sig_parts[#sig_parts + 1] = name .. ":" .. #(fn.description or "")
+  end
+  table.sort(sig_parts)
+  local sig = table.concat(sig_parts, ",") .. "#" .. tostring(divisor)
+  if _tools_tokens_cache.sig == sig then
+    return _tools_tokens_cache.tokens
+  end
+  local ok, encoded = pcall(function()
+    return require("NeoAI.utils.json").encode(tools)
+  end)
+  local tokens = (ok and type(encoded) == "string") and math.ceil(#encoded / divisor) or 0
+  _tools_tokens_cache.sig = sig
+  _tools_tokens_cache.tokens = tokens
+  return tokens
+end
+
+--- 重置工具估算缓存（测试用）
+function M.reset_estimate_cache()
+  _tools_tokens_cache.sig = nil
+  _tools_tokens_cache.tokens = 0
+end
+
 -- ========== 私有函数 ==========
 
 --- 构建系统消息（按有序段渲染，前缀缓存稳定）
@@ -352,12 +390,7 @@ function M.estimate_request(agent, opts)
     if ok then tools = defs end
   end
   if type(tools) == "table" and next(tools) ~= nil then
-    local ok, encoded = pcall(function()
-      return require("NeoAI.utils.json").encode(tools)
-    end)
-    if ok and type(encoded) == "string" then
-      total = total + math.ceil(#encoded / divisor)
-    end
+    total = total + _tools_tokens(tools, divisor)
   end
   return total
 end

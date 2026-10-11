@@ -1757,9 +1757,12 @@ tests.suite("chat_ui", function(_, it)
     vim.o.foldmethod = "indent"
 
     ask_user_ui.show({
-      question = "要继续吗？",
-      options = { "是", "否" },
-      on_answer = function() end,
+      batch_id = "chat_ui_fold",
+      questions = { { question = "要继续吗？", options = { "是", "否" }, multi_select = false } },
+      active = 1,
+      mode = "tab",
+      require_confirm = true,
+      on_submit = function() end,
       on_cancel = function() end,
     })
     local found = false
@@ -1770,8 +1773,8 @@ tests.suite("chat_ui", function(_, it)
         t.false_(vim.wo[win].foldenable, "提问悬浮窗应关闭 foldenable")
         t.eq("manual", vim.wo[win].foldmethod, "提问悬浮窗 foldmethod 应为 manual")
         local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
-        t.true_(lines[1]:find("要继续吗", 1, true) ~= nil, "问题应完整可见（不被折叠收起）")
         local joined = table.concat(lines, "\n")
+        t.true_(joined:find("要继续吗", 1, true) ~= nil, "问题应完整可见（不被折叠收起）")
         t.true_(joined:find("选项", 1, true) ~= nil, "选项内容应完整可见（不被折叠收起）")
         break
       end
@@ -1788,12 +1791,17 @@ tests.suite("chat_ui", function(_, it)
 
     local _ = nil
     ask_user_ui.show({
-      question = "选择生成方式？",
-      options = {
-        { label = "快速生成", description = "直接用当前上下文" },
-        { label = "计划模式", description = "先调研再生成" },
+      batch_id = "chat_ui_opts",
+      questions = {
+        { question = "选择生成方式？", options = {
+          { label = "快速生成", description = "直接用当前上下文" },
+          { label = "计划模式", description = "先调研再生成" },
+        }, multi_select = false },
       },
-      on_answer = function(a) _ = a end,
+      active = 1,
+      mode = "tab",
+      require_confirm = true,
+      on_submit = function(a) _ = a end,
       on_cancel = function() end,
     })
 
@@ -1818,6 +1826,131 @@ tests.suite("chat_ui", function(_, it)
     t.true_(#marks > 0, "应附加选项高亮标记")
 
     ask_user_ui.reset()
+  end)
+
+  local function invoke_map(buf, mode, lhs)
+    for _, m in ipairs(vim.api.nvim_buf_get_keymap(buf, mode)) do
+      if m.lhs == lhs and type(m.callback) == "function" then
+        m.callback()
+        return true
+      end
+    end
+    return false
+  end
+
+  it("ask_user 多 Tab：切题、多选勾选、汇总页提交", function(t)
+    local au = require("NeoAI.ui.components.ask_user")
+    au.reset()
+    local got = {}
+    au.show({
+      batch_id = "multi_tab",
+      questions = {
+        { question = "Q1", options = { "A", "B" }, multi_select = false },
+        { question = "Q2", options = { "X", "Y", "Z" }, multi_select = true },
+      },
+      active = 1,
+      mode = "tab",
+      require_confirm = true,
+      on_submit = function(a) got.answers = a end,
+      on_cancel = function(r) got.cancel = r end,
+    })
+    local buf = au.get_buf()
+    t.not_nil(buf, "应创建提问悬浮窗")
+    local st = au.get_state()
+    t.eq("tab", st.mode)
+    t.eq(1, st.active, "初始激活第 1 题")
+
+    -- 单选第 1 题选项 1（A）
+    t.true_(invoke_map(buf, "n", "1"), "应绑定数字键")
+    t.eq("A", au.get_state().answers[1], "单选应记录选中 label")
+    t.eq("tab", au.get_state().mode, "尚有未答题，不进汇总页")
+
+    -- 切到第 2 题（<Tab>），多选勾选 X 与 Z
+    t.true_(invoke_map(buf, "n", "<Tab>"))
+    t.eq(2, au.get_state().active, "<Tab> 应切到下一题")
+    invoke_map(buf, "n", "1") -- X
+    t.eq("X", au.get_state().answers[2], "多选首项即当前答案")
+    invoke_map(buf, "n", "3") -- Z
+    t.eq("X, Z", au.get_state().answers[2], "多选答案以 ', ' 连接")
+
+    -- 全部作答 → 汇总页
+    t.eq("summary", au.get_state().mode, "全部作答后进入汇总页")
+    local lines = table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n")
+    t.true_(lines:find("汇总", 1, true) ~= nil, "汇总页应展示标题")
+    t.true_(lines:find("X, Z", 1, true) ~= nil, "汇总页应展示各题答案")
+
+    -- 汇总页提交
+    t.true_(invoke_map(buf, "n", "<CR>"), "汇总页应绑定提交键")
+    t.not_nil(got.answers, "提交应回传答案数组")
+    t.eq("A", got.answers[1])
+    t.eq("X, Z", got.answers[2])
+    t.nil_(au.get_buf(), "提交后应关闭弹窗")
+    au.reset()
+  end)
+
+  it("ask_user 汇总页返回编辑并保持未作答状态", function(t)
+    local au = require("NeoAI.ui.components.ask_user")
+    au.reset()
+    local got = {}
+    au.show({
+      batch_id = "summary_edit",
+      questions = {
+        { question = "Q1", options = { "A", "B" } },
+        { question = "Q2", options = { "X", "Y" }, multi_select = true },
+      },
+      active = 1,
+      mode = "tab",
+      require_confirm = true,
+      on_submit = function(a) got.answers = a end,
+      on_cancel = function() end,
+    })
+    local buf = au.get_buf()
+    invoke_map(buf, "n", "1") -- Q1 = A
+    invoke_map(buf, "n", "<Tab>")
+    invoke_map(buf, "n", "1") -- Q2 = X
+    t.eq("summary", au.get_state().mode)
+    -- 汇总页 e 返回编辑
+    t.true_(invoke_map(buf, "n", "e"), "汇总页应绑定返回编辑键")
+    t.eq("tab", au.get_state().mode, "e 应返回编辑页")
+    -- 取消已勾选（多选再点一次 X）→ Q2 变为未作答
+    invoke_map(buf, "n", "1")
+    t.nil_(au.get_state().answers[2], "取消勾选后该题应为未作答")
+    t.eq("tab", au.get_state().mode, "存在未答题时不进汇总页")
+    au.reset()
+  end)
+
+  it("ask_user 同批次重展示追加 Tab 且保留已作答状态", function(t)
+    local au = require("NeoAI.ui.components.ask_user")
+    au.reset()
+    au.show({
+      batch_id = "late_append",
+      questions = { { question = "Q1", options = { "A" } }, { question = "Q2", options = { "X" } } },
+      active = 1,
+      mode = "tab",
+      require_confirm = true,
+      on_submit = function() end,
+      on_cancel = function() end,
+    })
+    local buf = au.get_buf()
+    invoke_map(buf, "n", "1") -- Q1 = A
+    -- 迟到调用：同 batch_id 追加第 3 题（工具层重渲染）
+    au.show({
+      batch_id = "late_append",
+      questions = {
+        { question = "Q1", options = { "A" } },
+        { question = "Q2", options = { "X" } },
+        { question = "Q3", options = { "M", "N" } },
+      },
+      active = 1,
+      mode = "tab",
+      require_confirm = true,
+      on_submit = function() end,
+      on_cancel = function() end,
+    })
+    local st = au.get_state()
+    t.eq(3, #st.questions, "迟到调用应追加 tab")
+    t.eq("A", st.answers[1], "重渲染应保留已作答状态")
+    au.reset()
   end)
 
   it("每个工具完成即各自更新状态（并发工具不互相等待）", function(t)

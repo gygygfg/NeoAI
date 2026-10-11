@@ -245,8 +245,10 @@ M.execute(agent, name, args, tool_call_id, opts)
 
 `git_worktree` 管理 `git worktree`（`list`/`add`/`remove`/`move`/`prune`/`lock`/`unlock`/`repair`）：
 `list` 只读；变更改写主仓 `.git/worktrees/**` 与工作树 `.git` 文件（均为 pointer），与工作树文件
-一起作为**原子整组**进入审批。工作树落点须位于可写根内、且不在 `.git` 内部或临时根
-（`worktree_guard`，fail-closed）。
+一起作为**原子整组**进入审批。工作树落点须位于可写根内、且不在 `.git` 内部；位于临时根
+（会话私有，如 `/tmp`）时放行，但在 nvim 退出（`lifecycle` 关闭钩子）时自动清理——删除工作树
+目录并对主仓执行 `git worktree prune`，避免主仓 `.git/worktrees` 残留悬空注册
+（`worktree_guard` + `worktree_cleanup`；`read_all=false` 且未被可写根覆盖时仍 fail-closed 拒绝）。
 
 ### 🔧 LSP（lsp_ops.lua，Neovim >= 0.12）
 
@@ -324,12 +326,20 @@ M.execute(agent, name, args, tool_call_id, opts)
 
 `ask_user`：暂停生成向用户提问，回答回传为工具结果。发射 `ASK_USER_WAITING`/`ASK_USER_ANSWERED`，
 等待期间暂停可暂停计时器。选项既可以是字符串，也可以是 `{ label, description }`（label 为选项简介，
-description 为选项描述，二者在弹窗中分别展示并高亮）。弹窗按键：数字键 `1-9` 直接选择选项，
-`i`/回车进入自由输入；**仅 NORMAL 模式按 `<Esc>` 取消**（INSERT 模式 `<Esc>` 保留退出插入模式的原义，
-避免编辑时误触取消整次提问；需放弃时先 `<Esc>` 回 NORMAL 再按一次）。同一时刻只展示一个提问弹窗，并行发起的
-多次提问按序排队（前一个回答/取消后再展示下一个），不会直接失败。**焦点不在 NeoAI 界面时不立即弹出**：
-暂存待展示配置并进入等待（`ASK_USER_WAITING` 照常发射，Herder 生命周期显示 `blocked`），
-待用户切回 NeoAI 界面（`UI_FOCUS_CHANGED` focused=true）时再弹。同机制同样适用于工具审批
+description 为选项描述，二者在弹窗中分别展示并高亮）。
+
+**同轮聚合（多 Tab 弹窗）**：同一轮（同 `agent.id` 且同 `agent._round_seq`）内并发发起的多次 `ask_user`
+会聚合为**一个多 Tab 弹窗**统一作答（去抖窗口 `ui.ask_user.batch_debounce_ms`，默认 25ms 覆盖兄弟调用到达时序）；
+顶部 Tab 栏以 `✓/○` 标记该题是否已答。跨轮的提问分别成批、按序串行展示（不直接失败）。全部作答后进入**汇总页**
+（列出各题 `Q → A`），可 `e` 返回编辑或 `y`/回车统一提交；提交时若有未作答项则提示并跳回首个未作答 Tab。
+`ui.ask_user.require_confirm=false` 时跳过汇总页，全部作答后直接提交。
+
+每题可选 `multi_select`（boolean，默认 false）：为 true 时该题可多选，返回选中 label 以 `", "` 连接；单选返回
+label 字符串；自由输入覆盖为纯文本。弹窗按键：数字键 `1-9` 选择/切换选项，`<Tab>`/`<S-Tab>`（或 `]`/`[`）切题，
+`i`/回车进入自由输入；**仅 NORMAL 模式按 `<Esc>` 取消整批提问**（INSERT 模式 `<Esc>` 保留退出插入模式的原义，
+避免编辑时误触取消；需放弃时先 `<Esc>` 回 NORMAL 再按一次）。未注册 UI 时回退 `vim.ui.input`，多题按题顺序逐个询问。
+**焦点不在 NeoAI 界面时不立即弹出**：暂存待展示配置并进入等待（`ASK_USER_WAITING` 照常逐项发射，Herder 生命周期显示
+`blocked`），待用户切回 NeoAI 界面（`UI_FOCUS_CHANGED` focused=true）时再弹。同机制同样适用于工具审批
 （tool_approval）、密钥告警（secret_alert）、网络同意（net_consent）等阻塞弹窗（另见
 [sandbox.md](sandbox.md) 的「焦点感知的交互弹窗」）。
 

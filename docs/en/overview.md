@@ -166,6 +166,11 @@ Key architectural principles:
 
 ## Installation
 
+**Prerequisites**: Neovim ≥ 0.10 (0.13+ recommended; uses the `vim.uv` multithreading API);
+`curl` recommended (HTTP transport); optional `git`, `node`/`npm` (`web_fetch`) and sandbox kernel
+capabilities (`bwrap`/`unshare`/`docker`). After installing, run `:NeoAIDoctor` or
+`:checkhealth NeoAI` for a one-stop self-check.
+
 Using lazy.nvim:
 
 ```lua
@@ -176,6 +181,26 @@ Using lazy.nvim:
   end
 }
 ```
+
+### Configure the API Key
+
+Set at least one provider's key in an environment variable:
+
+```bash
+export DEEPSEEK_API_KEY="your-api-key"   # or OPENAI_API_KEY / ANTHROPIC_API_KEY / ...
+```
+
+```lua
+require("NeoAI").setup({
+  ai = {
+    default_provider = "deepseek",
+    providers = { deepseek = { api_key = os.getenv("DEEPSEEK_API_KEY") } },
+  },
+})
+```
+
+> A one-time hint is shown at startup when no key is configured; `ai.auto_select_provider = true`
+> auto-falls back to a configured provider when the default one has no key.
 
 > **Startup model (lazy by default, no configuration)**: `setup()` only loads the config,
 > bootstraps the kernel, registers plugins, and installs placeholders for all `:NeoAI*`

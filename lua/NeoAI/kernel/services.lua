@@ -10,12 +10,50 @@ local M = {}
 
 -- ========== 私有状态 ==========
 
+-- 已知服务名（内置服务提供方）。用于拼写错误诊断：use/wait 遇到「形如 services.* 但既非
+-- 已知、也未登记」的名字时告警一次（不抛错，保持向后兼容）。provide() 会自动把新名字并入。
+local KNOWN = {
+  "services.agent",
+  "services.chat_service",
+  "services.herder",
+  "services.herder_install",
+  "services.mcp",
+  "services.model_service",
+  "services.pty",
+  "services.sandbox",
+  "services.session",
+  "services.skills",
+  "services.status",
+  "services.tool_service",
+  "services.tools",
+  "services.ui",
+}
+
 local state = {
   providers = {}, -- name -> impl
   waiters = {}, -- name -> { cb }
+  known = {}, -- name -> true（已知或已登记）
+  warned = {}, -- name -> true（已就未知名告警，去重）
 }
 
+-- 种子已知服务名
+for _, n in ipairs(KNOWN) do
+  state.known[n] = true
+end
+
 -- ========== 私有函数 ==========
+
+--- 未知服务名（形如 services.* 但未注册）告警一次，帮助定位拼写错误。
+--- 仅当实现缺失时检查，避免对「已就绪」调用产生无谓开销。
+--- @param name string
+local function _warn_unknown(name)
+  if type(name) ~= "string" then return end
+  if name:sub(1, 9) ~= "services." then return end
+  if state.known[name] or state.providers[name] ~= nil then return end
+  if state.warned[name] then return end
+  state.warned[name] = true
+  require("NeoAI.kernel.logger").warn("[services] 未知服务名（拼写错误？）: %s", name)
+end
 
 --- 通知某服务的等待者（服务就绪后调用）
 --- @param name string
@@ -44,6 +82,7 @@ function M.provide(name, impl)
     error("services.provide: name 必须为非空字符串")
   end
   state.providers[name] = impl
+  state.known[name] = true
   _notify(name, impl)
   return M
 end
@@ -52,7 +91,9 @@ end
 --- @param name string
 --- @return any
 function M.use(name)
-  return state.providers[name]
+  local impl = state.providers[name]
+  if impl == nil then _warn_unknown(name) end
+  return impl
 end
 
 --- 服务是否已提供
@@ -86,6 +127,7 @@ function M.wait(name, cb)
     end
     return function() end
   end
+  _warn_unknown(name)
   if not state.waiters[name] then state.waiters[name] = {} end
   table.insert(state.waiters[name], cb)
   local removed = false
@@ -116,6 +158,12 @@ end
 function M.reset()
   state.providers = {}
   state.waiters = {}
+  state.warned = {}
+  -- 已知服务名（内置常量）保留；动态登记的名字随 providers 清空而失效。
+  state.known = {}
+  for _, n in ipairs(KNOWN) do
+    state.known[n] = true
+  end
 end
 
 return M

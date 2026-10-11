@@ -491,16 +491,20 @@ tests.suite("sandbox_core", function(_, it)
     t.nil_(rt.git_path_class("/repo/a.lua"))
   end)
 
-  it("worktree 落点门禁：.git 内部/临时根/未覆盖路径分别被拒", function(t)
+  it("worktree 落点门禁：.git 内部被拒；临时根放行并登记退出清理；未覆盖路径被拒", function(t)
     local wg = require("NeoAI.sandbox.observe.worktree_guard")
+    local cleanup = require("NeoAI.sandbox.observe.worktree_cleanup")
+    cleanup.reset()
     -- `.git` 内部一律拒绝
     t.matches("SANDBOX_WORKTREE_IN_GIT",
       wg.check({ action = "add", path = "/repo/.git/wt" }, { cwd = "/repo" }) or "")
-    -- 临时根（/tmp，且不在 cwd 子树）拒绝（显式开启 ephemeral_roots）
+    -- 临时根（/tmp，且不在 cwd 子树）：放行，但登记退出清理
     with_config({ tools = { sandbox = { ephemeral_roots = { "/tmp" } } } }, function()
-      t.matches("SANDBOX_WORKTREE_EPHEMERAL",
-        wg.check({ action = "add", path = "/tmp/wt" }, { cwd = "/repo" }) or "")
+      t.nil_(wg.check({ action = "add", path = "/tmp/wt", repo = "/repo" }, { cwd = "/repo" }),
+        "临时根落点应放行")
+      t.eq(1, cleanup.count(), "临时根落点应登记退出清理")
     end)
+    cleanup.reset()
     -- read_all=false 且落点不在 cwd/process_roots → fail-closed 拒绝
     with_config({ tools = { sandbox = { read_all = false, ephemeral_roots = {}, process_roots = {} } } }, function()
       t.matches("SANDBOX_WORKTREE_UNCOVERED",
@@ -511,6 +515,24 @@ tests.suite("sandbox_core", function(_, it)
     end)
     -- list 无落点：任何路径参数均忽略
     t.nil_(wg.check({ action = "list", path = "/repo/.git" }, { cwd = "/repo" }), "list 应放行")
+  end)
+
+  it("临时根工作树退出清理：删除目录并 prune 主仓", function(t)
+    local fs = require("NeoAI.utils.fs")
+    local cleanup = require("NeoAI.sandbox.observe.worktree_cleanup")
+    cleanup.reset()
+    local repo = vim.fn.tempname()
+    local wt = repo .. "/wt-ephemeral"
+    fs.ensure_dir(wt)
+    fs.write_file(wt .. "/marker.txt", "x")
+    t.true_(vim.fn.isdirectory(wt) == 1)
+    cleanup.register(repo, wt)
+    t.eq(1, cleanup.count())
+    cleanup.flush()
+    t.eq(0, cleanup.count(), "flush 后应清空登记")
+    t.false_(vim.fn.isdirectory(wt) == 1, "临时根工作树目录应被删除")
+    vim.fn.delete(repo, "rf")
+    cleanup.reset()
   end)
 
   it("git 变更：沙箱内执行，.git 改动原子暂存进审批悬浮窗（dry_run 不改真实 .git）", function(t)

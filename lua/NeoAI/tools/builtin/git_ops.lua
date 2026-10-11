@@ -436,6 +436,7 @@ git_tools.git_worktree = helpers.define_tool(
   "管理 git 工作树（git worktree）。"
     .. "action: list（只读）/ add / remove / move / prune / lock / unlock / repair。"
     .. "add 需要 path（工作树目录，须位于可写根内且不可在 .git 内），可选 commit（默认 HEAD）/ detach / force；"
+    .. "落点位于临时根（会话私有）时放行，并在退出时自动清理（删除目录 + 主仓 prune）；"
     .. "remove 需要 path（可选 force）；move 需要 path 与 new_path；"
     .. "lock 需要 path（可选 reason）；unlock 需要 path；repair 可选 path。"
     .. "变更在沙箱内执行并进入审批（.git 工作树元数据整组原子应用）。",

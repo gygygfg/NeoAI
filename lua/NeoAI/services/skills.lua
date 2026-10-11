@@ -19,6 +19,9 @@ local M = {}
 local state = {
   index = {}, -- name -> { name, description, path, dir, body, metadata }
   loaded = false,
+  version = 0, -- 索引版本：任何重扫描/重置都递增，用于系统提示段文本记忆化
+  summary_sig = nil, -- 记忆化签名（版本|max|inject）
+  summary_text = nil, -- 记忆化的段文本
 }
 
 -- ========== 极简 YAML frontmatter 解析 ==========
@@ -197,6 +200,7 @@ end
 --- 扫描全部配置目录
 local function _scan_all()
   state.index = {}
+  state.version = state.version + 1
   local cfg = config_store.get("skills") or {}
   local paths = cfg.paths or {}
   for _, p in ipairs(paths) do
@@ -208,11 +212,12 @@ end
 
 --- 系统提示段文本：列出可用技能（受 max_skills_in_prompt 限制）
 --- inject_mode：list=名称+描述（默认），full=整篇正文（受每技能字节上限限制），none=不列出
+--- 构建系统提示段文本（纯函数；记忆化包装见 _summary_text）
+--- @param cfg table skills 配置
+--- @param max number 清单条数上限
+--- @param inject string "list" | "full" | "none"
 --- @return string
-local function _summary_text()
-  local cfg = config_store.get("skills") or {}
-  local max = cfg.max_skills_in_prompt or 20
-  local inject = cfg.inject_mode or "list"
+local function _build_summary_text(cfg, max, inject)
   if inject == "none" then return "" end
   local list = M.list()
   if #list == 0 then return "" end
@@ -241,6 +246,24 @@ local function _summary_text()
     end
   end
   return table.concat(lines, "\n")
+end
+
+--- @return string
+local function _summary_text()
+  local cfg = config_store.get("skills") or {}
+  local max = cfg.max_skills_in_prompt or 20
+  local inject = cfg.inject_mode or "list"
+  -- 记忆化：段文本由「索引版本 + 影响输出的配置」唯一决定。系统提示段每次渲染都会求值，
+  -- 未变化时直接复用旧串，避免重复构建大字符串（inject_mode=full 时为全文，代价可观），
+  -- 同时保证同一索引下段文本逐字节稳定（利于前缀缓存）。
+  local sig = table.concat({ state.version, max, inject }, "|")
+  if state.summary_sig == sig and state.summary_text then
+    return state.summary_text
+  end
+  local text = _build_summary_text(cfg, max, inject)
+  state.summary_sig = sig
+  state.summary_text = text
+  return text
 end
 
 -- ========== 公开 API ==========
@@ -311,6 +334,7 @@ end
 function M.reset()
   state.index = {}
   state.loaded = false
+  state.version = state.version + 1
 end
 
 return M

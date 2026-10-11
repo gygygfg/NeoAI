@@ -620,6 +620,11 @@ local function _finish(session, result)
     pcall(function() session.delay_timer:close() end)
     session.delay_timer = nil
   end
+  if session.timeout_timer then
+    pcall(function() session.timeout_timer:stop() end)
+    pcall(function() session.timeout_timer:close() end)
+    session.timeout_timer = nil
+  end
   if session.unsub then pcall(session.unsub) session.unsub = nil end
   if state.active_id == session.id then state.active_id = nil end
   local win = _window()
@@ -734,12 +739,14 @@ function M.open(opts)
     end)
   end
   if timeout_ms > 0 then
-    vim.defer_fn(function()
+    -- 可取消的 libuv 定时器（会话结束由 _finish 关闭句柄），避免 defer_fn 句柄滞留到超时。
+    session.timeout_timer = vim.uv.new_timer()
+    session.timeout_timer:start(timeout_ms, 0, vim.schedule_wrap(function()
       if session.done then return end
       session.timed_out = true
       if session.kill then pcall(session.kill) end
       pcall(vim.fn.jobstop, job)
-    end, timeout_ms)
+    end))
   end
 
   -- 订阅跟随跳变：跟随↔非跟随时隐藏/重弹终端窗（懒订阅，首次 open 时注册）。

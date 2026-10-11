@@ -1479,8 +1479,8 @@ local function _gate_inner(tool, args, ctx, call_original)
     end
   end
 
-  -- git worktree 落点门禁（git_worktree）：限定在可写根内，拒绝 `.git` 内部与临时根
-  -- （fail-closed：未被可写根覆盖时拒绝，绝不静默降级为「工作树会随会话丢失」）。
+  -- git worktree 落点门禁（git_worktree）：拒绝 `.git` 内部；临时根落点放行并在退出时清理
+  -- （删除工作树目录 + 主仓 prune）；read_all=false 且未被可写根覆盖时 fail-closed 拒绝。
   if attempt.tool_name == "git_worktree" and type(args) == "table" then
     local reason = require("NeoAI.sandbox.observe.worktree_guard").check(args, ctx)
     if reason then

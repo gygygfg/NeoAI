@@ -100,4 +100,28 @@ tests.suite("runtime_context", function(_, it)
     t.nil_(snap2.content:find("计划模式", 1, true))
     pm.cleanup(agent)
   end)
+
+  it("persist_loaded：已装载技能走历史快照，系统提示保持稳定", function(t)
+    local config_store = require("NeoAI.kernel.config_store")
+    config_store.load({
+      ai = { default_provider = "deepseek", default_model = "m1", system_prompt = "persona" },
+      skills = { persist_loaded = true },
+    })
+    local prefix = require("NeoAI.core.agent.prefix")
+    local rc = require("NeoAI.core.session.runtime_context")
+    local todo = require("NeoAI.tools.builtin.todo")
+    todo.reset()
+    local agent = fresh_agent()
+    agent.config = { system_prompt = "persona" }
+    -- 系统提示在装载技能前后应逐字节一致
+    local sys_before = prefix.build_system_prompt(agent)
+    agent._loaded_skills = { s1 = "步骤一：读文件\n步骤二：改文件" }
+    local snap = assert(rc.ensure(agent))
+    t.true_(snap.content:find("已常驻技能", 1, true) ~= nil)
+    t.true_(snap.content:find("步骤一：读文件", 1, true) ~= nil)
+    local sys_after = prefix.build_system_prompt(agent)
+    t.eq(sys_before, sys_after, "装载技能不得改动系统提示（否则前缀缓存整体失效）")
+    t.nil_(sys_after:find("步骤一", 1, true), "技能正文不应进入系统提示")
+    todo.reset()
+  end)
 end)
