@@ -92,6 +92,72 @@ function M.ssh_local_target(command)
   return false
 end
 
+-- ========== 危险设备访问检测 ==========
+
+--- glob（`*` 通配）匹配：把模式转为 Lua pattern 后整串匹配。
+--- @param pat string
+--- @param path string
+--- @return boolean
+local function _glob_match(pat, path)
+  if type(pat) ~= "string" or pat == "" then return false end
+  if pat == path then return true end
+  local out = {}
+  for i = 1, #pat do
+    local c = pat:sub(i, i)
+    if c == "*" then
+      out[#out + 1] = ".*"
+    elseif c:match("[%^%$%(%)%%%.%[%]%+%-%?]") then
+      out[#out + 1] = "%" .. c
+    else
+      out[#out + 1] = c
+    end
+  end
+  return path:match("^" .. table.concat(out) .. "$") ~= nil
+end
+
+--- 危险设备访问检测：命令文本中引用的、命中 `tools.sandbox.devices.paths` 的设备节点。
+--- 覆盖 `>` 重定向、`of=/dev/...`、shell 引号与行继续拼接；返回**具体**设备路径（去重）。
+--- 无害设备（/dev/null、/dev/urandom 等）不在默认模式列表，永不命中。
+--- @param command string|nil 有效命令文本（含脚本折叠后的 `effective`）
+--- @return table matched 具体设备路径数组（去重；未命中/关闭时为空）
+function M.device_access(command)
+  if type(command) ~= "string" or command == "" then return {} end
+  local dev = (config_store.get("tools.sandbox") or {}).devices or {}
+  if dev.enabled == false then return {} end
+  local pats = dev.paths
+  if type(pats) ~= "table" or #pats == 0 then return {} end
+  -- 去掉引号与行继续拼接，使 `of="/dev/net/tun"`、`> /dev/kvm` 等一并还原为可匹配 token。
+  local text = command:gsub("\\\n", " "):gsub("\\\r\n", " "):gsub("['\"]", "")
+  local matched, seen = {}, {}
+  for tok in text:gmatch("/dev/[%w%._%-/]*") do
+    if not seen[tok] then
+      for _, p in ipairs(pats) do
+        if _glob_match(p, tok) then
+          seen[tok] = true
+          matched[#matched + 1] = tok
+          break
+        end
+      end
+    end
+  end
+  return matched
+end
+
+--- 单个**具体**路径是否命中危险设备模式（供运行期观测按实际路径判定）。
+--- @param path string|nil
+--- @return string|nil matched 命中时返回该路径
+function M.device_path_match(path)
+  if type(path) ~= "string" or path == "" then return nil end
+  local dev = (config_store.get("tools.sandbox") or {}).devices or {}
+  if dev.enabled == false then return nil end
+  local pats = dev.paths
+  if type(pats) ~= "table" then return nil end
+  for _, p in ipairs(pats) do
+    if _glob_match(p, path) then return path end
+  end
+  return nil
+end
+
 -- 执行结果 → 安全级别提示（失败模式）。命中取最高。
 local RESULT_PATTERNS = {
   { level = 2, name = "PERMISSION_DENIED", pats = {

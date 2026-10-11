@@ -47,6 +47,8 @@ function M.init()
   _try_init("secret_alert", function() require("NeoAI.ui.components.secret_alert").init() end)
   -- 注册网络访问同意 UI（沙箱外部命令访问沙箱外目标时阻塞确认）
   _try_init("net_consent", function() require("NeoAI.ui.components.net_consent").init() end)
+  -- 注册危险设备访问同意 UI（命令访问 /dev/kvm、/dev/net/tun 等逃逸面设备时阻塞确认）
+  _try_init("device_consent", function() require("NeoAI.ui.components.device_consent").init() end)
   -- 注册审批分流中心（多级页面审批悬浮窗：待修改/工具行为/资源访问/网络请求/越界异常）
   _try_init("sandbox_review", function() require("NeoAI.ui.components.sandbox_review").setup() end)
   -- 启动子 Agent 监控监听
@@ -148,6 +150,7 @@ function M.reset()
   pcall(function() require("NeoAI.ui.components.ask_user").reset() end)
   pcall(function() require("NeoAI.ui.components.secret_alert").reset() end)
   pcall(function() require("NeoAI.ui.components.net_consent").reset() end)
+  pcall(function() require("NeoAI.ui.components.device_consent").reset() end)
   pcall(function() require("NeoAI.ui.components.sub_agent_dock").reset() end)
   pcall(function() require("NeoAI.ui.components.sub_agent_list").reset() end)
   pcall(function() require("NeoAI.ui.components.sandbox_review").reset() end)

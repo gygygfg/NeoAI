@@ -1760,6 +1760,54 @@ tests.suite("sandbox_review", function(_, it)
     config_store.load({})
   end)
 
+  it("工具行为页设备管理 API：增删改生效且去重", function(t)
+    local sr = require("NeoAI.ui.components.sandbox_review")
+    local config_store = require("NeoAI.kernel.config_store")
+    config_store.load({})
+    t.true_(sr.add_device("/dev/kvm"), "应能新增允许设备")
+    t.false_(sr.add_device("/dev/kvm"), "重复设备应被去重拒绝")
+    t.eq("/dev/kvm", config_store.get("tools.sandbox.devices.allowed")[1], "应写入配置")
+    local snap = sr.list_devices()
+    t.eq(1, #snap.allowed, "快照允许设备数应为 1")
+    t.true_(#snap.paths > 0, "危险设备模式应有默认值")
+    t.true_(sr.remove_device(1), "应能删除")
+    t.eq(0, #sr.list_devices().allowed, "删除后应为空")
+    t.false_(sr.remove_device(99), "越界应失败")
+    config_store.load({})
+  end)
+
+  it("E 键在工具行为页打开设备编辑器", function(t)
+    local services = require("NeoAI.kernel.services")
+    local sr = require("NeoAI.ui.components.sandbox_review")
+    local config_store = require("NeoAI.kernel.config_store")
+    sr.reset()
+    config_store.load({ tools = { sandbox = { devices = { allowed = { "/dev/kvm" } } } } })
+    local saved = services.use("services.sandbox")
+    _provide_sandbox({
+      list_reviews = function() return {} end,
+      list_traces = function() return {} end,
+      list_saved = function() return {} end,
+      apply = function() return { ok = true } end,
+      reject = function() end,
+    })
+    sr.open()
+    sr.open_page("behavior")
+    local buf = sr.get_buf()
+    for _, m in ipairs(vim.api.nvim_buf_get_keymap(buf, "n")) do
+      if m.lhs == "E" then m.callback() end
+    end
+    local ebuf = sr.get_devices_editor_buf()
+    t.not_nil(ebuf, "E 应打开设备编辑器")
+    local text = table.concat(vim.api.nvim_buf_get_lines(ebuf, 0, -1, false), "\n")
+    t.matches("允许的设备组件", text, "编辑器应含允许设备区")
+    t.matches("危险设备模式", text, "编辑器应含危险设备区")
+    t.matches("/dev/kvm", text, "编辑器应展示预置允许设备")
+    sr.close()
+    t.eq(nil, sr.get_devices_editor_buf(), "关闭审批窗应同时关闭设备编辑器")
+    services.provide("services.sandbox", saved)
+    config_store.load({})
+  end)
+
   it("「已拒绝」区展示且 u 触发恢复为待审", function(t)
     local services = require("NeoAI.kernel.services")
     local sr = require("NeoAI.ui.components.sandbox_review")

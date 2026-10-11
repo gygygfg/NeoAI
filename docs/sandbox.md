@@ -506,6 +506,11 @@ token（`NEOKEY_…`）或格式保真假密钥时**拒绝写盘**（`SECRET_TOK
       **仅当前会话生效，不写盘，重开 nvim 恢复默认**。光标落在资源访问条目上时按 `W` 可把该条目命中
       的遮蔽路径父目录快速加入工作目录。注意 `read_all=true`（默认）时遮蔽目录不生效（改为只读放行 +
       越界留痕），列表清空则回退默认（`/home`、`/root`）。
+    - **工具行为页的「设备组件」区**（仅本会话）：页内可见**允许的设备组件**（命令引用后直接
+      `--dev-bind` 进沙箱、不再弹窗）与**危险设备模式**（`tools.sandbox.devices.paths`，命中即触发
+      弹窗）列表；按 `E` 打开设备编辑器浮窗——`a` 添加允许设备（`tools.sandbox.devices.allowed`）、
+      `d` 删除光标处设备、`q`/`Esc` 关闭。改动经 `config_store.set` 热更新**仅当前会话生效，不写盘，
+      重开 nvim 恢复默认**。危险设备访问门禁见 §「危险设备访问门禁」。
   - `:NeoAISandboxApprove <id>` / `:NeoAISandboxReject <id>` — 批准（不应用）/ 拒绝并丢弃。
   - `:NeoAISandboxApply <id>` — 批准并应用（CAS 发布）；`:NeoAISandboxApplyAll` 批量应用。
   - `:NeoAISandboxList` / `:NeoAISandboxShow` / `:NeoAISandboxDiscard <digest>` / `:NeoAISandboxCommit <digest>`。
@@ -592,6 +597,41 @@ token（`NEOKEY_…`）或格式保真假密钥时**拒绝写盘**（`SECRET_TOK
 > 本模块只做**静态**分析。不做运行时追踪：沙箱的 seccomp 基线拦 `ptrace`/`bpf`/`process_vm_*`，
 > 沙箱内 `strace`/eBPF 不可用，且 shim（`LD_PRELOAD`/PATH 包装）可被 AI 绕过；稳健的动态侧
 > 信号是**效果观测**（overlay 捕获的真实文件改动、网络目标、包路径识别），与本静态扫描互补。
+
+### 危险设备访问门禁（`tools.sandbox.devices`，默认开）
+
+命令访问可用于**沙箱逃逸 / 内核控制**的设备节点（`/dev/kvm`、`/dev/net/tun`、裸盘
+`/dev/sd*`·`/dev/nvme*`、`/dev/mem`、`/dev/port`、`/dev/vfio/*`、`/dev/fuse` 等，见
+`tools.sandbox.devices.paths`）时，门禁**阻塞并弹窗询问用户**（`sandbox/review/device_consent`，
+UI 见 `ui/components/device_consent`，与网络同意/工具审批同款浮窗，受焦点门控）：
+
+- **动态监测（默认，`devices.dynamic=true`）**：以**运行期观测**（eBPF `openat/open` tracepoint，
+  见 `observe/observer.lua`）判定命令**实际**是否打开了危险设备节点，而非仅凭命令文本——
+  故变量拼接、脚本间接执行、别名等文本绕过无法逃避。观测到未允许的危险设备访问时：
+  - **终止命令树**（`cgroup.kill` / 常驻实例 `kill_current`），放弃本轮候选；
+  - 若命令因此**失败/被杀**，弹窗询问（`timeout_ms` 默认 30000 内无应答自动阻止）；**批准后自动
+    重跑**该命令，此时设备已 `--dev-bind` 绑定进沙箱命名空间，命令可正常使用；
+  - 若命令**已成功**（未真正依赖该设备），仅异步提示供后续会话放行，本轮结果照常返回；
+  - 未批准则返回 `DEVICE_ACCESS_DENIED`（fail-closed）。
+  - **常驻实例同样监测**：常驻命令服务器使用会话级 cgroup，门禁对其挂**常驻 eBPF 观测句柄**
+    （随会话实例存活，避免每条命令重建 bpftrace 的固定开销；实例重建/关闭时自动重启/停止）。
+  - eBPF 后端不可用（非 root / 无 bpftrace/内核）时自动**回退静态命令文本扫描**。
+- **静态回退（`devices.dynamic=false` 或 eBPF 不可用）**：从（含脚本折叠后的 `effective`）命令
+  文本抽取 `/dev/...` token，对 `devices.paths` 做 glob（`*`）匹配；`>` 重定向、`of=/dev/...`、
+  引号均覆盖，无害设备（`/dev/null`、`/dev/urandom`、`/dev/zero` 等）永不命中。命中且未允许时
+  在执行前弹窗/拒绝。
+- 默认 `action="ask"`：弹窗提供 **仅本次允许 / 本次会话允许该设备 / 拒绝**；`timeout_ms`（默认
+  30000）内无应答则**自动阻止**（fail-closed）；headless / 无可用界面时同样失败关闭。
+- `action="deny"` 直接拒绝；`action="allow"` 直接放行并暴露设备（不弹窗）。
+- **批准后设备真正可用**：门禁把该设备以 `--dev-bind` 挂载进本次命令的沙箱命名空间（叠加在 bwrap
+  基础参数 `--dev /dev` 的最小 devtmpfs 之上；仅宿主真实存在的字符/块设备）。未批准则拒绝、不暴露。
+- **本会话允许列表**：`devices.allowed`（内存，`config_store.set` 热更新、不写盘）。由弹窗
+  「本次会话允许」或审批悬浮窗**「工具行为」页按 `E`** 打开的**设备组件编辑器**写入（`a` 添加
+  / `d` 删除）。已在允许列表的设备在命令执行前预绑定、不再弹窗/阻断。
+- 该门禁针对**进程命令**的设备节点访问；内核命令（`modprobe`/`mkfs` 等）仍走既有的硬拒绝
+  （比弹窗更强），`mknod` 设备节点创建仍由 seccomp 基线拦（见 §6）。
+- 已知边界：并发常驻命令共享同一会话 cgroup，事件归因到「当前槽位」命令；极端并发下
+  危险设备访问的终止可能作用于同一实例的当前命令（设备访问本就罕见）。
 
 ### 暂存机制
 

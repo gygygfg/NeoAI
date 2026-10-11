@@ -198,6 +198,57 @@ tests.suite("ui_components", function(_, it)
     nc.reset()
   end)
 
+  it("device_consent：应用有焦点即弹（不因窗口非 NeoAI 而延迟），仅失焦时暂存", function(t)
+    local dc = require("NeoAI.ui.components.device_consent")
+    local focus = require("NeoAI.ui.focus")
+    dc.reset()
+    focus.reset()
+    focus._set_force_ui(true)
+    focus.install()
+    local plain = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_set_current_buf(plain)
+    focus._set_app_focused(true)
+    dc.show({ devices = { "/dev/kvm" } }, function() end)
+    t.not_nil(find_win_by_title("🔌 沙箱设备访问"), "应用有焦点时应立即弹设备同意窗")
+    dc.reset()
+    focus._set_app_focused(false)
+    dc.show({ devices = { "/dev/kvm" } }, function() end)
+    t.nil_(find_win_by_title("🔌 沙箱设备访问"), "失焦时不应建窗")
+    focus._set_app_focused(true)
+    event_bus.emit(events.UI_FOCUS_CHANGED, { focused = true })
+    t.not_nil(find_win_by_title("🔌 沙箱设备访问"), "回焦后应弹出设备同意窗")
+    vim.api.nvim_buf_delete(plain, { force = true })
+    dc.reset()
+    focus.reset()
+  end)
+
+  it("device_consent：show/hide 与 <CR> 回调 allow_once", function(t)
+    local dc = require("NeoAI.ui.components.device_consent")
+    dc.reset()
+    local decision
+    dc.show({ devices = { "/dev/kvm", "/dev/net/tun" } }, function(d) decision = d end)
+    local win = find_win_by_title("🔌 沙箱设备访问")
+    t.not_nil(win, "应打开设备同意弹窗")
+    if win then
+      local buf = vim.api.nvim_win_get_buf(win)
+      t.eq("neoai_device_consent", vim.bo[buf].filetype)
+      t.eq(false, vim.bo[buf].modifiable, "弹窗内容应只读")
+      local cb
+      for _, m in ipairs(vim.api.nvim_buf_get_keymap(buf, "n")) do
+        if m.lhs == "<CR>" then cb = m.callback end
+      end
+      t.not_nil(cb, "应注册 <CR> 回调")
+      if cb then cb() end
+      t.eq("allow_once", decision)
+      t.nil_(find_win_by_title("🔌 沙箱设备访问"), "确认后应关闭")
+    end
+    dc.show({ devices = { "/dev/kvm" } }, function() end)
+    t.not_nil(find_win_by_title("🔌 沙箱设备访问"))
+    dc.hide()
+    t.nil_(find_win_by_title("🔌 沙箱设备访问"), "hide 应关闭弹窗")
+    dc.reset()
+  end)
+
   it("sub_agent_dock：open 渲染、事件更新、reset 清理", function(t)
     local dock = require("NeoAI.ui.components.sub_agent_dock")
     dock.reset()

@@ -749,6 +749,53 @@ detection) and `risk.classify` (security level), so `pip install`, `sudo modprob
 > **effect observation** (overlay-captured real file changes, network targets, package-path
 > detection), which complements this static scan.
 
+### Dangerous-device access gate (`tools.sandbox.devices`, on by default)
+
+When a command accesses a device node usable for **sandbox escape / kernel control** (`/dev/kvm`,
+`/dev/net/tun`, raw disks `/dev/sd*`·`/dev/nvme*`, `/dev/mem`, `/dev/port`, `/dev/vfio/*`,
+`/dev/fuse`, ..., see `tools.sandbox.devices.paths`), the gate **blocks and prompts the user**
+(`sandbox/review/device_consent`; UI in `ui/components/device_consent`, a floating window like the
+network-consent / tool-approval ones, subject to focus gating):
+
+- **Dynamic monitoring (default, `devices.dynamic=true`)**: uses **runtime observation** (eBPF
+  `openat/open` tracepoints, see `observe/observer.lua`) to decide whether the command **actually**
+  opened a dangerous device node, not just its command text — so variable splicing, indirect script
+  execution and aliases cannot evade it. On observing an unapproved dangerous-device access:
+  - it **terminates the command tree** (`cgroup.kill` / resident `kill_current`) and discards the
+    candidate for that round;
+  - if the command thus **failed/was killed**, it prompts (`timeout_ms` default 30000, auto-blocked
+    if unanswered); **on approval it automatically re-runs** the command, now with the device
+    `--dev-bind`-mounted, so it works;
+  - if the command **already succeeded** (never actually needed the device), it only raises an async
+    prompt for future sessions and returns the round's result unchanged;
+  - unapproved access returns `DEVICE_ACCESS_DENIED` (fail-closed).
+  - **Resident instances are monitored too**: the resident command server runs in a session cgroup,
+    so the gate attaches a **persistent eBPF observer** to it (alive for the session, avoiding a
+    ~0.5s bpftrace rebuild per command; restarted/stopped when the instance is rebuilt/closed).
+  - If the eBPF backend is unavailable (non-root / no bpftrace/kernel support) it automatically
+    **falls back to static command-text scanning**.
+- **Static fallback (`devices.dynamic=false` or no eBPF)**: extracts `/dev/...` tokens from the
+  (script-folded `effective`) command text and glob-matches (`*`) against `devices.paths`; `>`
+  redirections, `of=/dev/...` and quotes are covered, and benign devices (`/dev/null`,
+  `/dev/urandom`, `/dev/zero`, ...) never match. On a hit it prompts/rejects before execution.
+- Default `action="ask"`: the prompt offers **allow once / allow this session / deny**; if unanswered
+  within `timeout_ms` (default 30000) it is **auto-blocked** (fail-closed); headless / no available
+  surface also fails closed.
+- `action="deny"` rejects outright; `action="allow"` passes and exposes the device (no prompt).
+- **On approval the device actually works**: the gate `--dev-bind`-mounts it into that command's
+  sandbox namespace (on top of bwrap's minimal devtmpfs from `--dev /dev`; only real char/block
+  devices on the host). Unapproved access is rejected and the device stays unexposed.
+- **Session allowlist**: `devices.allowed` (in memory; hot `config_store.set`, not persisted), written
+  by the prompt's "allow this session" or by the **device-components editor** opened with `E` on the
+  approval window's **"工具行为"/behavior** page (`a` add / `d` remove). Devices on the allowlist are
+  pre-bound and neither prompted nor blocked.
+- This gate targets **process-command** device access; kernel commands (`modprobe`/`mkfs`, ...)
+  keep their existing hard deny (stronger than a prompt), and `mknod` device-node creation is still
+  blocked by the seccomp baseline (see §6).
+- Known boundary: concurrent resident commands share one session cgroup, so events are attributed to
+  the "current slot"; under extreme concurrency a dangerous access may terminate whichever command is
+  current in that instance (dangerous device access is already rare).
+
 ### Staging
 
 - **Explicit-path tools** (`edit_file`/`create_directory`/`ensure_dir`/`delete_file`): the

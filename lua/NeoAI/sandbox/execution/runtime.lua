@@ -2808,7 +2808,12 @@ function M.process_prefix(opts)
     if priv then
       for _, m in ipairs(priv.mounts or {}) do
         if m and m.src and m.dst then
-          table.insert(argv, m.mode == "ro" and "--ro-bind" or "--bind")
+          if m.mode == "dev" then
+            -- 设备节点须用 --dev-bind（普通 --bind 对 char/block 设备不可靠）。
+            table.insert(argv, "--dev-bind")
+          else
+            table.insert(argv, m.mode == "ro" and "--ro-bind" or "--bind")
+          end
           table.insert(argv, m.src)
           table.insert(argv, m.dst)
         end

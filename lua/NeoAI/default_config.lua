@@ -905,6 +905,44 @@ local DEFAULT_CONFIG = {
           max_probes = 4096, -- 探测记录上限（防滥用）
         },
       },
+      -- 危险设备访问门禁：命令**访问**可用于**沙箱逃逸/内核控制**的设备节点（/dev/kvm、
+      -- /dev/net/tun、裸盘、/dev/mem 等）时，暂停并弹窗询问用户（默认 30s 无应答自动阻止）；
+      -- 批准后把该设备 `--dev-bind` 进本次命令的沙箱命名空间（叠加在 bwrap `--dev /dev` 的
+      -- 最小 devtmpfs 之上），使 AI 能真正使用；未批准则拒绝执行。已批准设备记入本会话
+      -- 允许列表（内存，不写盘），可在审批悬浮窗「工具行为」页按 E 管理。
+      devices = {
+        enabled = true, -- 总开关
+        -- 动态监测（默认开）：以**运行期观测**（eBPF openat/open 事件）判定是否真的访问了危险
+        -- 设备节点，而非仅凭命令文本。观测到未允许的危险设备 open 时终止命令并弹窗（失败/被杀
+        -- 时批准后自动重跑）；已允许设备在命令执行前预绑定。eBPF 后端不可用时自动回退静态命令
+        -- 文本扫描。设为 false 强制仅用静态扫描。
+        dynamic = true,
+        -- ask（默认）= 弹窗询问（仅本次/本次会话允许/拒绝）；allow = 直接放行并暴露设备；
+        -- deny = 直接拒绝（不暴露）。
+        action = "ask",
+        -- 弹窗无响应超时（毫秒；0 = 不限）。超时自动阻止（fail-closed），默认 30000（30s）。
+        timeout_ms = 30000,
+        -- 需要弹窗确认的危险设备路径（支持 `*` 通配）。默认覆盖可用于逃逸/内核控制的设备节点；
+        -- 无害设备（null/zero/random/urandom/full/tty/pts/fd/stdin/shm）不在此列，永不命中。
+        paths = {
+          -- 虚拟化 / 网络隧道 / 内核加速
+          "/dev/kvm", "/dev/net/tun", "/dev/net/tap",
+          "/dev/vhost-net", "/dev/vhost-vsock", "/dev/vhost-vsock-*",
+          "/dev/vfio/*",
+          -- FUSE / 块设备 / 裸盘
+          "/dev/fuse",
+          "/dev/loop*", "/dev/sd*", "/dev/hd*", "/dev/vd*", "/dev/xvd*",
+          "/dev/nvme*", "/dev/sr*", "/dev/bsg/*", "/dev/dm-*", "/dev/mapper/*",
+          "/dev/ram*", "/dev/zram*", "/dev/mmcblk*", "/dev/md*",
+          -- 直接内存 / I/O / 端口（内核逃逸面）
+          "/dev/mem", "/dev/kmem", "/dev/port", "/dev/io",
+          -- 内核调试 / 追踪 / 其它可被滥用设备
+          "/dev/kmsg", "/dev/cpu/*", "/dev/rfkill",
+        },
+        -- 本会话允许的设备组件（内存白名单，config_store.set 热更新、不写盘；重开 nvim 恢复默认）。
+        -- 由弹窗「本次会话允许」或审批悬浮窗「工具行为」页的编辑器写入。
+        allowed = {},
+      },
       -- 内核级行为观测（eBPF / strace / procfs）：以实际 syscall 判定「越界访问」与
       -- 「密钥文件访问」，替代/补充命令字符串解析启发式；事件按 attempt cgroup 精确归属。
       -- 后端优先级 auto：ebpf(bpftrace，需 root) → strace（命令前缀包裹）→ procfs(/proc/<pid>/fd)。

@@ -140,6 +140,23 @@ end
 
 local BTRACE_SCRIPT = _build_btrace_script()
 
+--- 生成「仅设备节点」bpftrace 脚本：只在路径以 `/dev/` 开头时输出（内核侧字符串前缀过滤），
+--- 用于常驻实例的动态危险设备监测——避免把每条 openat 都回传用户态（大量构建时主线程被刷爆）。
+local function _build_devwatch_script()
+  local L = {}
+  for _, tp in ipairs({ "sys_enter_openat", "sys_enter_open" }) do
+    if _has_tp(tp) then
+      L[#L + 1] = 'tracepoint:syscalls:' .. tp .. ' /cgroup == $1 && comm != "bwrap"/ {'
+      L[#L + 1] = '  $p = str(args->filename);'
+      L[#L + 1] = '  if (strncmp($p, "/dev/", 5) == 0) { printf("D\\t' .. tp .. '\\t%d\\t%s\\n", pid, $p); }'
+      L[#L + 1] = '}'
+    end
+  end
+  return table.concat(L, "\n")
+end
+
+local DEVWATCH_SCRIPT = _build_devwatch_script()
+
 --- 当前脚本是否包含写入/删除探针（用于判断「写日志」是否可用）。
 local WRITES_AVAILABLE = _has_tp("sys_enter_openat") or _has_tp("sys_enter_open")
 
@@ -644,6 +661,71 @@ function M.strace_prefix(opts)
 end
 
 -- ========== 公开 API ==========
+
+--- 启动「仅设备节点」观测（eBPF）：只回传路径以 `/dev/` 开头的 open/openat。
+--- 用于常驻实例的动态危险设备监测，避免把每条 openat 都经通用观测链路处理（大量构建时刷爆主线程）。
+--- @param opts table { cgroup_id, on_event, on_error? }
+--- @return table|nil handle
+--- @return string|nil err
+function M.start_devwatch(opts)
+  opts = opts or {}
+  if M.backend() ~= "ebpf" then return nil, "OBSERVE_BACKEND_UNAVAILABLE" end
+  local cg_id = tonumber(opts.cgroup_id)
+  if not cg_id then return nil, "OBSERVE_NO_CGROUP" end
+  local handle = { backend = "ebpf", stopped = false, pending = "", ready = false }
+  local function emit_line(rec)
+    local op, path = rec:match("^%a\t([^\t]+)\t%d+\t(.*)$")
+    if path and path ~= "" and opts.on_event then
+      pcall(opts.on_event, { kind = "file", op = op, path = path })
+    end
+  end
+  local function dispatch(text)
+    if text == "" then return end
+    handle.ready = true
+    local pos = 1
+    while true do
+      local nl = text:find("\n", pos, true)
+      local rec = nl and text:sub(pos, nl - 1) or text:sub(pos)
+      if rec ~= "" then emit_line(rec) end
+      if not nl then break end
+      pos = nl + 1
+    end
+  end
+  local job = vim.fn.jobstart({ "bpftrace", "-e", DEVWATCH_SCRIPT, tostring(cg_id) }, {
+    stdout_buffered = false,
+    stderr_buffered = false,
+    on_stdout = function(_, data)
+      if not data then return end
+      local text = ""
+      if #data > 1 then text = table.concat(data, "\n", 1, #data - 1) .. "\n" end
+      if #data >= 1 then handle.pending = handle.pending .. (data[#data] or "") end
+      if text ~= "" then dispatch(text) end
+    end,
+    on_stderr = function(_, data)
+      local msg = table.concat(data or {}, " ")
+      if msg:find("Attaching", 1, true) then handle.ready = true end
+      if opts.on_error and msg:find("ERROR", 1, true) then pcall(opts.on_error, msg) end
+    end,
+  })
+  if job <= 0 then return nil, "OBSERVE_BPFTRACE_SPAWN_FAILED" end
+  handle.job = job
+  function handle.wait_ready(ms)
+    if handle.ready then return true end
+    vim.wait(ms or 1000, function() return handle.ready end, 10)
+    return handle.ready
+  end
+  function handle.stop()
+    if handle.stopped then return end
+    handle.stopped = true
+    if handle.pending and handle.pending ~= "" then
+      local p = handle.pending
+      handle.pending = ""
+      pcall(dispatch, p)
+    end
+    pcall(vim.fn.jobstop, job)
+  end
+  return handle
+end
 
 --- 启动一次观测。
 --- @param opts table {

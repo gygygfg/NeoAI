@@ -524,6 +524,25 @@ sandbox = {
     --   rustup-> RUSTUP_DIST_SERVER / RUSTUP_UPDATE_ROOT (e.g. "https://mirrors.tuna.tsinghua.edu.cn/rustup")
     mirrors = { pip = "", npm = "", maven = "", apk = "", go = "", rustup = "" },
   },
+  -- Dangerous-device access gate: when a command accesses a device node usable for sandbox
+  -- escape / kernel control (/dev/kvm, /dev/net/tun, raw disks, /dev/mem, ...), it blocks and
+  -- prompts the user (auto-blocked if unanswered for 30s by default); on approval the device is
+  -- `--dev-bind`-mounted into that command's sandbox namespace so the AI can actually use it;
+  -- unapproved access is rejected. Approved devices are remembered in a session allowlist (in
+  -- memory, not persisted) manageable via the approval window's "工具行为" page (press E).
+  devices = {
+    enabled = true,                  -- master switch
+    dynamic = true,                  -- dynamic monitoring (default on): use runtime eBPF openat/open observation to decide the actual device access (variable/script bypass-proof); on unapproved access it terminates the command and prompts, auto-rerunning on approval if it failed. Falls back to static text scanning when eBPF is unavailable; false forces static only
+    action = "ask",                  -- ask (default, prompt: once / this session / deny) | allow (pass and expose) | deny (reject)
+    timeout_ms = 30000,              -- prompt timeout (ms; 0 = no limit); auto-block on timeout (fail-closed)
+    paths = {                        -- dangerous device paths requiring confirmation (supports * globs)
+      "/dev/kvm", "/dev/net/tun", "/dev/net/tap", "/dev/vhost-net", "/dev/vhost-vsock", "/dev/vhost-vsock-*",
+      "/dev/vfio/*", "/dev/fuse", "/dev/loop*", "/dev/sd*", "/dev/hd*", "/dev/vd*", "/dev/xvd*",
+      "/dev/nvme*", "/dev/sr*", "/dev/bsg/*", "/dev/dm-*", "/dev/mapper/*", "/dev/ram*", "/dev/zram*",
+      "/dev/mmcblk*", "/dev/md*", "/dev/mem", "/dev/kmem", "/dev/port", "/dev/io", "/dev/kmsg", "/dev/cpu/*", "/dev/rfkill",
+    },
+    allowed = {},                    -- session-allowed device components (in-memory allowlist; hot config_store.set, not persisted)
+  },
   -- Privilege tiers and auto-escalation: commands run at T0 least privilege by default
   -- (network allowed by default with host-local access intercepted); escalation is auto-requested
   -- at ALL tiers (T0→T1→T2 up to max_tier) and re-run in isolation, logging evidence/events/audit.

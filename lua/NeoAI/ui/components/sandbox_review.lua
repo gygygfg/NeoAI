@@ -2105,6 +2105,250 @@ local function _build_dirs_section()
   return lines, marks
 end
 
+-- ========== 设备组件设置（危险设备访问，仅本会话） ==========
+-- 「工具行为」页可管理危险设备访问的允许列表（仅当前会话生效：config_store.set 热更新，不写盘，
+-- 重开 nvim 恢复默认）：
+--   * 允许的设备组件 = tools.sandbox.devices.allowed：命令引用后**直接绑定进沙箱**、不再弹窗。
+--   * 危险设备模式 = tools.sandbox.devices.paths：命中即触发弹窗确认（只读展示，改配置调整）。
+-- 命中且未允许的设备由 `sandbox/review/device_consent` 弹窗询问（30s 无应答自动阻止）。
+local CFG_DEV_ALLOWED = "tools.sandbox.devices.allowed"
+local CFG_DEV_PATHS = "tools.sandbox.devices.paths"
+local CFG_DEV_ENABLED = "tools.sandbox.devices.enabled"
+local CFG_DEV_ACTION = "tools.sandbox.devices.action"
+
+local devices_editor = { win = nil, buf = nil, ns = nil, line_map = {} }
+
+--- 当前设备设置快照（只读）
+--- @return table { allowed, paths, action, enabled }
+local function _devices_snapshot()
+  local cfg = require("NeoAI.kernel.config_store")
+  local allowed = cfg.get(CFG_DEV_ALLOWED)
+  local paths = cfg.get(CFG_DEV_PATHS)
+  local action = cfg.get(CFG_DEV_ACTION)
+  if action ~= "allow" and action ~= "deny" then action = "ask" end
+  return {
+    allowed = type(allowed) == "table" and vim.deepcopy(allowed) or {},
+    paths = type(paths) == "table" and vim.deepcopy(paths) or {},
+    action = action,
+    enabled = cfg.get(CFG_DEV_ENABLED) ~= false,
+  }
+end
+
+--- 构建「设备组件」区（工具行为页，纯只读展示；编辑请按 E 打开编辑器）
+--- @return table lines
+--- @return table marks
+local function _build_devices_section()
+  local snap = _devices_snapshot()
+  local lines, marks = {}, {}
+  local function add(text, level)
+    lines[#lines + 1] = text
+    if level then marks[#marks + 1] = { line = #lines, start_col = 0, end_col = #text, level = level } end
+  end
+  add("── 设备组件（仅本会话，E 编辑）──", "note")
+  local state_txt = snap.enabled and ("生效中，动作=" .. snap.action) or "已关闭"
+  add(string.format("允许的设备组件（引用后直接绑定进沙箱，共 %d；%s）:", #snap.allowed, state_txt))
+  if #snap.allowed == 0 then
+    add("  （空，E 编辑器内按 a 添加）")
+  else
+    for i, d in ipairs(snap.allowed) do
+      add(string.format("  %d. %s", i, _one_line(d)), "system")
+    end
+  end
+  add(string.format("危险设备模式（命中弹窗确认，共 %d）:", #snap.paths))
+  if #snap.paths == 0 then
+    add("  （无）")
+  else
+    add("  " .. _one_line(table.concat(snap.paths, ", ")), "system")
+  end
+  add("")
+  return lines, marks
+end
+
+--- 重绘设备编辑器
+local function _refresh_devices_editor()
+  if not (devices_editor.buf and vim.api.nvim_buf_is_valid(devices_editor.buf)) then return end
+  local snap = _devices_snapshot()
+  local lines, map = {}, {}
+  local function add(text, entry)
+    lines[#lines + 1] = text
+    if entry then map[#lines] = entry end
+  end
+  add("⚙ 设备组件设置（仅本会话，重开 nvim 后恢复默认）")
+  add("")
+  add(string.format("─ 允许的设备组件（引用后直接绑定进沙箱，共 %d）─", #snap.allowed))
+  if #snap.allowed == 0 then
+    add("  （空，按 a 添加）")
+  else
+    for i, d in ipairs(snap.allowed) do
+      add("  " .. _one_line(d), { kind = "device", index = i })
+    end
+  end
+  add("")
+  add(string.format("─ 危险设备模式（命中弹窗确认，共 %d，动作=%s）─", #snap.paths, snap.action))
+  if #snap.paths == 0 then
+    add("  （无）")
+  else
+    for _, d in ipairs(snap.paths) do add("  " .. _one_line(d)) end
+  end
+  add("")
+  add("按键: a 添加允许设备    d 删除光标处设备    q/Esc 关闭")
+  devices_editor.line_map = map
+  vim.bo[devices_editor.buf].modifiable = true
+  vim.api.nvim_buf_set_lines(devices_editor.buf, 0, -1, false, lines)
+  if devices_editor.ns then
+    vim.api.nvim_buf_clear_namespace(devices_editor.buf, devices_editor.ns, 0, -1)
+    for ln, _ in pairs(map) do
+      vim.api.nvim_buf_add_highlight(devices_editor.buf, devices_editor.ns, LEVEL_HL.system, ln - 1, 2, -1)
+    end
+  end
+  if devices_editor.win and vim.api.nvim_win_is_valid(devices_editor.win) then
+    pcall(function()
+      local cfg = vim.api.nvim_win_get_config(devices_editor.win)
+      local h = math.max(6, math.min(#lines, vim.o.lines - 4))
+      if cfg.height ~= h then
+        cfg.height = h
+        vim.api.nvim_win_set_config(devices_editor.win, cfg)
+      end
+    end)
+  end
+end
+
+--- 关闭设备编辑器
+local function _close_devices_editor()
+  if devices_editor.win and vim.api.nvim_win_is_valid(devices_editor.win) then
+    pcall(vim.api.nvim_win_close, devices_editor.win, true)
+  end
+  geometry.untrack(devices_editor.win)
+  devices_editor.win, devices_editor.buf, devices_editor.ns = nil, nil, nil
+  devices_editor.line_map = {}
+end
+
+--- 编辑器内新增允许设备：vim.ui.input 输入路径（静默同步回调，避免 E5560）
+local function _edit_add_device()
+  local function handle(input)
+    if not input or input == "" then return end
+    local ok, err = M.add_device(input)
+    if ok then
+      vim.notify("[NeoAI] 已加入允许设备: " .. tostring(input), vim.log.levels.INFO)
+    else
+      vim.notify(("[NeoAI] 添加失败: %s"):format(tostring(err or "无效路径")), vim.log.levels.WARN)
+    end
+    _refresh_devices_editor()
+  end
+  local called = false
+  local ok = pcall(vim.ui.input, { prompt = "设备路径（如 /dev/kvm）: " }, function(input)
+    called = true
+    handle(input)
+  end)
+  if not ok and not called then
+    vim.notify("[NeoAI] 无法打开输入框", vim.log.levels.WARN)
+  end
+end
+
+--- 编辑器内删除光标所在设备行
+local function _edit_remove_device()
+  local ln = vim.api.nvim_win_get_cursor(0)[1]
+  local entry = devices_editor.line_map[ln]
+  if not entry then
+    vim.notify("[NeoAI] 请将光标移到设备行再按 d", vim.log.levels.WARN)
+    return
+  end
+  local ok, err = M.remove_device(entry.index)
+  if ok then
+    vim.notify("[NeoAI] 已移除设备", vim.log.levels.INFO)
+  else
+    vim.notify(("[NeoAI] 移除失败: %s"):format(tostring(err or "")), vim.log.levels.WARN)
+  end
+  _refresh_devices_editor()
+end
+
+--- 打开设备编辑器（可增删允许设备）
+local function _open_devices_editor()
+  if devices_editor.win and vim.api.nvim_win_is_valid(devices_editor.win) then
+    _refresh_devices_editor()
+    return
+  end
+  _ensure_hl()
+  devices_editor.buf = vim.api.nvim_create_buf(false, true)
+  vim.bo[devices_editor.buf].filetype = "neoai_sandbox_devices"
+  devices_editor.ns = vim.api.nvim_create_namespace("NeoAISandboxDevices")
+  local geom_opts = { w_ratio = 0.62, h_ratio = 0.5, fit_h = 20 }
+  local geom = geometry.compute(geom_opts)
+  devices_editor.win = vim.api.nvim_open_win(devices_editor.buf, true, {
+    relative = "editor",
+    width = geom.width,
+    height = math.max(6, math.min(geom.height, vim.o.lines - 4)),
+    col = geom.col,
+    row = geom.row,
+    style = "minimal",
+    border = "rounded",
+    title = "⚙ 设备组件设置（仅本会话）",
+    title_pos = "center",
+  })
+  geometry.track(devices_editor.win, geom_opts)
+  vim.wo[devices_editor.win].wrap = true
+  vim.wo[devices_editor.win].cursorline = true
+  local function bind(mode, key, fn) vim.keymap.set(mode, key, fn, { buffer = devices_editor.buf }) end
+  for _, mode in ipairs({ "n", "i" }) do
+    bind(mode, "q", function() _close_devices_editor(); M.refresh() end)
+    bind(mode, "<Esc>", function() _close_devices_editor(); M.refresh() end)
+    bind(mode, "a", _edit_add_device)
+    bind(mode, "d", _edit_remove_device)
+  end
+  _refresh_devices_editor()
+  pcall(vim.cmd, "stopinsert")
+end
+
+--- 设备设置公开 API（工具行为页，仅本会话） ==========
+
+--- 当前设备设置快照
+--- @return table { allowed, paths, action, enabled }
+function M.list_devices()
+  return _devices_snapshot()
+end
+
+--- 新增允许设备组件（仅当前会话；去重）
+--- @param path string
+--- @return boolean, string|nil err
+function M.add_device(path)
+  if type(path) ~= "string" then return false, "路径为空" end
+  local p = path:gsub("^%s+", ""):gsub("%s+$", "")
+  if p == "" then return false, "路径为空" end
+  if p:sub(1, 1) ~= "/" then return false, "需要绝对路径（以 / 开头）" end
+  local cfg = require("NeoAI.kernel.config_store")
+  local list = vim.deepcopy(cfg.get(CFG_DEV_ALLOWED) or {})
+  for _, d in ipairs(list) do
+    if d == p then return false, "设备已存在" end
+  end
+  list[#list + 1] = p
+  cfg.set(CFG_DEV_ALLOWED, list)
+  return true
+end
+
+--- 从允许设备列表移除一项（按 1-based 序号；仅当前会话）
+--- @param index number
+--- @return boolean, string|nil err
+function M.remove_device(index)
+  local cfg = require("NeoAI.kernel.config_store")
+  local list = vim.deepcopy(cfg.get(CFG_DEV_ALLOWED) or {})
+  local i = tonumber(index)
+  if not i or i < 1 or i > #list then return false, "序号越界" end
+  table.remove(list, i)
+  cfg.set(CFG_DEV_ALLOWED, list)
+  return true
+end
+
+--- 打开设备编辑器（公开，供键位/命令/测试调用）
+function M.open_devices_editor()
+  _open_devices_editor()
+end
+
+--- 获取设备编辑器 buffer（测试用）
+--- @return number|nil
+function M.get_devices_editor_buf()
+  return devices_editor.buf
+end
+
 --- 重绘目录编辑器
 local function _refresh_dirs_editor()
   if not (dirs_editor.buf and vim.api.nvim_buf_is_valid(dirs_editor.buf)) then return end
@@ -2394,6 +2638,15 @@ local function _build_blocking_page(page, ctx)
     for _, l in ipairs(ds_lines) do lines[#lines + 1] = l end
     local off = #lines - #ds_lines
     for _, m in ipairs(ds_marks) do
+      marks[#marks + 1] = { line = m.line + off, start_col = m.start_col, end_col = m.end_col, level = m.level }
+    end
+  end
+  -- 工具行为页追加「设备组件」区（危险设备访问允许列表，仅本会话；E 编辑）。
+  if page == "behavior" then
+    local dv_lines, dv_marks = _build_devices_section()
+    for _, l in ipairs(dv_lines) do lines[#lines + 1] = l end
+    local off = #lines - #dv_lines
+    for _, m in ipairs(dv_marks) do
       marks[#marks + 1] = { line = m.line + off, start_col = m.start_col, end_col = m.end_col, level = m.level }
     end
   end
@@ -2740,8 +2993,11 @@ function M.open()
   vim.keymap.set("n", "u", _undo_current, { buffer = state.buf, desc = "NeoAI 撤销保存/恢复已拒绝（回到待审）" })
   -- R：把合并冲突条目交给 AI（基于当前真实内容重做，不覆盖外部改动）。
   vim.keymap.set("n", "R", _resolve_conflict_current, { buffer = state.buf, desc = "NeoAI 合并冲突交给 AI 重做" })
-  -- E：打开目录设置（工作目录 / 遮蔽目录，仅本会话）；W：资源访问页把光标条目的遮蔽路径加入工作目录。
-  vim.keymap.set("n", "E", function() M.open_dirs_editor() end, { buffer = state.buf, desc = "NeoAI 目录设置" })
+  -- E：打开设置（工具行为页=设备组件，资源访问页=目录设置）。
+  vim.keymap.set("n", "E", function()
+    if state.page == "behavior" then return M.open_devices_editor() end
+    M.open_dirs_editor()
+  end, { buffer = state.buf, desc = "NeoAI 目录/设备设置" })
   vim.keymap.set("n", "W", function() _add_masked_to_workspace() end, { buffer = state.buf, desc = "NeoAI 遮蔽路径加入工作目录" })
   -- AI 审计（可配置按键；默认 a）
   local ai_cfg = require("NeoAI.kernel.config_store").get("tools.sandbox.review.ai_audit") or {}
@@ -2853,6 +3109,7 @@ end
 function M.close()
   _unwatch()
   _close_dirs_editor()
+  _close_devices_editor()
   if state.win_id and vim.api.nvim_win_is_valid(state.win_id) then
     -- 关闭前记录光标/目标/几何，供下次打开恢复。
     pcall(function()
@@ -2956,6 +3213,7 @@ function M.reset()
   pcall(function() local sb = _sb(); if sb then sb.reset_approval_hub() end end)
   _close_root_prompt()
   _close_dirs_editor()
+  _close_devices_editor()
   _close_diff()
   M.close()
 end

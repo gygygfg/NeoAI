@@ -1047,6 +1047,35 @@ end
 
 -- ========== 内核级行为观测（eBPF / strace / procfs） ==========
 
+--- 动态危险设备观测：观测到对危险设备节点的访问且未获允许时，记录并终止命令树。
+--- 命中的具体设备记入 `ctx.sandbox_device_blocked`（供 `finish` 弹窗/重跑）；返回命中的设备路径。
+--- @param attempt table|nil
+--- @param ctx table
+--- @param path string|nil
+--- @return string|nil matched
+function M._device_observe(attempt, ctx, path)
+  if type(path) ~= "string" or path == "" or type(ctx) ~= "table" then return nil end
+  local okdc, dc = pcall(require, "NeoAI.sandbox.review.device_consent")
+  if not (okdc and dc and dc.enabled() and dc.dynamic_active()) then return nil end
+  local matched = require("NeoAI.sandbox.review.risk").device_path_match(path)
+  if not matched or dc.is_granted(matched, ctx) then return nil end
+  local blocked = ctx.sandbox_device_blocked
+  if not blocked then blocked = {}; ctx.sandbox_device_blocked = blocked end
+  blocked[matched] = true
+  -- 终止命令树：真实设备不可被命令使用（未绑定）；阻止其继续执行/产生副作用。
+  if not ctx.sandbox_device_killed and type(ctx.sandbox_kill) == "function" then
+    ctx.sandbox_device_killed = true
+    pcall(ctx.sandbox_kill)
+  end
+  pcall(function()
+    require("NeoAI.sandbox.observe.trace").record({
+      path = matched, tool = attempt and attempt.tool_name, kind = "device", source = "observed",
+      command = attempt and attempt.command,
+    })
+  end)
+  return matched
+end
+
 --- 观测事件 → 越界访问留痕 + 密钥文件访问归因（非阻塞，best-effort）。
 --- 以实际 syscall 访问为准，替代/补充命令字符串解析启发式。
 --- @param attempt table
@@ -1090,6 +1119,8 @@ local function _on_observed(attempt, ctx, evt)
     seen[p] = true
     ctx._observed_paths_count = ctx._observed_paths_count + 1
   end
+  -- 危险设备访问动态监测：按实际 open 路径判定（去重后每路径仅一次），命中未允许即阻断。
+  M._device_observe(attempt, ctx, p)
   -- 每 attempt 缓存一次 read_all/cwd，避免逐事件读取配置与 getcwd。
   if ctx._observed_read_all == nil then ctx._observed_read_all = runtime.read_all() end
   if ctx._observed_read_all then
@@ -1249,6 +1280,21 @@ local function _start_observe(cg_handle, attempt, ctx, prewarmed)
   })
   if ok and handle then return handle end
   return nil
+end
+
+-- ========== 常驻实例观测（动态设备监测） ==========
+-- 常驻命令服务器使用会话级稳定 cgroup，而 `_start_observe` 只在一次性路径（有 attempt cgroup）启动。
+-- 为使默认的常驻 `run_command` 也能动态监测危险设备访问，这里对**会话级常驻 cgroup** 挂一个
+-- **每命令**轻量「仅设备」eBPF 观测（`observer.start_devwatch`：内核侧仅回传 `/dev/` 前缀路径），
+-- 句柄存于本次命令的 `ctx._resident_devwatch`，随命令结束（`_stop_observe`）停止——不跨命令常驻，
+-- 避免 bpftrace 残留与全局每事件主线程开销。事件直接回调 `M._device_observe`。
+--- 停止常驻设备观测句柄（兼容旧 API；当前为每命令句柄，随 `_stop_observe` 停）
+function M.clear_resident_observe() end
+
+--- 状态快照（诊断/测试）
+--- @return table { active }
+function M.resident_observe_info()
+  return { active = false }
 end
 
 --- 查询类动词：非零退出是**正常语义**（is-active 3=inactive、is-enabled 1=disabled、
@@ -1568,6 +1614,79 @@ local function _gate_inner(tool, args, ctx, call_original)
   end
 
   local spec = tool and tool.__sandbox_spec or tool_spec.get(tool and tool.name, tool and tool.category)
+
+  -- 危险设备访问门禁（/dev/kvm、/dev/net/tun 等内核逃逸面）：默认弹窗询问用户（30s 无应答自动
+  -- 阻止）；批准后由 `_build_prefix` 把该设备 `--dev-bind` 进本次命令的沙箱命名空间。检测用命令
+  -- 文本（含脚本折叠后的 effective，扫描结果缓存于 ctx 供后续复用，避免重复扫描）；无设备引用时
+  -- 直接放行。`action="deny"` 直接拒绝；`action="allow"` 直接暴露并放行。
+  if spec and spec.effect == "process" and type(args) == "table"
+    and type(args.command) == "string" then
+    local dc_ok, dc = pcall(require, "NeoAI.sandbox.review.device_consent")
+    if dc_ok and dc and dc.enabled() then
+      -- 脚本间接执行静态扫描：结果缓存复用（下面 deny_reason 阶段也使用，避免二次扫描）。
+      if ctx.sandbox_device_scan == nil then
+        local scan = nil
+        local ok_ss, ss = pcall(require, "NeoAI.sandbox.observe.script_scan")
+        if ok_ss and ss then
+          local ok_scan, s = pcall(ss.scan, args.command, {
+            cwd = ctx.sandbox_exec_cwd or ctx.cwd or vim.fn.getcwd(),
+          })
+          if ok_scan then scan = s end
+        end
+        ctx.sandbox_device_scan = scan or false
+      end
+      local scan = ctx.sandbox_device_scan ~= false and ctx.sandbox_device_scan or nil
+      local effective = (scan and scan.effective) or args.command
+      local matched = require("NeoAI.sandbox.review.risk").device_access(effective)
+      ctx.sandbox_device_paths = matched
+      if dc.dynamic_active() then
+        -- 动态监测模式：执行前**不**按文本弹窗/拒绝；仅对 `action="allow"` 预绑定（放行并暴露），
+        -- 已允许设备由 `_build_prefix` 的 bind_mounts 绑定。未允许者的**实际**访问由运行期
+        -- eBPF 观测（`_on_observed` → `M._device_observe`）发现后弹窗/重跑（见 `finish`）。
+        if #matched > 0 and dc.action() == "allow" then
+          local granted = vim.deepcopy(ctx.sandbox_device_granted or {})
+          for _, p in ipairs(matched) do granted[#granted + 1] = p end
+          ctx.sandbox_device_granted = granted
+        end
+      elseif #matched > 0 and not ctx.sandbox_device_gate_done then
+        -- 静态回退（无 eBPF / dynamic=false）：按命令文本判定并弹窗/拒绝。
+        local pending = {}
+        for _, p in ipairs(matched) do
+          if not dc.is_granted(p, ctx) then pending[#pending + 1] = p end
+        end
+        local action = dc.action()
+        if action == "deny" and #pending > 0 then
+          return async.reject({
+            kind = "sandbox",
+            message = "沙箱拒绝（危险设备访问，未获批准）: " .. table.concat(pending, ", "),
+            reason_codes = { "DEVICE_ACCESS_DENIED" },
+          })
+        elseif action == "ask" and #pending > 0 then
+          ctx.sandbox_device_gate_done = true
+          return dc.request(pending):then_(function(decision)
+            if decision == "deny" then
+              return async.reject({
+                kind = "sandbox",
+                message = "沙箱拒绝（危险设备未获批准）: " .. table.concat(pending, ", "),
+                reason_codes = { "DEVICE_ACCESS_DENIED" },
+              })
+            end
+            if decision == "allow_session" then dc.allow_session(pending) end
+            local granted = vim.deepcopy(ctx.sandbox_device_granted or {})
+            for _, p in ipairs(pending) do granted[#granted + 1] = p end
+            ctx.sandbox_device_granted = granted
+            -- 重新进入完整门禁（setup 锁此时已释放；设备检查因已授权而不再触发）。
+            return M.gate(tool, args, ctx, call_original)
+          end)
+        elseif action == "allow" and #matched > 0 then
+          local granted = vim.deepcopy(ctx.sandbox_device_granted or {})
+          for _, p in ipairs(matched) do granted[#granted + 1] = p end
+          ctx.sandbox_device_granted = granted
+        end
+      end
+    end
+  end
+
   local attempt = control.new_attempt(tool and tool.name or "unknown", args, ctx, spec)
 
   -- git 变更命令守卫（所有带 `command` 的进程类工具，含 run_command / service_start）：
@@ -1635,9 +1754,12 @@ local function _gate_inner(tool, args, ctx, call_original)
   -- bash -c '…'）时，读取脚本内容（含 AI 暂存副本）与高级语言内嵌 shell 调用，折叠为
   -- effective 文本，供硬拒绝/档位/分级复用；无法解析时标记不透明（强制复核）。
   if spec.effect == "process" and type(args.command) == "string" then
-    local scan = require("NeoAI.sandbox.observe.script_scan").scan(args.command, {
-      cwd = ctx.sandbox_exec_cwd or ctx.cwd or vim.fn.getcwd(),
-    })
+    local scan = (ctx.sandbox_device_scan ~= false and ctx.sandbox_device_scan) or nil
+    if not scan then
+      scan = require("NeoAI.sandbox.observe.script_scan").scan(args.command, {
+        cwd = ctx.sandbox_exec_cwd or ctx.cwd or vim.fn.getcwd(),
+      })
+    end
     attempt.script_scan = scan
   end
   -- 内核/破坏性命令硬拒绝（不执行）：普通命令（python/node/go/rust/apt/pip/npm 等）不受影响，
@@ -2087,6 +2209,27 @@ local function _gate_inner(tool, args, ctx, call_original)
             ctx.sandbox_command = require("NeoAI.sandbox.secret.secret").detokenize(args.command)
           end
           ctx.sandbox_kill = function() resident_mod.kill_current() end
+          -- 常驻实例动态设备监测：对会话级 cgroup 挂**本次命令**的轻量「仅设备」eBPF 观测
+          -- （内核侧仅回传 `/dev/` 前缀路径），句柄随命令结束由 `_stop_observe` 停止。
+          if inst.cg and type(inst.cg.path) == "string" and not ctx._resident_devwatch then
+            local dcfg = config_store.get("tools.sandbox.devices") or {}
+            if dcfg.enabled ~= false and dcfg.dynamic ~= false then
+              local observer = require("NeoAI.sandbox.observe.observer")
+              if observer.backend() == "ebpf" and type(observer.start_devwatch) == "function" then
+                local stat = vim.uv.fs_stat(inst.cg.path)
+                if stat then
+                  local okdw, h = pcall(observer.start_devwatch, {
+                    cgroup_id = stat.ino, cgroup_path = inst.cg.path, attempt_id = "resident_devwatch",
+                    on_event = function(evt) pcall(M._device_observe, attempt, ctx, evt.path) end,
+                    on_error = function(msg)
+                      require("NeoAI.kernel.logger").debug("[sandbox] 常驻设备观测: %s", tostring(msg))
+                    end,
+                  })
+                  if okdw and h then ctx._resident_devwatch = h end
+                end
+              end
+            end
+          end
           return true
         end
         -- 启动失败：回退一次性执行（不静默失败）。specs 基目录与一次性路径不同，
@@ -2146,6 +2289,22 @@ local function _gate_inner(tool, args, ctx, call_original)
       -- 记录本次 attempt 的有效 unmask（档位提权 + 审批放行 + 可写根）：冻结阶段据此
       -- 剔除「运行时实际未被遮蔽」的路径，避免把被放行的写入误判为遮蔽目标而整单元失败。
       attempt.effective_unmask = eff_priv and eff_priv.unmask or nil
+      -- 危险设备门禁：把本命令引用且已批准的设备 `--dev-bind` 进命名空间
+      -- （叠加在 bwrap 基础参数 `--dev /dev` 的最小 devtmpfs 之上；仅宿主真实存在的设备）。
+      do
+        local dev_mounts = require("NeoAI.sandbox.review.device_consent").bind_mounts(
+          ctx.sandbox_device_paths, ctx)
+        if #dev_mounts > 0 then
+          if eff_priv == priv then
+            eff_priv = {}
+            for k, v in pairs(priv or {}) do eff_priv[k] = v end
+          end
+          local m = {}
+          for _, x in ipairs(eff_priv.mounts or {}) do m[#m + 1] = x end
+          for _, x in ipairs(dev_mounts) do m[#m + 1] = x end
+          eff_priv.mounts = m
+        end
+      end
       -- 委派可写 cgroup 子树（挂到 /sys/fs/cgroup）：使命令能在沙箱内创建子 cgroup 并写
       -- memory.max/cpu.max（cgroup v2 写隔离），仅限该子树，不污染宿主其它 cgroup。
       local gateway_on = false
@@ -2240,6 +2399,7 @@ local function _gate_inner(tool, args, ctx, call_original)
 
     local function _fail(msg)
       if observe_handle then pcall(observe_handle.stop); observe_handle = nil end
+      if ctx._resident_devwatch then pcall(ctx._resident_devwatch.stop); ctx._resident_devwatch = nil end
       if cg_handle then cgroup.release(cg_handle) end
       if deleg_handle then cgroup.release_delegated(deleg_handle); deleg_handle = nil end
       candidate.cleanup(attempt.attempt_id)
@@ -2307,12 +2467,62 @@ local function _gate_inner(tool, args, ctx, call_original)
       observe_handle = nil
       if ctx._observe_handle then pcall(ctx._observe_handle.stop) end
       ctx._observe_handle = nil
+      -- 常驻实例的每命令「仅设备」观测句柄（见 `_build_prefix`）：命令结束即停止。
+      if ctx._resident_devwatch then pcall(ctx._resident_devwatch.stop) end
+      ctx._resident_devwatch = nil
       -- 命令结束后（结果即将返回、AI 开始生成下一轮）在后台预热下一条进程命令的探针，
       -- 使 bpftrace 挂载与 AI 输出重叠；用 vim.schedule 确保结果先返回、不阻塞。
       vim.schedule(function() pcall(_prewarm_observer) end)
     end
     local function finish(res, err)
       _stop_observe()
+      -- 动态设备门禁：运行期观测到未允许的危险设备访问（`M._device_observe`）时，命令已被终止或
+      -- 失败，此处释放资源并弹窗；批准后把设备重跑（绑定进命名空间），拒绝则报 DEVICE_ACCESS_DENIED。
+      local dev_blocked = ctx.sandbox_device_blocked
+      if dev_blocked and next(dev_blocked) and not ctx.sandbox_device_gate_done then
+        local list = {}
+        for p in pairs(dev_blocked) do list[#list + 1] = p end
+        table.sort(list)
+        local dev_failed = (err ~= nil)
+          or (type(res) == "table" and (res.aborted == true or res.timed_out == true))
+          or ctx.sandbox_device_killed == true
+        if dev_failed then
+          ctx.sandbox_device_gate_done = true
+          if cg_handle then cgroup.release(cg_handle); cg_handle = nil end
+          if deleg_handle then cgroup.release_delegated(deleg_handle); deleg_handle = nil end
+          candidate.cleanup(attempt.attempt_id)
+          control.transition(attempt, "FAILED")
+          local dc = require("NeoAI.sandbox.review.device_consent")
+          if dc.action() == "deny" then
+            d:reject({ kind = "sandbox",
+              message = "沙箱拒绝（危险设备访问，未获批准）: " .. table.concat(list, ", "),
+              reason_codes = { "DEVICE_ACCESS_DENIED" }, command_id = attempt.command_id })
+            return
+          end
+          dc.request(list):then_(function(decision)
+            if decision == "deny" then
+              d:reject({ kind = "sandbox",
+                message = "沙箱拒绝（危险设备未获批准）: " .. table.concat(list, ", "),
+                reason_codes = { "DEVICE_ACCESS_DENIED" }, command_id = attempt.command_id })
+              return
+            end
+            if decision == "allow_session" then dc.allow_session(list) end
+            local granted = vim.deepcopy(ctx.sandbox_device_granted or {})
+            for _, p in ipairs(list) do granted[#granted + 1] = p end
+            ctx.sandbox_device_granted = granted
+            ctx.sandbox_device_paths = list
+            ctx.sandbox_device_blocked = nil
+            ctx.sandbox_device_killed = nil
+            ctx.sandbox_device_scan = nil
+            -- 重新进入完整门禁：批准后设备由 `bind_mounts` 绑定进命名空间并重跑命令。
+            M.gate(tool, args, ctx, call_original):then_(
+              function(v) d:resolve(v) end, function(e) d:reject(e) end)
+          end)
+          return
+        end
+        -- 命令成功（未真正依赖该设备）：异步提示供后续会话放行，本次结果照常结算。
+        pcall(function() require("NeoAI.sandbox.review.device_consent").request(list) end)
+      end
       -- 诊断：命令结束时 dump 资源域事件（OOM / 进程终止归因），仅日志，不改变行为。
       local diag = config_store.get("tools.sandbox.diagnostics") or {}
       if diag.enabled and cg_handle then

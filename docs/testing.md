@@ -214,6 +214,7 @@ end)
 | `test_sandbox_systemd` | systemctl 门面（方案 A）：独立调用解析与路由、unit 解析与类型门禁、依赖闭包（Requires/Wants/After、缺失依赖）、start 静默成功、status/is-active/is-system-running/is-failed 真实风格输出与退出码、不支持动词返回真实错误（不暴露沙箱）、门禁拦截不调用宿主 systemctl；Service 属性解析与 `show --property`、pending enable 虚拟视图、`reset-failed` 清除 degraded、`kill`+`Restart=always` 自动重启与 NRestarts、`.timer` 调度与 `systemd-run --on-active` 瞬态定时器 |
 | `test_sandbox_maintscript` | systemd 门面入口：`process_prefix` 把极薄入口覆盖绑定真实二进制路径（不再 PATH 前置 `/tmp/.dynbin`）、包安装注入 policy-rc.d、入口经文件 IPC 转发到 Lua 门面（stdout/stderr/退出码与真实 systemctl 一致） |
 | `test_net_consent` | 沙箱网络访问同意：策略 ask/allow/deny、内部端口登记免权限、headless 失败关闭、弹窗 allow_once/deny/allow_session 记忆、外部目标按策略处理 |
+| `test_device_consent` | 危险设备访问门禁：`risk.device_access`/`device_path_match` 检测（/dev/kvm、/dev/net/tun、of=、重定向、引号、glob）与不误判；动作/超时/本会话允许列表；request 决策（headless 拒绝、弹窗允许、会话记住、超时自动阻止）；`bind_mounts` 生成 `--dev-bind`；动态监测 `_device_observe`（命中记录并终止命令树、已允许/无害不阻断）；静态回退端到端（deny 拒绝 / ask 批准后执行 / allow 直接放行）；eBPF 动态端到端（可用时） |
 | `test_sandbox_overlay_invalidate` | overlay 视图同步：发布/拒绝后 `resident.sync_real` 使命令读到真实盘新内容（不再读到旧物化，修复视图分裂）；权限位变化触发重新物化 |
 | `test_grant` | 沙箱任务授权：scope 精确/前缀/`/**`、操作白名单、预算累计、ttl 过期、撤销、`find_covering`、active_only 列表 |
 | `test_replay` | 策略回放：同规则同事实可复现、被篡改裁决 `same=false`、策略版本漂移、缺事实/非裁决/不存在证据的错误码 |
@@ -224,7 +225,7 @@ end)
 | `test_commands_plugin` | 命令插件：NAMES 唯一、注册/清理/幂等、缺服务静默降级 |
 | `test_keymaps_plugin` | 键位插件与 `ui.keymap`：全局/buffer 注册与卸载、双模式展开、action 分派、`show_keymaps` 浮窗 |
 | `test_lazy_plugin` | 懒加载占位：占位命令注册/清理契约、已启动不误删、阶段 1 与全量启动分派 |
-| `test_ui_components` | UI 组件：net_consent 弹窗与决策回调、sub_agent_dock 事件渲染、terminal_window headless no-op、`display_modes.chat` 注册/load/unload/render |
+| `test_ui_components` | UI 组件：net_consent/device_consent 弹窗与决策回调、sub_agent_dock 事件渲染、terminal_window headless no-op、`display_modes.chat` 注册/load/unload/render |
 | `test_sandbox_shims` | `fault`/`bench` 兼容 shim 转发到 `diag` |
 | `test_parallel_runner` | 并行运行器：LPT 分片均衡/可复现/空档、SUITE/LOADFAIL 解析、聚合 passed/failed 与耗时缓存、过滤套件、分片异常、发现失败（注入假 spawner，不启动真实子进程） |
 

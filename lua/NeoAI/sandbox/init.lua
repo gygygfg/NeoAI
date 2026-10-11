@@ -176,6 +176,8 @@ function M.shutdown()
   pcall(function() require("NeoAI.sandbox.execution.service").stop_all({ timeout_ms = 10000 }) end)
   -- 停止会话级常驻沙箱实例（连同其命名空间内的后台进程）。
   pcall(function() require("NeoAI.sandbox.execution.resident").stop({ timeout_ms = 2000 }) end)
+  -- 停止常驻实例的动态设备观测句柄（避免 bpftrace 残留）。
+  pcall(function() require("NeoAI.sandbox.execution.wrapper").clear_resident_observe() end)
   -- 回收保活的后台命令资源域（run_command 后台意图命令跨轮次存活，仅在关闭时统一回收）。
   pcall(function() require("NeoAI.sandbox.execution.wrapper").release_persistent_backgrounds() end)
   -- 卸载用户态 overlay（fuse-overlayfs）兜底挂载，避免残留挂载点影响后续/清理。
@@ -764,6 +766,12 @@ function M.set_secret_alert_ui(ui)
   return require("NeoAI.sandbox.secret.secret_alert").set_ui(ui)
 end
 
+--- 注册危险设备访问确认 UI 渲染器（由 ui 层注入；传 nil 解绑）
+--- @param ui table|nil
+function M.set_device_consent_ui(ui)
+  return require("NeoAI.sandbox.review.device_consent").set_ui(ui)
+end
+
 -- ---------- 呈现层只读查询（语义封装） ----------
 
 --- 风险等级徽标文本
@@ -933,6 +941,8 @@ function M.reset()
   pcall(function() require("NeoAI.sandbox.execution.service").reset() end)
   -- 停止会话级常驻沙箱实例（连同其后台进程与资源域）。
   pcall(function() require("NeoAI.sandbox.execution.resident").reset() end)
+  -- 停止常驻实例的动态设备观测句柄。
+  pcall(function() require("NeoAI.sandbox.execution.wrapper").clear_resident_observe() end)
   -- 回收保活的后台命令资源域（先于 `cgroup.reset()`，以便在句柄状态被清空前 kill + 删除）。
   pcall(function() require("NeoAI.sandbox.execution.wrapper").release_persistent_backgrounds() end)
   candidate.reset()
