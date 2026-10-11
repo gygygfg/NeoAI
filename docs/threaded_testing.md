@@ -67,53 +67,23 @@ end)
 
 ## 3. 测试文件清单
 
-`lua/NeoAI/tests/` 下按模块/特性划分：
+`lua/NeoAI/tests/` 下共 **126** 个 `test_*.lua`（另 `init.lua` 为运行器、`parallel.lua` 为并行运行器、`http_server.lua` / `sandbox_stub.lua` / `sandbox_boundary_helpers.lua` 为测试辅助），按类别划分：
 
-`lua/NeoAI/tests/` 下共 **41** 个 `test_*.lua`（另 `init.lua` 为运行器），按模块/特性划分：
+> **权威来源**：下为速览索引，实际清单以 `ls lua/NeoAI/tests/test_*.lua` 为准（新增套件无需回改本文）。
 
-| 文件 | 覆盖 |
+| 类别 | 套件（`test_*.lua`，省略 `test_` 前缀与 `.lua`） |
 | --- | --- |
-| `test_kernel.lua` | 内核（config_store / event_bus / events / lifecycle） |
-| `test_session.lua` | 会话（session / session_store / context_builder / compactor） |
-| `test_agent.lua` | Agent（agent / runtime） |
-| `test_guard.lua` | 工具循环护栏 |
-| `test_overflow.lua` | 上下文溢出恢复 |
-| `test_runtime_context.lua` | 运行时上下文 |
-| `test_model_registry.lua` | 模型注册表 |
-| `test_model_capabilities.lua` | 模型能力表 |
-| `test_model_profiles.lua` | 厂商/模型方言 |
-| `test_model_metadata.lua` | 实时模型元数据 |
-| `test_protocol_adapter.lua` | 协议编解码 |
-| `test_prompt_cache.lua` | 显式缓存 |
-| `test_cache_strategy.lua` | 前缀缓存策略 |
-| `test_cache_usage.lua` | 缓存命中用量统计 |
-| `test_model_picker.lua` | 模型选择器 |
-| `test_modes.lua` | 模式（CHAT/PLAN） |
-| `test_multimodal.lua` | 多模态图像 |
-| `test_tools.lua` | 工具系统 |
-| `test_tool_pending.lua` | 工具待发/暂存 |
-| `test_pending_queue.lua` | 待发消息队列 |
-| `test_services.lua` | 服务层（chat / tool / model / status） |
-| `test_status.lua` | 状态栏服务 |
-| `test_ask_user.lua` | 向用户提问 |
-| `test_herder.lua` | Herder 状态上报 |
-| `test_plan_mode.lua` | 计划模式 |
-| `test_plan_distill.lua` | 计划蒸馏 |
-| `test_todo.lua` | 待办清单 |
-| `test_sub_agent_result.lua` | 子 Agent 结果 |
-| `test_skills.lua` | Skills（frontmatter/发现/装载） |
-| `test_mcp_client.lua` | MCP JSON-RPC 客户端 |
-| `test_mcp_transport.lua` | MCP 传输层（stdio/HTTP） |
-| `test_mcp_bridge.lua` | MCP 管理器桥接 |
-| `test_chat_ui.lua` | 聊天 UI |
-| `test_tree_ui.lua` | 会话树 UI |
-| `test_chat_keys.lua` | 聊天键位 |
-| `test_display_modes.lua` | 显示模式插件 |
-| `test_fold.lua` | 折叠 |
-| `test_markdown.lua` | Markdown 渲染 |
-| `test_timer.lua` | 可暂停计时器 |
-| `test_http.lua` | HTTP 客户端 |
-| `test_integration.lua` | 集成测试（mock server） |
+| 内核 / 插件 / 服务 / 运行时 | `kernel`、`plugins`、`services`、`service_tool`、`lazy_plugin`、`lazy_startup`、`commands_plugin`、`keymaps_plugin`、`reload_all`、`lock`、`trace_retention` |
+| 会话 / Agent / 上下文 / 模式 | `session`、`session_store`、`session_progress`、`agent`、`runtime_context`、`guard`、`overflow`、`loop_compaction`、`compaction_overlay`、`truncation`、`max_tokens`、`pending_queue`、`sub_agent_result`、`abort_tools`、`modes` |
+| 模型 / 协议 / 缓存 | `model_registry`、`model_capabilities`、`model_profiles`、`model_metadata`、`model_picker`、`protocol_adapter`、`prompt_cache`、`cache_strategy`、`cache_usage` |
+| 工具系统 | `tools`、`tool_pending`、`tool_result_pruner`、`output_guard`、`approval_hub`、`plan_mode`、`plan_distill`、`todo`、`ask_user`、`read_image`、`web_fetch`、`multimodal` |
+| 文件 / Shell / LSP / 文本 | `fs_io`、`guest_fs`、`git_ops`、`lsp_check`、`lsp_guard`、`pty`、`ansi`、`stringx`、`textmetrics`、`sha256`、`merge3` |
+| UI | `chat_ui`、`tree_ui`、`chat_keys`、`display_modes`、`fold`、`markdown`、`ui_components`、`geometry`、`incremental`、`stream_batching`、`status` |
+| MCP | `mcp_client`、`mcp_transport`、`mcp_bridge`、`mcp_cache` |
+| Skills / Herder | `skills`、`herder`、`herder_install` |
+| 沙箱（含授权 / 回放 / 观测 / 网络同意） | `sandbox_ai_audit`、`sandbox_background`、`sandbox_boundary_consistency`、`sandbox_boundary_escape`、`sandbox_boundary_net`、`sandbox_conflict_ai`、`sandbox_core`、`sandbox_governance`、`sandbox_hardening`、`sandbox_instance`、`sandbox_loss_audit`、`sandbox_lost_update`、`sandbox_lsp`、`sandbox_maintscript`、`sandbox_merge`、`sandbox_mountview`、`sandbox_namespace`、`sandbox_ops`、`sandbox_overlay_invalidate`、`sandbox_package_signature`、`sandbox_privdrop`、`sandbox_privilege`、`sandbox_publish_async`、`sandbox_review`、`sandbox_script_scan`、`sandbox_secret`、`sandbox_service`、`sandbox_session`、`sandbox_shims`、`sandbox_staging`、`sandbox_symlink`、`sandbox_systemd`、`sandbox_systemd_user`、`sandbox_view`、`grant`、`replay`、`observer`、`review_cache`、`net_consent`、`gateway` |
+| 密钥防护 | `secret_async`、`secret_fake`、`secret_highlight` |
+| 测试框架 / 基础设施 | `test_runner`、`parallel_runner`、`integration`、`http`、`async`、`timer`、`work_codec` |
 
 ## 4. headless 运行
 

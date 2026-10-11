@@ -1566,7 +1566,7 @@ require("NeoAI").setup({
 
 ## 9. 测试
 
-`lua/NeoAI/tests/test_sandbox.lua` 覆盖：加载器强制附加规格、fail-closed、
+`lua/NeoAI/tests/` 下的 `test_sandbox_*.lua`（如 `test_sandbox_core` / `session` / `view` / `privilege` / `secret` / `ops` / `hardening` 等）覆盖：加载器强制附加规格、fail-closed、
 状态机/幂等/fencing、策略聚合与受限规则、dry-run 不落盘、CAS 发布与冲突、
 buffer 写盘重定向、运行时能力探测与隔离进程执行、异步审批入队/应用/拒绝、
 run_command overlay 候选捕获（含删除 whiteout 捕获与尝试目录清理）、
@@ -1851,7 +1851,7 @@ overlay 会 `EINVAL`），此时命令只能运行在「只读根 + 私有可写
 
 脱敏是**文本层尽力而为**：模型可用编码/间接方式绕过（如 `base64`），也可读取未被过滤的
 系统接口（`/proc/filesystems` 仍列出内核 overlay 支持）。测试见
-`tests/test_sandbox.lua` 的「隐匿」用例。
+`test_sandbox_*.lua` 的「隐匿」用例。
 
 ## 16. 密钥防护（secrets，常开）
 
@@ -2006,7 +2006,7 @@ UI 未注册但为**交互式 Neovim** 时，回退到内建 `confirm` **暂停�
 > 沙箱存储基目录分别预热 `overlay_writable` 探测，使首条 `run_command` 与首个长驻服务直接命中
 > 缓存，不在命令开始处阻塞主线程。
 
-### 检测（熵 + 字符集启发式）
+### 16.5 检测（熵 + 字符集启发式）
 
 - 候选：长度 `[min_length, max_length]`、含字母与数字、不同字符数 `≥ min_distinct`、
   香农熵 `≥ min_entropy`（默认 20/200/8/3.5）。
@@ -2052,7 +2052,7 @@ UI 未注册但为**交互式 Neovim** 时，回退到内建 `confirm` **暂停�
 - `allowlist` 可再加 Lua pattern 排除。参数见
   [configuration.md](configuration.md) 的 `tools.sandbox.secrets`。
 
-### 环境变量：沙箱进程拿到真实值，AI 只见假密钥
+### 16.6 环境变量：沙箱进程拿到真实值，AI 只见假密钥
 
 `sanitized_env()` 生成假化覆盖（供日志/审计与 AI 可见面）；`sandbox_env()` 在构造沙箱
 进程环境时会把假密钥还原为真实密钥——**假→真实的替换仅允许发生在沙箱内部进程**。
@@ -2065,7 +2065,7 @@ UI 未注册但为**交互式 Neovim** 时，回退到内建 `confirm` **暂停�
   `tools.sandbox.secrets.tokenize_env = false`；工具结果与暂存内容仍按密钥防护处理。
   **注意这会降低隔离强度，仅建议在可信环境临时使用。**
 
-### 加密映射与生命周期
+### 16.7 加密映射与生命周期
 
 - 每个真实密钥分配一个**格式保真假密钥**（前缀/长度/字符类一致，熵不低于原始）；映射表
   **仅在内存**，不落盘（仅假密钥集合可在会话内持久化用于热重载 fail-closed 检测）。
@@ -2082,7 +2082,7 @@ UI 未注册但为**交互式 Neovim** 时，回退到内建 `confirm` **暂停�
 - 暂存视图假化后，`base_hash`（真实基线，用于 CAS 冲突检测）与
   `view_base_hash`（假化基线，用于改动判定）分开记录，保证只读工具与编辑一致。
 
-### 留痕与告警
+### 16.8 留痕与告警
 
 - 每次检测到新密钥、以及工具参数中用到假密钥或出现敏感环境变量名，都写入一条
   `kind="secret"` 证据。
@@ -2095,7 +2095,7 @@ UI 未注册但为**交互式 Neovim** 时，回退到内建 `confirm` **暂停�
 - 事件：`SANDBOX_SECRET_DETECTED` / `SANDBOX_SECRET_TRACED` / `SANDBOX_SECRET_BLOCKED` /
   `SANDBOX_SECRET_ALERT` / `SANDBOX_SECRET_EGRESS`。
 
-### 原始密钥：立即停止 + 弹窗确认
+### 16.9 原始密钥：立即停止 + 弹窗确认
 
 映射表中已知的**原始密钥**出现在以下**任一**位置时，**立即停止 Agent 并弹窗**：
 
@@ -2126,7 +2126,7 @@ UI 未注册但为**交互式 Neovim** 时，回退到内建 `confirm` **暂停�
 > 该候选会被拒绝发布（fail-closed）。纯小写 hex 密钥、以及命令在沙箱内直接读取真实文件
 > 并在同一命令内使用密钥（不经过模型）的行为不在覆盖范围内。
 
-### 16.1 AI 生成的高熵信息（生成密钥也关注）
+### 16.10 AI 生成的高熵信息（生成密钥也关注）
 
 除「宿主已有密钥进入沙箱」外，**AI 在沙箱内自行生成**的密钥类高熵内容同样被关注：
 `secret.detect_generated(files)` 对候选文件内容直接做熵/具名规则检测（与只识别已 token 化的
@@ -2139,7 +2139,7 @@ UI 未注册但为**交互式 Neovim** 时，回退到内建 `confirm` **暂停�
 已知假密钥（宿主密钥的遮蔽形式）不计入生成检测，由 `warn_for_files` 处理。命令输出/
 工具参数中的生成密钥经 `tokenize_result`/`tokenize_args` 走既有假化路径。
 
-### 16.2 本机 SSH 服务禁止访问
+### 16.11 本机 SSH 服务禁止访问
 
 禁止沙箱内进程使用宿主的 SSH 服务（ssh-agent / sshd）：
 

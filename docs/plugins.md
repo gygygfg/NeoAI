@@ -1,4 +1,6 @@
-# NeoAI 插件系统（v1.0）
+# NeoAI 插件系统（v3.0）
+
+> [English](en/plugins.md) | **中文**
 
 NeoAI 采用「服务定位器 + 插件宿主」架构：业务代码不直接 `require` 具体服务，而是通过
 `kernel.services.use()` 获取**当前配置下生效**的实现；所有副作用（命令、键位、工具、事件订阅、

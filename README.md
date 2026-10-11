@@ -136,6 +136,9 @@ require("NeoAI").setup({
 | `:NeoAISandboxList` / `:NeoAISandboxShow` | 列出/查看待处理沙箱候选 |
 | `:NeoAISandboxDiscard`| 丢弃沙箱候选（参数为候选摘要）                  |
 | `:NeoAISandboxCaps`| 显示沙箱运行时能力探测结果                        |
+| `:NeoAISandboxDiag`| 显示沙箱资源域/负载诊断（137/OOM 归因）            |
+| `:NeoAISandboxAudit`| 显示沙箱行为审计与风险评估摘要                     |
+| `:NeoAISandboxAutoApprove`| 设置 AI 新会话自动审批（`on`/`off`/`status`，默认关闭）|
 | `:NeoAIStatusline` | 预览当前 lualine 状态栏组件内容                    |
 
 ### 4. 默认快捷键

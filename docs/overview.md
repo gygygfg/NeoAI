@@ -277,4 +277,18 @@ require('NeoAI').setup({
 | `:NeoAIReloadDisplay [name]` | 热重载某个显示模式插件 |
 | `:NeoAIPlan` | 切换 plan mode（只读/信息类工具 + ask_user） |
 | `:NeoAIApprovePlan` | 批准 plan，切换到 CHAT，执行任务列表 |
+| `:NeoAIReloadAll` | 热重载整个 NeoAI 插件（先隔离子进程预检，失败则取消） |
+| `:NeoAISandboxReview` | 列出并应用待审的沙箱修改（按路径级别高亮） |
+| `:NeoAISandboxCommit` | 应用沙箱候选到真实工作区（CAS 发布，参数为候选摘要） |
+| `:NeoAISandboxDiscard` | 丢弃沙箱候选 |
+| `:NeoAISandboxList` / `:NeoAISandboxShow` | 列出 / 查看待处理沙箱候选 |
+| `:NeoAISandboxCaps` / `:NeoAISandboxDiag` | 沙箱运行时能力探测 / 资源域负载诊断（137/OOM 归因） |
+| `:NeoAISandboxApprove` / `:NeoAISandboxReject` | 批准（不应用）/ 拒绝并丢弃变更单元 |
+| `:NeoAISandboxApply` / `:NeoAISandboxApplyAll` | 批准并应用单个 / 全部待审变更单元 |
+| `:NeoAISandboxGrant` / `:NeoAISandboxRevoke` | 创建窄范围任务授权 / 撤销授权 |
+| `:NeoAISandboxPrune` / `:NeoAISandboxMetrics` | 按保留期清理过期候选 / 显示沙箱运行指标 |
+| `:NeoAISandboxPublish` / `:NeoAISandboxReplay` | 组合发布多个变更单元 / 回放已记录的策略裁决 |
+| `:NeoAISandboxAudit` / `:NeoAISandboxAutoApprove` | 沙箱行为审计与风险评估 / 设置新会话自动审批（默认关闭） |
+| `:NeoAIHerderStatus` | 显示 Herder 集成状态 |
+| `:NeoAIHerderConfig [show\|install\|uninstall]` | 查看 / 安装 / 卸载 Herder 展示增强配置片段 |
 | `:NeoAIStatusline` | 预览 lualine 状态栏组件内容 |

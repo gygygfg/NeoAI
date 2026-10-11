@@ -1,4 +1,4 @@
-# NeoAI Plugin System (v1.0)
+# NeoAI Plugin System (v3.0)
 
 > [中文](../plugins.md) | **English**
 

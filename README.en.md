@@ -138,6 +138,9 @@ require("NeoAI").setup({
 | `:NeoAISandboxList` / `:NeoAISandboxShow` | List / inspect pending sandbox candidates |
 | `:NeoAISandboxDiscard`| Discard a sandbox candidate (arg = candidate digest) |
 | `:NeoAISandboxCaps`| Show sandbox runtime capability probe results |
+| `:NeoAISandboxDiag`| Show sandbox resource-domain / load diagnostics (137/OOM attribution) |
+| `:NeoAISandboxAudit`| Show the sandbox behavior-audit and risk-assessment summary |
+| `:NeoAISandboxAutoApprove`| Set auto-approval for new AI sessions (`on`/`off`/`status`, off by default) |
 | `:NeoAIStatusline` | Preview the content of the current lualine statusline components |
 
 ### 4. Default Keymaps

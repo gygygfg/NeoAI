@@ -290,4 +290,18 @@ require('NeoAI').setup({
 | `:NeoAIReloadDisplay [name]` | Hot-reload a display mode plugin |
 | `:NeoAIPlan` | Toggle plan mode (read-only/info tools + ask_user) |
 | `:NeoAIApprovePlan` | Approve plan, switch to CHAT, execute task list |
+| `:NeoAIReloadAll` | Hot-reload the whole NeoAI plugin (isolated subprocess pre-check first; cancel on failure) |
+| `:NeoAISandboxReview` | List and apply pending sandbox changes (highlighted by path level) |
+| `:NeoAISandboxCommit` | Apply a sandbox candidate to the real workspace (CAS publish; arg = candidate digest) |
+| `:NeoAISandboxDiscard` | Discard a sandbox candidate |
+| `:NeoAISandboxList` / `:NeoAISandboxShow` | List / inspect pending sandbox candidates |
+| `:NeoAISandboxCaps` / `:NeoAISandboxDiag` | Sandbox runtime capability probe / resource-domain load diagnostics (137/OOM attribution) |
+| `:NeoAISandboxApprove` / `:NeoAISandboxReject` | Approve (no apply) / reject & discard a change set |
+| `:NeoAISandboxApply` / `:NeoAISandboxApplyAll` | Approve and apply one / all pending change sets |
+| `:NeoAISandboxGrant` / `:NeoAISandboxRevoke` | Create a narrow task grant / revoke a grant |
+| `:NeoAISandboxPrune` / `:NeoAISandboxMetrics` | Prune expired candidates by retention / show sandbox metrics |
+| `:NeoAISandboxPublish` / `:NeoAISandboxReplay` | Publish multiple change sets together / replay a recorded policy decision |
+| `:NeoAISandboxAudit` / `:NeoAISandboxAutoApprove` | Sandbox behavior audit & risk assessment / set auto-approval for new sessions (off by default) |
+| `:NeoAIHerderStatus` | Show Herder integration status |
+| `:NeoAIHerderConfig [show\|install\|uninstall]` | View / install / uninstall the Herder display-enhancement config snippet |
 | `:NeoAIStatusline` | Preview the lualine statusline component content |

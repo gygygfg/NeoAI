@@ -143,6 +143,19 @@ All event constants are defined in `NeoAI.kernel.events`. They are listed below 
 
 > Approval events carry `agent_id` so subscribers such as Herder can distinguish the blocked state of different Agents.
 
+### Interactive terminal (run_command PTY)
+
+| Constant | Value | When it fires | Key payload fields |
+| --- | --- | --- | --- |
+| `PTY_STARTED` | `pty:started` | Interactive PTY session starts | `{ id, pid, command }` |
+| `PTY_WAITING_INPUT` | `pty:waiting_input` | Polling detects the process blocked on a terminal read (waiting for input) | `{ id, pid, description, command }` |
+| `PTY_INPUT_SENT` | `pty:input_sent` | Judge/user injects bytes | `{ id, bytes }` |
+| `PTY_EXITED` | `pty:exited` | Session exits | `{ id, code }` |
+
+> Fires only when `tools.run_command.interactive.enabled` is set. Detection is based on the `/proc` blocked-terminal-read state, not on matching terminal text.
+> Note: the Herder status service **no longer consumes** `PTY_*` events — a pty waiting for input does not affect pane lifecycle state (no red mark);
+> these events are still emitted by the pty service for other subscribers such as the floating terminal.
+
 ### User Prompts (ask_user)
 
 | Constant | Value | When it fires | Key payload fields |

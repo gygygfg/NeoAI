@@ -67,53 +67,23 @@ The test case callback parameter `t` passed to `it` contains all assertion helpe
 
 ## 3. List of Test Files
 
-Under `lua/NeoAI/tests/`, tests are organized by module/feature:
+`lua/NeoAI/tests/` contains **126** `test_*.lua` files in total (plus `init.lua` as the runner, `parallel.lua` as the parallel runner, and `http_server.lua` / `sandbox_stub.lua` / `sandbox_boundary_helpers.lua` as test helpers), organized by category:
 
-`lua/NeoAI/tests/` contains **41** `test_*.lua` files in total (plus `init.lua` as the runner), organized by module/feature:
+> **Authoritative source**: the list below is a quick index; the actual set is always `ls lua/NeoAI/tests/test_*.lua` (new suites need no doc change here).
 
-| File | Coverage |
+| Category | Suites (`test_*.lua`, prefix `test_` and `.lua` omitted) |
 | --- | --- |
-| `test_kernel.lua` | Kernel (config_store / event_bus / events / lifecycle) |
-| `test_session.lua` | Session (session / session_store / context_builder / compactor) |
-| `test_agent.lua` | Agent (agent / runtime) |
-| `test_guard.lua` | Tool loop guardrails |
-| `test_overflow.lua` | Context overflow recovery |
-| `test_runtime_context.lua` | Runtime context |
-| `test_model_registry.lua` | Model registry |
-| `test_model_capabilities.lua` | Model capabilities table |
-| `test_model_profiles.lua` | Provider/model dialects |
-| `test_model_metadata.lua` | Live model metadata |
-| `test_protocol_adapter.lua` | Protocol encoding/decoding |
-| `test_prompt_cache.lua` | Explicit caching |
-| `test_cache_strategy.lua` | Prefix caching strategy |
-| `test_cache_usage.lua` | Cache hit usage statistics |
-| `test_model_picker.lua` | Model picker |
-| `test_modes.lua` | Modes (CHAT/PLAN) |
-| `test_multimodal.lua` | Multimodal images |
-| `test_tools.lua` | Tool system |
-| `test_tool_pending.lua` | Pending/staged tools |
-| `test_pending_queue.lua` | Pending message queue |
-| `test_services.lua` | Service layer (chat / tool / model / status) |
-| `test_status.lua` | Status line service |
-| `test_ask_user.lua` | Asking the user |
-| `test_herder.lua` | Herder status reporting |
-| `test_plan_mode.lua` | Plan mode |
-| `test_plan_distill.lua` | Plan distillation |
-| `test_todo.lua` | Todo list |
-| `test_sub_agent_result.lua` | Sub-agent results |
-| `test_skills.lua` | Skills (frontmatter/discovery/loading) |
-| `test_mcp_client.lua` | MCP JSON-RPC client |
-| `test_mcp_transport.lua` | MCP transport layer (stdio/HTTP) |
-| `test_mcp_bridge.lua` | MCP manager bridge |
-| `test_chat_ui.lua` | Chat UI |
-| `test_tree_ui.lua` | Session tree UI |
-| `test_chat_keys.lua` | Chat keymaps |
-| `test_display_modes.lua` | Display mode plugin |
-| `test_fold.lua` | Folding |
-| `test_markdown.lua` | Markdown rendering |
-| `test_timer.lua` | Pausable timer |
-| `test_http.lua` | HTTP client |
-| `test_integration.lua` | Integration tests (mock server) |
+| Kernel / plugins / services / runtime | `kernel`, `plugins`, `services`, `service_tool`, `lazy_plugin`, `lazy_startup`, `commands_plugin`, `keymaps_plugin`, `reload_all`, `lock`, `trace_retention` |
+| Session / agent / context / modes | `session`, `session_store`, `session_progress`, `agent`, `runtime_context`, `guard`, `overflow`, `loop_compaction`, `compaction_overlay`, `truncation`, `max_tokens`, `pending_queue`, `sub_agent_result`, `abort_tools`, `modes` |
+| Model / protocol / cache | `model_registry`, `model_capabilities`, `model_profiles`, `model_metadata`, `model_picker`, `protocol_adapter`, `prompt_cache`, `cache_strategy`, `cache_usage` |
+| Tool system | `tools`, `tool_pending`, `tool_result_pruner`, `output_guard`, `approval_hub`, `plan_mode`, `plan_distill`, `todo`, `ask_user`, `read_image`, `web_fetch`, `multimodal` |
+| Files / shell / LSP / text | `fs_io`, `guest_fs`, `git_ops`, `lsp_check`, `lsp_guard`, `pty`, `ansi`, `stringx`, `textmetrics`, `sha256`, `merge3` |
+| UI | `chat_ui`, `tree_ui`, `chat_keys`, `display_modes`, `fold`, `markdown`, `ui_components`, `geometry`, `incremental`, `stream_batching`, `status` |
+| MCP | `mcp_client`, `mcp_transport`, `mcp_bridge`, `mcp_cache` |
+| Skills / Herder | `skills`, `herder`, `herder_install` |
+| Sandbox (incl. grants / replay / observation / network consent) | `sandbox_ai_audit`, `sandbox_background`, `sandbox_boundary_consistency`, `sandbox_boundary_escape`, `sandbox_boundary_net`, `sandbox_conflict_ai`, `sandbox_core`, `sandbox_governance`, `sandbox_hardening`, `sandbox_instance`, `sandbox_loss_audit`, `sandbox_lost_update`, `sandbox_lsp`, `sandbox_maintscript`, `sandbox_merge`, `sandbox_mountview`, `sandbox_namespace`, `sandbox_ops`, `sandbox_overlay_invalidate`, `sandbox_package_signature`, `sandbox_privdrop`, `sandbox_privilege`, `sandbox_publish_async`, `sandbox_review`, `sandbox_script_scan`, `sandbox_secret`, `sandbox_service`, `sandbox_session`, `sandbox_shims`, `sandbox_staging`, `sandbox_symlink`, `sandbox_systemd`, `sandbox_systemd_user`, `sandbox_view`, `grant`, `replay`, `observer`, `review_cache`, `net_consent`, `gateway` |
+| Secret guard | `secret_async`, `secret_fake`, `secret_highlight` |
+| Test framework / infrastructure | `test_runner`, `parallel_runner`, `integration`, `http`, `async`, `timer`, `work_codec` |
 
 ## 4. Running headless
 

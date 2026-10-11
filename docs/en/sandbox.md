@@ -1946,7 +1946,7 @@ plus async review `SANDBOX_REVIEW_ENQUEUED` / `SANDBOX_REVIEW_APPROVED` /
 
 ## 9. Tests
 
-`lua/NeoAI/tests/test_sandbox.lua` covers loader attachment, fail-closed, state machine/
+The `test_sandbox_*.lua` suites under `lua/NeoAI/tests/` (e.g. `test_sandbox_core` / `session` / `view` / `privilege` / `secret` / `ops` / `hardening`) cover loader attachment, fail-closed, state machine/
 idempotency/fencing, policy aggregation and restricted rules, dry-run no-write, CAS publish
 and conflict, buffer write redirection, runtime probe and isolated process execution,
 `run_command` overlay candidate capture (including deletion whiteout capture and attempt-dir cleanup),
@@ -2285,13 +2285,16 @@ previously returned raw overlay paths, bypassing shell-output redaction; `wrappe
 
 Redaction is a **best-effort text layer**: a model can bypass it with encoding/indirection (e.g.
 `base64`) or read unfiltered system interfaces (`/proc/filesystems` still lists kernel overlay
-support). Tests live in the "concealment" cases of `tests/test_sandbox.lua`.
+support). Tests live in the "concealment" cases of `test_sandbox_*.lua`.
 
 ## 16. Secret guard (secrets, always on)
 
-`sandbox/secret/secret.lua` ensures the AI can neither see nor use real secrets: entropy-based detection,
-encryption into a random token on the way into the sandbox, decryption only when committing to the
-real workspace. **Encrypted keys (tokens) and sensitive env-var names** are only traced and
+`sandbox/secret/secret.lua` ensures the AI can neither see nor use real secrets: entropy-based
+detection plus named rules replace secrets entering the sandbox with **format-preserving fake keys**
+(keeping the original prefix, length and character classes, with Shannon entropy no lower than the
+original; the mapping table is in-memory only, never persisted), restoring the real value only on
+commit, sandbox-process execution, or private-view materialization. **Fake keys and sensitive
+env-var names** are only traced and
 **escalated** in the review floating window (classified as a secret operation — L2 inside the
 workspace / L3 outside, forced review,
 `⚠ 密钥操作`) and **do not abort the agent**; only when a **raw secret** (the unencrypted real value)
@@ -2443,7 +2446,55 @@ ordinary text is byte-identical to before.
 > prewarmed for both the process overlay base and the sandbox store base, so the first `run_command` and
 > the first long-lived service hit the cache and do not block the main thread at command start.
 
-### Detection (entropy + charset heuristics)
+### 16.1 Format-preserving fake keys
+
+Named rules (private-key blocks, `AKIA`, `ghp_`, `xoxb-`, `AIza`, `sk-`, JWT, Bearer/Basic, …)
+generate fakes per their own prefix and character set (a JWT keeps its `eyJ` header and `.`
+separators; a private-key block keeps its header/footer lines and only randomizes the base64 body);
+unregistered rules follow **per-character-class preservation** (uppercase/lowercase/digits each
+randomized, symbols kept as-is). Generation retries with different derivation seeds until the length
+matches and the entropy is no lower than the original. Re-faking already-faked text is idempotent
+(no "fake of a fake"). By default the AI is **not told** (format fidelity is kept); with
+`disclose_fakes=true` a note is appended to the tool result.
+
+### 16.2 Binary secret files
+
+With `binary_fake=true` (default), when a sensitive binary secret file (`.p12`/`.pfx`/keystore/raw
+key etc., determined by `secret.is_sensitive_path`) is read or staged, it is whole-block faked with
+**same-length random bytes**, transmitted through AI-visible channels as a `NEOAI_BINARY:<len>:<b64>`
+marker, and restored to the real bytes by exact whole-block match on commit/execution. Ordinary
+binaries (images, executables, non-sensitive keyrings) are still preserved byte-for-byte with no
+substitution.
+
+### 16.3 Egress allowlist and secret-exfiltration blocking
+
+Sending a secret (a real value, or a fake key that would be restored inside the sandbox) to a
+**non-allowlisted** address pops up a block-and-warn dialog; allowlisted addresses **neither pop up
+nor warn**. `tools.sandbox.secrets.trusted_services` supports exact hosts, `*.suffix` wildcards and
+IP/CIDR; with `auto_trust_providers=true` the configured model providers' `base_url` hosts are
+auto-trusted. Covered paths: `utils/http` (programmatic HTTP: model/MCP-HTTP), sandboxed subprocesses
+(`curl`/`wget`/`nc` network commands) and `run_command`. When the target host cannot be determined it
+is treated as non-allowlisted. **Env vars participate only when their variable name is referenced by
+the command**, so real secret env vars injected into the sandbox do not make every command a false
+positive. Target extraction only accepts **explicit targets** (URLs, `host:port`, `user@host`, IP
+literals, or bare strings shaped like public hosts); **code identifiers** such as `os.getenv` /
+`os.environ.get` / attribute access are **not treated as addresses** (avoiding misreading local
+env-var-reading commands as exfiltration). The dialog **states the target, the source command and the
+matched secret**, with options: allow once / add to allowlist / stop the agent; it still asks when the
+hit target is uncertain. When the dedicated popup UI is not registered but Neovim is **interactive**,
+it falls back to the built-in `confirm` to **pause and ask** (still allow/stop); a truly headless (no
+attached UI) case still fails closed.
+
+### 16.4 Data-flow ledger and opaque derivation
+
+With `flow_tracking=true`, each fake key's origin (named rule / env var / file / binary) and all flow
+points (tool arguments, commands, env vars, host persistence paths, commit) are recorded and written
+to evidence (`kind="secret_flow"`). Commands/scripts may apply **irreversible
+encryption/transformation** to a secret; such derived files cannot be restored byte-for-byte, so they
+are marked `derived_opaque` ("opaque derivation"), flagged in red in the review UI, and **require
+explicit human confirmation** before publishing.
+
+### 16.5 Detection (entropy + charset heuristics)
 
 - Candidate: length in `[min_length, max_length]`, contains letters and digits, distinct chars
   `≥ min_distinct`, Shannon entropy `≥ min_entropy` (defaults 20/200/8/3.5).
@@ -2498,7 +2549,7 @@ ordinary text is byte-identical to before.
 - `allowlist` adds further Lua-pattern exclusions. See `tools.sandbox.secrets` in
   [configuration.md](configuration.md).
 
-### Env vars: the sandbox process gets real values, the AI only sees fake keys
+### 16.6 Env vars: the sandbox process gets real values, the AI only sees fake keys
 
 `sanitized_env()` produces the faked overrides (for logs/audit and the AI-visible surface);
 `sandbox_env()` restores real secrets when constructing the sandbox process environment —
@@ -2513,7 +2564,7 @@ ordinary text is byte-identical to before.
   `tools.sandbox.secrets.tokenize_env = false`; tool results and staged content are still protected.
   **This weakens isolation — use only temporarily in trusted environments.**
 
-### Mapping and lifecycle
+### 16.7 Mapping and lifecycle
 
 - Each real secret gets a **format-preserving fake key** (same prefix/length/character classes,
   entropy >= original); the mapping is **in-memory only** (only the fake set may be persisted for
@@ -2533,7 +2584,7 @@ ordinary text is byte-identical to before.
   and `view_base_hash` (faked baseline, used for change detection) are tracked separately, keeping
   read-only tools and edits consistent.
 
-### Tracing and warnings
+### 16.8 Tracing and warnings
 
 - Every newly detected secret, every fake used in tool arguments, and every sensitive env-var name
   occurrence writes a `kind="secret"` evidence record.
@@ -2548,7 +2599,7 @@ ordinary text is byte-identical to before.
 - Events: `SANDBOX_SECRET_DETECTED` / `SANDBOX_SECRET_TRACED` / `SANDBOX_SECRET_BLOCKED` /
   `SANDBOX_SECRET_ALERT` / `SANDBOX_SECRET_EGRESS`.
 
-### Raw secret: immediate stop + confirm popup
+### 16.9 Raw secret: immediate stop + confirm popup
 
 When a **raw secret** known to the mapping table appears in **either** location, the agent is
 **immediately stopped and a confirm popup is shown**:
@@ -2597,7 +2648,7 @@ is **interactive**, it falls back to the built-in `confirm` prompt (still pausin
 > commands that read a real file and use the secret within the same command (without going through the
 > model), are out of scope.
 
-### 16.1 High-entropy content generated by the AI (watch generated keys too)
+### 16.10 High-entropy content generated by the AI (watch generated keys too)
 
 Besides host secrets entering the sandbox, key-like high-entropy content the **AI itself generates**
 inside the sandbox is watched too: `secret.detect_generated(files)` runs entropy/named-rule detection
@@ -2614,7 +2665,7 @@ Known fake keys (the masked form of host secrets) are not counted as generated; 
 by `warn_for_files`. Generated keys in command output / tool arguments go through the existing
 faking path (`tokenize_result`/`tokenize_args`).
 
-### 16.2 Local SSH service access forbidden
+### 16.11 Local SSH service access forbidden
 
 Sandboxed processes may not use the host's SSH service (ssh-agent / sshd):
 
