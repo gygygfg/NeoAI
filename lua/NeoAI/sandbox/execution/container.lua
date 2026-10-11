@@ -50,6 +50,9 @@ local podman_override = nil
 -- 容器可运行性（测试可覆盖）。
 local runnable_override = nil
 
+-- 命名空间创建能力探测缓存（nil=未探测）。
+local ns_creation_cache = nil
+
 -- 触发注入的子命令
 local RUN_SUBS = { run = true, create = true }
 
@@ -113,20 +116,52 @@ local function _podman_available()
   return vim.fn.executable("podman") == 1
 end
 
+--- 当前外层运行环境是否允许创建（用户）命名空间。容器运行时（podman/runc/buildah）创建
+--- 容器依赖在沙箱命名空间内再创建 mount/pid/user 等命名空间（`unshare`/`clone(CLONE_NEW*)`）。
+--- 若外层容器/VM 的 seccomp 禁止**嵌套**命名空间创建（NeoAI 自身对容器命令已关闭 seccomp 基线，
+--- 故此处探测的是 bwrap 沙箱命名空间内、即 podman 实际所处的上下文），则容器根本无法启动。
+--- 探测方式：在 bwrap 新建命名空间内再 `unshare --user --mount --pid`（结果缓存）；无 bwrap 时
+--- 退化为直接 `unshare --user`。
+--- @return boolean
+local function _namespace_creation_available()
+  if ns_creation_cache ~= nil then return ns_creation_cache end
+  local ok = false
+  pcall(function()
+    local bwrap = vim.fn.exepath("bwrap")
+    if bwrap ~= "" then
+      vim.fn.system({
+        bwrap, "--unshare-user", "--unshare-pid", "--unshare-ipc", "--unshare-uts",
+        "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--",
+        "unshare", "--user", "--mount", "--pid", "--fork", "true",
+      })
+    else
+      vim.fn.system({ "unshare", "--user", "true" })
+    end
+    ok = (vim.v.shell_error == 0)
+  end)
+  ns_creation_cache = ok
+  return ok
+end
+
 --- 沙箱内能否实际运行标准容器。
 --- 容器运行时需创建命名空间、挂载 rootfs、按镜像层属主 chown。当载荷非 root（或
 --- `tools.sandbox.run_as.uid > 0`）时，bwrap 把真实用户单映射为 guest root：无法映射镜像层
 --- 的属主 uid/gid（lchown EINVAL），且沙箱内 overlay/嵌套 userns 不可用 → 无法运行标准镜像。
---- 此时门面伪装为真机「daemon 未运行」，避免把 uid_map/chown 等沙箱内部报错透给模型。
---- `tools.sandbox.container.allow_nonroot=true` 可强制尝试（届时可能暴露原始报错）。
---- @return boolean
+--- 外层运行环境（NeoAI 自身所在容器/VM 的 seccomp）禁止 `unshare`/`clone(CLONE_NEW*)` 时，
+--- podman 亦无法创建命名空间（`cannot clone: Operation not permitted`）。
+--- 此时门面伪装为真机「daemon 未运行」，避免把 uid_map/clone 等沙箱内部报错透给模型。
+--- `tools.sandbox.container.allow_nonroot=true` 可强制尝试。
+--- @return boolean ok
+--- @return string|nil reason
 local function _containers_runnable()
-  if runnable_override ~= nil then return runnable_override end
+  if runnable_override ~= nil then return runnable_override, "CONTAINER_REQUIRES_ROOT" end
   if _cfg().allow_nonroot == true then return true end
   local euid = (vim.uv and vim.uv.getuid and vim.uv.getuid()) or vim.fn.getuid()
-  if euid ~= 0 then return false end
+  if euid ~= 0 then return false, "CONTAINER_REQUIRES_ROOT" end
   local run_as = config_store.get("tools.sandbox.run_as") or {}
-  return (tonumber(run_as.uid) or 0) == 0
+  if (tonumber(run_as.uid) or 0) ~= 0 then return false, "CONTAINER_REQUIRES_ROOT" end
+  if not _namespace_creation_available() then return false, "CONTAINER_NAMESPACE_UNAVAILABLE" end
+  return true
 end
 
 --- 找到运行时命令 token 下标（跳过 VAR=val 与 SKIP_PREFIX）
@@ -252,8 +287,9 @@ function M.facade(command)
     if sub and UNSUPPORTED_SUBS[sub] then
       return { manager = manager, sub = sub, mode = "unsupported", reason = "CONTAINER_SUBCOMMAND_UNSUPPORTED" }
     end
-    if not _containers_runnable() then
-      return { manager = manager, sub = sub, mode = "unsupported", reason = "CONTAINER_REQUIRES_ROOT" }
+    local runnable, rr = _containers_runnable()
+    if not runnable then
+      return { manager = manager, sub = sub, mode = "unsupported", reason = rr }
     end
     return { manager = manager, sub = sub, mode = "sandbox" }
   end
@@ -262,7 +298,8 @@ function M.facade(command)
   -- 沙箱命名空间隔离）。
   local alias = DOCKER_ALIASES[manager] or "podman"
   local alias_enabled = cfg.docker_to_podman ~= false
-  if alias_enabled and _podman_available() and _containers_runnable() then
+  local runnable, rr = _containers_runnable()
+  if alias_enabled and _podman_available() and runnable then
     local rewritten = _rewrite_manager(command, spans, i, alias)
     if rewritten then
       return {
@@ -277,7 +314,7 @@ function M.facade(command)
   elseif not _podman_available() then
     reason = "CONTAINER_PODMAN_UNAVAILABLE"
   else
-    reason = "CONTAINER_REQUIRES_ROOT"
+    reason = rr or "CONTAINER_REQUIRES_ROOT"
   end
   return { manager = manager, sub = sub, mode = "unsupported", reason = reason }
 end
@@ -363,10 +400,17 @@ function M._set_containers_runnable(v)
   runnable_override = v
 end
 
+--- 测试钩子：覆盖命名空间创建能力探测（nil 恢复真实探测）。
+--- @param v boolean|nil
+function M._set_namespace_available(v)
+  ns_creation_cache = v
+end
+
 --- 重置（测试用）
 function M.reset()
   podman_override = nil
   runnable_override = nil
+  ns_creation_cache = nil
 end
 
 return M
