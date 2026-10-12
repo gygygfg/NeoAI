@@ -83,4 +83,60 @@ tests.suite("approval_hub", function(_, it)
     for _, p in ipairs(hub.PAGES) do ids[#ids + 1] = p.id end
     t.deep_eq({ "files", "behavior", "resource", "network", "anomaly" }, ids)
   end)
+
+  it("统一运行时请求事件：consent.emit 按 page 区分广播", function(t)
+    local bus = require("NeoAI.kernel.event_bus")
+    local events = require("NeoAI.kernel.events")
+    local got = {}
+    local un = bus.on(events.SANDBOX_CONSENT_REQUESTED, function(p) got[#got + 1] = p end)
+    local consent = require("NeoAI.sandbox.review.consent")
+    consent.emit("network", { host = "h", port = 1 })
+    consent.emit("behavior", { kind = "device" })
+    consent.emit("resource", { tool = "read_file" })
+    un()
+    t.eq(3, #got, "应广播 3 次（同一事件）")
+    t.eq("network", got[1].page)
+    t.eq("h", got[1].host)
+    t.eq("behavior", got[2].page)
+    t.eq("device", got[2].kind)
+    t.eq("resource", got[3].page)
+    t.eq("read_file", got[3].tool)
+  end)
+
+  it("三类请求模块广播同一事件且 page 正确（network/behavior）", function(t)
+    local bus = require("NeoAI.kernel.event_bus")
+    local events = require("NeoAI.kernel.events")
+    local hub = require("NeoAI.sandbox.review.approval_hub")
+    local orig_uis = vim.api.nvim_list_uis
+    ---@diagnostic disable-next-line: duplicate-set-field
+    vim.api.nvim_list_uis = function() return { {} } end
+    hub.reset()
+    hub.set_ui({ refresh = function() end })
+    local pages = {}
+    local un = bus.on(events.SANDBOX_CONSENT_REQUESTED, function(p) pages[#pages + 1] = p.page end)
+    -- 危险设备访问（behavior）
+    local dc = require("NeoAI.sandbox.review.device_consent")
+    dc.reset()
+    dc.set_ui({ show = function() end })
+    dc.request({ "/dev/kvm" })
+    -- 代理规避/策略确认（behavior）
+    local pc = require("NeoAI.sandbox.review.policy_consent")
+    pc.reset()
+    pc.set_ui({ show = function() end })
+    pc.request("proxy_evasion", { title = "t" })
+    -- 网络请求（network）
+    local nc = require("NeoAI.sandbox.net.net_consent")
+    nc.reset()
+    nc.set_ui({ show = function() end })
+    nc.request({ host = "example.com", port = 443, local_ = false, proto = "tcp" })
+    un()
+    t.true_(vim.tbl_contains(pages, "behavior"), "设备/策略应广播 behavior")
+    t.true_(vim.tbl_contains(pages, "network"), "网络同意应广播 network")
+    nc.reset()
+    pc.reset()
+    dc.reset()
+    hub.set_ui(nil)
+    hub.reset()
+    vim.api.nvim_list_uis = orig_uis
+  end)
 end)

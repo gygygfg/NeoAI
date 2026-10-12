@@ -20,7 +20,13 @@ local state = {
   related = {}, -- "host:port" -> { svc = true } / "svc" -> { "host:port" = true }（相关批准提示）
   listen_negative = {}, -- port -> expire_ms（沙箱内监听探测的短负缓存）
   owner_cache = {}, -- port -> { at_ms, owner }（端口→宿主服务进程解析短缓存）
+  allowances = {}, -- 有序数组：本会话已允许条目（供审批悬浮窗展示/撤销）
+  allowance_index = {}, -- key -> allowances 下标
+  history = {}, -- 已结束决策历史（新→旧，仅记录，供审批悬浮窗展示）
 }
+
+-- 网络访问决策历史保留上限（防止长会话内存增长）。
+local HISTORY_MAX = 100
 
 -- ========== 私有函数 ==========
 
@@ -71,6 +77,44 @@ local function _key(host, port, svc)
     return base .. "@" .. svc
   end
   return base
+end
+
+--- 追加一条已结束的网络访问决策历史（新→旧；受 HISTORY_MAX 约束）。
+--- @param rec table { host, port, local_?, proto?, comm?, decision, at_ms }
+local function _push_history(rec)
+  table.insert(state.history, 1, rec)
+  while #state.history > HISTORY_MAX do table.remove(state.history) end
+end
+
+--- 登记/刷新「本会话已允许」条目（供审批悬浮窗展示与撤销）。
+--- @param host string
+--- @param port number|string
+--- @param owner table|nil
+--- @return table rec
+local function _remember_allowance(host, port, owner)
+  local svc = _granular() and _svc_id(owner) or nil
+  local key = _key(host, port, svc)
+  local base = _key(host, port)
+  local now = os.time() * 1000
+  local idx = state.allowance_index[key]
+  if idx then
+    local rec = state.allowances[idx]
+    rec.at_ms = now
+    return rec
+  end
+  local rec = {
+    key = key,
+    host = tostring(host),
+    port = tonumber(port) or port,
+    base = base,
+    svc = svc,
+    comm = (type(owner) == "table" and owner.comm) or nil,
+    pid = (type(owner) == "table" and owner.pid) or nil,
+    at_ms = now,
+  }
+  state.allowances[#state.allowances + 1] = rec
+  state.allowance_index[key] = #state.allowances
+  return rec
 end
 
 -- ========== 公开 API ==========
@@ -416,6 +460,80 @@ function M.allow_session(host, port, owner)
   else
     state.session_ports[base] = true
   end
+  -- 登记/刷新结构化条目，供审批悬浮窗「本会话已允许」区展示与撤销。
+  _remember_allowance(host, port, owner)
+end
+
+--- 列出「本会话已允许」条目（供审批悬浮窗展示/撤销）。按批准先后顺序。
+--- @return table 数组 { key, host, port, base, svc, comm, pid, at_ms }
+function M.list_allowances()
+  local out = {}
+  for _, a in ipairs(state.allowances) do
+    out[#out + 1] = {
+      key = a.key, host = a.host, port = a.port, base = a.base,
+      svc = a.svc, comm = a.comm, pid = a.pid, at_ms = a.at_ms,
+    }
+  end
+  return out
+end
+
+--- 撤销「本会话已允许」中的一条（按 `list_allowances` 返回的 key）。撤销后该目标下次
+--- 访问会重新请求同意。返回是否确实移除。
+--- @param key string
+--- @return boolean
+function M.revoke_allowance(key)
+  key = tostring(key or "")
+  local idx = key ~= "" and state.allowance_index[key] or nil
+  if not idx then return false end
+  local rec = state.allowances[idx]
+  table.remove(state.allowances, idx)
+  state.allowance_index[key] = nil
+  -- 修正后续下标
+  for k, v in pairs(state.allowance_index) do
+    if v > idx then state.allowance_index[k] = v - 1 end
+  end
+  local base = rec.base or key
+  state.session_allowed[key] = nil
+  if rec.svc == nil then
+    state.session_ports[base] = nil
+  else
+    -- 同一端口若仍有其它服务粒度的允许，保留 session_service_ports[base]。
+    local still = false
+    for _, a in ipairs(state.allowances) do
+      if a.base == base then still = true; break end
+    end
+    if not still then state.session_service_ports[base] = nil end
+    if state.related[base] then
+      state.related[base][rec.svc] = nil
+      if not next(state.related[base]) then state.related[base] = nil end
+    end
+    if state.related[rec.svc] then
+      state.related[rec.svc][base] = nil
+      if not next(state.related[rec.svc]) then state.related[rec.svc] = nil end
+    end
+  end
+  _push_history({
+    host = rec.host, port = rec.port, svc = rec.svc, comm = rec.comm,
+    decision = "revoked", at_ms = os.time() * 1000,
+  })
+  pcall(function()
+    require("NeoAI.kernel.event_bus").emit(
+      require("NeoAI.kernel.events").SANDBOX_APPROVAL_CHANGED, { page = "network" })
+  end)
+  return true
+end
+
+--- 列出网络访问决策历史（新→旧，仅记录：单次允许 / 拒绝 / 已撤销）。
+--- @return table 数组 { host, port, local_, proto, svc, comm, decision, at_ms }
+function M.list_history()
+  local out = {}
+  for _, h in ipairs(state.history) do
+    out[#out + 1] = {
+      host = h.host, port = h.port, local_ = h.local_, proto = h.proto,
+      svc = h.svc, comm = h.comm, decision = h.decision, at_ms = h.at_ms,
+    }
+  end
+  return out
 end
 
 --- 本会话中与当前目标「相关」的历史批准（供弹窗提示：同进程的其它端口 / 同端口的其它进程）。
@@ -445,6 +563,15 @@ end
 --- @param ctx table { host, port, local_?, proto?, owner? }
 --- @return Deferred resolve(decision: "allow_once"|"allow_session"|"deny")
 function M.request(ctx)
+  -- libuv 快速事件回调（如 host_proxy 连接回调）中不得弹窗（E5560）：调度到主循环再发起。
+  if vim.in_fast_event and vim.in_fast_event() then
+    local async0 = require("NeoAI.utils.async")
+    local outer = async0.Deferred.new()
+    vim.schedule(function()
+      M.request(ctx):then_(function(v) outer:resolve(v) end, function(e) outer:reject(e) end)
+    end)
+    return outer
+  end
   local async = require("NeoAI.utils.async")
   local d = async.Deferred.new()
   ctx = ctx or {}
@@ -468,6 +595,15 @@ function M.request(ctx)
     if decision ~= "allow_once" and decision ~= "allow_session" and decision ~= "deny" then
       decision = "deny"
     end
+    -- 记录已结束决策历史（单次允许 / 拒绝）；allow_session 由「本会话已允许」区承载，不入历史。
+    if decision ~= "allow_session" then
+      _push_history({
+        host = tostring(ctx.host or "?"), port = tonumber(ctx.port) or ctx.port,
+        local_ = ctx.local_ == true, proto = ctx.proto,
+        svc = owner and owner.comm or nil, comm = owner and owner.comm or nil,
+        decision = decision, at_ms = os.time() * 1000,
+      })
+    end
     -- 决策后关闭独立弹窗（若打开）并取消其「失焦延迟展示」暂存：经审批中心决策 / 超时时，
     -- 独立弹窗可能仍处于待展示状态，需一并清理，避免切回后弹出已过期的弹窗。
     if state.ui and state.ui.hide then pcall(state.ui.hide) end
@@ -477,8 +613,13 @@ function M.request(ctx)
 
   -- 无 UI（headless / 非 ask / 无窗口）：失败关闭。
   -- 统一窗口（approval_hub）需真实 attached UI 才能决策；headless 下不视为可用界面。
+  -- 独立弹窗：真实弹窗组件（带 `is_open`，需 attached UI 才能真正呈现）在 headless 下不可用，
+  -- 直接失败关闭（否则会打开一个无人可交互的窗口并一直悬挂）；测试注入的 fake UI（无
+  -- `is_open`，程序化给出决策）仍视为可用，供 headless 单测。
   local hub = require("NeoAI.sandbox.review.approval_hub")
-  local standalone = M.available()
+  local fake_ui = state.ui ~= nil and type(state.ui.show) == "function"
+    and type(state.ui.is_open) ~= "function"
+  local standalone = fake_ui or (M.available() and _interactive())
   local via_hub = hub.available() and _interactive()
   if not standalone and not via_hub then
     -- 无任何可呈现界面：失败关闭（拒绝）。记录一次原因，便于区分「用户没看到弹窗」与
@@ -493,6 +634,11 @@ function M.request(ctx)
     return d
   end
 
+  -- 统一运行时请求广播（同一事件 SANDBOX_CONSENT_REQUESTED，page="network" 区分）。
+  require("NeoAI.sandbox.review.consent").emit("network", {
+    host = ctx.host, port = ctx.port, local_ = ctx.local_, proto = ctx.proto,
+    service = ctx.service,
+  })
   -- 镜像到审批分流中心「网络请求」页（窗口可决策；独立弹窗仍在时以先决策者为准）。
   hub_id = hub.submit("network", {
     title = string.format("%s:%s%s", tostring(ctx.host or "?"), tostring(ctx.port or "?"),
@@ -516,14 +662,25 @@ function M.request(ctx)
     pcall(function() hub.open_page("network") end)
   end
 
-  -- 超时兜底：用户长时间不响应时自动拒绝（fail-closed），避免连接永久悬挂。
+  -- 超时兜底（fail-closed）：**仅在弹窗已呈现**时到时自动拒绝；弹窗因聊天界面不在前台而
+  -- **暂存待弹**时不自动拒绝（请求已镜像到统一审批悬浮窗，可切回后弹窗或经窗口决策），
+  -- 避免「用户不在聊天界面时连接被静默拒绝」。每 `tms` 复查一次。
   local tms = _timeout_ms()
   if tms > 0 then
-    vim.defer_fn(function()
-      if done then return end
-      if state.ui and state.ui.hide then pcall(state.ui.hide) end
-      decide("deny")
-    end, tms)
+    local function arm()
+      vim.defer_fn(function()
+        if done then return end
+        local ui = state.ui
+        local presented = (ui == nil) or (type(ui.is_open) ~= "function") or ui.is_open()
+        if presented then
+          if ui and ui.hide then pcall(ui.hide) end
+          decide("deny")
+        else
+          arm() -- 仍暂存（未呈现）：继续等待
+        end
+      end, tms)
+    end
+    arm()
   end
   return d
 end
@@ -538,6 +695,9 @@ function M.reset()
   state.related = {}
   state.listen_negative = {}
   state.owner_cache = {}
+  state.allowances = {}
+  state.allowance_index = {}
+  state.history = {}
 end
 
 return M

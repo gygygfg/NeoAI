@@ -17,6 +17,7 @@ local SB_HELPERS = {
   "risk_badge", "group_traces", "group_traces_by_command",
   "hub_pages", "hub_pending_count", "hub_list", "hub_resolve", "hub_get",
   "set_hub_ui", "reset_approval_hub",
+  "net_consent_allowances", "net_consent_history", "net_consent_revoke",
   "detokenize", "git_path_class", "content_for",
   "l3_generate", "l3_fallback",
 }

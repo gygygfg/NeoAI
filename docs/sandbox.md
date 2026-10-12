@@ -413,7 +413,8 @@ token（`NEOKEY_…`）或格式保真假密钥时**拒绝写盘**（`SECRET_TOK
         `neoai*`）并在跳变时广播 `UI_FOCUS_CHANGED`，并提供统一的 `focus.gate(key, present)`：
         **焦点不在 NeoAI 界面（用户切到其他窗口）时不立即弹出、进入等待**，待切回 NeoAI 界面再弹。
         覆盖 `run_command` 交互伪终端悬浮窗（pty，隐藏/重弹）、`ask_user` 提问弹窗，以及
-        **工具审批（tool_approval）/ 密钥告警（secret_alert）/ 网络同意（net_consent）** 三个阻塞弹窗
+        **工具审批（tool_approval）/ 密钥告警（secret_alert）/ 网络同意（net_consent）/
+        危险设备同意（device_consent）/ 策略确认（policy_consent）** 阻塞弹窗
         （暂存展示、切回再弹；其超时 / 经审批中心决策会 `hide()` 取消暂存，避免切回后弹出过期弹窗）。
         等待期间 Herder 生命周期显示 `blocked`（红）。审批悬浮窗亦在切回时强制刷新一次。
         无 attached UI（headless/测试）时不抑制（无「其他窗口」可切）。
@@ -488,15 +489,28 @@ token（`NEOKEY_…`）或格式保真假密钥时**拒绝写盘**（`SECRET_TOK
       集合变化时自动重审；也可随时按 `key`（默认 `a`）手动触发。
   - **多级页面审批悬浮窗（审批分流）**：`:NeoAISandboxReview` 采用多级页面，页头按
     **待修改 / 工具行为 / 资源访问 / 网络请求 / 越界·异常** 分页，`h`/`l`（或 `←`/`→`）切换、
-    各页计数醒目。分流机制（`sandbox/review/approval_hub.lua`）汇聚所有需批准/需关注的请求与观测：
+    各页计数醒目。**页标签采用 Mason 高亮风格**（存在 mason.nvim 高亮组时链接复用其块状配色，
+    见 `ui/mason_hl.lua`：当前页=`MasonHighlightBlockBold`、其它页=`MasonHighlight`）。
+    三类运行时请求弹窗**分别落到对应页**：
+    - **白名单外网络请求**（`net_consent`）→ **网络请求** 页；
+    - **危险命令访问**（危险设备访问 `device_consent` / 代理规避 `policy_consent`）→ **工具行为** 页；
+    - **敏感隐私文件读取**（命中遮蔽目录的资源访问审批，经 `tool_service`）→ **资源访问** 页。
+    分流机制（`sandbox/review/approval_hub.lua`）汇聚所有需批准/需关注的请求与观测：
     **待修改**＝文件变更单元（`files`，非阻塞，走异步待审队列，`<CR>` 应用 / `d` 拒绝）；
     **工具行为**＝工具调用同意（阻塞，审批通过才执行）与 T2 主机操作提案；
     **资源访问**＝命中遮蔽目录等资源访问审批（阻塞）；**网络请求**＝出沙箱访问同意（阻塞）；
     **越界·异常**＝越界访问留痕（按文件，并可 `i` 查看该文件涉及的命令）、**临时写入留痕**
     （会话私有临时根 /tmp、/var/tmp 等写入，按文件，只读）与**越界命令**
     （命令 → 涉及文件，`i` 查看该命令越界访问的文件）及行为审计异常（L2+，仅记录）。阻塞类条目由来源模块
-    （`tool_service` / `net_consent`）提交并镜像；独立弹窗仍作即时通道，窗口内亦可决策
-    （`<CR>` 仅本次 / `S` 本次会话 / `d` 拒绝，决策幂等）。
+    （`tool_service` / `net_consent` / `device_consent` / `policy_consent` / `secret_alert`）提交并镜像；
+    **三类运行时请求（白名单外网络请求 / 危险命令访问 / 敏感隐私文件读取）统一经同一事件
+    `sandbox:consent_requested` 广播，由 `page` 参数区分归属页**（见 `sandbox/review/consent.lua`）；
+    独立弹窗仍作即时通道且**按聊天界面是否在前台门控**（在 NeoAI 界面立即弹出；否则暂存、切回再弹），
+    窗口内亦可决策（`<CR>` 仅本次 / `S` 本次会话 / `d` 拒绝，决策幂等）。
+    - **网络请求页**：除**待批准**（阻塞）外追加两段——**「本会话已允许（可撤销）」**列出本会话内
+      以「本次会话允许」放行的目标（按「端口 + 服务进程」颗粒度），光标落在该行按 `d` **撤销**
+      （撤销后该目标下次访问重新询问，并追加一条「已撤销」历史）；**「历史（仅记录）」**只读展示
+      已结束决策（单次允许 / 拒绝 / 已撤销），含服务身份与时间。
     - **资源访问页的「目录设置」区**（仅本会话）：页内可见工作目录/遮蔽目录列表。工作目录列表首项为
       **会话工作目录**（`session.metadata.cwd` / `agent.cwd`，创建会话时按 `.git`/工程配置文件定位，
       自动放行、不可删除），其后为显式配置项；按 `E` 打开目录
@@ -609,7 +623,8 @@ UI 见 `ui/components/device_consent`，与网络同意/工具审批同款浮窗
   见 `observe/observer.lua`）判定命令**实际**是否打开了危险设备节点，而非仅凭命令文本——
   故变量拼接、脚本间接执行、别名等文本绕过无法逃避。观测到未允许的危险设备访问时：
   - **终止命令树**（`cgroup.kill` / 常驻实例 `kill_current`），放弃本轮候选；
-  - 若命令因此**失败/被杀**，弹窗询问（`timeout_ms` 默认 30000 内无应答自动阻止）；**批准后自动
+  - 若命令因此**失败/被杀**，弹窗询问（`timeout_ms` 默认 30000 **仅弹窗已呈现时**无应答自动阻止；
+    因聊天界面不在前台而暂存待弹时**不**自动阻止）；**批准后自动
     重跑**该命令，此时设备已 `--dev-bind` 绑定进沙箱命名空间，命令可正常使用；
   - 若命令**已成功**（未真正依赖该设备），仅异步提示供后续会话放行，本轮结果照常返回；
   - 未批准则返回 `DEVICE_ACCESS_DENIED`（fail-closed）。
@@ -1505,7 +1520,8 @@ seccomp（含设备节点屏障）**——沙箱内进程看到的是一份「�
   `"allow"` 直接放行并记录（旧行为），`"deny"` 直接拒绝。弹窗由
    `ui/components/net_consent.lua` 提供（`<CR>` 仅本次 / `S` 本次会话始终 / `Esc` 拒绝），
    决策经 `sandbox/net/net_consent` 的服务端会话白名单记忆。headless/无 UI 时失败关闭（拒绝）。
-   发起请求时发 `sandbox:net_consent_requested` 事件。长驻服务启动时按 `PORT`/`--port` 等
+   发起请求时经统一事件 `sandbox:consent_requested` 广播（`page="network"`；旧的
+   `sandbox:net_consent_requested` 保留常量）。长驻服务启动时按 `PORT`/`--port` 等
    声明自动登记内部端口（`net_consent.register_from_command`）。
    - **按「端口 + 服务进程」颗粒度**（`network.consent_process_granularity`，默认开）：命中
      宿主本机目标时解析该端口的**宿主监听进程**（`net_consent.port_owner`：读 `/proc/net/tcp{,6}`
@@ -1517,7 +1533,10 @@ seccomp（含设备节点屏障）**——沙箱内进程看到的是一份「�
      非 root 读不到他人进程时退回纯端口粒度并显示「未识别到监听进程」。
    - **弹窗无响应超时**（`network.consent_timeout_ms`，默认 30s，0=不限）：超时自动拒绝
      （fail-closed），避免用户离开时连接永久悬挂；headless 不做昂贵进程解析、直接失败关闭。
-   - 弹窗可独立呈现，也可在统一审批悬浮窗「网络请求」页决策（见 §5 多级页面审批悬浮窗）。
+    - 弹窗可独立呈现，也可在统一审批悬浮窗「网络请求」页决策（见 §5 多级页面审批悬浮窗）。
+      该页同时展示**本会话已允许（可撤销）**（`net_consent.list_allowances`，按 `d` 撤销：
+      `net_consent.revoke_allowance(key)`）与**历史（仅记录）**（`net_consent.list_history`：
+      单次允许 / 拒绝 / 已撤销，带服务身份与时间），供审批人员回溯「放过/拦截了哪些出网目标」。
 - **软件源自动放行（`network.auto_allow_sources`，默认开）**：为避免包安装被同意门禁拦截，
   对**外部**软件源（PyPI/pythonhosted、npm/npmmirror、crates/rust-lang、proxy.golang.org/goproxy、
   Maven、Debian/Ubuntu/Alpine/Docker 源，以及 `tuna.tsinghua.edu.cn`、`mirrors.aliyun.com`、
@@ -1545,7 +1564,10 @@ seccomp（含设备节点屏障）**——沙箱内进程看到的是一份「�
 - **代理规避确认**：显式清除/绕过代理（`unset *proxy`、`env -u *proxy`、`curl --noproxy`、
   `--proxy ""`/`-x ''`、`export *proxy=`）会使上述过滤失效，门禁在进入沙箱前对**折叠后的
   有效命令**识别（`PROXY_EVASION:*`），默认**暂停 Agent 并弹窗询问**（`network.block_proxy_evasion=true`：
-  仅本次允许 / 本次会话始终允许 / 拒绝）；`"deny"` 直接拒绝（旧硬拒绝），`false` 不拦截。
+  仅本次允许 / 本次会话始终允许 / 拒绝）。弹窗为与网络同意/工具审批/设备同意一致的**沙箱浮窗**
+  （`ui/components/policy_consent.lua`，标题「⚠ 沙箱策略确认」，`<CR>` 仅本次 / `S` 本次会话始终 /
+  `Esc` 拒绝），无响应超时同 `network.consent_timeout_ms`（默认 30s 自动阻止）；`"deny"` 直接拒绝
+  （旧硬拒绝），`false` 不拦截。
   判定前先做 shell 规范化：还原引号拼接（`--noprox''y`）、ANSI-C 引用（`$'--noproxy'`）与
   反斜杠转义，并展开同一命令内 `NAME=value` 的简单变量（`c=--noproxy; curl $c`），防止静态
   扫描被拼接/变量绕过。`-x` 仅在 curl 段上等同 `--proxy`（`set -x`/`tar -x`/`grep -x`/

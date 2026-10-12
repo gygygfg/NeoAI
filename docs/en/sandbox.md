@@ -367,7 +367,20 @@ is only kept for other `approval.mode` values (`prompt`/`strict`).
     refresh. The review window uses **multi-level pages** whose header splits into
     **Files / Tool Behavior / Resource Access / Network Requests / Out-of-bounds·Anomaly**, switched
     with `h`/`l` (or `←`/`→`), each page counting its items (`sandbox/review/approval_hub.lua` aggregates all
-    blocking/observe entries). On the **Resource Access** page, a **directory-settings section** shows
+    blocking/observe entries). **Page tabs use the Mason highlight style** (when mason.nvim highlight
+    groups exist they are linked/reused; see `ui/mason_hl.lua`: active page = `MasonHighlightBlockBold`,
+    others = `MasonHighlight`). The three runtime request popups map to their pages:
+    **out-of-whitelist network requests** (`net_consent`) → **Network Requests**;
+    **dangerous command access** (dangerous device access `device_consent` / proxy evasion `policy_consent`)
+    → **Tool Behavior**; **sensitive private file reads** (masked-dir resource approval via `tool_service`)
+    → **Resource Access**. All three broadcast the **same event** `sandbox:consent_requested`,
+    distinguished by the `page` parameter (`sandbox/review/consent.lua`). The **Network Requests**
+    page shows, besides the **pending** (blocking) entries, two more sections: **"Session-allowed
+    (revocable)"** lists the targets allowed "for this session" (per host:port + service process
+    granularity); pressing `d` on such a row **revokes** it (the target is re-prompted on next access,
+    and a "revoked" history record is appended); **"History (record only)"** read-only lists finished
+    decisions (once / denied / revoked) with service identity and time. On the **Resource Access**
+    page, a **directory-settings section** shows
     the workspace allowlist and masked-dir list. The first workspace entry is the **session working
     directory** (`session.metadata.cwd` / `agent.cwd`, located at session creation via `.git`/project
     config markers; auto-allowed and non-removable), followed by explicit entries; press `E` to open a
@@ -416,8 +429,9 @@ is only kept for other `approval.mode` values (`prompt`/`strict`).
       a unified `focus.gate(key, present)`. **When focus is not on the NeoAI UI (the user switched to
       another window), popups do not pop up immediately — they wait** and appear once the user switches
       back. This covers the pty floating terminal (interactive `run_command`; hide/restore), the
-      `ask_user` popup, and the three blocking popups **tool approval (tool_approval) / secret alert
-      (secret_alert) / network consent (net_consent)** (stash and show on return; their timeout /
+      `ask_user` popup, and the blocking popups **tool approval (tool_approval) / secret alert
+      (secret_alert) / network consent (net_consent) / device consent (device_consent) / policy
+      confirmation (policy_consent)** (stash and show on return; their timeout /
       decision via the approval hub calls `hide()` to cancel the stash so no stale popup appears on
       return). While waiting, the Herder lifecycle reports `blocked` (red). The review window also
       force-refreshes once on switching back. There is no suppression when there is no attached UI
@@ -764,8 +778,9 @@ network-consent / tool-approval ones, subject to focus gating):
   - it **terminates the command tree** (`cgroup.kill` / resident `kill_current`) and discards the
     candidate for that round;
   - if the command thus **failed/was killed**, it prompts (`timeout_ms` default 30000, auto-blocked
-    if unanswered); **on approval it automatically re-runs** the command, now with the device
-    `--dev-bind`-mounted, so it works;
+    if unanswered **only while the popup is presented**; while stashed because the chat UI is not in
+    the foreground it does not auto-block); **on approval it automatically re-runs** the command, now
+    with the device `--dev-bind`-mounted, so it works;
   - if the command **already succeeded** (never actually needed the device), it only raises an async
     prompt for future sessions and returns the round's result unchanged;
   - unapproved access returns `DEVICE_ACCESS_DENIED` (fail-closed).
@@ -1892,8 +1907,9 @@ commands (SSRF, e.g. host admin panels, internal ports, cloud metadata):
   user for consent, `"allow"` allows directly and records (previous behaviour), `"deny"` denies
   directly. The prompt is provided by `ui/components/net_consent.lua` (`<CR>` once / `S` always for
   this session / `Esc` deny); decisions are remembered in a server-side session allowlist in
-  `sandbox/net/net_consent`. Headless / no UI fails closed (deny). A `sandbox:net_consent_requested`
-  event is emitted on each request. Long-lived services auto-register internal ports declared via
+  `sandbox/net/net_consent`. Headless / no UI fails closed (deny). Each request broadcasts the
+  unified `sandbox:consent_requested` event (`page="network"`; the old `sandbox:net_consent_requested`
+  constant is kept). Long-lived services auto-register internal ports declared via
   `PORT`/`--port` etc. (`net_consent.register_from_command`).
   - **Per "port + service process" granularity** (`network.consent_process_granularity`, on by
     default): for host-local targets the sandbox resolves the **host listening process** behind the
@@ -1910,7 +1926,11 @@ commands (SSRF, e.g. host admin panels, internal ports, cloud metadata):
     timeout (fail-closed) so a connection never hangs forever; headless does no expensive process
     resolution and fails closed immediately.
   - The prompt can be shown standalone or decided in the unified review window's "network requests"
-    page (see the multi-page approval window section).
+    page (see the multi-page approval window section). That page also shows a **session-allowed
+    (revocable)** list (`net_consent.list_allowances`; press `d` to revoke via
+    `net_consent.revoke_allowance(key)`) and a **history (record only)** list
+    (`net_consent.list_history`: once / denied / revoked, with service identity and time), so the
+    reviewer can trace which egress targets were allowed or blocked.
 - **Software-source auto-allow (`network.auto_allow_sources`, on by default)**: so that package
   installs are not intercepted by the consent gate, access to **external** software sources
   (PyPI/pythonhosted, npm/npmmirror, crates/rust-lang, proxy.golang.org/goproxy, Maven,
@@ -1947,8 +1967,11 @@ commands (SSRF, e.g. host admin panels, internal ports, cloud metadata):
   `env -u *proxy`, `curl --noproxy`, `--proxy ""`/`-x ''`, `export *proxy=`) defeats the filter above;
   the gate detects it on the **folded effective command** before entering the sandbox
   (`PROXY_EVASION:*`) and, by default, **pauses the agent and prompts** (`network.block_proxy_evasion=true`:
-  allow once / always this session / deny). `"deny"` rejects outright (old hard reject), `false` does
-  not intercept. It normalizes shell quoting/ANSI-C/escapes and expands same-command variables before
+  allow once / always this session / deny). The prompt is a **sandbox floating window** consistent with
+  the network-consent / tool-approval / device-consent ones (`ui/components/policy_consent.lua`, titled
+  "⚠ 沙箱策略确认"; `<CR>` once / `S` this session / `Esc` deny), with the no-response timeout from
+  `network.consent_timeout_ms` (default 30s auto-block). `"deny"` rejects outright (old hard reject),
+  `false` does not intercept. It normalizes shell quoting/ANSI-C/escapes and expands same-command variables before
   matching (defeating `--noprox''y`/`$'--noproxy'`/`$c`), and treats `-x` as `--proxy` only for curl
   (so `set -x` is not a false positive). Headless (no attached UI) fails closed.
 - **Residual information leak (inherent to a shared netns)**: because T0 shares the host network

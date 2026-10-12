@@ -222,6 +222,61 @@ tests.suite("net_consent", function(_, it)
     nc.reset()
   end)
 
+  it("决策历史与本会话允许可撤销", function(t)
+    local nc = require("NeoAI.sandbox.net.net_consent")
+    nc.reset()
+    -- 单次允许：入历史，不入允许列表
+    nc.set_ui({ show = function(_, decide) decide("allow_once") end })
+    local r1
+    nc.request({ host = "example.com", port = 443, local_ = false, proto = "tcp" })
+      :then_(function(v) r1 = v end)
+    t.true_(vim.wait(1000, function() return r1 ~= nil end), "请求应 resolve")
+    t.eq("allow_once", r1)
+    local hist = nc.list_history()
+    t.eq(1, #hist, "单次允许应入历史")
+    t.eq("allow_once", hist[1].decision)
+    t.eq("example.com", hist[1].host)
+    t.eq(0, #nc.list_allowances(), "单次允许不入会话允许列表")
+
+    -- 拒绝：入历史
+    nc.set_ui({ show = function(_, decide) decide("deny") end })
+    local r2
+    nc.request({ host = "deny.example", port = 80, local_ = false })
+      :then_(function(v) r2 = v end)
+    t.true_(vim.wait(1000, function() return r2 ~= nil end), "请求应 resolve")
+    t.eq("deny", r2)
+    hist = nc.list_history()
+    t.eq(2, #hist, "拒绝应入历史")
+    t.eq("deny", hist[1].decision, "新记录在最前")
+
+    -- 会话允许：入允许列表，不入历史（host_proxy 在决策后调用 allow_session）
+    local owner = { comm = "postgres", pid = 4242, exe = "/usr/bin/postgres" }
+    nc.set_ui({ show = function(_, decide) decide("allow_session") end })
+    local r3
+    nc.request({ host = "127.0.0.1", port = 5432, local_ = true, owner = owner, owner_resolved = true })
+      :then_(function(v) r3 = v end)
+    t.true_(vim.wait(1000, function() return r3 ~= nil end), "请求应 resolve")
+    t.eq("allow_session", r3)
+    nc.allow_session("127.0.0.1", 5432, owner)
+    local allow = nc.list_allowances()
+    t.eq(1, #allow, "会话允许应入允许列表")
+    t.matches("127%.0%.0%.1:5432", allow[1].key, "key 应含目标")
+    t.eq("postgres", allow[1].comm, "应含服务身份")
+    t.true_(nc.is_session_allowed("127.0.0.1", 5432, owner), "应记住会话允许")
+    t.eq(2, #nc.list_history(), "会话允许不入历史")
+
+    -- 撤销：移除允许 + 追加「已撤销」历史
+    t.true_(nc.revoke_allowance(allow[1].key), "应能撤销")
+    t.false_(nc.is_session_allowed("127.0.0.1", 5432, owner), "撤销后不再免弹窗")
+    t.eq(0, #nc.list_allowances(), "撤销后允许列表为空")
+    local hist2 = nc.list_history()
+    t.eq(3, #hist2, "撤销应追加历史")
+    t.eq("revoked", hist2[1].decision)
+    t.false_(nc.revoke_allowance("不存在"), "撤销不存在的 key 应为 false")
+    nc.set_ui(nil)
+    nc.reset()
+  end)
+
   it("外部目标按策略处理：allow 放行、deny 拒绝", function(t)
     local hp = require("NeoAI.sandbox.net.host_proxy")
     local nc = require("NeoAI.sandbox.net.net_consent")

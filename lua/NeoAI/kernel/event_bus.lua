@@ -31,6 +31,12 @@ end
 --- @param event string 常量名或 "domain:verb"
 --- @param payload any|nil
 function M.emit(event, payload)
+  -- libuv 快速事件回调（如 host_proxy 连接回调、job 输出回调）中不得调用 nvim_exec_autocmds
+  -- （E5560: must not be called in a fast event context）。此时调度到主循环再触发，避免事件丢失。
+  if vim.in_fast_event and vim.in_fast_event() then
+    vim.schedule(function() M.emit(event, payload) end)
+    return
+  end
   local pattern = _normalize(event)
   local ok, err = pcall(vim.api.nvim_exec_autocmds, "User", {
     pattern = pattern,

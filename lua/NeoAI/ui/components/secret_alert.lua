@@ -118,7 +118,7 @@ local function _present(ctx, decide)
   vim.bo[state.buf].filetype = "neoai_secret_alert"
   local lines = _text(ctx)
   vim.api.nvim_buf_set_lines(state.buf, 0, -1, false, lines)
-  local geom_opts = { w_ratio = 0.60, h_ratio = 0.40, fit_h = #lines + 2 }
+  local geom_opts = { w_ratio = 0.60, h_ratio = 0.40, fit_lines = lines, fit_pad = 2 }
   local geom = geometry.compute(geom_opts)
   local ok, wid = pcall(vim.api.nvim_open_win, state.buf, true, {
     relative = "editor",

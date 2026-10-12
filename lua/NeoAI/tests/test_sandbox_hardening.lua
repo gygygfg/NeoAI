@@ -128,6 +128,55 @@ tests.suite("sandbox_hardening", function(_, it)
     pc.reset()
   end)
 
+  it("策略确认：注册浮窗 UI 后经弹窗决策（与其它沙箱弹窗一致）", function(t)
+    local pc = require("NeoAI.sandbox.review.policy_consent")
+    local function via_ui(reply)
+      pc.reset()
+      local decision
+      pc.set_ui({ show = function(_ctx, decide) decide(reply) end, hide = function() end })
+      local d = pc.request("proxy_evasion", { title = "t", detail = "d" })
+      d:then_(function(v) decision = v end)
+      t.true_(vim.wait(2000, function() return decision ~= nil end), "应完成")
+      pc.set_ui(nil)
+      return decision
+    end
+    t.eq("allow_once", via_ui("allow_once"), "allow_once 映射为 allow_once")
+    t.eq("allow_session", via_ui("allow_session"), "allow_session 映射为 allow_session")
+    pc.reset()
+    -- 会话允许后不再弹窗
+    pc.allow_session("proxy_evasion")
+    local d2 = pc.request("proxy_evasion", {})
+    local v2
+    d2:then_(function(v) v2 = v end)
+    t.true_(vim.wait(2000, function() return v2 ~= nil end), "应完成")
+    t.eq("allow_session", v2, "会话允许应短路")
+    pc.reset()
+    t.eq("deny", via_ui("deny"), "deny 映射为 deny")
+    pc.reset()
+  end)
+
+  it("策略确认：广播到审批中心「工具行为」页（统一审批悬浮窗可见并可决策）", function(t)
+    local pc = require("NeoAI.sandbox.review.policy_consent")
+    local hub = require("NeoAI.sandbox.review.approval_hub")
+    pc.reset()
+    hub.reset()
+    local orig_uis = vim.api.nvim_list_uis
+    ---@diagnostic disable-next-line: duplicate-set-field
+    vim.api.nvim_list_uis = function() return { {} } end
+    hub.set_ui({ refresh = function() end })
+    pc.set_ui({ show = function() end })
+    local got
+    pc.request("proxy_evasion", { title = "代理规避确认" }):then_(function(v) got = v end)
+    local items = hub.list("behavior")
+    t.true_(#items >= 1, "应在「工具行为」页出现条目")
+    t.true_(hub.resolve(items[#items].id, "allow_once"), "中心应能决策")
+    t.true_(vim.wait(2000, function() return got ~= nil end), "应 resolve")
+    t.eq("allow_once", got, "中心决策应透传")
+    hub.reset()
+    vim.api.nvim_list_uis = orig_uis
+    pc.reset()
+  end)
+
   it("代理规避：默认弹窗拒绝（headless）；批准后放行；可配置 deny/allow", function(t)
     local tools = require("NeoAI.tools")
     ---@type table<string, any>
@@ -143,11 +192,12 @@ tests.suite("sandbox_hardening", function(_, it)
     local cmd = "env -u http_proxy echo neoai_evasion_ok"
     -- 默认 ask + headless（无 UI）→ 拒绝
     t.matches("代理规避未获批准", run(cmd), "headless ask 应拒绝")
-    -- 用户批准（stub）→ 放行
-    local orig = pc.ask
-    pc.ask = function() return "once" end
+    -- 用户批准（stub 异步 request）→ 放行
+    local async = require("NeoAI.utils.async")
+    local orig = pc.request
+    pc.request = function() return async.resolve("allow_once") end
     local allowed_out = run(cmd)
-    pc.ask = orig
+    pc.request = orig
     t.matches("neoai_evasion_ok", allowed_out, "批准后应执行")
     -- "deny" → 直接拒绝
     with_config({ tools = { sandbox = { network = { block_proxy_evasion = "deny" } } } }, function()

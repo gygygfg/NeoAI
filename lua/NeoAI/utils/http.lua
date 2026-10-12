@@ -38,12 +38,16 @@ local function _supports_fail_with_body()
   local curl = _which_curl()
   local ok = curl ~= nil
   if ok then
-    local handle = io.popen(curl .. " --help all 2>/dev/null")
-    if handle then
-      local out = handle:read("*a")
-      handle:close()
-      ok = out and out:find("--fail%-with%-body") ~= nil
+    -- 用 argv 列表（不经 shell）探测：`io.popen`/`system("...")` 会经 `/bin/sh`，当 nvim 的
+    -- 工作目录已被删除时，`sh` 在启动阶段会向终端打印 `getcwd() failed`，污染 TUI（出现在
+    -- 输入框等当前窗口）。argv 形式不启动 shell，避免该泄露。
+    local text = ""
+    local ok_run, res = pcall(vim.system, { curl, "--help", "all" }, { text = true })
+    if ok_run and res then
+      local r = res:wait()
+      text = (r and r.stdout) or ""
     end
+    ok = text:find("--fail%-with%-body") ~= nil
   end
   _fail_with_body_support = ok
   return ok

@@ -497,7 +497,7 @@ sandbox = {
     -- remembers the session approval per "port + service process" — a different process taking over
     -- the same port (service upgrade / hijack) triggers a new prompt. Off falls back to host:port.
     consent_process_granularity = true,
-    consent_timeout_ms = 30000,      -- no-response timeout for the network consent prompt (ms; 0 = unlimited); auto-deny on timeout (fail-closed) so connections never hang forever
+    consent_timeout_ms = 30000,      -- no-response timeout for the network consent prompt (ms; 0 = unlimited); auto-deny on timeout **only while presented** (fail-closed); while stashed (chat UI not foreground) it waits (mirrored to the unified approval window)
     consent_owner_ttl_ms = 2000,     -- short cache TTL (ms) for port→host-process resolution; revalidated per connection, reused within TTL to avoid full /proc scans
     auto_allow_sources = true,       -- auto-allow software sources (default on): external package sources (PyPI, npm, crates, Tsinghua/Aliyun/USTC mirrors, …) used by pip/uv/npm/go/cargo/apt are allowed through the proxy without a prompt, so package installs are not intercepted by the consent gate. Only non-host-local targets qualify (resolve-to-host/failed DNS is still denied; SSRF protection unchanged); still denied when access="deny"; auto-allowed requests are not returned in the command result (only blocks/failures are). The built-in list also contains the code hosts github.com / githubusercontent.com (subdomains match automatically), so git_fetch/git_pull/git clone to GitHub needs no prompt
     extra_package_sources = {},      -- extra software-source domain suffixes (private/self-hosted mirrors), e.g. { "pypi.mycorp.com" }; subdomains match automatically
@@ -534,7 +534,7 @@ sandbox = {
     enabled = true,                  -- master switch
     dynamic = true,                  -- dynamic monitoring (default on): use runtime eBPF openat/open observation to decide the actual device access (variable/script bypass-proof); on unapproved access it terminates the command and prompts, auto-rerunning on approval if it failed. Falls back to static text scanning when eBPF is unavailable; false forces static only
     action = "ask",                  -- ask (default, prompt: once / this session / deny) | allow (pass and expose) | deny (reject)
-    timeout_ms = 30000,              -- prompt timeout (ms; 0 = no limit); auto-block on timeout (fail-closed)
+    timeout_ms = 30000,              -- prompt timeout (ms; 0 = no limit); auto-block on timeout **only when the popup is presented** (fail-closed); while stashed (chat UI not foreground) it does not auto-block (the request is mirrored to the unified approval window)
     paths = {                        -- dangerous device paths requiring confirmation (supports * globs)
       "/dev/kvm", "/dev/net/tun", "/dev/net/tap", "/dev/vhost-net", "/dev/vhost-vsock", "/dev/vhost-vsock-*",
       "/dev/vfio/*", "/dev/fuse", "/dev/loop*", "/dev/sd*", "/dev/hd*", "/dev/vd*", "/dev/xvd*",

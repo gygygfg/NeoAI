@@ -145,6 +145,25 @@ tests.suite("geometry", function(_, it)
     end)
   end)
 
+  it("display_rows：按显示宽度折行（CJK 计 2 列；空行计 1）", function(t)
+    t.eq(1, geometry.display_rows({ "abc" }, 10), "短行 1 行")
+    t.eq(1, geometry.display_rows({ "" }, 10), "空行计 1")
+    t.eq(2, geometry.display_rows({ string.rep("a", 20) }, 10), "20 列 / 10 = 2 行")
+    t.eq(2, geometry.display_rows({ string.rep("中", 6) }, 6), "中文 12 列 / 6 = 2 行")
+    t.eq(0, geometry.display_rows({}, 10), "空表 0 行")
+  end)
+
+  it("fit_lines：按折行内容自适应高度（长文本不被截断）", function(t)
+    on_screen(200, 50, function()
+      local lines = { string.rep("中", 100), "short" } -- 长行显示宽 200，宽 100 → 内容宽 98 → 3 行
+      local g = geometry.compute({ w_ratio = 0.5, h_ratio = 0.9, fit_lines = lines, fit_pad = 2 })
+      t.eq(6, g.height, "3(折行) + 1 + 2(pad) = 6")
+      -- fit_lines 优先于 fit_h（min_h=0 解除全局最小高度兜底）
+      local g2 = geometry.compute({ w_ratio = 0.5, h_ratio = 0.9, fit_h = 99, fit_lines = { "x" }, fit_pad = 2, min_h = 0 })
+      t.eq(3, g2.height, "fit_lines 优先")
+    end)
+  end)
+
   it("untrack 后 refresh 不再更新窗口几何", function(t)
     on_screen(200, 50, function()
       local buf = vim.api.nvim_create_buf(false, true)

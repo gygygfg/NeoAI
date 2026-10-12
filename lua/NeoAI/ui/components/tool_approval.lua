@@ -134,7 +134,7 @@ local function _present(config)
   end
   vim.api.nvim_buf_set_lines(state.buf, 0, -1, false, lines)
 
-  local geom_opts = { w_ratio = 0.55, h_ratio = 0.50, fit_h = #lines + 4 }
+  local geom_opts = { w_ratio = 0.55, h_ratio = 0.50, fit_lines = lines, fit_pad = 4 }
   local geom = geometry.compute(geom_opts)
   local ok, wid = pcall(vim.api.nvim_open_win, state.buf, true, {
     relative = "editor",
@@ -163,12 +163,12 @@ local function _present(config)
   _set_keymaps()
 end
 
---- 展示审批弹窗。**应用级焦点门控**（`focus.gate_app`）：只要 nvim 有 OS 焦点即**立即弹出**，
---- 不因当前窗口不是 NeoAI 界面而延迟（否则用户在看代码窗口时审批被压住、超时后静默拒绝/挂起）；
---- 仅 nvim 失焦时暂存，回焦再弹。审批超时/经审批中心决策会调用 `hide()` 取消暂存。
+--- 展示审批弹窗。**聊天界面焦点门控**（`focus.gate`）：当前窗口是 NeoAI 界面时立即弹出；
+--- 否则**暂存**，待切回 NeoAI 界面再弹。审批分流中心始终**直接新建条目**（见 tool_service 的
+--- hub.submit），故暂存期间可在多级审批悬浮窗决策。审批超时/经审批中心决策会调用 `hide()`。
 --- @param config table { text, tool_name, args, on_confirm, on_cancel, on_confirm_all, on_add_to_workspace }
 function M.show(config)
-  require("NeoAI.ui.focus").gate_app("tool_approval", function() _present(config) end)
+  require("NeoAI.ui.focus").gate("tool_approval", function() _present(config) end)
 end
 
 --- 隐藏弹窗

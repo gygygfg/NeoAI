@@ -172,7 +172,13 @@ M.SANDBOX_SECRET_EGRESS = "sandbox:secret_egress"
 M.SANDBOX_SENSITIVE_REDACTED = "sandbox:sensitive_redacted"
 
 -- 沙箱网络访问同意：沙箱外部命令访问沙箱外目标（宿主本机其他端口/外部主机）时请求用户同意
+-- （保留常量；新代码请统一用 SANDBOX_CONSENT_REQUESTED + page="network"）
 M.SANDBOX_NET_CONSENT_REQUESTED = "sandbox:net_consent_requested"
+
+-- 统一的运行时请求弹窗事件：**白名单外网络请求 / 危险命令访问 / 敏感隐私文件读取** 三类运行时
+-- 审批请求统一经本事件广播，由 payload.page 区分归属（`network` | `behavior` | `resource`），其余
+-- 参数（host/port、devices、命令、目标、reason 等）随类型附带。审批分流中心同时据此刷新对应页。
+M.SANDBOX_CONSENT_REQUESTED = "sandbox:consent_requested"
 
 -- 审批分流中心：阻塞类审批条目或观测类页面内容变化（多级页面审批悬浮窗据此自动刷新）
 M.SANDBOX_APPROVAL_CHANGED = "sandbox:approval_changed"

@@ -121,6 +121,29 @@ tests.suite("device_consent", function(_, it)
     dc.reset()
   end)
 
+  it("request：暂存待弹（弹窗未呈现）不因超时自动拒绝；呈现后到时才拒绝", function(t)
+    local dc = require("NeoAI.sandbox.review.device_consent")
+    -- 未呈现（is_open=false）：小超时后仍不应 resolve（继续等待，避免用户不在聊天界面时被静默拒绝）
+    with_config({ tools = { sandbox = { devices = { timeout_ms = 40, allowed = {} } } } }, function()
+      dc.set_ui({ show = function() end, hide = function() end, is_open = function() return false end })
+      local decision
+      dc.request({ "/dev/kvm" }):then_(function(v) decision = v end)
+      vim.wait(250)
+      t.eq(nil, decision, "暂存待弹时超时不应自动拒绝")
+    end)
+    dc.set_ui(nil)
+    dc.reset()
+    -- 已呈现（is_open=true）：到时自动拒绝
+    with_config({ tools = { sandbox = { devices = { timeout_ms = 40, allowed = {} } } } }, function()
+      dc.set_ui({ show = function() end, hide = function() end, is_open = function() return true end })
+      local decision, done
+      dc.request({ "/dev/kvm" }):then_(function(v) decision = v; done = true end)
+      t.true_(vim.wait(2000, function() return done end), "呈现后超时应完成")
+      t.eq("deny", decision, "呈现后超时应自动阻止")
+    end)
+    dc.reset()
+  end)
+
   it("bind_mounts：已批准且宿主存在的设备生成 mode=dev", function(t)
     local dc = require("NeoAI.sandbox.review.device_consent")
     -- /dev/null 是真实字符设备，仅用于验证挂载项生成逻辑（不校验是否在危险模式表内）。

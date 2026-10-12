@@ -1863,23 +1863,28 @@ tests.suite("chat_ui", function(_, it)
     local bar = table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n")
     t.true_(bar:find("[确认]", 1, true) ~= nil, "最右侧应有确认标签")
 
-    -- 单选第 1 题选项 1（A）——选中不自动跳转，留在本题
+    -- 单选第 1 题选项 1（A）——多题单选作答后**自动跳到下一题**
     t.true_(invoke_map(buf, "n", "1"), "应绑定数字键")
     t.eq("A", au.get_state().answers[1], "单选应记录选中 label")
-    t.eq(1, au.get_state().active, "单选后留在本题（手动切页）")
+    t.eq(2, au.get_state().active, "单选作答后应自动跳到下一题")
     t.eq("tab", au.get_state().mode)
 
-    -- 右方向键切到第 2 题，多选勾选 X 与 Z
+    -- 右方向键切到最右确认标签（验证切页绑定），再 h 回到第 2 题
     t.true_(invoke_map(buf, "n", "<Right>"), "应绑定右方向键")
-    t.eq(2, au.get_state().active, "<Right> 应切到下一题")
+    t.eq(3, au.get_state().active, "<Right> 应切到确认标签")
+    t.true_(invoke_map(buf, "n", "h"), "应绑定 h 切页")
+    t.eq(2, au.get_state().active, "h 应切回第 2 题")
+
+    -- 第 2 题为多选：勾选 X 与 Z（多选不自动跳转，留在本题）
     invoke_map(buf, "n", "1") -- X
     t.eq("X", au.get_state().answers[2], "多选首项即当前答案")
     invoke_map(buf, "n", "3") -- Z
     t.eq("X, Z", au.get_state().answers[2], "多选答案以 ', ' 连接")
+    t.eq(2, au.get_state().active, "多选不自动跳转，留在本题")
     t.eq("tab", au.get_state().mode, "多选不自动确认，留在本题")
 
     -- h 左切回第 1 题；l 右切到最右确认标签
-    t.true_(invoke_map(buf, "n", "h"), "应绑定 h 切页")
+    invoke_map(buf, "n", "h")
     t.eq(1, au.get_state().active, "h 应切到上一题")
     invoke_map(buf, "n", "l")
     invoke_map(buf, "n", "l")
@@ -1941,8 +1946,8 @@ tests.suite("chat_ui", function(_, it)
       on_cancel = function() end,
     })
     local buf = au.get_buf()
-    invoke_map(buf, "n", "1") -- Q1 = A
-    invoke_map(buf, "n", "<Tab>") -- 切到 Q2
+    invoke_map(buf, "n", "1") -- Q1 = A（多题单选：自动跳到 Q2）
+    t.eq(2, au.get_state().active, "Q1 单选作答后应自动到 Q2")
     invoke_map(buf, "n", "1") -- Q2 = X（多选勾选）
     invoke_map(buf, "n", "l") -- 到确认标签
     t.eq("confirm", au.get_state().mode)

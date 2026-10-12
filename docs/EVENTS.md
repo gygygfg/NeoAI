@@ -289,7 +289,9 @@ vim.api.nvim_create_autocmd("User", {
 | `SANDBOX_CONTAINER_PLANNED` | `sandbox:container_planned` | 容器受控计划（命名空间共享 / 受控 socket） | `{ manager, mode, share_namespace, reason, command_id }` |
 | `SANDBOX_CONTAINER_UNSUPPORTED` | `sandbox:container_unsupported` | 容器门面拒绝需宿主守护进程/远程/宿主子命令 | `{ manager, sub, reason, command_id }` |
 | `SANDBOX_BACKGROUND_ROUTED` | `sandbox:background_routed` | （保留常量）旧后台命令门面转为长驻服务时发出；后台门面已移除，不再触发 | `{ name, service_id, kind, command_id }` |
-| `SANDBOX_NET_CONSENT_REQUESTED` | `sandbox:net_consent_requested` | 沙箱外部命令访问沙箱外目标（宿主本机其他端口/外部主机）时请求用户同意 | `{ host, port, local_, proto }` |
+| `SANDBOX_NET_CONSENT_REQUESTED` | `sandbox:net_consent_requested` | （保留常量）沙箱外部命令访问沙箱外目标时请求用户同意；新代码统一用 `SANDBOX_CONSENT_REQUESTED` + `page="network"` | `{ host, port, local_, proto }` |
+| `SANDBOX_CONSENT_REQUESTED` | `sandbox:consent_requested` | **统一的运行时请求弹窗事件**：白名单外网络请求 / 危险命令访问 / 敏感隐私文件读取三类审批请求统一经本事件广播，由 `page` 区分归属（`network` / `behavior` / `resource`），其余参数随类型附带；审批分流中心据此在对应页新建条目 | `{ page, kind?, host?, port?, devices?, tool?, masked?, reason? }` |
+| `SANDBOX_APPROVAL_CHANGED` | `sandbox:approval_changed` | 阻塞类审批条目或观测类页面内容变化（多级页面审批悬浮窗据此自动刷新） | `{ page }` |
 
 ## 4. 事件订阅最佳实践
 

@@ -92,12 +92,12 @@ tests.suite("kernel", function(_, it, before_each)
 
   it("event_bus 发布订阅", function(t)
     local event_bus = require("NeoAI.kernel.event_bus")
-    local events = require("NeoAI.kernel.events")
     local received
-    local unsub = event_bus.on(events.MODELS_UPDATED, function(data)
+    -- 用独立事件名，避免与后台模型拉取等并发 emit 的同一事件串扰。
+    local unsub = event_bus.on("test:pubsub", function(data)
       received = data
     end)
-    event_bus.emit(events.MODELS_UPDATED, { count = 7 })
+    event_bus.emit("test:pubsub", { count = 7 })
     return async.sleep(50):then_(function()
       t.not_nil(received)
       t.eq(7, received.count)
@@ -116,6 +116,23 @@ tests.suite("kernel", function(_, it, before_each)
       t.eq(1, received)
       unsub()
       print("  prefix done")
+    end)
+  end)
+
+  it("event_bus：快速事件上下文中的 emit 调度到主循环（不丢事件/E5560）", function(t)
+    local event_bus = require("NeoAI.kernel.event_bus")
+    local received
+    local unsub = event_bus.on("test:fast_event", function(data) received = data end)
+    -- 在 libuv 快速事件回调里 emit：应被调度到主循环触发（否则 nvim_exec_autocmds 抛 E5560）。
+    local timer = vim.uv.new_timer()
+    timer:start(10, 0, function()
+      event_bus.emit("test:fast_event", { count = 9 })
+    end)
+    return async.sleep(120):then_(function()
+      pcall(function() timer:stop(); timer:close() end)
+      t.not_nil(received, "快速事件中的 emit 应最终被触发")
+      t.eq(9, received.count)
+      unsub()
     end)
   end)
 

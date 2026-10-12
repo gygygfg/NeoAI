@@ -256,6 +256,15 @@ end
 --- @param devices table 待确认设备路径数组
 --- @return Deferred resolve(decision: "allow_once"|"allow_session"|"deny")
 function M.request(devices)
+  -- libuv 快速事件回调中不得弹窗（E5560）：调度到主循环再发起。
+  if vim.in_fast_event and vim.in_fast_event() then
+    local async0 = require("NeoAI.utils.async")
+    local outer = async0.Deferred.new()
+    vim.schedule(function()
+      M.request(devices):then_(function(v) outer:resolve(v) end, function(e) outer:reject(e) end)
+    end)
+    return outer
+  end
   local async = require("NeoAI.utils.async")
   local d = async.Deferred.new()
   devices = type(devices) == "table" and devices or {}
@@ -299,6 +308,10 @@ function M.request(devices)
   end
 
   local ctx = { devices = devices }
+  -- 统一运行时请求广播（同一事件 SANDBOX_CONSENT_REQUESTED，page="behavior" 区分）。
+  require("NeoAI.sandbox.review.consent").emit("behavior", {
+    kind = "device", devices = vim.deepcopy(devices),
+  })
   -- 镜像到审批分流中心「工具行为」页（窗口可决策；独立弹窗仍在时以先决策者为准）。
   hub_id = hub.submit("behavior", {
     title = "危险设备访问: " .. table.concat(devices, ", "),
@@ -323,14 +336,24 @@ function M.request(devices)
     pcall(function() hub.open_page("behavior") end)
   end
 
-  -- 超时兜底：用户长时间不响应时自动拒绝（fail-closed）。
+  -- 超时兜底（fail-closed）：**仅在弹窗已呈现**时到时自动拒绝；暂存待弹时不自动拒绝
+  -- （已镜像到统一审批悬浮窗），避免用户不在聊天界面时被静默拒绝。每 `tms` 复查。
   local tms = M.timeout_ms()
   if tms > 0 then
-    vim.defer_fn(function()
-      if done then return end
-      if state.ui and state.ui.hide then pcall(state.ui.hide) end
-      decide("deny")
-    end, tms)
+    local function arm()
+      vim.defer_fn(function()
+        if done then return end
+        local ui = state.ui
+        local presented = (ui == nil) or (type(ui.is_open) ~= "function") or ui.is_open()
+        if presented then
+          if ui and ui.hide then pcall(ui.hide) end
+          decide("deny")
+        else
+          arm()
+        end
+      end, tms)
+    end
+    arm()
   end
   return d
 end

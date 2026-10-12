@@ -238,7 +238,7 @@ ensures there are no leftover subscriptions or state between tests.
 | `test_commands_plugin` | Command plugin: unique NAMES, register/cleanup/idempotence, silent degradation when services are missing |
 | `test_keymaps_plugin` | Keymap plugin and `ui.keymap`: global/buffer register and unregister, dual-mode expansion, action dispatch, `show_keymaps` float |
 | `test_lazy_plugin` | Lazy placeholders: placeholder command register/cleanup contract, no deletion once started, phase-1 vs full-start dispatch |
-| `test_ui_components` | UI components: net_consent/device_consent prompt and decision callback, sub_agent_dock event rendering, terminal_window headless no-op, `display_modes.chat` register/load/unload/render |
+| `test_ui_components` | UI components: net_consent/device_consent/policy_consent prompt and decision callback, sub_agent_dock event rendering, terminal_window headless no-op, `display_modes.chat` register/load/unload/render |
 | `test_sandbox_shims` | `fault`/`bench` compatibility shims forward to `diag` |
 | `test_parallel_runner` | Parallel runner: LPT shard balance/reproducibility/empty bins, SUITE/LOADFAIL parsing, passed/failed + timing-cache aggregation, suite filtering, shard crash, discovery failure (injected fake spawner, no real child) |
 

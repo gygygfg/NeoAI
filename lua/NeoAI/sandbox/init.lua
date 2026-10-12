@@ -760,6 +760,25 @@ function M.set_net_consent_ui(ui)
   return require("NeoAI.sandbox.net.net_consent").set_ui(ui)
 end
 
+--- 网络请求页：本次会话已允许（可撤销）条目
+--- @return table 数组 { key, host, port, base, svc, comm, pid, at_ms }
+function M.net_consent_allowances()
+  return require("NeoAI.sandbox.net.net_consent").list_allowances()
+end
+
+--- 网络请求页：决策历史（新→旧，只读：单次允许 / 拒绝 / 已撤销）
+--- @return table 数组 { host, port, local_, proto, svc, comm, decision, at_ms }
+function M.net_consent_history()
+  return require("NeoAI.sandbox.net.net_consent").list_history()
+end
+
+--- 网络请求页：撤销一条本次会话允许（按 key）；撤销后下次访问重新询问。
+--- @param key string
+--- @return boolean
+function M.net_consent_revoke(key)
+  return require("NeoAI.sandbox.net.net_consent").revoke_allowance(key)
+end
+
 --- 注册密钥外泄告警 UI 渲染器（由 ui 层注入；传 nil 解绑）
 --- @param ui table|nil
 function M.set_secret_alert_ui(ui)
@@ -770,6 +789,12 @@ end
 --- @param ui table|nil
 function M.set_device_consent_ui(ui)
   return require("NeoAI.sandbox.review.device_consent").set_ui(ui)
+end
+
+--- 注册沙箱策略确认 UI 渲染器（代理规避等；由 ui 层注入；传 nil 解绑）
+--- @param ui table|nil
+function M.set_policy_consent_ui(ui)
+  return require("NeoAI.sandbox.review.policy_consent").set_ui(ui)
 end
 
 -- ---------- 呈现层只读查询（语义封装） ----------

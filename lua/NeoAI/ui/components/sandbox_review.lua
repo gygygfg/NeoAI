@@ -80,6 +80,24 @@ local function _hub_get(id)
   return sb and sb.hub_get(id)
 end
 
+--- 网络请求页：本会话已允许（可撤销）条目；服务缺失返回 {}
+local function _net_allowances()
+  local sb = _sb()
+  return (sb and sb.net_consent_allowances and sb.net_consent_allowances()) or {}
+end
+
+--- 网络请求页：决策历史（只读）；服务缺失返回 {}
+local function _net_history()
+  local sb = _sb()
+  return (sb and sb.net_consent_history and sb.net_consent_history()) or {}
+end
+
+--- 撤销一条本会话网络允许
+local function _net_revoke(key)
+  local sb = _sb()
+  return sb and sb.net_consent_revoke and sb.net_consent_revoke(key)
+end
+
 -- 审批页标签缓存（沙箱服务就绪后惰性填充；见 _ensure_page_labels）
 local PAGE_LABEL = {}
 local _page_labels_ready = false
@@ -118,6 +136,8 @@ local LEVEL_HL = {
   risk3 = "NeoAISandboxReviewRisk3",
   ai = "NeoAISandboxReviewAi",
   note = "NeoAISandboxReviewNote",
+  tab_active = "NeoAISandboxReviewTabActive",
+  tab_inactive = "NeoAISandboxReviewTabInactive",
   verdict_safe = "NeoAISandboxReviewVerdictSafe",
   verdict_unsafe = "NeoAISandboxReviewVerdictUnsafe",
 }
@@ -168,6 +188,7 @@ local state = {
   page = "files", -- 当前页面（多级页面：files/behavior/resource/network/anomaly）
   line_to_target = {}, -- 行号 -> { change_set_id, path? }
   line_to_hub = {}, -- 行号 -> 审批分流中心条目 id（阻塞类页面）
+  line_to_allowance = {}, -- 行号 -> 网络请求页「本会话已允许」条目 key（`d` 撤销）
   line_to_trace = {}, -- 行号 -> 越界留痕路径（`i` 查看详情，非审批目标）
   line_to_cmd = {}, -- 行号 -> { command = string|nil } 越界命令（`i` 查看该命令涉及的文件）
   fold_levels = {}, -- 行号 -> 折叠级别（仅「已应用」区 > 0）：区标题=1，条目及其文件行=2
@@ -199,6 +220,8 @@ local WATCH_EVENTS = {
   events.SANDBOX_HOST_OP_ENQUEUED, events.SANDBOX_HOST_OP_APPLIED,
   events.SANDBOX_HOST_OP_REJECTED,
   events.SANDBOX_APPROVAL_CHANGED,
+  -- 统一运行时请求广播（网络请求 / 危险命令访问 / 敏感文件读取，page 区分）：新条目到达即刷新。
+  events.SANDBOX_CONSENT_REQUESTED,
 }
 
 -- 安全级别 -> 中文风险档（高危 / 中危 / 低危）
@@ -246,6 +269,10 @@ local function _ensure_hl()
   vim.api.nvim_set_hl(0, LEVEL_HL.risk3, { default = true, fg = "#ff5555", bold = true, underline = true })
   vim.api.nvim_set_hl(0, LEVEL_HL.ai, { default = true, fg = "#56b6c2", bold = true })
   vim.api.nvim_set_hl(0, LEVEL_HL.note, { default = true, fg = "#7f8c8d" })
+  -- 页标签高亮采用 Mason 风格（存在 mason.nvim 高亮组时链接复用其块状配色）。
+  local mason_hl = require("NeoAI.ui.mason_hl")
+  mason_hl.def(LEVEL_HL.tab_active, "MasonHighlightBlockBold", { bold = true, reverse = true })
+  mason_hl.def(LEVEL_HL.tab_inactive, "MasonHighlight", { fg = "#7f8c8d" })
   vim.api.nvim_set_hl(0, LEVEL_HL.verdict_safe, { default = true, fg = "#98c379", bold = true })
   vim.api.nvim_set_hl(0, LEVEL_HL.verdict_unsafe, { default = true, fg = "#ff5555", bold = true })
   vim.api.nvim_set_hl(0, L3_WARN_HL, { default = true, fg = "#ff5555", bold = true })
@@ -928,7 +955,7 @@ local function _show_root_prompt(res, target, retry, retry_op)
   vim.bo[buf].filetype = "neoai_root_prompt"
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
   vim.bo[buf].modifiable = false
-  local geom_opts = { w_ratio = 0.60, h_ratio = 0.40, fit_h = #lines + 2 }
+  local geom_opts = { w_ratio = 0.60, h_ratio = 0.40, fit_lines = lines, fit_pad = 2 }
   local geom = geometry.compute(geom_opts)
   local win = vim.api.nvim_open_win(buf, true, {
     relative = "editor",
@@ -2575,7 +2602,7 @@ local function _build_header(page, ctx)
   for i, p in ipairs(pages) do
     local n = _page_count(p.id, ctx)
     local text = string.format("[%d %s%s]", i, p.label, n > 0 and (" " .. n) or "")
-    seg(text, p.id == page and "ai" or "note")
+    seg(text, p.id == page and "tab_active" or "tab_inactive")
     if i < #pages then seg("  ") end
   end
   seg("      h/l 切换页面    q 关闭")
@@ -2589,10 +2616,13 @@ end
 --- @return table
 local function _build_blocking_page(page, ctx)
   local lines, marks, line_to_hub, line_to_target = {}, {}, {}, {}
+  local line_to_allowance = {}
   local entries = _hub_list(page)
   local head = ("── %s（待批准 %d）──"):format(_page_label(page) or page, #entries)
   lines[#lines + 1] = head
-  lines[#lines + 1] = "快捷键: <CR> 仅本次允许    S 本次会话允许    d 拒绝"
+  lines[#lines + 1] = page == "network"
+    and "快捷键: <CR> 仅本次允许    S 本次会话允许    d 拒绝（本会话已允许行按 d 撤销）"
+    or "快捷键: <CR> 仅本次允许    S 本次会话允许    d 拒绝"
   lines[#lines + 1] = ""
   if #entries == 0 and not (page == "behavior" and #ctx.hostops > 0) then
     lines[#lines + 1] = "（无待批准项）"
@@ -2606,6 +2636,43 @@ local function _build_blocking_page(page, ctx)
     marks[#marks + 1] = { line = hln, start_col = 0, end_col = #text, level = "pending1" }
     for _, d in ipairs(e.detail or {}) do
       lines[#lines + 1] = "    " .. _one_line(d)
+    end
+    lines[#lines + 1] = ""
+  end
+  -- 网络请求页：待批准之外追加「本会话已允许（可撤销）」与「历史（只读）」两段。
+  if page == "network" then
+    local allowances = _net_allowances()
+    lines[#lines + 1] = ("── 本会话已允许（可撤销 %d，d 撤销）──"):format(#allowances)
+    if #allowances == 0 then
+      lines[#lines + 1] = "（无）"
+    else
+      for i, a in ipairs(allowances) do
+        local who = a.comm and ("（" .. _one_line(a.comm)
+          .. (a.pid and (" pid " .. tostring(a.pid)) or "") .. "）") or ""
+        local text = string.format("  %d. %s:%s%s", i, _one_line(a.host), tostring(a.port), who)
+        local ln = #lines + 1
+        lines[#lines + 1] = text
+        line_to_allowance[ln] = a.key
+        marks[#marks + 1] = { line = ln, start_col = 0, end_col = #text, level = "workspace" }
+      end
+    end
+    lines[#lines + 1] = ""
+    local hist = _net_history()
+    lines[#lines + 1] = ("── 历史（仅记录 %d）──"):format(#hist)
+    if #hist == 0 then
+      lines[#lines + 1] = "（无）"
+    else
+      for _, h in ipairs(hist) do
+        local label = h.decision == "allow_once" and "已允许(单次)"
+          or (h.decision == "revoked" and "已撤销" or "已拒绝")
+        local who = h.comm and ("（" .. _one_line(h.comm) .. "）") or ""
+        local tm = h.at_ms and ("  " .. os.date("%H:%M:%S", math.floor(h.at_ms / 1000))) or ""
+        local text = string.format("  [%s] %s:%s%s%s",
+          label, _one_line(h.host), tostring(h.port), who, tm)
+        local ln = #lines + 1
+        lines[#lines + 1] = text
+        marks[#marks + 1] = { line = ln, start_col = 0, end_col = #text, level = "note" }
+      end
     end
     lines[#lines + 1] = ""
   end
@@ -2650,7 +2717,8 @@ local function _build_blocking_page(page, ctx)
       marks[#marks + 1] = { line = m.line + off, start_col = m.start_col, end_col = m.end_col, level = m.level }
     end
   end
-  return { lines = lines, marks = marks, line_to_hub = line_to_hub, line_to_target = line_to_target }
+  return { lines = lines, marks = marks, line_to_hub = line_to_hub,
+    line_to_target = line_to_target, line_to_allowance = line_to_allowance }
 end
 
 --- 构建「越界/异常」页：越界访问留痕（按文件，只读）+ 越界命令（命令 → 文件，只读）
@@ -2770,6 +2838,19 @@ end
 --- @param value string
 local function _blocking_decide(value)
   local ln = vim.api.nvim_win_get_cursor(0)[1]
+  -- 网络请求页「本会话已允许」行：仅支持 d 撤销（其余键提示）。
+  local akey = state.line_to_allowance and state.line_to_allowance[ln]
+  if akey then
+    if value == "deny" then
+      if _net_revoke(akey) then
+        vim.notify("[NeoAI] 已撤销本会话网络允许（下次访问将重新询问）", vim.log.levels.INFO)
+        _schedule_refresh()
+      end
+    else
+      vim.notify("[NeoAI] 该行仅支持 d 撤销本会话允许", vim.log.levels.INFO)
+    end
+    return
+  end
   local id = state.line_to_hub and state.line_to_hub[ln]
   if id then
     if _hub_resolve(id, value) then
@@ -3069,6 +3150,7 @@ function M.refresh()
   state.line_to_trace = _shift(body.line_to_trace)
   state.line_to_cmd = _shift(body.line_to_cmd)
   state.line_to_hub = _shift(body.line_to_hub)
+  state.line_to_allowance = _shift(body.line_to_allowance)
   vim.api.nvim_buf_clear_namespace(state.buf, state.ns, 0, -1)
   for _, m in ipairs(marks) do
     if LEVEL_HL[m.level] then
@@ -3129,6 +3211,7 @@ function M.close()
   state.ns = nil
   state.line_to_target = {}
   state.line_to_hub = {}
+  state.line_to_allowance = {}
   state.line_to_trace = {}
   state.line_to_cmd = {}
   state.fold_levels = {}
@@ -3206,6 +3289,7 @@ function M.reset()
   state.fold_levels = {}
   state.page = "files"
   state.line_to_hub = {}
+  state.line_to_allowance = {}
   if state.unwait then
     pcall(state.unwait)
     state.unwait = nil

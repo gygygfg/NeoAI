@@ -75,14 +75,25 @@ end
 --- @param ctx table { kind, tool?, command?, agent?, secret?, secret_preview?, fake?, dest?, reason? }
 --- @return Deferred resolve(decision)
 function M.request(ctx)
+  -- libuv 快速事件回调中不得弹窗/confirm（E5560）：调度到主循环再发起。
+  if vim.in_fast_event and vim.in_fast_event() then
+    local async0 = require("NeoAI.utils.async")
+    local outer = async0.Deferred.new()
+    vim.schedule(function()
+      M.request(ctx):then_(function(v) outer:resolve(v) end, function(e) outer:reject(e) end)
+    end)
+    return outer
+  end
   local async = require("NeoAI.utils.async")
   local d = async.Deferred.new()
+  ctx = ctx or {}
   if not M.available() then
     -- headless / 无 UI 且无回退：失败关闭
     d:resolve("stop")
     return d
   end
   local done = false
+  local hub_id
   local function decide(decision)
     if done then return end
     done = true
@@ -90,15 +101,60 @@ function M.request(ctx)
       and decision ~= "whitelist" and decision ~= "stop" then
       decision = "stop"
     end
+    if state.ui and state.ui.hide then pcall(state.ui.hide) end
+    if hub_id then
+      pcall(function() require("NeoAI.sandbox.review.approval_hub").clear(hub_id) end)
+    end
     d:resolve(decision)
   end
+
+  local has_fake = ctx.fake ~= nil and ctx.fake ~= ""
+  -- 广播到审批分流中心「工具行为」页：统一审批悬浮窗（多级页面）同步出现该条目并可决策。
+  local ok_hub, hub = pcall(require, "NeoAI.sandbox.review.approval_hub")
+  if ok_hub and hub.available() and _interactive() then
+    local title
+    if ctx.kind == "egress" then
+      title = "密钥外发: " .. tostring(ctx.dest or "?")
+    elseif ctx.kind == "context" then
+      title = "AI 上下文出现真实密钥"
+    else
+      title = "工具调用出现真实密钥: " .. tostring(ctx.tool or "?")
+    end
+    local detail = {}
+    if ctx.command then detail[#detail + 1] = "来源命令: " .. tostring(ctx.command):gsub("[\r\n]+", " ") end
+    if ctx.dest then detail[#detail + 1] = "目标: " .. tostring(ctx.dest) end
+    local s_label = has_fake and "替换为假密钥"
+      or (ctx.kind == "egress" and "加入白名单" or "停止 Agent")
+    hub_id = hub.submit("behavior", {
+      title = title,
+      detail = detail,
+      decisions = {
+        { key = "<CR>", label = "仅本次允许", value = "allow_once" },
+        { key = "S", label = s_label, value = "allow_session" },
+        { key = "<Esc>", label = "停止 Agent", value = "deny" },
+      },
+      on_decision = function(v)
+        if v == "allow_once" then
+          decide("allow_once")
+        elseif v == "allow_session" then
+          if has_fake then decide("fake")
+          elseif ctx.kind == "egress" then decide("whitelist")
+          else decide("allow_once") end
+        else
+          decide("stop")
+        end
+      end,
+      meta = { kind = ctx.kind },
+    })
+  end
+
   if state.ui ~= nil and type(state.ui.show) == "function" then
-    local ok = pcall(state.ui.show, ctx or {}, decide)
+    local ok = pcall(state.ui.show, ctx, decide)
     if not ok then decide("stop") end
     return d
   end
   -- 专用 UI 未注册：交互式 Neovim 用内建确认（暂停 Agent 直到用户选择）
-  local ok = pcall(M._confirm_fallback, ctx or {}, decide)
+  local ok = pcall(M._confirm_fallback, ctx, decide)
   if not ok then decide("stop") end
   return d
 end

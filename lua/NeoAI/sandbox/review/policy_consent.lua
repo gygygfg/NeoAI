@@ -1,17 +1,42 @@
 --- 沙箱策略确认：代理规避等「需用户批准」的操作暂停 Agent 并弹窗询问。
---- 交互式 Neovim 使用内建 `confirm`；真正 headless（无 attached UI）失败关闭（拒绝）。
+--- 优先使用与网络同意/工具审批/设备同意同款的**沙箱浮窗**（`ui/components/policy_consent`，经
+--- `set_ui` 注册）；无注册 UI 时回退内建 `confirm`；真正 headless（无 attached UI）失败关闭（拒绝）。
+---
+--- 主路径是**异步** `request(kind, opts)`（返回 Deferred，浮窗按键经正常事件循环处理）；
+--- `ask` 为兼容用的**同步**入口（仅测试/非 UI 场景），生产门禁请用 `request`。
 --- 会话级「始终允许」按 kind 记忆。策略由 `tools.sandbox.network.block_proxy_evasion` 选择。
 --- @module 'NeoAI.sandbox.review.policy_consent'
 
 local M = {}
 
-local state = { session = {} }
+local state = { session = {}, ui = nil }
 
 --- 是否存在可交互的 Neovim UI（`--headless` 无 attached UI）。
 --- @return boolean
 local function _interactive()
   local ok, uis = pcall(vim.api.nvim_list_uis)
   return ok and type(uis) == "table" and #uis > 0
+end
+
+--- 弹窗无响应超时（毫秒；0 = 不限）。复用网络同意的超时配置。
+--- @return number
+local function _timeout_ms()
+  local net = require("NeoAI.kernel.config_store").get("tools.sandbox.network") or {}
+  local v = tonumber(net.consent_timeout_ms)
+  if v == nil then v = 30000 end
+  return v > 0 and v or 0
+end
+
+--- 注册/注销沙箱策略确认 UI（由 ui 层注入；传 nil 解绑）。
+--- @param ui table|nil { show = function(ctx, decide), hide? = function() }
+function M.set_ui(ui)
+  state.ui = ui
+end
+
+--- 是否有可用的浮窗 UI。
+--- @return boolean
+function M.available()
+  return state.ui ~= nil and type(state.ui.show) == "function"
 end
 
 --- 本会话是否已对某策略「始终允许」
@@ -27,17 +52,16 @@ function M.allow_session(kind)
   if type(kind) == "string" and kind ~= "" then state.session[kind] = true end
 end
 
---- 暂停并询问用户。返回 `"once"|"session"|"deny"`。
---- @param kind string 策略标识（如 "proxy_evasion"）
---- @param opts table|nil { title?, detail? }
---- @return string
-function M.ask(kind, opts)
-  opts = opts or {}
-  if M.is_session_allowed(kind) then return "session" end
-  if not _interactive() then return "deny" end
+--- 同步回退：内建 `confirm`（仅无浮窗 UI 的交互式场景；会**阻塞**且不处理浮窗输入）。
+--- @param kind string
+--- @param opts table
+--- @return string "once"|"session"|"deny"
+local function _ask_confirm(kind, opts)
   local prompt = tostring(opts.title or "沙箱策略确认")
-  if opts.detail and opts.detail ~= "" then
-    prompt = prompt .. " " .. tostring(opts.detail):gsub("%s+", " ")
+  local detail = opts.detail
+  if type(detail) == "table" then detail = table.concat(detail, " ") end
+  if type(detail) == "string" and detail ~= "" then
+    prompt = prompt .. " " .. detail:gsub("%s+", " ")
   end
   local choices = "仅本次允许\n本次会话始终允许\n拒绝"
   local confirm = vim.fn.confirm --[[@as fun(title: string, choices: string, default: integer, kind: string): integer]]
@@ -47,9 +71,130 @@ function M.ask(kind, opts)
   return "deny"
 end
 
+--- 异步请求用户同意（主路径）。
+--- @param kind string 策略标识（如 "proxy_evasion"）
+--- @param opts table|nil { title?, detail? }
+--- @return Deferred resolve("allow_once"|"allow_session"|"deny")
+function M.request(kind, opts)
+  opts = opts or {}
+  -- libuv 快速事件回调中不得弹窗/confirm（E5560）：调度到主循环再发起。
+  if vim.in_fast_event and vim.in_fast_event() then
+    local async = require("NeoAI.utils.async")
+    local outer = async.Deferred.new()
+    vim.schedule(function()
+      M.request(kind, opts):then_(function(v) outer:resolve(v) end, function(e) outer:reject(e) end)
+    end)
+    return outer
+  end
+  local async = require("NeoAI.utils.async")
+  local d = async.Deferred.new()
+  if M.is_session_allowed(kind) then
+    vim.schedule(function() d:resolve("allow_session") end)
+    return d
+  end
+
+  local done = false
+  local hub_id
+  local function decide(decision)
+    if done then return end
+    done = true
+    if decision ~= "allow_once" and decision ~= "allow_session" and decision ~= "deny" then
+      decision = "deny"
+    end
+    if decision == "allow_session" then M.allow_session(kind) end
+    if state.ui and state.ui.hide then pcall(state.ui.hide) end
+    if hub_id then
+      pcall(function() require("NeoAI.sandbox.review.approval_hub").clear(hub_id) end)
+    end
+    d:resolve(decision)
+  end
+
+  local hub = require("NeoAI.sandbox.review.approval_hub")
+  local standalone = M.available()
+  local via_hub = hub.available() and _interactive()
+  if not standalone and not via_hub then
+    -- 无浮窗/统一窗口可用：交互式退回内建 confirm（同步），headless 失败关闭。
+    if _interactive() then
+      local decision = _ask_confirm(kind, opts)
+      decide(decision)
+      return d
+    end
+    pcall(function()
+      require("NeoAI.kernel.logger").warn("[policy_consent] 无可用确认界面，拒绝策略 %s", tostring(kind))
+    end)
+    decide("deny")
+    return d
+  end
+
+  -- 统一运行时请求广播（同一事件 SANDBOX_CONSENT_REQUESTED，page="behavior" 区分）。
+  require("NeoAI.sandbox.review.consent").emit("behavior", {
+    kind = "policy", reason = kind, title = tostring(opts.title or ""),
+  })
+  -- 镜像到审批分流中心「工具行为」页（窗口可决策；独立弹窗仍在时以先决策者为准）。
+  local hub_detail = {}
+  if type(opts.detail) == "table" then
+    for _, l in ipairs(opts.detail) do hub_detail[#hub_detail + 1] = tostring(l) end
+  elseif type(opts.detail) == "string" and opts.detail ~= "" then
+    hub_detail[1] = opts.detail
+  end
+  hub_id = hub.submit("behavior", {
+    title = tostring(opts.title or "沙箱策略确认"),
+    detail = hub_detail,
+    decisions = {
+      { key = "<CR>", label = "仅本次允许", value = "allow_once" },
+      { key = "S", label = "本次会话始终允许", value = "allow_session" },
+      { key = "<Esc>", label = "拒绝", value = "deny" },
+    },
+    on_decision = decide,
+    meta = { kind = kind },
+  })
+
+  if standalone then
+    local ok = pcall(state.ui.show, { title = opts.title, detail = opts.detail }, decide)
+    if not ok then decide("deny") end
+  else
+    pcall(function() hub.open_page("behavior") end)
+  end
+
+  local tms = _timeout_ms()
+  if tms > 0 then
+    local function arm()
+      vim.defer_fn(function()
+        if done then return end
+        -- 仅在弹窗**已呈现**时到时自动拒绝；暂存待弹（聊天界面不在前台）时不拒绝
+        -- （请求已镜像到统一审批悬浮窗），避免「用户不在聊天界面时被静默拒绝」。
+        local ui = state.ui
+        local presented = (ui == nil) or (type(ui.is_open) ~= "function") or ui.is_open()
+        if presented then
+          if ui and ui.hide then pcall(ui.hide) end
+          decide("deny")
+        else
+          arm()
+        end
+      end, tms)
+    end
+    arm()
+  end
+  return d
+end
+
+--- 同步询问（兼容入口，仅测试/无浮窗场景）。返回 `"once"|"session"|"deny"`。
+--- @param kind string
+--- @param opts table|nil { title?, detail? }
+--- @return string
+function M.ask(kind, opts)
+  opts = opts or {}
+  if M.is_session_allowed(kind) then return "session" end
+  if _interactive() then
+    return _ask_confirm(kind, opts)
+  end
+  return "deny"
+end
+
 --- 重置（测试用）
 function M.reset()
   state.session = {}
+  state.ui = nil
 end
 
 return M

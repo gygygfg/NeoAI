@@ -412,12 +412,7 @@ local function _gate(local_, host, port, ips, proto, cb)
   if nc.is_session_allowed(host, port, owner) then
     return cb(true, local_ and "allow_local" or "allow")
   end
-  pcall(function()
-    require("NeoAI.kernel.event_bus").emit(
-      require("NeoAI.kernel.events").SANDBOX_NET_CONSENT_REQUESTED,
-      { host = host, port = port, local_ = local_, proto = proto,
-        service = owner and { pid = owner.pid, comm = owner.comm, exe = owner.exe } or nil })
-  end)
+  -- 统一运行时请求广播由 `net_consent.request` 发出（事件 SANDBOX_CONSENT_REQUESTED，page="network"）。
   nc.request({ host = host, port = port, local_ = local_, proto = proto, owner = owner,
     owner_resolved = true }):then_(function(decision)
     if decision == "deny" then return cb(false, block_reason) end

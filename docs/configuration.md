@@ -480,7 +480,7 @@ sandbox = {
     enabled = true,                  -- 总开关
     dynamic = true,                  -- 动态监测（默认开）：以运行期 eBPF openat/open 观测判定实际设备访问（变量/脚本绕过无效）；观测到未允许访问即终止命令并弹窗，失败时批准后自动重跑。eBPF 不可用时回退静态文本扫描；false 强制仅静态
     action = "ask",                  -- ask（默认，弹窗询问：仅本次/本次会话允许/拒绝）| allow（直接放行并暴露设备）| deny（直接拒绝）
-    timeout_ms = 30000,              -- 弹窗无响应超时（毫秒；0=不限）；超时自动阻止（fail-closed）
+    timeout_ms = 30000,              -- 弹窗无响应超时（毫秒；0=不限）；**仅弹窗已呈现**时超时自动阻止（fail-closed）；因聊天界面不在前台而暂存待弹时不自动阻止（请求已镜像到统一审批悬浮窗）
     paths = {                        -- 需要确认的危险设备路径（支持 * 通配）。默认覆盖逃逸/内核控制设备节点
       "/dev/kvm", "/dev/net/tun", "/dev/net/tap", "/dev/vhost-net", "/dev/vhost-vsock", "/dev/vhost-vsock-*",
       "/dev/vfio/*", "/dev/fuse", "/dev/loop*", "/dev/sd*", "/dev/hd*", "/dev/vd*", "/dev/xvd*",

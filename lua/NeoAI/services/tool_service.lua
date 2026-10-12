@@ -172,6 +172,15 @@ local function _show_approval(tool_name, args, decision_cb, ctx)
   if okhub and hub.available() then
     local page = (type(ctx) == "table" and type(ctx.sandbox_unmask) == "table"
       and #ctx.sandbox_unmask > 0) and "resource" or "behavior"
+    -- 统一运行时请求广播（同一事件 SANDBOX_CONSENT_REQUESTED，按 page 区分：
+    -- 敏感隐私文件读取 → resource；危险命令/工具调用同意 → behavior）。
+    pcall(function()
+      require("NeoAI.sandbox.review.consent").emit(page, {
+        tool = tool_name,
+        masked = page == "resource" and type(ctx.sandbox_unmask) == "table"
+          and ctx.sandbox_unmask[1] or nil,
+      })
+    end)
     local tool = registry.get(tool_name)
     local detail = {}
     if tool and tool.description then detail[#detail + 1] = "描述: " .. tostring(tool.description) end

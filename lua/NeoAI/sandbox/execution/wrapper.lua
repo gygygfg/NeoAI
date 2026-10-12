@@ -29,6 +29,33 @@ local _rewrite_value, _enc_root, _is_sudo_bin, _split_shell, _cand_paths, _packa
 
 local M = {}
 
+--- 选择有效的沙箱工作目录：会话/上下文 cwd 失效（空串或目录已不存在）时回退到有效目录。
+--- nvim 的工作目录被删除时 `vim.fn.getcwd()` 返回空串，`tool_service` 会把 `ctx.cwd`/
+--- `sandbox_exec_cwd` 设为空串；若直接用它作 bwrap `--chdir` 目标，bwrap 会以
+--- `init: Can't chdir to : No such file or directory` 失败、命令无法执行。此处保证返回一个
+--- **真实存在的目录**（绝不返回空串），必要时退到工作区探测/homedir/`/`。
+--- @param ctx table|nil
+--- @return string
+local function _effective_cwd(ctx)
+  local candidates = {}
+  if type(ctx) == "table" then
+    candidates[#candidates + 1] = ctx.sandbox_exec_cwd
+    candidates[#candidates + 1] = ctx.cwd
+  end
+  candidates[#candidates + 1] = vim.fn.getcwd()
+  for _, c in ipairs(candidates) do
+    if type(c) == "string" and c ~= "" and vim.fn.isdirectory(c) == 1 then return c end
+  end
+  -- 工作区探测（按当前 buffer 的工程配置定位一个存在的目录）——cwd 失效时 buffer 目录可能仍可用。
+  local ok, ws = pcall(function()
+    return require("NeoAI.core.session.workspace_root").detect_from_context()
+  end)
+  if ok and type(ws) == "string" and ws ~= "" and vim.fn.isdirectory(ws) == 1 then return ws end
+  local home = vim.fn.expand("~")
+  if type(home) == "string" and home ~= "" and vim.fn.isdirectory(home) == 1 then return home end
+  return "/"
+end
+
 -- 后台命令保活：`run_command` 后台意图（`&`/nohup/setsid）的命令结束后**不回收**其资源域，
 -- 使后台进程跨工具调用 / 跨轮次存活（PID 命名空间不隔离，bwrap 退出也不销毁后台进程）。
 -- 保留的资源域在会话结束 / 沙箱关闭 / 测试重置时统一回收（kill + 删除）。
@@ -690,7 +717,7 @@ local function _settle_candidate(cand, attempt, ctx, cfg, spec, result, process_
     local roots = config_store.get("tools.sandbox.ephemeral_roots")
     if type(roots) ~= "table" then roots = require("NeoAI.sandbox.execution.runtime").tmpfs_roots() end
     if #roots > 0 and #(cand.files or {}) > 0 then
-      local cwd = ((ctx and (ctx.sandbox_exec_cwd or ctx.cwd)) or vim.fn.getcwd() or ""):gsub("/+$", "")
+      local cwd = _effective_cwd(ctx)
       local function under(p, r)
         return p == r or p:sub(1, #r + 1) == r .. "/"
       end
@@ -1125,7 +1152,7 @@ local function _on_observed(attempt, ctx, evt)
   if ctx._observed_read_all == nil then ctx._observed_read_all = runtime.read_all() end
   if ctx._observed_read_all then
     if ctx._observed_cwd == nil then
-      ctx._observed_cwd = ctx.sandbox_exec_cwd or ctx.cwd or vim.fn.getcwd()
+      ctx._observed_cwd = _effective_cwd(ctx)
     end
     local hit = runtime.outside_workspace(p, ctx._observed_cwd)
     if hit then
@@ -1545,7 +1572,7 @@ local function _ensure_fileop_resident(ctx, tool_name, args, spec)
   -- 已存在常驻实例（由命令建立）时直接复用；否则负缓存期内不重试启动。
   if vim.uv.hrtime() < _fileop_resident_neg_until then return false end
   pcall(function()
-    local real_cwd = ctx.sandbox_exec_cwd or ctx.cwd or vim.fn.getcwd()
+    local real_cwd = _effective_cwd(ctx)
     local proc_dir = candidate.process_dir()
     local staging = proc_dir .. "/fallback"
     fs.ensure_dir(staging)
@@ -1629,7 +1656,7 @@ local function _gate_inner(tool, args, ctx, call_original)
         local ok_ss, ss = pcall(require, "NeoAI.sandbox.observe.script_scan")
         if ok_ss and ss then
           local ok_scan, s = pcall(ss.scan, args.command, {
-            cwd = ctx.sandbox_exec_cwd or ctx.cwd or vim.fn.getcwd(),
+            cwd = _effective_cwd(ctx),
           })
           if ok_scan then scan = s end
         end
@@ -1687,6 +1714,71 @@ local function _gate_inner(tool, args, ctx, call_original)
     end
   end
 
+  -- 代理规避确认（host_local_block 生效时）：显式清除/绕过代理变量会绕过宿主本机过滤。默认
+  -- **暂停并弹窗询问**（与设备/网络同意一致的**异步**浮窗，按键经正常事件循环处理）；"deny"
+  -- 直接拒绝；false 不拦截。裸 TCP（nc/ssh/自建 socket）不在覆盖范围（已知边界）。
+  -- 放在 `control.new_attempt` 之前（与设备门禁一致）：命中时**不创建** attempt，同意后重新进入
+  -- 完整门禁（setup 锁此时已释放）。
+  if spec and spec.effect == "process" and type(args) == "table"
+    and type(args.command) == "string" and not ctx.sandbox_proxy_gate_done then
+    local net = config_store.get("tools.sandbox.network") or {}
+    local pmode = net.block_proxy_evasion
+    if pmode == false then pmode = "allow" elseif pmode == "deny" then pmode = "deny" else pmode = "ask" end
+    if pmode ~= "allow" then
+      local ok_rt, rt = pcall(require, "NeoAI.sandbox.execution.runtime")
+      if ok_rt and rt.host_local_block_enabled and rt.host_local_block_enabled() then
+        -- 复用设备门禁缓存的脚本扫描；未缓存时现算（避免重复扫描）。
+        if ctx.sandbox_device_scan == nil then
+          local scan = nil
+          local ok_ss, ss = pcall(require, "NeoAI.sandbox.observe.script_scan")
+          if ok_ss and ss then
+            local ok_scan, s = pcall(ss.scan, args.command, { cwd = _effective_cwd(ctx) })
+            if ok_scan then scan = s end
+          end
+          ctx.sandbox_device_scan = scan or false
+        end
+        local scan = ctx.sandbox_device_scan ~= false and ctx.sandbox_device_scan or nil
+        local evasion = require("NeoAI.sandbox.review.risk").network_evasion_reason(
+          (scan and scan.effective) or args.command)
+        if evasion then
+          if pmode == "deny" then
+            return async.reject({
+              kind = "sandbox",
+              message = "沙箱拒绝（代理规避未获批准）: " .. evasion,
+              reason_codes = { evasion },
+            })
+          end
+          ctx.sandbox_proxy_gate_done = true
+          -- 弹窗展示上下文：工具名、目标（若有，如 web_fetch 的 URL）、命令、触发原因。
+          local tool_display = tostring((tool and tool.name) or "run_command"):gsub("^exec_", "")
+          local cmd_display = tostring(args.command or ""):gsub("[\r\n]+", " ")
+          cmd_display = vim.fn.strcharpart(cmd_display, 0, 300)
+          local detail = {
+            "触发原因: " .. tostring(evasion),
+            "工具: " .. tool_display,
+          }
+          if type(ctx.sandbox_consent_hint) == "string" and ctx.sandbox_consent_hint ~= "" then
+            detail[#detail + 1] = "目标: " .. vim.fn.strcharpart(ctx.sandbox_consent_hint, 0, 300)
+          end
+          detail[#detail + 1] = "命令: " .. cmd_display
+          return require("NeoAI.sandbox.review.policy_consent").request("proxy_evasion", {
+            title = "代理规避确认：命令清除/绕过代理，将绕过宿主本机访问过滤。是否允许？",
+            detail = detail,
+          }):then_(function(decision)
+            if decision ~= "allow_once" and decision ~= "allow_session" then
+              return async.reject({
+                kind = "sandbox",
+                message = "沙箱拒绝（代理规避未获批准）: " .. evasion,
+                reason_codes = { evasion },
+              })
+            end
+            return M.gate(tool, args, ctx, call_original)
+          end)
+        end
+      end
+    end
+  end
+
   local attempt = control.new_attempt(tool and tool.name or "unknown", args, ctx, spec)
 
   -- git 变更命令守卫（所有带 `command` 的进程类工具，含 run_command / service_start）：
@@ -1730,7 +1822,7 @@ local function _gate_inner(tool, args, ctx, call_original)
     tool = attempt.tool_name,
     effect = spec.effect,
     args = args,
-    cwd = ctx.sandbox_exec_cwd or ctx.cwd or vim.fn.getcwd(),
+    cwd = _effective_cwd(ctx),
     mode = ctx.sandbox_mode or cfg.mode or "dry_run",
   }
   local verdict = policy.evaluate(facts)
@@ -1757,7 +1849,7 @@ local function _gate_inner(tool, args, ctx, call_original)
     local scan = (ctx.sandbox_device_scan ~= false and ctx.sandbox_device_scan) or nil
     if not scan then
       scan = require("NeoAI.sandbox.observe.script_scan").scan(args.command, {
-        cwd = ctx.sandbox_exec_cwd or ctx.cwd or vim.fn.getcwd(),
+        cwd = _effective_cwd(ctx),
       })
     end
     attempt.script_scan = scan
@@ -1785,38 +1877,6 @@ local function _gate_inner(tool, args, ctx, call_original)
         reason_codes = { deny },
         command_id = attempt.command_id,
       })
-    end
-    -- 代理规避：host_local_block 生效时，显式清除/绕过代理变量会让应用层过滤失效、直达宿主本机。
-    -- 默认（block_proxy_evasion=true）暂停并弹窗询问；"deny" 直接拒绝；false 不拦截。
-    -- 裸 TCP（nc/ssh/自建 socket）不在覆盖范围（已知边界）。
-    local net = config_store.get("tools.sandbox.network") or {}
-    local pmode = net.block_proxy_evasion
-    if pmode == false then pmode = "allow" elseif pmode == "deny" then pmode = "deny" else pmode = "ask" end
-    if pmode ~= "allow" then
-      local ok_rt, rt = pcall(require, "NeoAI.sandbox.execution.runtime")
-      if ok_rt and rt.host_local_block_enabled and rt.host_local_block_enabled() then
-        local evasion = require("NeoAI.sandbox.review.risk").network_evasion_reason(
-          (scan and scan.effective) or args.command)
-        if evasion then
-          local allowed = pmode ~= "deny"
-          if allowed then
-            local decision = require("NeoAI.sandbox.review.policy_consent").ask("proxy_evasion", {
-              title = "代理规避确认：命令清除/绕过代理，将绕过宿主本机访问过滤。是否允许？",
-            })
-            allowed = (decision == "once" or decision == "session")
-          end
-          if not allowed then
-            control.transition(attempt, "PARSED")
-            control.transition(attempt, "BLOCKED")
-            return async.reject({
-              kind = "sandbox",
-              message = "沙箱拒绝（代理规避未获批准）: " .. evasion,
-              reason_codes = { evasion },
-              command_id = attempt.command_id,
-            })
-          end
-        end
-      end
     end
   end
   control.transition(attempt, "PARSED")
@@ -1967,7 +2027,7 @@ local function _gate_inner(tool, args, ctx, call_original)
     candidate.begin(attempt, root)
     -- 工具子进程（exec）可指定进程 cwd（通常取可写根公共父目录，避免遮蔽目录把 overlay 遮蔽）；
     -- 未指定时沿用当前工作目录。
-    local real_cwd = ctx.sandbox_exec_cwd or vim.fn.getcwd()
+    local real_cwd = _effective_cwd(ctx)
     -- 会话级共享可写层：同一 agent 循环内所有命令共用（命令 N 看得到命令 N-1 的改动），
     -- agentEnd 轮换会话时随会话目录清理（改动已冻结为候选）。可写根（默认仅 cwd；
     -- /tmp、/var/tmp 属每会话私有 tmpfs，不作为 overlay lower）的写入进会话可写层。

@@ -251,6 +251,7 @@ local function _run_bash(script, opts)
     timeout_ms = opts.timeout_ms or 30000,
     signal = opts.signal,
     command = script,
+    consent_hint = opts.consent_hint,
   })
 end
 
@@ -622,7 +623,7 @@ local function _render(url, params, cfg, ctx)
   local signal = ctx and ctx.signal
   local d = async.Deferred.new()
 
-  _run_bash(script, { timeout_ms = total_timeout, signal = signal })
+  _run_bash(script, { timeout_ms = total_timeout, signal = signal, consent_hint = "web_fetch " .. tostring(url) })
     :then_(function(result)
       pcall(vim.fn.delete, opts_file)
 

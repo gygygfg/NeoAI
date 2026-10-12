@@ -78,11 +78,30 @@ function M.narrow_active()
   return base ~= nil and base.w < NARROW_MAX
 end
 
+--- 估算若干行在给定显示宽度下折行后的显示行数（按显示宽度，CJK 计 2 列）。
+--- 用于内容自适应弹窗：长文本按窗口宽度换行后，窗口高度需要容纳折行后的行数，
+--- 否则内容被截断。不做字节级切分（避免切断多字节 UTF-8）。
+--- @param lines table 行数组（字符串）
+--- @param width number 可用显示宽度（列；与窗口内容区宽度一致，不含边框）
+--- @return number
+function M.display_rows(lines, width)
+  width = math.max(1, math.floor(tonumber(width) or 1))
+  local rows = 0
+  for _, l in ipairs(lines or {}) do
+    local w = vim.fn.strdisplaywidth(tostring(l))
+    rows = rows + math.max(1, math.ceil(w / width))
+  end
+  return rows
+end
+
 --- 计算浮窗几何。
 --- @param opts table|nil {
 ---   w_ratio? number 宽度占屏幕列比例（如 0.7）
 ---   h_ratio? number 高度占屏幕行比例（如 0.6）
 ---   fit_h? number   内容所需高度：与实际高度取较小值（内容自适应；仅压不撑）
+---   fit_lines? table 内容行数组：按窗口宽度折行后计算所需高度（自动适配换行后的内容；
+---                    与 fit_h 二选一，优先 fit_lines）
+---   fit_pad? number  fit_lines 额外高度（边框/留白，默认 2）
 ---   min_w? number   宽度下限（单元格）
 ---   max_w? number   宽度上限（单元格）
 ---   min_h? number   高度下限（单元格）
@@ -133,9 +152,18 @@ function M.compute(opts)
     width = math.max(1, math.min(width, avail_w))
   end
 
-  -- 高度：比例 → fit_h（内容自适应，仅压不撑）→ 屏幕可用高 → 全局最小 → max_h → min_h → 夹紧
-  local height = math.floor(lines * (tonumber(opts.h_ratio) or 0.6))
-  if type(opts.fit_h) == "number" then height = math.min(height, opts.fit_h) end
+  -- 高度：fit_lines 内容驱动（折行后所需高度，受屏幕/max_h 夹紧）＞ fit_h（仅压不撑）＞ 比例。
+  local ratio_h = math.floor(lines * (tonumber(opts.h_ratio) or 0.6))
+  local height
+  if type(opts.fit_lines) == "table" then
+    -- 按窗口内容区宽度（去边框左右各 1 列）估算折行后的显示行数，再加固高度（默认 2：上下边框）。
+    local usable_w = math.max(10, width - 2)
+    height = M.display_rows(opts.fit_lines, usable_w) + (tonumber(opts.fit_pad) or 2)
+  elseif type(opts.fit_h) == "number" then
+    height = math.min(ratio_h, opts.fit_h)
+  else
+    height = ratio_h
+  end
   height = math.min(height, avail_h)
   if type(opts.max_h) == "number" then height = math.min(height, opts.max_h) end
   local min_h = type(opts.min_h) == "number" and opts.min_h or def_min_h

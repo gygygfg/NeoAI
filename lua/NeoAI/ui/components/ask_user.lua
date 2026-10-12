@@ -6,7 +6,8 @@
 ---   - 切页：`h/l` 或 `←/→`（并保留 `<Tab>`/`<S-Tab>`、`]`/`[`）
 ---   - 题目正文 + 选项：单选显示 `[n]`，多选显示 `[x]/[ ]` 复选框（`multi_select=true`）；
 ---     `k/j`/`↑/↓` 移动选项焦点（焦点行背景高亮），`1-9` 或 `<CR>` 选择/切换，已选项高亮
----   - **单题单选选中即提交**（不二次确认、无确认标签）；多选/多题在最右确认标签二次确认
+---   - **单题单选选中即提交**（不二次确认、无确认标签）；**多题单选作答后自动跳到下一 tab**
+---     （最后一题跳到最右确认标签；多选不自动跳转，可继续勾选）；多选/多题在最右确认标签二次确认
 ---     （列出 `Q → A`，`<CR>`/`y` 提交、`h`/`←` 返回编辑、`Esc` 取消）
 ---   - `i` 进入自由输入（vim.ui.input）覆盖本题答案
 ---   - `require_confirm=false` 时不展示确认标签，全部作答后直接提交
@@ -38,13 +39,15 @@ local HL_NS = vim.api.nvim_create_namespace("neoai_ask_user_hi")
 
 --- 定义高亮组（default=true，不覆盖用户自定义；兼容无外网/无主题环境）
 --- 对齐 opencode：顶部 tab 醒目高亮（当前 tab 反显加粗）、选项行焦点高亮、已选项高亮。
+--- Tab 高亮采用 **Mason 风格**（存在 mason.nvim 高亮组时链接复用其块状配色）。
 local function _setup_hl()
   vim.api.nvim_set_hl(0, "NeoAIAskUserOptionLabel", { default = true, bold = true })
   vim.api.nvim_set_hl(0, "NeoAIAskUserOptionDesc", { default = true, fg = "#8a8a8a" })
-  vim.api.nvim_set_hl(0, "NeoAIAskUserTabActive", { default = true, bold = true, reverse = true })
-  vim.api.nvim_set_hl(0, "NeoAIAskUserTabAnswered", { default = true, bold = true, fg = "#9ece6a" })
-  vim.api.nvim_set_hl(0, "NeoAIAskUserTabPending", { default = true, fg = "#8a8a8a" })
-  vim.api.nvim_set_hl(0, "NeoAIAskUserTabConfirm", { default = true, bold = true, fg = "#7aa2f7" })
+  local mason_hl = require("NeoAI.ui.mason_hl")
+  mason_hl.def("NeoAIAskUserTabActive", "MasonHighlightBlockBold", { default = true, bold = true, reverse = true })
+  mason_hl.def("NeoAIAskUserTabAnswered", "MasonHighlightSecondary", { default = true, bold = true, fg = "#9ece6a" })
+  mason_hl.def("NeoAIAskUserTabPending", "MasonHighlight", { default = true, fg = "#8a8a8a" })
+  mason_hl.def("NeoAIAskUserTabConfirm", "MasonHighlightBlock", { default = true, bold = true, fg = "#7aa2f7" })
   vim.api.nvim_set_hl(0, "NeoAIAskUserOptionFocus", { default = true, bg = "#3b4252" })
   vim.api.nvim_set_hl(0, "NeoAIAskUserOptionPicked", { default = true, bold = true, fg = "#9ece6a" })
   vim.api.nvim_set_hl(0, "NeoAIAskUserUnanswered", { default = true, fg = "#e0af68" })
@@ -178,10 +181,30 @@ local function _cancel(reason)
   if cb then cb(reason or "用户取消") end
 end
 
---- 作答后推进：单题单选选中即提交；无确认标签且全部作答直接提交；否则重渲染。
+--- 多题单选：作答后自动前进到下一 tab（含最右确认标签）。多选/单题不适用。
+--- 前进成功返回 true（已重渲染）；已在最后一题（无确认标签）返回 false，交调用方判定提交。
+--- @param idx number 刚作答的题号
+--- @return boolean
+local function _advance_single(idx)
+  local q = state.questions[idx]
+  if not q or q.multi_select then return false end
+  local total = _tab_total()
+  if idx < total then
+    state.active = idx + 1
+    _render()
+    return true
+  end
+  return false
+end
+
+--- 作答后推进：单题单选选中即提交；**多题单选作答后自动跳到下一 tab**；
+--- 无确认标签且全部作答直接提交；否则重渲染（多选留在本题继续勾选）。
 local function _after_answer()
   if _form_single() then
     _do_submit()
+    return
+  end
+  if #state.questions > 1 and _advance_single(state.active) then
     return
   end
   if not _has_confirm() and _all_answered() then
@@ -481,8 +504,10 @@ _render = function()
   pcall(vim.api.nvim_win_set_cursor, state.win_id, { 1, 0 })
   pcall(vim.cmd, "stopinsert")
   _set_keymaps()
-  -- 动态高度：随内容（题目 + 选项 + 汇总行）自适应，避免截断
-  local geom = geometry.compute({ w_ratio = 0.66, h_ratio = 0.72, fit_h = #lines + 4 })
+  -- 动态高度：随内容（题目 + 选项 + 汇总行）自适应，按显示宽度折行后适配，避免截断
+  local geom_opts = { w_ratio = 0.66, h_ratio = 0.72, fit_lines = lines, fit_pad = 4 }
+  local geom = geometry.compute(geom_opts)
+  geometry.track(state.win_id, geom_opts)
   pcall(vim.api.nvim_win_set_config, state.win_id, {
     relative = "editor",
     width = geom.width,

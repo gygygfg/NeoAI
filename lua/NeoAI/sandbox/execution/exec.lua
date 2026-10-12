@@ -148,6 +148,8 @@ function M.run(argv, opts)
   end
   local ictx = {}
   ictx.sandbox_exec_cwd = opts.cwd or _common_parent(roots) or vim.fn.getcwd()
+  -- 供沙箱门禁弹窗展示的上下文（工具/目标，如 web_fetch 的 URL）；可选。
+  ictx.sandbox_consent_hint = opts.consent_hint
   if not sandbox then
     if cfg.enabled ~= false and cfg.fail_closed ~= false then
       return async.reject({ kind = "sandbox", message = "沙箱服务不可用且 fail_closed=true，拒绝执行工具子进程" })

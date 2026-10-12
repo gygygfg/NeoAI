@@ -225,7 +225,7 @@ end)
 | `test_commands_plugin` | 命令插件：NAMES 唯一、注册/清理/幂等、缺服务静默降级 |
 | `test_keymaps_plugin` | 键位插件与 `ui.keymap`：全局/buffer 注册与卸载、双模式展开、action 分派、`show_keymaps` 浮窗 |
 | `test_lazy_plugin` | 懒加载占位：占位命令注册/清理契约、已启动不误删、阶段 1 与全量启动分派 |
-| `test_ui_components` | UI 组件：net_consent/device_consent 弹窗与决策回调、sub_agent_dock 事件渲染、terminal_window headless no-op、`display_modes.chat` 注册/load/unload/render |
+| `test_ui_components` | UI 组件：net_consent/device_consent/policy_consent 弹窗与决策回调、sub_agent_dock 事件渲染、terminal_window headless no-op、`display_modes.chat` 注册/load/unload/render |
 | `test_sandbox_shims` | `fault`/`bench` 兼容 shim 转发到 `diag` |
 | `test_parallel_runner` | 并行运行器：LPT 分片均衡/可复现/空档、SUITE/LOADFAIL 解析、聚合 passed/failed 与耗时缓存、过滤套件、分片异常、发现失败（注入假 spawner，不启动真实子进程） |
 

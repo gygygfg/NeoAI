@@ -82,7 +82,7 @@ local function _present(ctx, decide)
   vim.bo[state.buf].filetype = "neoai_device_consent"
   local lines = _text(ctx)
   vim.api.nvim_buf_set_lines(state.buf, 0, -1, false, lines)
-  local geom_opts = { w_ratio = 0.60, h_ratio = 0.40, fit_h = #lines + 2 }
+  local geom_opts = { w_ratio = 0.60, h_ratio = 0.40, fit_lines = lines, fit_pad = 2 }
   local geom = geometry.compute(geom_opts)
   local ok, wid = pcall(vim.api.nvim_open_win, state.buf, true, {
     relative = "editor",
@@ -108,19 +108,25 @@ local function _present(ctx, decide)
   _set_keymaps()
 end
 
---- 展示同意弹窗。**应用级焦点门控**（`focus.gate_app`）：只要 nvim 有 OS 焦点即**立即弹出**，
---- 不因当前窗口不是 NeoAI 界面而延迟；仅 nvim 失焦时暂存，回焦再弹。同意超时/经审批中心
---- 决策会调用 `hide()` 取消暂存。
+--- 展示同意弹窗。**聊天界面焦点门控**（`focus.gate`）：当前窗口是 NeoAI 界面时立即弹出；
+--- 否则**暂存**，待切回 NeoAI 界面再弹。审批分流中心始终**直接新建条目**，故暂存期间可在多级
+--- 审批悬浮窗决策。同意超时/经审批中心决策会调用 `hide()` 取消暂存。
 --- @param ctx table { devices: string[] }
 --- @param decide function(decision)
 function M.show(ctx, decide)
-  require("NeoAI.ui.focus").gate_app("device_consent", function() _present(ctx, decide) end)
+  require("NeoAI.ui.focus").gate("device_consent", function() _present(ctx, decide) end)
 end
 
 --- 隐藏弹窗
 function M.hide()
   require("NeoAI.ui.focus").cancel_gate("device_consent")
   _close()
+end
+
+--- 弹窗当前是否已呈现（供同意模块区分「已弹出」与「暂存待弹」：仅前者到时自动拒绝）
+--- @return boolean
+function M.is_open()
+  return state.win_id ~= nil and vim.api.nvim_win_is_valid(state.win_id)
 end
 
 --- 注册到 sandbox.device_consent。
@@ -130,7 +136,7 @@ function M.init()
   if state.unwait then state.unwait() end
   state.unwait = services.wait("services.sandbox", function(sandbox)
     if sandbox and sandbox.set_device_consent_ui then
-      sandbox.set_device_consent_ui({ show = M.show, hide = M.hide })
+      sandbox.set_device_consent_ui({ show = M.show, hide = M.hide, is_open = M.is_open })
     end
   end)
 end

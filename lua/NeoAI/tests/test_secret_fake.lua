@@ -326,6 +326,31 @@ tests.suite("secret_fake", function(_, it)
     t.true_(vim.tbl_contains(eg._extract_hosts([[curl mycorp.internal:8080/x]]), "mycorp.internal"), "私有域带端口")
   end)
 
+  it("密钥告警：广播到审批分流中心（统一审批悬浮窗出现条目并可决策）", function(t)
+    local alert = require("NeoAI.sandbox.secret.secret_alert")
+    local hub = require("NeoAI.sandbox.review.approval_hub")
+    alert.reset()
+    hub.reset()
+    local orig_uis = vim.api.nvim_list_uis
+    ---@diagnostic disable-next-line: duplicate-set-field
+    vim.api.nvim_list_uis = function() return { {} } end
+    hub.set_ui({ refresh = function() end })
+    -- 有专用弹窗 UI（no-op，不自行决策），验证镜像条目可经统一窗口决策
+    alert.set_ui({ show = function() end })
+    local got
+    alert.request({ kind = "egress", dest = "evil.com", tool = "run_command" })
+      :then_(function(v) got = v end)
+    local items = hub.list("behavior")
+    t.true_(#items >= 1, "应在「工具行为」页出现条目")
+    local id = items[#items].id
+    t.true_(hub.resolve(id, "allow_once"), "中心应能决策该条目")
+    t.true_(vim.wait(2000, function() return got ~= nil end), "决策应 resolve")
+    t.eq("allow_once", got, "中心 allow_once 应映射为仅本次允许")
+    hub.reset()
+    vim.api.nvim_list_uis = orig_uis
+    alert.reset()
+  end)
+
   it("密钥告警：无专用 UI 时回退内建确认，仍暂停并询问", function(t)
     local alert = require("NeoAI.sandbox.secret.secret_alert")
     alert.reset()

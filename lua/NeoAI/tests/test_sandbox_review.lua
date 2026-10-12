@@ -1607,6 +1607,54 @@ tests.suite("sandbox_review", function(_, it)
     services.provide("services.sandbox", saved)
   end)
 
+  it("网络请求页三段式：本会话已允许可 d 撤销 + 历史只读", function(t)
+    local services = require("NeoAI.kernel.services")
+    local sr = require("NeoAI.ui.components.sandbox_review")
+    sr.reset()
+    local saved = services.use("services.sandbox")
+    local revoked
+    _provide_sandbox({
+      list_reviews = function() return {} end,
+      list_traces = function() return {} end,
+      list_saved = function() return {} end,
+      apply = function() return { ok = true } end,
+      reject = function() end,
+      net_consent_allowances = function()
+        return { { key = "127.0.0.1:5432@/usr/bin/postgres", host = "127.0.0.1", port = 5432,
+          base = "127.0.0.1:5432", svc = "/usr/bin/postgres", comm = "postgres", pid = 7 } }
+      end,
+      net_consent_history = function()
+        return { { host = "example.com", port = 443, decision = "allow_once", at_ms = 1700000000000 },
+          { host = "bad.example", port = 80, decision = "deny" } }
+      end,
+      net_consent_revoke = function(key) revoked = key; return true end,
+    })
+    sr.open()
+    sr.open_page("network")
+    local buf = sr.get_buf()
+    local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+    local text = table.concat(lines, "\n")
+    t.matches("本会话已允许", text, "应展示本会话已允许段")
+    t.matches("127.0.0.1:5432", text, "应展示允许条目")
+    t.matches("postgres", text, "应展示服务身份")
+    t.matches("历史", text, "应展示历史段")
+    t.matches("已允许%(单次%)", text, "历史应展示单次允许")
+    t.matches("已拒绝", text, "历史应展示拒绝")
+    -- 定位允许行并 d 撤销
+    local allow_line
+    for i, l in ipairs(lines) do
+      if l:find("127.0.0.1:5432", 1, true) then allow_line = i end
+    end
+    t.not_nil(allow_line, "应能定位允许行")
+    vim.api.nvim_win_set_cursor(0, { allow_line, 0 })
+    for _, m in ipairs(vim.api.nvim_buf_get_keymap(buf, "n")) do
+      if m.lhs == "d" then m.callback() end
+    end
+    t.eq("127.0.0.1:5432@/usr/bin/postgres", revoked, "d 应撤销本会话允许")
+    sr.close()
+    services.provide("services.sandbox", saved)
+  end)
+
   it("工具行为页并入主机操作提案", function(t)
     local services = require("NeoAI.kernel.services")
     local sr = require("NeoAI.ui.components.sandbox_review")
