@@ -1996,6 +1996,75 @@ tests.suite("chat_ui", function(_, it)
     au.reset()
   end)
 
+  it("ask_user 多选题：选项自动标号，自由输入追加不覆盖已选项", function(t)
+    local au = require("NeoAI.ui.components.ask_user")
+    au.reset()
+    local got = {}
+    au.show({
+      batch_id = "multi_number",
+      questions = {
+        { question = "Q1", options = { "X", "Y", "Z" }, multi_select = true },
+      },
+      active = 1,
+      mode = "tab",
+      require_confirm = true,
+      on_submit = function(a) got.answers = a end,
+      on_cancel = function() end,
+    })
+    local buf = au.get_buf()
+    t.not_nil(buf, "应创建提问悬浮窗")
+    local lines = table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n")
+    t.true_(lines:find("[1] [ ] X", 1, true) ~= nil, "多选选项应带序号")
+    t.true_(lines:find("[2] [ ] Y", 1, true) ~= nil, "多选选项应带序号")
+
+    -- 勾选 X、Z
+    t.true_(invoke_map(buf, "n", "1"))
+    invoke_map(buf, "n", "3")
+    t.eq("X, Z", au.get_state().answers[1], "应记录勾选项")
+
+    -- 自由输入：应追加，不覆盖已勾选项
+    local orig_ui = rawget(vim, "ui")
+    vim.ui = { input = function(_, cb) cb("自定义") end }
+    t.true_(invoke_map(buf, "n", "i"), "应绑定自由输入键")
+    vim.ui = orig_ui or { input = function(_, cb) if cb then cb(nil) end end }
+    t.eq("X, Z, 自定义", au.get_state().answers[1], "自由输入应追加而非覆盖")
+    local lines2 = table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n")
+    t.true_(lines2:find("自定义", 1, true) ~= nil, "自由输入应展示在弹窗内")
+
+    -- 勾选态变化后自由输入仍保留
+    invoke_map(buf, "n", "2") -- 勾选 Y
+    t.eq("X, Y, Z, 自定义", au.get_state().answers[1], "追加后勾选不丢失自由输入")
+    au.reset()
+  end)
+
+  it("ask_user 单选题：自由输入覆盖唯一选项", function(t)
+    local au = require("NeoAI.ui.components.ask_user")
+    au.reset()
+    local got = {}
+    au.show({
+      batch_id = "single_free",
+      questions = {
+        { question = "Q1", options = { "A", "B" }, multi_select = false },
+        { question = "Q2", options = { "X", "Y" }, multi_select = false },
+      },
+      active = 1,
+      mode = "tab",
+      require_confirm = true,
+      on_submit = function(a) got.answers = a end,
+      on_cancel = function() end,
+    })
+    local buf = au.get_buf()
+    invoke_map(buf, "n", "1") -- 选 Q1=A（多题单选：自动跳到 Q2）
+    t.eq("A", au.get_state().answers[1])
+    invoke_map(buf, "n", "h") -- 回到 Q1
+    local orig_ui = rawget(vim, "ui")
+    vim.ui = { input = function(_, cb) cb("手写") end }
+    invoke_map(buf, "n", "i")
+    vim.ui = orig_ui or { input = function(_, cb) if cb then cb(nil) end end }
+    t.eq("手写", au.get_state().answers[1], "单选自由输入应覆盖选项")
+    au.reset()
+  end)
+
   it("每个工具完成即各自更新状态（并发工具不互相等待）", function(t)
     local chat_view = require("NeoAI.ui.window.chat_view")
     local chat_service = require("NeoAI.services.chat_service")
@@ -3100,6 +3169,65 @@ tests.suite("chat_ui", function(_, it)
     t.true_(chat_view.has_window(), "聊天窗口应仍然存在")
 
     chat_view.reset()
+    chat_service.reset()
+  end)
+
+  it("主聊天窗口内 :terminal 改在新标签页打开，聊天与输入框不被接管（回归 N1 主窗口泛化）", function(t)
+    local chat_view = require("NeoAI.ui.window.chat_view")
+    local chat_service = require("NeoAI.services.chat_service")
+    local input_box = require("NeoAI.ui.components.input_box")
+    chat_view.reset()
+    chat_service.reset()
+
+    local opened = chat_view.open()
+    local iwin = input_box.get_win()
+    t.true_(iwin ~= nil and vim.api.nvim_win_is_valid(iwin), "打开后应创建输入窗口")
+
+    vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<Esc>", true, false, true), "x", false)
+    vim.wait(50, function() return false end)
+    vim.api.nvim_set_current_win(opened.win_id)
+    vim.cmd("stopinsert")
+    vim.cmd("messages clear")
+
+    local tabs_before = vim.fn.tabpagenr("$")
+    vim.api.nvim_feedkeys(
+      vim.api.nvim_replace_termcodes(":terminal<CR>", true, false, true), "x", false)
+    vim.wait(800, function() return false end)
+
+    -- 1) 不抛 E1513
+    local msgs = vim.api.nvim_exec2("messages", { output = true }).output or ""
+    t.true_(msgs:find("1513") == nil, "主窗口内 :terminal 不应报 E1513，实际消息: " .. msgs)
+    -- 2) 终端在新标签页打开，而非接管聊天主窗口（旧行为：:terminal 复用主窗口 buffer，
+    --    随后 :q 关闭主窗口 → 聊天界面与输入框一并消失）
+    t.eq(tabs_before + 1, vim.fn.tabpagenr("$"), "应在新标签页打开终端")
+    t.eq(opened.buf, vim.api.nvim_win_get_buf(opened.win_id), "聊天主窗口应仍显示聊天 buffer")
+    t.true_(vim.api.nvim_win_is_valid(iwin), "输入窗口应仍在")
+
+    -- 3) 关闭终端标签页后聊天与输入框仍完好
+    pcall(vim.cmd, "tabclose!")
+    vim.wait(300, function() return false end)
+    t.true_(chat_view.has_window(), "关闭终端后聊天窗口应仍存在")
+    t.eq(opened.buf, vim.api.nvim_win_get_buf(opened.win_id), "聊天主窗口应仍显示聊天 buffer")
+
+    chat_view.reset()
+    chat_service.reset()
+  end)
+
+  it("主聊天窗口被意外关闭（非 M.close）时清理本实例，不留孤儿（回归卡顿）", function(t)
+    local chat_view = require("NeoAI.ui.window.chat_view")
+    local chat_service = require("NeoAI.services.chat_service")
+    chat_view.reset()
+    chat_service.reset()
+
+    local opened = chat_view.open()
+    t.true_(chat_view.has_window())
+
+    -- 模拟 NeoAI 以外路径关闭主窗口（如终端/帮助接管后 :q）：直接关窗，不经过 M.close
+    local ok = pcall(vim.api.nvim_win_close, opened.win_id, true)
+    t.true_(ok, "关窗不应报错")
+    t.true_(vim.wait(300, function() return not chat_view.has_window() end),
+      "意外关闭主窗口后应清理本实例（避免实例/焦点自动命令空转）")
+
     chat_service.reset()
   end)
 

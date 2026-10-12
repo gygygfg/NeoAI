@@ -32,6 +32,10 @@ The chat window = **main message area (top)** + **input box (bottom, split, heig
   via `CmdlineLeave`: the original command is replayed as-is and only falls back to a **new tab** when it fails with
   E1513. So whether it is `:e <file>` or `:terminal`/`:help` etc., it neither raises `E1513` nor turns the input box
   into that buffer (avoiding input landing in the user's file / a wrong `:wq`).
+- `:terminal`/`:help` in the main message area: these **take over the current window** and may later close the whole
+  chat window (including the input box) along with their own `:q`; they are redirected to open in a **new tab**.
+  Ordinary buffer switches such as `:e`/`:bnext` still act on the main window, collapsing/restoring the input box via
+  focus tracking. If the main window is closed by a non-NeoAI path, the chat instance is cleaned up to avoid lag.
 
 ## 3. Basic Interaction
 
@@ -108,8 +112,11 @@ Expand/collapse: `zM` (collapse all) / `zo` (expand) / `zR` (expand all).
 ## 7. Asking the User (ask_user)
 
 During generation the AI can pause and ask the user a question via `ask_user`, waiting for the answer. The question
-popup (`ui/components/ask_user`) supports quick option selection; the answer is passed back to the AI as a tool
-result. When no UI is registered, it falls back to `vim.ui.input`.
+popup (`ui/components/ask_user`) supports quick option selection (single-select shows `[n]`, multi-select shows
+`[n] [x]/[ ]`, with the index mapping to the `1-9` shortcuts); for multi-select the text typed via `i` (free input)
+is appended as an extra item and combined with the checked options (it does not overwrite them), whereas for
+single-select it replaces the sole option. The answer is passed back to the AI as a tool result. When no UI is
+registered, it falls back to `vim.ui.input`.
 
 ## 8. Related Documentation
 

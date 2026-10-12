@@ -315,6 +315,16 @@ Cmdline events (plugins calling `nvim_win_set_buf` directly, `<Cmd>`, etc.) are 
 > windows without touching this window's buffer, so `winfixbuf` lets them through and replaying them as-is succeeds
 > (no spurious tab).
 
+The main chat window has an extra targeted protection: commands like `:terminal`/`:help` **take over the current
+window and may be closed together with it via `:q`**. If run directly in the main chat window, they reuse its buffer
+(the chat buffer becomes hidden), and closing them then takes the whole chat interface (including the input box) away;
+the instance becomes an orphan whose focus autocmds keep reacting to global events, showing up as "very laggy and the
+input box no longer pops up". So `_on_input_cmdline_leave` intercepts only these "window-hijacking" commands for the
+main window, aborting them and opening them in a **new tab page** (`tabnew`) instead; ordinary buffer switches such as
+`:e`/`:bnext` still act on the main window (collapsing/restoring the input box via `_on_buf_enter`). Additionally, when
+the main window is closed by a non-NeoAI path (`:q`/`:close` etc.), `WinClosed` cleans up the instance (see §4.7) so
+that a vanished window does not leave the instance and its focus autocmds spinning.
+
 Scrolling in the main message area uses two paths:
 
 - **`j` / `k`**: go through `_scroll(delta)`, moving the cursor by line (clamped to `[1, line count]`).
@@ -342,8 +352,11 @@ that instance (see §4.0) — avoiding a view that shows chat content with no in
 is missing/invalid it is recreated, not only when `state.collapsed` is true. So even if the user closes the input window
 with `:q`/`<C-w>c` (which `winfixbuf` does not block, and `collapsed` is still false at that point), the input box is
 automatically restored when returning to the chat rather than staying gone forever. `WinClosed` promptly clears the
-stale handle when the input window is closed, and a re-entrancy guard `_input_creating` prevents the nested `WinEnter`
-fired synchronously by `:split` from creating a second input box.
+stale handle when the input window is closed; when the main chat window is closed by a non-NeoAI path (not `M.close`,
+e.g. `:q`/`:close` after a terminal/help takeover) it also cleans up the instance, so a vanished window does not leave
+the instance and its focus autocmds reacting to global events (which shows up as lag and an input box that cannot be
+restored). A re-entrancy guard `_input_creating` prevents the nested `WinEnter` fired synchronously by `:split` from
+creating a second input box.
 
 ### 4.8 LSP Isolation for UI Buffers (ui/lsp_guard)
 

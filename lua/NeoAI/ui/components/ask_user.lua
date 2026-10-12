@@ -4,12 +4,14 @@
 ---   - 顶部 Tab 栏：`[n]✓/○` 标记该题是否已答，**当前标签反显加粗**、已答绿色、未答暗灰，
 ---     多选/多题时最右侧追加**「确认」标签**（多选二次确认集中于此）
 ---   - 切页：`h/l` 或 `←/→`（并保留 `<Tab>`/`<S-Tab>`、`]`/`[`）
----   - 题目正文 + 选项：单选显示 `[n]`，多选显示 `[x]/[ ]` 复选框（`multi_select=true`）；
+---   - 题目正文 + 选项：单选显示 `[n]`，多选显示 `[n] [x]/[ ]`（复选框，`multi_select=true`，
+---     序号与 `[1-9]` 快捷键对应）；
 ---     `k/j`/`↑/↓` 移动选项焦点（焦点行背景高亮），`1-9` 或 `<CR>` 选择/切换，已选项高亮
 ---   - **单题单选选中即提交**（不二次确认、无确认标签）；**多题单选作答后自动跳到下一 tab**
 ---     （最后一题跳到最右确认标签；多选不自动跳转，可继续勾选）；多选/多题在最右确认标签二次确认
 ---     （列出 `Q → A`，`<CR>`/`y` 提交、`h`/`←` 返回编辑、`Esc` 取消）
----   - `i` 进入自由输入（vim.ui.input）覆盖本题答案
+---   - `i` 进入自由输入（vim.ui.input）：**多选时作为附加项与已勾选项合并**（不覆盖已选项），
+---     单选时覆盖唯一选项；当前自由输入会在选项下方展示
 ---   - `require_confirm=false` 时不展示确认标签，全部作答后直接提交
 --- 焦点门控（focus.gate）：焦点不在 NeoAI 界面时暂存，切回再弹。
 
@@ -127,21 +129,29 @@ local function _tab_total()
   return #state.questions + (_has_confirm() and 1 or 0)
 end
 
---- 第 i 题最终答案（nil = 未作答）；自由输入优先于选项勾选
+--- 第 i 题最终答案（nil = 未作答）。
+--- 多选：选项勾选与自由输入**合并**（自由输入追加为末项，不覆盖已勾选项）；
+--- 单选：自由输入覆盖唯一的选项勾选。
 --- @param i number
 --- @return string|nil
 local function _answer_of(i)
-  local free = state.free[i]
-  if type(free) == "string" and free ~= "" then return free end
-  local picks = state.picks[i]
   local q = state.questions[i]
-  if not picks or not q or not q.options then return nil end
+  local picks = state.picks[i]
   local labels = {}
-  for oi = 1, #q.options do
-    if picks[oi] then labels[#labels + 1] = q.options[oi].label end
+  if q and q.options and picks then
+    for oi = 1, #q.options do
+      if picks[oi] then labels[#labels + 1] = q.options[oi].label end
+    end
   end
+  local free = state.free[i]
+  local has_free = type(free) == "string" and free ~= ""
+  if q and q.multi_select then
+    if has_free then labels[#labels + 1] = free end
+    if #labels == 0 then return nil end
+    return table.concat(labels, ", ")
+  end
+  if has_free then return free end
   if #labels == 0 then return nil end
-  if q.multi_select then return table.concat(labels, ", ") end
   return labels[1]
 end
 
@@ -227,12 +237,14 @@ local function _pick(oi)
     picks[oi] = (not picks[oi]) or nil
   else
     state.picks[idx] = { [oi] = true }
+    state.free[idx] = nil -- 单选：勾选覆盖自由输入
   end
-  state.free[idx] = nil -- 勾选覆盖自由输入
   _after_answer()
 end
 
---- 自由输入覆盖本题答案
+--- 自由输入覆盖/追加本题答案。
+--- 多选：自由文本作为附加项与已勾选项合并（不清空已勾选）；
+--- 单选：自由输入覆盖唯一的选项勾选。
 local function _free_input()
   local idx = state.active
   local q = state.questions[idx]
@@ -240,6 +252,7 @@ local function _free_input()
   vim.ui.input({ prompt = (q.question or "") .. " " }, function(ans)
     if ans == nil then return end
     state.free[idx] = (ans ~= "" and ans or nil)
+    if not q.multi_select then state.picks[idx] = {} end
     _after_answer()
   end)
 end
@@ -411,7 +424,8 @@ local function _build_lines()
         local picked = state.picks[state.active] and state.picks[state.active][oi]
         local box
         if q.multi_select then
-          box = picked and "[x]" or "[ ]"
+          -- 多选：保留复选框，同时标注序号（与 [1-9] 快捷键对应）
+          box = string.format("[%d] %s", oi, picked and "[x]" or "[ ]")
         else
           box = string.format("[%d]", oi)
         end
@@ -428,6 +442,14 @@ local function _build_lines()
           hl[#hl + 1] = { line = dl, col = 8, end_col = 8 + #opt.description, group = "NeoAIAskUserOptionDesc" }
         end
       end
+    end
+    -- 自由输入：展示当前覆盖/追加的文本，便于用户确认它是如何参与答案的
+    local free = state.free[state.active]
+    if type(free) == "string" and free ~= "" then
+      push("")
+      local prefix = "  ✎ 自由输入: "
+      local fl = push(prefix .. free)
+      hl[#hl + 1] = { line = fl, col = #prefix, end_col = #prefix + #free, group = "NeoAIAskUserOptionPicked" }
     end
   end
 

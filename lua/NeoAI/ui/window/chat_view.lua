@@ -107,6 +107,7 @@ local function _make_instance()
   resize_augroup = nil, -- 窗口大小变化时重排表格自动命令组（VimResized）
   last_table_width = nil, -- 上次渲染表格所用宽度（resize 后宽度变化才重排）
   folds_dirty = false, -- 插入模式期间写入过内容、折叠尚未补算（详见 _recompute_folds）
+  closing = false, -- 是否正由 M.close 主动关闭（WinClosed 据此区分主动关闭与意外关闭）
 }
 
 -- ========== 流式自动浮窗状态 ==========
@@ -1307,12 +1308,27 @@ local function _on_win_enter()
   end
 end
 
+--- 会「接管」当前窗口、且随后可能随其关闭而把整个聊天窗口一并带走的命令（:terminal/:help）。
+--- 在主聊天窗口输入这类命令时改在新标签页打开，避免聊天界面（含输入框）被接管后消失。
+--- @param line string 冒号命令行（不含前导 `:`）
+--- @return boolean
+local function _is_window_hijack_cmd(line)
+  local cmd = line:match("^%s*%d*%s*(%a+)")
+  if not cmd then return false end
+  cmd = cmd:lower()
+  return cmd == "terminal" or cmd == "term" or cmd == "ter"
+    or cmd == "help" or cmd == "h" or cmd == "hel"
+end
+
 --- 输入框窗口内的任何命令都可能复用输入窗口的 nofile 暂存 buffer（buftype 变空、内容被文件名替换），
 --- 既而输入落进用户文件 / :wq 误保存；除了 :e/:bnext，还有 :terminal / :help / 各类插件命令等，
 --- 无法穷举。input_box 的 'winfixbuf' 会在低层阻止这种切换，但会向用户抛 E1513。
 --- 因此这里不做命令白名单，而是**通用拦截所有 `:` 命令行**：中止原命令 → 在当前窗口原样重放；
 --- 仅当重放因 winfixbuf 报 E1513 时，才改用**新标签页**执行（:terminal/:help 这类会接管当前窗口的
 --- 命令也能正确在新标签页打开）。普通输入（回车发送）、:set/:w/:q 等一概不受影响。
+--- 主聊天窗口同理：:terminal/:help 会接管主窗口，其关闭会连带把聊天窗口关掉（输入框消失），
+--- 故只对这类「接管命令」在新标签页打开；:e/:bnext 等缓冲区切换仍作用于主窗口（由 _on_buf_enter
+--- 收起/恢复输入框），不受影响。
 --- 关键：Lua 回调里 ev.abort / vim.v.event.abort 均无效（实测命令仍执行），
 --- 必须用 vim.cmd("let v:event.abort = v:true") 才能真正中止。
 --- 注：新标签页兜底只在确实撞上 E1513（winfixbuf）时发生；:sp/:vsp/:tabnew 等新开窗口的命令
@@ -1321,11 +1337,29 @@ local function _on_input_cmdline_leave(_)
   -- 参数为 CmdlineLeave 事件对象，本实现不使用，故以 `_` 占位。
   if not M.has_window() then return end
   if vim.fn.getcmdtype() ~= ":" then return end
-  if not state.input_win_id or not vim.api.nvim_win_is_valid(state.input_win_id) then return end
-  -- CmdlineLeave 在 cmdwin 等场景也会触发，只处理「当前窗口恰为输入窗口」的情况。
-  if vim.api.nvim_get_current_win() ~= state.input_win_id then return end
+  local cur = vim.api.nvim_get_current_win()
   local line = vim.fn.getcmdline()
   if not line or line:match("^%s*$") then return end
+
+  -- 主聊天窗口：仅拦截会接管窗口的命令（:terminal/:help），改在新标签页打开。
+  if cur == state.win_id and state.buf and vim.api.nvim_win_get_buf(cur) == state.buf then
+    if not _is_window_hijack_cmd(line) then return end
+    pcall(vim.cmd, "let v:event.abort = v:true")
+    vim.schedule(function()
+      if not M.has_window() then return end
+      pcall(vim.cmd, "tabnew")
+      local ok2, err2 = pcall(vim.cmd, line)
+      if not ok2 then
+        local msg = tostring(err2)
+        vim.notify(msg:match("E%d+:[^\n]*") or msg, vim.log.levels.ERROR)
+      end
+    end)
+    return
+  end
+
+  if not state.input_win_id or not vim.api.nvim_win_is_valid(state.input_win_id) then return end
+  -- CmdlineLeave 在 cmdwin 等场景也会触发，只处理「当前窗口恰为输入窗口」的情况。
+  if cur ~= state.input_win_id then return end
   -- 中止原命令后在主循环下一拍重放：一是让输入框的按键映射（如回车发送）不被本拦截吞掉，
   -- 二是用 pcall 捕获错误，从而仅对 winfixbuf(E1513) 做新标签页兜底，其它错误原样提示。
   pcall(vim.cmd, "let v:event.abort = v:true")
@@ -1359,11 +1393,22 @@ end
 
 --- WinClosed：输入窗口被用户关掉（:q / <C-w>c 等）时及时清除失效句柄，
 --- 使后续回到聊天界面时 _restore_aux 能重建输入框（回归 N2）。
+--- 主聊天窗口被 NeoAI 以外的路径关闭（如 :terminal/:help 接管后 :q、:close）时清理本实例，
+--- 避免窗口已消失但实例与焦点自动命令仍存活而空转（表现为界面卡顿、输入框无法恢复）。
 --- @param ev table
 local function _on_win_closed(ev) -- luacheck: ignore ev
-  if not state.input_win_id then return end
-  if tonumber(ev.match) == state.input_win_id then
+  local win = tonumber(ev.match)
+  if not win then return end
+  if state.input_win_id and win == state.input_win_id then
     state.input_win_id = nil
+    return
+  end
+  if state.win_id and win == state.win_id and not state.closing then
+    vim.schedule(function()
+      if state.win_id == win and not state.closing then
+        pcall(M.close)
+      end
+    end)
   end
 end
 
@@ -1796,6 +1841,7 @@ end
 
 --- 关闭聊天窗口
 function M.close()
+  state.closing = true
   _stop_tool_tick()
   fold.clear_timing()
   -- 本实例拥有**自己的**流式浮窗（思考/接收参数/上下文压缩）：无论是否聚焦都必须关闭，
@@ -1861,6 +1907,7 @@ function M.close()
   state.following = true
   -- 缓存以 buffer 为键，关闭前已删除 buffer，回收其块缓存避免泄漏
   incremental.reset()
+  state.closing = false
 end
 
 --- 是否有打开的窗口
