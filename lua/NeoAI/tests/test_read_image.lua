@@ -69,9 +69,11 @@ tests.suite("read_image", function(_, it, before_each)
     t.matches("无法解析当前模型 route", err)
   end)
 
-  it("非视觉模型被门禁拒绝（不读盘）", function(t)
+  it("显式纯文本模型被门禁拒绝（不读盘）", function(t)
+    config_store.set("ai.attachments.text_only_models", { "plain-model-xyz" })
     local _, err = invoke({ file_path = "x.png" }, vision_ctx("plain-model-xyz"))
-    t.matches("未声明支持图像输入", err)
+    t.matches("判定为不支持图像输入", err)
+    config_store.set("ai.attachments.text_only_models", nil)
   end)
 
   it("附件存储禁用时报错", function(t)

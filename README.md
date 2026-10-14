@@ -483,6 +483,8 @@ ai = {
     vision_models = {
       "deepseek-v4-flash-vision-exp", -- 声明支持图像输入的模型 id 或 provider:model
     },
+    text_only_models = {}, -- 声明为纯文本（不支持图像）的模型 —— 命中即拦截（最高优先）
+    assume_vision = true, -- 未知模型默认放行（软门禁）；false 则回退“未声明即拒绝”
     vision_model_heuristics = { "vision", "-vl", "4o", "gemini" }, -- 按 id 子串自动识别视觉模型
     media_types = { "image/png", "image/jpeg", "image/webp", "image/gif" },
     limits = {

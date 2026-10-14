@@ -82,12 +82,23 @@ tests.suite("multimodal", function(_, it, before_each)
     t.eq(10, select(2, image.parse_dimensions(jpeg, "image/jpeg")), "jpeg 高")
   end)
 
-  it("vision 模型门禁", function(t)
+  it("vision 模型门禁（软门禁：未知默认放行）", function(t)
     local att = require("NeoAI.core.attachment.attachment")
     t.true_(att.supports_image("deepseek-v4-flash-vision-exp"), "显式 vision 模型")
     t.true_(att.supports_image("gpt-4o"), "启发式 4o")
     t.true_(att.supports_image("gemini-2.0-flash"), "启发式 gemini")
-    t.false_(att.supports_image("deepseek-v4-flash"), "非 vision 模型")
+    -- 未知模型（无显式声明 / 无实时模态）默认放行
+    t.true_(att.supports_image("deepseek-v4-flash"), "未知模型默认放行")
+    t.true_(att.supports_image("deepseek-flash"), "未知模型默认放行（deepseek-flash）")
+    -- 显式声明纯文本 → 拒绝（含 provider:model 形式）
+    config_store.set("ai.attachments.text_only_models", { "deepseek-v4-flash", "acme:plain-1" })
+    t.false_(att.supports_image("deepseek-v4-flash"), "显式纯文本模型拒绝")
+    t.false_(att.supports_image("plain-1", "acme"), "provider:model 形式命中拒绝")
+    config_store.set("ai.attachments.text_only_models", nil)
+    -- assume_vision=false 时回退保守行为
+    config_store.set("ai.attachments.assume_vision", false)
+    t.false_(att.supports_image("unknown-xyz"), "assume_vision=false 未声明即拒")
+    config_store.set("ai.attachments.assume_vision", nil)
   end)
 
   it("保存附件并解析 data_url", function(t)
@@ -251,12 +262,14 @@ tests.suite("multimodal", function(_, it, before_each)
     local image_tool = assert(registry.get("read_image"))
     t.not_nil(image_tool, "read_image 已注册")
 
-    -- 非视觉模型：门禁拒绝
+    -- 显式声明为纯文本的模型：门禁拒绝
+    config_store.set("ai.attachments.text_only_models", { "deepseek-v4-flash" })
     local rejected = false
     image_tool.func({ file_path = path, description = "测试" }, function() end, function()
       rejected = true
     end, { agent = { model = "deepseek-v4-flash" } })
-    t.true_(rejected, "非视觉模型拒绝")
+    t.true_(rejected, "显式纯文本模型拒绝")
+    config_store.set("ai.attachments.text_only_models", nil)
 
     -- 视觉模型：注入附件
     local ok = false

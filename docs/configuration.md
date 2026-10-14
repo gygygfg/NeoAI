@@ -54,8 +54,10 @@
 attachments = {
   enabled = true,               -- 多模态总开关
   path = ".../NeoAI/attachments", -- 内容寻址附件存储目录
-  vision_models = { "deepseek-v4-flash-vision-exp", "deepseek-vl" },
-  vision_model_heuristics = { "vision", "-vl", "4o", "gemini" },
+  vision_models = { "deepseek-v4-flash-vision-exp", "deepseek-vl" }, -- 显式支持图像（最高优先放行）
+  text_only_models = {},         -- 显式纯文本模型（命中即拦截，最高优先）
+  assume_vision = true,          -- 未知模型默认放行（软门禁）；false 回退旧的保守行为
+  vision_model_heuristics = { "vision", "-vl", "4o", "gemini" }, -- 按 id 子串识别视觉模型
   media_types = { "image/png", "image/jpeg", "image/webp", "image/gif" },
   limits = { maxImageBytes=20MB, maxImagesPerMessage=16, maxMessageImageBytes=40MB,
              maxImagePixels=50M, maxImageDimension=8000 },
@@ -63,6 +65,12 @@ attachments = {
                     maxRequestBytes=20MB, maxRequestImages=600 },
 }
 ```
+
+> **视觉模型判定顺序（先严后松）**：`text_only_models`（显式纯文本，拦截）→ `vision_models`
+> （显式视觉，放行）→ `/models` 实时模态元数据（如 OpenRouter 的 `architecture.input_modalities`、
+> `modalities`、`capabilities.vision`）→ `vision_model_heuristics` 命名启发式 → `assume_vision`
+> 默认放行。因此未知模型（如 `deepseek-flash`）默认可读图；若某模型实为纯文本，把它加入
+> `text_only_models` 即可拦截。
 
 **model_policy（按模型自动选择）**：
 

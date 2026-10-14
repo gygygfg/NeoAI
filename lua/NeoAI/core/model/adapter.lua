@@ -155,6 +155,62 @@ end
 
 M._extract_meta = _extract_meta
 
+--- 从模型对象中提取「是否声明支持图像输入」（供 /models 实时模态元数据解析透传）
+--- 兼容常见回传形态（键大小写不敏感）：
+---   architecture.input_modalities / architecture.modality（OpenRouter）
+---   modalities.input / modalities（Gemini、部分聚合网关）
+---   capabilities.vision / input_modalities / supports_vision / vision
+--- 未识别到模态信息时返回 nil（由调用方回退到其它判定）。
+--- @param item table 单个模型对象
+--- @return boolean|nil
+local function _extract_vision(item)
+  if type(item) ~= "table" then return nil end
+  local lm = _lower_keys(item)
+
+  --- 模态列表是否包含图像：true=含 image，false=列表存在但不含，nil=非列表
+  local function list_has_image(v)
+    if type(v) ~= "table" then return nil end
+    for _, m in ipairs(v) do
+      if type(m) == "string" and m:lower():find("image", 1, true) then return true end
+    end
+    return false
+  end
+
+  local arch = lm.architecture
+  if type(arch) == "table" then
+    local an = _lower_keys(arch)
+    local r = list_has_image(an.input_modalities)
+    if r ~= nil then return r end
+    if type(an.modality) == "string" then
+      return an.modality:lower():find("image", 1, true) ~= nil
+    end
+  end
+
+  local mods = lm.modalities
+  if type(mods) == "table" then
+    local r = list_has_image(mods.input) or list_has_image(mods)
+    if r ~= nil then return r end
+  end
+
+  local caps = lm.capabilities
+  if type(caps) == "table" then
+    local v = _lower_keys(caps).vision
+    if type(v) == "boolean" then return v end
+  end
+
+  for _, k in ipairs({ "input_modalities", "supports_vision", "vision" }) do
+    local v = lm[k]
+    if type(v) == "boolean" then return v end
+    if type(v) == "table" then
+      local r = list_has_image(v)
+      if r ~= nil then return r end
+    end
+  end
+  return nil
+end
+
+M._extract_vision = _extract_vision
+
 --- 取模型列表中的 id 数组（兼容 string[] / object[]）
 --- @param list table|nil
 --- @return table id 数组
@@ -296,8 +352,8 @@ function openai.parse_response(body)
   }
 end
 
---- 解析 OpenAI /models 响应（含实时数值元数据，缺失则为 nil）
---- @return table|nil { { id, context_window?, max_output? }, ... }
+--- 解析 OpenAI /models 响应（含实时数值 + 模态元数据，缺失则为 nil）
+--- @return table|nil { { id, context_window?, max_output?, vision? }, ... }
 function openai.parse_models(body)
   local obj = _json().decode_or_nil(body)
   if not obj or not obj.data then return nil end
@@ -305,7 +361,12 @@ function openai.parse_models(body)
   for _, item in ipairs(obj.data) do
     if item.id then
       local window, max_out = _extract_meta(item)
-      models[#models + 1] = { id = item.id, context_window = window, max_output = max_out }
+      models[#models + 1] = {
+        id = item.id,
+        context_window = window,
+        max_output = max_out,
+        vision = _extract_vision(item),
+      }
     end
   end
   return models
@@ -500,8 +561,8 @@ function anthropic.parse_response(body)
   }
 end
 
---- 解析 Anthropic /models 响应（含实时数值元数据，缺失则为 nil）
---- @return table|nil { { id, context_window?, max_output? }, ... }
+--- 解析 Anthropic /models 响应（含实时数值 + 模态元数据，缺失则为 nil）
+--- @return table|nil { { id, context_window?, max_output?, vision? }, ... }
 function anthropic.parse_models(body)
   local obj = _json().decode_or_nil(body)
   if not obj or not obj.data then return nil end
@@ -509,7 +570,12 @@ function anthropic.parse_models(body)
   for _, item in ipairs(obj.data) do
     if item.id then
       local window, max_out = _extract_meta(item)
-      models[#models + 1] = { id = item.id, context_window = window, max_output = max_out }
+      models[#models + 1] = {
+        id = item.id,
+        context_window = window,
+        max_output = max_out,
+        vision = _extract_vision(item),
+      }
     end
   end
   return models
@@ -726,8 +792,8 @@ function google.parse_response(body)
   }
 end
 
---- 解析 Google /models 响应（inputTokenLimit / outputTokenLimit → 实时元数据）
---- @return table|nil { { id, context_window?, max_output? }, ... }
+--- 解析 Google /models 响应（inputTokenLimit / outputTokenLimit → 实时数值，含模态）
+--- @return table|nil { { id, context_window?, max_output?, vision? }, ... }
 function google.parse_models(body)
   local obj = _json().decode_or_nil(body)
   if not obj or not obj.models then return nil end
@@ -736,7 +802,12 @@ function google.parse_models(body)
     if item.name then
       local name = item.name:match("models/(.+)$") or item.name
       local window, max_out = _extract_meta(item)
-      models[#models + 1] = { id = name, context_window = window, max_output = max_out }
+      models[#models + 1] = {
+        id = name,
+        context_window = window,
+        max_output = max_out,
+        vision = _extract_vision(item),
+      }
     end
   end
   return models

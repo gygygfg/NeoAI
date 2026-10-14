@@ -100,7 +100,7 @@ local function _assert_vision_capable(ctx)
     return false, "附件存储未启用，无法读取图像"
   end
   if not attachment.supports_image(model, provider) then
-    return false, ("模型 %s 未声明支持图像输入；请切换到多模态模型（如 deepseek-v4-flash-vision-exp）后再调用 read_image"):format(model)
+    return false, ("模型 %s 被判定为不支持图像输入（命中 text_only_models 声明或 /models 实时模态 vision=false）；如该模型实为多模态，请将其从 ai.attachments.text_only_models 移除或加入 vision_models"):format(model)
   end
   return true
 end

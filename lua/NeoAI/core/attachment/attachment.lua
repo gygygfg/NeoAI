@@ -140,27 +140,59 @@ local function _ensure_dirs(paths)
   end
 end
 
---- 是否支持某模型输入图像
+--- 在显式模型列表中查找（支持「模型 id」或「provider:model」）
+--- @param list table|nil
 --- @param model_id string
 --- @param provider string|nil
 --- @return boolean
-function M.supports_image(model_id, provider)
-  if not model_id then return false end
-  local cfg = _cfg()
+local function _list_matches(list, model_id, provider)
+  if type(list) ~= "table" then return false end
   local full = (provider and (provider .. ":" .. model_id)) or model_id
-  local md = model_id:lower()
-  for _, m in ipairs(cfg.vision_models or {}) do
+  for _, m in ipairs(list) do
     if type(m) == "string" then
       if m == model_id or m == full then return true end
       local _, mid = m:match("^([^:]+):(.+)$")
       if mid == model_id then return true end
     end
   end
-  -- 启发式：常见视觉模型命名特征（可配置）
+  return false
+end
+
+--- 是否支持某模型输入图像（多源自动识别，先严后松）
+--- 优先级：显式纯文本(text_only_models) ＞ 显式视觉(vision_models) ＞ /models 实时模态
+---         ＞ 命名启发式 ＞ 默认放行(assume_vision)。
+--- 对齐「未知视为可读图」的软门禁：仅当显式声明为纯文本、实时元数据回传 vision=false、
+--- 或 assume_vision=false 时才拒绝。
+--- @param model_id string
+--- @param provider string|nil
+--- @return boolean
+function M.supports_image(model_id, provider)
+  if not model_id then return false end
+  local cfg = _cfg()
+  local md = model_id:lower()
+
+  -- 1. 显式纯文本模型：最高优先，命中即拒绝
+  if _list_matches(cfg.text_only_models, model_id, provider) then return false end
+
+  -- 2. 显式视觉模型
+  if _list_matches(cfg.vision_models, model_id, provider) then return true end
+
+  -- 3. /models 实时模态元数据（provider 回传时最权威）
+  local ok, registry = pcall(require, "NeoAI.core.model.registry")
+  if ok and registry.meta then
+    local ok2, meta = pcall(registry.meta, model_id, provider)
+    if ok2 and type(meta) == "table" and type(meta.vision) == "boolean" then
+      return meta.vision
+    end
+  end
+
+  -- 4. 启发式：常见视觉模型命名特征（命中即放行）
   for _, pat in ipairs(cfg.vision_model_heuristics or { "vision", "-vl", "4o", "gemini" }) do
     if md:find(pat, 1, true) then return true end
   end
-  return false
+
+  -- 5. 未知模型：默认放行（软门禁）
+  return cfg.assume_vision ~= false
 end
 
 --- 准入上限（config 合并默认）

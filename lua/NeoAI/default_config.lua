@@ -142,12 +142,17 @@ local DEFAULT_CONFIG = {
     attachments = {
       enabled = true, -- 多模态图像注入总开关（read_image 工具 + 图像消息解析）
       path = vim.fn.stdpath("cache") .. "/NeoAI/attachments", -- 附件存储目录（内容寻址）
-      -- 声明支持图像输入的模型（模型 id 或 provider:model；命中则注入图像，否则降级为文本）
+      -- 显式声明支持图像输入的模型（模型 id 或 provider:model）——最高优先，命中即放行
       vision_models = {
         "deepseek-v4-flash-vision-exp",
         "deepseek-vl",
       },
-      -- 启发式：模型 id 含这些子串即视为视觉模型（可配置，需时清空）
+      -- 显式声明【不支持】图像输入的纯文本模型（模型 id 或 provider:model）——最高优先，命中即拒绝
+      text_only_models = {},
+      -- 未知模型（无显式声明、无 /models 实时模态、未命中启发式）是否默认放行（软门禁）。
+      -- true=默认视为可读图；false=回退旧的保守行为（未声明即拒绝）。
+      assume_vision = true,
+      -- 启发式：模型 id 含这些子串即视为视觉模型（命中即放行，便于快速识别已知多模态家族）
       vision_model_heuristics = { "vision", "-vl", "4o", "gemini" },
       media_types = { "image/png", "image/jpeg", "image/webp", "image/gif" },
       limits = {

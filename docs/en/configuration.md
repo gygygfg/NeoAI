@@ -53,8 +53,10 @@ See `lua/NeoAI/default_config.lua` for the full configuration. The main sections
 attachments = {
   enabled = true,               -- Master switch for multimodal
   path = ".../NeoAI/attachments", -- Content-addressed attachment storage directory
-  vision_models = { "deepseek-v4-flash-vision-exp", "deepseek-vl" },
-  vision_model_heuristics = { "vision", "-vl", "4o", "gemini" },
+  vision_models = { "deepseek-v4-flash-vision-exp", "deepseek-vl" }, -- explicit vision models (highest-priority allow)
+  text_only_models = {},         -- explicit text-only models (highest-priority deny)
+  assume_vision = true,          -- assume unknown models can read images (soft gate); false restores the old conservative behavior
+  vision_model_heuristics = { "vision", "-vl", "4o", "gemini" }, -- detect vision models by id substring
   media_types = { "image/png", "image/jpeg", "image/webp", "image/gif" },
   limits = { maxImageBytes=20MB, maxImagesPerMessage=16, maxMessageImageBytes=40MB,
              maxImagePixels=50M, maxImageDimension=8000 },
@@ -62,6 +64,12 @@ attachments = {
                     maxRequestBytes=20MB, maxRequestImages=600 },
 }
 ```
+
+> **Vision-capability detection order (strict first)**: `text_only_models` (explicit text-only → deny) →
+> `vision_models` (explicit vision → allow) → live `/models` modality metadata (e.g. OpenRouter's
+> `architecture.input_modalities`, `modalities`, `capabilities.vision`) → `vision_model_heuristics`
+> (id substring) → `assume_vision` (default allow). Hence unknown models (e.g. `deepseek-flash`) are
+> assumed to accept images; to block a text-only model, list it in `text_only_models`.
 
 **model_policy (automatic per-model selection)**:
 

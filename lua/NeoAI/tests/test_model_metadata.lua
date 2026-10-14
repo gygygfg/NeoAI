@@ -40,6 +40,23 @@ tests.suite("model_metadata", function(_, it)
     t.eq(16384, models[2].max_output)
   end)
 
+  it("OpenAI 模态元数据：architecture/modalities/capabilities → vision", function(t)
+    local adapter = require("NeoAI.core.model.adapter")
+    local a = assert(adapter.get("openai"))
+    local models = a.parse_models([[{"data":[
+      {"id":"or/vision","architecture":{"input_modalities":["text","image"]}},
+      {"id":"or/text","architecture":{"input_modalities":["text"]}},
+      {"id":"omni","capabilities":{"vision":true}},
+      {"id":"plainimg","modalities":{"input":["text","image"]}},
+      {"id":"no-meta"}
+    ]}]])
+    t.eq(true, models[1].vision)
+    t.eq(false, models[2].vision)
+    t.eq(true, models[3].vision)
+    t.eq(true, models[4].vision)
+    t.nil_(models[5].vision)
+  end)
+
   it("Google 元数据：inputTokenLimit / outputTokenLimit", function(t)
     local adapter = require("NeoAI.core.model.adapter")
     local g = assert(adapter.get("google"))
@@ -81,6 +98,21 @@ tests.suite("model_metadata", function(_, it)
     -- 无元数据的模型返回 nil
     t.nil_(registry.meta("plain-model", "groq"))
     t.nil_(registry.meta("nope", "groq"))
+    reset_registry()
+  end)
+
+  it("registry 规范化：存 vision + meta 可查询", function(t)
+    load()
+    reset_registry()
+    local registry = require("NeoAI.core.model.registry")
+    registry.update("groq", {
+      { id = "vision-model", context_window = 1000, vision = true },
+      { id = "text-model", vision = false },
+      { id = "plain-model" },
+    })
+    t.eq(true, assert(registry.meta("vision-model", "groq")).vision)
+    t.eq(false, assert(registry.meta("text-model", "groq")).vision)
+    t.nil_(registry.meta("plain-model", "groq"))
     reset_registry()
   end)
 

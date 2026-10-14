@@ -52,6 +52,7 @@ local function _normalize(provider, models)
         status = m.status or "available",
         context_window = m.context_window,
         max_output = m.max_output,
+        vision = m.vision,
       }
     end
   end
@@ -117,17 +118,17 @@ function M.get(model_id, provider)
   return nil
 end
 
---- 获取某模型的实时数值元数据（来自 /models 响应，未获取到则为 nil）
+--- 获取某模型的实时元数据（来自 /models 响应，未获取到则为 nil）
 --- @param model_id string
 --- @param provider string|nil
---- @return table|nil { context_window?, max_output? }
+--- @return table|nil { context_window?, max_output?, vision? }
 function M.meta(model_id, provider)
   if not model_id then return nil end
   local pname = provider or config_store.get("ai.default_provider")
   for _, m in ipairs(_merge(pname)) do
     if m.id == model_id then
-      if m.context_window or m.max_output then
-        return { context_window = m.context_window, max_output = m.max_output }
+      if m.context_window or m.max_output or m.vision ~= nil then
+        return { context_window = m.context_window, max_output = m.max_output, vision = m.vision }
       end
       return nil
     end

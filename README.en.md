@@ -480,6 +480,8 @@ ai = {
     vision_models = {
       "deepseek-v4-flash-vision-exp", -- model id or provider:model declared to support image input
     },
+    text_only_models = {}, -- models declared text-only (no image input) — highest-priority deny
+    assume_vision = true, -- assume unknown models can read images (soft gate); false restores "deny unless declared"
     vision_model_heuristics = { "vision", "-vl", "4o", "gemini" }, -- auto-detect vision models by id substring
     media_types = { "image/png", "image/jpeg", "image/webp", "image/gif" },
     limits = {
