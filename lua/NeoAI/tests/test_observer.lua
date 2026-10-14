@@ -70,6 +70,27 @@ tests.suite("observer", function(_, it)
     t.nil_(f.delete, "F 不应标记 delete")
   end)
 
+  it("行为兜底：解析违规行与生成探针脚本", function(t)
+    -- 违规行：`V\t<syscall>\t<pid>[\t<args>]`
+    local v = observer.parse_backstop_line("V\tmknod\t1234")
+    t.not_nil(v, "应解析违规行")
+    t.eq("violation", v.kind)
+    t.eq("mknod", v.syscall)
+    t.eq(1234, v.pid)
+    t.nil_(observer.parse_backstop_line("F\topenat\t1\t/x"), "非 V 标签不应解析为违规")
+    t.nil_(observer.parse_backstop_line(""), "空行不应解析")
+    -- 脚本按内核可用 tracepoint 动态拼装（缺失则不含）：至少应为字符串；mknod/mknodat 覆盖。
+    t.eq("string", type(observer.BACKSTOP_SCRIPT))
+    local tps_dir = vim.fn.isdirectory("/sys/kernel/tracing/events/syscalls") == 1
+      or vim.fn.isdirectory("/sys/kernel/debug/tracing/events/syscalls") == 1
+    if tps_dir then
+      if vim.fn.isdirectory("/sys/kernel/tracing/events/syscalls/sys_enter_mknodat") == 1
+        or vim.fn.isdirectory("/sys/kernel/debug/tracing/events/syscalls/sys_enter_mknodat") == 1 then
+        t.true_(observer.BACKSTOP_SCRIPT:find("mknodat", 1, true) ~= nil, "应含 mknodat 探针")
+      end
+    end
+  end)
+
   it("后端选择：关闭观测 / 强制 heuristic 时回退命令解析", function(t)
     observer.reset()
     with_config({ tools = { sandbox = { observe = { enabled = false } } } }, function()

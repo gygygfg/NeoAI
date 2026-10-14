@@ -288,6 +288,13 @@ function M.start()
     local diag = sandbox.overlay_diagnosis(vim.fn.getcwd())
     parts[#parts + 1] = "overlay=" .. (diag.available and "ready"
       or ("unavailable(" .. tostring(diag.reason) .. ")"))
+    -- seccomp 施加方式（bwrap|unshare|none）与第 2 层行为兜底可用性（诊断降级落到哪一层）
+    pcall(function()
+      local runtime = require("NeoAI.sandbox.execution.runtime")
+      parts[#parts + 1] = "seccomp_mode=" .. tostring(runtime.seccomp_mode())
+      local obs = require("NeoAI.sandbox.observe.observer")
+      parts[#parts + 1] = "backstop=" .. (obs.backstop_available() and "ebpf" or "none")
+    end)
     vim.notify("[NeoAI] 沙箱能力: " .. table.concat(parts, " "), vim.log.levels.INFO)
   end, { desc = "显示沙箱运行时能力探测结果" })
 

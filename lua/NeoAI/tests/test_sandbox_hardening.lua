@@ -183,7 +183,9 @@ tests.suite("sandbox_hardening", function(_, it)
     local pc = require("NeoAI.sandbox.review.policy_consent")
     local function run(cmd)
       local done, out = false, nil
-      tools.execute("run_command", { command = cmd, description = "t" }, {})
+      -- 显式标记跨挂载点已批准：本用例验证「代理规避」门禁，不应被工作区位于独立挂载点
+      -- （如容器卷 /data）时的兼容模式审批门遮蔽（headless 无审批能力）。
+      tools.execute("run_command", { command = cmd, description = "t" }, { sandbox_cross_mount_approved = true })
         :then_(function(r) out = tostring(r); done = true end,
           function(e) out = "ERR:" .. tostring(e and e.message or e); done = true end)
       t.true_(vim.wait(15000, function() return done end), "命令应完成")
@@ -331,6 +333,131 @@ tests.suite("sandbox_hardening", function(_, it)
       t.matches("200", code, "沙箱内临时服务应被自动放行（实际: " .. code .. "）")
       run("pkill -f 'http.server " .. port .. "' >/dev/null 2>&1; true")
       resident.stop({ timeout_ms = 5000 })
+    end)
+  end)
+
+  it("seccomp：无隔离后端经 setpriv 前缀施加基线，mknod 被预防性拦截（第 1 层）", function(t)
+    local runtime = require("NeoAI.sandbox.execution.runtime")
+    local seccomp = require("NeoAI.sandbox.execution.seccomp")
+    -- 仅验证「无隔离后端 → 档 A setpriv seccomp 前缀」这条路径；有命名空间后端另有覆盖。
+    if runtime.backend() ~= nil then return end
+    if not seccomp.unshare_capable() then return end -- 无 setpriv --seccomp-filter，落第 2/3 层
+    seccomp.reset(); runtime.reset()
+    -- 直接取沙箱进程前缀（不经过 wrapper 的跨挂载点审批门，headless 下也能验证内核强制层）。
+    local prefix, err = runtime.process_prefix({ cwd = vim.fn.getcwd() })
+    t.not_nil(prefix, "档 A 应能构造进程前缀: " .. tostring(err))
+    local joined = table.concat(prefix, " ")
+    t.true_(joined:find("setpriv", 1, true) ~= nil and joined:find("--seccomp-filter", 1, true) ~= nil,
+      "前缀应经 setpriv --seccomp-filter 施加 seccomp，实际: " .. joined)
+    -- 在真实前缀下执行 mknod：应被 denylist 拒绝（EPERM），设备节点未创建。
+    local dev = vim.fn.tempname()
+    local argv = vim.list_extend(vim.deepcopy(prefix), {
+      "sh", "-c", "mknod " .. vim.fn.shellescape(dev) .. " b 8 0 2>&1; echo rc=$?",
+    })
+    local out = {}
+    local pid = vim.fn.jobstart(argv, { stdout_buffered = true, on_stdout = function(_, d) vim.list_extend(out, d) end })
+    local ok_wait = vim.wait(20000, function() return vim.fn.jobwait({ pid }, 0)[1] ~= -1 end)
+    t.true_(ok_wait, "命令应完成")
+    local text = table.concat(out, "\n")
+    t.true_(text:match("rc=1") ~= nil, "mknod 应被 seccomp 基线拒绝（rc=1），实际: " .. text)
+    t.true_(vim.uv.fs_stat(dev) == nil, "设备节点不应被创建")
+  end)
+
+  it("行为兜底：seccomp 不可用时 eBPF 命中触发 cgroup.kill 与 SANDBOX_BEHAVIOR_VIOLATION", function(t)
+    local observer = require("NeoAI.sandbox.observe.observer")
+    -- 仅当 eBPF 后端可用（root + bpftrace + BTF + tracefs）才验证真实探针；否则跳过。
+    if not (type(observer.backstop_available) == "function" and observer.backstop_available()) then return end
+    local cgroup = require("NeoAI.sandbox.execution.cgroup")
+    if not cgroup.limits_configured() then return end
+    local killed = false
+    local handle = { path = nil, attempt_id = "backstop_test" }
+    local limits = cgroup.resolve_limits()
+    local h = cgroup.prepare("backstop_test", limits)
+    if not h then return end
+    handle = h
+    local stat = vim.uv.fs_stat(handle.path)
+    if not stat then cgroup.release(handle); return end
+    local syscall_seen = nil
+    local bs = observer.start_backstop({
+      cgroup_id = stat.ino,
+      on_violation = function(sys, _pid) syscall_seen = sys; killed = true; pcall(cgroup.kill, handle) end,
+    })
+    if not bs then cgroup.release(handle); return end
+    bs.wait_ready(2000)
+    -- 在测试 cgroup 内触发一次危险 syscall（mknodat 创建设备节点）。
+    local pid = vim.fn.jobstart({ "sh", "-c",
+      "echo $$ > " .. handle.path .. "/cgroup.procs; "
+        .. "python3 - <<'PY' 2>/dev/null || true\n"
+        .. "import os\ntry:\n os.mknod('/tmp/neoai_backstop_dev', 0o600 | 0o020000, os.makedev(8, 0))\nexcept Exception:\n pass\nPY" }, {})
+    local deadline = vim.uv.hrtime() + 4000 * 1e6
+    while vim.uv.hrtime() < deadline and not killed do vim.wait(50) end
+    pcall(vim.fn.jobstop, pid)
+    pcall(bs.stop)
+    cgroup.release(handle)
+    -- 若内核/环境不允许观测到 mknod（无 python3 等）也不误判失败。
+    if syscall_seen then
+      t.matches("mknod", tostring(syscall_seen), "应观测到 mknod/mknodat 违规")
+      t.true_(killed, "命中后应触发 cgroup.kill")
+    end
+  end)
+
+  it("档位降级：unshare 后端忽略 cap_add/mounts（degrade 放行 / deny 硬拒）", function(t)
+    local runtime = require("NeoAI.sandbox.execution.runtime")
+    if runtime.backend() ~= "unshare" then return end -- 仅 unshare 后端适用
+    local priv = { cap_add = { "CAP_DAC_OVERRIDE" }, mounts = {}, network = true, unmask = {} }
+    -- 默认 degrade：不因档位 mounts/cap_add 而硬拒（忽略并放行，载荷为 userns 内 root）。
+    with_config({ tools = { sandbox = { backend = "unshare",
+      seccomp = { on_unavailable = "degrade" } } } }, function()
+      runtime.reset()
+      local prefix, err = runtime.process_prefix({ cwd = "/tmp", privileges = priv })
+      t.not_nil(prefix, "默认应降级放行（忽略档位 cap_add），实际: " .. tostring(err))
+    end)
+    -- strict（on_unavailable="deny"）：恢复旧 fail-closed。
+    with_config({ tools = { sandbox = { backend = "unshare",
+      seccomp = { on_unavailable = "deny" } } } }, function()
+      runtime.reset()
+      local prefix, err = runtime.process_prefix({ cwd = "/tmp", privileges = priv })
+      t.nil_(prefix, "strict 时应硬拒")
+      t.matches("PRIVILEGE_UNSUPPORTED", tostring(err))
+    end)
+  end)
+
+  it("无隔离后端：档 A(seccomp) 优先，其次 allow_unisolated 决定直跑/硬拒", function(t)
+    local runtime = require("NeoAI.sandbox.execution.runtime")
+    local seccomp = require("NeoAI.sandbox.execution.seccomp")
+    if runtime.backend() ~= nil then return end -- 本机有可用后端则不适用
+    -- 档 A 可达性：setpriv --seccomp-filter 可用（本机 Android/Termux 可达）。
+    local tierA = seccomp.unshare_capable()
+    -- allow_unisolated=false：若档 A 可用则 seccomp 放行；否则硬拒。
+    with_config({ tools = { sandbox = { allow_unisolated = false, require_seccomp = true,
+      seccomp = { enabled = true } } } }, function()
+      seccomp.reset(); runtime.reset()
+      local ok, err, info = runtime.check_available()
+      if tierA then
+        t.true_(ok, "档 A 可用时应 seccomp 放行: " .. tostring(err))
+        t.eq("seccomp", info and info.fallback)
+        t.eq("backend", info and info.layer)
+      else
+        t.false_(ok, "无后端且未允许直跑时应硬拒")
+        t.matches("BACKEND_UNAVAILABLE", tostring(err))
+      end
+    end)
+    -- allow_unisolated=true：放行（档 A 优先 seccomp；否则 unisolated 直跑）。
+    with_config({ tools = { sandbox = { allow_unisolated = true, require_seccomp = true,
+      seccomp = { enabled = true } } } }, function()
+      seccomp.reset(); runtime.reset()
+      local ok, err, info = runtime.check_available()
+      t.true_(ok, "允许直跑/档 A 时应放行: " .. tostring(err))
+      t.true_(info and (info.fallback == "seccomp" or info.fallback == "unisolated"),
+        "fallback 应为 seccomp 或 unisolated，实际: " .. tostring(info and info.fallback))
+    end)
+    -- 关闭 seccomp 且未允许直跑：兜底硬拒。
+    with_config({ tools = { sandbox = { allow_unisolated = false, require_seccomp = false,
+      seccomp = { enabled = false } } } }, function()
+      seccomp.reset(); runtime.reset()
+      local ok, err = runtime.check_available()
+      t.false_(ok, "无 seccomp 且未允许直跑时应硬拒")
+      t.matches("BACKEND_UNAVAILABLE", tostring(err))
     end)
   end)
 end)

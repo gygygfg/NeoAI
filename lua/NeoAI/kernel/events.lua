@@ -203,6 +203,13 @@ M.SANDBOX_SYSTEMD_UNSUPPORTED = "sandbox:systemd_unsupported"
 -- 后台命令门面：run_command 的 &/nohup/setsid 被路由到长驻服务（跨调用存活）
 M.SANDBOX_BACKGROUND_ROUTED = "sandbox:background_routed"
 
+-- 防御层降级：seccomp 门禁不可用 / unshare 的 /proc/sys 遮蔽门禁不可用时，按三层行为模型
+-- 降级放行（绝不静默）。payload={layer="seccomp"|"sysctl_mask"|"backstop", mode="bwrap"|"unshare"|"none", reason=...}
+M.SANDBOX_DEGRADED = "sandbox:degraded"
+-- 行为违规：eBPF 行为兜底（第 2 层）观测到危险 syscall 命中并已 cgroup.kill 整树终止。
+-- payload={syscall=..., pid=..., attempt=...}
+M.SANDBOX_BEHAVIOR_VIOLATION = "sandbox:behavior_violation"
+
 -- ========== 交互式终端（run_command PTY） ==========
 -- run_command 以 PTY 运行命令时，轮询 /proc 检测到“阻塞读终端 = 等待输入”触发 waiting_input；
 -- 判官子 agent / 用户手动注入时触发 input_sent；命令退出触发 exited。

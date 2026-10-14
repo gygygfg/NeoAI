@@ -207,9 +207,13 @@ function M.open(argv, opts)
     return nil, nil, "SANDBOX_DISABLED: 沙箱已禁用"
   end
   local runtime = require("NeoAI.sandbox.execution.runtime")
-  local ok, err = runtime.check_available()
+  local ok, err, deg = runtime.check_available()
   if not ok then
     if cfg.fail_closed ~= false then return nil, nil, err end
+    return argv, function() end, nil
+  end
+  -- 无隔离后端且显式允许直跑：返回原 argv（不套沙箱前缀）。
+  if deg and deg.fallback == "unisolated" then
     return argv, function() end, nil
   end
   local roots = _norm_dirs(opts.writable_roots, true)

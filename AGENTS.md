@@ -76,8 +76,20 @@ nvim --headless --clean -u NONE --cmd "set rtp+=$PWD" \
    新增副作用插件时须标注 `phase`（`catalog.lua`）；只读访问器不得触发启动。
    测试/热重载用 `ensure_started_sync()` 同步等待全量启动。
 9. **工具执行必须过沙箱**：所有工具经 `services.sandbox` 门禁（`tools/executor` 强制，
-   `tools/registry`/加载器附加 `__sandbox_spec`）。沙箱服务缺失且 `fail_closed` 时拒绝执行，
-   不得绕过或静默降级。默认异步审批（`tools.approval.mode="async"`）：效果类工具立即在沙箱内
+   `tools/registry`/加载器附加 `__sandbox_spec`）。安全边界（网关 `GATEWAY_REQUIRES_BWRAP`、
+   降权 `SANDBOX_SETPRIV_UNAVAILABLE`）缺失时**硬拒绝**，不得绕过或静默降级。「无任何隔离后端」
+   （`SANDBOX_BACKEND_UNAVAILABLE`）默认亦硬拒，仅当显式 `tools.sandbox.allow_unisolated=true` 时
+   降级为**直跑**（无隔离、写入直接落盘，不冻结候选）——绝不静默（告警 + 审计）。
+   **例外——防御层/能力缺失**（seccomp 基线 `SANDBOX_SECCOMP_UNAVAILABLE`、unshare 的 `/proc/sys`
+   遮蔽 `SANDBOX_SYSCTL_MASK_UNAVAILABLE`、unshare 档位挂载/capability `SANDBOX_PRIVILEGE_UNSUPPORTED`）：
+   默认降级放行，且**绝不静默**——seccomp 走三层行为模型（第 1 层 bwrap 原生 / unshare 经
+   `setpriv --no-new-privs --seccomp-filter`；第 2 层 eBPF 行为兜底，命中危险 syscall 即
+   `cgroup.kill`，补救型；第 3 层无行为强制层，仅强告警）；unshare 的 `/proc/sys` 遮蔽与档位
+   挂载/capability 则忽略并留痕（载荷在 userns 内为 root，T0 所需能力等效具备）。
+   任何降级均写 evidence（`sandbox_degrade`）+ 发 `SANDBOX_DEGRADED` 事件 + `vim.notify`（会话去重）+
+   结果提示。安全优先可经 `tools.sandbox.seccomp.on_unavailable="deny"`（或 `require_backstop=true`）
+   恢复 fail-closed。文本匹配（`risk.deny_reason` 等）只做审批分级，**绝不冒充安全边界**，不新增危险
+   命令文本名单。默认异步审批（`tools.approval.mode="async"`）：效果类工具立即在沙箱内
    执行并冻结候选，真实修改进入待审队列，用户经 `:NeoAISandboxReview` 异步确认后应用。
    详见 `docs/sandbox.md`。
 

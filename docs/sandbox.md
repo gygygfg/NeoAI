@@ -18,7 +18,29 @@
 2. 隔离执行只改可丢弃的私有状态，不写宿主真实工作区、不调真实外部写接口。
 3. commit 只发布已冻结、已校验、已授权的候选，不重跑原命令。
 4. 硬拒绝不可被人工确认覆盖；未知结果不报告为成功或可重试。
-5. 沙箱服务缺失且 `fail_closed=true` 时**拒绝执行**，不静默降级。
+5. 沙箱服务缺失且 `fail_closed=true` 时**拒绝执行**，不静默降级。**例外——防御层缺失**
+   （seccomp 基线、unshare 的 `/proc/sys` 遮蔽）按三层行为模型降级放行，且**绝不静默**（详见 §12）：
+   - 第 1 层 seccomp：bwrap 原生 `--seccomp`；unshare 后端经
+     `setpriv --no-new-privs --seccomp-filter <bpf>` 补装（util-linux ≥ 2.32）。预防性、内核强制。
+   - 第 2 层 eBPF 行为兜底：seccomp 不可用时观测危险 syscall，命中即 `cgroup.kill` 整树终止并判失败
+     （**补救型**，副作用可能已发生一次，不等价于 seccomp 的发生前拦截）。
+   - 第 3 层无行为强制层：仅放行 + 强告警 + 审计（`require_backstop=true` 时改硬拒）。
+   - 任何降级均写 evidence（`sandbox_degrade`）+ 发 `SANDBOX_DEGRADED` 事件 + `vim.notify`（会话去重）+
+     结果提示；`seccomp.on_unavailable="deny"` 可恢复旧 fail-closed。
+   - 网关（`GATEWAY_REQUIRES_BWRAP`）与降权（`SANDBOX_SETPRIV_UNAVAILABLE`）仍**硬拒绝**，不降级。
+     此外 unshare 后端的**档位挂载/capability**（Extra mounts / `cap_add`）无法施加，按降级处理
+     （忽略 + 告警 + 审计；载荷在 userns 内为 root，T0 所需 `CAP_DAC_OVERRIDE`/`SETUID`/`SETGID`
+     等效具备）。
+   - **无任何隔离后端**（无 bwrap、unshare/userns 被内核拒绝，如 Android/Termux 拦
+     `clone(CLONE_NEWUSER)`）：
+     - **档 A（自动）**：`setpriv --seccomp-filter` 可用 → 施加 **seccomp 行为级防护**——命令不经
+       命名空间（写入落真实盘），但 denylist 仍在内核层拦截 `mount`/`unshare`/`ptrace`/`mknod`/
+       `bpf`/`init_module` 等危险 syscall。无语义隔离下的尽力保护，自动启用。
+     - **档 B（全失败，连 seccomp 都不可用）**：默认硬拒（`SANDBOX_BACKEND_UNAVAILABLE`）；设
+       `tools.sandbox.allow_unisolated=true` 时降级为**直跑**（无任何隔离、写入直接落盘），
+       **必须经用户弹窗确认**（headless → 拒绝），并写 evidence + `SANDBOX_DEGRADED` 事件 +
+       `vim.notify` + 结果提示（绝不静默）。默认关以保留沙箱保护。
+   - 文本匹配（`risk.deny_reason` 等）仅做审批分级，**绝不冒充安全边界**，不新增危险命令文本名单。
 
 ## 2. 模块结构
 
@@ -44,7 +66,7 @@
 | `sandbox/execution/resident.lua` | 会话级常驻沙箱实例（命令服务器，后台进程跨调用存活） |
 | `sandbox/execution/file_bridge.lua` | 命名空间文件桥：进程内工具经常驻实例在 mount 命名空间内读写（`F` 帧），写入落 overlay 暂存、读取为合并视图 |
 | `sandbox/execution/ns_fs.lua` | 命名空间视图 I/O 适配：写入前 detokenize、读取后 tokenize，供已接入的进程内文件工具在 overlay 权威暂存层上读写 |
-| `sandbox/execution/seccomp.lua` | seccomp 能力探测与 require_seccomp 门禁 |
+| `sandbox/execution/seccomp.lua` | seccomp 基线生成与能力探测；bwrap 原生 / unshare 经 `setpriv --seccomp-filter`；`unshare_capable`/`unshare_argv` 与降级感知门禁 |
 | `sandbox/execution/privilege.lua` | 权限档位（T0/T1/T2）分类、解析、自动升级检测与留痕 |
 | `sandbox/execution/hostop.lua` | T2 主机效果提案（冻结/审批后 replay/拒绝） |
 | `sandbox/state/cache.lua` | 内容寻址缓存（隔离写入、可清理） |
@@ -644,7 +666,8 @@ UI 见 `ui/components/device_consent`，与网络同意/工具审批同款浮窗
   「本次会话允许」或审批悬浮窗**「工具行为」页按 `E`** 打开的**设备组件编辑器**写入（`a` 添加
   / `d` 删除）。已在允许列表的设备在命令执行前预绑定、不再弹窗/阻断。
 - 该门禁针对**进程命令**的设备节点访问；内核命令（`modprobe`/`mkfs` 等）仍走既有的硬拒绝
-  （比弹窗更强），`mknod` 设备节点创建仍由 seccomp 基线拦（见 §6）。
+  （比弹窗更强），`mknod` 设备节点创建仍由 seccomp 基线拦（见「seccomp 基线与三层行为强制」；
+  防御层缺失时按三层模型降级并要求告警/审计，见该节）。
 - 已知边界：并发常驻命令共享同一会话 cgroup，事件归因到「当前槽位」命令；极端并发下
   危险设备访问的终止可能作用于同一实例的当前命令（设备访问本就罕见）。
 
@@ -1334,7 +1357,8 @@ seccomp（含设备节点屏障）**——沙箱内进程看到的是一份「�
   `/proc/slabinfo`、`/proc/interrupts`、`/proc/softirqs`、`/proc/buddyinfo`、`/proc/zoneinfo`、
   `/proc/pagetypeinfo`、`/proc/keys`、`/proc/sched_debug`、`/proc/iomem`、`/proc/ioports`。
   用户 `hide_proc_paths` 只能**追加**、不能移除强制项。`unshare` 兜底后端无法 bind mount，
-  故对 `process` 类 **fail-closed**（`SANDBOX_SYSCTL_MASK_UNAVAILABLE`），不静默降级。
+  故默认对 `process` 类按**三层行为模型降级**（放行 + 强告警 + 审计），`seccomp.on_unavailable="deny"`
+  时恢复旧 fail-closed（`SANDBOX_SYSCTL_MASK_UNAVAILABLE`）；降级绝不静默（见 §1 / §18「seccomp 基线与三层行为强制」）。
 - **seccomp 基线默认开启**（见 §12）：即便未来出现 capability 相关内核缺陷，denylist
   仍拦截 `mount`/`bpf`/`init_module` 等危险 syscall。**嵌套命名空间默认放行**
   （`tools.sandbox.seccomp.allow_namespaces = true`）：不再拦截 `unshare`/`setns`/
@@ -1902,12 +1926,20 @@ overlay 会 `EINVAL`），此时命令只能运行在「只读根 + 私有可写
   不经 overlayfs，暂存/遮蔽/审批对 `open` 设备节点均无效）。FIFO（`mkfifo`）与普通文件
   不受影响；即便 capability 含 `CAP_MKNOD` 也硬拦（纵深防御，覆盖 `cap_add={"ALL"}` 场景）。
 - `tools.sandbox.seccomp.enabled=true` 时启用；**默认开启**（与 `--cap-drop ALL` 共同构成纵深防御）。
-- `filter_path` 为空则用内置 denylist 生成到 `<root>/seccomp/baseline-v5-<arch>.bpf`
+- `filter_path` 为空则用内置 denylist 生成到 `<root>/seccomp/baseline-v6-ns<0|1>-<arch>.bpf`
   （文件名带版本，内容变更时自动重建）；
   非空则必须存在，否则明确拒绝。
-- `require_seccomp=true` 要求外部进程有可用过滤器（且后端为 bwrap），否则返回
-  `SANDBOX_SECCOMP_UNAVAILABLE`，不声称已施加。
-- 仅 bwrap 后端支持；unshare 后端在启用/要求时明确拒绝。
+- **施加方式**：bwrap 后端 `bwrap --seccomp FD`（FD 由 bwrap 关闭后转交过滤器）；unshare 后端在
+  unshare 之后、真实命令之前经 `setpriv --no-new-privs --seccomp-filter <bpf> -- <cmd>` 补装
+  （过滤器须由即将 exec 载荷的进程自身装载——seccomp 是 per-thread 进程属性，无法跨进程代劳）。
+  需 util-linux ≥ 2.32 的 `setpriv --seccomp-filter`（`seccomp.unshare_capable()` 探测并缓存，
+  不可用时不假装已施加）。
+- `require_seccomp=true` 把 seccomp 视为必需（默认）：缺能力时按 `seccomp.on_unavailable` 处置——
+  `"degrade"`（默认）按**三层行为模型**降级（第 2 层 eBPF 行为兜底命中即 `cgroup.kill` / 第 3 层
+  仅告警），`"deny"` 恢复旧 fail-closed（`SANDBOX_SECCOMP_UNAVAILABLE`）。详见 §1 / §18
+  「seccomp 基线与三层行为强制」。
+- 降级绝不静默：写证据 `sandbox_degrade` + 发 `SANDBOX_DEGRADED` 事件 + `vim.notify`（会话去重）+
+  结果提示；`:NeoAIDoctor` / `:NeoAISandboxCaps` 报告 `seccomp_mode`（`bwrap`|`unshare`|`none`）。
 
 ### 内容寻址缓存
 
@@ -2464,7 +2496,8 @@ upper/work、暂存、会话）会 chown 到该 uid。
   已保护宿主机，其删除效果冻结为待审候选（详见 §5 暂存机制）。
   段首为 `sudo`/`doas`/`env`/`bash -c` 等包装器时会向下识别真实命令。`mount`/`umount` 仍按
   T2 主机操作冻结为提案（审批后 `sudo` replay），`mknod`/`unshare` 等由 seccomp 与命名空间
-  隔离处理，不在硬拒绝列表内。
+  隔离处理（见「seccomp 基线与三层行为强制」：防御层缺失时按三层模型降级 + 告警 + 审计），
+  不在硬拒绝列表内。
 
 - **包管理器专用识别 + 封顶 L2**：`apt`/`apt-get`/`dnf`/`pacman`/`pip`/`pipx`/`uv`/`poetry`/
   `conda`/`mamba`/`npm`/`npx`/`pnpm`/`yarn`/`bun`/`cargo`/`go`/`gem`/`composer` 等
@@ -2510,6 +2543,40 @@ upper/work、暂存、会话）会 chown 到该 uid。
 `operation not permitted`/`permission denied` → L2，网络失败 → L1，包变更
 `Setting up …`/`Successfully installed …` → L1，破坏性输出 → L3），与调用前分级取较大者，
 记录证据并驱动自动提权检测（§17）。只读进程工具也会记录结果分级。
+
+### seccomp 基线与三层行为强制（含降级）
+
+seccomp 是**唯一**能拦住「不经 overlayfs 的效果」（典型：`mknod`/`mknodat` 创建设备节点）的
+**预防性、内核强制**边界；命名空间可结构性消解 `mount`/`chroot`/`pivot_root`/`unshare`/`setns`/
+`ptrace`。防御层缺失时按**三层行为模型**降级，**绝不静默**：
+
+| 层 | 机制 | 触发条件 | 语义 |
+| --- | --- | --- | --- |
+| 1 | seccomp 基线 | `seccomp.enabled` 且过滤器可生成 且（bwrap 或 `setpriv` 可用） | 预防性、发生前拦截 |
+| 2 | eBPF 行为兜底 | 第 1 层缺失 且 `observer.backend()=="ebpf"` 且 cgroup 可用 | **补救型**：命中危险 syscall 即 `cgroup.kill` 整树终止并判失败 |
+| 3 | 仅告警 | 第 1、2 层均不可用 | 放行 + 强告警 + 审计（`require_backstop=true` 时硬拒） |
+
+- **第 1 层施加方式**：bwrap 后端 `bwrap --seccomp 3`（fd 3 = 过滤器）；unshare 后端在 unshare
+  之后、真实命令之前经 `setpriv --no-new-privs --seccomp-filter <bpf> -- <cmd>` 补装（过滤器须由
+  即将 exec 载荷的进程自身装载——seccomp 是 per-thread 进程属性，无法跨进程代劳）。需
+  util-linux ≥ 2.32 的 `setpriv --seccomp-filter`（`seccomp.unshare_capable()` 探测并缓存）。
+- **第 2 层覆盖集**与 `seccomp.ARCH[*].blocked` 对齐（`mknod`/`mknodat`、`mount`/`umount2`、
+  `chroot`/`pivot_root`、`unshare`/`setns`、`ptrace`、`iopl`/`ioperm`、`init_module`/`finit_module`/
+  `delete_module`、`kexec_load`、`clock_settime`/`clock_adjtime`/`adjtimex`/`settimeofday`、
+  `bpf`/`perf_event_open`；`clone` 仅当 `flags & 0x7E020000` 命中）。命中即 `cgroup.kill` 该 attempt
+  的独立资源域（不删树、不触共享父域）、写证据 `sandbox_behavior_violation`、发
+  `SANDBOX_BEHAVIOR_VIOLATION` 事件、结果判失败（`SANDBOX_BEHAVIOR_VIOLATION:<syscall>`）。
+- **降级绝不静默**：任何降级均写 evidence（`sandbox_degrade`）+ 发 `SANDBOX_DEGRADED` 事件 +
+  `vim.notify`（会话内按层去重）+ 结果前置提示（第 2 层「已启用 eBPF 行为兜底（补救型）」；
+  第 3 层「本次无行为强制层（仅告警）」）。
+- **诚实边界**：第 2 层为补救型——危险 syscall 命中后才终止进程，其副作用可能已发生一次
+  （如设备节点已创建、挂载已完成）；靠整机根 overlay/只读 + 候选冻结兜住写入面，但**不等价**
+  于 seccomp 的发生前拦截。仅降级 `seccomp` 门禁与 unshare 的 `/proc/sys` 遮蔽门禁，其余门禁
+  （后端缺失、网关、降权、档位挂载）仍**硬拒绝**。
+- **配置**（`tools.sandbox.seccomp`）：`enabled`（默认 true）、`filter_path`、`allow_namespaces`、
+  `on_unavailable`（`"degrade"` 默认 | `"deny"` 恢复旧 fail-closed）、`backstop`（`"ebpf"` 默认 |
+  `"off"`）、`require_backstop`（默认 false；true = 第 1、2 层均不可用时硬拒）。
+  `:NeoAIDoctor` / `:NeoAISandboxCaps` 报告 `seccomp_mode`（`bwrap`|`unshare`|`none`）与兜底可用性。
 
 ### 18.3 容器门面（`sandbox/execution/container.lua`）
 

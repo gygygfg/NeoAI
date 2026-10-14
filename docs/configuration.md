@@ -255,9 +255,16 @@ sandbox = {
   postprocess = "async",           -- 进程命令后处理模式：async（默认）= 命令进程退出后立即返回结果给主循环，overlay 捕获/候选冻结/暂存合并/落盘/结算在后台完成（FIFO 槽位保持到后台完成，保证下一命令看到一致暂存；后续读写工具会等待在途后处理）；sync = 等待后处理完成后再返回（确定性，测试默认）
   shutdown_timeout_ms = 3000,      -- 退出/关闭（`:qall`、插件热重载）时等待后台后处理与暂存迁移完成的最长时间（ms）；超时即放弃等待，避免卡住退出；0 = 不等待（可能丢失最后一笔未完成的冻结/待审入队）
   backend = "auto",                -- auto | bwrap | unshare
+  allow_unisolated = false,        -- 无任何可用隔离后端（无 bwrap、unshare/userns 被内核拒绝，如 Android/Termux 拦 clone(CLONE_NEWUSER)）时：false（默认）硬拒；true 直跑（无隔离、写入直接落盘、不冻结候选）+ 告警 + 审计。仅受限设备上理解风险后开启
   offline = false,                 -- 网络默认放行（仅记录，不拦截）；true 时硬拒绝网络并隔离进程网络
-  require_seccomp = true,          -- 缺少 seccomp 能力时是否拒绝外部执行（默认开，fail-closed）
-  seccomp = { enabled = true, filter_path = "", allow_namespaces = true }, -- seccomp 基线（内置 denylist；默认开；仅 bwrap）。allow_namespaces=true（默认）时不再拦截嵌套命名空间（unshare/setns/clone(CLONE_NEW*)），容器运行时依赖它；设为 false 恢复拦截
+  require_seccomp = true,          -- true 时把 seccomp 视为必需（默认开）：缺 seccomp 能力时按 seccomp.on_unavailable 处置（默认降级放行 + 告警 + 审计；"deny" 恢复旧 fail-closed 硬拒）
+  -- seccomp 基线（内置 denylist；默认开）。bwrap 原生 `--seccomp`；unshare 后端起经 `setpriv --no-new-privs --seccomp-filter`（需 util-linux ≥ 2.32）补装。
+  --   allow_namespaces=true（默认）时不再拦截嵌套命名空间（unshare/setns/clone(CLONE_NEW*)），容器运行时依赖它；设为 false 恢复拦截。
+  --   on_unavailable：防御层缺失（seccomp 不可施加）时 "degrade"（默认，按三层行为模型降级：第 2 层 eBPF 行为兜底命中即 cgroup.kill / 第 3 层仅告警）/ "deny"（旧 fail-closed 硬拒）。
+  --   backstop：第 2 层后端 "ebpf"（默认，需 root+bpftrace+BTF+tracefs+cgroup）/ "off"（关闭）。
+  --   require_backstop：第 1、2 层均不可用时是否硬拒（默认 false = 放行+强告警+审计；true = 硬拒）。
+  seccomp = { enabled = true, filter_path = "", allow_namespaces = true,
+    on_unavailable = "degrade", backstop = "ebpf", require_backstop = false },
   cap_add = {},                    -- 全局额外 capability（默认空）；档位基线另加回 CAP_DAC_OVERRIDE + CAP_SETUID/CAP_SETGID（沙箱内降权，见 privilege.tiers），包安装/系统管理再按需加回。仅调试时才设 { "ALL" }
   -- 载荷运行身份：默认以 root 运行（uid=0），使 AI 能在沙箱内使用宿主工具链（/root 下的
   --   nvm/cargo/go 等 0700 目录非 root 不可遍历）与包管理（dpkg 硬检查 euid==0）。所有写入仍

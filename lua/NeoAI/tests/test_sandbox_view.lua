@@ -959,8 +959,13 @@ tests.suite("sandbox_view", function(_, it)
       t.true_(vim.tbl_contains(paths, "/proc/sys/kernel/core_pattern"), "空配置下仍应含 core_pattern")
       t.true_(vim.tbl_contains(paths, "/proc/sys/kernel/modprobe"), "空配置下仍应含 modprobe")
       local joined = table.concat(runtime.append_hidden_proc({}), " ")
-      t.true_(joined:find("/proc/sys/kernel/core_pattern", 1, true) ~= nil, "argv 应遮蔽 core_pattern")
-      t.true_(joined:find("/proc/sys/kernel/modprobe", 1, true) ~= nil, "argv 应遮蔽 modprobe")
+      -- 遮蔽以宿主真实路径为 ro-bind 源：宿主缺失该路径则跳过（Android/Termux 的 /proc 常缺）。
+      if vim.uv.fs_stat("/proc/sys/kernel/core_pattern") then
+        t.true_(joined:find("/proc/sys/kernel/core_pattern", 1, true) ~= nil, "argv 应遮蔽 core_pattern")
+      end
+      if vim.uv.fs_stat("/proc/sys/kernel/modprobe") then
+        t.true_(joined:find("/proc/sys/kernel/modprobe", 1, true) ~= nil, "argv 应遮蔽 modprobe")
+      end
     end)
     -- 整个 /proc/sys 只读绑定应出现在 bwrap 前缀中
     if runtime.backend() == "bwrap" then
@@ -1040,6 +1045,8 @@ tests.suite("sandbox_view", function(_, it)
   it("加固：/run 为每会话私有可写根（postinst 的 adduser 锁文件可用）", function(t)
     local runtime = require("NeoAI.sandbox.execution.runtime")
     t.true_(vim.tbl_contains(runtime.tmpfs_roots(), "/run"), "tmpfs_roots 应包含 /run")
+    -- 仅命名空间后端（init/bwrap/unshare）会实际挂载 /run；无后端（档 A seccomp）不产生挂载。
+    if runtime.backend() == nil then return end
     local joined = table.concat(runtime.process_prefix({ cwd = "/tmp" }) or {}, " ")
     -- 以 bind（会话私有目录）或 tmpfs 覆盖为可写（否则整机 overlay 下 /run 只读）
     local writable = joined:find("--tmpfs /run", 1, true) ~= nil

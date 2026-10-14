@@ -2012,10 +2012,67 @@ local function _gate_inner(tool, args, ctx, call_original)
 
   -- 外部进程：经运行时隔离执行；cwd 用 overlay 私有可写层，改动冻结为候选
   if spec.effect == "process" then
-    local ok_rt, rt_err = runtime.check_available()
+    -- check_available 对「防御层缺失」（seccomp 基线等）默认降级放行，返回 degrade_info；
+    -- 仅在 on_unavailable="deny" 或 require_backstop=true 且无兜底层时返回 false（硬拒）。
+    local ok_rt, rt_err, degrade_info = runtime.check_available({
+      tool = attempt.tool_name, command = args and args.command,
+    })
     if not ok_rt then
       control.transition(attempt, "FAILED")
       return async.reject({ kind = "sandbox", message = rt_err, command_id = attempt.command_id })
+    end
+    if degrade_info then
+      ctx.sandbox_degrade_info = degrade_info
+      -- 结果提示：仅用户可见（不进入模型上下文，与 T2 特权档提示一致）。
+      if degrade_info.layer == "seccomp" and degrade_info.fallback == "ebpf" then
+        ctx.ui_notice = ctx.ui_notice
+          or "[NeoAI] 沙箱降级：seccomp 不可用，已启用 eBPF 行为兜底（补救型，非等价于发生前拦截）"
+      elseif degrade_info.layer == "seccomp" then
+        ctx.ui_notice = ctx.ui_notice
+          or "[NeoAI] 沙箱降级：本次无行为强制层（seccomp 与 eBPF 兜底均不可用，仅告警）"
+      elseif degrade_info.fallback == "seccomp" then
+        ctx.ui_notice = ctx.ui_notice
+          or "[NeoAI] 沙箱降级：本机无命名空间隔离，已用 seccomp 行为级防护"
+            .. "（拦截 mount/unshare/ptrace/mknod 等危险 syscall；写入直接落盘、不冻结候选）"
+      end
+    end
+    -- 无隔离后端的两条降级路径（都不经 overlay/候选冻结，命令直接在宿主执行）：
+    --   * fallback="seccomp"：用 setpriv 施加 seccomp 行为级防护（危险 syscall 被拦）后执行；
+    --   * fallback="unisolated"：连 seccomp 都不可用 → 经用户弹窗确认后裸跑（无任何隔离）。
+    -- 绝不静默（告警/审计已在 check_available 记录）。
+    if degrade_info and (degrade_info.fallback == "seccomp" or degrade_info.fallback == "unisolated") then
+      local function _direct_run()
+        ctx.sandbox_cwd = _effective_cwd(ctx)
+        ctx.sandbox_env = runtime.sandbox_env()
+        if degrade_info.fallback == "seccomp" then
+          local seccomp = require("NeoAI.sandbox.execution.seccomp")
+          local f = seccomp.ensure_filter()
+          ctx.sandbox_prefix = f and seccomp.unshare_argv(f) or nil
+        else
+          ctx.sandbox_prefix = nil
+        end
+        ctx.sandbox_resident = false
+        return call_original()
+      end
+      if degrade_info.fallback == "seccomp" then
+        return _direct_run()
+      end
+      -- unisolated：先弹窗确认（headless 走 fail-closed 拒绝）。
+      local dd = async.Deferred.new()
+      runtime.unisolated_confirm(args and args.command):then_(function(allow)
+        if not allow then
+          control.transition(attempt, "FAILED")
+          dd:reject({ kind = "sandbox",
+            message = "沙箱拒绝（本机无任何隔离，且未获用户确认直跑）",
+            reason_codes = { "UNISOLATED_DENIED" }, command_id = attempt.command_id })
+          return
+        end
+        ctx.sandbox_unisolated = true
+        ctx.ui_notice = ctx.ui_notice
+          or "[NeoAI] 沙箱降级：本机无可用隔离，经确认后直跑（无隔离、写入直接落盘）"
+        dd:resolve(_direct_run())
+      end, function(e) dd:reject(e) end)
+      return dd
     end
     -- systemctl/journalctl 门面：独立调用在沙箱内路由到长驻服务，不触碰宿主 systemd；
     -- 门面不处理的动词/单元回退既有 T2/hostop 提案路径（见 docs/sandbox.md §5.1）。
@@ -2209,6 +2266,56 @@ local function _gate_inner(tool, args, ctx, call_original)
     -- 内核级行为观测（eBPF/strace/procfs）：优先复用后台预热好的探针；否则在命令前启动
     -- （不等待挂载完成，挂载异步进行，早期访问可能漏观测，由命令解析启发式兜底）。
     local observe_handle = _start_observe(cg_handle, attempt, ctx, prewarmed)
+
+    -- 第 2 层行为兜底：seccomp 基线不可用（seccomp_mode()=="none"）且 eBPF 观测可用时，
+    -- 挂载「危险 syscall 命中即整树终止」探针，作为补救型行为强制（非等价于 seccomp 发生前拦截）。
+    local backstop_handle = nil
+    do
+      local scfg = config_store.get("tools.sandbox.seccomp") or {}
+      -- 仅当 seccomp「已启用但无法施加」（防御层缺失）时启用兜底；用户在 enabled=false 下显式
+      -- 关闭 seccomp 视为主动选择，不另行施加兜底（可另行设 backstop="off" 关闭）。
+      local seccomp_on = require("NeoAI.sandbox.execution.seccomp").enabled()
+      if (scfg.backstop or "ebpf") ~= "off"
+        and seccomp_on and runtime.seccomp_mode() == "none" and cg_handle then
+        local observer = require("NeoAI.sandbox.observe.observer")
+        local stat = vim.uv.fs_stat(cg_handle.path)
+        if stat and type(observer.start_backstop) == "function"
+          and observer.backstop_available() then
+          local okbs, h = pcall(observer.start_backstop, {
+            cgroup_id = stat.ino,
+            on_violation = function(syscall, pid)
+              if ctx.sandbox_behavior_violation then return end
+              ctx.sandbox_behavior_violation = syscall
+              pcall(cgroup.kill, cg_handle)
+              pcall(function()
+                require("NeoAI.sandbox.review.evidence").add("sandbox_behavior_violation", {
+                  syscall = syscall, pid = pid, tool = attempt.tool_name,
+                  command = args and args.command, source = "observed",
+                }, { tool = attempt.tool_name, command_id = attempt.command_id,
+                  attempt_id = attempt.attempt_id })
+              end)
+              pcall(function()
+                require("NeoAI.kernel.event_bus").emit(
+                  require("NeoAI.kernel.events").SANDBOX_BEHAVIOR_VIOLATION, {
+                    syscall = syscall, pid = pid, command_id = attempt.command_id,
+                    attempt = attempt.attempt_id,
+                  })
+              end)
+              pcall(vim.notify,
+                "[NeoAI] 沙箱行为违规：检测到危险系统调用 " .. tostring(syscall) .. "，已终止命令",
+                vim.log.levels.WARN)
+            end,
+            on_error = function(msg)
+              require("NeoAI.kernel.logger").debug("[sandbox] 行为兜底观测: %s", tostring(msg))
+            end,
+          })
+          if okbs and h then
+            backstop_handle = h
+            ctx._sandbox_backstop = true
+          end
+        end
+      end
+    end
 
     -- 命令取消/超时/输出截断时真正终止整个进程树：bwrap 载荷在独立 pid 命名空间内，
     -- `jobstop` 只杀外层 bwrap，载荷可能继续存活；`cgroup.kill` 按资源域精确终止全部子进程。
@@ -2459,6 +2566,7 @@ local function _gate_inner(tool, args, ctx, call_original)
 
     local function _fail(msg)
       if observe_handle then pcall(observe_handle.stop); observe_handle = nil end
+      if backstop_handle then pcall(backstop_handle.stop); backstop_handle = nil end
       if ctx._resident_devwatch then pcall(ctx._resident_devwatch.stop); ctx._resident_devwatch = nil end
       if cg_handle then cgroup.release(cg_handle) end
       if deleg_handle then cgroup.release_delegated(deleg_handle); deleg_handle = nil end
@@ -2527,6 +2635,9 @@ local function _gate_inner(tool, args, ctx, call_original)
       observe_handle = nil
       if ctx._observe_handle then pcall(ctx._observe_handle.stop) end
       ctx._observe_handle = nil
+      -- 行为兜底观测句柄（第 2 层）：命令结束即停止探针。
+      if backstop_handle then pcall(backstop_handle.stop) end
+      backstop_handle = nil
       -- 常驻实例的每命令「仅设备」观测句柄（见 `_build_prefix`）：命令结束即停止。
       if ctx._resident_devwatch then pcall(ctx._resident_devwatch.stop) end
       ctx._resident_devwatch = nil
@@ -2536,6 +2647,24 @@ local function _gate_inner(tool, args, ctx, call_original)
     end
     local function finish(res, err)
       _stop_observe()
+      -- 第 2 层行为兜底命中：eBPF 观测到 seccomp 本应拦截的危险 syscall（如 mknod 创建设备节点），
+      -- 已 cgroup.kill 整树终止；此处释放资源并把本次命令判为失败（SANDBOX_BEHAVIOR_VIOLATION）。
+      -- 注意：这是补救型（该 syscall 副作用可能已发生一次），不等价于 seccomp 的发生前拦截。
+      if ctx.sandbox_behavior_violation then
+        if cg_handle then cgroup.release(cg_handle); cg_handle = nil end
+        if deleg_handle then cgroup.release_delegated(deleg_handle); deleg_handle = nil end
+        candidate.cleanup(attempt.attempt_id)
+        control.transition(attempt, "FAILED")
+        local sys = tostring(ctx.sandbox_behavior_violation)
+        d:reject({
+          kind = "sandbox",
+          message = "SANDBOX_BEHAVIOR_VIOLATION: " .. sys
+            .. "（行为兜底：seccomp 不可用，命中危险系统调用后已终止命令）",
+          reason_codes = { "SANDBOX_BEHAVIOR_VIOLATION:" .. sys },
+          command_id = attempt.command_id,
+        })
+        return
+      end
       -- 动态设备门禁：运行期观测到未允许的危险设备访问（`M._device_observe`）时，命令已被终止或
       -- 失败，此处释放资源并弹窗；批准后把设备重跑（绑定进命名空间），拒绝则报 DEVICE_ACCESS_DENIED。
       local dev_blocked = ctx.sandbox_device_blocked

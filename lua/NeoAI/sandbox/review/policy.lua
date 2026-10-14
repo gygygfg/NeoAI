@@ -166,7 +166,9 @@ function M.evaluate(facts)
   end
   if facts.effect == "process" then
     local runtime = require("NeoAI.sandbox.execution.runtime")
-    local ok, err = runtime.check_available()
+    -- 防御层缺失（seccomp 基线等）默认降级放行（check_available 记录降级/告警/审计），
+    -- 仅在 on_unavailable="deny" 或 require_backstop=true 且无兜底层时返回 false。
+    local ok, err = runtime.check_available({ tool = facts.tool, command = facts.command })
     if not ok then
       results[#results + 1] = { decision = "DENY", reason_codes = { err } }
     end

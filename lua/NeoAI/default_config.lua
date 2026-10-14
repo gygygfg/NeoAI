@@ -615,8 +615,19 @@ local DEFAULT_CONFIG = {
       -- 0 = 不等待（可能丢失最后一笔未完成的冻结/待审入队）。
       shutdown_timeout_ms = 3000,
       backend = "auto", -- auto | bwrap | unshare（外部隔离后端）
+      -- 无任何可用隔离后端（无 bwrap、unshare/userns 被内核拒绝，如 Android/Termux 拦
+      -- `clone(CLONE_NEWUSER)`）时的降级处置：
+      --   * 档 A（自动，无需配置）：`setpriv --seccomp-filter` 可用 → 施加 **seccomp 行为级防护**
+      --     （命令不经命名空间、写真实盘，但 denylist 拦截 mount/unshare/ptrace/mknod/bpf 等危险
+      --     syscall）。此为无语义隔离下的尽力保护，自动启用。
+      --   * 档 B：连 seccomp 都不可用（全失败）→ 默认硬拒（`SANDBOX_BACKEND_UNAVAILABLE`）；设本项
+      --     true 时降级为「直跑」（无任何隔离、写入直接落盘），**必须经用户弹窗确认**（headless
+      --     则拒绝），绝不静默（告警 + 审计）。安全优先默认 false。
+      allow_unisolated = false,
       offline = false, -- 网络默认放行（仅记录审计，不拦截）；true 时硬拒绝网络类工具并隔离进程网络
-      require_seccomp = true, -- true 时缺少 seccomp 能力则拒绝外部执行（默认开，fail-closed）
+      -- true 时把 seccomp 视为必需（默认开）：缺少 seccomp 能力时按 seccomp.on_unavailable 处置
+      -- （"degrade" 默认降级放行 + 告警 + 审计；"deny" 恢复旧 fail-closed 硬拒）。
+      require_seccomp = true,
       -- 载荷 capability：默认**最小权限**（`{}` → `--cap-drop ALL`）。需要的能力按命令
       -- **窄范围**加回：包安装经 `packages.cap_add`、系统管理命令（useradd/chown/passwd 等）
       -- 经 `privilege.sysadmin.cap_add`（见下），均只对命中的命令授予，普通命令不授予。
@@ -1384,15 +1395,29 @@ local DEFAULT_CONFIG = {
         disk_bytes = 64 * 1024 * 1024 * 1024, -- 64 GiB
       },
       seccomp_filter_path = "", -- 可选：编译后 seccomp BPF 过滤器路径（供 bwrap --seccomp）
-      -- seccomp 基线：默认开启；经 bwrap 在载荷上施加 denylist 过滤器（拦 mount/
+      -- seccomp 基线：默认开启；在载荷上施加 denylist 过滤器（拦 mount/
       -- unshare/ptrace/init_module/bpf 等）。与 --cap-drop ALL 共同构成纵深防御。
+      -- 施加方式：bwrap 后端经 `bwrap --seccomp FD`；unshare 后端经
+      -- `setpriv --no-new-privs --seccomp-filter <bpf> --`（需 util-linux ≥ 2.32）。
       seccomp = {
-        enabled = true, -- 是否施加 seccomp 基线（仅 bwrap 后端）
+        enabled = true, -- 是否施加 seccomp 基线（bwrap 原生 / unshare 经 setpriv）
         filter_path = "", -- 自定义过滤器路径；空则使用内置 denylist 生成
         -- 是否允许载荷创建**嵌套命名空间**（unshare/setns/clone(CLONE_NEW*)）。默认 true：
         -- 嵌套命名空间不改变宿主可见面（载荷仍受沙箱 mount/pid/遮蔽/overlay 约束），且容器运行时
         -- （podman/runc/buildah）依赖它。设为 false 恢复「拦截嵌套命名空间」的纵深防御。
         allow_namespaces = true,
+        -- 防御层缺失（seccomp 不可施加）时的处置，绝不静默：
+        --   "degrade"（默认）= 按三层行为模型降级——能上第 2 层（eBPF 行为兜底，命中即
+        --      cgroup.kill）则启用并放行；否则落第 3 层（无行为强制层，仅强告警 + 审计）。
+        --   "deny" = 恢复旧 fail-closed（缺 seccomp 能力即拒绝外部执行，报
+        --      SANDBOX_SECCOMP_UNAVAILABLE）。`require_seccomp=true` 亦按本项处置。
+        on_unavailable = "degrade",
+        -- 第 2 层行为兜底后端（seccomp 不可用时）："ebpf"（默认，需 root + bpftrace + BTF +
+        -- tracefs + cgroup v2）| "off"（关闭，直接落第 3 层）。命中危险 syscall 即终止命令并判失败。
+        backstop = "ebpf",
+        -- 第 3 层（seccomp 与 eBPF 兜底均不可用）是否硬拒：false（默认）= 降级放行 + 强告警 +
+        -- 审计；true = 硬拒（fail-closed，报 SANDBOX_BEHAVIOR_BACKSTOP_UNAVAILABLE）。
+        require_backstop = false,
       },
       -- 权限档位与自动提权（见 docs/sandbox.md §17）：命令默认以最小权限（T0）运行，
       -- 权限不足时自动「发起」升级请求（不静默执行）；T1 在隔离内自动执行并留痕，

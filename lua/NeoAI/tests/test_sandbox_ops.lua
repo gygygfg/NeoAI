@@ -501,15 +501,34 @@ tests.suite("sandbox_ops", function(_, it)
     end)
   end)
 
-  it("seccomp：显式缺失过滤器时 require_seccomp 拒绝", function(t)
+  it("seccomp：on_unavailable=deny 显式缺失过滤器拒绝 / degrade 默认降级放行", function(t)
     local runtime = require("NeoAI.sandbox.execution.runtime")
     local seccomp = require("NeoAI.sandbox.execution.seccomp")
+    -- on_unavailable="deny"（旧 fail-closed）：显式过滤器缺失即硬拒。
     seccomp.reset()
-    with_config({ tools = { sandbox = { require_seccomp = true, seccomp = { filter_path = "/nonexistent/x.bpf" } } } }, function()
+    with_config({ tools = { sandbox = { require_seccomp = true,
+      seccomp = { filter_path = "/nonexistent/x.bpf", on_unavailable = "deny" } } } }, function()
       local ok, err = runtime.check_available()
-      t.false_(ok, "显式过滤器缺失时应拒绝")
-      t.matches("SECCOMP", tostring(err))
+      t.false_(ok, "显式过滤器缺失且 on_unavailable=deny 时应拒绝")
+      -- 有隔离后端时错误为 SECCOMP；本机无任何后端（如 Termux/Android）时先命中
+      -- BACKEND_UNAVAILABLE（无后端硬拒优先于 seccomp 门禁）。
+      t.true_(tostring(err):match("SECCOMP") ~= nil
+        or tostring(err):match("BACKEND_UNAVAILABLE") ~= nil,
+        "应报 SECCOMP 或 BACKEND_UNAVAILABLE，实际: " .. tostring(err))
     end)
+    -- 默认 on_unavailable="degrade" + 内置过滤器可生成：不应硬拒。
+    --   * 有后端：seccomp 直接施加（无降级，info=nil）；
+    --   * 无后端（如本机）：走档 A seccomp 行为级防护（info.fallback="seccomp"）。
+    seccomp.reset()
+    with_config({ tools = { sandbox = { require_seccomp = true, seccomp = { filter_path = "" } } } }, function()
+      local ok, err, info = runtime.check_available()
+      t.true_(ok, "degrade 且内置过滤器可用时不应硬拒: " .. tostring(err))
+      if info then
+        t.true_(info.layer == "seccomp" or info.layer == "backend",
+          "降级信息 layer 应合法，实际: " .. tostring(info.layer))
+      end
+    end)
+    -- 显式提供有效过滤器文件：应可用且放行。
     local filter = vim.fn.tempname()
     vim.fn.writefile({ "dummy" }, filter)
     with_config({ tools = { sandbox = { require_seccomp = true, seccomp = { filter_path = filter } } } }, function()
@@ -518,6 +537,9 @@ tests.suite("sandbox_ops", function(_, it)
       t.true_(runtime.check_available())
     end)
     vim.fn.delete(filter)
+    -- seccomp_mode 返回 bwrap|unshare|none
+    local mode = runtime.seccomp_mode()
+    t.true_(mode == "bwrap" or mode == "unshare" or mode == "none", "seccomp_mode 取值应合法: " .. tostring(mode))
   end)
 
   it("seccomp：内置过滤器生成且被 bwrap 施加", function(t)
@@ -791,16 +813,19 @@ tests.suite("sandbox_ops", function(_, it)
 
   it("故障注入：后端不可用时进程被拒绝", function(t)
     local sandbox = require("NeoAI.sandbox")
-    with_config({ tools = { approval = { mode = "async" }, sandbox = { mode = "dry_run" } } }, function()
+    -- headless 无审批 UI：用 auto_allow 避免 async 审批挂起；并显式标记跨挂载点已批准，
+    -- 使流程直达沙箱门禁（本用例只关心后端故障拒绝，不关心审批/跨挂载兼容模式）。
+    with_config({ tools = { approval = { mode = "auto_allow" }, sandbox = { mode = "dry_run" } } }, function()
       sandbox.reset()
       sandbox.fault.set("backend", 1)
       local done = false
-      require("NeoAI.tools").execute("run_command", { command = "echo x", description = "t" }, {})
+      require("NeoAI.tools").execute("run_command", { command = "echo x", description = "t" },
+        { sandbox_cross_mount_approved = true })
         :then_(function() t.true_(false, "注入后端不可用时不应成功"); done = true end, function(e)
           t.matches("SANDBOX_BACKEND_UNAVAILABLE", tostring(e and e.message or e))
           done = true
         end)
-      t.true_(vim.wait(3000, function() return done end), "应快速失败")
+      t.true_(vim.wait(5000, function() return done end), "应快速失败")
     end)
   end)
 

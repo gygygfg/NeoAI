@@ -19,7 +19,33 @@ Invariants:
 3. `commit` publishes a frozen, validated, authorized candidate; it never re-runs the command.
 4. Hard denies cannot be overridden by human confirmation; unknown outcomes are not success.
 5. When the sandbox service is missing and `fail_closed=true`, execution is **rejected**
-   rather than silently downgraded.
+   rather than silently downgraded. **Exception — a missing defense layer** (seccomp baseline,
+   unshare `/proc/sys` masking) degrades per a three-layer behavioral model, and **never silently**:
+   - Layer 1 seccomp: bwrap natively `--seccomp`; the unshare backend applies it via
+     `setpriv --no-new-privs --seccomp-filter <bpf>` (util-linux >= 2.32). Preventive, kernel-enforced.
+   - Layer 2 eBPF backstop: when seccomp is unavailable, dangerous syscalls are observed and a hit
+     triggers `cgroup.kill` on the whole tree plus a failed attempt (**reactive**; the syscall's side
+     effect may already have happened once — not equivalent to seccomp's pre-execution interception).
+   - Layer 3 no behavioral enforcement: allow + loud warn + audit (`require_backstop=true` hard-denies).
+   - Every degradation writes evidence (`sandbox_degrade`) + emits `SANDBOX_DEGRADED` + `vim.notify`
+     (session-deduped) + a result note; `seccomp.on_unavailable="deny"` restores old fail-closed.
+   - Gateway (`GATEWAY_REQUIRES_BWRAP`) and privdrop (`SANDBOX_SETPRIV_UNAVAILABLE`) still
+     **hard-deny**. Additionally the unshare backend cannot apply **tier mounts / `cap_add`**
+     (Extra mounts), so those degrade too (ignore + warn + audit; the payload is userns-root, so
+     T0's `CAP_DAC_OVERRIDE`/`SETUID`/`SETGID` are effectively present).
+   - **No isolation backend at all** (no bwrap, unshare/userns rejected by the kernel, e.g.
+     Android/Termux blocking `clone(CLONE_NEWUSER)`):
+     - **Tier A (automatic)**: if `setpriv --seccomp-filter` works, apply a **seccomp behavioral
+       baseline** — the command runs without namespaces (writes land on disk) but the denylist still
+       blocks `mount`/`unshare`/`ptrace`/`mknod`/`bpf`/`init_module` etc. at the kernel level. Best
+       effort without semantic isolation; enabled automatically.
+     - **Tier B (all layers failed, seccomp unavailable too)**: hard-denied by default
+       (`SANDBOX_BACKEND_UNAVAILABLE`); with `tools.sandbox.allow_unisolated=true` it degrades to a
+       **direct run** (no isolation at all, writes land on disk) that **requires user confirmation
+       via a dialog** (headless → denied), with evidence + `SANDBOX_DEGRADED` event + `vim.notify` +
+       a result note (never silent). Off by default to keep sandbox protection.
+   - Text matching (`risk.deny_reason` etc.) only grades approvals and **never poses as a security
+     boundary**; no new dangerous-command text lists.
 
 ## 2. Modules
 
@@ -42,7 +68,7 @@ Invariants:
 | `sandbox/execution/cgroup.lua` | cgroup v2 resource domain (memory/PID/CPU), one per attempt |
 | `sandbox/execution/disk.lua` | Sandbox staging disk usage measurement and cap gate (async cached; rejects write/process tools when over) |
 | `sandbox/execution/background.lua` | Background-command detection (`&`/nohup/setsid) for gate promotion to a long-lived service |
-| `sandbox/execution/seccomp.lua` | seccomp capability probe and require_seccomp gate |
+| `sandbox/execution/seccomp.lua` | seccomp baseline generation and capability probe; bwrap natively / unshare via `setpriv --seccomp-filter`; `unshare_capable`/`unshare_argv` and degradation-aware gate |
 | `sandbox/state/cache.lua` | Content-addressed cache (isolated writes, prunable) |
 | `sandbox/observe/diag.lua` | Fault injection (backend/freeze/publish/store) and critical-path benchmarks; merges former `fault`+`bench` (old files are compat shims) |
 | `sandbox/execution/tool_spec.lua` | Per-tool effect class and staged path declaration |
@@ -3117,6 +3143,46 @@ After an external command, `risk.from_result({code,stdout,stderr})` parses resul
 (permission denied → L2, network failure → L1, package changes → L1, destructive output → L3),
 takes the max with the pre-call grade, records evidence and drives auto-escalation detection (§17).
 Read-only process tools record result grading too.
+
+### seccomp baseline and three-layer behavioral enforcement (with degradation)
+
+seccomp is the **only** boundary that can stop effects that bypass overlayfs (typically `mknod`/
+`mknodat` creating device nodes): it is **preventive and kernel-enforced**. Namespaces structurally
+neutralize `mount`/`chroot`/`pivot_root`/`unshare`/`setns`/`ptrace`. When a defense layer is missing,
+the sandbox degrades per a **three-layer behavioral model** and **never silently**:
+
+| Layer | Mechanism | Trigger | Semantics |
+| --- | --- | --- | --- |
+| 1 | seccomp baseline | `seccomp.enabled` and filter generatable and (bwrap or `setpriv` available) | preventive, pre-execution |
+| 2 | eBPF backstop | layer 1 missing and `observer.backend()=="ebpf"` and cgroup available | **reactive**: hit dangerous syscall → `cgroup.kill` whole tree, fail the attempt |
+| 3 | warn-only | layers 1 and 2 unavailable | allow + loud warn + audit (`require_backstop=true` hard-denies) |
+
+- **Layer 1 application**: bwrap backend `bwrap --seccomp 3` (fd 3 = filter); the unshare backend
+  applies it after `unshare` and before the real command via
+  `setpriv --no-new-privs --seccomp-filter <bpf> -- <cmd>` (the filter must be installed by the very
+  process that will `exec` the payload — seccomp is a per-thread process attribute and cannot be
+  installed cross-process). Requires util-linux >= 2.32 `setpriv --seccomp-filter`
+  (`seccomp.unshare_capable()` probes and caches).
+- **Layer 2 coverage** aligns with `seccomp.ARCH[*].blocked` (`mknod`/`mknodat`, `mount`/`umount2`,
+  `chroot`/`pivot_root`, `unshare`/`setns`, `ptrace`, `iopl`/`ioperm`, `init_module`/`finit_module`/
+  `delete_module`, `kexec_load`, `clock_settime`/`clock_adjtime`/`adjtimex`/`settimeofday`,
+  `bpf`/`perf_event_open`; `clone` only when `flags & 0x7E020000`). A hit runs `cgroup.kill` on the
+  attempt's isolated resource domain (no tree deletion, no touching the shared parent), writes
+  `sandbox_behavior_violation` evidence, emits `SANDBOX_BEHAVIOR_VIOLATION`, and fails the result
+  (`SANDBOX_BEHAVIOR_VIOLATION:<syscall>`).
+- **Never silent**: any degradation writes `sandbox_degrade` evidence + emits `SANDBOX_DEGRADED` +
+  `vim.notify` (per-layer session dedup) + a result note (layer 2 "eBPF backstop enabled (reactive)";
+  layer 3 "no behavioral enforcement layer (warn only)").
+- **Honest boundary**: layer 2 is reactive — the process is killed after the syscall, so its side
+  effect may already have happened once (e.g. a device node was created); the whole-root overlay/
+  read-only + candidate freeze contain the write surface but are **not equivalent** to seccomp's
+  pre-execution interception. Only the `seccomp` gate and the unshare `/proc/sys` masking gate are
+  degraded; other gates (backend missing, gateway, privdrop, tier mounts) still **hard-deny**.
+- **Config** (`tools.sandbox.seccomp`): `enabled` (default true), `filter_path`, `allow_namespaces`,
+  `on_unavailable` (`"degrade"` default | `"deny"` restores old fail-closed), `backstop` (`"ebpf"`
+  default | `"off"`), `require_backstop` (default false; true = hard-deny when layers 1 and 2 are both
+  unavailable). `:NeoAIDoctor` / `:NeoAISandboxCaps` report `seccomp_mode` (`bwrap`|`unshare`|`none`)
+  and backstop availability.
 
 ### 18.3 Container facade (`sandbox/execution/container.lua`)
 

@@ -157,6 +157,47 @@ end
 
 local DEVWATCH_SCRIPT = _build_devwatch_script()
 
+--- 生成 bpftrace **行为兜底**脚本：seccomp 基线不可用（第 1 层缺失）时，由 eBPF 观测危险
+--- syscall 的 `sys_enter` 探针，命中即输出 `V\t<syscall>\t<pid>`，由 wrapper 映射为
+--- `cgroup.kill` 整树终止（第 2 层，补救型行为兜底）。
+--- 覆盖集与 execution/seccomp.lua 的 `ARCH[*].blocked` 对齐（tracepoint 名为架构无关的符号名）。
+--- 为规避跨内核/架构字段名差异导致**整脚本编译失败**（一次失败即全部探针不挂载），
+--- 除 clone 外一律**不解引用参数**，仅记 syscall 名 + pid。
+--- clone 仅当 flags 命中 CLONE_NS_MASK(0x7E020000) 时记 V（与 seccomp 一致）。
+local function _build_backstop_script()
+  local L = {}
+  local function add(s) L[#L + 1] = s end
+  local names = {
+    "mknod", "mknodat",
+    "mount", "umount2",
+    "chroot", "pivot_root",
+    "unshare", "setns",
+    "ptrace",
+    "iopl", "ioperm",
+    "init_module", "finit_module", "delete_module",
+    "kexec_load",
+    "clock_settime", "clock_adjtime", "adjtimex", "settimeofday",
+    "bpf", "perf_event_open",
+  }
+  for _, n in ipairs(names) do
+    local tp = "sys_enter_" .. n
+    if _has_tp(tp) then
+      add('tracepoint:syscalls:' .. tp .. ' /cgroup == $1 && comm != "bwrap"/ {')
+      add('  printf("V\\t' .. n .. '\\t%d\\n", pid);')
+      add('}')
+    end
+  end
+  -- clone：仅嵌套命名空间标志命中时记（与 seccomp 的 clone 过滤一致）。
+  if _has_tp("sys_enter_clone") then
+    add('tracepoint:syscalls:sys_enter_clone /cgroup == $1 && comm != "bwrap"/ {')
+    add('  if (args->clone_flags & 0x7E020000) { printf("V\\tclone\\t%d\\n", pid); }')
+    add('}')
+  end
+  return table.concat(L, "\n")
+end
+
+local BACKSTOP_SCRIPT = _build_backstop_script()
+
 --- 当前脚本是否包含写入/删除探针（用于判断「写日志」是否可用）。
 local WRITES_AVAILABLE = _has_tp("sys_enter_openat") or _has_tp("sys_enter_open")
 
@@ -266,8 +307,17 @@ function M.parse_strace_line(line)
   return nil
 end
 
--- ========== 后端探测 ==========
+--- 解析一行行为兜底脚本输出为违规事件：`V\t<syscall>\t<pid>[\t<args摘要>]`。
+--- @param line string
+--- @return table|nil { kind="violation", syscall, pid }
+function M.parse_backstop_line(line)
+  if type(line) ~= "string" or line == "" then return nil end
+  local tag, sys, pid = line:match("^(%a)\t([^\t]+)\t(%d+)")
+  if tag ~= "V" or not sys then return nil end
+  return { kind = "violation", syscall = sys, pid = tonumber(pid) }
+end
 
+-- ========== 后端探测 ==========
 --- 探测各后端可用性（含内核条件），并按配置优先级给出选定后端。
 --- @return table { ebpf = {ok, reason}, strace = {ok, reason}, procfs = {ok, reason}, backend = string }
 function M.probe()
@@ -727,14 +777,83 @@ function M.start_devwatch(opts)
   return handle
 end
 
+--- 行为兜底观测（第 2 层）是否可用：需要 eBPF 后端（root + bpftrace + BTF + tracefs）。
+--- @return boolean
+function M.backstop_available()
+  return M.backend() == "ebpf"
+end
+
+--- 启动行为兜底观测：seccomp 基线不可用（第 1 层缺失）时，eBPF 观测危险 syscall 的
+--- sys_enter 探针（BACKSTOP_SCRIPT），命中回调 `on_violation(syscall, pid)`——由调用方
+--- 执行 `cgroup.kill` 整树终止并判该 attempt 失败（第 2 层，补救型）。
+--- @param opts table { cgroup_id, on_violation function(syscall, pid), on_error? function(msg) }
+--- @return table|nil handle
+--- @return string|nil err
+function M.start_backstop(opts)
+  opts = opts or {}
+  if M.backend() ~= "ebpf" then return nil, "OBSERVE_BACKEND_UNAVAILABLE" end
+  local cg_id = tonumber(opts.cgroup_id)
+  if not cg_id then return nil, "OBSERVE_NO_CGROUP" end
+  local handle = { backend = "ebpf", stopped = false, pending = "", ready = false }
+  local function dispatch(text)
+    if text == "" then return end
+    handle.ready = true
+    local pos = 1
+    while true do
+      local nl = text:find("\n", pos, true)
+      local rec = nl and text:sub(pos, nl - 1) or text:sub(pos)
+      if rec ~= "" then
+        local evt = M.parse_backstop_line(rec)
+        if evt and opts.on_violation then pcall(opts.on_violation, evt.syscall, evt.pid) end
+      end
+      if not nl then break end
+      pos = nl + 1
+    end
+  end
+  local job = vim.fn.jobstart({ "bpftrace", "-e", BACKSTOP_SCRIPT, tostring(cg_id) }, {
+    stdout_buffered = false,
+    stderr_buffered = false,
+    on_stdout = function(_, data)
+      if not data then return end
+      local text = ""
+      if #data > 1 then text = table.concat(data, "\n", 1, #data - 1) .. "\n" end
+      if #data >= 1 then handle.pending = handle.pending .. (data[#data] or "") end
+      if text ~= "" then dispatch(text) end
+    end,
+    on_stderr = function(_, data)
+      local msg = table.concat(data or {}, " ")
+      if msg:find("Attaching", 1, true) then handle.ready = true end
+      if opts.on_error and msg:find("ERROR", 1, true) then pcall(opts.on_error, msg) end
+    end,
+  })
+  if job <= 0 then return nil, "OBSERVE_BPFTRACE_SPAWN_FAILED" end
+  handle.job = job
+  --- 等待探针挂载完成（最多 ms 毫秒）；返回是否就绪。
+  function handle.wait_ready(ms)
+    if handle.ready then return true end
+    vim.wait(ms or 1000, function() return handle.ready end, 10)
+    return handle.ready
+  end
+  function handle.stop()
+    if handle.stopped then return end
+    handle.stopped = true
+    if handle.pending and handle.pending ~= "" then
+      local p = handle.pending
+      handle.pending = ""
+      pcall(dispatch, p)
+    end
+    pcall(vim.fn.jobstop, job)
+  end
+  return handle
+end
+
 --- 启动一次观测。
 --- @param opts table {
 ---   cgroup_id? number, cgroup_path? string, attempt_id? string,
 ---   on_event function(evt), on_error? function(msg), poll_ms? number }
 --- @return table|nil handle  { backend, stop() }
 --- @return string|nil err
-function M.start(opts)
-  opts = opts or {}
+function M.start(opts)  opts = opts or {}
   local backend = M.backend()
   if backend == "ebpf" then
     return _start_ebpf(opts)
@@ -761,5 +880,6 @@ end
 
 M._clean = _clean
 M.BTRACE_SCRIPT = BTRACE_SCRIPT
+M.BACKSTOP_SCRIPT = BACKSTOP_SCRIPT
 
 return M

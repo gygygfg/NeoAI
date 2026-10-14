@@ -37,6 +37,10 @@ local state = {
   store_root_canon = nil, -- store 根的规范化形式（避免逐文件 resolve）
   self_paths_cache = nil, -- { key = string, paths = string[] } 沙箱自有作用域路径（越界留痕排除用）
   self_runtime_cache = nil, -- { key = string, fn = function, roots = string[] } NeoAI 自身运行时/状态目录匹配器缓存
+  degrade = nil, -- 最近一次防御层降级信息 { layer, mode, reason, fallback }
+  degrade_notified = {}, -- 会话内 notify 去重（key -> true）
+  degrade_audited = {}, -- 证据/事件去重（key -> hrtime(ms)，抑制同一命令的重复评估）
+  unisolated_acked = nil, -- 档 B：本会话是否已确认「无隔离直跑」
 }
 
 -- 默认遮蔽的宿主敏感路径（安全默认，可经 tools.sandbox.mask_paths 覆盖）：
@@ -1378,7 +1382,9 @@ local function _probe()
     seccomp = false,
     checked_at = os.time(),
   }
-  -- 非特权 user namespace
+  -- 非特权 user namespace：优先读 sysctl；无该文件（如 Android/Termux、部分内核）时以
+  -- **功能实测**判定——不能仅凭「存在 unshare 二进制」就认定 userns 可用（Android/SELinux
+  -- 常拦截 `clone(CLONE_NEWUSER)`，会使 unshare 后端每条命令都 `Operation not permitted`）。
   local f = io.open("/proc/sys/kernel/unprivileged_userns_clone", "r")
   if f then
     local v = f:read("*a")
@@ -1386,6 +1392,7 @@ local function _probe()
     caps.userns = v:gsub("%s", "") == "1"
   else
     caps.userns = caps.unshare
+      and _run_probe({ "unshare", "--user", "--map-root-user", "true" })
   end
   -- bwrap：功能实测（仅存在二进制不够）。隐匿优先：root 下先试「无 user namespace」，
   -- 成功则采用（避免 uid_map/ns-user 泄露）；否则退回带 userns 的隔离。
@@ -2704,6 +2711,19 @@ function M.process_prefix(opts)
   opts = opts or {}
   local backend = M.backend()
   if not backend then
+    -- 无隔离后端（无 bwrap、unshare/userns 被内核拒绝，如 Android/Termux）：若 `setpriv` 可施加
+    -- seccomp，则用**行为级 seccomp 前缀**降级执行——不经命名空间/overlay（写真实盘、不冻结候选），
+    -- 但 denylist 仍拦截危险 syscall（mount/unshare/ptrace/mknod/bpf/init_module 等），比完全裸跑多
+    -- 一层内核强制防护。真正的「无后端且无 seccomp」直跑由 wrapper 的 unisolated 兜底（需用户确认）。
+    local seccomp = require("NeoAI.sandbox.execution.seccomp")
+    if seccomp.enabled() and not (opts.privileges and opts.privileges.seccomp == false) then
+      local f = seccomp.ensure_filter()
+      if f and seccomp.unshare_capable() then
+        -- setpriv 用 `--seccomp-filter <文件路径>` 装载（非 bwrap 的 fd3 机制），故无需 fd-close 包装。
+        local argv = seccomp.unshare_argv(f) -- { setpriv, --no-new-privs, --seccomp-filter, <bpf>, -- }
+        return _prepend_affinity(argv), nil, (opts.cwd or opts.fallback_cwd)
+      end
+    end
     return nil, "SANDBOX_BACKEND_UNAVAILABLE: 既无 bwrap 也无可用的 unshare/userns"
   end
   local cfg = config_store.get("tools.sandbox") or {}
@@ -3057,12 +3077,18 @@ function M.process_prefix(opts)
     -- mount 创建并进入容器命名空间，基线会拦截。其余命令照常施加。
     if seccomp.enabled() and not (priv and priv.seccomp == false) then
       local f, ferr = seccomp.ensure_filter()
-      if not f then
-        return nil, ferr or "SANDBOX_SECCOMP_UNAVAILABLE"
+      if f then
+        filter = f
+        table.insert(argv, "--seccomp")
+        table.insert(argv, "3")
+      else
+        local on_unavail = config_store.get("tools.sandbox.seccomp.on_unavailable") or "degrade"
+        if on_unavail == "deny" then
+          return nil, ferr or "SANDBOX_SECCOMP_UNAVAILABLE"
+        end
+        -- 防御层缺失：降级留痕（bwrap 路径；check_available 已按同一策略记录，此处幂等）。
+        M._degrade_or_deny({ layer = "seccomp", mode = "bwrap", reason = "filter_unavailable" })
       end
-      filter = f
-      table.insert(argv, "--seccomp")
-      table.insert(argv, "3")
     end
     -- 最小权限（root 启动 + 专用 uid）：bwrap 以 root 完成全部挂载后，仅**载荷**经 setpriv
     -- 降为专用非 root uid。载荷在宿主与命名空间内都非 root、无能力（bwrap 已 --cap-drop ALL，
@@ -3091,18 +3117,31 @@ function M.process_prefix(opts)
     end
     return _wrap_close_fds(_prepend_affinity(argv)), nil, opts.cwd
   end
-  -- unshare 后端：无 overlay 支持，退化为空暂存 cwd（仍隔离 net/pid/ipc/uts/user）
-  if require("NeoAI.sandbox.execution.seccomp").enabled() then
-    return nil, "SANDBOX_SECCOMP_UNAVAILABLE: unshare 后端不支持 seccomp 基线"
-  end
-  -- 档位提权（额外挂载 / 加回 capability）仅 bwrap 后端支持，不静默降级。
+  -- unshare 后端：无 overlay 支持，退化为空暂存 cwd（仍隔离 net/pid/ipc/uts/user）。
+  local scfg = config_store.get("tools.sandbox.seccomp") or {}
+  local strict = (scfg.on_unavailable or "degrade") == "deny"
+  -- 档位提权（额外挂载 / 加回 capability）仅 bwrap 后端支持：unshare 后端无法施加 mounts
+  -- （bind/overlay），但其 `--map-root-user` 已把载荷映射为 **userns 内 root**——T0 基线所需的
+  -- `CAP_DAC_OVERRIDE`/`CAP_SETUID`/`CAP_SETGID` 在 userns 作用域内等效具备（改 uid 只影响
+  -- 命名空间内），故默认降级放行（忽略档位 mounts/cap_add）并留痕；strict（on_unavailable="deny"）
+  -- 时恢复旧 fail-closed。T1/T2 的额外挂载（如受控 docker.sock）在 unshare 下不生效，属已知边界。
   if priv and ((priv.mounts and #priv.mounts > 0) or (priv.cap_add and #priv.cap_add > 0)) then
-    return nil, "SANDBOX_PRIVILEGE_UNSUPPORTED: unshare 后端不支持档位挂载/capability"
+    if strict then
+      return nil, "SANDBOX_PRIVILEGE_UNSUPPORTED: unshare 后端不支持档位挂载/capability"
+    end
+    M.note_degrade({
+      layer = "privilege", mode = "unshare",
+      reason = ((priv.mounts and #priv.mounts > 0) and "tier_mounts" or "tier_cap_add"),
+    })
   end
   -- 危险全局 sysctl 遮蔽（core_pattern/modprobe 等）需要 bind mount，仅 bwrap 后端支持。
-  -- unshare 后端下 root 的 euid 仍是全局 root，DAC 会放行写入 → 必须 fail-closed，不静默降级。
+  -- unshare 后端下 root 的 euid 仍是全局 root，DAC 会放行写入：默认按三层行为模型降级放行并留痕
+  -- （写入面仍受整机根只读/overlay + seccomp（若第 1 层生效）约束）；strict 时恢复旧 fail-closed。
   if #MANDATORY_PROC_MASKS > 0 then
-    return nil, "SANDBOX_SYSCTL_MASK_UNAVAILABLE: unshare 后端无法遮蔽 /proc/sys（core_pattern/modprobe 等）"
+    if strict then
+      return nil, "SANDBOX_SYSCTL_MASK_UNAVAILABLE: unshare 后端无法遮蔽 /proc/sys（core_pattern/modprobe 等）"
+    end
+    M.note_degrade({ layer = "sysctl_mask", mode = "unshare", reason = "proc_sys_unmaskable" })
   end
   local argv = { "unshare", "--user", "--map-root-user", "--mount", "--pid", "--fork",
     "--ipc", "--uts", "--mount-proc" }
@@ -3112,36 +3151,239 @@ function M.process_prefix(opts)
   if not want_net then
     table.insert(argv, "--net")
   end
+  -- seccomp 基线：unshare 无法自行施加（过滤器须由即将 exec 载荷的进程自身装载，seccomp 是
+  -- per-thread 进程属性），故经 setpriv 在 unshare 之后、真实命令之前补装（util-linux ≥ 2.32
+  -- 的 `--seccomp-filter`；由调用方把真实命令追加到 setpriv 的 `--` 之后）。缺 setpriv/过滤器时：
+  -- strict 仍硬拒；否则按三层模型降级留痕（第 2 层 eBPF 兜底由 wrapper 接线）。
+  local seccomp = require("NeoAI.sandbox.execution.seccomp")
+  if seccomp.enabled() and not (priv and priv.seccomp == false) then
+    local f = seccomp.ensure_filter()
+    if f and seccomp.unshare_capable() then
+      table.insert(argv, "--")
+      for _, v in ipairs(seccomp.unshare_argv(f)) do argv[#argv + 1] = v end
+    elseif strict then
+      if not f then
+        return nil, "SANDBOX_SECCOMP_UNAVAILABLE: 需要 seccomp 过滤器但未提供"
+      end
+      return nil, "SANDBOX_SECCOMP_UNAVAILABLE: unshare 后端缺少 setpriv --seccomp-filter，无法施加 seccomp 基线"
+    else
+      M._degrade_or_deny({
+        layer = "seccomp", mode = "unshare",
+        reason = (not f) and "filter_unavailable" or "setpriv_unavailable",
+      })
+    end
+  end
   return _wrap_close_fds(_prepend_affinity(argv)), nil, (opts.fallback_cwd or opts.cwd)
 end
 
---- 判断某 effect 是否可在当前环境隔离执行
+--- 记录一次防御层降级（绝不静默）：写证据 + 发事件 + 会话内去重告警。
+--- @param info table { layer="seccomp"|"sysctl_mask", mode?, reason?, fallback?, tool?, command? }
+--- @return table info
+function M.note_degrade(info)
+  info = info or {}
+  state.degrade = info
+  local key = tostring(info.layer) .. "|" .. tostring(info.mode or "") .. "|" .. tostring(info.fallback or "")
+  -- 告警：会话内按层去重（避免每条命令刷屏）。
+  if not state.degrade_notified[key] then
+    state.degrade_notified[key] = true
+    local msg
+    if info.layer == "seccomp" and info.fallback == "ebpf" then
+      msg = "[NeoAI] 沙箱降级：seccomp 不可用（" .. tostring(info.reason or "")
+        .. "），已启用 eBPF 行为兜底"
+    elseif info.layer == "seccomp" then
+      msg = "[NeoAI] 沙箱降级：seccomp 不可用（" .. tostring(info.reason or "")
+        .. "），本次无行为强制层（仅告警）"
+    elseif info.layer == "sysctl_mask" then
+      msg = "[NeoAI] 沙箱降级：unshare 后端无法遮蔽 /proc/sys（core_pattern/modprobe 等），已放行并留痕"
+    elseif info.layer == "privilege" then
+      msg = "[NeoAI] 沙箱降级：unshare 后端不支持档位挂载/capability（"
+        .. tostring(info.reason or "") .. "），已忽略并放行（载荷为 userns 内 root）"
+    elseif info.layer == "backend" and info.fallback == "seccomp" then
+      msg = "[NeoAI] 沙箱降级：本机无命名空间隔离（bwrap/unshare 均不可用），"
+        .. "已改用 seccomp 行为级防护（拦截 mount/unshare/ptrace/mknod 等危险 syscall；"
+        .. "写入直接落盘、不冻结候选）"
+    elseif info.layer == "backend" then
+      msg = "[NeoAI] 沙箱降级：本机无可用隔离后端（bwrap/unshare 均不可用），"
+        .. "已直跑（无隔离、写入直接落盘，不做候选冻结）"
+    else
+      msg = "[NeoAI] 沙箱降级：" .. tostring(info.layer)
+    end
+    pcall(vim.notify, msg, vim.log.levels.WARN)
+  end
+  -- 证据 + 事件：抑制同一命令内（<1.5s）的重复评估（审批与执行两处各评估一次）。
+  local now = vim.uv.hrtime() / 1e6
+  local last = state.degrade_audited[key]
+  if not last or (now - last) > 1500 then
+    state.degrade_audited[key] = now
+    pcall(function()
+      require("NeoAI.sandbox.review.evidence").add("sandbox_degrade", {
+        layer = info.layer, mode = info.mode, reason = info.reason, fallback = info.fallback,
+        tool = info.tool, command = info.command,
+      }, { source = "observed", tool = info.tool })
+    end)
+    pcall(function()
+      require("NeoAI.kernel.event_bus").emit(
+        require("NeoAI.kernel.events").SANDBOX_DEGRADED, {
+          layer = info.layer, mode = info.mode, reason = info.reason, fallback = info.fallback,
+        })
+    end)
+  end
+  return info
+end
+
+--- 最近一次降级信息（供结果提示/诊断；无降级时为 nil）。
+--- @return table|nil
+function M.last_degrade()
+  return state.degrade
+end
+
+--- 请求用户确认「无隔离直跑」（档 B：连 seccomp 都不可用）。经审批分流中心「工具行为」页弹窗，
+--- 会话内确认一次后本会话不再重复弹窗。headless / 无可用 UI → fail-closed（拒绝）。
+--- @param command string|nil 待执行命令（供弹窗展示）
+--- @return Deferred resolve(boolean 是否允许)
+function M.unisolated_confirm(command)
+  local async = require("NeoAI.utils.async")
+  local d = async.Deferred.new()
+  -- 本会话已确认过：直接允许。
+  if state.unisolated_acked then
+    d:resolve(true)
+    return d
+  end
+  local ok_hub, hub = pcall(require, "NeoAI.sandbox.review.approval_hub")
+  local interactive = vim.api.nvim_list_uis and #vim.api.nvim_list_uis() > 0
+  if not (ok_hub and hub and hub.available() and interactive) then
+    d:resolve(false) -- headless：fail-closed
+    return d
+  end
+  local done = false
+  hub.submit("behavior", {
+    title = "无隔离执行确认",
+    detail = {
+      "本机无任何可用隔离（无 bwrap/unshare，且 seccomp 不可用）。",
+      "命令将直接在宿主执行：无命名空间/overlay/seccomp，写入直接落盘、不冻结候选。",
+      "命令: " .. tostring(command or ""),
+    },
+    decisions = {
+      { key = "<CR>", label = "允许本次会话直跑", value = "allow" },
+      { key = "<Esc>", label = "拒绝", value = "deny" },
+    },
+    on_decision = function(v)
+      if done then return end
+      done = true
+      if v == "allow" then state.unisolated_acked = true end
+      d:resolve(v == "allow")
+    end,
+  })
+  pcall(hub.open_page, "behavior")
+  return d
+end
+
+--- 当前 seccomp 基线的施加方式（诊断用）。
+--- @return string "bwrap"|"unshare"|"none"
+function M.seccomp_mode()
+  local seccomp = require("NeoAI.sandbox.execution.seccomp")
+  if not seccomp.enabled() then return "none" end
+  if not seccomp.available() then return "none" end
+  local backend = M.backend()
+  if backend == "bwrap" then return "bwrap" end
+  if backend == "unshare" and seccomp.unshare_capable() then return "unshare" end
+  return "none"
+end
+
+--- 按三层行为模型处置「防御层缺失」：seccomp 不可施加且不允许硬拒时，能上第 2 层（eBPF 行为兜底）
+--- 则放行并标 fallback="ebpf"；否则落第 3 层（无行为强制层）——`require_backstop=true` 改硬拒。
+--- @param info table 降级信息
 --- @return boolean ok
 --- @return string|nil err
-function M.check_available()
+--- @return table|nil info
+function M._degrade_or_deny(info)
+  local scfg = config_store.get("tools.sandbox.seccomp") or {}
+  local backstop_on = (scfg.backstop or "ebpf") ~= "off"
+  local can_backstop = false
+  if backstop_on then
+    can_backstop = require("NeoAI.sandbox.observe.observer").backstop_available() == true
+  end
+  if can_backstop then
+    info.fallback = "ebpf"
+  else
+    info.fallback = "none"
+    if scfg.require_backstop == true then
+      M.note_degrade(info)
+      return false, "SANDBOX_BEHAVIOR_BACKSTOP_UNAVAILABLE: seccomp 不可用且无 eBPF 行为兜底层"
+        .. "（require_backstop=true）"
+    end
+  end
+  M.note_degrade(info)
+  return true, nil, info
+end
+
+--- 判断某 effect 是否可在当前环境隔离执行。
+--- 安全边界（后端缺失 / setpriv 降权 / 网关 / 档位挂载）缺失仍硬拒；「防御层缺失」（seccomp
+--- 基线、unshare 的 /proc/sys 遮蔽）按三层行为模型降级放行（默认）或经 on_unavailable="deny" 硬拒。
+--- @param opts table|nil { tool?, command? }（仅用于审计上下文）
+--- @return boolean ok
+--- @return string|nil err
+--- @return table|nil degrade_info
+function M.check_available(opts)
+  opts = opts or {}
   if require("NeoAI.sandbox.observe.fault").hit("backend") then
     return false, "SANDBOX_BACKEND_UNAVAILABLE: injected"
   end
   local backend = M.backend()
   if not backend then
+    local sb = config_store.get("tools.sandbox") or {}
+    -- 优先档 A：无命名空间，但 `setpriv --seccomp-filter` 可用 → 施加**行为级 seccomp** 防护
+    -- （不经命名空间、写真实盘，但危险 syscall 被 denylist 拦截）。本机（Android/Termux）可达。
+    local seccomp0 = require("NeoAI.sandbox.execution.seccomp")
+    if seccomp0.enabled() and seccomp0.ensure_filter() and seccomp0.unshare_capable() then
+      local info = { layer = "backend", mode = "none", reason = "no_backend", fallback = "seccomp" }
+      M.note_degrade(info)
+      return true, nil, info
+    end
+    -- 档 B：连 seccomp 都不可用（全失败）。默认硬拒；`allow_unisolated=true` 时降级为「直跑」
+    -- （无任何隔离、写入直接落盘），由 wrapper 弹窗确认后才执行，绝不静默（告警 + 审计）。
+    if sb.allow_unisolated == true then
+      local info = { layer = "backend", mode = "none", reason = "no_backend", fallback = "unisolated" }
+      M.note_degrade(info)
+      return true, nil, info
+    end
     return false, "SANDBOX_BACKEND_UNAVAILABLE: 既无 bwrap 也无可用的 unshare/userns"
   end
   local cfg = config_store.get("tools.sandbox") or {}
   -- root 启动 + 配置专用非 root uid 时需要 setpriv 降权；缺失则 fail-closed，
-  -- 绝不静默以 root 运行载荷。uid=0（默认）不降权，无需 setpriv。
+  -- 绝不静默以 root 运行载荷。uid=0（默认）不降权，无需 setpriv（安全边界，不降级）。
   if _is_root() then
     local uid = _payload_ids()
     if uid and uid > 0 and vim.fn.executable("setpriv") ~= 1 then
       return false, "SANDBOX_SETPRIV_UNAVAILABLE: root 启动需 setpriv 降权到 run_as.uid"
     end
   end
-  if cfg.require_seccomp then
-    local seccomp = require("NeoAI.sandbox.execution.seccomp")
-    if backend ~= "bwrap" then
-      return false, "SANDBOX_SECCOMP_UNAVAILABLE: 仅 bwrap 后端支持 seccomp 基线"
-    end
-    if not seccomp.available() then
-      return false, "SANDBOX_SECCOMP_UNAVAILABLE: 需要 seccomp 过滤器但未提供"
+  -- seccomp 门禁：可施加（bwrap 原生 / unshare 经 setpriv）则通过；不可施加时按 on_unavailable
+  -- 决定——"deny" 恢复旧 fail-closed（硬拒），否则按三层行为模型降级（第 2 层 eBPF 兜底 /
+  -- 第 3 层仅告警）。这是「防御层缺失」，不属安全边界，故可降级。
+  -- require_seccomp=false 表示「不把 seccomp 作为门禁」（seccomp.enabled=true 时仍在 process_prefix
+  -- 尽力施加，但缺失不阻断）——此时不做门禁/降级判定。
+  local seccomp = require("NeoAI.sandbox.execution.seccomp")
+  if cfg.require_seccomp ~= false and seccomp.enabled() then
+    local have_filter = seccomp.available()
+    local applied = have_filter and (backend == "bwrap" or seccomp.unshare_capable())
+    if not applied then
+      local on_unavail = config_store.get("tools.sandbox.seccomp.on_unavailable") or "degrade"
+      if on_unavail == "deny" then
+        if not have_filter then
+          return false, "SANDBOX_SECCOMP_UNAVAILABLE: 需要 seccomp 过滤器但未提供"
+        end
+        if backend == "unshare" then
+          return false, "SANDBOX_SECCOMP_UNAVAILABLE: unshare 后端缺少 setpriv --seccomp-filter，无法施加 seccomp 基线"
+        end
+        return false, "SANDBOX_SECCOMP_UNAVAILABLE: 仅 bwrap 后端支持 seccomp 基线"
+      end
+      local reason = (not have_filter) and "filter_unavailable"
+        or (backend == "unshare" and "setpriv_unavailable" or "backend_unsupported")
+      return M._degrade_or_deny({
+        layer = "seccomp", mode = backend, reason = reason,
+        tool = opts.tool, command = opts.command,
+      })
     end
   end
   return true
@@ -3221,6 +3463,10 @@ end
 --- 重置（测试用）
 function M.reset()
   state.caps = nil
+  state.degrade = nil
+  state.degrade_notified = {}
+  state.degrade_audited = {}
+  state.unisolated_acked = nil
   state.overlay_probe = {}
   state.overlay_probe_neg = {}
   state.overlay_write_probe = {}

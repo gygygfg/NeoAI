@@ -1,11 +1,14 @@
 --- 沙箱 seccomp 基线
 --- @module 'NeoAI.sandbox.execution.seccomp'
 --- 生成并施加 seccomp 基线（设计文档 §7.1）：默认 denylist（只拦危险 syscall）+
---- 设备节点屏障，架构不符直接 KILL。经 `bwrap --seccomp FD` 在沙箱载荷上施加
---- （bwrap 特权设置不被过滤）。
+--- 设备节点屏障，架构不符直接 KILL。在沙箱载荷上施加（特权设置不被过滤）：
+---   * bwrap 后端：`bwrap --seccomp FD`（FD 由 bwrap 自身关闭后转交过滤器）。
+---   * unshare 后端：`... -- setpriv --no-new-privs --seccomp-filter <bpf> -- <cmd>`
+---     （util-linux ≥ 2.32；由即将 exec 载荷的进程自身装载，见 M.unshare_argv）。
 ---
---- 默认开启（`tools.sandbox.seccomp.enabled=true`）；无可用过滤器时明确拒绝，
---- 不静默声称已施加。`require_seccomp=true` 时外部进程必须有可用过滤器。
+--- 默认开启（`tools.sandbox.seccomp.enabled=true`）；无可用过滤器时按三层行为模型降级
+--- （见 runtime.check_available / M.seccomp_mode），降级绝不静默。`require_seccomp=true`
+--- 或 `seccomp.on_unavailable="deny"` 时外部进程必须有可用过滤器（旧 fail-closed）。
 
 local config_store = require("NeoAI.kernel.config_store")
 local fs = require("NeoAI.utils.fs")
@@ -299,8 +302,47 @@ function M.bwrap_args(fd)
   return { "--seccomp", tostring(fd) }
 end
 
+-- ========== unshare 后端：setpriv 施加 seccomp ==========
+
+-- setpriv --seccomp-filter 支持性探测（进程内缓存：nil=未探测，true/false=结论）。
+local _unshare_ok = nil
+
+--- unshare 后端是否可经 setpriv 施加 seccomp 基线。
+--- 需要 util-linux ≥ 2.32（提供 `setpriv --seccomp-filter`）。注意过滤器必须由即将
+--- exec 载荷的进程自身装载（seccomp 是 per-thread 进程属性，无法跨进程代劳），
+--- 故只能在 unshare 之后、真实命令之前由 setpriv 装载。
+--- @return boolean
+function M.unshare_capable()
+  if _unshare_ok ~= nil then return _unshare_ok end
+  _unshare_ok = false
+  if vim.fn.executable("setpriv") == 1 then
+    -- `setpriv --help` 输出是否含 --seccomp-filter（旧版 util-linux 无此项）。
+    local out = vim.fn.system({ "setpriv", "--help" })
+    if type(out) == "string" and out:find("%-%-seccomp%-filter") then
+      _unshare_ok = true
+    end
+  end
+  return _unshare_ok
+end
+
+--- unshare 后端 seccomp 施加前缀：setpriv 装载过滤器后 exec 真实命令。
+--- 返回 `{ "setpriv", "--no-new-privs", "--seccomp-filter", <bpf>, "--" }`；
+--- 调用方在其后追加真实命令（setpriv 以 `--` 之后的程序替换自身进程映像）。
+--- @param filter_path string
+--- @return table
+function M.unshare_argv(filter_path)
+  return {
+    "setpriv",
+    "--no-new-privs",
+    "--seccomp-filter",
+    filter_path,
+    "--",
+  }
+end
+
 --- 重置（测试用）
 function M.reset()
+  _unshare_ok = nil
 end
 
 M._arch = _arch

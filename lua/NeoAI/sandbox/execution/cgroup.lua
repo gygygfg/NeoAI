@@ -616,19 +616,23 @@ end
 --- 立即终止资源域内所有进程（不删除目录，幂等）。
 --- 供命令取消/超时/输出截断时真正杀掉整个进程树：bwrap 载荷运行在独立 pid 命名空间内，
 --- `jobstop` 只杀外层 bwrap，载荷可能继续存活并占住 cgroup；`cgroup.kill` 按域精确终止。
+--- 委托句柄（prepare_delegated）优先作用于 `limit_path`（未暴露给沙箱的限额层 `path`）：
+--- `cgroup.kill` 会连同其下可写叶子 `leaf` 一并终止，避免只杀掉叶子而漏掉限额层内的进程。
 --- @param handle table
 function M.kill(handle)
-  if not handle or not handle.path then return end
+  if not handle then return end
+  local root = handle.limit_path or handle.path
+  if not root then return end
   local diag = _diag()
   if diag.enabled then
     local caller = diag.log_kill_caller and ("\n" .. debug.traceback("", 2)) or ""
-    local snap = diag.dump_cgroup_events and M.events_snapshot(handle.path) or nil
+    local snap = diag.dump_cgroup_events and M.events_snapshot(root) or nil
     require("NeoAI.kernel.logger").warn(
       "[sandbox:diag] cgroup.kill attempt=%s path=%s%s%s",
-      tostring(handle.attempt_id), handle.path, caller,
+      tostring(handle.attempt_id), root, caller,
       snap and (" events=" .. vim.inspect(snap)) or "")
   end
-  pcall(_write_file, handle.path .. "/cgroup.kill", "1")
+  pcall(_write_file, root .. "/cgroup.kill", "1")
 end
 
 --- 释放资源域：杀掉残留进程并删除子域（共享父域保留，供后续任务复用）。

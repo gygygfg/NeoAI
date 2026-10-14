@@ -266,9 +266,16 @@ sandbox = {
   postprocess = "async",           -- Process-command post-processing mode: async (default) = return the result to the main loop as soon as the process exits, while overlay capture/candidate freeze/staging merge/persist/settle run in the background (the FIFO slot is held until the background chain finishes so the next command sees consistent staging; subsequent read/write tools wait for in-flight post-processing); sync = wait for post-processing before returning (deterministic; tests inject this)
   shutdown_timeout_ms = 3000,      -- Max time (ms) to wait for background post-processing and staging migration on exit/close (`:qall`, plugin hot reload); the wait is abandoned on timeout so quitting never hangs; 0 = don't wait (the last unfinished freeze/pending enqueue may be lost)
   backend = "auto",                -- auto | bwrap | unshare
+  allow_unisolated = false,        -- When NO isolation backend is available (no bwrap, unshare/userns rejected by kernel, e.g. Android/Termux blocking clone(CLONE_NEWUSER)): false (default) hard-denies; true runs directly on the host (no isolation, writes land on disk, no candidate freeze) + warn + audit. Enable only on constrained devices with full awareness
   offline = false,                 -- Network allowed by default (recorded only, not blocked); true hard-denies network and isolates process networking
-  require_seccomp = true,          -- Reject external execution when seccomp is unavailable (default on, fail-closed)
-  seccomp = { enabled = true, filter_path = "", allow_namespaces = true }, -- seccomp baseline (built-in denylist; default on; bwrap only). allow_namespaces=true (default) no longer blocks nested namespaces (unshare/setns/clone(CLONE_NEW*)), required by container runtimes; set false to restore blocking
+  require_seccomp = true,          -- Treat seccomp as required (default on): when unavailable, handled per seccomp.on_unavailable (default: degrade + warn + audit; "deny" restores old fail-closed hard-deny)
+  -- seccomp baseline (built-in denylist; default on). bwrap natively via `--seccomp`; the unshare backend applies it via `setpriv --no-new-privs --seccomp-filter` (util-linux >= 2.32).
+  --   allow_namespaces=true (default) no longer blocks nested namespaces (unshare/setns/clone(CLONE_NEW*)), required by container runtimes; set false to restore blocking.
+  --   on_unavailable: when the defense layer is missing (seccomp cannot be applied) "degrade" (default: three-layer behavioral model — layer 2 eBPF backstop kills on dangerous syscall / layer 3 warn-only) | "deny" (old fail-closed hard-deny).
+  --   backstop: layer-2 backend "ebpf" (default; needs root+bpftrace+BTF+tracefs+cgroup) | "off".
+  --   require_backstop: hard-deny when layers 1 and 2 are both unavailable (default false = allow + loud warn + audit; true = hard-deny).
+  seccomp = { enabled = true, filter_path = "", allow_namespaces = true,
+    on_unavailable = "degrade", backstop = "ebpf", require_backstop = false },
   cap_add = {},                    -- Global extra capabilities (empty by default); the tier baseline adds CAP_DAC_OVERRIDE (see privilege.tiers), package installs/system administration add more on demand. Set { "ALL" } only for debugging
   -- Payload identity (least privilege): sandboxed processes run as a non-root user by default.
   -- Payload identity: runs as root by default (uid=0) so the AI can use host toolchains inside the
