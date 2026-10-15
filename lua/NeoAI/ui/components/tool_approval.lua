@@ -16,6 +16,7 @@ local state = {
   on_cancel = nil,
   on_confirm_all = nil,
   on_add_to_workspace = nil,
+  unwait = nil, -- services.wait 注销句柄（tool_service 未就绪时延迟注册）
 }
 
 -- ========== 私有函数 ==========
@@ -177,20 +178,28 @@ function M.hide()
   _close()
 end
 
---- 注册到 tool_service
+--- 注册到 tool_service。
+--- tool_service 属 phase 2、UI 属 phase 1：UI 初始化时 `services.tool_service` 往往尚未就绪，
+--- 直接 `use` 会拿到 nil 而静默跳过注册（approval_ui 恒为 nil），工具审批将退化为
+--- `vim.notify` + 静默放行。经 `services.wait` 延迟登记（已就绪则立即回调），
+--- 保证弹窗 UI 最终一定注册。
 function M.init()
-  local tool_service = services.use("services.tool_service")
-  if not tool_service then return end
-  tool_service.set_approval_ui({
-    show = M.show,
-    hide = M.hide,
-  })
+  if state.unwait then state.unwait() end
+  state.unwait = services.wait("services.tool_service", function(tool_service)
+    if tool_service and tool_service.set_approval_ui then
+      tool_service.set_approval_ui({ show = M.show, hide = M.hide })
+    end
+  end)
 end
 
 --- 重置（测试用）：关闭弹窗并解除 tool_service 注册
 function M.reset()
   _close()
   pcall(function() require("NeoAI.ui.focus").cancel_gate("tool_approval") end)
+  if state.unwait then
+    pcall(state.unwait)
+    state.unwait = nil
+  end
   local tool_service = services.use("services.tool_service")
   if tool_service then tool_service.set_approval_ui(nil) end
 end

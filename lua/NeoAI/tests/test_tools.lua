@@ -784,6 +784,33 @@ tests.suite("tools", function(_, it)
     end)
   end)
 
+  it("tool_approval.init 延迟注册：tool_service 未就绪时等待，就绪后自动注册（不再静默早退）", function(t)
+    -- 回归：UI 属 phase 1、tool_service 属 phase 2，UI 初始化时服务常未就绪。旧实现直接
+    -- `services.use` 判空 return → approval_ui 恒为 nil → 工具审批退化为 vim.notify + 静默放行。
+    local services = require("NeoAI.kernel.services")
+    local ts = require("NeoAI.services.tool_service")
+    local ta = require("NeoAI.ui.components.tool_approval")
+    local seen = {}
+    local orig = ts.set_approval_ui
+    ts.set_approval_ui = function(impl) seen[#seen + 1] = impl; return orig(impl) end
+    -- 确保 tool_service 未提供（模拟 UI 早于 tool_service 启动）。
+    local prev = services.use("services.tool_service")
+    if prev then services.revoke("services.tool_service", prev) end
+    ta.reset()
+    ta.init()
+    t.eq(0, #seen, "tool_service 未就绪时不应立即注册（应经 services.wait 等待）")
+    -- 服务就绪（provide 一个假实现）：同步触发 wait 回调。
+    local fake = { set_approval_ui = function(impl) seen[#seen + 1] = impl end }
+    services.provide("services.tool_service", fake)
+    local registered = false
+    for _, v in ipairs(seen) do if v ~= nil then registered = true end end
+    t.true_(registered, "tool_service 就绪后应自动注册审批 UI（否则审批退化为 vim.notify）")
+    services.revoke("services.tool_service", fake)
+    if prev then services.provide("services.tool_service", prev) end
+    ts.set_approval_ui = orig
+    ta.reset()
+  end)
+
   it("tool_service 把 ctx.ui_notice 作为 UI-only 元数据回传（不进入结果内容）", function(t)
     -- 工具执行需过沙箱门禁；无可用后端时跳过（否则被门禁拒绝，无法验证 ui_notice）。
     if require("NeoAI.sandbox.execution.runtime").backend() == nil then return end
