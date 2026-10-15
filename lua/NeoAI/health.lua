@@ -114,7 +114,8 @@ function M.collect()
     if has("docker") then caps[#caps + 1] = "docker" end
     local sandbox_status = #caps > 0 and "ok" or "warn"
     add("沙箱内核能力", sandbox_status, {
-      #caps > 0 and ("可用工具: " .. table.concat(caps, ", ")) or "未检测到 bwrap/unshare/docker；工具沙箱隔离能力受限。",
+      #caps > 0 and ("可用工具: " .. table.concat(caps, ", "))
+        or "未检测到 bwrap/unshare：无命名空间隔离后端，将禁用沙箱并退回审批模式（命令经事前审批后直接在宿主执行，写入直接落盘、不冻结候选）。",
       "详见 :NeoAISandboxCaps / docs/sandbox.md。",
     })
   end

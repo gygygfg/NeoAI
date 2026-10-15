@@ -97,6 +97,7 @@ tests.suite("sandbox_ops", function(_, it)
   end)
 
   it("任务授权：覆盖候选时自动应用并消费预算", function(t)
+    if require("NeoAI.sandbox.execution.runtime").backend() == nil then return end -- 无命名空间隔离后端时门禁直跑（退回审批），沙箱子系统不经此路径
     local fs = require("NeoAI.utils.fs")
     local sandbox = require("NeoAI.sandbox")
     local dir = vim.fn.tempname()
@@ -121,6 +122,7 @@ tests.suite("sandbox_ops", function(_, it)
   end)
 
   it("任务授权：范围外不覆盖 → 进入待审", function(t)
+    if require("NeoAI.sandbox.execution.runtime").backend() == nil then return end -- 无命名空间隔离后端时门禁直跑（退回审批），沙箱子系统不经此路径
     local fs = require("NeoAI.utils.fs")
     local sandbox = require("NeoAI.sandbox")
     local dir = vim.fn.tempname()
@@ -173,6 +175,7 @@ tests.suite("sandbox_ops", function(_, it)
   end)
 
   it("保留期清理与指标", function(t)
+    if require("NeoAI.sandbox.execution.runtime").backend() == nil then return end -- 无命名空间隔离后端时门禁直跑（退回审批），沙箱子系统不经此路径
     local fs = require("NeoAI.utils.fs")
     local sandbox = require("NeoAI.sandbox")
     with_config({ tools = { approval = { mode = "async" }, sandbox = { mode = "dry_run", retention = { candidate_days = -1 }, review = { enabled = true } } } }, function()
@@ -221,6 +224,7 @@ tests.suite("sandbox_ops", function(_, it)
   end)
 
   it("网络：默认放行并记录证据（不拦截）", function(t)
+    if require("NeoAI.sandbox.execution.runtime").backend() == nil then return end -- 无命名空间隔离后端时门禁直跑（退回审批），沙箱子系统不经此路径
     local sandbox = require("NeoAI.sandbox")
     local evidence = require("NeoAI.sandbox.review.evidence")
     local async = require("NeoAI.utils.async")
@@ -311,6 +315,7 @@ tests.suite("sandbox_ops", function(_, it)
   end)
 
   it("组合发布集合：合并多候选并 CAS 应用", function(t)
+    if require("NeoAI.sandbox.execution.runtime").backend() == nil then return end -- 无命名空间隔离后端时门禁直跑（退回审批），沙箱子系统不经此路径
     local fs = require("NeoAI.utils.fs")
     local sandbox = require("NeoAI.sandbox")
     with_config({ tools = { approval = { mode = "async" }, sandbox = { mode = "dry_run", review = { enabled = true } } } }, function()
@@ -508,17 +513,20 @@ tests.suite("sandbox_ops", function(_, it)
     seccomp.reset()
     with_config({ tools = { sandbox = { require_seccomp = true,
       seccomp = { filter_path = "/nonexistent/x.bpf", on_unavailable = "deny" } } } }, function()
-      local ok, err = runtime.check_available()
-      t.false_(ok, "显式过滤器缺失且 on_unavailable=deny 时应拒绝")
-      -- 有隔离后端时错误为 SECCOMP；本机无任何后端（如 Termux/Android）时先命中
-      -- BACKEND_UNAVAILABLE（无后端硬拒优先于 seccomp 门禁）。
-      t.true_(tostring(err):match("SECCOMP") ~= nil
-        or tostring(err):match("BACKEND_UNAVAILABLE") ~= nil,
-        "应报 SECCOMP 或 BACKEND_UNAVAILABLE，实际: " .. tostring(err))
+      local ok, err, info = runtime.check_available()
+      if runtime.backend() == nil then
+        -- 无命名空间隔离后端：沙箱不成立，直接退回审批（fallback="approval"），
+        -- seccomp 配置不再参与门禁（不再 seccomp-only 或硬拒）。
+        t.true_(ok, "无后端时应退回审批（放行交调用方处理）: " .. tostring(err))
+        t.eq("approval", info and info.fallback)
+      else
+        t.false_(ok, "显式过滤器缺失且 on_unavailable=deny 时应拒绝")
+        t.matches("SECCOMP", tostring(err))
+      end
     end)
     -- 默认 on_unavailable="degrade" + 内置过滤器可生成：不应硬拒。
     --   * 有后端：seccomp 直接施加（无降级，info=nil）；
-    --   * 无后端（如本机）：走档 A seccomp 行为级防护（info.fallback="seccomp"）。
+    --   * 无后端（如本机）：退回审批（info.layer="backend"、fallback="approval"）。
     seccomp.reset()
     with_config({ tools = { sandbox = { require_seccomp = true, seccomp = { filter_path = "" } } } }, function()
       local ok, err, info = runtime.check_available()
@@ -791,6 +799,7 @@ tests.suite("sandbox_ops", function(_, it)
   end)
 
   it("故障注入：发布失败不产生部分写入", function(t)
+    if require("NeoAI.sandbox.execution.runtime").backend() == nil then return end -- 无命名空间隔离后端时门禁直跑（退回审批），沙箱子系统不经此路径
     local fs = require("NeoAI.utils.fs")
     local sandbox = require("NeoAI.sandbox")
     with_config({ tools = { approval = { mode = "async" }, sandbox = { mode = "commit" } } }, function()
@@ -812,6 +821,7 @@ tests.suite("sandbox_ops", function(_, it)
   end)
 
   it("故障注入：后端不可用时进程被拒绝", function(t)
+    if require("NeoAI.sandbox.execution.runtime").backend() == nil then return end -- 无命名空间隔离后端时门禁直跑（退回审批），沙箱子系统不经此路径
     local sandbox = require("NeoAI.sandbox")
     -- headless 无审批 UI：用 auto_allow 避免 async 审批挂起；并显式标记跨挂载点已批准，
     -- 使流程直达沙箱门禁（本用例只关心后端故障拒绝，不关心审批/跨挂载兼容模式）。
@@ -830,6 +840,7 @@ tests.suite("sandbox_ops", function(_, it)
   end)
 
   it("故障注入：候选冻结失败被拒绝", function(t)
+    if require("NeoAI.sandbox.execution.runtime").backend() == nil then return end -- 无命名空间隔离后端时门禁直跑（退回审批），沙箱子系统不经此路径
     local fs = require("NeoAI.utils.fs")
     local sandbox = require("NeoAI.sandbox")
     with_config({ tools = { approval = { mode = "async" }, sandbox = { mode = "dry_run" } } }, function()
@@ -861,6 +872,7 @@ tests.suite("sandbox_ops", function(_, it)
   end)
 
   it("派生 revision：按内容拆分后重新审查且不迁移旧批准", function(t)
+    if require("NeoAI.sandbox.execution.runtime").backend() == nil then return end -- 无命名空间隔离后端时门禁直跑（退回审批），沙箱子系统不经此路径
     local fs = require("NeoAI.utils.fs")
     local sandbox = require("NeoAI.sandbox")
     with_config({ tools = { approval = { mode = "async" }, sandbox = { mode = "dry_run", review = { enabled = true } } } }, function()

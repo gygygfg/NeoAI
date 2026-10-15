@@ -2024,55 +2024,15 @@ local function _gate_inner(tool, args, ctx, call_original)
     if degrade_info then
       ctx.sandbox_degrade_info = degrade_info
       -- 结果提示：仅用户可见（不进入模型上下文，与 T2 特权档提示一致）。
+      -- 此处只可能是「后端存在时的防御层缺失」（seccomp 基线不可施加）；无命名空间后端的
+      -- 「禁用沙箱、退回审批模式」已在 M.gate 顶部提前处理，不进入本函数。
       if degrade_info.layer == "seccomp" and degrade_info.fallback == "ebpf" then
         ctx.ui_notice = ctx.ui_notice
           or "[NeoAI] 沙箱降级：seccomp 不可用，已启用 eBPF 行为兜底（补救型，非等价于发生前拦截）"
       elseif degrade_info.layer == "seccomp" then
         ctx.ui_notice = ctx.ui_notice
           or "[NeoAI] 沙箱降级：本次无行为强制层（seccomp 与 eBPF 兜底均不可用，仅告警）"
-      elseif degrade_info.fallback == "seccomp" then
-        ctx.ui_notice = ctx.ui_notice
-          or "[NeoAI] 沙箱降级：本机无命名空间隔离，已用 seccomp 行为级防护"
-            .. "（拦截 mount/unshare/ptrace/mknod 等危险 syscall；写入直接落盘、不冻结候选）"
       end
-    end
-    -- 无隔离后端的两条降级路径（都不经 overlay/候选冻结，命令直接在宿主执行）：
-    --   * fallback="seccomp"：用 setpriv 施加 seccomp 行为级防护（危险 syscall 被拦）后执行；
-    --   * fallback="unisolated"：连 seccomp 都不可用 → 经用户弹窗确认后裸跑（无任何隔离）。
-    -- 绝不静默（告警/审计已在 check_available 记录）。
-    if degrade_info and (degrade_info.fallback == "seccomp" or degrade_info.fallback == "unisolated") then
-      local function _direct_run()
-        ctx.sandbox_cwd = _effective_cwd(ctx)
-        ctx.sandbox_env = runtime.sandbox_env()
-        if degrade_info.fallback == "seccomp" then
-          local seccomp = require("NeoAI.sandbox.execution.seccomp")
-          local f = seccomp.ensure_filter()
-          ctx.sandbox_prefix = f and seccomp.unshare_argv(f) or nil
-        else
-          ctx.sandbox_prefix = nil
-        end
-        ctx.sandbox_resident = false
-        return call_original()
-      end
-      if degrade_info.fallback == "seccomp" then
-        return _direct_run()
-      end
-      -- unisolated：先弹窗确认（headless 走 fail-closed 拒绝）。
-      local dd = async.Deferred.new()
-      runtime.unisolated_confirm(args and args.command):then_(function(allow)
-        if not allow then
-          control.transition(attempt, "FAILED")
-          dd:reject({ kind = "sandbox",
-            message = "沙箱拒绝（本机无任何隔离，且未获用户确认直跑）",
-            reason_codes = { "UNISOLATED_DENIED" }, command_id = attempt.command_id })
-          return
-        end
-        ctx.sandbox_unisolated = true
-        ctx.ui_notice = ctx.ui_notice
-          or "[NeoAI] 沙箱降级：本机无可用隔离，经确认后直跑（无隔离、写入直接落盘）"
-        dd:resolve(_direct_run())
-      end, function(e) dd:reject(e) end)
-      return dd
     end
     -- systemctl/journalctl 门面：独立调用在沙箱内路由到长驻服务，不触碰宿主 systemd；
     -- 门面不处理的动词/单元回退既有 T2/hostop 提案路径（见 docs/sandbox.md §5.1）。
@@ -3121,7 +3081,35 @@ end
 --- @return Deferred
 function M.gate(tool, args, ctx, call_original)
   local cfg = config_store.get("tools.sandbox") or {}
-  if cfg.enabled == false and cfg.fail_closed == false then
+  if cfg.enabled == false then
+    -- 沙箱关闭：允许降级则直跑；否则交给 _gate_inner 按其 fail_closed 语义硬拒（不静默放行）。
+    if cfg.fail_closed == false then
+      return call_original()
+    end
+  elseif not runtime.isolation_available() then
+    -- 无命名空间隔离后端（无 bwrap、unshare/userns 被内核拒绝，如 Android/Termux）：沙箱不成立
+    -- → **禁用沙箱、退回原有审批模式**。所有经门禁的工具（process 与非进程工具）都不再套沙箱
+    -- 前缀/建 overlay/冻结候选，直接在宿主执行；事前阻塞审批（prompt）由 tools.executor 强制
+    -- （见 executor._execute_after_secret_guard 的 no_isolation 分支），复用既有工具审批弹窗。
+    -- 绝不静默：note_degrade 写 evidence + SANDBOX_DEGRADED 事件 + vim.notify（会话去重）；
+    -- ui_notice 仅用户可见，不进入模型上下文。
+    local info = runtime.note_degrade({
+      layer = "backend",
+      mode = "none",
+      reason = "no_backend",
+      fallback = "approval",
+      tool = tool and tool.name,
+      command = (type(args) == "table" and type(args.command) == "string") and args.command or nil,
+    })
+    ctx = ctx or {}
+    ctx.sandbox_degrade_info = info
+    ctx.ui_notice = ctx.ui_notice
+      or "[NeoAI] 无命名空间隔离：已禁用沙箱、退回审批模式"
+        .. "（命令经事前审批后直接在宿主执行；写入直接落盘、不冻结候选）"
+    ctx.sandbox_cwd = _effective_cwd(ctx)
+    ctx.sandbox_env = runtime.sandbox_env()
+    ctx.sandbox_prefix = nil
+    ctx.sandbox_resident = false
     return call_original()
   end
   local spec = tool and tool.__sandbox_spec or tool_spec.get(tool and tool.name, tool and tool.category)

@@ -178,6 +178,9 @@ tests.suite("sandbox_hardening", function(_, it)
   end)
 
   it("代理规避：默认弹窗拒绝（headless）；批准后放行；可配置 deny/allow", function(t)
+    -- 代理规避门禁位于沙箱进程门禁内；无命名空间隔离后端时沙箱被禁用（退回事前审批），
+    -- 门禁不经此路径（命令由用户逐条审批把关）。仅在有隔离后端的环境验证该门禁。
+    if require("NeoAI.sandbox.execution.runtime").backend() == nil then return end
     local tools = require("NeoAI.tools")
     ---@type table<string, any>
     local pc = require("NeoAI.sandbox.review.policy_consent")
@@ -336,31 +339,22 @@ tests.suite("sandbox_hardening", function(_, it)
     end)
   end)
 
-  it("seccomp：无隔离后端经 setpriv 前缀施加基线，mknod 被预防性拦截（第 1 层）", function(t)
+  it("无隔离后端：check_available 退回审批（fallback=approval），process_prefix 明确报错", function(t)
     local runtime = require("NeoAI.sandbox.execution.runtime")
-    local seccomp = require("NeoAI.sandbox.execution.seccomp")
-    -- 仅验证「无隔离后端 → 档 A setpriv seccomp 前缀」这条路径；有命名空间后端另有覆盖。
+    -- 仅验证「无命名空间隔离后端」这条路径；有 bwrap/unshare 后端另有覆盖。
     if runtime.backend() ~= nil then return end
-    if not seccomp.unshare_capable() then return end -- 无 setpriv --seccomp-filter，落第 2/3 层
-    seccomp.reset(); runtime.reset()
-    -- 直接取沙箱进程前缀（不经过 wrapper 的跨挂载点审批门，headless 下也能验证内核强制层）。
-    local prefix, err = runtime.process_prefix({ cwd = vim.fn.getcwd() })
-    t.not_nil(prefix, "档 A 应能构造进程前缀: " .. tostring(err))
-    local joined = table.concat(prefix, " ")
-    t.true_(joined:find("setpriv", 1, true) ~= nil and joined:find("--seccomp-filter", 1, true) ~= nil,
-      "前缀应经 setpriv --seccomp-filter 施加 seccomp，实际: " .. joined)
-    -- 在真实前缀下执行 mknod：应被 denylist 拒绝（EPERM），设备节点未创建。
-    local dev = vim.fn.tempname()
-    local argv = vim.list_extend(vim.deepcopy(prefix), {
-      "sh", "-c", "mknod " .. vim.fn.shellescape(dev) .. " b 8 0 2>&1; echo rc=$?",
-    })
-    local out = {}
-    local pid = vim.fn.jobstart(argv, { stdout_buffered = true, on_stdout = function(_, d) vim.list_extend(out, d) end })
-    local ok_wait = vim.wait(20000, function() return vim.fn.jobwait({ pid }, 0)[1] ~= -1 end)
-    t.true_(ok_wait, "命令应完成")
-    local text = table.concat(out, "\n")
-    t.true_(text:match("rc=1") ~= nil, "mknod 应被 seccomp 基线拒绝（rc=1），实际: " .. text)
-    t.true_(vim.uv.fs_stat(dev) == nil, "设备节点不应被创建")
+    runtime.reset()
+    t.false_(runtime.isolation_available(), "无后端时 isolation_available() 应为 false")
+    -- 契约：无后端不再 seccomp-only 放行或硬拒，而是返回 fallback="approval" 交调用方退回审批。
+    local ok, err, info = runtime.check_available({ tool = "run_command", command = "true" })
+    t.true_(ok, "无后端时 check_available 应放行（交调用方退回审批）: " .. tostring(err))
+    t.eq("backend", info and info.layer)
+    t.eq("approval", info and info.fallback)
+    t.eq("no_backend", info and info.reason)
+    -- process_prefix 不再构造任何前缀（既无 namespace 亦无 setpriv seccomp-only 降级）。
+    local prefix, perr = runtime.process_prefix({ cwd = vim.fn.getcwd() })
+    t.nil_(prefix, "无后端时不应构造任何沙箱前缀（含 setpriv seccomp-only）")
+    t.matches("BACKEND_UNAVAILABLE", tostring(perr))
   end)
 
   it("行为兜底：seccomp 不可用时 eBPF 命中触发 cgroup.kill 与 SANDBOX_BEHAVIOR_VIOLATION", function(t)
@@ -422,42 +416,70 @@ tests.suite("sandbox_hardening", function(_, it)
     end)
   end)
 
-  it("无隔离后端：档 A(seccomp) 优先，其次 allow_unisolated 决定直跑/硬拒", function(t)
+  it("无隔离后端：禁用沙箱、退回审批模式（wrapper.gate 直接放行原工具）", function(t)
     local runtime = require("NeoAI.sandbox.execution.runtime")
-    local seccomp = require("NeoAI.sandbox.execution.seccomp")
     if runtime.backend() ~= nil then return end -- 本机有可用后端则不适用
-    -- 档 A 可达性：setpriv --seccomp-filter 可用（本机 Android/Termux 可达）。
-    local tierA = seccomp.unshare_capable()
-    -- allow_unisolated=false：若档 A 可用则 seccomp 放行；否则硬拒。
-    with_config({ tools = { sandbox = { allow_unisolated = false, require_seccomp = true,
-      seccomp = { enabled = true } } } }, function()
-      seccomp.reset(); runtime.reset()
-      local ok, err, info = runtime.check_available()
-      if tierA then
-        t.true_(ok, "档 A 可用时应 seccomp 放行: " .. tostring(err))
-        t.eq("seccomp", info and info.fallback)
-        t.eq("backend", info and info.layer)
-      else
-        t.false_(ok, "无后端且未允许直跑时应硬拒")
-        t.matches("BACKEND_UNAVAILABLE", tostring(err))
-      end
+    local wrapper = require("NeoAI.sandbox.execution.wrapper")
+    local async = require("NeoAI.utils.async")
+    with_config({ tools = { sandbox = { require_seccomp = true, seccomp = { enabled = true } } } }, function()
+      runtime.reset()
+      -- 无后端：wrapper.gate 应在门禁顶部直接执行原工具（不套沙箱前缀/不建 overlay/不冻结候选），
+      -- 仅留下降级留痕与仅用户可见提示（绝不静默）。
+      local called = false
+      local tool = { name = "run_command", __sandbox_spec = { effect = "process", paths = {} } }
+      local ctx = {}
+      wrapper.gate(tool, { command = "echo hi" }, ctx, function()
+        called = true
+        return async.resolve({ code = 0 })
+      end)
+      t.true_(called, "无隔离时应直接执行原工具（不经沙箱门禁）")
+      t.nil_(ctx.sandbox_prefix, "无隔离直跑不应设置沙箱前缀")
+      t.eq(false, ctx.sandbox_resident, "无隔离直跑不应标记常驻沙箱")
+      t.not_nil(ctx.sandbox_cwd, "应设置会话工作目录供直跑使用")
+      t.not_nil(ctx.sandbox_degrade_info, "应记录降级信息（证据/事件/告警由 note_degrade 落）")
+      t.eq("approval", ctx.sandbox_degrade_info and ctx.sandbox_degrade_info.fallback)
+      t.not_nil(ctx.ui_notice, "应有仅用户可见的降级提示（不进入模型上下文）")
     end)
-    -- allow_unisolated=true：放行（档 A 优先 seccomp；否则 unisolated 直跑）。
-    with_config({ tools = { sandbox = { allow_unisolated = true, require_seccomp = true,
-      seccomp = { enabled = true } } } }, function()
-      seccomp.reset(); runtime.reset()
-      local ok, err, info = runtime.check_available()
-      t.true_(ok, "允许直跑/档 A 时应放行: " .. tostring(err))
-      t.true_(info and (info.fallback == "seccomp" or info.fallback == "unisolated"),
-        "fallback 应为 seccomp 或 unisolated，实际: " .. tostring(info and info.fallback))
-    end)
-    -- 关闭 seccomp 且未允许直跑：兜底硬拒。
-    with_config({ tools = { sandbox = { allow_unisolated = false, require_seccomp = false,
-      seccomp = { enabled = false } } } }, function()
-      seccomp.reset(); runtime.reset()
-      local ok, err = runtime.check_available()
-      t.false_(ok, "无 seccomp 且未允许直跑时应硬拒")
-      t.matches("BACKEND_UNAVAILABLE", tostring(err))
+  end)
+
+  it("无隔离后端：executor 退回审批模式（强制 prompt，经工具审批弹窗）", function(t)
+    local runtime = require("NeoAI.sandbox.execution.runtime")
+    if runtime.backend() ~= nil then return end -- 本机有可用后端则不适用
+    local executor = require("NeoAI.tools.executor")
+    local registry = require("NeoAI.tools.registry")
+    local async = require("NeoAI.utils.async")
+    -- 注册一个合成 process 工具（tool_spec 未命中 → 归为 process），避免依赖插件加载的内置工具。
+    local name = "neoai_test_noiso_cmd"
+    registry.register({
+      name = name,
+      description = "测试用命令工具",
+      parameters = {
+        type = "object",
+        properties = { command = { type = "string" }, description = { type = "string" } },
+        required = { "command", "description" },
+      },
+      func = function() return "real-exec" end,
+    })
+    -- 配置为 async（默认）：async 依赖沙箱内先执行再事后确认应用，无沙箱时不成立，
+    -- 故无隔离时应被强制退回 prompt（事前阻塞审批）。
+    with_config({ tools = { sandbox = { enabled = true }, approval = { mode = "async" } } }, function()
+      runtime.reset()
+      local seen_mode, called = nil, false
+      local ctx = {
+        approval_mode = "async", -- 会话默认；无隔离时应被覆盖为 prompt
+        tool_service = {
+          approve_and_execute = function(_, _, actx, _)
+            seen_mode = actx.approval_mode
+            called = true
+            return async.resolve("stub-result")
+          end,
+        },
+      }
+      executor.execute(name, { command = "echo hi", description = "t" }, ctx)
+      t.true_(called, "无隔离时应经审批模式（prompt）走 approve_and_execute")
+      t.eq("prompt", seen_mode, "无隔离时 approval_mode 应被强制为 prompt")
+      t.eq("prompt", ctx.approval_mode, "ctx.approval_mode 应被设为 prompt")
+      t.not_nil(ctx.ui_notice, "应有仅用户可见的退回审批提示（不进入模型上下文）")
     end)
   end)
 end)

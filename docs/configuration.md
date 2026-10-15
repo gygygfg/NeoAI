@@ -248,6 +248,10 @@ approval = {
 > `allowed_directories` 为**全局工作区允许目录**（对所有工具生效，且**包含其所有子目录**）；
 > 工具自身与 `per_tool` 的条目与之**并集**合并，只追加不覆盖。文件类工具只按路径判定
 > （无命令参数时不要求命令白名单），故配置工作区目录后其子目录无需逐个审批。
+>
+> **无隔离回退**：当宿主无任何命名空间隔离后端（`runtime.isolation_available()` 为 false，如
+> Android/Termux）时，沙箱被禁用并**退回审批模式**——`async` 会被强制为 `prompt`（命令经事前
+> 阻塞审批后直接在宿主执行），用户显式配置的 `prompt`/`strict`/`auto_allow` 予以保留。
 > 亦可在 `:NeoAISandboxReview`「资源访问」页按 `E` 打开目录编辑器热增删本列表（及遮蔽目录
 > `sandbox.mask_dirs`、切换 `sandbox.mask_dirs_enabled`）——**仅当前会话生效，不写盘**。
 
@@ -263,7 +267,10 @@ sandbox = {
   postprocess = "async",           -- 进程命令后处理模式：async（默认）= 命令进程退出后立即返回结果给主循环，overlay 捕获/候选冻结/暂存合并/落盘/结算在后台完成（FIFO 槽位保持到后台完成，保证下一命令看到一致暂存；后续读写工具会等待在途后处理）；sync = 等待后处理完成后再返回（确定性，测试默认）
   shutdown_timeout_ms = 3000,      -- 退出/关闭（`:qall`、插件热重载）时等待后台后处理与暂存迁移完成的最长时间（ms）；超时即放弃等待，避免卡住退出；0 = 不等待（可能丢失最后一笔未完成的冻结/待审入队）
   backend = "auto",                -- auto | bwrap | unshare
-  allow_unisolated = false,        -- 无任何可用隔离后端（无 bwrap、unshare/userns 被内核拒绝，如 Android/Termux 拦 clone(CLONE_NEWUSER)）时：false（默认）硬拒；true 直跑（无隔离、写入直接落盘、不冻结候选）+ 告警 + 审计。仅受限设备上理解风险后开启
+  -- 无任何可用隔离后端（无 bwrap、unshare/userns 被内核拒绝，如 Android/Termux 拦 clone(CLONE_NEWUSER)）时：
+  --   沙箱不成立 → **禁用沙箱、退回原有审批模式**（命令不套沙箱前缀/不建 overlay/不冻结候选，直接在宿主执行、
+  --   写入直接落盘；强制事前阻塞审批，async 退回 prompt）。绝不静默（证据 + SANDBOX_DEGRADED 事件 + 告警 + 结果提示）。
+  --   无 allow_unisolated 之类开关：无隔离即退回审批，由审批弹窗把关。
   offline = false,                 -- 网络默认放行（仅记录，不拦截）；true 时硬拒绝网络并隔离进程网络
   require_seccomp = true,          -- true 时把 seccomp 视为必需（默认开）：缺 seccomp 能力时按 seccomp.on_unavailable 处置（默认降级放行 + 告警 + 审计；"deny" 恢复旧 fail-closed 硬拒）
   -- seccomp 基线（内置 denylist；默认开）。bwrap 原生 `--seccomp`；unshare 后端起经 `setpriv --no-new-privs --seccomp-filter`（需 util-linux ≥ 2.32）补装。

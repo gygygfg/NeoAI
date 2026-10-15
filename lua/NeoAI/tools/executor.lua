@@ -585,6 +585,22 @@ local function _execute_after_secret_guard(tool, resolved, args, ctx)
   local approval_config = registry.get_approval_config(resolved)
   local mode = ctx.approval_mode or config_store.get("tools.approval.mode") or "async"
   local spec = tool_spec.get(resolved)
+  -- 无命名空间隔离后端（无 bwrap、unshare/userns 被内核拒绝，如 Android/Termux）：沙箱不成立，
+  -- 退回**原有审批模式**（事前阻塞审批；批准后命令直接在宿主执行）。async 依赖沙箱内先执行、
+  -- 事后异步确认应用，无沙箱时不成立，故退回 prompt。用户显式配置的 prompt/strict/auto_allow
+  -- 予以保留（strict 更严，不得被降级为 prompt）。降级留痕由沙箱门禁（wrapper.gate）写
+  -- evidence/事件/告警；此处只补一条仅用户可见的结果提示。
+  local sandbox_cfg = config_store.get("tools.sandbox") or {}
+  local no_isolation = sandbox_cfg.enabled ~= false and not require("NeoAI.sandbox.execution.runtime").isolation_available()
+  if no_isolation and mode == "async" then
+    mode = "prompt"
+  end
+  if no_isolation then
+    ctx.approval_mode = mode
+    ctx.ui_notice = ctx.ui_notice
+      or "[NeoAI] 无命名空间隔离：已禁用沙箱、退回审批模式"
+        .. "（命令经事前审批后直接在宿主执行；写入直接落盘、不冻结候选）"
+  end
   local masked_hit, masked_hard = _masked_target(resolved, args, ctx)
   local approval_on = config_store.get("tools.sandbox.mask_dirs_approval") ~= false
   -- 进程内读写（read/fs_write）不受 mount 遮蔽约束，必须显式拦截；外部进程（process/network）
@@ -616,7 +632,7 @@ local function _execute_after_secret_guard(tool, resolved, args, ctx)
   -- `/mnt/<uuid>`）时，命令视图会只投影出 overlay upper 里被物化的暂存文件，chdir 也可能
   -- 因路径在该视图不存在而失败。经审批悬浮窗确认后，本次命令退回「整机只读 + 工作区单层
   -- overlay」兼容模式（见 sandbox/wrapper.build_overlay_specs 的 no_root_overlay）。
-  if spec.effect == "process" and ctx.sandbox_cross_mount_approved ~= true then
+  if spec.effect == "process" and ctx.sandbox_cross_mount_approved ~= true and not no_isolation then
     local rt = require("NeoAI.sandbox.execution.runtime")
     local cwd = ctx.sandbox_exec_cwd or vim.fn.getcwd()
     local mount_root = rt.cross_mount_root(cwd)

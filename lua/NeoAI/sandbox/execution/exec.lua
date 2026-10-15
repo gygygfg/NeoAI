@@ -212,8 +212,9 @@ function M.open(argv, opts)
     if cfg.fail_closed ~= false then return nil, nil, err end
     return argv, function() end, nil
   end
-  -- 无隔离后端且显式允许直跑：返回原 argv（不套沙箱前缀）。
-  if deg and deg.fallback == "unisolated" then
+  -- 无命名空间隔离后端：沙箱不成立，退回审批模式（由 executor 强制事前 prompt 审批后直接在宿主
+  -- 执行）。此处返回原 argv、不套沙箱前缀（无 overlay/无候选冻结），保证进程内工具的子进程直跑。
+  if deg and deg.fallback == "approval" then
     return argv, function() end, nil
   end
   local roots = _norm_dirs(opts.writable_roots, true)

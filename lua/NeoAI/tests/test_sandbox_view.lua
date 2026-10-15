@@ -1045,7 +1045,7 @@ tests.suite("sandbox_view", function(_, it)
   it("加固：/run 为每会话私有可写根（postinst 的 adduser 锁文件可用）", function(t)
     local runtime = require("NeoAI.sandbox.execution.runtime")
     t.true_(vim.tbl_contains(runtime.tmpfs_roots(), "/run"), "tmpfs_roots 应包含 /run")
-    -- 仅命名空间后端（init/bwrap/unshare）会实际挂载 /run；无后端（档 A seccomp）不产生挂载。
+    -- 仅命名空间后端（bwrap/unshare）会实际挂载 /run；无后端时沙箱禁用（退回审批）不产生挂载。
     if runtime.backend() == nil then return end
     local joined = table.concat(runtime.process_prefix({ cwd = "/tmp" }) or {}, " ")
     -- 以 bind（会话私有目录）或 tmpfs 覆盖为可写（否则整机 overlay 下 /run 只读）

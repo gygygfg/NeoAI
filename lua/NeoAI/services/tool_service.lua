@@ -289,7 +289,9 @@ end
 --- @return Deferred
 function M.approve_and_execute(tool_name, args, ctx, continue_fn)
   local d = async.Deferred.new()
-  local mode = _current_mode()
+  -- 优先取调用方 ctx 指定的模式：无命名空间隔离后端时 executor 会强制 approval_mode="prompt"
+  -- （禁用沙箱、退回事前阻塞审批），需覆盖配置里的 async/auto_allow。
+  local mode = (ctx and ctx.approval_mode) or _current_mode()
 
   -- auto_allow 模式直接执行
   if mode == "auto_allow" then

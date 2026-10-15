@@ -40,7 +40,6 @@ local state = {
   degrade = nil, -- 最近一次防御层降级信息 { layer, mode, reason, fallback }
   degrade_notified = {}, -- 会话内 notify 去重（key -> true）
   degrade_audited = {}, -- 证据/事件去重（key -> hrtime(ms)，抑制同一命令的重复评估）
-  unisolated_acked = nil, -- 档 B：本会话是否已确认「无隔离直跑」
 }
 
 -- 默认遮蔽的宿主敏感路径（安全默认，可经 tools.sandbox.mask_paths 覆盖）：
@@ -2702,6 +2701,14 @@ function M.backend()
   return nil
 end
 
+--- 本机是否有可用的命名空间隔离后端（bwrap 或 unshare/userns）。
+--- 这是「隔离是否可用」的**唯一**判定：无后端时沙箱不成立，调用方应禁用沙箱并退回审批模式
+--- （见 wrapper.gate / executor），而不是以 seccomp-only 或完全裸跑「降级直跑」。
+--- @return boolean
+function M.isolation_available()
+  return M.backend() ~= nil
+end
+
 --- 构造外部进程 argv 前缀
 --- @param opts table { cwd?, upper?, work?, fallback_cwd?, session_tmp_dir?, network?, privileges? = { tier, cap_add, mounts, unmask, network, userns } }
 --- @return table|nil prefix
@@ -2711,19 +2718,9 @@ function M.process_prefix(opts)
   opts = opts or {}
   local backend = M.backend()
   if not backend then
-    -- 无隔离后端（无 bwrap、unshare/userns 被内核拒绝，如 Android/Termux）：若 `setpriv` 可施加
-    -- seccomp，则用**行为级 seccomp 前缀**降级执行——不经命名空间/overlay（写真实盘、不冻结候选），
-    -- 但 denylist 仍拦截危险 syscall（mount/unshare/ptrace/mknod/bpf/init_module 等），比完全裸跑多
-    -- 一层内核强制防护。真正的「无后端且无 seccomp」直跑由 wrapper 的 unisolated 兜底（需用户确认）。
-    local seccomp = require("NeoAI.sandbox.execution.seccomp")
-    if seccomp.enabled() and not (opts.privileges and opts.privileges.seccomp == false) then
-      local f = seccomp.ensure_filter()
-      if f and seccomp.unshare_capable() then
-        -- setpriv 用 `--seccomp-filter <文件路径>` 装载（非 bwrap 的 fd3 机制），故无需 fd-close 包装。
-        local argv = seccomp.unshare_argv(f) -- { setpriv, --no-new-privs, --seccomp-filter, <bpf>, -- }
-        return _prepend_affinity(argv), nil, (opts.cwd or opts.fallback_cwd)
-      end
-    end
+    -- 无命名空间隔离后端（无 bwrap、unshare/userns 被内核拒绝，如 Android/Termux）：沙箱不成立。
+    -- 不再构造 seccomp-only 前缀降级直跑——由 wrapper.gate / executor 在无隔离时禁用沙箱、退回
+    -- 审批模式（强制事前 prompt 审批后直接在宿主执行）。此处返回明确错误，绝不静默降级。
     return nil, "SANDBOX_BACKEND_UNAVAILABLE: 既无 bwrap 也无可用的 unshare/userns"
   end
   local cfg = config_store.get("tools.sandbox") or {}
@@ -3198,13 +3195,9 @@ function M.note_degrade(info)
     elseif info.layer == "privilege" then
       msg = "[NeoAI] 沙箱降级：unshare 后端不支持档位挂载/capability（"
         .. tostring(info.reason or "") .. "），已忽略并放行（载荷为 userns 内 root）"
-    elseif info.layer == "backend" and info.fallback == "seccomp" then
-      msg = "[NeoAI] 沙箱降级：本机无命名空间隔离（bwrap/unshare 均不可用），"
-        .. "已改用 seccomp 行为级防护（拦截 mount/unshare/ptrace/mknod 等危险 syscall；"
-        .. "写入直接落盘、不冻结候选）"
     elseif info.layer == "backend" then
-      msg = "[NeoAI] 沙箱降级：本机无可用隔离后端（bwrap/unshare 均不可用），"
-        .. "已直跑（无隔离、写入直接落盘，不做候选冻结）"
+      msg = "[NeoAI] 无命名空间隔离（bwrap/unshare 均不可用）：已禁用沙箱、退回审批模式"
+        .. "（本次命令经事前审批后直接在宿主执行；写入直接落盘、不冻结候选）"
     else
       msg = "[NeoAI] 沙箱降级：" .. tostring(info.layer)
     end
@@ -3235,47 +3228,6 @@ end
 --- @return table|nil
 function M.last_degrade()
   return state.degrade
-end
-
---- 请求用户确认「无隔离直跑」（档 B：连 seccomp 都不可用）。经审批分流中心「工具行为」页弹窗，
---- 会话内确认一次后本会话不再重复弹窗。headless / 无可用 UI → fail-closed（拒绝）。
---- @param command string|nil 待执行命令（供弹窗展示）
---- @return Deferred resolve(boolean 是否允许)
-function M.unisolated_confirm(command)
-  local async = require("NeoAI.utils.async")
-  local d = async.Deferred.new()
-  -- 本会话已确认过：直接允许。
-  if state.unisolated_acked then
-    d:resolve(true)
-    return d
-  end
-  local ok_hub, hub = pcall(require, "NeoAI.sandbox.review.approval_hub")
-  local interactive = vim.api.nvim_list_uis and #vim.api.nvim_list_uis() > 0
-  if not (ok_hub and hub and hub.available() and interactive) then
-    d:resolve(false) -- headless：fail-closed
-    return d
-  end
-  local done = false
-  hub.submit("behavior", {
-    title = "无隔离执行确认",
-    detail = {
-      "本机无任何可用隔离（无 bwrap/unshare，且 seccomp 不可用）。",
-      "命令将直接在宿主执行：无命名空间/overlay/seccomp，写入直接落盘、不冻结候选。",
-      "命令: " .. tostring(command or ""),
-    },
-    decisions = {
-      { key = "<CR>", label = "允许本次会话直跑", value = "allow" },
-      { key = "<Esc>", label = "拒绝", value = "deny" },
-    },
-    on_decision = function(v)
-      if done then return end
-      done = true
-      if v == "allow" then state.unisolated_acked = true end
-      d:resolve(v == "allow")
-    end,
-  })
-  pcall(hub.open_page, "behavior")
-  return d
 end
 
 --- 当前 seccomp 基线的施加方式（诊断用）。
@@ -3331,23 +3283,13 @@ function M.check_available(opts)
   end
   local backend = M.backend()
   if not backend then
-    local sb = config_store.get("tools.sandbox") or {}
-    -- 优先档 A：无命名空间，但 `setpriv --seccomp-filter` 可用 → 施加**行为级 seccomp** 防护
-    -- （不经命名空间、写真实盘，但危险 syscall 被 denylist 拦截）。本机（Android/Termux）可达。
-    local seccomp0 = require("NeoAI.sandbox.execution.seccomp")
-    if seccomp0.enabled() and seccomp0.ensure_filter() and seccomp0.unshare_capable() then
-      local info = { layer = "backend", mode = "none", reason = "no_backend", fallback = "seccomp" }
-      M.note_degrade(info)
-      return true, nil, info
-    end
-    -- 档 B：连 seccomp 都不可用（全失败）。默认硬拒；`allow_unisolated=true` 时降级为「直跑」
-    -- （无任何隔离、写入直接落盘），由 wrapper 弹窗确认后才执行，绝不静默（告警 + 审计）。
-    if sb.allow_unisolated == true then
-      local info = { layer = "backend", mode = "none", reason = "no_backend", fallback = "unisolated" }
-      M.note_degrade(info)
-      return true, nil, info
-    end
-    return false, "SANDBOX_BACKEND_UNAVAILABLE: 既无 bwrap 也无可用的 unshare/userns"
+    -- 无命名空间隔离后端（无 bwrap、unshare/userns 被内核拒绝，如 Android/Termux）：沙箱不成立。
+    -- 不再做 seccomp-only（档 A）或裸跑（档 B）降级，而是禁用沙箱、退回既有审批模式——由
+    -- wrapper.gate 直接放行到原工具、由 executor 强制事前 prompt 审批。此处返回 fallback="approval"
+    -- 作为契约信号（调用方据此后退，不放行、也不硬拒），降级留痕由 note_degrade 记录（绝不静默）。
+    local info = { layer = "backend", mode = "none", reason = "no_backend", fallback = "approval" }
+    M.note_degrade(info)
+    return true, nil, info
   end
   local cfg = config_store.get("tools.sandbox") or {}
   -- root 启动 + 配置专用非 root uid 时需要 setpriv 降权；缺失则 fail-closed，
@@ -3466,7 +3408,6 @@ function M.reset()
   state.degrade = nil
   state.degrade_notified = {}
   state.degrade_audited = {}
-  state.unisolated_acked = nil
   state.overlay_probe = {}
   state.overlay_probe_neg = {}
   state.overlay_write_probe = {}

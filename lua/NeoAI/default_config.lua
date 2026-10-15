@@ -621,14 +621,11 @@ local DEFAULT_CONFIG = {
       shutdown_timeout_ms = 3000,
       backend = "auto", -- auto | bwrap | unshare（外部隔离后端）
       -- 无任何可用隔离后端（无 bwrap、unshare/userns 被内核拒绝，如 Android/Termux 拦
-      -- `clone(CLONE_NEWUSER)`）时的降级处置：
-      --   * 档 A（自动，无需配置）：`setpriv --seccomp-filter` 可用 → 施加 **seccomp 行为级防护**
-      --     （命令不经命名空间、写真实盘，但 denylist 拦截 mount/unshare/ptrace/mknod/bpf 等危险
-      --     syscall）。此为无语义隔离下的尽力保护，自动启用。
-      --   * 档 B：连 seccomp 都不可用（全失败）→ 默认硬拒（`SANDBOX_BACKEND_UNAVAILABLE`）；设本项
-      --     true 时降级为「直跑」（无任何隔离、写入直接落盘），**必须经用户弹窗确认**（headless
-      --     则拒绝），绝不静默（告警 + 审计）。安全优先默认 false。
-      allow_unisolated = false,
+      -- `clone(CLONE_NEWUSER)`）时：沙箱不成立，**禁用沙箱、退回原有审批模式**——
+      -- 命令不套沙箱前缀/不建 overlay/不冻结候选，直接在宿主执行（写入直接落盘），
+      -- 但强制走事前阻塞审批（`tools.approval.mode`；async 依赖沙箱内先执行再事后确认，
+      -- 无沙箱时退回 prompt）。绝不静默：仍写证据 + 发 `SANDBOX_DEGRADED` 事件 + 告警 + 结果提示。
+      -- 不再提供「硬拒」或「无隔离直跑」的独立开关：无隔离即退回审批，由审批弹窗把关。
       offline = false, -- 网络默认放行（仅记录审计，不拦截）；true 时硬拒绝网络类工具并隔离进程网络
       -- true 时把 seccomp 视为必需（默认开）：缺少 seccomp 能力时按 seccomp.on_unavailable 处置
       -- （"degrade" 默认降级放行 + 告警 + 审计；"deny" 恢复旧 fail-closed 硬拒）。

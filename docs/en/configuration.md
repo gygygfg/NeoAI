@@ -257,6 +257,11 @@ approval = {
 > subdirectories**); tool-level and `per_tool` entries are **unioned** with it (append-only, never overriding).
 > File tools are judged by path alone (the command allowlist does not apply when there is no command argument),
 > so once the workspace directory is configured its subdirectories need no per-file approval.
+>
+> **No-isolation fallback**: when the host has no namespace isolation backend
+> (`runtime.isolation_available()` is false, e.g. Android/Termux), the sandbox is disabled and execution
+> **falls back to approval mode** — `async` is forced to `prompt` (the command runs on the host after blocking
+> pre-execution approval), while user-configured `prompt`/`strict`/`auto_allow` are preserved.
 > You can also press `E` on the "Resource Access" page of `:NeoAISandboxReview` to open a directory editor and
 > hot-add/remove this list (plus masked dirs `sandbox.mask_dirs` and the `sandbox.mask_dirs_enabled` toggle) —
 > **session-only, not persisted to disk**.
@@ -274,7 +279,12 @@ sandbox = {
   postprocess = "async",           -- Process-command post-processing mode: async (default) = return the result to the main loop as soon as the process exits, while overlay capture/candidate freeze/staging merge/persist/settle run in the background (the FIFO slot is held until the background chain finishes so the next command sees consistent staging; subsequent read/write tools wait for in-flight post-processing); sync = wait for post-processing before returning (deterministic; tests inject this)
   shutdown_timeout_ms = 3000,      -- Max time (ms) to wait for background post-processing and staging migration on exit/close (`:qall`, plugin hot reload); the wait is abandoned on timeout so quitting never hangs; 0 = don't wait (the last unfinished freeze/pending enqueue may be lost)
   backend = "auto",                -- auto | bwrap | unshare
-  allow_unisolated = false,        -- When NO isolation backend is available (no bwrap, unshare/userns rejected by kernel, e.g. Android/Termux blocking clone(CLONE_NEWUSER)): false (default) hard-denies; true runs directly on the host (no isolation, writes land on disk, no candidate freeze) + warn + audit. Enable only on constrained devices with full awareness
+  -- When NO isolation backend is available (no bwrap, unshare/userns rejected by kernel, e.g. Android/Termux
+  --   blocking clone(CLONE_NEWUSER)): the sandbox does not apply -> **disable the sandbox and fall back to the
+  --   original approval mode** (no sandbox prefix / overlay / candidate freeze; runs directly on the host,
+  --   writes land on disk; forced blocking pre-execution approval, async falls back to prompt). Never silent
+  --   (evidence + SANDBOX_DEGRADED event + warn + result note). There is no allow_unisolated switch: no
+  --   isolation means fall back to approval, gated by the approval dialog.
   offline = false,                 -- Network allowed by default (recorded only, not blocked); true hard-denies network and isolates process networking
   require_seccomp = true,          -- Treat seccomp as required (default on): when unavailable, handled per seccomp.on_unavailable (default: degrade + warn + audit; "deny" restores old fail-closed hard-deny)
   -- seccomp baseline (built-in denylist; default on). bwrap natively via `--seccomp`; the unshare backend applies it via `setpriv --no-new-privs --seccomp-filter` (util-linux >= 2.32).

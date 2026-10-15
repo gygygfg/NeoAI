@@ -31,6 +31,7 @@ end
 
 tests.suite("sandbox_service", function(_, it)
   it("service：启动/日志/状态/停止 + 注册表清理", function(t)
+    if require("NeoAI.sandbox.execution.runtime").backend() == nil then return end -- 无命名空间隔离后端时沙箱禁用（退回审批）；systemd 门面/单元启动依赖沙箱进程前缀，不经此路径
     with_config({ tools = { sandbox = sandbox_config() } }, function()
       require("NeoAI.sandbox").reset()
       local svc_mod = require("NeoAI.sandbox.execution.service")

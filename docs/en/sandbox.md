@@ -34,16 +34,23 @@ Invariants:
      (Extra mounts), so those degrade too (ignore + warn + audit; the payload is userns-root, so
      T0's `CAP_DAC_OVERRIDE`/`SETUID`/`SETGID` are effectively present).
    - **No isolation backend at all** (no bwrap, unshare/userns rejected by the kernel, e.g.
-     Android/Termux blocking `clone(CLONE_NEWUSER)`):
-     - **Tier A (automatic)**: if `setpriv --seccomp-filter` works, apply a **seccomp behavioral
-       baseline** — the command runs without namespaces (writes land on disk) but the denylist still
-       blocks `mount`/`unshare`/`ptrace`/`mknod`/`bpf`/`init_module` etc. at the kernel level. Best
-       effort without semantic isolation; enabled automatically.
-     - **Tier B (all layers failed, seccomp unavailable too)**: hard-denied by default
-       (`SANDBOX_BACKEND_UNAVAILABLE`); with `tools.sandbox.allow_unisolated=true` it degrades to a
-       **direct run** (no isolation at all, writes land on disk) that **requires user confirmation
-       via a dialog** (headless → denied), with evidence + `SANDBOX_DEGRADED` event + `vim.notify` +
-       a result note (never silent). Off by default to keep sandbox protection.
+     Android/Termux blocking `clone(CLONE_NEWUSER)`): **the sandbox does not apply -> disable the
+     sandbox and fall back to the original approval mode** (no seccomp-only or bare "degraded direct
+     run"). Every gated tool (both `effect=process` and in-process read/write tools) no longer gets a
+     sandbox prefix / overlay / candidate freeze; the command runs directly on the host (writes land
+     on disk, not queued for review) - but it is **forced through blocking pre-execution approval**
+     (`tools.approval.mode`; `async` relies on executing inside the sandbox first and confirming
+     afterwards, which does not hold without a sandbox, so it falls back to `prompt`), reusing the
+     existing tool approval dialog (`services.tool_service`). User-configured `prompt`/`strict`/
+     `auto_allow` are preserved (`strict` is stricter and never downgraded).
+     - The only trigger is `runtime.isolation_available()` (i.e. `backend() ~= nil`).
+     - Never silent: `runtime.note_degrade` writes evidence (`sandbox_degrade`) + emits a
+       `SANDBOX_DEGRADED` event + `vim.notify` (deduped per session) + a result note (`ctx.ui_notice`,
+       UI-only, never entering model context).
+     - `check_available` returns `{ layer="backend", fallback="approval" }` as the contract signal;
+       `process_prefix` returns a clear error (no prefix is built).
+     - `tools.sandbox.allow_unisolated` is removed: no isolation means fall back to approval, gated
+       by the approval dialog.
    - Text matching (`risk.deny_reason` etc.) only grades approvals and **never poses as a security
      boundary**; no new dangerous-command text lists.
 
@@ -1632,10 +1639,12 @@ the facade (`sandbox/systemd/systemd.lua`) with a **fake parser** covering only 
     cached by `(dev_lower, dev_upper)`. A probe using same-source temp dirs can be a false positive
     when the real paths span mounts/userns, so a failed real-path probe follows the fail-closed
     policy above (rejected by default; neither a hard failure nor a silent downgrade).
-- A completely unavailable backend returns a clear error (`SANDBOX_BACKEND_UNAVAILABLE`); no silent
-  downgrade. Overlay being individually unavailable is fail-closed by default
-  (`SANDBOX_OVERLAY_UNAVAILABLE`); only `tools.sandbox.overlay_fail_closed = false` falls back to
-  the private cwd.
+- A completely unavailable backend disables the sandbox and falls back to the original approval mode
+  (`check_available` returns `fallback="approval"`; `process_prefix` returns `SANDBOX_BACKEND_UNAVAILABLE`):
+  the command runs on the host after blocking pre-execution approval, and this is **never silent**
+  (evidence + event + warning + result note). Overlay being individually unavailable is fail-closed by
+  default (`SANDBOX_OVERLAY_UNAVAILABLE`); only `tools.sandbox.overlay_fail_closed = false` falls back
+  to the private cwd.
 
 > In-process tools (LSP/treesitter/UI) cannot be namespace-isolated; they are constrained by
 > "read-only by default + staged writes + policy gate". This is a documented boundary.

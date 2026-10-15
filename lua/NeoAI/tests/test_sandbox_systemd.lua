@@ -184,6 +184,7 @@ tests.suite("sandbox_systemd", function(_, it)
   end)
 
   it("门面：start 静默成功、status/is-active 合成真实输出、stop 移除服务", function(t)
+    if require("NeoAI.sandbox.execution.runtime").backend() == nil then return end -- 无命名空间隔离后端时沙箱禁用（退回审批）；systemd 门面/单元启动依赖沙箱进程前缀，不经此路径
     local dir = vim.fn.tempname()
     vim.fn.mkdir(dir, "p")
     write_unit(dir, "demo.service",
@@ -373,6 +374,7 @@ tests.suite("sandbox_systemd", function(_, it)
   end)
 
   it("systemd-run：解析与临时单元启动（--unit/--wait）", function(t)
+    if require("NeoAI.sandbox.execution.runtime").backend() == nil then return end -- 无命名空间隔离后端时沙箱禁用（退回审批）；systemd 门面/单元启动依赖沙箱进程前缀，不经此路径
     local sd = require("NeoAI.sandbox.systemd.systemd")
     local p = assert(sd.parse_command("systemd-run --unit=foo.service /bin/true --flag"))
     t.not_nil(p)
@@ -482,6 +484,7 @@ tests.suite("sandbox_systemd", function(_, it)
   end)
 
   it("systemd-run 瞬态单元：status/cat/show/is-enabled/stop/restart 一致", function(t)
+    if require("NeoAI.sandbox.execution.runtime").backend() == nil then return end -- 无命名空间隔离后端时沙箱禁用（退回审批）；systemd 门面/单元启动依赖沙箱进程前缀，不经此路径
     with_config({ tools = { sandbox = systemd_config({}) } }, function()
       require("NeoAI.sandbox").reset()
       local sd = require("NeoAI.sandbox.systemd.systemd")
@@ -601,6 +604,7 @@ tests.suite("sandbox_systemd", function(_, it)
   end)
 
   it("systemd-run --pipe/-P：回传输出与退出码（不再报不支持）", function(t)
+    if require("NeoAI.sandbox.execution.runtime").backend() == nil then return end -- 无命名空间隔离后端时沙箱禁用（退回审批）；systemd 门面/单元启动依赖沙箱进程前缀，不经此路径
     with_config({ tools = { sandbox = systemd_config({}) } }, function()
       require("NeoAI.sandbox").reset()
       local sd = require("NeoAI.sandbox.systemd.systemd")
@@ -620,6 +624,7 @@ tests.suite("sandbox_systemd", function(_, it)
   end)
 
   it("oneshot：start 等待结束并按退出码返回", function(t)
+    if require("NeoAI.sandbox.execution.runtime").backend() == nil then return end -- 无命名空间隔离后端时沙箱禁用（退回审批）；systemd 门面/单元启动依赖沙箱进程前缀，不经此路径
     local dir = vim.fn.tempname()
     vim.fn.mkdir(dir, "p")
     write_unit(dir, "ok.service", "[Service]\nType=oneshot\nExecStart=/bin/true\n")
@@ -716,6 +721,7 @@ tests.suite("sandbox_systemd", function(_, it)
   end)
 
   it("reset-failed：清除失败态（--failed/degraded 恢复，状态不再粘滞）", function(t)
+    if require("NeoAI.sandbox.execution.runtime").backend() == nil then return end -- 无命名空间隔离后端时沙箱禁用（退回审批）；systemd 门面/单元启动依赖沙箱进程前缀，不经此路径
     local dir = vim.fn.tempname()
     vim.fn.mkdir(dir, "p")
     write_unit(dir, "fail.service", "[Service]\nType=oneshot\nExecStart=/bin/sh -c 'exit 3'\n")
@@ -738,6 +744,7 @@ tests.suite("sandbox_systemd", function(_, it)
   end)
 
   it("kill + Restart=always：SIGKILL 后按策略自动重启，NRestarts 累加", function(t)
+    if require("NeoAI.sandbox.execution.runtime").backend() == nil then return end -- 无命名空间隔离后端时沙箱禁用（退回审批）；systemd 门面/单元启动依赖沙箱进程前缀，不经此路径
     local dir = vim.fn.tempname()
     vim.fn.mkdir(dir, "p")
     write_unit(dir, "loop.service",
@@ -764,6 +771,7 @@ tests.suite("sandbox_systemd", function(_, it)
   end)
 
   it(".timer：OnActiveSec 到点激活被触发单元，status/list-timers 可见", function(t)
+    if require("NeoAI.sandbox.execution.runtime").backend() == nil then return end -- 无命名空间隔离后端时沙箱禁用（退回审批）；systemd 门面/单元启动依赖沙箱进程前缀，不经此路径
     local dir = vim.fn.tempname()
     vim.fn.mkdir(dir, "p")
     write_unit(dir, "tick.service",
@@ -793,6 +801,7 @@ tests.suite("sandbox_systemd", function(_, it)
   end)
 
   it("systemd-run --on-active：建立瞬态定时器，到点执行命令", function(t)
+    if require("NeoAI.sandbox.execution.runtime").backend() == nil then return end -- 无命名空间隔离后端时沙箱禁用（退回审批）；systemd 门面/单元启动依赖沙箱进程前缀，不经此路径
     with_config({ tools = { sandbox = systemd_config({}) } }, function()
       require("NeoAI.sandbox").reset()
       local sd = require("NeoAI.sandbox.systemd.systemd")

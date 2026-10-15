@@ -32,14 +32,18 @@
      （忽略 + 告警 + 审计；载荷在 userns 内为 root，T0 所需 `CAP_DAC_OVERRIDE`/`SETUID`/`SETGID`
      等效具备）。
    - **无任何隔离后端**（无 bwrap、unshare/userns 被内核拒绝，如 Android/Termux 拦
-     `clone(CLONE_NEWUSER)`）：
-     - **档 A（自动）**：`setpriv --seccomp-filter` 可用 → 施加 **seccomp 行为级防护**——命令不经
-       命名空间（写入落真实盘），但 denylist 仍在内核层拦截 `mount`/`unshare`/`ptrace`/`mknod`/
-       `bpf`/`init_module` 等危险 syscall。无语义隔离下的尽力保护，自动启用。
-     - **档 B（全失败，连 seccomp 都不可用）**：默认硬拒（`SANDBOX_BACKEND_UNAVAILABLE`）；设
-       `tools.sandbox.allow_unisolated=true` 时降级为**直跑**（无任何隔离、写入直接落盘），
-       **必须经用户弹窗确认**（headless → 拒绝），并写 evidence + `SANDBOX_DEGRADED` 事件 +
-       `vim.notify` + 结果提示（绝不静默）。默认关以保留沙箱保护。
+     `clone(CLONE_NEWUSER)`）：**沙箱不成立 → 禁用沙箱、退回原有审批模式**（不做 seccomp-only
+     或裸跑的「降级直跑」）。所有经门禁的工具（含 `effect=process` 与进程内读写工具）都不再套
+     沙箱前缀/建 overlay/冻结候选，命令直接在宿主执行（写入直接落盘、不进待审队列）；但**强制走
+     事前阻塞审批**（`tools.approval.mode`；`async` 依赖沙箱内先执行再事后确认应用，无沙箱时不
+     成立，故退回 `prompt`），复用既有工具审批弹窗（`services.tool_service`）。用户显式配置的
+     `prompt`/`strict`/`auto_allow` 予以保留（`strict` 更严，不被降级）。
+     - 判定唯一依据是 `runtime.isolation_available()`（即 `backend() ~= nil`）。
+     - 绝不静默：`runtime.note_degrade` 写 evidence（`sandbox_degrade`）+ 发 `SANDBOX_DEGRADED`
+       事件 + `vim.notify`（会话去重）+ 结果提示（`ctx.ui_notice`，仅用户可见、不进入模型上下文）。
+     - `check_available` 在该情形返回 `{ layer="backend", fallback="approval" }` 作为契约信号；
+       `process_prefix` 直接返回明确错误（不再构造任何前缀）。
+     - 不再提供 `tools.sandbox.allow_unisolated` 逃生开关：无隔离即退回审批，由审批弹窗把关。
    - 文本匹配（`risk.deny_reason` 等）仅做审批分级，**绝不冒充安全边界**，不新增危险命令文本名单。
 
 ## 2. 模块结构
@@ -1289,7 +1293,9 @@ stdout/stderr/退出码返回。宿主侧由 `sandbox/systemd/systemd_ipc.lua` �
     （lower=真实 cwd、upper/work=私有层）再实测一次 overlay 挂载，按 `(dev_lower, dev_upper)`
     缓存结果。探测用同源临时目录、真实路径跨挂载/跨 userns 归属时会产生假阳性，因此
     真实路径实测失败即按上面的 fail-closed 策略处理（默认拒绝，不硬失败也不静默降级）。
-- 后端完全不可用时返回明确错误（`SANDBOX_BACKEND_UNAVAILABLE`），**不静默降级**；
+- 后端完全不可用时：沙箱禁用、退回原有审批模式（`check_available` 返回
+  `fallback="approval"`，`process_prefix` 返回明确错误 `SANDBOX_BACKEND_UNAVAILABLE`），
+  命令经事前阻塞审批后直接在宿主执行，**绝不静默**（evidence + 事件 + 告警 + 结果提示）；
   overlay 单项不可用时默认同样 fail-closed（`SANDBOX_OVERLAY_UNAVAILABLE`），
   仅 `tools.sandbox.overlay_fail_closed = false` 才回退私有 cwd。
 
