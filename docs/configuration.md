@@ -269,7 +269,8 @@ sandbox = {
   backend = "auto",                -- auto | bwrap | unshare
   -- 无任何可用隔离后端（无 bwrap、unshare/userns 被内核拒绝，如 Android/Termux 拦 clone(CLONE_NEWUSER)）时：
   --   沙箱不成立 → **禁用沙箱、退回原有审批模式**（命令不套沙箱前缀/不建 overlay/不冻结候选，直接在宿主执行、
-  --   写入直接落盘；强制事前阻塞审批，async 退回 prompt）。绝不静默（证据 + SANDBOX_DEGRADED 事件 + 告警 + 结果提示）。
+  --   写入直接落盘；强制事前阻塞审批，async 退回 prompt）。绝不静默（证据 + SANDBOX_DEGRADED 事件；
+  --   审批由工具审批悬浮窗把关，不再 notify / 主界面提示）。
   --   无 allow_unisolated 之类开关：无隔离即退回审批，由审批弹窗把关。
   offline = false,                 -- 网络默认放行（仅记录，不拦截）；true 时硬拒绝网络并隔离进程网络
   require_seccomp = true,          -- true 时把 seccomp 视为必需（默认开）：缺 seccomp 能力时按 seccomp.on_unavailable 处置（默认降级放行 + 告警 + 审计；"deny" 恢复旧 fail-closed 硬拒）

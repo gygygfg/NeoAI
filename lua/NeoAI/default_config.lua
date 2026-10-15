@@ -624,7 +624,8 @@ local DEFAULT_CONFIG = {
       -- `clone(CLONE_NEWUSER)`）时：沙箱不成立，**禁用沙箱、退回原有审批模式**——
       -- 命令不套沙箱前缀/不建 overlay/不冻结候选，直接在宿主执行（写入直接落盘），
       -- 但强制走事前阻塞审批（`tools.approval.mode`；async 依赖沙箱内先执行再事后确认，
-      -- 无沙箱时退回 prompt）。绝不静默：仍写证据 + 发 `SANDBOX_DEGRADED` 事件 + 告警 + 结果提示。
+      -- 无沙箱时退回 prompt）。绝不静默：仍写证据 + 发 `SANDBOX_DEGRADED` 事件；审批由工具审批
+      -- 悬浮窗把关（不再 notify / 主界面提示）。
       -- 不再提供「硬拒」或「无隔离直跑」的独立开关：无隔离即退回审批，由审批弹窗把关。
       offline = false, -- 网络默认放行（仅记录审计，不拦截）；true 时硬拒绝网络类工具并隔离进程网络
       -- true 时把 seccomp 视为必需（默认开）：缺少 seccomp 能力时按 seccomp.on_unavailable 处置

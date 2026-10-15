@@ -27,6 +27,9 @@
    - 第 3 层无行为强制层：仅放行 + 强告警 + 审计（`require_backstop=true` 时改硬拒）。
    - 任何降级均写 evidence（`sandbox_degrade`）+ 发 `SANDBOX_DEGRADED` 事件 + `vim.notify`（会话去重）+
      结果提示；`seccomp.on_unavailable="deny"` 可恢复旧 fail-closed。
+   - **例外**：无命名空间隔离后端（`layer="backend"`）**不弹 `vim.notify`、不写主界面降级提示**——
+     无隔离时唯一用户可见交互是由工具审批悬浮窗（`tool_approval`）把关；审计证据/事件照常落
+     （绝不静默，见下文「无任何隔离后端」）。
    - 网关（`GATEWAY_REQUIRES_BWRAP`）与降权（`SANDBOX_SETPRIV_UNAVAILABLE`）仍**硬拒绝**，不降级。
      此外 unshare 后端的**档位挂载/capability**（Extra mounts / `cap_add`）无法施加，按降级处理
      （忽略 + 告警 + 审计；载荷在 userns 内为 root，T0 所需 `CAP_DAC_OVERRIDE`/`SETUID`/`SETGID`
@@ -40,7 +43,8 @@
      `prompt`/`strict`/`auto_allow` 予以保留（`strict` 更严，不被降级）。
      - 判定唯一依据是 `runtime.isolation_available()`（即 `backend() ~= nil`）。
      - 绝不静默：`runtime.note_degrade` 写 evidence（`sandbox_degrade`）+ 发 `SANDBOX_DEGRADED`
-       事件 + `vim.notify`（会话去重）+ 结果提示（`ctx.ui_notice`，仅用户可见、不进入模型上下文）。
+       事件；**无隔离时不弹 `vim.notify`、不写主界面降级提示**——唯一用户可见交互是由工具审批
+       悬浮窗（`tool_approval`）把关（需审批的工具经事前阻塞审批）。
      - `check_available` 在该情形返回 `{ layer="backend", fallback="approval" }` 作为契约信号；
        `process_prefix` 直接返回明确错误（不再构造任何前缀）。
      - 不再提供 `tools.sandbox.allow_unisolated` 逃生开关：无隔离即退回审批，由审批弹窗把关。
@@ -1295,7 +1299,8 @@ stdout/stderr/退出码返回。宿主侧由 `sandbox/systemd/systemd_ipc.lua` �
     真实路径实测失败即按上面的 fail-closed 策略处理（默认拒绝，不硬失败也不静默降级）。
 - 后端完全不可用时：沙箱禁用、退回原有审批模式（`check_available` 返回
   `fallback="approval"`，`process_prefix` 返回明确错误 `SANDBOX_BACKEND_UNAVAILABLE`），
-  命令经事前阻塞审批后直接在宿主执行，**绝不静默**（evidence + 事件 + 告警 + 结果提示）；
+  命令经事前阻塞审批后直接在宿主执行，**绝不静默**（evidence + `SANDBOX_DEGRADED` 事件；
+  审批由工具审批悬浮窗把关，不再 notify / 主界面提示）；
   overlay 单项不可用时默认同样 fail-closed（`SANDBOX_OVERLAY_UNAVAILABLE`），
   仅 `tools.sandbox.overlay_fail_closed = false` 才回退私有 cwd。
 

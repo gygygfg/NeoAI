@@ -3174,14 +3174,18 @@ function M.process_prefix(opts)
 end
 
 --- 记录一次防御层降级（绝不静默）：写证据 + 发事件 + 会话内去重告警。
---- @param info table { layer="seccomp"|"sysctl_mask", mode?, reason?, fallback?, tool?, command? }
+--- 特例：layer=="backend"（无命名空间隔离后端）不弹 vim.notify——无隔离时由工具审批悬浮窗
+--- （tool_approval）把关；证据与 SANDBOX_DEGRADED 事件照常落。
+--- @param info table { layer="seccomp"|"sysctl_mask"|"backend", mode?, reason?, fallback?, tool?, command? }
 --- @return table info
 function M.note_degrade(info)
   info = info or {}
   state.degrade = info
   local key = tostring(info.layer) .. "|" .. tostring(info.mode or "") .. "|" .. tostring(info.fallback or "")
-  -- 告警：会话内按层去重（避免每条命令刷屏）。
-  if not state.degrade_notified[key] then
+  -- 告警：会话内按层去重（避免每条命令刷屏）。**无命名空间隔离后端（layer=="backend"）不弹通知**：
+  -- 无隔离时不成立沙箱，改由工具审批悬浮窗（tool_approval）把关（见 wrapper.gate / tools.executor
+  -- 的无隔离分支），不再额外弹右上角通知；审计仍写 evidence + SANDBOX_DEGRADED 事件（绝不静默）。
+  if info.layer ~= "backend" and not state.degrade_notified[key] then
     state.degrade_notified[key] = true
     local msg
     if info.layer == "seccomp" and info.fallback == "ebpf" then
@@ -3195,9 +3199,6 @@ function M.note_degrade(info)
     elseif info.layer == "privilege" then
       msg = "[NeoAI] 沙箱降级：unshare 后端不支持档位挂载/capability（"
         .. tostring(info.reason or "") .. "），已忽略并放行（载荷为 userns 内 root）"
-    elseif info.layer == "backend" then
-      msg = "[NeoAI] 无命名空间隔离（bwrap/unshare 均不可用）：已禁用沙箱、退回审批模式"
-        .. "（本次命令经事前审批后直接在宿主执行；写入直接落盘、不冻结候选）"
     else
       msg = "[NeoAI] 沙箱降级：" .. tostring(info.layer)
     end

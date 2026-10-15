@@ -424,7 +424,7 @@ tests.suite("sandbox_hardening", function(_, it)
     with_config({ tools = { sandbox = { require_seccomp = true, seccomp = { enabled = true } } } }, function()
       runtime.reset()
       -- 无后端：wrapper.gate 应在门禁顶部直接执行原工具（不套沙箱前缀/不建 overlay/不冻结候选），
-      -- 仅留下降级留痕与仅用户可见提示（绝不静默）。
+      -- 仅留下降级留痕（evidence/事件）；无 notify、无主界面降级文案（由工具审批悬浮窗把关）。
       local called = false
       local tool = { name = "run_command", __sandbox_spec = { effect = "process", paths = {} } }
       local ctx = {}
@@ -436,9 +436,9 @@ tests.suite("sandbox_hardening", function(_, it)
       t.nil_(ctx.sandbox_prefix, "无隔离直跑不应设置沙箱前缀")
       t.eq(false, ctx.sandbox_resident, "无隔离直跑不应标记常驻沙箱")
       t.not_nil(ctx.sandbox_cwd, "应设置会话工作目录供直跑使用")
-      t.not_nil(ctx.sandbox_degrade_info, "应记录降级信息（证据/事件/告警由 note_degrade 落）")
+      t.not_nil(ctx.sandbox_degrade_info, "应记录降级信息（证据/事件由 note_degrade 落）")
       t.eq("approval", ctx.sandbox_degrade_info and ctx.sandbox_degrade_info.fallback)
-      t.not_nil(ctx.ui_notice, "应有仅用户可见的降级提示（不进入模型上下文）")
+      t.nil_(ctx.ui_notice, "无隔离时不应再有主界面降级提示（仅由工具审批悬浮窗把关）")
     end)
   end)
 
@@ -479,7 +479,7 @@ tests.suite("sandbox_hardening", function(_, it)
       t.true_(called, "无隔离时应经审批模式（prompt）走 approve_and_execute")
       t.eq("prompt", seen_mode, "无隔离时 approval_mode 应被强制为 prompt")
       t.eq("prompt", ctx.approval_mode, "ctx.approval_mode 应被设为 prompt")
-      t.not_nil(ctx.ui_notice, "应有仅用户可见的退回审批提示（不进入模型上下文）")
+      t.nil_(ctx.ui_notice, "无隔离时不应再有主界面降级提示（仅由工具审批悬浮窗把关）")
     end)
   end)
 end)

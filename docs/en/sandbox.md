@@ -29,6 +29,10 @@ Invariants:
    - Layer 3 no behavioral enforcement: allow + loud warn + audit (`require_backstop=true` hard-denies).
    - Every degradation writes evidence (`sandbox_degrade`) + emits `SANDBOX_DEGRADED` + `vim.notify`
      (session-deduped) + a result note; `seccomp.on_unavailable="deny"` restores old fail-closed.
+   - **Exception**: with no namespace-isolation backend (`layer="backend"`) there is **no `vim.notify`
+     and no main-UI degrade notice** - the only user-visible interaction is the tool approval dialog
+     (`tool_approval`); audit evidence/events are still recorded (never silent; see "No isolation
+     backend at all" below).
    - Gateway (`GATEWAY_REQUIRES_BWRAP`) and privdrop (`SANDBOX_SETPRIV_UNAVAILABLE`) still
      **hard-deny**. Additionally the unshare backend cannot apply **tier mounts / `cap_add`**
      (Extra mounts), so those degrade too (ignore + warn + audit; the payload is userns-root, so
@@ -45,8 +49,9 @@ Invariants:
      `auto_allow` are preserved (`strict` is stricter and never downgraded).
      - The only trigger is `runtime.isolation_available()` (i.e. `backend() ~= nil`).
      - Never silent: `runtime.note_degrade` writes evidence (`sandbox_degrade`) + emits a
-       `SANDBOX_DEGRADED` event + `vim.notify` (deduped per session) + a result note (`ctx.ui_notice`,
-       UI-only, never entering model context).
+       `SANDBOX_DEGRADED` event; with no isolation it **does not emit `vim.notify` and does not write
+       a main-UI degrade notice** - the only user-visible interaction is the tool approval dialog
+       (`tool_approval`, blocking pre-execution approval for tools that need it).
      - `check_available` returns `{ layer="backend", fallback="approval" }` as the contract signal;
        `process_prefix` returns a clear error (no prefix is built).
      - `tools.sandbox.allow_unisolated` is removed: no isolation means fall back to approval, gated
@@ -1642,7 +1647,8 @@ the facade (`sandbox/systemd/systemd.lua`) with a **fake parser** covering only 
 - A completely unavailable backend disables the sandbox and falls back to the original approval mode
   (`check_available` returns `fallback="approval"`; `process_prefix` returns `SANDBOX_BACKEND_UNAVAILABLE`):
   the command runs on the host after blocking pre-execution approval, and this is **never silent**
-  (evidence + event + warning + result note). Overlay being individually unavailable is fail-closed by
+  (evidence + `SANDBOX_DEGRADED` event; approval is gated by the tool approval dialog, no
+  notify / main-UI notice). Overlay being individually unavailable is fail-closed by
   default (`SANDBOX_OVERLAY_UNAVAILABLE`); only `tools.sandbox.overlay_fail_closed = false` falls back
   to the private cwd.
 

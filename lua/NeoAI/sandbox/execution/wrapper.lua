@@ -3091,8 +3091,8 @@ function M.gate(tool, args, ctx, call_original)
     -- → **禁用沙箱、退回原有审批模式**。所有经门禁的工具（process 与非进程工具）都不再套沙箱
     -- 前缀/建 overlay/冻结候选，直接在宿主执行；事前阻塞审批（prompt）由 tools.executor 强制
     -- （见 executor._execute_after_secret_guard 的 no_isolation 分支），复用既有工具审批弹窗。
-    -- 绝不静默：note_degrade 写 evidence + SANDBOX_DEGRADED 事件 + vim.notify（会话去重）；
-    -- ui_notice 仅用户可见，不进入模型上下文。
+    -- 绝不静默：note_degrade 写 evidence + SANDBOX_DEGRADED 事件（审计面）；**不弹 notify、不写
+    -- 主界面降级文案**——无隔离时唯一用户可见交互是由工具审批悬浮窗（tool_approval）把关。
     local info = runtime.note_degrade({
       layer = "backend",
       mode = "none",
@@ -3103,9 +3103,6 @@ function M.gate(tool, args, ctx, call_original)
     })
     ctx = ctx or {}
     ctx.sandbox_degrade_info = info
-    ctx.ui_notice = ctx.ui_notice
-      or "[NeoAI] 无命名空间隔离：已禁用沙箱、退回审批模式"
-        .. "（命令经事前审批后直接在宿主执行；写入直接落盘、不冻结候选）"
     ctx.sandbox_cwd = _effective_cwd(ctx)
     ctx.sandbox_env = runtime.sandbox_env()
     ctx.sandbox_prefix = nil

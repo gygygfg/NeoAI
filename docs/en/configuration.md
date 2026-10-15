@@ -283,7 +283,8 @@ sandbox = {
   --   blocking clone(CLONE_NEWUSER)): the sandbox does not apply -> **disable the sandbox and fall back to the
   --   original approval mode** (no sandbox prefix / overlay / candidate freeze; runs directly on the host,
   --   writes land on disk; forced blocking pre-execution approval, async falls back to prompt). Never silent
-  --   (evidence + SANDBOX_DEGRADED event + warn + result note). There is no allow_unisolated switch: no
+  --   (evidence + SANDBOX_DEGRADED event; approval is gated by the tool approval dialog, no notify / main-UI
+  --   notice). There is no allow_unisolated switch: no
   --   isolation means fall back to approval, gated by the approval dialog.
   offline = false,                 -- Network allowed by default (recorded only, not blocked); true hard-denies network and isolates process networking
   require_seccomp = true,          -- Treat seccomp as required (default on): when unavailable, handled per seccomp.on_unavailable (default: degrade + warn + audit; "deny" restores old fail-closed hard-deny)

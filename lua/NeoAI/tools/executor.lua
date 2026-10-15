@@ -589,7 +589,8 @@ local function _execute_after_secret_guard(tool, resolved, args, ctx)
   -- 退回**原有审批模式**（事前阻塞审批；批准后命令直接在宿主执行）。async 依赖沙箱内先执行、
   -- 事后异步确认应用，无沙箱时不成立，故退回 prompt。用户显式配置的 prompt/strict/auto_allow
   -- 予以保留（strict 更严，不得被降级为 prompt）。降级留痕由沙箱门禁（wrapper.gate）写
-  -- evidence/事件/告警；此处只补一条仅用户可见的结果提示。
+  -- evidence/事件；无隔离时不弹 notify、不写主界面降级文案——唯一用户可见交互是由工具审批
+  -- 悬浮窗（tool_approval）把关（mode~="async" 时 validator.check_approval 触发 needs_approval）。
   local sandbox_cfg = config_store.get("tools.sandbox") or {}
   local no_isolation = sandbox_cfg.enabled ~= false and not require("NeoAI.sandbox.execution.runtime").isolation_available()
   if no_isolation and mode == "async" then
@@ -597,9 +598,6 @@ local function _execute_after_secret_guard(tool, resolved, args, ctx)
   end
   if no_isolation then
     ctx.approval_mode = mode
-    ctx.ui_notice = ctx.ui_notice
-      or "[NeoAI] 无命名空间隔离：已禁用沙箱、退回审批模式"
-        .. "（命令经事前审批后直接在宿主执行；写入直接落盘、不冻结候选）"
   end
   local masked_hit, masked_hard = _masked_target(resolved, args, ctx)
   local approval_on = config_store.get("tools.sandbox.mask_dirs_approval") ~= false
