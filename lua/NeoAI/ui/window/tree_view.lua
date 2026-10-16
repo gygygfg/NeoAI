@@ -298,12 +298,28 @@ local function _toggle_expand()
   _render()
 end
 
+--- 沿会话树向下的单子链取出末尾会话（叶）。
+--- 若会话仅有一个子会话就继续深入其唯一子会话，直到遇分裂分支（多个子会话）
+--- 或末尾（无子会话）为止；无子会话时返回其自身。
+--- 用于从树进入「单分支中间」的会话时顺延到该分支末尾，使当前会话落在末尾、
+--- 后续新消息追加到末尾，而不是停在中间会话上。
+--- @param session table
+--- @return table 末尾会话
+local function _downstream_leaf(session)
+  local down = session_store.get_downstream(session.id)
+  return down[#down] or session
+end
+
 --- 将给定会话打开到聊天界面（选择或新建共用）。
 --- 打开后按 ui.tree.auto_close_on_select 决定是否关闭树窗口。
 --- @param session table
 --- @param round number|nil 选中的轮次；nil = 整个会话
 local function _open_session_in_chat(session, round)
   if not session then return end
+  -- 选择会话节点（未指定轮次）时顺延到单分支末尾；显式选中某轮次（回退改稿）不顺延。
+  if not round then
+    session = _downstream_leaf(session)
+  end
   chat_view.open({ session_id = session.id, round = round })
   -- 打开会话到聊天界面后自动关闭会话树（可用 ui.tree.auto_close_on_select 关闭此行为）
   if config_store.get("ui.tree.auto_close_on_select", true) then

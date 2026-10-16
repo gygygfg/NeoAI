@@ -129,6 +129,11 @@ Sessions express their tree structure through `parent_id` / `root_id`. When a se
 extends upward along `get_chain` (ancestors) to the first turn, then downward along `get_downstream` (the single-child chain) to a split branch or the end,
 assembling the full linear conversation (`_build_chain_messages`), so that opening only the selected session does not lose branch context.
 
+When a session node (no specific round) is chosen in the tree UI, if that session sits in the middle of a single branch
+(exactly one child session, chaining further), the tree view first advances along `get_downstream` to that branch's end
+(leaf) before opening, so the current session lands at the end and new messages append there; explicitly selecting a round
+(rewinding to edit) does not advance.
+
 ## 7. Related Documents
 
 - [configuration.md](configuration.md): `session.*` configuration (save_path / max_history_per_session / file).

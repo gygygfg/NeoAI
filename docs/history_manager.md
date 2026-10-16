@@ -127,6 +127,10 @@ session = {
 沿 `get_chain`（祖先）向上延展到首轮，再沿 `get_downstream`（单子链）向下延展到分裂分支或末尾，
 拼出完整线性对话（`_build_chain_messages`），避免只打开选中会话丢失分支上下文。
 
+从树界面选择会话节点（未指定轮次）时，若该会话处在单分支中间（仅有一个子会话，逐层延续），
+树视图会先沿 `get_downstream` 顺延到该分支末尾（叶）再打开，使当前会话落在末尾、后续新消息
+追加到末尾；显式选中某个轮次（回退改稿）时不做顺延。
+
 ## 7. 相关文档
 
 - [configuration.md](configuration.md)：`session.*` 配置（save_path / max_history_per_session / file）。
