@@ -97,8 +97,9 @@ end
 --- @param method string
 --- @param params table
 --- @param target number|table bufnr 或 LSP 客户端（client:request）
+--- @param no_client_msg string|nil 「无客户端」时的准确错误文案（由 `_request` 按启动原因给出）
 --- @return Deferred
-local function _request_inner(method, params, target)
+local function _request_inner(method, params, target, no_client_msg)
   -- 优先走 AI 专用沙箱 LSP 克隆（独立进程，读暂存内容，诊断不外溢）。
   -- 未启用 / overlay 不可用 / 无克隆时回退到编辑器客户端（原行为）。
   local sandbox_blocked = false
@@ -126,6 +127,7 @@ local function _request_inner(method, params, target)
   end
   local called = false
   local timeout_ms = config_store.get("tools.lsp.timeout_ms") or 10000
+  local no_client = no_client_msg or "无 LSP 客户端（文件可能在后台加载，客户端未附加）"
 
   local timer
   local function _settle(ok_, value)
@@ -174,19 +176,13 @@ local function _request_inner(method, params, target)
       -- 区分两者给出准确错误，避免误导为"无 LSP 客户端"。
       local clients = vim.lsp.get_clients({ bufnr = target })
       if #clients == 0 then
-        _settle(
-          false,
-          { kind = "lsp", message = "无 LSP 客户端（文件可能在后台加载，客户端未附加）" }
-        )
+        _settle(false, { kind = "lsp", message = no_client })
       else
         _settle(false, { kind = "lsp", message = ("当前 LSP 客户端不支持请求: %s"):format(method) })
       end
     elseif id == 0 then
       -- 旧版 API：返回 0 表示无客户端
-      _settle(
-        false,
-        { kind = "lsp", message = "无 LSP 客户端（文件可能在后台加载，客户端未附加）" }
-      )
+      _settle(false, { kind = "lsp", message = no_client })
     end
   else
     local ok, err = pcall(function()
@@ -318,7 +314,8 @@ end
 --- @param bufnr number
 --- @param attempt function() -> boolean 就绪并已处理时返回 true
 --- @param on_timeout function()
-local function _await_client(bufnr, attempt, on_timeout)
+--- @param wait_ms number|nil 等待上限（ms）；缺省用 `tools.lsp.attach_timeout_ms`
+local function _await_client(bufnr, attempt, on_timeout, wait_ms)
   if attempt() then
     return
   end
@@ -348,7 +345,7 @@ local function _await_client(bufnr, attempt, on_timeout)
       end
     end,
   })
-  local timeout_ms = config_store.get("tools.lsp.attach_timeout_ms") or 3000
+  local timeout_ms = wait_ms or config_store.get("tools.lsp.attach_timeout_ms") or 3000
   local deadline = vim.uv.now() + timeout_ms
   timer = vim.uv.new_timer()
   timer:start(100, 100, function()
@@ -365,48 +362,142 @@ local function _await_client(bufnr, attempt, on_timeout)
   end)
 end
 
---- 是否应先等待 LSP 客户端 attach 再发请求（有界，`tools.lsp.attach_timeout_ms`）：
---- - 已有客户端：否；
+--- 沙箱 LSP 模块（惰性、pcall 安全）。
+--- @return table|nil
+local function _sandbox()
+  local ok, sb = pcall(require, "NeoAI.sandbox.execution.lsp")
+  if ok and sb then return sb end
+  return nil
+end
+
+--- 是否允许按编辑器配置自主启动缺失的 server（`tools.lsp.auto_start`，默认开）。
+--- @return boolean
+local function _auto_start_enabled()
+  return config_store.get("tools.lsp.auto_start") ~= false
+end
+
+--- 该 buffer 上支持指定方法的已初始化客户端（provider 函数式接口则默认支持）。
+--- @param bufnr number
+--- @param method string
+--- @return boolean
+local function _ready_supporting(bufnr, method)
+  for _, client in ipairs(vim.lsp.get_clients({ bufnr = bufnr })) do
+    if client.initialized ~= false then
+      local ok, supported = pcall(client.supports_method, client, method, bufnr)
+      if ok and supported then return true end
+    end
+  end
+  return false
+end
+
+--- 是否应先等待 LSP 客户端就绪再发请求（有界）：
+--- - 已有该 buffer 的客户端：否（直接发请求，方法不支持由请求层给准确错误）；
+--- - 之前已等待超时放弃过的 buffer：否（避免每次调用都白等）；
 --- - 本次后台新加载但尚未 attach：是；
---- - 本会话已有其它 LSP 客户端（该 buffer 的服务器可能正在启动/重启）：是；
---- - 之前已等待超时放弃过的 buffer：否（避免每次调用都白等）。
+--- - 该 buffer 已有**未初始化**客户端（server 启动在途）：是；
+--- - 可按编辑器配置自主启动（`auto_start` 且有可执行 cmd 的候选配置）：是；
+--- - 本会话已有其它 LSP 客户端（该 buffer 的服务器可能正在启动/重启）：是。
 --- @param target number
 --- @return boolean
 local function _should_wait(target)
+  if type(target) ~= "number" then return false end
   if #vim.lsp.get_clients({ bufnr = target }) > 0 then return false end
   if _no_wait[target] then return false end
   if _pending_attach[target] then return true end
+  local sb = _sandbox()
+  if sb then
+    if type(sb.pending_for) == "function" then
+      local ok, pending = pcall(sb.pending_for, target)
+      if ok and pending then return true end
+    end
+    if _auto_start_enabled() and type(sb.can_start) == "function" then
+      local ok, can = pcall(sb.can_start, target)
+      if ok and can then return true end
+    end
+  end
   return #vim.lsp.get_clients() > 0
 end
 
---- 请求包装（对外）：对尚无客户端、且可能即将 attach 的 buffer，先等待 LSP 客户端 attach
---- 再发请求——后台加载/服务器启动/重启触发的 attach 是异步的，立即请求会误报「无客户端」。
---- 等待有界（tools.lsp.attach_timeout_ms），超时后仍发起一次请求以给出准确错误（绝不永久挂起）。
+--- 「无客户端」时的准确错误文案：按自主启动的失败原因细分，避免笼统误导。
+--- @param bufnr number
+--- @param reason table|nil { code, name? }
+--- @return string
+local function _no_client_message(bufnr, reason)
+  local code = reason and reason.code
+  if code == "cmd_not_executable" then
+    return ("无法启动 LSP server「%s」：命令不可执行（请先安装）"):format(tostring(reason.name or "?"))
+  elseif code == "start_failed" then
+    return ("无法启动 LSP server「%s」（命令可执行但启动失败）"):format(tostring(reason.name or "?"))
+  elseif code == "staged_no_sandbox" then
+    return "沙箱 LSP 不可用（overlay 不可用或 server 无法在沙箱内启动）；"
+      .. "存在未发布暂存改动，拒绝回退真实视图以避免与只读工具不一致"
+  elseif code == "no_config" then
+    return "无 LSP 客户端（文件可能在后台加载，客户端未附加；本文件类型未配置 LSP server）"
+  end
+  return "无 LSP 客户端（文件可能在后台加载，客户端未附加）"
+end
+
+--- 请求包装（对外）：对尚无客户端、且可能即将就绪的 buffer，先**按编辑器配置自主启动**
+--- 缺失的 server（受 `tools.lsp.auto_start` 控制）并等待其 initialize 完成，再发请求——
+--- 后台加载 / 服务器启动或重启触发的 attach 是异步的，立即请求会误报「无客户端」。
+--- 等待有界：确有启动在途用 `tools.lsp.start_timeout_ms`（默认 15s）；否则用
+--- `tools.lsp.attach_timeout_ms`（默认 3s）快速失败；超时后仍发起一次请求以给出准确错误
+--- （绝不永久挂起）。
 --- @param method string
 --- @param params table
 --- @param target number|table bufnr 或 LSP 客户端
 --- @return Deferred
 local function _request(method, params, target)
-  if type(target) == "number" and _should_wait(target) then
-    local outer = async.Deferred.new()
-    local function proceed(timed_out)
-      _pending_attach[target] = nil
-      if timed_out then _no_wait[target] = true end
-      _request_inner(method, params, target):then_(
-        function(v) outer:resolve(v) end,
-        function(e) outer:reject(e) end
-      )
-    end
-    _await_client(target, function()
-      if #vim.lsp.get_clients({ bufnr = target }) > 0 then
-        proceed(false)
-        return true
-      end
-      return false
-    end, function() proceed(true) end)
-    return outer
+  if type(target) ~= "number" then
+    return _request_inner(method, params, target)
   end
-  return _request_inner(method, params, target)
+  local bufnr = target
+  local sb = _sandbox()
+  -- 幂等 kickstart：缺失已初始化客户端时按编辑器配置自主启动（受 `tools.lsp.auto_start` 控制）。
+  local reason = nil
+  if #vim.lsp.get_clients({ bufnr = bufnr }) == 0 then
+    if _auto_start_enabled() and sb and type(sb.start_missing) == "function" then
+      local ok, _started, rs = pcall(sb.start_missing, bufnr)
+      if ok then reason = rs end
+    end
+  end
+  local no_msg = _no_client_message(bufnr, reason)
+  -- 是否有**真实**的未初始化客户端（server 启动在途）：决定等待上限与是否允许硬失败快速返回。
+  local pending_actual = false
+  if sb and type(sb.pending_for) == "function" then
+    local ok, pending = pcall(sb.pending_for, bufnr)
+    pending_actual = ok and pending or false
+  end
+  local inflight = pending_actual or _pending_attach[bufnr] == true
+  -- 硬失败（命令不可执行 / 该类型无配置 / 有暂存改动但沙箱不可用）且无真实在途客户端：
+  -- 客户端永远不会就绪，直接快速失败并给出准确原因（不空等）。
+  local code = reason and reason.code
+  local hard_fail = (code == "cmd_not_executable" or code == "no_config" or code == "staged_no_sandbox")
+  if hard_fail and not pending_actual then
+    return _request_inner(method, params, bufnr, no_msg)
+  end
+  if not _should_wait(bufnr) then
+    return _request_inner(method, params, bufnr, no_msg)
+  end
+  local wait_ms = inflight and (config_store.get("tools.lsp.start_timeout_ms") or 15000)
+    or (config_store.get("tools.lsp.attach_timeout_ms") or 3000)
+  local outer = async.Deferred.new()
+  local function proceed(timed_out)
+    _pending_attach[bufnr] = nil
+    if timed_out then _no_wait[bufnr] = true end
+    _request_inner(method, params, bufnr, no_msg):then_(
+      function(v) outer:resolve(v) end,
+      function(e) outer:reject(e) end
+    )
+  end
+  _await_client(bufnr, function()
+    if _ready_supporting(bufnr, method) then
+      proceed(false)
+      return true
+    end
+    return false
+  end, function() proceed(true) end, wait_ms)
+  return outer
 end
 
 -- ========== 工具定义 ==========

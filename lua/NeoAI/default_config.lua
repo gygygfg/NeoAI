@@ -294,8 +294,8 @@ local DEFAULT_CONFIG = {
       new_root = { key = "N", desc = "新建根分支并打开聊天" },
       delete_dialog = { key = "d", desc = "删除当前轮次" },
       delete_branch = { key = "D", desc = "删除整个会话分支" },
-      expand = { key = "o", desc = "展开节点" },
-      collapse = { key = "O", desc = "折叠节点" },
+      expand = { key = "o", desc = "展开分组或节点" },
+      collapse = { key = "O", desc = "折叠分组或节点" },
     },
     chat = {
       insert = { key = "i", desc = "进入插入模式" },
@@ -430,6 +430,20 @@ local DEFAULT_CONFIG = {
     },
     lsp = {
       timeout_ms = 10000, -- LSP 请求超时（ms）：服务器无响应时快速失败，避免工具循环挂到 executor 超时
+      -- 等待 LSP 客户端**完成 initialize** 的超时（ms）：仅当确有 server 启动在途
+      -- （本会话已有该 filetype 的未初始化客户端，或本次调用刚发起启动）时使用。
+      -- 原生 `vim.lsp.enable` 触发启动后 `vim.lsp.start` 返回时客户端尚未 initialize，
+      -- 此时 `vim.lsp.get_clients()` / `buf_request` 都看不到它；首次 `lsp_*` 调用若抢跑
+      -- 就会误报「无 LSP 客户端」。这里等待其就绪（而不是立即报错），超时后仍发一次请求
+      -- 以给出准确错误，绝不永久挂起。完全无候选（无该 filetype 的 server 配置）时不用本
+      -- 超时，改走 attach_timeout_ms 快速有界失败，避免每个无 LSP 文件都拖满本超时。
+      start_timeout_ms = 15000,
+      -- 缺失客户端时是否按**编辑器 LSP 配置**（vim.lsp.config / vim.lsp.get_configs，
+      -- lspconfig 兜底）派生并自主启动 server。沙箱可用时优先启动 `@neoai-sandbox` 克隆
+      -- （读暂存视图、纳入保活/空闲回收，沿用 tools.sandbox.lsp_overlay.idle_timeout_ms）；
+      -- 沙箱不可用且该文件无未发布暂存改动时回退启动非沙箱（plain）客户端（不纳入回收，
+      -- 绝不误停编辑器/用户配置的客户端）；有暂存改动则拒绝回退以保持视图一致（R3）。
+      auto_start = true,
       -- 等待 LSP 客户端附加的超时（ms）：后台加载 buffer / 服务器启动或重启期间客户端尚未
       -- 附加时，lsp_diagnostics 会等待其就绪再取诊断，而不是立即报「无 LSP 客户端」。
       attach_timeout_ms = 3000,

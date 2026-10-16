@@ -779,6 +779,103 @@ function M.net_consent_revoke(key)
   return require("NeoAI.sandbox.net.net_consent").revoke_allowance(key)
 end
 
+-- ---------- 工具审批条件（「工具行为」页集中管理，仅本会话内存态） ----------
+-- 供 ui/components/sandbox_review 的「工具审批条件」编辑器读取与调整。全部为运行期内存态：
+--   * session_allow → tool_service.state.allow_all（会话允许，不再弹窗）；
+--   * runtime_directories / runtime_param_groups → registry.state.approval_overrides（本次会话新增，可增可删）；
+--   * auto_allow / allowed_directories / allowed_param_groups → registry.get_approval_config 生效值（含来自配置，只读）。
+-- 惰性 require（调用时）以避免 phase 1/2 服务加载时序导致拿到 nil。
+
+--- 工具审批条件列表（全部已注册工具）。
+--- @return table 数组，每项 {
+---   name, category, description,
+---   auto_allow,        -- 生效 auto_allow（只读）
+---   session_allow,     -- 本次会话允许（可切换）
+---   allowed_directories,  -- 生效允许目录（含来自配置，只读）
+---   runtime_directories,  -- 本次会话新增目录（可删）
+---   allowed_param_groups, -- 生效命令白名单组（含来自配置，只读）
+---   runtime_param_groups, -- 本次会话新增命令组（可删）
+--- }
+function M.tool_approval_list()
+  local okr, registry = pcall(require, "NeoAI.tools.registry")
+  if not okr or type(registry) ~= "table" then return {} end
+  local oks, tool_service = pcall(require, "NeoAI.services.tool_service")
+  local out = {}
+  for _, tool in ipairs(registry.list()) do
+    local name = tool.name
+    local cfg = registry.get_approval_config(name) or {}
+    local rt = registry.get_runtime_approval(name) or {}
+    out[#out + 1] = {
+      name = name,
+      category = tool.category,
+      description = tool.description,
+      auto_allow = cfg.auto_allow == true,
+      session_allow = oks and type(tool_service) == "table"
+        and tool_service.get_allow_all and tool_service.get_allow_all(name) or false,
+      allowed_directories = vim.deepcopy(cfg.allowed_directories or {}),
+      runtime_directories = vim.deepcopy(rt.allowed_directories or {}),
+      allowed_param_groups = vim.deepcopy(cfg.allowed_param_groups or {}),
+      runtime_param_groups = vim.deepcopy(rt.allowed_param_groups or {}),
+    }
+  end
+  return out
+end
+
+--- 设置/清除某工具的本次会话允许（仅本会话内存态）。
+--- @param name string
+--- @param allow boolean
+--- @return boolean
+function M.tool_approval_set_session_allow(name, allow)
+  local oks, tool_service = pcall(require, "NeoAI.services.tool_service")
+  if not oks or type(tool_service) ~= "table" or not tool_service.set_allow_all then return false end
+  tool_service.set_allow_all(name, allow and true or false)
+  return true
+end
+
+--- 本次会话为某工具新增允许目录（仅本会话内存态）。
+--- @param name string
+--- @param dir string
+--- @return boolean added
+--- @return string|nil err
+function M.tool_approval_add_directory(name, dir)
+  local okr, registry = pcall(require, "NeoAI.tools.registry")
+  if not okr or type(registry) ~= "table" then return false, "工具注册表未就绪" end
+  return registry.add_allowed_directory(name, dir)
+end
+
+--- 移除某工具本次会话新增的允许目录（来自配置的只读，不可删）。
+--- @param name string
+--- @param dir string
+--- @return boolean removed
+--- @return string|nil err
+function M.tool_approval_remove_directory(name, dir)
+  local okr, registry = pcall(require, "NeoAI.tools.registry")
+  if not okr or type(registry) ~= "table" then return false, "工具注册表未就绪" end
+  return registry.remove_allowed_directory(name, dir)
+end
+
+--- 本次会话为某工具新增命令白名单组（仅本会话内存态）。
+--- @param name string
+--- @param group string
+--- @return boolean added
+--- @return string|nil err
+function M.tool_approval_add_param_group(name, group)
+  local okr, registry = pcall(require, "NeoAI.tools.registry")
+  if not okr or type(registry) ~= "table" then return false, "工具注册表未就绪" end
+  return registry.add_allowed_param_group(name, group)
+end
+
+--- 移除某工具本次会话新增的命令白名单组（来自配置的只读，不可删）。
+--- @param name string
+--- @param group string
+--- @return boolean removed
+--- @return string|nil err
+function M.tool_approval_remove_param_group(name, group)
+  local okr, registry = pcall(require, "NeoAI.tools.registry")
+  if not okr or type(registry) ~= "table" then return false, "工具注册表未就绪" end
+  return registry.remove_allowed_param_group(name, group)
+end
+
 --- 注册密钥外泄告警 UI 渲染器（由 ui 层注入；传 nil 解绑）
 --- @param ui table|nil
 function M.set_secret_alert_ui(ui)

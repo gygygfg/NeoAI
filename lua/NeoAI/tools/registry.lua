@@ -248,6 +248,102 @@ function M.add_allowed_directory(name, dir)
   return true
 end
 
+--- 取某工具的运行期审批覆盖（本次会话新增项，深拷贝；无则返回 nil）。
+--- 用于区分「本次会话新增」（可增可删）与「来自配置/工具默认」（会话内只读）：
+--- 覆盖模型为追加式，get_approval_config 返回的是全局/工具默认/per_tool 与运行期覆盖的并集，
+--- 只有本函数返回的运行时覆盖里的条目才可在会话内移除。
+--- @param name string 工具名
+--- @return table|nil { auto_allow?, allowed_directories?, allowed_param_groups? }
+function M.get_runtime_approval(name)
+  local ov = state.approval_overrides[name]
+  if type(ov) ~= "table" then return nil end
+  return vim.deepcopy(ov)
+end
+
+--- 归一化目录（展开 ~ 并去掉结尾 /），用于运行期目录的去重与比较。
+--- @param dir string
+--- @return string
+local function _norm_dir(dir)
+  return (vim.fn.fnamemodify(vim.fn.expand(dir), ":p"):gsub("/+$", ""))
+end
+
+--- 运行期把命令白名单组并入某工具的 allowed_param_groups（仅本次会话）。
+--- 对「生效配置」（全局/工具默认/per_tool/运行期）去重后追加到运行期覆盖。
+--- @param name string 工具名
+--- @param group string 命令组名
+--- @return boolean 是否新增（已包含或参数非法时返回 false）
+function M.add_allowed_param_group(name, group)
+  if type(name) ~= "string" or type(group) ~= "string" or group == "" then return false end
+  for _, g in ipairs(M.get_approval_config(name).allowed_param_groups or {}) do
+    if g == group then return false end
+  end
+  local ov = vim.deepcopy(state.approval_overrides[name] or {})
+  ov.allowed_param_groups = ov.allowed_param_groups or {}
+  ov.allowed_param_groups[#ov.allowed_param_groups + 1] = group
+  state.approval_overrides[name] = ov
+  return true
+end
+
+--- 从运行期覆盖移除一个允许目录（仅本次会话新增项可删）。
+--- 来自全局/工具默认/per_tool 的目录在会话内只读，返回 false 与提示。
+--- @param name string 工具名
+--- @param dir string 目录路径
+--- @return boolean removed
+--- @return string|nil err
+function M.remove_allowed_directory(name, dir)
+  if type(name) ~= "string" or type(dir) ~= "string" or dir == "" then
+    return false, "参数非法"
+  end
+  local abs = _norm_dir(dir)
+  if abs == "" then return false, "目录为空" end
+  local ov = state.approval_overrides[name]
+  local list = type(ov) == "table" and ov.allowed_directories
+  if type(list) == "table" then
+    for i, d in ipairs(list) do
+      if _norm_dir(d) == abs then
+        -- 复制后原地删除，避免影响原表引用
+        local next_ov = vim.deepcopy(ov)
+        table.remove(next_ov.allowed_directories, i)
+        state.approval_overrides[name] = next_ov
+        return true
+      end
+    end
+  end
+  -- 不在运行期覆盖中：若生效配置含该项则来自配置（只读），否则未找到。
+  for _, d in ipairs(M.get_approval_config(name).allowed_directories or {}) do
+    if _norm_dir(d) == abs then return false, "来自配置，不可在会话内移除" end
+  end
+  return false, "未找到该目录"
+end
+
+--- 从运行期覆盖移除一个命令白名单组（仅本次会话新增项可删）。
+--- 来自全局/工具默认/per_tool 的命令组在会话内只读，返回 false 与提示。
+--- @param name string 工具名
+--- @param group string 命令组名
+--- @return boolean removed
+--- @return string|nil err
+function M.remove_allowed_param_group(name, group)
+  if type(name) ~= "string" or type(group) ~= "string" or group == "" then
+    return false, "参数非法"
+  end
+  local ov = state.approval_overrides[name]
+  local list = type(ov) == "table" and ov.allowed_param_groups
+  if type(list) == "table" then
+    for i, g in ipairs(list) do
+      if g == group then
+        local next_ov = vim.deepcopy(ov)
+        table.remove(next_ov.allowed_param_groups, i)
+        state.approval_overrides[name] = next_ov
+        return true
+      end
+    end
+  end
+  for _, g in ipairs(M.get_approval_config(name).allowed_param_groups or {}) do
+    if g == group then return false, "来自配置，不可在会话内移除" end
+  end
+  return false, "未找到该命令组"
+end
+
 --- 清空（测试用）
 function M.reset()
   state.tools = {}

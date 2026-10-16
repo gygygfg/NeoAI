@@ -13,7 +13,7 @@
 | `ui/init.lua` | UI 入口：初始化（注册审批/提问/子Agent监控 UI）、`open_default`/`open_chat`/`open_tree`/`close_all`、键位显示。 |
 | `ui/window/manager.lua` | 窗口管理器：`float` / `tab` / `split` 三种模式创建/关闭/聚焦；禁用 LSP 挂载与行号/符号列。 |
 | `ui/window/chat_view.lua` | 聊天视图（**支持多实例**，见 §4.0）：绑定事件、流式更新、折叠、悬浮窗调度、输入框联动、后台收起/恢复、显示模式宿主。 |
-| `ui/window/tree_view.lua` | 会话树视图：分支树展示与 CRUD。 |
+| `ui/window/tree_view.lua` | 会话树视图：按工作目录分组的**分支树**展示与 CRUD（见 §7）。 |
 | `ui/components/*` | 可复用组件（见下）。 |
 | `ui/geometry.lua` | 浮窗几何计算：按屏幕**相对比例**推导浮窗宽高与居中/贴边位置，避免硬编码像素尺寸。`compute{ w_ratio, h_ratio, fit_h, min_w, max_w, min_h, max_h, margin, anchor, row, narrow }` → `{ width, height, col, row }`。内置全局最小尺寸兜底（`ui.float.min_width/min_height`，默认 24/4），并提供 `track/untrack/refresh/reset`：已登记的浮窗在编辑器窗口 resize（`VimResized`）时实时重算尺寸与位置跟随（流式窗可用自定义 `apply` 保留内容自适应高度）。另支持**窄屏留白**（见 §2.1）。 |
 | `ui/session_cleanup.lua` | 会话恢复残留清理：`:restart`/`-S` 后清掉界面孤儿 buffer（见 §4.9）。 |
@@ -380,7 +380,22 @@ NeoAI 的聊天/输入框/悬浮窗等都是纯 UI 文本，若 LSP 客户端（
 | `display_modes/` | 显示模式插件管理器 + `chat.lua`/`trajectory.lua`。 |
 | `markdown_view` | Markdown 渲染器（代码块 / 行内代码 / 标题 / 列表（含嵌套）/ 引用 / 表格）。输出带 `style`（供 `message_list` 施加正文高亮）与 `tbl`（表格斑马纹）标签。 |
 
-## 7. 键位（ui/keymap.lua）
+## 7. 会话树（tree_view.lua）
+
+会话树窗口展示会话分支，支持选择/新建/删除/展开折叠，**默认按会话绑定的工作目录
+（`session.metadata.cwd`）分组**（见 `ui/window/tree_view.lua`）：
+
+- **始终分组（无开关）**：每个 cwd 一组，组头显示 `▾/▸ 📁 <末级目录名>  <完整路径>  · N 个会话`
+  （组内仅一个会话也显示组头；无 `metadata.cwd` 的旧会话归入「（未绑定工作目录）」组）。
+- **排序**：当前编辑器工作区（`workspace_root.detect_from_context()` 回退 `getcwd()`）对应的组
+  置顶（精确匹配优先，其次路径边界匹配），其余按组内最近使用（`updated_at`）倒序。
+- **键位**：`<CR>`/`o`/`O` 作用于组头时折叠/展开该组（`<CR>` 切换、`o` 展开、`O` 折叠），
+  作用于会话节点时照旧（`<CR>` 打开、`o`/`O` 展开/折叠）；组内按 `N`/`n` 新建会话**继承光标所在
+  分组的 cwd**；`d`/`D` 作用于组头时提示「分组行不可删除」。
+- **兼容**：组内仍按原树渲染（分支/多轮次缩进不变），分组折叠态存于 `state.expanded["group:<cwd>"]`
+  （`nil` = 展开），关闭树窗口即清空。
+
+## 8. 键位（ui/keymap.lua）
 
 `keymap.register_context("chat", actions, buf)` 把一段 action handler 映射到指定 buffer。主界面与
 输入框共用同一份 chat 上下文键位（排除 send/insert，在输入框内单独绑定）。`show_keymaps()` 展示
@@ -394,7 +409,7 @@ NeoAI 的聊天/输入框/悬浮窗等都是纯 UI 文本，若 LSP 客户端（
 `<ScrollWheelUp>`/`<ScrollWheelDown>`（走 `_wheel_scroll`，平滑滚动视口并把末行下方留白钳制在
 `ui.chat.mousescroll_max_blank` 行内）。
 
-## 8. 相关文档
+## 9. 相关文档
 
 - [configuration.md](configuration.md)：`ui.*` / `keymaps.*` 配置。
 - [EVENTS.md](EVENTS.md)：UI 事件（`WINDOW_*`、`DISPLAY_MODE_CHANGED` 等）。

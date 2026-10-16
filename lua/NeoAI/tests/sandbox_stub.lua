@@ -18,6 +18,9 @@ local SB_HELPERS = {
   "hub_pages", "hub_pending_count", "hub_list", "hub_resolve", "hub_get",
   "set_hub_ui", "reset_approval_hub",
   "net_consent_allowances", "net_consent_history", "net_consent_revoke",
+  "tool_approval_list", "tool_approval_set_session_allow",
+  "tool_approval_add_directory", "tool_approval_remove_directory",
+  "tool_approval_add_param_group", "tool_approval_remove_param_group",
   "detokenize", "git_path_class", "content_for",
   "l3_generate", "l3_fallback",
 }

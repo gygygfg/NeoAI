@@ -299,11 +299,25 @@ when `read_all=false` and the target is not covered by a writable root).
 > Files not in any buffer are **auto-opened in a background buffer** (no window switch / layout change): the
 > path is `~`-expanded and made absolute, registered-but-unloaded buffers are actually loaded, and files that
 > exist only as a sandbox staged copy (AI-created, not yet written to disk) can be opened too. LSP client
-> attach is asynchronous, so the tools **wait for it before requesting** (`tools.lsp.attach_timeout_ms`,
-> default 3s; on timeout they still issue one request to return an accurate error): this covers both a
-> buffer just background-loaded and a buffer whose server may still be starting/restarting (another LSP
-> client already exists in the session); a buffer that already timed out once is not waited on again,
-> avoiding a false "no LSP client" report.
+> attach is asynchronous, so the tools **wait for it to be ready before requesting**:
+> 1) When the buffer has **no initialized client yet**, they first derive the missing server from the
+>    **editor LSP config** (`vim.lsp.config` / `vim.lsp.get_configs`, falling back to lspconfig) and
+>    **start it themselves** (controlled by `tools.lsp.auto_start`, on by default) — the `@neoai-sandbox`
+>    clone is preferred when the sandbox is available (reads the staged view, subject to keep-alive/idle
+>    reclamation); when the sandbox is unavailable and the file has no unpublished staged changes it falls
+>    back to a plain (non-sandbox) client (**not** subject to reclamation, never stopping an editor/user
+>    client); with staged changes present it refuses the fallback to keep the view consistent (R3).
+> 2) Then they wait for the client to finish **initializing** — after native `vim.lsp.enable` triggers a
+>    start, the client is not yet initialized when `vim.lsp.start` returns, so `get_clients()` /
+>    `buf_request` cannot see it and an early request falsely reports "no LSP client". Wait budget: use
+>    `tools.lsp.start_timeout_ms` (default 15s) when a start is genuinely in flight; use
+>    `tools.lsp.attach_timeout_ms` (default 3s) for a fully absent candidate (no server configured for the
+>    filetype) to fail fast instead of dragging 15s on every LSP-less file. On timeout they still issue one
+>    request to return an accurate error (never hang forever); a buffer that already timed out once is not
+>    waited on again.
+> 3) When the server command is **not executable** they report a locatable error
+>    (`无法启动 LSP server「x」：命令不可执行（请先安装）`); when the filetype has **no server config** they
+>    report "本文件类型未配置 LSP server" instead of a vague "no LSP client".
 >
 > `lsp_diagnostics` **re-fetches on every call**: pull clients (`textDocument/diagnostic`, sandbox clone
 > preferred) are queried directly for the latest diagnostics; when only push clients exist, it forces a

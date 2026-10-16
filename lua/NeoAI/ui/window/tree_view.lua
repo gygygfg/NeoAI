@@ -166,24 +166,108 @@ local function _cleanup_empty_sessions()
   return #delete_ids
 end
 
+--- ========== 工作目录分组 ==========
+
+--- 会话绑定的工作目录（`metadata.cwd`）；无则返回空串（归入「未绑定工作目录」组）。
+--- @param session table
+--- @return string
+local function _cwd_of(session)
+  local cwd = session and session.metadata and session.metadata.cwd
+  if type(cwd) == "string" then return cwd end
+  return ""
+end
+
+--- 分组键（与会话 id 区分，避免折叠态串扰）。
+--- @param cwd string
+--- @return string
+local function _group_key(cwd)
+  return "group:" .. cwd
+end
+
+--- 组头文本：▾/▸ + 目录名 + 完整路径 + 会话数（无绑定目录时省略路径）。
+--- @param cwd string
+--- @param n number 会话数
+--- @param is_open boolean
+--- @return string
+local function _group_label(cwd, n, is_open)
+  local caret = is_open and "▾" or "▸"
+  if cwd == "" then
+    return ("%s 📁 （未绑定工作目录）  · %d 个会话"):format(caret, n)
+  end
+  local base = vim.fn.fnamemodify(cwd, ":t")
+  if base == "" then base = cwd end
+  return ("%s 📁 %s  %s  · %d 个会话"):format(caret, base, cwd, n)
+end
+
+--- 当前编辑器工作区目录（用于把对应分组置顶）；检测失败回退 cwd。
+--- @return string
+local function _editor_group_cwd()
+  local ok, wr = pcall(require, "NeoAI.core.session.workspace_root")
+  if ok and wr and type(wr.detect_from_context) == "function" then
+    local ok2, root = pcall(wr.detect_from_context)
+    if ok2 and type(root) == "string" and root ~= "" then return root end
+  end
+  return vim.fn.getcwd()
+end
+
 --- 展平会话树，使用 ├─、└─ 和 │ 绘制层级连接线。
+--- 顶层按会话绑定工作目录（`metadata.cwd`）分组：每组先渲染一行组头（▾/▸ + 目录名 +
+--- 完整路径 + 会话数），可折叠；组内根会话以 depth=1 走原有树渲染（分支/多轮次照旧缩进）。
+--- @return table 数组
 local function _build_flat()
   local items = {}
-  local roots = session_store.get_roots()
-  local function walk(session, depth, prefix, is_last, is_root)
+  local editor_cwd = _editor_group_cwd()
+  -- 按根会话绑定的工作目录分组（组内保持 updated_at 倒序：get_roots 已排序）。
+  local groups, order = {}, {}
+  for _, root in ipairs(session_store.get_roots()) do
+    local cwd = _cwd_of(root)
+    local key = _group_key(cwd)
+    local g = groups[key]
+    if not g then
+      g = { key = key, cwd = cwd, roots = {}, max_updated = root.updated_at or 0, count = 0 }
+      groups[key] = g
+      order[#order + 1] = g
+    end
+    g.roots[#g.roots + 1] = root
+    if (root.updated_at or 0) > g.max_updated then g.max_updated = root.updated_at or 0 end
+  end
+  -- 会话数（含分支/多轮次所属会话）：按绑定 cwd 统计。
+  for _, s in pairs(session_store.get_all()) do
+    local g = groups[_group_key(_cwd_of(s))]
+    if g then g.count = g.count + 1 end
+  end
+  -- 组排序等级：0=精确实等编辑器工作区；1=路径边界匹配（编辑器位于组目录之下或反之）；
+  -- 2=其它。用于把「当前编辑器工作区」对应的组置顶。
+  local function _rank(cwd)
+    if cwd == "" or editor_cwd == "" then return 2 end
+    local a = cwd:gsub("/+$", "")
+    local b = editor_cwd:gsub("/+$", "")
+    if a == b then return 0 end
+    if a ~= "" and b:sub(1, #a + 1) == a .. "/" then return 1 end
+    if b ~= "" and a:sub(1, #b + 1) == b .. "/" then return 1 end
+    return 2
+  end
+  table.sort(order, function(x, y)
+    local rx, ry = _rank(x.cwd), _rank(y.cwd)
+    if rx ~= ry then return rx < ry end
+    if x.max_updated ~= y.max_updated then return x.max_updated > y.max_updated end
+    return tostring(x.cwd) < tostring(y.cwd)
+  end)
+  local function walk(session, depth, prefix, is_last)
     local children = session_store.get_children(session.id)
     -- 空会话不渲染为节点；其子会话提升到当前层级
     if _session_is_empty(session) then
       for idx, child in ipairs(children) do
-        walk(child, depth, prefix, is_last and idx == #children, is_root)
+        walk(child, depth, prefix, is_last and idx == #children)
       end
       return
     end
     local is_open = state.expanded[session.id] == true
     local rounds = _conversation_rounds(session)
     local has_children = #rounds > 1 or #children > 0
-    local connector = (is_root and #roots == 1) and "" or (is_last and "└─ " or "├─ ")
+    local connector = is_last and "└─ " or "├─ "
     items[#items + 1] = {
+      kind = "session",
       depth = depth,
       session = session,
       is_open = is_open,
@@ -196,16 +280,14 @@ local function _build_flat()
 
     if is_open then
       local entry_count = #rounds - 1 + #children
-      local child_prefix = prefix
-      if not (is_root and #roots == 1) then
-        child_prefix = child_prefix .. (is_last and "   " or "│  ")
-      end
+      local child_prefix = prefix .. (is_last and "   " or "│  ")
       local entry_idx = 0
 
       -- 首轮是会话节点本身；剩余轮次和分支会话作为其子节点连续展示。
       for round_idx = 2, #rounds do
         entry_idx = entry_idx + 1
         items[#items + 1] = {
+          kind = "session",
           depth = depth + 1,
           session = session,
           is_open = false,
@@ -218,17 +300,32 @@ local function _build_flat()
       end
       for _, child in ipairs(children) do
         entry_idx = entry_idx + 1
-        walk(child, depth + 1, child_prefix, entry_idx == entry_count, false)
+        walk(child, depth + 1, child_prefix, entry_idx == entry_count)
       end
     end
   end
-  for idx, root in ipairs(roots) do
-    -- 默认展开根节点
-    if state.expanded[root.id] == nil then
-      state.expanded[root.id] = true
+  for gi, g in ipairs(order) do
+    local is_last_group = (gi == #order)
+    local is_open = state.expanded[g.key] ~= false -- 分组：nil=展开
+    items[#items + 1] = {
+      kind = "group",
+      key = g.key,
+      cwd = g.cwd,
+      is_open = is_open,
+      prefix = is_last_group and "└─ " or "├─ ",
+      label = _group_label(g.cwd, g.count, is_open),
+    }
+    if is_open then
+      local group_child_prefix = is_last_group and "   " or "│  "
+      local n = #g.roots
+      for ri, root in ipairs(g.roots) do
+        -- 默认展开根节点
+        if state.expanded[root.id] == nil then
+          state.expanded[root.id] = true
+        end
+        walk(root, 1, group_child_prefix, ri == n)
+      end
     end
-    local is_last_root = (idx == #roots)
-    walk(root, 0, "", is_last_root, true)
   end
   return items
 end
@@ -285,16 +382,33 @@ local function _move(delta)
   _update_selection()
 end
 
---- 展开/折叠
-local function _toggle_expand()
-  local item = _current_item()
+--- 展开/折叠当前项（分组头或会话节点）。分组以「非显式 false」为展开态。
+local function _toggle_expand(item)
+  item = item or _current_item()
   if not item then return end
-  if not item.has_children then return end
-  if state.expanded[item.session.id] then
-    state.expanded[item.session.id] = false
-  else
-    state.expanded[item.session.id] = true
+  if item.kind == "group" then
+    state.expanded[item.key] = not (state.expanded[item.key] ~= false)
+    _render()
+    return
   end
+  if not item.has_children then return end
+  state.expanded[item.session.id] = not (state.expanded[item.session.id] == true)
+  _render()
+end
+
+--- 显式展开（want=true）/折叠（want=false）当前项（供 o/O 分组键使用）。
+--- @param item table|nil
+--- @param want boolean
+local function _set_expand(item, want)
+  item = item or _current_item()
+  if not item then return end
+  if item.kind == "group" then
+    state.expanded[item.key] = want
+    _render()
+    return
+  end
+  if not item.has_children then return end
+  state.expanded[item.session.id] = want
   _render()
 end
 
@@ -327,19 +441,37 @@ local function _open_session_in_chat(session, round)
   end
 end
 
---- 选择并打开聊天
+--- 光标所在项所属分组的 cwd（分组头取自身；会话取绑定 cwd）；无则 nil。
+--- @param item table|nil
+--- @return string|nil
+local function _item_cwd(item)
+  if not item then return nil end
+  local cwd = (item.kind == "group") and item.cwd or _cwd_of(item.session)
+  if type(cwd) ~= "string" or cwd == "" then return nil end
+  return cwd
+end
+
+--- 选择并打开聊天；作用于分组头时改为折叠/展开该组。
 local function _select()
   local item = _current_item()
   if not item then return end
+  if item.kind == "group" then
+    _toggle_expand(item)
+    return
+  end
   _open_session_in_chat(item.session, item.round)
 end
 
---- 新建子分支：创建会话后直接切到聊天界面，避免"看不见新会话"
+--- 新建子分支：创建会话后直接切到聊天界面，避免"看不见新会话"。
+--- 作用于分组头或在组内时，继承光标所在分组的 cwd。
 local function _new_child()
   local item = _current_item()
   local session
   if not item then
     session = session_store.create()
+  elseif item.kind == "group" then
+    session = session_store.create({ cwd = _item_cwd(item) })
+    state.expanded[item.key] = true
   else
     session = session_store.create({ parent_id = item.session.id })
     state.expanded[item.session.id] = true
@@ -347,16 +479,21 @@ local function _new_child()
   _open_session_in_chat(session)
 end
 
---- 新建根分支：创建会话后直接切到聊天界面
+--- 新建根分支：创建会话后直接切到聊天界面；继承光标所在分组的 cwd。
 local function _new_root()
-  local session = session_store.create()
+  local item = _current_item()
+  local session = session_store.create({ cwd = _item_cwd(item) })
   _open_session_in_chat(session)
 end
 
---- 删除光标所在轮次（会话首行对应第一轮）。
+--- 删除光标所在轮次（会话首行对应第一轮）；分组头不可删除。
 local function _delete_round()
   local item = _current_item()
   if not item then return end
+  if item.kind == "group" then
+    vim.notify("[NeoAI] 分组行不可删除", vim.log.levels.WARN)
+    return
+  end
   local round = _conversation_rounds(item.session)[item.round or 1]
   if not round then return end
   local ok, err = session_store.delete_messages(item.session.id, round.first, round.last)
@@ -364,10 +501,14 @@ local function _delete_round()
   _render()
 end
 
---- 删除该轮所属会话及全部后代分支。
+--- 删除该轮所属会话及全部后代分支；分组头不可删除。
 local function _delete_branch()
   local item = _current_item()
   if not item then return end
+  if item.kind == "group" then
+    vim.notify("[NeoAI] 分组行不可删除", vim.log.levels.WARN)
+    return
+  end
   local _, err = session_store.delete(item.session.id, { recursive = true })
   if err then vim.notify("[NeoAI] 删除会话失败: " .. tostring(err), vim.log.levels.ERROR) end
   _render()
@@ -383,8 +524,8 @@ local function _set_keymaps()
     new_root = _new_root,
     delete_dialog = _delete_round,
     delete_branch = _delete_branch,
-    expand = _toggle_expand,
-    collapse = _toggle_expand,
+    expand = function() _set_expand(nil, true) end,
+    collapse = function() _set_expand(nil, false) end,
   }
   vim.keymap.set("n", "j", function() _move(1) end, { buffer = state.buf, desc = "下移" })
   vim.keymap.set("n", "k", function() _move(-1) end, { buffer = state.buf, desc = "上移" })

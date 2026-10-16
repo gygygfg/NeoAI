@@ -1981,4 +1981,122 @@ tests.suite("sandbox_review", function(_, it)
     sr.close()
     services.provide("services.sandbox", saved)
   end)
+
+  it("沙箱门面 tool_approval_list 与各 mutator（仅本会话内存态）", function(t)
+    local sb = require("NeoAI.sandbox")
+    local registry = require("NeoAI.tools.registry")
+    local tool_service = require("NeoAI.services.tool_service")
+    local config_store = require("NeoAI.kernel.config_store")
+    registry.reset()
+    tool_service.reset()
+    local saved_cfg = config_store.get_all()
+    config_store.load({ tools = { approval = {} } })
+    registry.register({ name = "facade_tool", description = "门面测试", parameters = {}, category = "test",
+      func = function(_, on_success) on_success("ok") end })
+    -- 列表含所有工具且带生效/运行期字段
+    local found
+    for _, item in ipairs(sb.tool_approval_list()) do
+      if item.name == "facade_tool" then found = item end
+    end
+    t.not_nil(found, "列表应含已注册工具")
+    t.false_(found.session_allow, "初始非会话允许")
+    t.true_(found.allowed_directories ~= nil and found.runtime_directories ~= nil, "应含目录字段")
+    -- 会话允许
+    t.true_(sb.tool_approval_set_session_allow("facade_tool", true), "设置会话允许应成功")
+    t.true_(tool_service.get_allow_all("facade_tool"), "tool_service 应记录会话允许")
+    t.true_(vim.tbl_contains(tool_service.list_allow_all(), "facade_tool"), "list_allow_all 应含该工具")
+    -- 目录：会话新增可增可删
+    t.true_(sb.tool_approval_add_directory("facade_tool", "/tmp/neoai_facade_dir"), "应能加会话目录")
+    local rt = registry.get_runtime_approval("facade_tool")
+    t.eq(1, #(rt and rt.allowed_directories or {}), "应写入运行期覆盖")
+    t.true_(sb.tool_approval_remove_directory("facade_tool", "/tmp/neoai_facade_dir"), "应能删会话新增目录")
+    -- 命令组：会话新增可增可删
+    t.true_(sb.tool_approval_add_param_group("facade_tool", "facade-group"), "应能加会话命令组")
+    t.true_(sb.tool_approval_remove_param_group("facade_tool", "facade-group"), "应能删会话新增命令组")
+    registry.reset()
+    tool_service.reset()
+    config_store.load(saved_cfg)
+  end)
+
+  it("工具行为页 T 打开「工具审批条件」编辑器并支持 s/d", function(t)
+    local services = require("NeoAI.kernel.services")
+    local sr = require("NeoAI.ui.components.sandbox_review")
+    local config_store = require("NeoAI.kernel.config_store")
+    sr.reset()
+    config_store.load({ tools = { approval = {} } })
+    local saved = services.use("services.sandbox")
+    local calls = {}
+    _provide_sandbox({
+      list_reviews = function() return {} end,
+      list_traces = function() return {} end,
+      list_saved = function() return {} end,
+      apply = function() return { ok = true } end,
+      reject = function() end,
+      tool_approval_list = function()
+        return {
+          { name = "srv_tool", category = "test",
+            auto_allow = false, session_allow = false,
+            allowed_directories = { "/tmp/neoai_cfg1" },
+            runtime_directories = { "/tmp/neoai_rt1" },
+            allowed_param_groups = { "cfg-g" },
+            runtime_param_groups = { "rt-g" } },
+        }
+      end,
+      tool_approval_set_session_allow = function(name, allow)
+        calls.session = { name, allow }; return true
+      end,
+      tool_approval_remove_directory = function(name, dir)
+        calls.dir = { name, dir }; return true
+      end,
+      tool_approval_remove_param_group = function(name, group)
+        calls.group = { name, group }; return true
+      end,
+    })
+    sr.open()
+    sr.open_page("behavior")
+    local buf = sr.get_buf()
+    for _, m in ipairs(vim.api.nvim_buf_get_keymap(buf, "n")) do
+      if m.lhs == "T" then m.callback() end
+    end
+    local ebuf = sr.get_tools_approval_editor_buf()
+    t.not_nil(ebuf, "T 应打开「工具审批条件」编辑器")
+    local text = table.concat(vim.api.nvim_buf_get_lines(ebuf, 0, -1, false), "\n")
+    t.matches("工具审批条件", text, "编辑器应含标题")
+    t.matches("srv_tool", text, "编辑器应含工具名")
+    t.matches("/tmp/neoai_rt1", text, "编辑器应含本次会话新增目录")
+    t.matches("/tmp/neoai_cfg1", text, "编辑器应含配置目录")
+    t.matches("来自配置", text, "应标注来自配置的只读项")
+    -- 行定位与按键派发
+    local function find(pat)
+      for i, l in ipairs(vim.api.nvim_buf_get_lines(ebuf, 0, -1, false)) do
+        if l:find(pat, 1, true) then return i end
+      end
+    end
+    local function press(key)
+      for _, m in ipairs(vim.api.nvim_buf_get_keymap(ebuf, "n")) do
+        if m.lhs == key then m.callback(); return end
+      end
+    end
+    local ewin = vim.fn.bufwinid(ebuf)
+    -- s：切换光标所在工具的本次会话允许
+    vim.api.nvim_win_set_cursor(ewin, { find("srv_tool"), 0 })
+    press("s")
+    t.not_nil(calls.session, "s 应触发会话允许切换")
+    t.eq("srv_tool", calls.session[1])
+    t.eq(true, calls.session[2])
+    -- d：删除本次会话新增目录
+    vim.api.nvim_win_set_cursor(ewin, { find("/tmp/neoai_rt1"), 0 })
+    press("d")
+    t.not_nil(calls.dir, "d 应删除本次会话新增目录")
+    t.eq("/tmp/neoai_rt1", calls.dir[2])
+    -- d：删除本次会话新增命令组
+    vim.api.nvim_win_set_cursor(ewin, { find("rt-g"), 0 })
+    press("d")
+    t.not_nil(calls.group, "d 应删除本次会话新增命令组")
+    t.eq("rt-g", calls.group[2])
+    sr.close()
+    t.eq(nil, sr.get_tools_approval_editor_buf(), "关闭审批窗应同时关闭工具审批条件编辑器")
+    services.provide("services.sandbox", saved)
+    config_store.load({})
+  end)
 end)

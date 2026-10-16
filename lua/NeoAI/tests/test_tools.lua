@@ -1653,6 +1653,161 @@ tests.suite("tools", function(_, it)
     vim.lsp.get_clients = orig_clients
   end)
 
+  --- LSP 用例辅助：注入 services.sandbox 直通门禁，消除本机 sandbox=nil + fail_closed 的假失败
+  --- （executor._execute_tool 会因沙箱服务缺失且 fail_closed=true 直接拒绝，掩盖 LSP 行为）。
+  --- @param fn function
+  local function with_lsp_sandbox(fn)
+    local services = require("NeoAI.kernel.services")
+    local prev = services.has("services.sandbox") and services.use("services.sandbox") or nil
+    services.provide("services.sandbox", { gate = function(_, _, _, run) return run() end })
+    local ok, err = pcall(fn)
+    if prev then
+      services.provide("services.sandbox", prev)
+    else
+      services.revoke("services.sandbox")
+    end
+    if not ok then error(err, 0) end
+  end
+
+  --- 写入临时文件（本机 /tmp 不可写，改用 stdpath 下的临时目录）。
+  --- @param name string
+  --- @param content string
+  --- @return string path
+  local function write_tmp(name, content)
+    local fs = require("NeoAI.utils.fs")
+    local dir = vim.fn.stdpath("cache") .. "/neoai-lsp-test"
+    vim.fn.mkdir(dir, "p")
+    local path = dir .. "/" .. name
+    fs.write_file(path, content)
+    return path
+  end
+
+  --- 取 lsp_ops 的某个工具定义。
+  local function lsp_tool_def(name)
+    for _, tool in ipairs(require("NeoAI.tools.builtin.lsp_ops").get_tools()) do
+      if tool.name == name then return tool end
+    end
+    return nil
+  end
+
+  it("LSP：首次调用自主启动缺失 server 并等待 initialize 后再发请求", function(t)
+    with_lsp_sandbox(function()
+      local config_store = require("NeoAI.kernel.config_store")
+      config_store.load({ tools = { approval = { mode = "auto_allow" },
+        lsp = { auto_start = true, start_timeout_ms = 3000, attach_timeout_ms = 300, timeout_ms = 2000 } } })
+      local sandbox_lsp = require("NeoAI.sandbox.execution.lsp")
+      sandbox_lsp.reset()
+      local tool = assert(lsp_tool_def("lsp_hover"), "应暴露 lsp_hover")
+      local path = write_tmp("start_wait.py", "x = 1\n")
+      local buf = vim.fn.bufadd(path)
+      vim.fn.bufload(buf)
+      vim.bo[buf].filetype = "python"
+      local oc, ogc, os, obr = vim.lsp.get_configs, vim.lsp.get_clients, vim.lsp.start, vim.lsp.buf_request
+      local start_calls = {}
+      ---@diagnostic disable-next-line: duplicate-set-field
+      vim.lsp.get_configs = function()
+        return { { name = "pyright", cmd = { "sh" }, filetypes = { "python" }, root_markers = { "setup.py" } } }
+      end
+      ---@diagnostic disable-next-line: duplicate-set-field
+      vim.lsp.start = function(cfg) start_calls[#start_calls + 1] = cfg; return 9101 end
+      local attached = false
+      local ready = { id = 9101, name = "pyright", initialized = true,
+        supports_method = function() return true end }
+      ---@diagnostic disable-next-line: duplicate-set-field
+      vim.lsp.get_clients = function(opts)
+        if opts and opts._uninitialized then
+          -- 启动在途（未 initialize）：attach 前返回 pending 假客户端。
+          return attached and { ready } or { { id = 9101, name = "pyright", initialized = false } }
+        end
+        if opts and opts.bufnr then return attached and { ready } or {} end
+        return attached and { ready } or {}
+      end
+      ---@diagnostic disable-next-line: duplicate-set-field
+      vim.lsp.buf_request = function(_, method, _, handler)
+        if method == "textDocument/hover" then handler(nil, { contents = "HOVER-START-OK" }) end
+        return { [1] = 1 }
+      end
+      vim.defer_fn(function() attached = true end, 200)
+      local result, done
+      tool.func({ file_path = path, line = 1, col = 1, description = "t" },
+        function(r) result = r; done = true end,
+        function(e) result = "ERR:" .. tostring(e); done = true end)
+      t.true_(vim.wait(4000, function() return done end, 10), "应在等待 initialize 后完成")
+      vim.lsp.get_configs, vim.lsp.get_clients, vim.lsp.start, vim.lsp.buf_request = oc, ogc, os, obr
+      sandbox_lsp.reset()
+      pcall(vim.api.nvim_buf_delete, buf, { force = true })
+      t.true_(#start_calls >= 1, "缺失客户端时应按编辑器配置自主启动 server")
+      t.matches("HOVER%-START%-OK", tostring(result), "initialize 完成后应正常返回悬停结果")
+    end)
+  end)
+
+  it("LSP：server 命令不可执行时明确报错（而非笼统「无客户端」）", function(t)
+    with_lsp_sandbox(function()
+      local config_store = require("NeoAI.kernel.config_store")
+      config_store.load({ tools = { approval = { mode = "auto_allow" },
+        lsp = { auto_start = true, start_timeout_ms = 800, attach_timeout_ms = 300, timeout_ms = 1000 } } })
+      local sandbox_lsp = require("NeoAI.sandbox.execution.lsp")
+      sandbox_lsp.reset()
+      local tool = assert(lsp_tool_def("lsp_hover"), "应暴露 lsp_hover")
+      local path = write_tmp("missing_cmd.lua", "local x = 1\n")
+      local buf = vim.fn.bufadd(path)
+      vim.fn.bufload(buf)
+      vim.bo[buf].filetype = "lua"
+      local oc, ogc, os = vim.lsp.get_configs, vim.lsp.get_clients, vim.lsp.start
+      local started = 0
+      ---@diagnostic disable-next-line: duplicate-set-field
+      vim.lsp.get_configs = function()
+        return { { name = "lua-language-server", cmd = { "neoai-nonexistent-server-xyz" }, filetypes = { "lua" } } }
+      end
+      ---@diagnostic disable-next-line: duplicate-set-field
+      vim.lsp.start = function() started = started + 1; return 9201 end
+      ---@diagnostic disable-next-line: duplicate-set-field
+      vim.lsp.get_clients = function() return {} end
+      local result, done
+      tool.func({ file_path = path, line = 1, col = 1, description = "t" },
+        function(r) result = "OK:" .. tostring(r); done = true end,
+        function(e) result = tostring(e); done = true end)
+      t.true_(vim.wait(3000, function() return done end, 10), "应快速完成（不空等）")
+      vim.lsp.get_configs, vim.lsp.get_clients, vim.lsp.start = oc, ogc, os
+      sandbox_lsp.reset()
+      pcall(vim.api.nvim_buf_delete, buf, { force = true })
+      t.matches("不可执行", tostring(result), "应给出「命令不可执行」的明确错误")
+      t.eq(0, started, "命令不可执行时不应尝试启动")
+    end)
+  end)
+
+  it("LSP：本文件类型无 server 配置时有界快速失败（不空等 start_timeout）", function(t)
+    with_lsp_sandbox(function()
+      local config_store = require("NeoAI.kernel.config_store")
+      config_store.load({ tools = { approval = { mode = "auto_allow" },
+        lsp = { auto_start = true, start_timeout_ms = 5000, attach_timeout_ms = 500, timeout_ms = 1000 } } })
+      local sandbox_lsp = require("NeoAI.sandbox.execution.lsp")
+      sandbox_lsp.reset()
+      local tool = assert(lsp_tool_def("lsp_hover"), "应暴露 lsp_hover")
+      local path = write_tmp("no_config.txt", "hello\n")
+      local buf = vim.fn.bufadd(path)
+      vim.fn.bufload(buf)
+      vim.bo[buf].filetype = "text"
+      local oc, ogc = vim.lsp.get_configs, vim.lsp.get_clients
+      ---@diagnostic disable-next-line: duplicate-set-field
+      vim.lsp.get_configs = function() return {} end
+      ---@diagnostic disable-next-line: duplicate-set-field
+      vim.lsp.get_clients = function() return {} end
+      local result, done = nil, false
+      local t0 = vim.uv.now()
+      tool.func({ file_path = path, line = 1, col = 1, description = "t" },
+        function(r) result = "OK:" .. tostring(r); done = true end,
+        function(e) result = tostring(e); done = true end)
+      t.true_(vim.wait(3000, function() return done end, 10), "应完成而非挂起")
+      local elapsed = vim.uv.now() - t0
+      vim.lsp.get_configs, vim.lsp.get_clients = oc, ogc
+      sandbox_lsp.reset()
+      pcall(vim.api.nvim_buf_delete, buf, { force = true })
+      t.matches("无 LSP 客户端", tostring(result), "无配置应报「无 LSP 客户端」")
+      t.true_(elapsed < 2000, "无配置应快速失败，不得等满 start_timeout_ms")
+    end)
+  end)
+
   it("environment: 无 git 工作树时禁用 git 工具，进入后恢复", function(t)
     local env = require("NeoAI.tools.environment")
     local tool_loop = require("NeoAI.core.agent.tool_loop")
@@ -1721,5 +1876,49 @@ tests.suite("tools", function(_, it)
       { filePath = dir .. "/a.lua", description = "别名读取" }, {}))
     t.matches("needle", tostring(c), "filePath 别名应生效")
     vim.fn.delete(dir, "rf")
+  end)
+
+  it("registry 运行期审批覆盖：增删目录/命令组与「来自配置不可删」", function(t)
+    local registry = require("NeoAI.tools.registry")
+    local config_store = require("NeoAI.kernel.config_store")
+    registry.reset()
+    local saved = config_store.get_all()
+    config_store.load({ tools = { approval = {
+      allowed_directories = { "/tmp/neoai_cfg_dir" },
+      allowed_param_groups = { "cfg-group" },
+    } } })
+    -- 初始：无运行期覆盖
+    t.eq(nil, registry.get_runtime_approval("edit_file"), "初始应无运行期覆盖")
+    local cfg = registry.get_approval_config("edit_file")
+    t.true_(vim.tbl_contains(cfg.allowed_directories, "/tmp/neoai_cfg_dir"), "全局目录应生效")
+    t.true_(vim.tbl_contains(cfg.allowed_param_groups, "cfg-group"), "全局命令组应生效")
+    -- 运行期新增目录（去重）
+    t.true_(registry.add_allowed_directory("edit_file", "/tmp/neoai_rt_dir"), "应能新增运行期目录")
+    t.false_(registry.add_allowed_directory("edit_file", "/tmp/neoai_rt_dir"), "重复目录应被去重拒绝")
+    t.false_(registry.add_allowed_directory("edit_file", "/tmp/neoai_cfg_dir"), "已生效（配置）目录不应重复新增")
+    local rt = registry.get_runtime_approval("edit_file")
+    t.not_nil(rt, "新增后应有运行期覆盖")
+    t.eq(1, #rt.allowed_directories, "运行期目录应仅含会话新增项")
+    -- 运行期新增命令组（去重）
+    t.true_(registry.add_allowed_param_group("edit_file", "rt-group"), "应能新增运行期命令组")
+    t.false_(registry.add_allowed_param_group("edit_file", "rt-group"), "重复命令组应被去重拒绝")
+    t.false_(registry.add_allowed_param_group("edit_file", "cfg-group"), "已生效（配置）命令组不应重复新增")
+    t.eq(1, #registry.get_runtime_approval("edit_file").allowed_param_groups, "运行期命令组应仅含会话新增项")
+    -- 移除：会话新增项可删
+    t.true_(registry.remove_allowed_directory("edit_file", "/tmp/neoai_rt_dir"), "会话新增目录应可删")
+    t.true_(registry.remove_allowed_param_group("edit_file", "rt-group"), "会话新增命令组应可删")
+    -- 移除：来自配置的只读，不可删（返回 false 与提示）
+    local ok, err = registry.remove_allowed_directory("edit_file", "/tmp/neoai_cfg_dir")
+    t.false_(ok, "配置目录不可在会话内移除")
+    t.matches("配置", tostring(err), "应提示来自配置")
+    local ok2, err2 = registry.remove_allowed_param_group("edit_file", "cfg-group")
+    t.false_(ok2, "配置命令组不可在会话内移除")
+    t.matches("配置", tostring(err2), "应提示来自配置")
+    -- 生效配置仍含配置项（移除运行期项不影响）
+    local cfg2 = registry.get_approval_config("edit_file")
+    t.true_(vim.tbl_contains(cfg2.allowed_directories, "/tmp/neoai_cfg_dir"), "配置目录应始终生效")
+    t.true_(vim.tbl_contains(cfg2.allowed_param_groups, "cfg-group"), "配置命令组应始终生效")
+    registry.reset()
+    config_store.load(saved)
   end)
 end)

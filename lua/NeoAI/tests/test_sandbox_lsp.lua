@@ -393,4 +393,147 @@ tests.suite("sandbox_lsp", function(_, it)
       lsp.reset()
     end)
   end)
+
+  -- ---- 自主启动（start_missing）：派生配置 / 幂等 / 暂存守卫 / 克隆纳入回收 ----
+
+  it("start_missing 按编辑器配置派生启动（沙箱不可用时 plain 回退）", function(t)
+    local lsp = require("NeoAI.sandbox.execution.lsp")
+    local fs = require("NeoAI.utils.fs")
+    local dir = vim.fn.tempname()
+    fs.ensure_dir(dir)
+    local real = dir .. "/a.py"
+    fs.write_file(real, "x = 1\n")
+    with_config({ tools = { sandbox = { lsp_overlay = { enabled = true } } } }, function()
+      lsp.reset()
+      local bufnr = vim.api.nvim_create_buf(false, true)
+      vim.api.nvim_buf_set_name(bufnr, real)
+      vim.bo[bufnr].filetype = "python"
+      local ogc, os, ocl = vim.lsp.get_configs, vim.lsp.start, vim.lsp.get_clients
+      local captured
+      ---@diagnostic disable-next-line: duplicate-set-field
+      vim.lsp.get_configs = function()
+        return { { name = "pyright", cmd = { "sh" }, filetypes = { "python" } } }
+      end
+      ---@diagnostic disable-next-line: duplicate-set-field
+      vim.lsp.start = function(cfg) captured = cfg; return 9401 end
+      ---@diagnostic disable-next-line: duplicate-set-field
+      vim.lsp.get_clients = function() return {} end
+      local started, reason = lsp.start_missing(bufnr)
+      vim.lsp.get_configs, vim.lsp.start, vim.lsp.get_clients = ogc, os, ocl
+      t.true_(started, "应按编辑器配置启动缺失 server")
+      t.nil_(reason, "成功时不应返回原因")
+      t.not_nil(captured, "应调用 vim.lsp.start")
+      t.eq("pyright", captured.name, "配置名应透传")
+      t.true_(lsp._test_plain_started()[9401] == true, "plain 回退客户端应被登记（可区分，不纳入回收）")
+      pcall(vim.api.nvim_buf_delete, bufnr, { force = true })
+      lsp.reset()
+    end)
+    vim.fn.delete(dir, "rf")
+  end)
+
+  it("start_missing 幂等：已有已初始化客户端时不再启动", function(t)
+    local lsp = require("NeoAI.sandbox.execution.lsp")
+    with_config({ tools = { sandbox = { lsp_overlay = { enabled = true } } } }, function()
+      lsp.reset()
+      local bufnr = vim.api.nvim_get_current_buf()
+      local ogc, os, oc = vim.lsp.get_clients, vim.lsp.start, vim.lsp.get_configs
+      local started = 0
+      ---@diagnostic disable-next-line: duplicate-set-field
+      vim.lsp.get_clients = function() return { { id = 1, initialized = true } } end
+      ---@diagnostic disable-next-line: duplicate-set-field
+      vim.lsp.get_configs = function()
+        return { { name = "pyright", cmd = { "sh" }, filetypes = { "python" } } }
+      end
+      ---@diagnostic disable-next-line: duplicate-set-field
+      vim.lsp.start = function() started = started + 1; return 2 end
+      local ok, reason = lsp.start_missing(bufnr)
+      vim.lsp.get_clients, vim.lsp.start, vim.lsp.get_configs = ogc, os, oc
+      t.false_(ok, "已有客户端时不应再启动")
+      t.nil_(reason, "已有客户端时应静默跳过")
+      t.eq(0, started, "不应调用 vim.lsp.start")
+      lsp.reset()
+    end)
+  end)
+
+  it("start_missing：沙箱不可用且有暂存改动时拒绝回退（不启动 plain）", function(t)
+    local lsp = require("NeoAI.sandbox.execution.lsp")
+    local cand = require("NeoAI.sandbox.execution.candidate")
+    local fs = require("NeoAI.utils.fs")
+    local dir = vim.fn.tempname()
+    fs.ensure_dir(dir)
+    local real = dir .. "/s.py"
+    fs.write_file(real, "x = 1\n")
+    with_config({ tools = { sandbox = { lsp_overlay = { enabled = true } } } }, function()
+      lsp.reset()
+      cand.reset(1000)
+      cand.begin({ attempt_id = "t1" }, dir)
+      t.not_nil(cand.stage_path("t1", real), "应建立暂存副本")
+      local bufnr = vim.api.nvim_create_buf(false, true)
+      vim.api.nvim_buf_set_name(bufnr, real)
+      vim.bo[bufnr].filetype = "python"
+      local ogc, os, oc = vim.lsp.get_clients, vim.lsp.start, vim.lsp.get_configs
+      local started = 0
+      ---@diagnostic disable-next-line: duplicate-set-field
+      vim.lsp.get_clients = function() return {} end
+      ---@diagnostic disable-next-line: duplicate-set-field
+      vim.lsp.get_configs = function()
+        return { { name = "pyright", cmd = { "sh" }, filetypes = { "python" } } }
+      end
+      ---@diagnostic disable-next-line: duplicate-set-field
+      vim.lsp.start = function() started = started + 1; return 9501 end
+      local ok, reason = lsp.start_missing(bufnr)
+      vim.lsp.get_clients, vim.lsp.start, vim.lsp.get_configs = ogc, os, oc
+      t.false_(ok, "有暂存改动且沙箱不可用时应拒绝回退")
+      t.eq("staged_no_sandbox", reason and reason.code, "应返回 staged_no_sandbox 原因")
+      t.eq(0, started, "不应启动 plain 客户端（保持视图一致 R3）")
+      pcall(vim.api.nvim_buf_delete, bufnr, { force = true })
+      cand.reset(1000)
+      lsp.reset()
+    end)
+    vim.fn.delete(dir, "rf")
+  end)
+
+  it("start_missing 启动的沙箱克隆纳入保活与空闲回收", function(t)
+    local lsp = require("NeoAI.sandbox.execution.lsp")
+    with_config({ tools = { sandbox = { lsp_overlay = { enabled = true, idle_timeout_ms = 100000 } } } }, function()
+      lsp.reset()
+      local bufnr = vim.api.nvim_create_buf(false, true)
+      vim.bo[bufnr].filetype = "python"
+      local ogc, os, oc, ow, ogbi = vim.lsp.get_clients, vim.lsp.start,
+        vim.lsp.get_configs, lsp.wrap_cmd, vim.lsp.get_client_by_id
+      -- 模拟沙箱可用：wrap_cmd 返回带 bwrap 前缀的命令。
+      lsp.wrap_cmd = function(cmd)
+        local full = { "bwrap", "--" }
+        for _, v in ipairs(cmd) do full[#full + 1] = v end
+        return full
+      end
+      local client = fake_client(9601, vim.fn.getcwd())
+      ---@diagnostic disable-next-line: duplicate-set-field
+      vim.lsp.get_clients = function() return {} end
+      ---@diagnostic disable-next-line: duplicate-set-field
+      vim.lsp.get_configs = function()
+        return { { name = "pyright", cmd = { "sh" }, filetypes = { "python" } } }
+      end
+      ---@diagnostic disable-next-line: duplicate-set-field
+      vim.lsp.start = function() return 9601 end
+      ---@diagnostic disable-next-line: duplicate-set-field
+      vim.lsp.get_client_by_id = function(id) if id == 9601 then return client end end
+      local ok = lsp.start_missing(bufnr)
+      t.true_(ok, "沙箱可用时应启动克隆")
+      local keys = {}
+      for k in pairs(lsp._test_clones()) do keys[#keys + 1] = k end
+      t.eq(1, #keys, "克隆应登记进缓存（供回收）")
+      t.matches("@neoai%-sandbox", keys[1] or "", "克隆名应带沙箱后缀")
+      t.not_nil(lsp._test_last_used(keys[1]), "应记录取用时刻（保活）")
+      -- 空闲超时后回收覆盖该新克隆。
+      lsp._test_set_last_used(keys[1], vim.uv.now() - 200000)
+      lsp._reap_now()
+      t.true_(client:is_stopped(), "空闲超时应回收新克隆")
+      t.true_(next(lsp._test_clones()) == nil, "回收后克隆缓存应清空")
+      lsp.wrap_cmd = ow
+      vim.lsp.get_clients, vim.lsp.start, vim.lsp.get_configs, vim.lsp.get_client_by_id = ogc, os, oc, ogbi
+      pcall(vim.api.nvim_buf_delete, bufnr, { force = true })
+      lsp.reset()
+    end)
+  end)
 end)

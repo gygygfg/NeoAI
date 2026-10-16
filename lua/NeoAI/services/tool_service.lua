@@ -111,6 +111,61 @@ local function _approval_text(tool_name, args, ctx)
   return text
 end
 
+--- 结算一条待审批条目：resolve/reject 其 Deferred 并发相应事件（幂等）。
+--- 供当前条目决策与会话允许批量放行复用：条目已决策（item.d == nil）时不重复 settle。
+--- @param item table { tool_name, args, ctx, continue_fn, d }
+--- @param allowed boolean 是否允许
+--- @param reason string|nil 拒绝原因
+local function _resolve_approval_item(item, allowed, reason)
+  local d = item.d
+  item.d = nil -- 已决策：审批超时不再作用于本条目（避免杀掉已批准的长耗时执行）
+  if not (d and d:is_pending()) then return end
+  local agent_id = item.ctx and item.ctx.agent and item.ctx.agent.id
+  if allowed then
+    event_bus.emit(events.TOOL_APPROVED, { tool_name = item.tool_name, agent_id = agent_id })
+    item.continue_fn():then_(function(r) d:resolve(r) end, function(e) d:reject(e) end)
+  else
+    event_bus.emit(events.TOOL_APPROVAL_CANCELLED, { tool_name = item.tool_name, reason = reason, agent_id = agent_id })
+    d:reject({ kind = "approval", message = reason or ("用户拒绝了工具调用: " .. item.tool_name) })
+  end
+end
+
+--- 设置/清除某工具的「本次会话允许」（仅内存态）。
+--- allow=true：写入 state.allow_all，并把审批队列中已排队的同名工具**立即放行**
+--- （保持其余条目原顺序），避免同一工具继续逐个重复弹窗；随后发 SANDBOX_APPROVAL_CHANGED
+--- 通知悬浮窗刷新「工具审批条件」摘要。
+--- @param tool_name string
+--- @param allow boolean
+local function _set_allow_all(tool_name, allow)
+  if type(tool_name) ~= "string" or tool_name == "" then return end
+  if allow then
+    state.allow_all[tool_name] = true
+    -- 先重建队列（移出同名条目、保持其余原顺序），再对移出的条目放行，
+    -- 使放行回调（continue_fn）内若再次入队不会被重复处理。
+    local kept, granted = {}, {}
+    for _, item in ipairs(state.approval_queue) do
+      if item.tool_name == tool_name then
+        granted[#granted + 1] = item
+      else
+        kept[#kept + 1] = item
+      end
+    end
+    state.approval_queue = kept
+    for _, item in ipairs(granted) do
+      _resolve_approval_item(item, true)
+    end
+  else
+    state.allow_all[tool_name] = nil
+  end
+  pcall(function()
+    event_bus.emit(events.SANDBOX_APPROVAL_CHANGED, {
+      page = "behavior",
+      tool_name = tool_name,
+      allow = allow and true or false,
+    })
+  end)
+end
+
 -- ========== 审批 UI（由 ui/components/tool_approval 注入） ==========
 
 local approval_ui = nil
@@ -124,26 +179,37 @@ end
 --- 展示审批窗口
 --- @param tool_name string
 --- @param args table
---- @param decision_cb function(true=allow, false=deny)
+--- @param decision_cb function(allowed=boolean, reason=string|nil)
 --- @param ctx table
 local function _show_approval(tool_name, args, decision_cb, ctx)
   local text = _approval_text(tool_name, args, ctx)
   local done = false
-  local function decide(allowed, reason)
+  local hub_id = nil
+  -- 归一决策值：allow_once | allow_session | deny（与 net_consent / device_consent 一致）。
+  -- 幂等：done 标记保证先决策者生效，重复决策不重复 settle Deferred / 不重复发事件。
+  -- 联动：先关自身弹窗（若还开着），再清除悬浮窗镜像条目（hub.resolve，幂等），最后回调。
+  local function decide(value, reason)
     if done then return end
     done = true
-    decision_cb(allowed, reason)
+    if value ~= "allow_once" and value ~= "allow_session" and value ~= "deny" then
+      value = value and "allow_once" or "deny"
+    end
+    if approval_ui and approval_ui.hide then pcall(approval_ui.hide) end
+    if hub_id then
+      pcall(require("NeoAI.sandbox.review.approval_hub").resolve, hub_id, value)
+    end
+    decision_cb(value ~= "deny", reason)
   end
   if approval_ui and approval_ui.show then
     approval_ui.show({
       text = text,
       tool_name = tool_name,
       args = args,
-      on_confirm = function() decide(true) end,
-      on_cancel = function(reason) decide(false, reason) end,
+      on_confirm = function() decide("allow_once") end,
+      on_cancel = function(reason) decide("deny", reason) end,
       on_confirm_all = function()
-        state.allow_all[tool_name] = true
-        decide(true)
+        _set_allow_all(tool_name, true)
+        decide("allow_session")
       end,
       on_add_to_workspace = function()
         local path = _target_path(tool_name, args)
@@ -157,17 +223,17 @@ local function _show_approval(tool_name, args, decision_cb, ctx)
             vim.notify("[NeoAI] 目录已在工作目录中: " .. dir, vim.log.levels.INFO)
           end
         end
-        decide(true)
+        decide("allow_once")
       end,
     })
   else
     -- 无 UI（headless/测试）：默认允许
     vim.notify("[NeoAI] 工具审批: " .. text, vim.log.levels.WARN)
-    decide(true)
+    decide("allow_once")
   end
   -- 镜像到审批分流中心（多级页面审批悬浮窗可决策）：
   --   命中遮蔽目录（ctx.sandbox_unmask）→「资源访问」页；其余工具调用同意 →「工具行为」页。
-  -- 独立弹窗仍为即时通道；先决策者生效（decide 幂等）。
+  -- 独立弹窗仍为即时通道；先决策者生效（decide 幂等 + hub.resolve 幂等）。
   local okhub, hub = pcall(require, "NeoAI.sandbox.review.approval_hub")
   if okhub and hub.available() then
     local page = (type(ctx) == "table" and type(ctx.sandbox_unmask) == "table"
@@ -191,27 +257,22 @@ local function _show_approval(tool_name, args, decision_cb, ctx)
         detail[#detail + 1] = "参数: " .. js
       end
     end
-    hub.submit(page, {
+    hub_id = hub.submit(page, {
       title = tool_name,
       detail = detail,
       on_decision = function(v)
-        if v == "deny" then
-          if approval_ui and approval_ui.hide then pcall(approval_ui.hide) end
-          decide(false, "用户拒绝（审批中心）")
-        elseif v == "allow_session" then
-          state.allow_all[tool_name] = true
-          if approval_ui and approval_ui.hide then pcall(approval_ui.hide) end
-          decide(true)
-        else
-          if approval_ui and approval_ui.hide then pcall(approval_ui.hide) end
-          decide(true)
-        end
+        -- 悬浮窗决策：allow_session 时同步置会话允许并放行队列中同名工具。
+        if v == "allow_session" then _set_allow_all(tool_name, true) end
+        decide(v, v == "deny" and "用户拒绝（审批中心）" or nil)
       end,
       meta = { tool_name = tool_name,
         -- 资源访问页：记录命中的遮蔽路径，供审批悬浮窗「W」便捷加入工作目录。
         masked = page == "resource" and type(ctx.sandbox_unmask) == "table"
           and ctx.sandbox_unmask[1] or nil },
     })
+    -- 弹窗在提交镜像前已同步决策（如 fake UI 在 show 内即回调）：清掉刚建的镜像条目，
+    -- 避免悬浮窗残留「待批准」（此处用 hub.clear 不触发 on_decision，防重复决策）。
+    if done then pcall(hub.clear, hub_id) end
   end
 end
 
@@ -235,17 +296,7 @@ local function _drain_approval_queue()
   -- 后续审批只入队不弹窗、对应 Deferred 永不 settle，工具循环永久卡死（"完全无响应"）。
   -- 注意：必须是 pcall 包裹，异常不能向上传播中断 _execute_single 的循环。
   local show_ok, show_err = pcall(_show_approval, item.tool_name, item.args, function(allowed, reason)
-    local d = item.d
-    item.d = nil -- 已决策：审批超时不再作用于本条目（避免杀掉已批准的长耗时执行）
-    if d and d:is_pending() then
-      if allowed then
-        event_bus.emit(events.TOOL_APPROVED, { tool_name = item.tool_name, agent_id = item.ctx.agent and item.ctx.agent.id })
-        item.continue_fn():then_(function(r) d:resolve(r) end, function(e) d:reject(e) end)
-      else
-        event_bus.emit(events.TOOL_APPROVAL_CANCELLED, { tool_name = item.tool_name, reason = reason, agent_id = item.ctx.agent and item.ctx.agent.id })
-        d:reject({ kind = "approval", message = reason or ("用户拒绝了工具调用: " .. item.tool_name) })
-      end
-    end
+    _resolve_approval_item(item, allowed, reason)
     _settle()
     -- 延后到下一个事件循环再弹下一个：审批 UI 的按键回调（如 tool_approval）在
     -- on_confirm() 返回后还会调用 _close()；若这里同步打开下一个弹窗，会被那个
@@ -412,15 +463,28 @@ function M.has_pending_approval()
   return #state.approval_queue > 0 or state.approval_showing
 end
 
---- 设置某个工具为始终允许（运行期）
+--- 设置某个工具为始终允许（运行期，仅本会话内存态）。
+--- 置 true 时会立即放行审批队列中已排队的同名工具（不再逐个弹窗）。
 --- @param tool_name string
 --- @param allow boolean
 function M.set_allow_all(tool_name, allow)
-  if allow then
-    state.allow_all[tool_name] = true
-  else
-    state.allow_all[tool_name] = nil
-  end
+  _set_allow_all(tool_name, allow)
+end
+
+--- 某工具是否已「本次会话允许」
+--- @param tool_name string
+--- @return boolean
+function M.get_allow_all(tool_name)
+  return state.allow_all[tool_name] == true
+end
+
+--- 列出本次会话允许的工具名（浅拷贝数组，按名称排序）
+--- @return string[]
+function M.list_allow_all()
+  local out = {}
+  for name in pairs(state.allow_all) do out[#out + 1] = name end
+  table.sort(out)
+  return out
 end
 
 --- 重置（测试用）

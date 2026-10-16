@@ -174,4 +174,100 @@ tests.suite("services", function(_, it)
     agent = chat.load_session(a.id, { round = 2 })
     t.eq(4, #agent.messages)
   end)
+
+  it("tool_service 会话允许自动放行队列中同名工具，不再重复弹窗", function(t)
+    local config_store = require("NeoAI.kernel.config_store")
+    config_store.load({ tools = { approval = { mode = "prompt", per_tool = {} } } })
+    local tool_service = require("NeoAI.services.tool_service")
+    local async = require("NeoAI.utils.async")
+    tool_service.reset()
+    local show_calls, pending = 0, nil
+    tool_service.set_approval_ui({
+      show = function(cfg) show_calls = show_calls + 1; pending = cfg end,
+      hide = function() end,
+    })
+    local ctx = { agent = { id = "a" }, approval_mode = "prompt" }
+    local function ok_run()
+      return function()
+        local d = async.Deferred.new()
+        d:resolve("ok")
+        return d
+      end
+    end
+    local r1, r2
+    tool_service.approve_and_execute("dup_tool", { description = "x" }, ctx, ok_run())
+      :then_(function(v) r1 = v end)
+    tool_service.approve_and_execute("dup_tool", { description = "x" }, ctx, ok_run())
+      :then_(function(v) r2 = v end)
+    t.eq(1, show_calls, "并行发起同一工具应只弹第一次（第二个入队）")
+    t.not_nil(pending, "应展示审批弹窗")
+    -- 用户在第一个弹窗选「允许所有（本次会话）」
+    pending.on_confirm_all()
+    t.true_(tool_service.get_allow_all("dup_tool"), "应置本次会话允许")
+    vim.wait(1000, function() return r1 ~= nil and r2 ~= nil end)
+    t.eq("ok", r1, "第一个应放行执行")
+    t.eq("ok", r2, "队列中同名工具应被自动放行（不再弹窗）")
+    t.eq(1, show_calls, "第二个不应再触发弹窗")
+    t.false_(tool_service.has_pending_approval(), "队列应已清空")
+    tool_service.reset()
+    config_store.load({})
+  end)
+
+  it("tool_service 弹窗决策清除审批中心镜像条目（正向联动）", function(t)
+    local config_store = require("NeoAI.kernel.config_store")
+    config_store.load({ tools = { approval = { mode = "prompt", per_tool = {} } } })
+    local hub = require("NeoAI.sandbox.review.approval_hub")
+    hub.reset()
+    hub.set_ui({ refresh = function() end })
+    local tool_service = require("NeoAI.services.tool_service")
+    local async = require("NeoAI.utils.async")
+    tool_service.reset()
+    local pending
+    tool_service.set_approval_ui({ show = function(cfg) pending = cfg end, hide = function() end })
+    local ctx = { agent = { id = "a" }, approval_mode = "prompt" }
+    local out
+    tool_service.approve_and_execute("mirror_tool", { description = "x" }, ctx, function()
+      local d = async.Deferred.new(); d:resolve("ok"); return d
+    end):then_(function(v) out = v end)
+    t.eq(1, hub.pending_count(), "应镜像一条到审批中心")
+    t.eq(1, hub.pending_count("behavior"), "工具行为页应有 1 条待批准")
+    pending.on_confirm()
+    t.eq(0, hub.pending_count(), "弹窗决策后镜像条目应立即清除（不再滞留待批准）")
+    vim.wait(1000, function() return out ~= nil end)
+    t.eq("ok", out, "应放行执行")
+    tool_service.reset()
+    hub.reset()
+    config_store.load({})
+  end)
+
+  it("tool_service 审批中心决策反向联动关闭弹窗并结算", function(t)
+    local config_store = require("NeoAI.kernel.config_store")
+    config_store.load({ tools = { approval = { mode = "prompt", per_tool = {} } } })
+    local hub = require("NeoAI.sandbox.review.approval_hub")
+    hub.reset()
+    hub.set_ui({ refresh = function() end })
+    local tool_service = require("NeoAI.services.tool_service")
+    local async = require("NeoAI.utils.async")
+    tool_service.reset()
+    local hidden = false
+    tool_service.set_approval_ui({ show = function() end, hide = function() hidden = true end })
+    local ctx = { agent = { id = "a" }, approval_mode = "prompt" }
+    local err
+    tool_service.approve_and_execute("hub_tool", { description = "x" }, ctx, function()
+      local d = async.Deferred.new(); d:resolve("ok"); return d
+    end):catch(function(e) err = e end)
+    local entries = hub.list("behavior")
+    t.eq(1, #entries, "应有镜像条目可供悬浮窗决策")
+    hub.resolve(entries[1].id, "deny")
+    vim.wait(1000, function() return err ~= nil end)
+    t.eq("approval", err and err.kind, "悬浮窗拒绝应以 approval 错误结算 Deferred")
+    t.true_(hidden, "反向决策应关闭独立弹窗")
+    t.eq(0, hub.pending_count(), "决策后条目应清除")
+    -- 幂等：重复决策不应再次结算
+    local again = hub.resolve(entries[1].id, "deny")
+    t.false_(again, "重复决策应返回 false（幂等）")
+    tool_service.reset()
+    hub.reset()
+    config_store.load({})
+  end)
 end)

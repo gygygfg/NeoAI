@@ -98,6 +98,50 @@ local function _net_revoke(key)
   return sb and sb.net_consent_revoke and sb.net_consent_revoke(key)
 end
 
+-- ========== 工具审批条件门面访问器（「工具行为」页集中管理，仅本会话内存态） ==========
+-- 全部经 services.sandbox 语义化 API；服务缺失时降级（列表返回空、mutator 返回 false）。
+
+--- 工具审批条件列表；服务缺失返回 {}
+local function _tool_approval_list()
+  local sb = _sb()
+  return (sb and sb.tool_approval_list and sb.tool_approval_list()) or {}
+end
+
+--- 设置/清除某工具的本次会话允许
+local function _tool_approval_set_session_allow(name, allow)
+  local sb = _sb()
+  if not (sb and sb.tool_approval_set_session_allow) then return false end
+  return sb.tool_approval_set_session_allow(name, allow)
+end
+
+--- 本次会话为某工具新增允许目录
+local function _tool_approval_add_directory(name, dir)
+  local sb = _sb()
+  if not (sb and sb.tool_approval_add_directory) then return false, "沙箱服务未就绪" end
+  return sb.tool_approval_add_directory(name, dir)
+end
+
+--- 移除某工具本次会话新增的允许目录
+local function _tool_approval_remove_directory(name, dir)
+  local sb = _sb()
+  if not (sb and sb.tool_approval_remove_directory) then return false, "沙箱服务未就绪" end
+  return sb.tool_approval_remove_directory(name, dir)
+end
+
+--- 本次会话为某工具新增命令白名单组
+local function _tool_approval_add_param_group(name, group)
+  local sb = _sb()
+  if not (sb and sb.tool_approval_add_param_group) then return false, "沙箱服务未就绪" end
+  return sb.tool_approval_add_param_group(name, group)
+end
+
+--- 移除某工具本次会话新增的命令白名单组
+local function _tool_approval_remove_param_group(name, group)
+  local sb = _sb()
+  if not (sb and sb.tool_approval_remove_param_group) then return false, "沙箱服务未就绪" end
+  return sb.tool_approval_remove_param_group(name, group)
+end
+
 -- 审批页标签缓存（沙箱服务就绪后惰性填充；见 _ensure_page_labels）
 local PAGE_LABEL = {}
 local _page_labels_ready = false
@@ -2191,6 +2235,33 @@ local function _build_devices_section()
   return lines, marks
 end
 
+--- 构建「工具审批条件」只读摘要区（工具行为页；T 打开编辑器管理）
+--- 每工具一行：会话允许状态 + 允许目录数 / 命令白名单组数（生效值，含来自配置）。
+--- @return table lines
+--- @return table marks
+local function _build_tool_approval_section()
+  local list = _tool_approval_list()
+  local lines, marks = {}, {}
+  local function add(text, level)
+    lines[#lines + 1] = text
+    if level then marks[#marks + 1] = { line = #lines, start_col = 0, end_col = #text, level = level } end
+  end
+  add("── 工具审批条件（全部工具，仅本会话，T 管理）──", "note")
+  if #list == 0 then
+    add("  （暂无已注册工具）")
+    add("")
+    return lines, marks
+  end
+  for _, t in ipairs(list) do
+    local sess = t.session_allow and "会话允许" or "询问"
+    local text = string.format("  [%s] %s    目录 %d / 命令组 %d",
+      sess, _one_line(t.name), #(t.allowed_directories or {}), #(t.allowed_param_groups or {}))
+    add(text, t.session_allow and "workspace" or "note")
+  end
+  add("")
+  return lines, marks
+end
+
 --- 重绘设备编辑器
 local function _refresh_devices_editor()
   if not (devices_editor.buf and vim.api.nvim_buf_is_valid(devices_editor.buf)) then return end
@@ -2526,6 +2597,239 @@ local function _open_dirs_editor()
   pcall(vim.cmd, "stopinsert")
 end
 
+-- ========== 工具审批条件编辑器（工具行为页，仅本会话） ==========
+-- 集中查看/调整全部工具的审批条件（均经 services.sandbox 门面，仅内存态）：
+--   * s：切换光标所在工具的「本次会话允许」（allow_all）。
+--   * a：为光标所在工具新增允许目录（本次会话，可删）。
+--   * p：为光标所在工具新增命令白名单组（本次会话，可删）。
+--   * d：删除光标所在行的「本次会话新增」目录/命令组；来自配置的只读项不可删。
+-- 数据模型为追加式覆盖：来自配置/工具默认/per_tool 的目录与命令组在会话内只读。
+local tools_approval_editor = { win = nil, buf = nil, ns = nil, line_map = {} }
+
+--- 查询某工具是否「本次会话允许」（经门面列表；服务缺失视为 false）
+--- @param name string
+--- @return boolean
+local function _tool_approval_session_allow_of(name)
+  for _, t in ipairs(_tool_approval_list()) do
+    if t.name == name then return t.session_allow == true end
+  end
+  return false
+end
+
+--- 光标所在工具名（命中工具行或向上回溯到最近工具行）
+--- @return string|nil tool_name
+--- @return table|nil entry 光标直接命中的行条目
+local function _tools_approval_tool_at_cursor()
+  local ln = vim.api.nvim_win_get_cursor(0)[1]
+  local entry = tools_approval_editor.line_map[ln]
+  if entry and entry.tool then return entry.tool, entry end
+  for l = ln - 1, 1, -1 do
+    local e = tools_approval_editor.line_map[l]
+    if e and e.tool then return e.tool, nil end
+  end
+  return nil, nil
+end
+
+--- 重绘工具审批条件编辑器
+local function _refresh_tools_approval_editor()
+  if not (tools_approval_editor.buf and vim.api.nvim_buf_is_valid(tools_approval_editor.buf)) then return end
+  local list = _tool_approval_list()
+  local lines, map = {}, {}
+  local function add(text, entry)
+    lines[#lines + 1] = text
+    if entry then map[#lines] = entry end
+  end
+  add("⚙ 工具审批条件（仅本会话，重开 nvim 后恢复默认）")
+  add("")
+  if #list == 0 then
+    add("  （暂无已注册工具）")
+  end
+  for _, t in ipairs(list) do
+    local sess = t.session_allow and "会话允许" or "询问"
+    add(string.format("─ %s [%s]%s ─", _one_line(t.name), sess, t.auto_allow and "（默认自动允许）" or ""),
+      { tool = t.name, kind = "tool", name = t.name })
+    -- 允许目录：运行期内新增（可删）在前，配置生效的其余项（只读）在后。
+    local rt_dirs = t.runtime_directories or {}
+    local rt_set = {}
+    for _, d in ipairs(rt_dirs) do rt_set[_norm_dir(d)] = true end
+    add(string.format("  允许目录（生效 %d，其中本次会话 %d）:", #(t.allowed_directories or {}), #rt_dirs))
+    if #(t.allowed_directories or {}) == 0 then
+      add("    （无）")
+    else
+      for _, d in ipairs(rt_dirs) do
+        add("    - " .. _one_line(d) .. "（本次会话，d 可删）",
+          { tool = t.name, kind = "dir", name = d })
+      end
+      for _, d in ipairs(t.allowed_directories or {}) do
+        if not rt_set[_norm_dir(d)] then
+          add("    - " .. _one_line(d) .. "（来自配置，只读）")
+        end
+      end
+    end
+    -- 命令白名单组：同上。
+    local rt_groups = t.runtime_param_groups or {}
+    local rg_set = {}
+    for _, g in ipairs(rt_groups) do rg_set[g] = true end
+    add(string.format("  命令白名单组（生效 %d，其中本次会话 %d）:", #(t.allowed_param_groups or {}), #rt_groups))
+    if #(t.allowed_param_groups or {}) == 0 then
+      add("    （无）")
+    else
+      for _, g in ipairs(rt_groups) do
+        add("    - " .. _one_line(g) .. "（本次会话，d 可删）",
+          { tool = t.name, kind = "group", name = g })
+      end
+      for _, g in ipairs(t.allowed_param_groups or {}) do
+        if not rg_set[g] then
+          add("    - " .. _one_line(g) .. "（来自配置，只读）")
+        end
+      end
+    end
+    add("")
+  end
+  add("按键: s 切换会话允许    a 加允许目录    p 加命令组    d 删本次会话新增项    q/Esc 关闭")
+  tools_approval_editor.line_map = map
+  vim.bo[tools_approval_editor.buf].modifiable = true
+  vim.api.nvim_buf_set_lines(tools_approval_editor.buf, 0, -1, false, lines)
+  if tools_approval_editor.ns then
+    vim.api.nvim_buf_clear_namespace(tools_approval_editor.buf, tools_approval_editor.ns, 0, -1)
+    for ln, e in pairs(map) do
+      local hl = LEVEL_HL.system
+      if e.kind == "tool" then
+        hl = _tool_approval_session_allow_of(e.name) and LEVEL_HL.workspace or LEVEL_HL.user
+      end
+      vim.api.nvim_buf_add_highlight(tools_approval_editor.buf, tools_approval_editor.ns, hl, ln - 1, 2, -1)
+    end
+  end
+  if tools_approval_editor.win and vim.api.nvim_win_is_valid(tools_approval_editor.win) then
+    pcall(function()
+      local cfg = vim.api.nvim_win_get_config(tools_approval_editor.win)
+      local h = math.max(6, math.min(#lines, vim.o.lines - 4))
+      if cfg.height ~= h then
+        cfg.height = h
+        vim.api.nvim_win_set_config(tools_approval_editor.win, cfg)
+      end
+    end)
+  end
+end
+
+--- 关闭工具审批条件编辑器
+local function _close_tools_approval_editor()
+  if tools_approval_editor.win and vim.api.nvim_win_is_valid(tools_approval_editor.win) then
+    pcall(vim.api.nvim_win_close, tools_approval_editor.win, true)
+  end
+  geometry.untrack(tools_approval_editor.win)
+  tools_approval_editor.win, tools_approval_editor.buf, tools_approval_editor.ns = nil, nil, nil
+  tools_approval_editor.line_map = {}
+end
+
+--- 编辑器内：切换光标所在工具的本次会话允许
+local function _edit_toggle_session_allow()
+  local name = _tools_approval_tool_at_cursor()
+  if not name then
+    vim.notify("[NeoAI] 请将光标移到工具行再按 s", vim.log.levels.WARN)
+    return
+  end
+  local cur = _tool_approval_session_allow_of(name)
+  _tool_approval_set_session_allow(name, not cur)
+  vim.notify(("[NeoAI] %s: %s"):format(name, not cur and "本次会话允许" or "恢复询问"), vim.log.levels.INFO)
+  _refresh_tools_approval_editor()
+end
+
+--- 编辑器内：为光标所在工具新增允许目录 / 命令组（kind = "dir" | "group"）
+--- @param kind string
+local function _edit_add_tool_condition(kind)
+  local name = _tools_approval_tool_at_cursor()
+  if not name then
+    vim.notify("[NeoAI] 请将光标移到工具行或其条目行再操作", vim.log.levels.WARN)
+    return
+  end
+  local label = kind == "dir" and "允许目录" or "命令白名单组"
+  local function handle(input)
+    if not input or input == "" then return end
+    local ok, err
+    if kind == "dir" then
+      ok, err = _tool_approval_add_directory(name, input)
+    else
+      ok, err = _tool_approval_add_param_group(name, input)
+    end
+    if ok then
+      vim.notify(("[NeoAI] %s 已加入%s: %s"):format(name, label, input), vim.log.levels.INFO)
+    else
+      vim.notify(("[NeoAI] 添加失败: %s"):format(tostring(err or "无效值")), vim.log.levels.WARN)
+    end
+    _refresh_tools_approval_editor()
+  end
+  local called = false
+  local ok = pcall(vim.ui.input, { prompt = label .. "（" .. name .. "）: " }, function(input)
+    called = true
+    handle(input)
+  end)
+  if not ok and not called then
+    vim.notify("[NeoAI] 无法打开输入框", vim.log.levels.WARN)
+  end
+end
+
+--- 编辑器内：删除光标所在的本次会话新增目录/命令组（来自配置的只读项不可删）
+local function _edit_remove_tool_condition()
+  local ln = vim.api.nvim_win_get_cursor(0)[1]
+  local entry = tools_approval_editor.line_map[ln]
+  if not entry or (entry.kind ~= "dir" and entry.kind ~= "group") then
+    vim.notify("[NeoAI] 请将光标移到「本次会话」条目行再按 d", vim.log.levels.WARN)
+    return
+  end
+  local ok, err
+  if entry.kind == "dir" then
+    ok, err = _tool_approval_remove_directory(entry.tool, entry.name)
+  else
+    ok, err = _tool_approval_remove_param_group(entry.tool, entry.name)
+  end
+  if ok then
+    vim.notify("[NeoAI] 已移除本次会话新增项", vim.log.levels.INFO)
+  else
+    vim.notify(("[NeoAI] 移除失败: %s"):format(tostring(err or "")), vim.log.levels.WARN)
+  end
+  _refresh_tools_approval_editor()
+end
+
+--- 打开工具审批条件编辑器（工具行为页 T）
+local function _open_tools_approval_editor()
+  if tools_approval_editor.win and vim.api.nvim_win_is_valid(tools_approval_editor.win) then
+    _refresh_tools_approval_editor()
+    return
+  end
+  _ensure_hl()
+  tools_approval_editor.buf = vim.api.nvim_create_buf(false, true)
+  vim.bo[tools_approval_editor.buf].filetype = "neoai_tool_approval"
+  tools_approval_editor.ns = vim.api.nvim_create_namespace("NeoAIToolApproval")
+  local geom_opts = { w_ratio = 0.7, h_ratio = 0.6, fit_h = 24 }
+  local geom = geometry.compute(geom_opts)
+  tools_approval_editor.win = vim.api.nvim_open_win(tools_approval_editor.buf, true, {
+    relative = "editor",
+    width = geom.width,
+    height = math.max(6, math.min(geom.height, vim.o.lines - 4)),
+    col = geom.col,
+    row = geom.row,
+    style = "minimal",
+    border = "rounded",
+    title = "⚙ 工具审批条件（仅本会话）",
+    title_pos = "center",
+  })
+  geometry.track(tools_approval_editor.win, geom_opts)
+  vim.wo[tools_approval_editor.win].wrap = true
+  vim.wo[tools_approval_editor.win].cursorline = true
+  local function bind(mode, key, fn) vim.keymap.set(mode, key, fn, { buffer = tools_approval_editor.buf }) end
+  for _, mode in ipairs({ "n", "i" }) do
+    bind(mode, "q", function() _close_tools_approval_editor(); M.refresh() end)
+    bind(mode, "<Esc>", function() _close_tools_approval_editor(); M.refresh() end)
+    bind(mode, "s", _edit_toggle_session_allow)
+    bind(mode, "a", function() _edit_add_tool_condition("dir") end)
+    bind(mode, "p", function() _edit_add_tool_condition("group") end)
+    bind(mode, "d", _edit_remove_tool_condition)
+  end
+  _refresh_tools_approval_editor()
+  pcall(vim.cmd, "stopinsert")
+end
+
 --- 逐页数据来源（阻塞类来自 approval_hub，观测类来自 provider/现取）
 --- @return table ctx
 local function _gather_ctx()
@@ -2622,7 +2926,9 @@ local function _build_blocking_page(page, ctx)
   lines[#lines + 1] = head
   lines[#lines + 1] = page == "network"
     and "快捷键: <CR> 仅本次允许    S 本次会话允许    d 拒绝（本会话已允许行按 d 撤销）"
-    or "快捷键: <CR> 仅本次允许    S 本次会话允许    d 拒绝"
+    or (page == "behavior"
+      and "快捷键: <CR> 仅本次允许    S 本次会话允许    d 拒绝    E 设备组件    T 工具审批条件"
+      or "快捷键: <CR> 仅本次允许    S 本次会话允许    d 拒绝")
   lines[#lines + 1] = ""
   if #entries == 0 and not (page == "behavior" and #ctx.hostops > 0) then
     lines[#lines + 1] = "（无待批准项）"
@@ -2715,6 +3021,13 @@ local function _build_blocking_page(page, ctx)
     local off = #lines - #dv_lines
     for _, m in ipairs(dv_marks) do
       marks[#marks + 1] = { line = m.line + off, start_col = m.start_col, end_col = m.end_col, level = m.level }
+    end
+    -- 工具审批条件只读摘要（全部工具；T 打开编辑器管理）。
+    local ta_lines, ta_marks = _build_tool_approval_section()
+    for _, l in ipairs(ta_lines) do lines[#lines + 1] = l end
+    local off2 = #lines - #ta_lines
+    for _, m in ipairs(ta_marks) do
+      marks[#marks + 1] = { line = m.line + off2, start_col = m.start_col, end_col = m.end_col, level = m.level }
     end
   end
   return { lines = lines, marks = marks, line_to_hub = line_to_hub,
@@ -2951,6 +3264,17 @@ function M.get_dirs_editor_buf()
   return dirs_editor.buf
 end
 
+--- 打开「工具审批条件」编辑器（公开，供键位/测试调用；仅本会话）
+function M.open_tools_approval_editor()
+  _open_tools_approval_editor()
+end
+
+--- 获取「工具审批条件」编辑器 buffer（测试用）
+--- @return number|nil
+function M.get_tools_approval_editor_buf()
+  return tools_approval_editor.buf
+end
+
 --- 由审批分流中心拉起/刷新窗口并切页。
 --- @param page string|nil
 function M.open_page(page)
@@ -3079,6 +3403,11 @@ function M.open()
     if state.page == "behavior" then return M.open_devices_editor() end
     M.open_dirs_editor()
   end, { buffer = state.buf, desc = "NeoAI 目录/设备设置" })
+  -- T：工具行为页打开「工具审批条件」编辑器（仅行为页生效）。
+  vim.keymap.set("n", "T", function()
+    if state.page == "behavior" then return M.open_tools_approval_editor() end
+    vim.notify("[NeoAI] 请在「工具行为」页按 T 管理工具审批条件", vim.log.levels.INFO)
+  end, { buffer = state.buf, desc = "NeoAI 工具审批条件" })
   vim.keymap.set("n", "W", function() _add_masked_to_workspace() end, { buffer = state.buf, desc = "NeoAI 遮蔽路径加入工作目录" })
   -- AI 审计（可配置按键；默认 a）
   local ai_cfg = require("NeoAI.kernel.config_store").get("tools.sandbox.review.ai_audit") or {}
@@ -3192,6 +3521,7 @@ function M.close()
   _unwatch()
   _close_dirs_editor()
   _close_devices_editor()
+  _close_tools_approval_editor()
   if state.win_id and vim.api.nvim_win_is_valid(state.win_id) then
     -- 关闭前记录光标/目标/几何，供下次打开恢复。
     pcall(function()
@@ -3298,6 +3628,7 @@ function M.reset()
   _close_root_prompt()
   _close_dirs_editor()
   _close_devices_editor()
+  _close_tools_approval_editor()
   _close_diff()
   M.close()
 end

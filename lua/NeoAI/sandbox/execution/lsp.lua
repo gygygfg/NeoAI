@@ -279,7 +279,9 @@ end
 local function _editor_clients(bufnr)
   local out = {}
   for _, c in ipairs(vim.lsp.get_clients({ bufnr = bufnr })) do
-    if not _is_clone(c.name) then out[#out + 1] = c end
+    -- 排除沙箱克隆（@neoai-sandbox）与 NeoAI 自主启动的 plain 回退客户端：二者都非编辑器
+    -- 客户端，不应作为克隆母体（否则会自我派生）。
+    if not _is_clone(c.name) and not plain_started[c.id] then out[#out + 1] = c end
   end
   return out
 end
@@ -457,7 +459,215 @@ function M.client_supporting(method, bufnr)
   return nil
 end
 
---- 停止全部沙箱克隆并清空缓存。
+-- ========== 按编辑器配置自主启动（缺失客户端时） ==========
+--
+-- 编辑器用 `vim.lsp.enable` 触发启动时，`vim.lsp.start` 返回后客户端尚未 initialize：
+-- 此时 `vim.lsp.get_clients()` / `buf_request` 都看不到它。首次 `lsp_*` 调用若抢跑就会
+-- 误报「无 LSP 客户端」。这里按编辑器 LSP 配置派生并于需要时自主启动 server，配合工具侧
+-- 「等待 initialize」消除该误报。
+
+--- 命令是否可执行（首元素为字符串时查 executable；函数式 cmd 视为可执行）。
+--- @param cmd table|function|nil
+--- @return boolean
+local function _cmd_executable(cmd)
+  if type(cmd) == "function" then return true end
+  if type(cmd) ~= "table" or #cmd == 0 then return false end
+  local exe = cmd[1]
+  if type(exe) ~= "string" or exe == "" then return false end
+  local ok, code = pcall(vim.fn.executable, vim.fn.expand(exe))
+  return ok and code == 1
+end
+
+--- 该 buffer 对应真实文件是否存在**未发布暂存副本**（有则禁止回退真实视图，R3）。
+--- @param bufnr number
+--- @return boolean
+local function _has_staged(bufnr)
+  local realpath = vim.api.nvim_buf_get_name(bufnr)
+  if type(realpath) ~= "string" or realpath == "" then return false end
+  local ok, cand = pcall(require, "NeoAI.sandbox.execution.candidate")
+  if not ok or not cand or type(cand.read_path) ~= "function" then return false end
+  local ok2, staged = pcall(cand.read_path, realpath)
+  return ok2 and staged ~= nil
+end
+
+--- 该 buffer 的 filetype 候选 LSP 配置（按编辑器 LSP 配置派生）。
+--- 优先 `vim.lsp.get_configs({ filetype = ft, enabled = true })`；为空再放宽到
+--- `{ filetype = ft }`（含未启用）；仍为空时回退 lspconfig（按 filetypes 匹配）。
+--- 集中封装 `vim.lsp.get_configs`（Neovim 0.12 API）并 pcall 降级，便于版本兼容。
+--- @param bufnr number
+--- @return table[] configs 数组（每项 { name, cmd, root_dir?, filetypes?, ... }）
+--- @return string|nil ft
+local function _derived_configs(bufnr)
+  local ft = vim.bo[bufnr].filetype
+  if type(ft) ~= "string" or ft == "" then return {}, ft end
+  local out, seen = {}, {}
+  local function add(list)
+    for _, cfg in ipairs(list or {}) do
+      local name = cfg and cfg.name
+      if name and not seen[name] then
+        seen[name] = true
+        out[#out + 1] = cfg
+      end
+    end
+  end
+  local ok, list = pcall(vim.lsp.get_configs, { filetype = ft, enabled = true })
+  if ok and type(list) == "table" then add(list) end
+  if #out == 0 then
+    local ok2, list2 = pcall(vim.lsp.get_configs, { filetype = ft })
+    if ok2 and type(list2) == "table" then add(list2) end
+  end
+  if #out == 0 then
+    -- lspconfig 兜底：遍历其 configs，按 filetypes 匹配。
+    local ok3, lspconfig = pcall(require, "lspconfig")
+    if ok3 and type(lspconfig) == "table" and type(lspconfig.configs) == "table" then
+      for name, conf in pairs(lspconfig.configs) do
+        local dft = conf.document_config and conf.document_config.default_config or conf
+        local fts = dft and dft.filetypes
+        if type(fts) == "table" and vim.tbl_contains(fts, ft) and not seen[name] then
+          seen[name] = true
+          out[#out + 1] = {
+            name = name,
+            cmd = dft.cmd,
+            root_dir = dft.root_dir,
+            root_markers = dft.root_markers,
+            filetypes = fts,
+          }
+        end
+      end
+    end
+  end
+  return out, ft
+end
+
+--- 解析配置的 root_dir：函数式 → 字符串 → root_markers → cwd。
+--- @param cfg table
+--- @param bufnr number
+--- @return string
+local function _resolve_root(cfg, bufnr)
+  local rd = cfg.root_dir
+  if type(rd) == "function" then
+    local ok, v = pcall(rd, bufnr)
+    if ok and type(v) == "string" and v ~= "" then
+      return (vim.fn.fnamemodify(v, ":p"):gsub("/+$", ""))
+    end
+  elseif type(rd) == "string" and rd ~= "" then
+    return (vim.fn.fnamemodify(vim.fn.expand(rd), ":p"):gsub("/+$", ""))
+  end
+  local markers = cfg.root_markers
+  if type(markers) == "table" and #markers > 0 then
+    local ok, root = pcall(vim.fs.root, bufnr, markers)
+    if ok and type(root) == "string" and root ~= "" then return root end
+  end
+  return vim.fn.getcwd()
+end
+
+--- 启动单个派生配置；返回 ok, reason（幂等：调用方先确认无已初始化客户端）。
+--- 沙箱可用时优先启动克隆（纳入保活/回收）；否则仅在无暂存改动时回退 plain（不纳入回收）。
+--- @param cfg table
+--- @param bufnr number
+--- @return boolean ok, table|nil reason { code, name }
+local function _start_one(cfg, bufnr)
+  local name = tostring(cfg.name or "lsp")
+  local root = _resolve_root(cfg, bufnr)
+  local wrapped = M.enabled()
+    and M.wrap_cmd(cfg.cmd, { cwd = root, env = cfg.cmd_env, detached = cfg.detached })
+    or nil
+  if wrapped then
+    local clone_cfg = {
+      name = name .. CLONE_SUFFIX,
+      cmd = wrapped,
+      root_dir = root,
+      filetypes = cfg.filetypes,
+      capabilities = cfg.capabilities,
+      init_options = cfg.init_options,
+      settings = cfg.settings,
+      cmd_cwd = cfg.cmd_cwd,
+      cmd_env = cfg.cmd_env,
+      detached = cfg.detached,
+      root_markers = cfg.root_markers,
+      -- 克隆诊断不外溢到编辑器（AI 通过 pull diagnostics 读取）。
+      handlers = { ["textDocument/publishDiagnostics"] = function() end },
+    }
+    local ok, id = pcall(vim.lsp.start, clone_cfg, { bufnr = bufnr })
+    if ok and id then
+      local key = name .. CLONE_SUFFIX .. "\0" .. root
+      clones[key] = id
+      _touch(key)
+      return true
+    end
+  end
+  -- 回退真实视图前统一守卫：沙箱不可用（或克隆启动失败）且有未发布暂存改动时拒绝回退，
+  -- 以保持 read_file/git_diff/LSP 视图一致（R3）。
+  if _has_staged(bufnr) then
+    return false, { code = "staged_no_sandbox", name = name }
+  end
+  -- 非沙箱回退（plain）：不纳入 reaper，绝不误停编辑器/用户配置的客户端。
+  local plain = vim.tbl_deep_extend("force", {}, cfg)
+  plain.name = name
+  plain.root_dir = root
+  local ok, id = pcall(vim.lsp.start, plain, { bufnr = bufnr })
+  if ok and id then
+    plain_started[id] = true
+    return true
+  end
+  return false, { code = "start_failed", name = name }
+end
+
+--- 是否有候选配置、且其命令可执行（即「可按编辑器配置启动」）。
+--- @param bufnr number
+--- @return boolean
+function M.can_start(bufnr)
+  if not (bufnr and vim.api.nvim_buf_is_valid(bufnr)) then return false end
+  local cfgs = _derived_configs(bufnr)
+  for _, cfg in ipairs(cfgs) do
+    if _cmd_executable(cfg.cmd) then return true end
+  end
+  return false
+end
+
+--- 该 buffer 是否已有**未初始化**客户端（server 启动在途、尚未 initialize）。
+--- 用于区分「启动中（应等待，用 start_timeout_ms）」与「完全无候选（快速失败）」。
+--- @param bufnr number
+--- @return boolean
+function M.pending_for(bufnr)
+  if not (bufnr and vim.api.nvim_buf_is_valid(bufnr)) then return false end
+  local ok, list = pcall(vim.lsp.get_clients, { bufnr = bufnr, _uninitialized = true })
+  if not ok or type(list) ~= "table" then return false end
+  for _, c in ipairs(list) do
+    if c and c.initialized == false then return true end
+  end
+  return false
+end
+
+--- 为某 buffer 按编辑器配置自主启动缺失的 server（幂等：已有已初始化客户端时跳过）。
+--- @param bufnr number
+--- @return boolean started 是否本次启动了至少一个客户端
+--- @return table|nil reason { code, name } 未启动原因（no_config / cmd_not_executable / staged_no_sandbox / start_failed / invalid_buffer）
+function M.start_missing(bufnr)
+  if not (bufnr and vim.api.nvim_buf_is_valid(bufnr)) then
+    return false, { code = "invalid_buffer" }
+  end
+  if #vim.lsp.get_clients({ bufnr = bufnr }) > 0 then return false, nil end
+  local cfgs, ft = _derived_configs(bufnr)
+  if #cfgs == 0 then
+    return false, { code = "no_config", ft = ft }
+  end
+  local reason = nil
+  for _, cfg in ipairs(cfgs) do
+    local name = tostring(cfg.name or "lsp")
+    if _cmd_executable(cfg.cmd) then
+      local ok, r = _start_one(cfg, bufnr)
+      if ok then return true, nil end
+      reason = r or { code = "start_failed", name = name }
+    else
+      reason = { code = "cmd_not_executable", name = name }
+    end
+  end
+  return false, reason
+end
+
+--- 停止全部沙箱克隆并清空缓存。（不停止 plain 回退客户端——避免误停编辑器客户端；
+--- plain 客户端由 Neovim/编辑器生命周期管理。）
 function M.stop_all()
   _stop_reaper()
   for key, id in pairs(clones) do
@@ -468,6 +678,7 @@ function M.stop_all()
   last_used = {}
   pushed_text = {}
   pushed_version = {}
+  plain_started = {}
 end
 
 --- 重置（测试用）
@@ -509,6 +720,14 @@ end
 function M._test_clones()
   local out = {}
   for k, v in pairs(clones) do out[k] = v end
+  return out
+end
+
+--- 当前 plain 回退客户端 id 集合（测试用）。
+--- @return table
+function M._test_plain_started()
+  local out = {}
+  for k, v in pairs(plain_started) do out[k] = v end
   return out
 end
 

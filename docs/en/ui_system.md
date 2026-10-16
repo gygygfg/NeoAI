@@ -14,7 +14,7 @@
 | `ui/init.lua` | UI entry point: initialization (registers approval/questioning/sub-agent monitoring UIs), `open_default`/`open_chat`/`open_tree`/`close_all`, keymap display. |
 | `ui/window/manager.lua` | Window manager: create/close/focus for the three modes `float` / `tab` / `split`; disables LSP attachment and line numbers/sign columns. |
 | `ui/window/chat_view.lua` | Chat view (**supports multiple instances**, see §4.0): binds events, streaming updates, folds, floating window scheduling, input box linkage, background collapse/restore, display mode host. |
-| `ui/window/tree_view.lua` | Session tree view: branch tree display and CRUD. |
+| `ui/window/tree_view.lua` | Session tree view: branch tree display grouped by working directory, with CRUD (see §7). |
 | `ui/components/*` | Reusable components (see below). |
 | `ui/geometry.lua` | Floating-window geometry: derives width/height and centering/anchoring from **screen-relative ratios**, avoiding hard-coded pixel sizes. `compute{ w_ratio, h_ratio, fit_h, min_w, max_w, min_h, max_h, margin, anchor, row, narrow }` → `{ width, height, col, row }`. Also supports **narrow-screen padding** (see §2.1). |
 | `ui/session_cleanup.lua` | Session-restore residue cleanup: clears orphan UI buffers after `:restart`/`-S` (see §4.9). |
@@ -438,7 +438,27 @@ Following deepseek-harness's Cordis plugin model, the chat view's "display modes
 | `display_modes/` | Display mode plugin manager + `chat.lua`/`trajectory.lua`. |
 | `markdown_view` | Markdown renderer (code blocks / inline code / headings / lists (incl. nested) / quotes / tables). Emits `style` tags (used by `message_list` for body highlights) and `tbl` (table zebra stripes). |
 
-## 7. Keymaps (ui/keymap.lua)
+## 7. Session Tree (tree_view.lua)
+
+The session tree window shows session branches and supports select/create/delete/expand-collapse, and is
+**grouped by each session's bound working directory (`session.metadata.cwd`) by default**
+(see `ui/window/tree_view.lua`):
+
+- **Always grouped (no toggle)**: one group per cwd; the group header shows
+  `▾/▸ 📁 <basename>  <full path>  · N sessions` (the header is shown even for a single-session group;
+  legacy sessions without `metadata.cwd` fall into the "（未绑定工作目录）" group).
+- **Ordering**: the group matching the current editor workspace
+  (`workspace_root.detect_from_context()` falling back to `getcwd()`) is pinned on top (exact match first,
+  then path-boundary match); the rest are sorted by most-recently-used within the group (`updated_at`).
+- **Keymaps**: `<CR>`/`o`/`O` on a group header collapse/expand that group (`<CR>` toggles, `o` expands,
+  `O` collapses); on a session node they behave as before (`<CR>` opens, `o`/`O` expand/collapse);
+  `N`/`n` inside a group create a session that **inherits the group's cwd**; `d`/`D` on a group header
+  reports "分组行不可删除".
+- **Compatibility**: sessions within a group still render as the original tree (branch/multi-round
+  indentation unchanged); group collapse state is stored in `state.expanded["group:<cwd>"]` (`nil` =
+  expanded) and cleared when the tree window closes.
+
+## 8. Keymaps (ui/keymap.lua)
 
 `keymap.register_context("chat", actions, buf)` maps a set of action handlers to the specified buffer. The main view
 and the input box share the same chat context keymaps (send/insert are excluded and bound separately inside the input
@@ -451,7 +471,7 @@ There are also internal scrolling mappings for the main message area: `j`/`k` (t
 line), and `<ScrollWheelUp>`/`<ScrollWheelDown>` (through `_wheel_scroll`, smoothly scrolling the viewport while clamping
 the blank space below the last line to `ui.chat.mousescroll_max_blank` lines).
 
-## 8. Related Documents
+## 9. Related Documents
 
 - [configuration.md](configuration.md): `ui.*` / `keymaps.*` configuration.
 - [EVENTS.md](EVENTS.md): UI events (`WINDOW_*`, `DISPLAY_MODE_CHANGED`, etc.).
