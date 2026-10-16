@@ -50,6 +50,29 @@ local function _append_raw(lines, text, base)
   end
 end
 
+--- 是否为子 Agent 结果消息（标记或投递包装文本，兼容旧数据）。
+--- 子 Agent 结果以 role="user" 回传主 Agent，但**不是用户请求**：轨迹视图不得把它当作
+--- 用户 turn / 「用户请求」小节渲染，否则重开会话后会显示成「用户信息」。
+--- @param msg table|nil
+--- @return boolean
+local function _is_sub_agent(msg)
+  if not msg then return false end
+  if msg.sub_agent then return true end
+  if msg.role ~= "user" then return false end
+  local c = msg.content
+  return type(c) == "string" and c:match("^%s*【子 Agent ") ~= nil
+end
+
+--- turn 是否含子 Agent 结果条目（用于无用户消息时的折叠标题）
+--- @param turn table
+--- @return boolean
+local function _turn_has_sub_agent(turn)
+  for _, e in ipairs(turn.entries or {}) do
+    if _is_sub_agent(e) then return true end
+  end
+  return false
+end
+
 --- 折叠文本：turn 摘要（用户内容预览 + 请求/工具数量）
 --- @param turn table
 --- @return string
@@ -59,6 +82,10 @@ local function _header(turn)
     local preview = turn.user.content:gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
     preview = stringx.truncate(preview, 48)
     parts[#parts + 1] = "用户: " .. preview
+  elseif turn.user then
+    parts[#parts + 1] = "用户"
+  elseif _turn_has_sub_agent(turn) then
+    parts[#parts + 1] = "子 Agent 结果"
   else
     parts[#parts + 1] = "用户"
   end
@@ -295,6 +322,27 @@ local function _append_turn(lines, marks, turn, full, show)
       end
       -- wire 级细节：请求参数 + 原始请求体 + 原始响应（层级 3 子块）
       _append_request_meta(lines, msg, full)
+    elseif _is_sub_agent(msg) then
+      -- 子 Agent 结果：渲染为专属小节（不并入用户请求、不计入请求序号）
+      local sa = msg.sub_agent
+      local name, status
+      if sa then
+        name, status = sa.name or sa.id, sa.status
+      else
+        -- 旧数据兜底：从投递包装行解析名字与状态
+        local n, label = tostring(msg.content or ""):match('^%s*【子 Agent "([^"]*)"%s*([^】]*)】')
+        name = n or "子 Agent"
+        status = "completed"
+        if label and label:find("取消") then status = "cancelled"
+        elseif label and label:find("失败") then status = "error" end
+      end
+      status = status or "completed"
+      local emoji = status == "error" and "❌" or (status == "cancelled" and "⏹" or "✅")
+      lines[#lines + 1] = "  ▸ " .. emoji .. " 子 Agent 结果 · " .. tostring(name or "子 Agent")
+      -- 剥离投递包装行（首行「【子 Agent "x" 已完成】」），避免与小节标题重复
+      local body = tostring(msg.content or ""):gsub("^%s*【子 Agent[^\n]*】\n?", "")
+      if body ~= "" then _append_raw(lines, body, 2) end
+      i = i + 1
     else
       i = i + 1
     end
@@ -318,7 +366,7 @@ local function _group_turns(messages)
       if cur.kind == "system" then
         cur.sys_msgs[#cur.sys_msgs + 1] = msg
       end
-    elseif msg.role == "user" then
+    elseif msg.role == "user" and not _is_sub_agent(msg) then
       user_seq = user_seq + 1
       cur = { kind = "user", index = user_seq, user = msg, entries = {} }
       turns[#turns + 1] = cur
@@ -425,6 +473,9 @@ local function _turn_sig(turn, full, show)
   end
   for _, m in ipairs(turn.entries or {}) do
     p[#p + 1] = tostring(m.role)
+    -- 子 Agent 结果标记（有无/名字/状态）纳入签名：user 与 sub_agent 结果都可能是 role=user，
+    -- 若签名只含 role+content，标记变化时可能命中陈旧块而不重渲染。
+    p[#p + 1] = m.sub_agent and ("sa:" .. tostring(m.sub_agent.name or "") .. ":" .. tostring(m.sub_agent.status or "")) or "-"
     p[#p + 1] = _fingerprint(m.content)
     p[#p + 1] = _fingerprint(m.reasoning)
     p[#p + 1] = tostring(m.duration_ms)

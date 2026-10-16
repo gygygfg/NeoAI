@@ -702,4 +702,30 @@ tests.suite("display_modes", function(_, it)
     chat_service.reset()
     display_modes.reset()
   end)
+
+  it("轨迹模式：子 Agent 结果不以用户 turn/用户请求小节渲染（回归）", function(t)
+    local trajectory = require("NeoAI.ui.components.display_modes.trajectory")
+    local messages = {
+      { role = "user", content = "开始" },
+      { role = "assistant", content = "好" },
+      -- 标记式（新数据）：role=user 但带 sub_agent 标记
+      { role = "user", content = "【子 Agent \"调研\" 已完成】\n结论 A",
+        sub_agent = { id = "s1", name = "调研", status = "completed", task = "t" } },
+      -- 前缀兜底式（旧数据，无 sub_agent 字段）
+      { role = "user", content = "【子 Agent \"复算\" 已完成】\n结论 B" },
+      { role = "user", content = "第二个问题" },
+    }
+    local lines = trajectory.build_lines(messages)
+    local joined = table.concat(lines, "\n")
+    local user_req = 0
+    for _, l in ipairs(lines) do if l:find("▸ 用户请求", 1, true) then user_req = user_req + 1 end end
+    t.eq(2, user_req, "子 Agent 结果不应产生「用户请求」小节（仅 2 条真实用户消息）")
+    t.true_(joined:find("子 Agent 结果 · 调研", 1, true) ~= nil, "应有子 Agent 结果小节（标记式）")
+    t.true_(joined:find("子 Agent 结果 · 复算", 1, true) ~= nil, "应有子 Agent 结果小节（前缀兜底式）")
+    for _, l in ipairs(lines) do
+      if l:find("⏷ Turn", 1, true) and l:find("用户:", 1, true) then
+        t.true_(not l:find("【子 Agent", 1, true), "turn 头不应把子 Agent 结果当用户内容: " .. l)
+      end
+    end
+  end)
 end)
