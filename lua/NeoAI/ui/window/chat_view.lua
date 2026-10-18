@@ -99,6 +99,7 @@ local function _make_instance()
     input_win_id = nil, -- 输入窗口
     unsubs = {},
     agent_id = nil,
+  session_id = nil, -- 本实例绑定的会话 id（删除会话时据此精确关闭窗口）
   tool_tick = nil, -- 工具执行中折叠文本定时刷新句柄
   following = true, -- 流式更新时光标是否跟随（不跟随时不弹思考悬浮窗、不重新折叠已有折叠）
   collapsed = false, -- 聊天窗口进入后台后是否已收起（输入框）
@@ -1688,6 +1689,7 @@ local function _switch_agent(agent)
   -- 先解绑旧 Agent（持久化 + 销毁），再绑定新 Agent（原实现顺序，语义不变）
   chat_service.detach_window(state.win_id)
   state.agent_id = agent.id
+  state.session_id = agent.session_id
   chat_service.attach_window(state.win_id, agent)
   reasoning_panel.close()
   _cancel_ctxop()
@@ -1767,6 +1769,7 @@ function M.open(opts)
     agent = chat_service.new_session({})
   end
   state.agent_id = agent.id
+  state.session_id = agent.session_id
   chat_service.attach_window(state.win_id, agent)
 
   -- 显示模式插件：注入宿主 API，激活默认（或上次）显示模式。
@@ -1904,6 +1907,7 @@ function M.close()
   state.buf = nil
   state.input_win_id = nil
   state.agent_id = nil
+  state.session_id = nil
   state.following = true
   -- 缓存以 buffer 为键，关闭前已删除 buffer，回收其块缓存避免泄漏
   incremental.reset()
@@ -2000,6 +2004,18 @@ end
   function M._input_buf() return input_box.get_buf() end
   --- @return string|nil
   function M._agent_id() return state.agent_id end
+  --- 本实例当前绑定的会话 id（用于「删除会话即关闭其窗口」的精确匹配）。
+  --- 优先用绑定 Agent 时记录的会话 id：会话被删除后 Agent 可能已被销毁，
+  --- 此时按 Agent 反查会失效。
+  --- @return string|nil
+  function M._session_id()
+    if state.session_id then return state.session_id end
+    local aid = state.agent_id
+    if not aid then return nil end
+    local sid = chat_service.get_session_id_for_agent
+    if type(sid) ~= "function" then return nil end
+    return sid(aid)
+  end
   --- @return string|nil
   function M._title() return state.title end
   --- @param t string
@@ -2147,6 +2163,9 @@ end
 
 local ChatView = {}
 
+-- 前向声明：会话被删除时关闭其聊天实例的监听（实现见会话删除订阅小节）。
+local _ensure_session_deleted_watch = nil
+
 --- 打开聊天界面（默认复用当前实例；new_window 时新建独立实例）。
 --- @param opts table|nil { session_id?, round?, new_session?, new_window? }
 --- @return table { win_id, buf }
@@ -2165,6 +2184,7 @@ end
 --- @return table { win_id, buf }
 function ChatView.open_new(opts)
   opts = opts or {}
+  _ensure_session_deleted_watch()
   local inst = _make_instance()
   local id = inst._instance_id()
   _instances[id] = inst
@@ -2195,6 +2215,44 @@ function ChatView.close_all()
   end
   _instances, _order, _title_used = {}, {}, {}
   _current_id = nil
+end
+
+--- 关闭绑定到指定会话的全部聊天实例（含 `new_window` 打开的子 Agent 查看窗口）。
+--- 无匹配实例时为 no-op；返回实际关闭的实例数。
+--- @param session_id string|nil
+--- @return number
+function ChatView.close_for_session(session_id)
+  if type(session_id) ~= "string" then return 0 end
+  local closed = 0
+  for i = #_order, 1, -1 do
+    local inst = _instances[_order[i]]
+    if inst and inst._is_alive() and inst._session_id() == session_id then
+      pcall(inst.close)
+      closed = closed + 1
+    end
+  end
+  _prune()
+  local nxt = _current_inst()
+  if nxt then _note_focus(nxt._instance_id()) end
+  return closed
+end
+
+-- 会话被删除时关闭其聊天实例：订阅一次（跨实例共享），避免留下指向已删会话的窗口。
+local _session_deleted_unsub = nil
+
+_ensure_session_deleted_watch = function()
+  if _session_deleted_unsub then return end
+  _session_deleted_unsub = event_bus.on(events.SESSION_DELETED, function(data)
+    local deleted = data and data.deleted
+    if type(deleted) ~= "table" then return end
+    -- 事件在批量落盘回调中派发：延后到下一事件循环再关窗，
+    -- 避免在事件处理过程中销毁 buffer/窗口引发重入。
+    vim.schedule(function()
+      for _, sid in ipairs(deleted) do
+        ChatView.close_for_session(sid)
+      end
+    end)
+  end)
 end
 
 --- 是否有任一聊天窗口打开。

@@ -457,6 +457,83 @@ The session tree window shows session branches and supports select/create/delete
 - **Compatibility**: sessions within a group still render as the original tree (branch/multi-round
   indentation unchanged); group collapse state is stored in `state.expanded["group:<cwd>"]` (`nil` =
   expanded) and cleared when the tree window closes.
+- **Hidden sub-agent sessions**: sessions whose `metadata.tags` contain `sub_agent`, and their whole
+  descendant subtree, are not rendered and do not count toward group totals. They are dependent
+  sessions of the main session (`parent_id` points at it); rendering them would interleave them with
+  user branches, and with "the main session has only one child" the single-child `<CR>` follow-down
+  would wrongly enter a sub-agent session. So `_downstream_leaf` uses
+  `get_downstream(id, {skip_sub_agent = true})` and `chat_service._build_chain_messages` likewise
+  never splices sub-agent messages into the main context.
+
+### 7.1 Rendering: build offloaded to the thread pool
+
+All tree computation (grouping / sorting / hidden-branch marking / empty-session detection /
+`├─└─│` connectors / per-row labels) runs in the `utils.work` pool; **the main thread only slices
+`table.concat` + calls `nvim_buf_set_lines`**:
+
+- **Snapshot (main thread, O(n) copy)**: one pass over `session_store.get_all()` producing a **flat
+  scalar array** (9 scalars per session + 4 per round: id / parent_id / cwd / name / timestamps /
+  sub-agent flag / message count / round count / two truncated summaries per round). Summaries are
+  cached by `updated_at .. ":" .. #messages` (`state.digest_cache`), so unchanged sessions are not
+  rescanned; truncation uses a pure-Lua character-boundary scan (`vim.fn.strchars/strcharpart` and
+  `vim.str_byteindex` cost 0.2–1.1s across ~20k messages). Collapse state is passed as two
+  newline-separated strings (explicit true / explicit false).
+- **Worker build**: `work.run_codec` hands the snapshot plus the module constant `TREE_BUILD_SRC`
+  (pure Lua, self-contained, no `require`/upvalue) to the pool; inside the worker the flat array is
+  parsed by stride (no string splitting) and the result is:
+  - `rows`: **one string of row text** (rows separated by `\n`, fragments by `\t`) — the main thread
+    slices and `concat`s it;
+  - `meta`: a parallel array of metadata strings (`kind / session_id / cwd / round / is_open /
+    has_children / depth`), **parsed lazily** only for the cursor row and subtree deletions;
+  - `depths`: one byte per row (depth+48) for O(1) subtree-range lookup during optimistic deletes;
+  - `cleanup_ids`: fully-empty branches.
+- **Why this format (measured at 390 sessions / 9007 rows)**: decoding nested small tables costs
+  143ms, a flat number array 169ms, string rows + metadata array 30ms. Fixed main-thread transfer cost
+  is ≈ 35ms snapshot encode + 8ms result decode + 15ms row concat, while the build itself is 43ms and
+  a worker round trip is 300ms — so **small trees build on the main thread**
+  (`OFFLOAD_MIN_SESSIONS=80`; a few dozen sessions take <2ms, far less than a round trip) and only
+  larger ones are offloaded.
+- **Fallback**: when `work` is unavailable, the tree is below the threshold, or
+  `M._set_sync_build(true)` (tests), the **same** `TREE_BUILD_SRC` runs on the main thread via
+  `load()` — one implementation, two execution paths, identical output (covered by a parity test).
+- **Scheduling**: `_schedule_build()` coalesces same-tick requests, enforces a `RENDER_MIN_INTERVAL_MS`
+  (50ms) floor, merges in-flight requests (`build_dirty`), and validates an epoch (`close/reset` bump
+  `build_epoch`, voiding stale callbacks). After a build the cursor is re-anchored by "selected item
+  key" (`kind` + `session_id` + `round`) with a **bounded** search around the previous index, clamped
+  when that item is gone.
+- **First frame / tests**: `M.flush()` synchronously drains in-flight builds and pending writes and
+  rebuilds; `M.open()` calls it once so the content is ready on return.
+
+### 7.2 Deletion: optimistic row removal + throttled async persistence
+
+`d` (delete round) and `D` (delete session subtree) are **optimistic**:
+
+1. The main thread computes the contiguous row range of the node and its whole subtree from `items`
+   depths and **removes those rows immediately** (`_remove_rows`, keeping `state.items/lines/selected_idx`
+   in sync);
+2. The operation is queued in `state.pending_ops` and debounced by `FLUSH_DEBOUNCE_MS` (150ms) into a
+   **single** batch;
+3. The batch goes through `session_store.mutate_async(ops)`: the whole-file rewrite runs in the
+   `utils.work` pool (read → apply `delete`/`trim` → atomic rewrite), sharing one per-path write chain
+   with append-style persistence;
+4. Success: memory is committed, `SESSION_SAVED`/`SESSION_DELETED` are emitted, and a rebuild corrects
+   the view (connectors/group counts may be stale during the optimistic window). Failure: notify
+   "delete failed, data unchanged" and rebuild so the rows come back.
+
+- **Ordering invariant**: while `pending_ops` is non-empty or a write is in flight, builds are
+  **suspended** so a stale snapshot cannot resurrect removed rows.
+- **First round `d`**: the first-round row doubles as the session node; it is not removed optimistically
+  and is corrected by the rebuild after persistence.
+- **Closing the window**: `M.close()` hands unsubmitted deletions **straight to the store** (no lost
+  keystrokes).
+- **Cascade**: deleting a main session also deletes its sub-agent sessions and their descendant
+  subtrees (`include_sub_agents`, on by default, see [history_manager.md](history_manager.md)) and
+  triggers runtime cleanup: `core.agent.sub_agent` aborts/disposes its sub-agents,
+  `services.chat_service` disposes the session's agent and drops its persist chain, and
+  `chat_view.close_for_session` closes its chat windows (including `new_window` sub-agent viewers).
+- **Empty-session cleanup**: `cleanup_ids` returned by the build are filtered by `is_session_active`
+  and merged into the same batch; failures are recorded in `cleanup_skipped` and not retried for this
+  window (avoiding a retry loop).
 
 ## 8. Keymaps (ui/keymap.lua)
 

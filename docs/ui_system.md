@@ -395,11 +395,64 @@ NeoAI 的聊天/输入框/悬浮窗等都是纯 UI 文本，若 LSP 客户端（
 - **兼容**：组内仍按原树渲染（分支/多轮次缩进不变），分组折叠态存于 `state.expanded["group:<cwd>"]`
   （`nil` = 展开），关闭树窗口即清空。
 - **隐藏子 Agent 会话**：`metadata.tags` 含 `sub_agent` 的会话及其整支后代不在树中渲染，也不参与
-  分组计数（`_is_hidden_branch`）。它们是主会话的附属会话（`parent_id` 指向主会话），渲染出来会
+  分组计数。它们是主会话的附属会话（`parent_id` 指向主会话），渲染出来会
   与用户分支混排；且"主会话只有唯一子会话"时，`<CR>` 的单子链顺延会误入子 Agent 会话。因此
   `_downstream_leaf` 用 `get_downstream(id, {skip_sub_agent = true})` 跳过子 Agent 会话，
   `chat_service._build_chain_messages` 同样不把子 Agent 会话消息拼进主会话上下文。子 Agent 的
   查看入口见 [sub_agent_system.md](sub_agent_system.md)（状态栏 / `switch_sub_agent` / 浮窗列表）。
+
+### 7.1 渲染：构建下沉线程池
+
+树的全部计算（分组 / 排序 / 隐藏支标记 / 空会话判定 / `├─└─│` 连接线 / 每行文案）都在
+`utils.work` 线程池执行，**主线程只做切片 `table.concat` + `nvim_buf_set_lines`**：
+
+- **快照组装（主线程，O(n) 拷贝）**：一次遍历 `session_store.get_all()` 得到**平铺标量数组**
+  （每会话 9 个标量 + 每轮 4 个：id / parent_id / cwd / name / 时间戳 / 子 Agent 标记 /
+  消息数 / 轮次数 / 每轮两条已截断摘要）。摘要按 `updated_at .. ":" .. #messages` 缓存
+  （`state.digest_cache`），会话未变更不重扫消息；摘要截断用纯 Lua 字符边界扫描
+  （`vim.fn.strchars/strcharpart`、`vim.str_byteindex` 在 2 万条消息规模下要 0.2~1.1s）。
+  折叠态按「显式 true / 显式 false」两组新行分隔字符串一并入快照。
+- **工作线程构建**：`work.run_codec` 把快照 + 模块常量 `TREE_BUILD_SRC`（纯 Lua、自包含、
+  无 `require`/upvalue）交给线程池；线程内按下标步进解析（无字符串切分），返回
+  - `rows`：**行文本单字符串**（行以 `\n`、片段以 `\t` 分隔）——主线程据此切片 `concat`；
+  - `meta`：与行平行的元数据字符串数组（`kind / session_id / cwd / round / is_open /
+    has_children / depth`，**按需懒解析**，仅光标行与子树删除时解析）；
+  - `depths`：每行 1 字节 depth+48，乐观删除找子树范围时 O(1) 读取；
+  - `cleanup_ids`：整支皆空的清理候选。
+- **格式选择依据（实测 390 会话 / 9007 行）**：嵌套小表回传解码 143ms、平铺数字数组 169ms、
+  字符串行 + 元数据数组 30ms。主线程跨线程固定开销 ≈ 快照编码 35ms + 结果解码 8ms + 行拼接 15ms，
+  而构建本身 43ms、线程往返 300ms —— 因此**小规模树直接在主线程构建**（`OFFLOAD_MIN_SESSIONS=80`，
+  几十个会话 <2ms，比线程往返快得多），超过阈值才卸载。
+- **回退**：`work` 不可用、规模低于阈值或 `M._set_sync_build(true)`（测试）时，**同一份**
+  `TREE_BUILD_SRC` 在主线程 `load()` 执行——单一实现、双执行路径，产出逐行一致（有对拍用例）。
+- **调度**：`_schedule_build()` 合并同一 tick 的多次请求、最小间隔 `RENDER_MIN_INTERVAL_MS`(50ms)、
+  在途合并（`build_dirty`）、代次校验（`close/reset` 递增 `build_epoch`，作废旧回调）。构建后按
+  「选中项 key（`kind` + `session_id` + `round`）」在原索引附近**有界搜索**重定位光标，
+  找不到则钳制到有效行。
+- **首帧与测试**：`M.flush()` 同步完成在途构建与待落盘操作并立即重建，`M.open()` 末尾调用一次，
+  保证返回即内容就绪。
+
+### 7.2 删除：乐观删行 + 节流异步落盘
+
+`d`（删轮次）/`D`（删会话整支）均为**乐观语义**：
+
+1. 主线程按 `items` 的 `depth` 算出该节点及其整支子树的连续行区间，**立即从 buffer 移除**
+   （`_remove_rows`，同时同步 `state.items/lines/selected_idx`）；
+2. 操作入队 `state.pending_ops`，按 `FLUSH_DEBOUNCE_MS`(150ms) 防抖合并为**一次**批量提交；
+3. 提交走 `session_store.mutate_async(ops)`：整文件重写在 `utils.work` 线程内完成（读盘 → 应用
+   `delete`/`trim` → 原子重写），与追加式持久化共用同一条 per-path 写盘串行链；
+4. 成功：应用内存变更、发 `SESSION_SAVED`/`SESSION_DELETED`，并重建渲染校正（乐观删行期间可能残留
+   连接线/分组计数）；失败：提示「删除失败，数据未变」并重建，使行回归。
+
+- **顺序一致性**：`pending_ops` 非空或落盘在途时**挂起构建**，避免旧快照把已移除的行「复活」。
+- **首轮 `d`**：首轮行同时承担会话节点身份，不即时删行，落盘后由重建校正为新的首轮摘要。
+- **关窗**：`M.close()` 把未提交的删除**直接交给会话存储**（不丢失用户按键）。
+- **连带清理**：删除主会话时一并删除其子 Agent 会话及整支后代（`include_sub_agents`，默认开启，
+  见 [history_manager.md](history_manager.md)），并触发运行时回收：`core.agent.sub_agent` 终止/销毁
+  其子 Agent，`services.chat_service` 销毁该会话的 Agent、丢弃持久化链，`chat_view.close_for_session`
+  关闭其聊天窗口（含 `new_window` 打开的子 Agent 查看窗口）。
+- **空会话清理**：构建返回的 `cleanup_ids` 经 `is_session_active` 过滤后并入同一批量提交；失败项记入
+  `cleanup_skipped`，本次窗口内不重试（避免抖动循环）。
 
 ## 8. 键位（ui/keymap.lua）
 

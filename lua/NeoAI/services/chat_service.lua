@@ -40,6 +40,10 @@ local queue_state_sub = nil -- 监听 Agent 状态变化以在 turn 结束时机
 local pending_mode = nil
 local pending_mode_agent_id = nil
 
+-- 前向声明：会话删除清理订阅（实现见下文「会话删除后的运行时回收」）。
+-- 在创建/加载 Agent 时懒注册，避免聊天服务未被使用时也挂事件订阅。
+local _ensure_session_cleanup_hook = nil
+
 -- ========== 私有函数 ==========
 
 --- 判断 Agent 是否已被销毁
@@ -116,6 +120,7 @@ end
 --- @return table Agent
 local function _get_or_create_agent(opts)
   opts = opts or {}
+  if _ensure_session_cleanup_hook then _ensure_session_cleanup_hook() end
   local agent_id = state.current_agent_id
   local agent = agent_id and runtime.get(agent_id) or nil
   if not agent or agent_mod_is_disposed(agent) then
@@ -798,6 +803,70 @@ function M.is_session_active(session_id)
   return runtime.get_by_session(session_id) ~= nil
 end
 
+--- 按 Agent id 查询其绑定的会话 id（供 UI 精确关闭某个会话的窗口）。
+--- 外部托管（子 Agent）的 Agent 不在 state.agents 登记，回退读 Agent 自身字段。
+--- @param agent_id string|nil
+--- @return string|nil
+function M.get_session_id_for_agent(agent_id)
+  if not agent_id then return nil end
+  local info = state.agents[agent_id]
+  if info and info.session_id then return info.session_id end
+  local agent = runtime.get(agent_id)
+  return agent and agent.session_id or nil
+end
+
+-- ========== 会话删除后的运行时回收 ==========
+
+local session_cleanup_unsubs = {}
+local session_cleanup_inited = false
+
+--- 会话被删除后回收其活跃 Agent、持久化链与窗口映射，避免孤儿运行时继续消耗 token 或写回
+--- 已删会话。子 Agent 的 Agent 由 `core.agent.sub_agent` 自行处置（它订阅同一事件），
+--- 此处只处理聊天服务自己拥有的 Agent。
+--- @param session_id string
+local function _forget_deleted_session(session_id)
+  local agent_id = state.sessions[session_id]
+  local agent = (agent_id and runtime.get(agent_id)) or runtime.get_by_session(session_id)
+  if agent and agent._external_owner then agent = nil end
+  if agent then
+    local aid = agent.id
+    -- 先终止生成：避免删除后仍有在途请求把结果写回已删会话。
+    pcall(runtime.abort, agent, "session_deleted")
+    pcall(runtime.dispose, agent)
+    pcall(function() require("NeoAI.tools.builtin.todo").cleanup(agent) end)
+    state.agents[aid] = nil
+    for win_id, aid2 in pairs(state.windows) do
+      if aid2 == aid then state.windows[win_id] = nil end
+    end
+    _flush_pending(aid)
+  end
+  -- 该会话的持久化链已无意义：丢弃，后续 persist 因会话不存在而自然 no-op。
+  persist_chains[session_id] = nil
+  if state.sessions[session_id] ~= nil then state.sessions[session_id] = nil end
+  if state.current_agent_id and not runtime.get(state.current_agent_id) then
+    state.current_agent_id = nil
+    for id in pairs(state.agents) do
+      if runtime.get(id) then
+        state.current_agent_id = id
+        break
+      end
+    end
+  end
+end
+
+--- 懒注册会话删除订阅（首次创建/加载会话时调用）。订阅随 M.reset() 注销。
+_ensure_session_cleanup_hook = function()
+  if session_cleanup_inited then return end
+  session_cleanup_inited = true
+  session_cleanup_unsubs[#session_cleanup_unsubs + 1] = event_bus.on(events.SESSION_DELETED, function(data)
+    local deleted = data and data.deleted
+    if type(deleted) ~= "table" then return end
+    for _, sid in ipairs(deleted) do
+      if type(sid) == "string" then _forget_deleted_session(sid) end
+    end
+  end)
+end
+
 --- 绑定窗口到 Agent
 --- @param win_id number
 --- @param agent table|nil Agent；nil 则用当前 Agent
@@ -1037,6 +1106,7 @@ end
 --- @return table Agent
 function M.load_session(session_id, opts)
   opts = opts or {}
+  if _ensure_session_cleanup_hook then _ensure_session_cleanup_hook() end
   local session = session_store.get(session_id)
   if not session then
     return M.new_session({})
@@ -1136,6 +1206,14 @@ function M.persist_active_sessions()
   return n
 end
 
+--- 测试辅助：当前登记的会话持久化链数量
+--- @return number
+function M._persist_chain_count()
+  local n = 0
+  for _ in pairs(persist_chains) do n = n + 1 end
+  return n
+end
+
 --- 重置（测试用）
 function M.reset()
   for _, agent_id in pairs(state.windows) do
@@ -1146,6 +1224,13 @@ function M.reset()
   state.agents = {}
   state.sessions = {}
   state.current_agent_id = nil
+  -- 注销会话删除订阅，避免跨测试/重载残留重复清理
+  for _, unsub in ipairs(session_cleanup_unsubs) do
+    if unsub then pcall(unsub) end
+  end
+  session_cleanup_unsubs = {}
+  session_cleanup_inited = false
+  persist_chains = {}
   -- 清理待应用的模式切换与状态监听，避免跨测试/重载残留
   pending_mode = nil
   pending_mode_agent_id = nil

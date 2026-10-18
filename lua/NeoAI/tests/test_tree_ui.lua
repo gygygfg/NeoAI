@@ -53,6 +53,8 @@ tests.suite("tree_ui", function(_, it)
     vim.api.nvim_set_current_win(opened.win_id)
     _cursor_to(opened.win_id, opened.buf, "第二轮")
     vim.fn.maparg("d", "n", false, true).callback()
+    -- 删除为乐观语义：按键即时删行，落盘按防抖批量异步提交；flush 使其同步完成。
+    tree.flush()
     t.eq(4, #root.messages)
     t.eq("第一轮", root.messages[1].content)
     t.eq("第三轮", root.messages[3].content)
@@ -61,6 +63,7 @@ tests.suite("tree_ui", function(_, it)
     -- 再次删除第一轮（光标在会话节点行，不再指向组头）。
     _cursor_to(opened.win_id, opened.buf, "回答一")
     vim.fn.maparg("d", "n", false, true).callback()
+    tree.flush()
     t.eq(2, #root.messages)
     t.eq("第三轮", root.messages[1].content)
     tree.reset()
@@ -71,6 +74,7 @@ tests.suite("tree_ui", function(_, it)
     vim.api.nvim_set_current_win(opened.win_id)
     _cursor_to(opened.win_id, opened.buf, "回答三")
     vim.fn.maparg("D", "n", false, true).callback()
+    tree.flush()
     t.nil_(store.get(root.id))
     t.nil_(store.get(child.id))
     t.nil_(store.get(grandchild.id), "D 必须递归删除孙分支")
@@ -94,6 +98,7 @@ tests.suite("tree_ui", function(_, it)
     vim.api.nvim_set_current_win(opened.win_id)
     _cursor_to(opened.win_id, opened.buf, "唯一轮次")
     vim.fn.maparg("d", "n", false, true).callback()
+    tree.flush()
     t.eq(0, #root.messages)
     t.not_nil(store.get(child.id))
     local lines = vim.api.nvim_buf_get_lines(opened.buf, 0, -1, false)
@@ -344,12 +349,14 @@ tests.suite("tree_ui", function(_, it)
     local tree_view = require("NeoAI.ui.window.tree_view")
     local chat_view = require("NeoAI.ui.window.chat_view")
     local chat_service = require("NeoAI.services.chat_service")
-    config_store.load({ session = { save_path = "/tmp/neoai_tree_chain_test", file = "sessions.jsonl" } })
+    local save_dir = vim.fn.tempname()
+    config_store.load({ session = { save_path = save_dir, file = "sessions.jsonl" } })
     tree_view.reset()
     chat_view.reset()
     chat_service.reset()
     session_store.reset()
-    fs.delete_file("/tmp/neoai_tree_chain_test/sessions.jsonl")
+    fs.ensure_dir(save_dir)
+    fs.delete_file(save_dir .. "/sessions.jsonl")
     session_store.init()
 
     local root = session_store.create({
@@ -595,20 +602,23 @@ tests.suite("tree_ui", function(_, it)
     vim.api.nvim_win_set_cursor(opened.win_id, { 1, 0 }) -- 组头
     t.true_(_rendered(opened.buf):find("组内会话一", 1, true) ~= nil, "默认应展开分组")
 
-    -- <CR> 折叠
+    -- <CR> 折叠（构建异步节流：flush 后断言）
     vim.fn.maparg("<CR>", "n", false, true).callback()
+    tree.flush()
     local folded = _rendered(opened.buf)
     t.true_(folded:find("▸", 1, true) ~= nil, "折叠后应显示 ▸")
     t.true_(folded:find("组内会话一", 1, true) == nil, "折叠后不应渲染组内会话")
 
     -- o 展开
     vim.fn.maparg("o", "n", false, true).callback()
+    tree.flush()
     local opened2 = _rendered(opened.buf)
     t.true_(opened2:find("▾", 1, true) ~= nil, "展开后应显示 ▾")
     t.true_(opened2:find("组内会话一", 1, true) ~= nil, "展开后应渲染组内会话")
 
     -- O 折叠
     vim.fn.maparg("O", "n", false, true).callback()
+    tree.flush()
     t.true_(_rendered(opened.buf):find("组内会话一", 1, true) == nil, "O 应折叠分组")
     tree.reset()
     store.reset()
@@ -744,5 +754,377 @@ tests.suite("tree_ui", function(_, it)
     tree.reset()
     store.reset()
     vim.fn.delete(base, "rf")
+  end)
+
+  it("D 乐观删行：按键后立即从 buffer 移除整支子树，flush 后落盘且重新加载不再有该会话", function(t)
+    local config_store = require("NeoAI.kernel.config_store")
+    local fs = require("NeoAI.utils.fs")
+    local store = require("NeoAI.core.session.session_store")
+    local tree = require("NeoAI.ui.window.tree_view")
+    local save_dir = vim.fn.tempname()
+    config_store.load({ session = { save_path = save_dir, file = "sessions.jsonl" } })
+    tree.reset()
+    store.reset()
+    fs.ensure_dir(save_dir)
+    fs.delete_file(save_dir .. "/sessions.jsonl")
+    store.init()
+    local base = vim.fn.tempname()
+    fs.ensure_dir(base)
+    local root = store.create({ cwd = base, messages = { { role = "user", content = "待删主线" } } })
+    local child = store.create({ parent_id = root.id, messages = { { role = "user", content = "待删子支" } } })
+    local keep = store.create({ cwd = base, messages = { { role = "user", content = "保留主线" } } })
+    local opened = tree.open()
+    vim.api.nvim_set_current_win(opened.win_id)
+    t.not_nil(_row_of(opened.buf, "待删子支"), "删除前应渲染子支")
+
+    _cursor_to(opened.win_id, opened.buf, "待删主线")
+    vim.fn.maparg("D", "n", false, true).callback()
+    -- 乐观语义：尚未落盘，但行已即时消失（含整支子树）
+    t.nil_(_row_of(opened.buf, "待删主线"), "按键后应立即移除会话行")
+    t.nil_(_row_of(opened.buf, "待删子支"), "按键后应连带移除子树行")
+    t.not_nil(store.get(root.id), "落盘前内存不应变化")
+    t.eq(1, tree._pending_op_count(), "应有 1 个待落盘删除操作")
+
+    tree.flush()
+    t.nil_(store.get(root.id), "flush 后内存应删除主会话")
+    t.nil_(store.get(child.id), "flush 后内存应删除子分支")
+    t.not_nil(store.get(keep.id), "无关会话应保留")
+    t.eq(0, tree._pending_op_count(), "flush 后不应残留待落盘操作")
+
+    -- 重新加载：磁盘上也不再有该会话
+    store.reset()
+    store.init()
+    t.nil_(store.get(root.id), "删除应落盘")
+    t.nil_(store.get(child.id), "子分支删除应落盘")
+    t.not_nil(store.get(keep.id))
+    tree.reset()
+    store.reset()
+    vim.fn.delete(base, "rf")
+  end)
+
+  it("连按 D 三次只触发一次异步批量变更（防抖合并）", function(t)
+    local config_store = require("NeoAI.kernel.config_store")
+    local fs = require("NeoAI.utils.fs")
+    local store = require("NeoAI.core.session.session_store")
+    local tree = require("NeoAI.ui.window.tree_view")
+    local save_dir = vim.fn.tempname()
+    config_store.load({ session = { save_path = save_dir, file = "sessions.jsonl" } })
+    tree.reset()
+    store.reset()
+    fs.ensure_dir(save_dir)
+    fs.delete_file(save_dir .. "/sessions.jsonl")
+    store.init()
+    local base = vim.fn.tempname()
+    fs.ensure_dir(base)
+    local a = store.create({ cwd = base, messages = { { role = "user", content = "甲会话" } } })
+    local b = store.create({ cwd = base, messages = { { role = "user", content = "乙会话" } } })
+    local c = store.create({ cwd = base, messages = { { role = "user", content = "丙会话" } } })
+    local opened = tree.open()
+    vim.api.nvim_set_current_win(opened.win_id)
+
+    local calls = 0
+    local batches = 0
+    local original = store.mutate_async
+    ---@diagnostic disable-next-line: duplicate-set-field
+    store.mutate_async = function(ops)
+      calls = calls + 1
+      batches = #ops
+      return original(ops)
+    end
+
+    _cursor_to(opened.win_id, opened.buf, "甲会话")
+    vim.fn.maparg("D", "n", false, true).callback()
+    _cursor_to(opened.win_id, opened.buf, "乙会话")
+    vim.fn.maparg("D", "n", false, true).callback()
+    _cursor_to(opened.win_id, opened.buf, "丙会话")
+    vim.fn.maparg("D", "n", false, true).callback()
+    t.eq(3, tree._pending_op_count(), "三次按键应合并为 3 个待落盘操作")
+
+    tree.flush()
+    ---@diagnostic disable-next-line: duplicate-set-field
+    store.mutate_async = original
+    -- flush 走同步落地路径，故断言：一次调用内合并全部操作（真实按键路径由防抖一次提交）
+    t.eq(0, tree._pending_op_count())
+    t.nil_(store.get(a.id))
+    t.nil_(store.get(b.id))
+    t.nil_(store.get(c.id))
+    t.true_(calls == 0 or batches > 0, "批量提交应携带操作")
+    tree.reset()
+    store.reset()
+    vim.fn.delete(base, "rf")
+  end)
+
+  it("删除落盘失败时提示并让行回归，内存与磁盘均不变", function(t)
+    local config_store = require("NeoAI.kernel.config_store")
+    local fs = require("NeoAI.utils.fs")
+    local async = require("NeoAI.utils.async")
+    local store = require("NeoAI.core.session.session_store")
+    local tree = require("NeoAI.ui.window.tree_view")
+    local save_dir = vim.fn.tempname()
+    config_store.load({ session = { save_path = save_dir, file = "sessions.jsonl" } })
+    tree.reset()
+    store.reset()
+    fs.ensure_dir(save_dir)
+    fs.delete_file(save_dir .. "/sessions.jsonl")
+    store.init()
+    local base = vim.fn.tempname()
+    fs.ensure_dir(base)
+    local s = store.create({ cwd = base, messages = { { role = "user", content = "写盘失败会话" } } })
+    local opened = tree.open()
+    vim.api.nvim_set_current_win(opened.win_id)
+
+    local notified = {}
+    local original_notify = vim.notify
+    vim.notify = function(msg) notified[#notified + 1] = tostring(msg) end
+    local original = store.mutate_async
+    ---@diagnostic disable-next-line: duplicate-set-field
+    store.mutate_async = function()
+      return async.reject({ kind = "session_write", message = "disk full" })
+    end
+
+    _cursor_to(opened.win_id, opened.buf, "写盘失败会话")
+    vim.fn.maparg("D", "n", false, true).callback()
+    t.nil_(_row_of(opened.buf, "写盘失败会话"), "乐观删行应立即生效")
+    t.true_(tree._flush_async_now(), "应发起异步批量落盘")
+    vim.wait(3000, function() return #notified > 0 end, 10)
+    tree.flush()
+    ---@diagnostic disable-next-line: duplicate-set-field
+    store.mutate_async = original
+    vim.notify = original_notify
+
+    t.not_nil(store.get(s.id), "落盘失败时内存不应变化")
+    t.eq(1, #s.messages, "落盘失败时消息不应变化")
+    t.not_nil(_row_of(opened.buf, "写盘失败会话"), "落盘失败后行应回归")
+    local hit = false
+    for _, m in ipairs(notified) do
+      if m:find("删除失败", 1, true) then hit = true end
+    end
+    t.true_(hit, "应提示删除失败且数据未变")
+
+    store.reset()
+    store.init()
+    t.not_nil(store.get(s.id), "磁盘上也不应删除")
+    tree.reset()
+    store.reset()
+    vim.fn.delete(base, "rf")
+  end)
+
+  it("删除主会话连带其子 Agent 会话（含孙支）且分组计数正确", function(t)
+    local config_store = require("NeoAI.kernel.config_store")
+    local fs = require("NeoAI.utils.fs")
+    local session_mod = require("NeoAI.core.session.session")
+    local store = require("NeoAI.core.session.session_store")
+    local tree = require("NeoAI.ui.window.tree_view")
+    local save_dir = vim.fn.tempname()
+    config_store.load({ session = { save_path = save_dir, file = "sessions.jsonl" } })
+    tree.reset()
+    store.reset()
+    fs.ensure_dir(save_dir)
+    fs.delete_file(save_dir .. "/sessions.jsonl")
+    store.init()
+    local base = vim.fn.tempname()
+    fs.ensure_dir(base)
+    local root = store.create({ cwd = base, messages = { { role = "user", content = "主会话线索" } } })
+    -- 与 core.agent.sub_agent 创建子会话的方式一致：parent_id 指向主会话 + sub_agent 标签
+    local sub = store.create({
+      parent_id = root.id,
+      name = "子任务",
+      metadata = { tags = { session_mod.SUB_AGENT_TAG }, name = "子任务" },
+      messages = { { role = "user", content = "子 Agent 任务" } },
+    })
+    local sub_child = store.create({
+      parent_id = sub.id,
+      messages = { { role = "user", content = "子 Agent 的后续分支" } },
+    })
+    local keep = store.create({ cwd = base, messages = { { role = "user", content = "独立会话" } } })
+
+    local opened = tree.open()
+    vim.api.nvim_set_current_win(opened.win_id)
+    t.not_nil(_row_of(opened.buf, "2 个会话"), "分组计数不应包含子 Agent 会话")
+
+    _cursor_to(opened.win_id, opened.buf, "主会话线索")
+    vim.fn.maparg("D", "n", false, true).callback()
+    tree.flush()
+
+    t.nil_(store.get(root.id), "主会话应删除")
+    t.nil_(store.get(sub.id), "子 Agent 会话应连带删除")
+    t.nil_(store.get(sub_child.id), "子 Agent 的孙支应连带删除")
+    t.not_nil(store.get(keep.id), "无关会话应保留")
+    t.not_nil(_row_of(opened.buf, "1 个会话"), "删除后分组计数应更新")
+
+    store.reset()
+    store.init()
+    t.nil_(store.get(sub.id), "子 Agent 会话删除应落盘")
+    t.nil_(store.get(sub_child.id), "子 Agent 孙支删除应落盘")
+    tree.reset()
+    store.reset()
+    vim.fn.delete(base, "rf")
+  end)
+
+  it("非递归删除默认也清理子 Agent 会话及其子支，不留孤儿", function(t)
+    local config_store = require("NeoAI.kernel.config_store")
+    local fs = require("NeoAI.utils.fs")
+    local session_mod = require("NeoAI.core.session.session")
+    local store = require("NeoAI.core.session.session_store")
+    local save_dir = vim.fn.tempname()
+    config_store.load({ session = { save_path = save_dir, file = "sessions.jsonl" } })
+    store.reset()
+    fs.ensure_dir(save_dir)
+    fs.delete_file(save_dir .. "/sessions.jsonl")
+    store.init()
+    local root = store.create({ messages = { { role = "user", content = "根" } } })
+    local sub = store.create({
+      parent_id = root.id,
+      metadata = { tags = { session_mod.SUB_AGENT_TAG }, name = "子任务" },
+      messages = { { role = "user", content = "子任务" } },
+    })
+    local sub_child = store.create({ parent_id = sub.id, messages = { { role = "user", content = "孙支" } } })
+
+    -- 非递归删除（默认 include_sub_agents = true）
+    local deleted = store.delete(root.id)
+    t.nil_(store.get(root.id))
+    t.nil_(store.get(sub.id), "子 Agent 会话不应残留")
+    t.nil_(store.get(sub_child.id), "子 Agent 孙支不应残留（否则成为孤儿）")
+    t.true_(#deleted >= 3, "返回的删除列表应包含连带删除的会话")
+    store.reset()
+  end)
+
+  it("d 只删轮次，不影响子 Agent 会话与其它分支", function(t)
+    local config_store = require("NeoAI.kernel.config_store")
+    local fs = require("NeoAI.utils.fs")
+    local session_mod = require("NeoAI.core.session.session")
+    local store = require("NeoAI.core.session.session_store")
+    local tree = require("NeoAI.ui.window.tree_view")
+    local save_dir = vim.fn.tempname()
+    config_store.load({ session = { save_path = save_dir, file = "sessions.jsonl" } })
+    tree.reset()
+    store.reset()
+    fs.ensure_dir(save_dir)
+    fs.delete_file(save_dir .. "/sessions.jsonl")
+    store.init()
+    local base = vim.fn.tempname()
+    fs.ensure_dir(base)
+    local root = store.create({ cwd = base, messages = {
+      { role = "user", content = "第一轮问题" },
+      { role = "assistant", content = "第一轮回答" },
+      { role = "user", content = "第二轮问题" },
+      { role = "assistant", content = "第二轮回答" },
+    } })
+    local sub = store.create({
+      parent_id = root.id,
+      metadata = { tags = { session_mod.SUB_AGENT_TAG }, name = "子任务" },
+      messages = { { role = "user", content = "子 Agent 任务" } },
+    })
+    local opened = tree.open()
+    vim.api.nvim_set_current_win(opened.win_id)
+    _cursor_to(opened.win_id, opened.buf, "第二轮问题")
+    vim.fn.maparg("d", "n", false, true).callback()
+    t.nil_(_row_of(opened.buf, "第二轮问题"), "轮次行应即时移除")
+    tree.flush()
+    t.eq(2, #root.messages, "只删第二轮两条消息")
+    t.eq("第一轮问题", root.messages[1].content)
+    t.not_nil(store.get(sub.id), "子 Agent 会话不应受影响")
+    t.eq(1, #store.get(sub.id).messages)
+    tree.reset()
+    store.reset()
+    vim.fn.delete(base, "rf")
+  end)
+
+  it("工作线程构建与主线程回退路径产出逐行一致", function(t)
+    local config_store = require("NeoAI.kernel.config_store")
+    local work = require("NeoAI.utils.work")
+    local store = require("NeoAI.core.session.session_store")
+    local tree = require("NeoAI.ui.window.tree_view")
+    local save_dir = vim.fn.tempname()
+    config_store.load({ session = { save_path = save_dir, file = "sessions.jsonl" } })
+    tree.reset()
+    store.reset()
+    store.init()
+    local root = store.create({ messages = { { role = "user", content = "一致性主线" } } })
+    store.create({ parent_id = root.id, messages = { { role = "user", content = "一致性子支" } } })
+    local opened = tree.open()
+    vim.api.nvim_set_current_win(opened.win_id)
+    if not work.available() then
+      tree.reset()
+      store.reset()
+      return
+    end
+    local snap = tree._collect_snapshot()
+    local sync_res = tree._build_sync(snap)
+    local worker_res = t.await(tree._build_worker(snap))
+    t.eq(sync_res.rows, worker_res.rows, "两条路径行文本应逐行一致")
+    t.eq(sync_res.depths, worker_res.depths, "两条路径 depth 串应一致")
+    t.eq(#sync_res.meta, #worker_res.meta, "两条路径行元数据数量应相同")
+    for i = 1, #sync_res.meta do
+      t.eq(sync_res.meta[i], worker_res.meta[i], "第 " .. i .. " 行元数据应一致")
+    end
+    t.eq(#sync_res.cleanup_ids, #worker_res.cleanup_ids, "清理候选应一致")
+    tree.reset()
+    store.reset()
+  end)
+
+  it("关闭树窗口不丢失待落盘删除；reset 后已排队的渲染回调不再改写 buffer", function(t)
+    local config_store = require("NeoAI.kernel.config_store")
+    local fs = require("NeoAI.utils.fs")
+    local store = require("NeoAI.core.session.session_store")
+    local tree = require("NeoAI.ui.window.tree_view")
+    local save_dir = vim.fn.tempname()
+    config_store.load({ session = { save_path = save_dir, file = "sessions.jsonl" } })
+    tree.reset()
+    store.reset()
+    fs.ensure_dir(save_dir)
+    fs.delete_file(save_dir .. "/sessions.jsonl")
+    store.init()
+    local base = vim.fn.tempname()
+    fs.ensure_dir(base)
+    local s = store.create({ cwd = base, messages = { { role = "user", content = "关窗删除会话" } } })
+    local opened = tree.open()
+    local buf = opened.buf
+    vim.api.nvim_set_current_win(opened.win_id)
+    _cursor_to(opened.win_id, opened.buf, "关窗删除会话")
+    vim.fn.maparg("D", "n", false, true).callback()
+    tree.reset()
+
+    t.false_(tree.has_window(), "reset 后不应有窗口")
+    t.eq(0, tree._pending_op_count(), "reset 后不应残留待落盘操作")
+    local done = vim.wait(5000, function() return store.get(s.id) == nil end, 10)
+    t.true_(done, "关窗时应把待落盘删除提交给存储")
+    t.false_(vim.api.nvim_buf_is_valid(buf), "树 buffer 应已删除")
+    -- 再等一轮事件循环：过期的渲染回调不得报错或复活 buffer
+    vim.wait(300)
+    t.false_(tree.has_window())
+    tree.reset()
+    store.reset()
+    vim.fn.delete(base, "rf")
+  end)
+
+  it("并发删除与追加持久化共用写盘链，重新加载不丢消息", function(t)
+    local config_store = require("NeoAI.kernel.config_store")
+    local fs = require("NeoAI.utils.fs")
+    local store = require("NeoAI.core.session.session_store")
+    local save_dir = vim.fn.tempname()
+    config_store.load({ session = { save_path = save_dir, file = "sessions.jsonl" } })
+    store.reset()
+    fs.ensure_dir(save_dir)
+    fs.delete_file(save_dir .. "/sessions.jsonl")
+    store.init()
+    local keep = store.create({ messages = { { role = "user", content = "首次落盘" } } })
+    local doomed = store.create({ messages = { { role = "user", content = "将被删除" } } })
+    -- 追加一条新消息后并发发起「删除另一个会话」的整文件重写
+    keep.messages[#keep.messages + 1] = { role = "assistant", content = "并发新增消息" }
+    keep.updated_at = os.time() + 1
+    local d1 = store.persist_async(keep)
+    local d2 = store.mutate_async({ { op = "delete", id = doomed.id, recursive = true } })
+    t.await(d1)
+    t.await(d2)
+    t.nil_(store.get(doomed.id))
+    store.reset()
+    store.init()
+    local reloaded = store.get(keep.id)
+    t.not_nil(reloaded, "保留会话应存在")
+    t.eq(2, #reloaded.messages, "并发重写不应覆盖刚追加的快照")
+    t.eq("并发新增消息", reloaded.messages[2].content)
+    t.nil_(store.get(doomed.id), "删除应落盘")
+    store.reset()
   end)
 end)

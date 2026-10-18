@@ -3356,4 +3356,76 @@ tests.suite("chat_ui", function(_, it)
     chat_service.reset()
   end)
 
+  it("删除当前会话后关闭其聊天实例、销毁 Agent 并清理持久化链", function(t)
+    local chat_view = require("NeoAI.ui.window.chat_view")
+    local chat_service = require("NeoAI.services.chat_service")
+    local session_store = require("NeoAI.core.session.session_store")
+    local runtime = require("NeoAI.core.agent.runtime")
+    local config_store = require("NeoAI.kernel.config_store")
+    local fs = require("NeoAI.utils.fs")
+    local save_dir = vim.fn.tempname()
+    config_store.load({ session = { save_path = save_dir, file = "sessions.jsonl" } })
+    fs.ensure_dir(save_dir)
+    chat_view.reset()
+    chat_service.reset()
+    session_store.reset()
+    session_store.init()
+
+    local opened = chat_view.open()
+    t.true_(vim.api.nvim_win_is_valid(opened.win_id))
+    local agent = assert(chat_service.get_current_agent())
+    local sid = agent.session_id
+    t.not_nil(sid)
+    t.true_(chat_service.is_session_active(sid), "会话应有活跃 Agent")
+    t.eq(sid, chat_service.get_session_id_for_agent(agent.id), "应能按 Agent 反查会话")
+
+    -- 删除会话（内存 + 事件）：聊天服务订阅事件后回收运行时与窗口映射
+    session_store.delete(sid, { recursive = true })
+    t.false_(chat_service.is_session_active(sid), "删除后不应再有活跃 Agent")
+    t.nil_(runtime.get(agent.id), "Agent 应被销毁")
+    t.nil_(chat_service.get_session_id_for_agent(agent.id))
+
+    -- 窗口关闭延后到下一事件循环（避免在事件处理中销毁 buffer/窗口）
+    vim.wait(2000, function() return not chat_view.has_window() end, 10)
+    t.false_(chat_view.has_window(), "删除当前会话后应关闭其聊天实例")
+    t.eq(0, chat_service._persist_chain_count(), "不应残留该会话的持久化链")
+
+    chat_view.reset()
+    chat_service.reset()
+    session_store.reset()
+  end)
+
+  it("删除无关会话不影响当前打开的聊天会话", function(t)
+    local chat_view = require("NeoAI.ui.window.chat_view")
+    local chat_service = require("NeoAI.services.chat_service")
+    local session_store = require("NeoAI.core.session.session_store")
+    local runtime = require("NeoAI.core.agent.runtime")
+    local config_store = require("NeoAI.kernel.config_store")
+    local fs = require("NeoAI.utils.fs")
+    local save_dir = vim.fn.tempname()
+    config_store.load({ session = { save_path = save_dir, file = "sessions.jsonl" } })
+    fs.ensure_dir(save_dir)
+    chat_view.reset()
+    chat_service.reset()
+    session_store.reset()
+    session_store.init()
+
+    local opened = chat_view.open()
+    local agent = assert(chat_service.get_current_agent())
+    local sid = agent.session_id
+    local other = session_store.create({ messages = { { role = "user", content = "无关会话" } } })
+
+    session_store.delete(other.id, { recursive = true })
+    vim.wait(100, function() return false end)
+
+    t.true_(chat_view.has_window(), "删除无关会话不应关闭当前聊天窗口")
+    t.true_(vim.api.nvim_win_is_valid(opened.win_id))
+    t.true_(chat_service.is_session_active(sid), "当前会话的 Agent 不应被销毁")
+    t.not_nil(runtime.get(agent.id))
+
+    chat_view.reset()
+    chat_service.reset()
+    session_store.reset()
+  end)
+
 end)

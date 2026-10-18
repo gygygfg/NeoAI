@@ -73,6 +73,8 @@ end, { a = 1, b = 2 }):then_(function(res) ... end)
 | 流式 UI 渲染 | 生成中渲染节流（至多每 80ms 一次）+ markdown 渲染结果记忆化（`ui/window/chat_view.lua`、`ui/components/markdown_view.lua`） |
 | 工具结果/参数展示 | 有界美化打印：超过 256KB 的结果/参数跳过全量 JSON 解码，按有界原始前缀渲染（实测 10MB 结果渲染 ~97ms → ~0.1ms）；同一工具块参数/结果只解码一次，供密钥扫描与渲染复用（`ui/components/message_list.lua`） |
 | 长会话流式渲染 | 块描述符按「廉价输入」（消息身份、content/reasoning 长度、推理开关、工具调用与结果身份及状态）复用；未变化块跳过指纹/签名拼接与 build 闭包分配，只重建变化块（`ui/components/message_list.lua`） |
+| 会话树构建 | 分组 / 排序 / 隐藏支标记 / 空会话判定 / `├─└─│` 连接线 / 每行文案整体下沉 `work.run_codec`（模块常量 `TREE_BUILD_SRC` 源码串传入线程内 `load`）；主线程只做快照拷贝、行片段 `concat`、`nvim_buf_set_lines`。回传格式按实测择优：**行文本单字符串 + 元数据字符串数组 + 每行 1 字节 depth**（嵌套小表解码 143ms、平铺数字数组 169ms、字符串 30ms @390 会话/9007 行）。摘要按 `updated_at`+消息数缓存，截断改纯 Lua 字符边界扫描（`vim.fn.strcharpart` 在 2 万条消息下约 1.1s → 70ms）；隐藏支由逐会话回溯祖先链（O(n·depth)）改为单遍向下传播（O(n)）。会话数 < 80 时直接主线程构建（比线程往返更快）。构建同 tick 合并 + 50ms 最小间隔 + 在途合并 + 代次校验（`ui/window/tree_view.lua`） |
+| 会话删除落盘 | 树里 `d`/`D` 先乐观删行（主线程只移行），再防抖 150ms 合并为一次 `session_store.mutate_async`：整文件重写在 `utils.work` 线程内完成（读盘 → `delete`/`trim` → mkstemp + 全量写 + 尺寸校验 + fsync + `.bak` + rename），与追加式持久化共用 per-path 写盘串行链（`core/session/session_store.lua`、`ui/window/tree_view.lua`） |
 
 ## 3. 使用线程池的模块
 
@@ -88,6 +90,8 @@ end, { a = 1, b = 2 }):then_(function(res) ... end)
 | `utils/sha256.lua` | 纯 Lua SHA-256；`source` 源码字符串传入线程内 `load`，供候选哈希与线程内 token 派生在独立核心计算。 |
 | `utils/textmetrics.lua` | 纯 Lua 文本度量（显示宽度/码点切片/折行）；`source` 源码字符串传入线程内 `load`。 |
 | `core/session/tool_result_pruner.lua` | `prune_agent_async`：MB 级工具结果的码点统计/切片经线程池计算（实测 12×3.7MB 从主线程阻塞 330ms → 0ms，4 线程并行约 140ms），仅把裁剪结果传回主线程应用。 |
+| `ui/window/tree_view.lua` | 会话树构建（`_build_runner` + `TREE_BUILD_SRC`）：分组/排序/连接线/文案全在线程内，回传二维文本片段；线程不可用时同一份源码在主线程回退执行。 |
+| `core/session/session_store.lua` | `mutate_async`：批量删除/裁剪的整文件重写在 `MUTATE_SRC` 内完成（`io` + `vim.json` + `vim.uv`，禁用 `vim.api`/`vim.fn`）；与 `persist_async` 共用 per-path 写盘串行链。 |
 
 > 渲染侧（`ui/components/markdown_view.lua`）已改为纯 Lua `utils.textmetrics` 单遍扫描
 > （不再逐字符 `vim.fn.strwidth/strcharpart`），CJK 表格折行约快 1.8~3 倍；按设计渲染仍在

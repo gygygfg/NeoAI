@@ -162,10 +162,60 @@ local function _on_parent_disposed(data)
   state.order = keep
 end
 
+--- 主会话被删除时，终止并销毁挂在它下面的子 Agent（避免孤儿运行时与残留界面）。
+--- 静默处置：先置空 parent_agent_id / parent_session_id，不再把结果回传给已删主 Agent，
+--- 也不写回已删会话存档。
+--- @param data table { deleted?: string[], session_id?: string }
+local function _on_session_deleted(data)
+  local deleted = data and data.deleted
+  if type(deleted) ~= "table" then return end
+  local gone = {}
+  local any = false
+  for _, id in ipairs(deleted) do
+    if type(id) == "string" then
+      gone[id] = true
+      any = true
+    end
+  end
+  if not any then return end
+  local keep = {}
+  for _, id in ipairs(state.order) do
+    local entry = state.subs[id]
+    local hit = entry
+      and ((entry.session_id and gone[entry.session_id])
+        or (entry.parent_session_id and gone[entry.parent_session_id]))
+    if hit then
+      -- 先摘除登记：abort/dispose 触发的生成事件因查不到条目而自动静默。
+      state.subs[id] = nil
+      if entry.agent_id then state.by_agent[entry.agent_id] = nil end
+      entry.parent_agent_id = nil
+      entry.parent_session_id = nil
+      local was_running = entry.status == "running"
+      entry.status = "cancelled"
+      local child = entry.agent_id and runtime.get(entry.agent_id) or nil
+      if child then
+        if was_running then pcall(runtime.abort, child, "session_deleted") end
+        pcall(runtime.dispose, child)
+      end
+      -- 驱动子 Agent 列表 / 浮窗 / 状态栏刷新（条目已不在注册表内）。
+      event_bus.emit(events.SUB_AGENT_UPDATED, {
+        sub_agent_id = id,
+        name = entry.name,
+        status = "cancelled",
+        removed = true,
+      })
+    else
+      keep[#keep + 1] = id
+    end
+  end
+  state.order = keep
+end
+
 local function _init()
   if state.inited then return end
   state.inited = true
   state.unsubs[#state.unsubs + 1] = event_bus.on(events.AGENT_DISPOSED, _on_parent_disposed)
+  state.unsubs[#state.unsubs + 1] = event_bus.on(events.SESSION_DELETED, _on_session_deleted)
   state.unsubs[#state.unsubs + 1] = event_bus.on(events.GENERATION_COMPLETED, function(data)
     local entry = _entry_by_agent(data and data.agent_id)
     if entry then _settle(entry, "completed", _final_text(entry)) end
@@ -384,6 +434,7 @@ end
 --- @param opts table|nil { allowed_tools?, max_tool_calls?, name?, agent_id?, parent_agent_id?, session_id?, parent_session_id? }
 function M._inject_for_test(id, opts)
   opts = opts or {}
+  _init()
   local agent_id = opts.agent_id or ("agent_" .. id)
   state.subs[id] = {
     id = id, name = opts.name or id, task = "test",

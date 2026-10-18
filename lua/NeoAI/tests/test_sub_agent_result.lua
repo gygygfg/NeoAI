@@ -320,4 +320,59 @@ tests.suite("sub_agent_result", function(_, it)
     chat_service.get_current_agent = orig
     manager.reset()
   end)
+
+  it("主会话被删除时终止并销毁其子 Agent，且不影响其它会话的子 Agent", function(t)
+    local manager = require("NeoAI.core.agent.sub_agent")
+    local runtime = require("NeoAI.core.agent.runtime")
+    local event_bus = require("NeoAI.kernel.event_bus")
+    local events = require("NeoAI.kernel.events")
+    manager.reset()
+
+    local aborted, disposed = {}, {}
+    local orig_get, orig_abort, orig_dispose = runtime.get, runtime.abort, runtime.dispose
+    ---@diagnostic disable-next-line: duplicate-set-field
+    runtime.get = function(id) return { id = id } end
+    ---@diagnostic disable-next-line: duplicate-set-field
+    runtime.abort = function(agent, reason)
+      aborted[#aborted + 1] = { id = agent.id, reason = reason }
+    end
+    ---@diagnostic disable-next-line: duplicate-set-field
+    runtime.dispose = function(agent) disposed[#disposed + 1] = agent.id end
+
+    local updated = {}
+    local unsub = event_bus.on(events.SUB_AGENT_UPDATED, function(data)
+      updated[#updated + 1] = data
+    end)
+
+    -- sub_a 挂在主会话 main 下；sub_b 属于另一个主会话 other
+    manager._inject_for_test("sub_a", {
+      agent_id = "childA", parent_agent_id = "pa", session_id = "subA", parent_session_id = "main",
+    })
+    manager._inject_for_test("sub_b", {
+      agent_id = "childB", parent_agent_id = "pb", session_id = "subB", parent_session_id = "other",
+    })
+
+    event_bus.emit(events.SESSION_DELETED, {
+      session_id = "main",
+      deleted = { "main", "subA" },
+      reparented = {},
+    })
+
+    t.nil_(manager.get("sub_a"), "被删主会话的子 Agent 应从注册表移除")
+    t.not_nil(manager.get("sub_b"), "其它会话的子 Agent 不应受影响")
+    t.eq(1, #aborted, "运行中的子 Agent 应被终止")
+    t.eq("childA", aborted[1].id)
+    t.eq("session_deleted", aborted[1].reason)
+    t.eq(1, #disposed, "子 Agent 的 Agent 应被销毁")
+    t.eq("childA", disposed[1])
+    local hit = false
+    for _, e in ipairs(updated) do
+      if e.sub_agent_id == "sub_a" and e.status == "cancelled" then hit = true end
+    end
+    t.true_(hit, "应发出 SUB_AGENT_UPDATED(cancelled) 驱动列表/状态栏刷新")
+
+    unsub()
+    runtime.get, runtime.abort, runtime.dispose = orig_get, orig_abort, orig_dispose
+    manager.reset()
+  end)
 end)
