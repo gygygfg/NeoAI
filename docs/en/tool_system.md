@@ -214,6 +214,7 @@ approval is allowed by default and a notify is sent.
 
 - **Goal**: run the command and complete its interactions (`read` input, y/n confirmations, menu choices, passphrases, ...).
 - **How to operate**: `command` is required; `timeout_ms` is optional (default 30000, -1 = unlimited; pass a large value such as 120000~600000 for multi-round interaction). While the command awaits input, NeoAI polls `/proc/<pid>/{fd/0,syscall,wchan}` to detect "process blocked reading the terminal" (an OS-level signal, not terminal-text parsing) and uses `/proc/<pid>/io` `rchar` growth to tell consecutive reads apart. Each wait fires a **single-turn LLM request** (the judge) returning `{"action":"text"|"keys"|"kill"|"none",...}` JSON that directly injects text/keys or ends the process; a floating terminal (when the chat cursor is following) mirrors the output for manual typing.
+  Syscall detection uses the **architecture-specific** `read`/`readv` numbers (x86_64 `0`/`19`; aarch64/riscv64/loongarch64 `63`/`65`; i386/arm `3`/`145`; mips `4003`/`4145`; common values for unknown archs) and requires the first argument (fd) to be `0`; wchan names (`n_tty_read`/`tty_read`/`wait_woken`) are a fallback. The old code only accepted x86_64's `0`, so waiting-for-input was never detected on ARM (Termux/Android, ARM servers).
 - **Tool-description requirement**: `description` is required and must state the command's **goal and expected inputs** (the judge uses it). The description handed to the model marks it as "interactive" and explains the goal and how to operate.
 - With `enabled=false` it falls back to the original non-interactive jobstart path and restores resident-sandbox semantics.
 
@@ -331,15 +332,21 @@ when `read_all=false` and the target is not covered by a writable root).
 > `Name (Kind)  path:line:col` (`lsp_document_symbols` nests children by two spaces per depth).
 >
 > `lsp_check`: **project-wide diagnostics** running the LSP server's **CLI check command** over a
-> file/directory/glob (e.g. `lua-language-server --check=.`, see `tools.lsp.check.servers`); independent
+> file/directory; independent
 > of whether buffers are open, fully recomputed and reproducible. The command runs inside the sandbox
 > (reads the staged view, writes never leak) so it is decoupled from the editor LSP's mount/cache state.
+> **Built-in servers**: `lua-language-server` (`lua-ls` format, reads the `{out}` JSON), `pyright`
+> (`--outputjson`), `clangd` (`--check`, single file only). When `server` is omitted, an **installed**
+> (executable on PATH) server matching the target extension is auto-selected; an explicitly requested
+> but missing server reports "executable unavailable" instead of a vague "not configured". `bashls` has
+> no CLI check mode — use `lsp_diagnostics`/`shellcheck` instead; add other tools via
+> `tools.lsp.check.servers` (`format=lua-ls|pyright|clangd|text`).
 > Result reading: lua-language-server writes JSON to `--check_out_path` (stdout carries only the progress
 > bar); config uses the `{out}` placeholder pointing to a "sandbox-writable, host-readable" file that the
 > tool reads back after exit. stdout progress/ANSI (`Initializing`, `===017/322`, `Diagnosis complete`,
 > …) is stripped and never echoed. Parsing tolerates lua-language-server / pyright / generic JSON, and
 > extracts JSON from text when needed.
-> Params: `path` (file/dir/glob, default cwd), `severity` (minimum level error|warning|information|hint,
+> Params: `path` (file/dir, default cwd), `severity` (minimum level error|warning|information|hint,
 > passed to the CLI and also filtered locally), `format` (`summary` (default: file/problem counts +
 > per-rule/per-message/per-file breakdown) / `text` (grouped by code) / `json`), `server` (auto-selected),
 > `codes`/`exclude_codes` (rule include/exclude), `paths`/`exclude_paths` (path substring or glob
@@ -363,6 +370,11 @@ when `read_all=false` and the target is not covered by a writable root).
 
 `parse_file` / `query_tree` / `get_node_at_position` / `get_node_type` / `get_node_range` /
 `is_named_node` / `get_parent_node` / `get_child_nodes` / `get_node_code` / `delete_node`.
+
+> `delete_node` removes **only the node's own text** (located by `line`/`col`); it does **not** clean up
+> surrounding commas/separators/whitespace — deleting a function argument, table field or list element
+> usually leaves a dangling `,` that must be removed with `edit_file`. If the deletion introduces new
+> syntax errors the result carries a warning (no warning when the file was already broken).
 
 ### 🪵 Logging (log_ops.lua)
 

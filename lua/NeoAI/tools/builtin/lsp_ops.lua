@@ -1216,12 +1216,90 @@ local function _check_cfg()
   return config_store.get("tools.lsp.check") or {}
 end
 
---- 默认 server 名（配置键排序后的第一个）。
-local function _default_check_server(servers)
+--- 展开可执行文件路径里的 `~`/`$VAR`（直接 exec，shell 不会代劳）。
+--- @param p string|nil
+--- @return string
+local function _expand_bin(p)
+  local s = tostring(p or "")
+  if s:sub(1, 1) == "~" or s:sub(1, 1) == "$" then return vim.fn.expand(s) end
+  return s
+end
+
+--- 该 server 的检查命令是否可用（argv[1] 或显式 `bin` 在 PATH 中可执行）。
+--- @param spec table|nil
+--- @return boolean
+local function _check_bin(spec)
+  if type(spec) ~= "table" or type(spec.argv) ~= "table" or type(spec.argv[1]) ~= "string" then
+    return false
+  end
+  return vim.fn.executable(_expand_bin(spec.bin or spec.argv[1])) == 1
+end
+
+--- 目标路径的扩展名（小写、无点）；目录或无扩展名时返回 nil。
+--- @param target string
+--- @return string|nil
+local function _target_ext(target)
+  local ext = tostring(target or ""):match("%.([%w_]+)$")
+  return ext and ext:lower() or nil
+end
+
+--- 选择检查 server。
+--- 显式指定：必须是已配置且可执行；自动：优先扩展名命中（`spec.extensions`）的可执行 server，
+--- 其次任一可执行 server；都不可用时返回可操作的诊断（而不是含糊的「未配置」）。
+--- @param servers table tools.lsp.check.servers
+--- @param target string 目标文件/目录（绝对路径）
+--- @param requested string|nil 显式指定的 server 名
+--- @return string|nil name, table|nil spec, string|nil err
+local function _pick_check_server(servers, target, requested)
   local names = {}
-  for k in pairs(servers or {}) do names[#names + 1] = k end
+  for k, v in pairs(servers or {}) do
+    if type(v) == "table" and type(v.argv) == "table" then names[#names + 1] = k end
+  end
   table.sort(names)
-  return names[1]
+  if requested then
+    local spec = (servers or {})[requested]
+    if type(spec) ~= "table" or type(spec.argv) ~= "table" then
+      return nil, nil, ("未配置 server '%s'（可用：%s）"):format(
+        tostring(requested),
+        #names > 0 and table.concat(names, ", ") or "无（tools.lsp.check.servers 为空）"
+      )
+    end
+    if not _check_bin(spec) then
+      return nil, nil, ("server '%s' 的可执行文件不可用：%s（请安装并确保在 PATH 中，"
+        .. "或在 tools.lsp.check.servers 用 bin 指定绝对路径）"):format(
+        tostring(requested), tostring(spec.bin or spec.argv[1]))
+    end
+    return requested, spec
+  end
+  local ext = _target_ext(target)
+  local matched, installed, diag = nil, nil, {}
+  for _, name in ipairs(names) do
+    local spec = servers[name]
+    local ok = _check_bin(spec)
+    diag[#diag + 1] = ("%s（%s）"):format(
+      name, ok and "已安装" or ("未安装 " .. tostring(spec.bin or spec.argv[1])))
+    if ok then
+      installed = installed or name
+      if ext and not matched then
+        for _, e in ipairs(_as_list(spec.extensions)) do
+          if tostring(e):lower() == ext then
+            matched = name
+            break
+          end
+        end
+      end
+    end
+  end
+  local chosen = matched or installed
+  if chosen then
+    return chosen, servers[chosen]
+  end
+  if #names == 0 then
+    return nil, nil, "未配置可用的 server（tools.lsp.check.servers 为空）"
+  end
+  return nil, nil, ("没有可用的 server CLI（已配置：%s）；请安装对应检查工具"
+    .. "（如 lua-language-server / pyright / clangd）或扩展 tools.lsp.check.servers"):format(
+    table.concat(diag, "，"))
 end
 
 --- 向上查找项目根（含任一 root_files 的目录）；找不到时回退 target（目录）或其父目录。
@@ -1263,6 +1341,86 @@ end
 --- POSIX 单引号转义。
 local function _shquote(s)
   return "'" .. tostring(s):gsub("'", "'\\''") .. "'"
+end
+
+--- pyright 严重级别 → 数值。
+local _PYRIGHT_SEV = { error = 1, warning = 2, information = 3, hint = 4 }
+
+--- 解析 `pyright --outputjson`：{ generalDiagnostics: [ {file,severity,message,range,rule} ] }。
+--- @param text string
+--- @return table|nil
+local function _parse_pyright(text)
+  if type(text) ~= "string" or text == "" then return nil end
+  local ok, decoded = pcall(require("NeoAI.utils.json").decode, text)
+  if not ok or type(decoded) ~= "table" then return nil end
+  local list = decoded.generalDiagnostics or decoded.diagnostics
+  if type(list) ~= "table" then return nil end
+  local out = {}
+  for _, d in ipairs(list) do
+    if type(d) == "table" then
+      local range = d.range or {}
+      local start = range.start or {}
+      out[#out + 1] = {
+        path = d.file or d.uri,
+        line = (tonumber(start.line) or 0) + 1,
+        col = (tonumber(start.character) or 0) + 1,
+        severity = _PYRIGHT_SEV[tostring(d.severity or "error"):lower()] or 1,
+        code = d.rule,
+        message = tostring(d.message or ""),
+      }
+    end
+  end
+  return out
+end
+
+--- 解析 clangd `--check` 的输出。
+--- 兼容两种格式：
+---   1. 旧版：`path:line:col: error: msg [-Wcode]`；
+---   2. 新版（clangd 17+ check 模式日志）：`E[hh:mm:ss.mmm] [check_name] Line N: msg`
+---      （无路径/列号；路径用本次检查的目标文件，列记为 1，级别看日志前缀 E/W）。
+--- 无诊断时 clangd 打印 "All checks completed, 0 errors"；若它声称有错误却无法解析，
+--- 返回 nil 让调用方回退原文，绝不误报「无诊断」。
+--- @param text string
+--- @param default_path string|nil 新版格式缺省的诊断文件路径
+--- @return table|nil
+local function _parse_clangd(text, default_path)
+  if type(text) ~= "string" or text == "" then return nil end
+  local out = {}
+  for line in (text .. "\n"):gmatch("(.-)\n") do
+    local path, ln, col, sev, msg = line:match("^(.-):(%d+):(%d+):%s*(%a+):%s*(.*)$")
+    local sev_num = sev and _SEV_NUM[sev:lower()]
+    if path and sev_num and path ~= "" then
+      local code = msg:match("%[([^%]]+)%]%s*$")
+      out[#out + 1] = {
+        path = path,
+        line = tonumber(ln) or 0,
+        col = tonumber(col) or 0,
+        severity = sev_num,
+        code = code,
+        message = msg,
+      }
+    else
+      local lvl, body = line:match("^([EW])%[[^%]]*%]%s*(.*)$")
+      local lno, body_msg
+      if body then lno, body_msg = body:match("Line%s+(%d+):%s*(.*)$") end
+      if lvl and lno then
+        out[#out + 1] = {
+          path = default_path,
+          line = tonumber(lno) or 0,
+          col = 1,
+          severity = lvl == "E" and 1 or 2,
+          code = body:match("^%[([%w_]+)%]"),
+          message = body_msg,
+        }
+      end
+    end
+  end
+  if #out == 0 then
+    local n = text:match("All checks completed,%s*(%d+)%s*errors")
+    if n and tonumber(n) == 0 then return out end -- 确认无诊断
+    return nil -- 有错误但格式未识别 / 无完成标记 → 回退原文
+  end
+  return out
 end
 
 --- 解析 LuaLS `--check_out_path` JSON：{ uri: [ {range, severity, message, code} ] }。
@@ -1377,20 +1535,24 @@ local function _diag_key(d)
 end
 
 --- 沙箱内/宿主的结果文件路径对（`{out}` 与回读路径）。
---- 仅当命令确实经沙箱前缀运行时，guest `/tmp` 才映射到宿主会话私有目录；直接运行（无前缀）
---- 时 guest `/tmp` 就是真实 `/tmp`，回读也用真实路径（否则会与写入位置不一致）。
+--- 沙箱内：`/tmp` 被 bind 到会话私有目录，guest `/tmp` 映射为宿主私有路径（两侧都要用对）；
+--- 直接运行（无沙箱前缀）：guest 即宿主路径，改用宿主临时目录，避免依赖 `/tmp` 是否可写
+--- （如 Android/Termux 没有 `/tmp`，旧实现会因 mkdir 失败而拿不到结果文件）。
 --- @param uniq string
 --- @param in_sandbox boolean
 --- @return string guest, string host
 local function _out_paths(uniq, in_sandbox)
+  if not in_sandbox then
+    local host = vim.fn.tempname() .. "-" .. uniq .. "-lsp-check.json"
+    pcall(vim.fn.mkdir, vim.fn.fnamemodify(host, ":h"), "p")
+    return host, host
+  end
   local guest = "/tmp/neoai-lsp-check/" .. uniq .. ".json"
   local host = guest
-  if in_sandbox then
-    local ok, guest_fs = pcall(require, "NeoAI.sandbox.execution.guest_fs")
-    if ok and guest_fs and type(guest_fs.tmp_host) == "function" then
-      local host_dir = guest_fs.tmp_host("/tmp")
-      if host_dir then host = host_dir .. "/neoai-lsp-check/" .. uniq .. ".json" end
-    end
+  local ok, guest_fs = pcall(require, "NeoAI.sandbox.execution.guest_fs")
+  if ok and guest_fs and type(guest_fs.tmp_host) == "function" then
+    local host_dir = guest_fs.tmp_host("/tmp")
+    if host_dir then host = host_dir .. "/neoai-lsp-check/" .. uniq .. ".json" end
   end
   pcall(vim.fn.mkdir, vim.fn.fnamemodify(host, ":h"), "p")
   return guest, host
@@ -1425,14 +1587,18 @@ end
 --- 项目级全量诊断：运行 server CLI 检查命令（沙箱内、只读、读暂存视图）。
 lsp_tools.lsp_check = helpers.define_tool(
   "lsp_check",
-  "项目级全量诊断：运行 LSP server 的 CLI 检查命令（如 lua-language-server --check），"
-    .. "对文件/目录/glob 全量重算，支持严重级别与 code/路径过滤、summary/text/json、基线比对。"
+  "项目级全量诊断：运行 LSP server 的 CLI 检查命令（内置 lua-language-server / pyright / clangd，"
+    .. "缺省按目标扩展名自动选择**已安装**的 server），"
+    .. "对文件/目录全量重算，支持严重级别与 code/路径过滤、summary/text/json、基线比对。"
     .. "不依赖 buffer 是否打开，读沙箱暂存视图。",
   {
     type = "object",
     properties = {
-      path = { type = "string" },
-      server = { type = "string" },
+      path = { type = "string", description = "目标文件或目录（默认会话 cwd）" },
+      server = {
+        type = "string",
+        description = "server 名（内置：lua-language-server / pyright / clangd；缺省自动选择）",
+      },
       severity = { type = "string" },
       format = { type = "string" },
       codes = { type = "string" },
@@ -1453,11 +1619,14 @@ lsp_tools.lsp_check = helpers.define_tool(
     local servers = cfg.servers or {}
     local cwd = (ctx and ctx.cwd) or vim.fn.getcwd()
     local target = args.path and vim.fn.fnamemodify(args.path, ":p"):gsub("/+$", "") or cwd
-    local server_name = args.server or _default_check_server(servers)
-    local spec = server_name and servers[server_name]
-    if type(spec) ~= "table" or type(spec.argv) ~= "table" then
-      on_error("lsp_check：未配置可用的 server（tools.lsp.check.servers）"
-        .. (server_name and ("：" .. tostring(server_name)) or ""))
+    local server_name, spec, pick_err = _pick_check_server(servers, target, args.server)
+    if not server_name then
+      on_error("lsp_check：" .. tostring(pick_err or "没有可用的 server"))
+      return
+    end
+    -- 仅支持单文件检查的 server（如 `clangd --check=<file>`）拒绝目录目标，避免误报。
+    if spec.requires_file and vim.fn.isdirectory(target) == 1 then
+      on_error(("lsp_check：server '%s' 只支持单文件检查，请把 path 指向具体文件"):format(server_name))
       return
     end
     local root = _check_root(target, spec)
@@ -1471,7 +1640,13 @@ lsp_tools.lsp_check = helpers.define_tool(
       path = target, root = root, level = level,
       server = server_name, out = out_guest,
     }
-    local argv = _expand_argv(spec.argv, subs)
+    -- `bin` 覆盖可执行文件（绝对路径 / ~ 路径都支持），其余 argv 原样保留。
+    local argv_src = spec.argv
+    if type(spec.bin) == "string" and spec.bin ~= "" then
+      argv_src = { _expand_bin(spec.bin) }
+      for i = 2, #spec.argv do argv_src[i] = spec.argv[i] end
+    end
+    local argv = _expand_argv(argv_src, subs)
     -- 根缺少项目配置（声明了 root_files 但不存在）：结果顶部强警示（按沙箱视图检测）。
     local missing_cfg = #(spec.root_files or {}) > 0 and not _check_configured(root, spec)
     -- 根缺少项目配置且 auto_config：在沙箱内写入默认配置（overlay 暂存、不落工作区真实盘）。
@@ -1498,8 +1673,14 @@ lsp_tools.lsp_check = helpers.define_tool(
       local f = io.open(out_host, "r")
       if f then raw_out = f:read("*a"); f:close() end
       local diags
-      if (spec.format == "lua-ls") and raw_out and raw_out ~= "" then
+      if spec.format == "lua-ls" and raw_out and raw_out ~= "" then
         diags = _parse_luals(raw_out)
+      elseif spec.format == "pyright" then
+        -- pyright 把 JSON 打到 stdout；部分版本也可能落到 {out}（保持兼容）。
+        diags = _parse_pyright(stdout ~= "" and stdout or (raw_out or ""))
+      elseif spec.format == "clangd" then
+        -- clangd --check 的诊断走 stderr，兼容部分版本写 stdout。
+        diags = _parse_clangd((stdout or "") .. "\n" .. (stderr or ""), target)
       end
       if not diags then
         -- text/未知：stdout 直接回传（附退出码），不解析。
@@ -1521,8 +1702,9 @@ lsp_tools.lsp_check = helpers.define_tool(
         body = _format_diags(filtered, fmt, total)
       end
       if missing_cfg then
+        local hint = spec.missing_root_hint or "结果可能含较多噪声（未定义符号/默认编译参数等）。"
         body = ("⚠ 项目根缺少 " .. table.concat(spec.root_files or {}, "/")
-          .. "（按沙箱视图检测；AI 刚暂存的配置也算存在）。结果可能含大批 undefined-global 噪声。\n")
+          .. "（按沙箱视图检测；AI 刚暂存的配置也算存在）。" .. hint .. "\n")
           .. body
       end
       -- 基线比对：只标出相对基线「新增」的诊断。
@@ -1562,5 +1744,11 @@ function M.get_tools()
   end
   return out
 end
+
+-- ========== 测试可见的内部 API ==========
+M._pick_check_server = _pick_check_server
+M._check_bin = _check_bin
+M._parse_pyright = _parse_pyright
+M._parse_clangd = _parse_clangd
 
 return M

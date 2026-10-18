@@ -104,9 +104,14 @@ parent_session_id, boundaries, status, result_text, error, started_at, tool_call
   子 Agent 名字处）弹出一个**无边框**悬浮列表，`↑/↓`（k/j）移动光标、`<CR>` 在新窗口进入该
   子 Agent 会话、`q`/`<Esc>` 关闭。浮窗相对聊天窗口定位，窗口尺寸变化时重算几何跟随。
 - `sub_agent_dock`：事件驱动的运行状态面板。
-- **会话树**：子 Agent 会话（`metadata.tags` 含 `sub_agent`）在树里以 `🤖 子 Agent：<名字>`
-  标识，**不标记为「用户」**；重开会话时据标签识别（标记 `_sub_agent_session`，只给非 Agent 类
-  工具，且只载入其自身消息、不拼接祖先链）。
+- **会话树**：子 Agent 会话（`metadata.tags` 含 `sub_agent`）**不在会话树中显示**，其整支后代
+  一并隐藏——它们挂在主会话下（`parent_id` = 主会话），混排进树会与用户分支混淆，且"主会话
+  仅有唯一子会话"时点主会话会被单子链顺延误入子 Agent 会话。会话树的分支顺延
+  （`session_store.get_downstream(id, {skip_sub_agent=true})`）与上下文拼接
+  （`chat_service._build_chain_messages`）同样跳过子 Agent 会话，保证主会话始终落在用户对话
+  主线上。子 Agent 的查看入口是状态栏 / `switch_sub_agent` / `sub_agent_list` 浮窗（见上）。
+  重开子 Agent 会话时据标签识别（标记 `_sub_agent_session`，只给非 Agent 类工具，且只载入
+  其自身消息、不拼接祖先链）。
 - **聊天界面**：子 Agent 回传的结果消息**不作为用户消息渲染**，而是像工具调用一样渲染为
   可折叠块（首行 `✅ 子 Agent: <名字>`，含任务与正文），并随会话持久化。
 

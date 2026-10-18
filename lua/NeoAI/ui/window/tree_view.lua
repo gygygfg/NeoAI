@@ -108,6 +108,22 @@ local function _is_sub_agent_session(session)
   return false
 end
 
+--- 会话是否在会话树中整体隐藏：子 Agent 会话及其整支后代都不显示。
+--- 子 Agent 会话由子 Agent 管理器挂在主会话下（`parent_id` = 主会话），
+--- 在树里混排会让用户误以为它们是用户分支；隐藏后主会话节点仍是用户对话主线。
+--- @param session table
+--- @return boolean
+local function _is_hidden_branch(session)
+  if not session then return false end
+  if _is_sub_agent_session(session) then return true end
+  for _, ancestor in ipairs(session_store.get_chain(session.id)) do
+    if ancestor.id ~= session.id and _is_sub_agent_session(ancestor) then
+      return true
+    end
+  end
+  return false
+end
+
 --- 单轮会话树节点文本，不显示内部会话 ID。
 --- 子 Agent 会话不标记为「用户」（其首条消息是任务而非用户输入），改用专属前缀。
 --- @param round table
@@ -218,23 +234,28 @@ local function _build_flat()
   local items = {}
   local editor_cwd = _editor_group_cwd()
   -- 按根会话绑定的工作目录分组（组内保持 updated_at 倒序：get_roots 已排序）。
+  -- 子 Agent 会话（及其后代）不参与分组与计数：它们在树中整体隐藏。
   local groups, order = {}, {}
   for _, root in ipairs(session_store.get_roots()) do
-    local cwd = _cwd_of(root)
-    local key = _group_key(cwd)
-    local g = groups[key]
-    if not g then
-      g = { key = key, cwd = cwd, roots = {}, max_updated = root.updated_at or 0, count = 0 }
-      groups[key] = g
-      order[#order + 1] = g
+    if not _is_hidden_branch(root) then
+      local cwd = _cwd_of(root)
+      local key = _group_key(cwd)
+      local g = groups[key]
+      if not g then
+        g = { key = key, cwd = cwd, roots = {}, max_updated = root.updated_at or 0, count = 0 }
+        groups[key] = g
+        order[#order + 1] = g
+      end
+      g.roots[#g.roots + 1] = root
+      if (root.updated_at or 0) > g.max_updated then g.max_updated = root.updated_at or 0 end
     end
-    g.roots[#g.roots + 1] = root
-    if (root.updated_at or 0) > g.max_updated then g.max_updated = root.updated_at or 0 end
   end
   -- 会话数（含分支/多轮次所属会话）：按绑定 cwd 统计。
   for _, s in pairs(session_store.get_all()) do
-    local g = groups[_group_key(_cwd_of(s))]
-    if g then g.count = g.count + 1 end
+    if not _is_hidden_branch(s) then
+      local g = groups[_group_key(_cwd_of(s))]
+      if g then g.count = g.count + 1 end
+    end
   end
   -- 组排序等级：0=精确实等编辑器工作区；1=路径边界匹配（编辑器位于组目录之下或反之）；
   -- 2=其它。用于把「当前编辑器工作区」对应的组置顶。
@@ -254,7 +275,12 @@ local function _build_flat()
     return tostring(x.cwd) < tostring(y.cwd)
   end)
   local function walk(session, depth, prefix, is_last)
-    local children = session_store.get_children(session.id)
+    -- 子 Agent 会话整体隐藏（连同其整支后代）：它们是主会话的附属会话，
+    -- 渲染出来会与用户分支混排，也容易被误当作可编辑的对话主线。
+    local children = {}
+    for _, child in ipairs(session_store.get_children(session.id)) do
+      if not _is_sub_agent_session(child) then children[#children + 1] = child end
+    end
     -- 空会话不渲染为节点；其子会话提升到当前层级
     if _session_is_empty(session) then
       for idx, child in ipairs(children) do
@@ -417,10 +443,12 @@ end
 --- 或末尾（无子会话）为止；无子会话时返回其自身。
 --- 用于从树进入「单分支中间」的会话时顺延到该分支末尾，使当前会话落在末尾、
 --- 后续新消息追加到末尾，而不是停在中间会话上。
+--- 子 Agent 会话不计入单子链：它们是主会话的附属会话（`parent_id` 指向主会话），
+--- 顺延时必须跳过，否则"主会话只有一个子 Agent 会话"时点主会话会误入子 Agent 会话。
 --- @param session table
 --- @return table 末尾会话
 local function _downstream_leaf(session)
-  local down = session_store.get_downstream(session.id)
+  local down = session_store.get_downstream(session.id, { skip_sub_agent = true })
   return down[#down] or session
 end
 

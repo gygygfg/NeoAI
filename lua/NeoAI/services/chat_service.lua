@@ -644,8 +644,10 @@ local function _build_chain_messages(session, round)
       out[#out + 1] = m
     end
   end
-  -- 下游：沿单子链向下，各会话全部消息，直到分裂分支或末尾
-  for _, s in ipairs(session_store.get_downstream(session.id)) do
+  -- 下游：沿单子链向下，各会话全部消息，直到分裂分支或末尾。
+  -- 子 Agent 会话是主会话的附属会话（`parent_id` 指向主会话）：不计入单子链，
+  -- 其消息也不拼进用户对话上下文，否则从树进入主会话会把子 Agent 的对话混入主线。
+  for _, s in ipairs(session_store.get_downstream(session.id, { skip_sub_agent = true })) do
     for _, m in ipairs(s.messages or {}) do
       out[#out + 1] = m
     end

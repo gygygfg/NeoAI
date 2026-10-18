@@ -252,6 +252,95 @@ tests.suite("tools", function(_, it)
     t.matches("必须显式指定 mode", tostring(err), "省略 mode 且提供 content 应报错而非推断 write")
   end)
 
+  it("edit_file：old_text 未匹配时报错且不写盘（不静默成功）", function(t)
+    local file_ops = require("NeoAI.tools.builtin.file_ops")
+    local def
+    for _, d in ipairs(file_ops.get_tools()) do
+      if d.name == "edit_file" then def = d end
+    end
+    t.not_nil(def, "应注册 edit_file")
+    local fs = require("NeoAI.utils.fs")
+    local path = vim.fn.tempname() .. ".txt"
+    fs.write_file(path, "alpha\nbeta\n")
+
+    local function call(args)
+      local done, out, err = false, nil, nil
+      def.func(args, function(v) out, done = v, true end, function(e) err, done = e, true end)
+      t.true_(vim.wait(8000, function() return done end), "edit_file 应完成")
+      return out, err
+    end
+
+    local out, err = call({ file_path = path, old_text = "NOT_PRESENT", new_text = "x", description = "t" })
+    t.nil_(out, "未匹配不应返回成功")
+    t.matches("old_text 未匹配", tostring(err), "应明确报未匹配")
+    t.eq("alpha\nbeta\n", fs.read_file(path), "未匹配时文件必须零改动")
+
+    -- 命中：报告替换处数（全部出现位置）
+    local out2 = call({ file_path = path, old_text = "alpha", new_text = "A", description = "t" })
+    t.matches("1 处替换", tostring(out2), "应报告替换处数")
+    t.eq("A\nbeta\n", fs.read_file(path))
+
+    -- 多条 edits 中任一条未匹配：整次失败，已命中的那条也不落盘
+    local out3, err3 = call({
+      file_path = path,
+      edits = { { old_text = "A", new_text = "AA" }, { old_text = "zzz", new_text = "y" } },
+      description = "t",
+    })
+    t.nil_(out3, "部分未匹配不应返回成功")
+    t.matches("edits%[2%]", tostring(err3), "应指出出错条目")
+    t.eq("A\nbeta\n", fs.read_file(path), "部分未匹配时不得半途写盘")
+
+    -- 空 old_text 是静默破坏源头，必须拒绝
+    local out4, err4 = call({ file_path = path, old_text = "", new_text = "y", description = "t" })
+    t.nil_(out4)
+    t.matches("不能为空", tostring(err4))
+    vim.fn.delete(path)
+  end)
+
+  it("delete_node：删除引入语法错误时在结果中警示", function(t)
+    local tree_ops = require("NeoAI.tools.builtin.tree_ops")
+    local def
+    for _, d in ipairs(tree_ops.get_tools()) do
+      if d.name == "delete_node" then def = d end
+    end
+    t.not_nil(def, "应注册 delete_node")
+    local fs = require("NeoAI.utils.fs")
+    local path = vim.fn.tempname() .. ".lua"
+    fs.write_file(path, "local t = { a = 1, b = 2 }\n")
+    local done, out = false, nil
+    def.func({ file_path = path, line = 1, col = 12, description = "t" }, function(v)
+      out, done = v, true
+    end, function(e)
+      out, done = e, true
+    end)
+    t.true_(vim.wait(8000, function() return done end), "delete_node 应完成")
+    t.matches("语法树出现错误节点", tostring(out), "删除后应提示清理残留分隔符/逗号")
+    vim.fn.delete(path)
+  end)
+
+  it("file_exists：展开 ~ 且目录视为存在", function(t)
+    local file_ops = require("NeoAI.tools.builtin.file_ops")
+    local def
+    for _, d in ipairs(file_ops.get_tools()) do
+      if d.name == "file_exists" then def = d end
+    end
+    t.not_nil(def, "应注册 file_exists")
+    local home = vim.fn.expand("~")
+    local name = ".neoai_fe_test_" .. vim.fn.tempname():gsub("[^%w]", "")
+    local dir = home .. "/" .. name
+    t.true_(vim.fn.mkdir(dir, "p") == 1 or vim.fn.isdirectory(dir) == 1, "应创建临时目录")
+    local function call(p)
+      local done, out = false, nil
+      def.func({ file_path = p }, function(v) out, done = v, true end, function(e) out, done = e, true end)
+      t.true_(vim.wait(3000, function() return done end), "file_exists 应完成")
+      return out
+    end
+    t.eq("true", call("~/" .. name), "~/… 应展开后判定存在")
+    t.eq("true", call(dir), "目录也应视为存在")
+    t.eq("false", call(dir .. "/nope"), "不存在的路径应为 false")
+    vim.fn.delete(dir, "rf")
+  end)
+
   it("read_file 大文件保护：小文件无行范围仍返回全文", function(t)
     local registry = require("NeoAI.tools.registry")
     registry.reset()

@@ -465,14 +465,25 @@ end
 
 --- 沿会话树向下的单子链（不含起始会话）。
 --- 只有唯一子会话时继续深入；遇分裂分支（多个子会话）或末尾（无子会话）即止。
+--- `opts.skip_sub_agent` 为真时把子 Agent 会话视为不可见：它们不参与单子链判定，
+--- 也不会被返回（用于「用户对话主线」的顺延与上下文拼接，避免误入子 Agent 会话）。
 --- @param session_id string
+--- @param opts table|nil { skip_sub_agent? }
 --- @return table 数组
-function M.get_downstream(session_id)
+function M.get_downstream(session_id, opts)
+  local skip_sub_agent = type(opts) == "table" and opts.skip_sub_agent == true
   local out = {}
   local current = session_id
   local guard = 0
   while state.sessions[current] and guard < 1000 do
     local children = M.get_children(current)
+    if skip_sub_agent then
+      local visible = {}
+      for _, c in ipairs(children) do
+        if not session_mod.is_sub_agent(c) then visible[#visible + 1] = c end
+      end
+      children = visible
+    end
     if #children ~= 1 then break end
     out[#out + 1] = children[1]
     current = children[1].id

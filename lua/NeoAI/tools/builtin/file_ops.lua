@@ -301,6 +301,50 @@ local function _abs_norm(p)
   return fs.canonical(p)
 end
 
+--- 展开路径中的 `~` / `~user` / `$VAR`（`fs.expand` 幂等：已展开的绝对路径原样返回）。
+--- `tools/executor` 会统一展开路径型参数，但工具句柄也可能被直接调用（测试、子 Agent、
+--- 内部链路），故各文件工具入口再兜底展开一次，保证 `~/x` 与绝对路径在
+--- `file_exists`/`read_file`/`edit_file` 之间结论一致。
+--- @param p string|nil
+--- @return string|nil
+local function _expand(p)
+  if type(p) ~= "string" then return p end
+  return fs.expand(p)
+end
+
+--- 转义 Lua 模式串中的魔法字符，使 `old_text` 按字面匹配。
+--- @param s string
+--- @return string
+local function _pattern_escape(s)
+  return (s:gsub("([%(%)%.%%%+%-%*%?%[%]%^%$])", "%%%1"))
+end
+
+--- 按字面替换**全部**命中项（`gsub` 的替换值用函数，避免 `new_text` 中的 `%` 被解析）。
+--- 注意：worker 线程内需自包含实现（string.dump 不携带 upvalue），此函数仅用于主线程路径。
+--- @param text string
+--- @param old string
+--- @param new string
+--- @return string replaced, number count 命中次数
+local function _replace_literal_all(text, old, new)
+  local count = 0
+  local out = text:gsub(_pattern_escape(old), function()
+    count = count + 1
+    return new
+  end)
+  return out, count
+end
+
+--- 错误提示用的片段截断（保留可辨识前缀，换行转义为 `\n`）。
+--- @param s string|nil
+--- @param max integer|nil
+--- @return string
+local function _snippet(s, max)
+  max = max or 80
+  local text = tostring(s or ""):gsub("\n", "\\n")
+  if #text > max then text = text:sub(1, max) .. "…" end
+  return text
+end
+
 --- 以「同一文件串行化」的方式执行异步写操作。
 --- 工具调用可并行发起（tool_loop），而 `edit_file` 的替换分支为「读→改→写」；同一文件若
 --- 不加锁会并发读到旧内容，导致后写覆盖先写、丢更新（write/append 亦需互斥）。这里以
@@ -563,13 +607,14 @@ file_tools.read_file = helpers.define_tool(
     end
     -- 命名空间视图读取（快路径：小文件且无行范围）：overlay 权威暂存层下读取与暂存视图一致。
     -- overlay 不可用/路径落在私有 tmpfs 根/大文件或指定行范围时回退既有解析路径。
+    local target = _expand(args.file_path)
     do
       local ns = _ns_fs()
-      if ns and ns.eligible(args.file_path) and not (args.start_line or args.end_line) then
-        local st = ns.stat(args.file_path)
+      if ns and ns.eligible(target) and not (args.start_line or args.end_line) then
+        local st = ns.stat(target)
         if st and st.type == "file" then
           local guard0 = _read_guard_opts()
-          local content = ns.read(args.file_path)
+          local content = ns.read(target)
           if content ~= nil and _char_count(content) <= guard0.outline_threshold_chars then
             on_success(output_guard.cap(content, { tool = "read_file" }))
             return
@@ -579,7 +624,7 @@ file_tools.read_file = helpers.define_tool(
     end
     -- 沙箱访客路径（/tmp/…，如 output_guard 落盘的输出）还原为宿主路径，使 read_file 能回读。
     -- 映射策略由沙箱负责（guest_fs.resolve_read_path），工具仅调用。
-    local filepath = _resolve_guest_path(args.file_path)
+    local filepath = _resolve_guest_path(target)
     local guard = _read_guard_opts()
     local max_bytes = guard.max_read_bytes
     if args.start_line or args.end_line then
@@ -627,7 +672,8 @@ file_tools.read_file = helpers.define_tool(
 file_tools.edit_file = helpers.define_tool(
   "edit_file",
   "编辑文件。同 opencode edit：局部替换用 old_text/new_text（或 edits 数组，别名 oldString/newString）；"
-    .. "整文件覆写/追加用 mode='write'/'append' + content。两组互斥，误传直接报错（不静默覆写）。",
+    .. "整文件覆写/追加用 mode='write'/'append' + content。两组互斥，误传直接报错（不静默覆写）。"
+    .. "old_text 按字面匹配并替换全部出现位置；任一 old_text 未匹配则整次编辑失败且不写盘（返回错误，绝不静默成功）。",
   {
     type = "object",
     properties = {
@@ -656,7 +702,7 @@ file_tools.edit_file = helpers.define_tool(
     required = { "file_path", "description" },
   },
   function(args, on_success, on_error)
-    local filepath = args.file_path
+    local filepath = _expand(args.file_path)
     -- 参数契约（严格互斥，误传即报错，绝不静默降级为覆写）：
     --   · 局部替换：提供 edits（或顶层 old_text/new_text 简写），且不得同时传 mode；
     --   · 整体覆写/追加：显式 mode='write'/'append'，且不得同时传替换字段。
@@ -777,13 +823,31 @@ file_tools.edit_file = helpers.define_tool(
       on_error("替换需要提供非空 edits 数组（或顶层 old_text/new_text）")
       return
     end
+    -- 校验每条编辑：old_text 必须是非空字符串（空串会命中每个字符位置，是静默破坏）。
+    for idx, edit in ipairs(edits) do
+      if type(edit) ~= "table" then
+        on_error(("edit_file：edits[%d] 需为 { old_text, new_text } 表"):format(idx))
+        return
+      end
+      local old, new = edit.old_text, edit.new_text
+      if type(old) ~= "string" or type(new) ~= "string" then
+        on_error(("edit_file：edits[%d] 需要字符串类型的 old_text 与 new_text"):format(idx))
+        return
+      end
+      if old == "" then
+        on_error(("edit_file：edits[%d] 的 old_text 不能为空字符串"):format(idx))
+        return
+      end
+      if old == new then
+        on_error(("edit_file：edits[%d] 的 old_text 与 new_text 相同，无需编辑"):format(idx))
+        return
+      end
+    end
     -- 序列化传给子线程（仅原始类型）：分隔符约定
     --   \1 = old/new 之间   \2 = 编辑条目之间   \3 = filepath 与编辑序列之间
     local packed = {}
     for _, edit in ipairs(edits) do
-      if edit.old_text and edit.new_text then
-        packed[#packed + 1] = edit.old_text .. "\1" .. edit.new_text
-      end
+      packed[#packed + 1] = edit.old_text .. "\1" .. edit.new_text
     end
     if #packed == 0 then
       on_error("edits 需要包含有效的 old_text/new_text")
@@ -797,20 +861,24 @@ file_tools.edit_file = helpers.define_tool(
         if content == nil then
           return async.reject({ kind = "sandbox", message = "无法读取文件: " .. tostring(rerr) })
         end
-        for _, edit in ipairs(edits) do
-          if edit.old_text and edit.new_text then
-            local escaped = edit.old_text:gsub("([%(%)%.%%%+%-%*%?%[%]%^%$])", "%%%1")
-            content = content:gsub(escaped, function()
-              return edit.new_text
-            end)
+        local total = 0
+        for idx, edit in ipairs(edits) do
+          local replaced, n = _replace_literal_all(content, edit.old_text, edit.new_text)
+          if n == 0 then
+            -- 未命中即失败：绝不写盘（否则「文件已编辑」与零改动并存，Agent 会误判改动已落地）。
+            return async.reject({
+              kind = "edit",
+              message = ("old_text 未匹配（edits[%d]，文件未修改）：%s"):format(idx, _snippet(edit.old_text)),
+            })
           end
+          content, total = replaced, total + n
         end
         local ok, werr = ns.write(filepath, content)
         if not ok then return async.reject({ kind = "sandbox", message = "写入失败: " .. tostring(werr) }) end
-        return async.resolve(true)
-      end), function()
+        return async.resolve(total)
+      end), function(total)
         helpers.reload_buffers_for(filepath)
-        on_success("文件已编辑: " .. filepath)
+        on_success(("文件已编辑: %s（%d 处替换）"):format(filepath, tonumber(total) or 0))
       end, on_error)
       return
     end
@@ -831,16 +899,36 @@ file_tools.edit_file = helpers.define_tool(
             end
             local text = f:read("*a")
             f:close()
+            -- worker 线程内自包含实现（string.dump 不携带 upvalue，不能复用模块内局部函数）：
+            -- 字面匹配 + 全量替换，统计命中次数；任一条未命中即报错（保持文件零改动）。
+            local function replace_all(src, old, new)
+              local n = 0
+              local escaped = old:gsub("([%(%)%.%%%+%-%*%?%[%]%^%$])", "%%%1")
+              local out = src:gsub(escaped, function()
+                n = n + 1
+                return new
+              end)
+              return out, n
+            end
+            local function snippet(s)
+              local v = tostring(s or ""):gsub("\n", "\\n")
+              if #v > 80 then v = v:sub(1, 80) .. "…" end
+              return v
+            end
+            local total = 0
+            local idx = 0
             for entry in edits_blob:gmatch("[^\2]+") do
+              idx = idx + 1
               local old, new = entry:match("^(.-)\1(.*)$")
-              if old and new ~= nil then
-                -- new 作为替换串会被 gsub 解析其中的 % 转义（如 %d/%s 被吞），
-                -- 用函数替换使 new 按字面写入，避免破坏含 % 的内容。
-                local escaped = old:gsub("([%(%)%.%%%+%-%*%?%[%]%^%$])", "%%%1")
-                text = text:gsub(escaped, function()
-                  return new
-                end)
+              if not old then
+                -- level=0：不附加 "file_ops.lua:行号:" 前缀，错误文本直接回给模型。
+                error(("编辑负载格式错误（edits[%d]）"):format(idx), 0)
               end
+              local replaced, n = replace_all(text, old, new)
+              if n == 0 then
+                error(("old_text 未匹配（edits[%d]，文件未修改）：%s"):format(idx, snippet(old)), 0)
+              end
+              text, total = replaced, total + n
             end
             local w = io.open(path, "wb")
             if not w then
@@ -848,12 +936,12 @@ file_tools.edit_file = helpers.define_tool(
             end
             w:write(text)
             w:close()
-            return "ok"
+            return tostring(total)
           end, filepath .. "\3" .. table.concat(packed, "\2"))
         end)
-    end), function()
+    end), function(total)
       helpers.reload_buffers_for(filepath)
-      on_success("文件已编辑: " .. filepath)
+      on_success(("文件已编辑: %s（%d 处替换）"):format(filepath, tonumber(total) or 0))
     end, on_error)
   end,
   { category = "file", approval = { auto_allow = false } }
@@ -874,7 +962,7 @@ file_tools.list_files = helpers.define_tool(
   },
   function(args, on_success, on_error)
     -- 目录参数经沙箱解析（保持命名空间路径，暂存叠加由本工具完成）。
-    local dir = _resolve_guest_path(args.path or ".")
+    local dir = _resolve_guest_path(_expand(args.path or "."))
     local max = args.max_results or 0
     -- 安全默认：递归默认最多 2000 条、非递归单层最多 5000 条。否则对 home/ 等超大目录
     -- 会返回数万行（数 MB）并撑爆模型上下文；显式 max_results 可覆盖（仍受 worker 硬上限钳制）。
@@ -959,7 +1047,7 @@ file_tools.search_files = helpers.define_tool(
   },
   function(args, on_success, on_error)
     -- 目录参数经沙箱解析（保持命名空间路径，暂存叠加由本工具完成）。
-    local dir = _resolve_guest_path(args.path or ".")
+    local dir = _resolve_guest_path(_expand(args.path or "."))
     local search_cfg = config_store.get("tools.search_files") or {}
     local max_file_bytes = type(search_cfg.max_file_bytes) == "number" and search_cfg.max_file_bytes or nil
     local max_results = args.max_results or 50
@@ -978,32 +1066,36 @@ file_tools.search_files = helpers.define_tool(
   { category = "file" }
 )
 
--- 文件是否存在（同步，量级极小）
+-- 路径是否存在（同步，量级极小）
 file_tools.file_exists = helpers.define_tool(
   "file_exists",
-  "检查文件是否存在。file_path 必填。返回 'true'/'false'。",
+  "检查路径是否存在（文件或目录，支持 ~/$VAR）。file_path 必填。返回 'true'/'false'。",
   {
     type = "object",
     properties = { file_path = { type = "string" } },
     required = { "file_path" },
   },
   function(args, on_success)
+    -- 入口兜底展开 ~/$VAR：直接调用工具句柄（不经 executor 参数规范化）时也保持一致。
+    local target = _expand(args.file_path)
     -- 命名空间视图存在性（overlay 权威暂存层）。
     local ns = _ns_fs()
-    if ns and ns.eligible(args.file_path) then
-      local e = ns.exists(args.file_path)
+    if ns and ns.eligible(target) then
+      local e = ns.exists(target)
       if e ~= nil then
         on_success(tostring(e))
         return
       end
     end
-    local fp = _resolve_guest_path(args.file_path)
+    local fp = _resolve_guest_path(target)
     local sv = _sandbox_path_exists(fp)
     if sv ~= nil then
       on_success(tostring(sv))
       return
     end
-    on_success(tostring(fs.exists(fp)))
+    -- 用 stat 而非 `fs.exists`：后者基于 filereadable，对目录恒为 false，会让
+    -- file_exists 与 list_files/create_directory 对同一路径给出矛盾结论。
+    on_success(tostring(vim.uv.fs_stat(fp) ~= nil))
   end,
   { category = "file" }
 )
@@ -1018,17 +1110,18 @@ file_tools.create_directory = helpers.define_tool(
     required = { "file_path" },
   },
   function(args, on_success, on_error)
+    local target = _expand(args.file_path)
     local ns = _ns_fs()
-    if ns and ns.active() and ns.mkdir(args.file_path) then
-      on_success("目录已创建: " .. args.file_path)
+    if ns and ns.active() and ns.mkdir(target) then
+      on_success("目录已创建: " .. target)
       return
     end
-    local ok, err = fs.ensure_dir(args.file_path)
+    local ok, err = fs.ensure_dir(target)
     if not ok then
       on_error("创建目录失败: " .. tostring(err))
       return
     end
-    on_success("目录已创建: " .. args.file_path)
+    on_success("目录已创建: " .. target)
   end,
   { category = "file", approval = { auto_allow = false } }
 )
@@ -1043,17 +1136,18 @@ file_tools.ensure_dir = helpers.define_tool(
     required = { "file_path" },
   },
   function(args, on_success, on_error)
+    local target = _expand(args.file_path)
     local ns = _ns_fs()
-    if ns and ns.active() and ns.mkdir(args.file_path) then
-      on_success("目录已就绪: " .. args.file_path)
+    if ns and ns.active() and ns.mkdir(target) then
+      on_success("目录已就绪: " .. target)
       return
     end
-    local ok, err = fs.ensure_dir(args.file_path)
+    local ok, err = fs.ensure_dir(target)
     if not ok then
       on_error("创建目录失败: " .. tostring(err))
       return
     end
-    on_success("目录已就绪: " .. args.file_path)
+    on_success("目录已就绪: " .. target)
   end,
   { category = "file", approval = { auto_allow = false } }
 )
@@ -1064,25 +1158,26 @@ file_tools.delete_file = helpers.define_tool("delete_file", "删除文件。file
   properties = { file_path = { type = "string" } },
   required = { "file_path" },
 }, function(args, on_success, on_error)
+  local target = _expand(args.file_path)
   local ns = _ns_fs()
   if ns and ns.active() then
-    if ns.exists(args.file_path) == false then
-      on_error("文件不存在: " .. args.file_path)
+    if ns.exists(target) == false then
+      on_error("文件不存在: " .. target)
       return
     end
-    if ns.unlink(args.file_path) then
-      helpers.reload_buffers_for(args.file_path)
-      on_success("文件已删除: " .. args.file_path)
+    if ns.unlink(target) then
+      helpers.reload_buffers_for(target)
+      on_success("文件已删除: " .. target)
       return
     end
   end
-  if not fs.exists(args.file_path) then
-    on_error("文件不存在: " .. args.file_path)
+  if not fs.exists(target) then
+    on_error("文件不存在: " .. target)
     return
   end
-  _pipe(fs.delete_file_async(args.file_path), function()
-    helpers.reload_buffers_for(args.file_path)
-    on_success("文件已删除: " .. args.file_path)
+  _pipe(fs.delete_file_async(target), function()
+    helpers.reload_buffers_for(target)
+    on_success("文件已删除: " .. target)
   end, on_error)
 end, { category = "file", approval = { auto_allow = false } })
 

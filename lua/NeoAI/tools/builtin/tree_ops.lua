@@ -307,7 +307,9 @@ tree_tools.query_tree = helpers.define_tool(
 
 tree_tools.delete_node = helpers.define_tool(
   "delete_node",
-  "删除语法树节点。file_path/line/col 必填。",
+  "删除语法树节点（file_path/line/col 必填，按位置定位命名节点）。"
+    .. "仅删除节点原文，不清理其周围的逗号/分隔符/空白：删函数参数、表字段、列表元素后"
+    .. "常会残留 `,` 或空行，需再用 edit_file 清理。删除后若出现新的语法错误会在结果中警示。",
   {
     type = "object",
     properties = { file_path = { type = "string" }, line = { type = "integer" }, col = { type = "integer" } },
@@ -319,12 +321,35 @@ tree_tools.delete_node = helpers.define_tool(
     local node = _node_at(bufnr, (args.line or 1) - 1, (args.col or 1) - 1)
     if not node then on_error("位置无节点") return end
     local sr, sc, er, ec = _node_range(node)
+    -- 删除前的语法健康度：仅当「删除引入了新的语法错误」时才提示，避免对本来就残缺的文件误报。
+    local had_error = false
+    do
+      local root0 = _root(bufnr)
+      if root0 then
+        local ok0, v0 = pcall(function() return root0:has_error() end)
+        had_error = ok0 and v0 == true
+      end
+    end
     local ok = pcall(vim.api.nvim_buf_set_text, bufnr, sr, sc, er, ec, {})
     if not ok then on_error("删除失败") return end
     helpers.mark_edited(bufnr) -- 显式编辑：允许回写（只读加载路径不标记、不回写）
     local saved, err = helpers.persist_buffer(bufnr)
     if not saved then on_error("删除失败：无法保存文件（" .. tostring(err) .. "）") return end
-    on_success(string.format("已删除节点 %s (%d:%d-%d:%d)", node:type(), sr + 1, sc + 1, er + 1, ec + 1))
+    local msg = string.format("已删除节点 %s (%d:%d-%d:%d)", node:type(), sr + 1, sc + 1, er + 1, ec + 1)
+    if not had_error then
+      local root = _root(bufnr)
+      local broken = false
+      if root then
+        local ok2, v = pcall(function() return root:has_error() end)
+        broken = ok2 and v == true
+      end
+      if broken then
+        msg = msg
+          .. "；⚠ 删除后语法树出现错误节点：节点周围的分隔符/逗号/空白可能残留，"
+          .. "请用 read_file 查看并用 edit_file 清理"
+      end
+    end
+    on_success(msg)
   end,
   { category = "treesitter", approval = { auto_allow = false } }
 )

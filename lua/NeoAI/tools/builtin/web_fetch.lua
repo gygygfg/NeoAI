@@ -54,6 +54,8 @@ local state = {
   deps_ready = false, --- 依赖是否已就绪
   deps = nil, --- 进行中的依赖安装 Deferred
   install_started = false, --- 后台安装是否已触发
+  platform_warned = false, --- 平台不支持告警是否已提示（避免重复告警）
+  platform_override = nil, --- 测试用：false=强制视为受支持；字符串=强制该平台不支持
   install_dir_override = nil, --- 测试用：覆盖安装目录
   cache_dir_override = nil, --- 测试用：覆盖缓存目录
   images_dir = nil, --- 当前会话的图片临时目录（懒创建，mktemp -d）
@@ -74,6 +76,38 @@ end
 local function _is_enabled()
   local cfg = _cfg()
   return cfg.enabled == true
+end
+
+--- 当前平台是否无法运行 Playwright 无头浏览器；无法运行时返回平台名。
+--- Playwright 只发布桌面/服务器平台的浏览器内核：Android（Termux、aarch64）上
+--- `npx playwright install <engine>` 必然失败（退出码 44），随后每次调用都失败，
+--- 还会白下载 node_modules。故在此平台**提前拒绝**（不注册工具、不触发安装）。
+--- 判定：Termux 的 `$PREFIX` 指向 com.termux 应用目录；或 Android 用户空间存在
+--- `/system/build.prop`（桌面 Linux 没有该文件）。
+--- @return string|nil platform
+local function _unsupported_platform()
+  -- 测试钩子：false = 强制视为受支持；字符串 = 强制视为该平台不受支持。
+  local ov = state.platform_override
+  if ov ~= nil then
+    if ov == false then return nil end
+    return tostring(ov)
+  end
+  local ok, uname = pcall(function() return vim.uv.os_uname() end)
+  if not ok or not uname or uname.sysname ~= "Linux" then return nil end
+  local prefix = type(vim.env.PREFIX) == "string" and vim.env.PREFIX or ""
+  if prefix:find("com.termux", 1, true) then return "Android/Termux" end
+  if vim.uv.fs_stat("/system/build.prop") ~= nil then return "Android" end
+  return nil
+end
+
+--- 平台不支持时的统一说明（工具错误 + 启用告警共用）。
+--- @param platform string
+--- @return string
+local function _unsupported_message(platform)
+  return ("web_fetch 在 %s 上不可用：Playwright 不提供 Android 原生浏览器内核（aarch64），"
+    .. "`npx playwright install` 必然失败。已跳过依赖安装与抓取；"
+    .. "请在桌面 Linux/macOS/Windows 上使用该工具（或在远端浏览器服务上抓取后回传正文）。")
+    :format(platform)
 end
 
 --- 插件根目录（定位内置资源 assets/）
@@ -430,6 +464,13 @@ local function _ensure_deps(opts)
   opts = opts or {}
   local cfg = _cfg()
   local dir = _install_dir()
+
+  -- 平台守卫：Android/Termux 无 Playwright 浏览器内核，安装必然失败（退出码 44）。
+  -- 直接拒绝，绝不白跑一次 npm/npx 安装。
+  local platform = _unsupported_platform()
+  if platform then
+    return async.reject({ kind = "web_fetch", message = _unsupported_message(platform) })
+  end
 
   if opts.force then
     state.deps_ready = false
@@ -921,6 +962,12 @@ local web_fetch = helpers.define_tool(
       return
     end
 
+    local platform = _unsupported_platform()
+    if platform then
+      on_error(_unsupported_message(platform))
+      return
+    end
+
     local url = args.url
     if not _http_url(url) then
       on_error("web_fetch 需要 http(s) 开头的 url")
@@ -993,6 +1040,21 @@ function M.get_tools()
     return {}
   end
 
+  -- 平台守卫：Android/Termux 无法安装 Playwright 内核 → 不注册工具、绝不触发后台安装，
+  -- 并只提示一次（避免每次刷新工具列表都告警）。
+  local platform = _unsupported_platform()
+  if platform then
+    local msg = _unsupported_message(platform)
+    if not state.platform_warned then
+      state.platform_warned = true
+      logger.warn("[web_fetch] %s", msg)
+      vim.schedule(function()
+        vim.notify("[NeoAI] " .. msg, vim.log.levels.WARN)
+      end)
+    end
+    return {}
+  end
+
   local cfg = _cfg()
   -- 退出 nvim 时删除图片临时目录（幂等，仅注册一次）
   _ensure_cleanup_registered()
@@ -1015,6 +1077,8 @@ function M.reset()
   state.deps_ready = false
   state.deps = nil
   state.install_started = false
+  state.platform_warned = false
+  state.platform_override = nil
   state.install_dir_override = nil
   state.cache_dir_override = nil
   state.images_dir = nil
@@ -1025,6 +1089,13 @@ end
 -- ========== 测试可见的内部 API ==========
 M._cfg = _cfg
 M._is_enabled = _is_enabled
+M._unsupported_platform = _unsupported_platform
+M._unsupported_message = _unsupported_message
+--- 测试钩子：false=强制视为受支持平台；字符串=强制视为该平台不受支持
+--- @param v string|false|nil
+function M._set_platform_override(v)
+  state.platform_override = v
+end
 M._install_dir = _install_dir
 M._assets_dir = _assets_dir
 M._cache_dir = _cache_dir

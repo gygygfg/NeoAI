@@ -450,8 +450,12 @@ local DEFAULT_CONFIG = {
       -- `lsp_check` 工具（项目级全量诊断）：在沙箱内运行 server 的 CLI 检查命令（只读、读暂存
       -- 视图）。`servers` 按 server 名映射检查命令，argv 占位符：`{path}` 目标文件/目录、
       -- `{root}` 项目根、`{level}` 严重级别、`{server}` server 名、`{out}` 结果文件（沙箱可写/
-      -- 宿主可读；LuaLS 写 JSON 到文件而非 stdout）。`format=lua-ls|text`。`root_files` 判定项目根；
+      -- 宿主可读；LuaLS 写 JSON 到文件而非 stdout）。`format` 决定结果解析：
+      -- `lua-ls`（LuaLS JSON）/`pyright`（`--outputjson`）/`clangd`（`--check` 文本）/`text`（原样回传）。
+      -- `extensions` 用于缺省 server 选择（按目标扩展名匹配），`bin` 可覆盖可执行文件路径
+      -- （缺省用 argv[1]），`requires_file` 表示只支持单文件检查。`root_files` 判定项目根；
       -- 根缺少项目配置且 `auto_config=true` 时用内置默认配置执行本次检查（沙箱内，不写工作区）。
+      -- 未显式指定 server 时，只在**已安装**（PATH 可执行）的 server 中自动选择。
       check = {
         enabled = true, -- 总开关
         timeout_ms = 60000, -- 检查命令超时（ms）
@@ -465,9 +469,25 @@ local DEFAULT_CONFIG = {
               "--logpath={out}.log",
             },
             format = "lua-ls",
+            extensions = { "lua" },
             root_files = { ".luarc.json", ".luarc.lua" },
             auto_config = true,
             auto_config_file = ".luarc.json",
+            missing_root_hint = "结果可能含大批 undefined-global 噪声。",
+          },
+          ["pyright"] = {
+            argv = { "pyright", "--outputjson", "{path}" },
+            format = "pyright",
+            extensions = { "py", "pyi" },
+            root_files = { "pyrightconfig.json", "pyproject.toml", "setup.py" },
+          },
+          ["clangd"] = {
+            argv = { "clangd", "--check={path}" },
+            format = "clangd",
+            extensions = { "c", "h", "cc", "cp", "cpp", "cxx", "hpp", "hh", "hxx", "m", "mm" },
+            root_files = { "compile_commands.json", "compile_flags.txt" },
+            requires_file = true, -- clangd --check 只接受单个文件
+            missing_root_hint = "clangd 将退回默认编译参数，结果可能含头文件/宏解析噪声。",
           },
         },
       },

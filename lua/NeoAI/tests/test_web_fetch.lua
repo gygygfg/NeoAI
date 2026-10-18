@@ -50,6 +50,27 @@ tests.suite("web_fetch", function(_, it, before_each)
     config_store.reset()
     wf = require("NeoAI.tools.builtin.web_fetch")
     wf.reset()
+    -- 本套件验证与平台无关的逻辑：强制视为受支持平台（Android/Termux 上默认会被平台守卫拒绝，
+    -- 见下方「平台守卫」用例）。真实平台判定仍由 _unsupported_platform() 负责。
+    wf._set_platform_override(false)
+  end)
+
+  it("平台守卫：不支持的平台不注册工具且明确拒绝安装", function(t)
+    _enable()
+    wf._set_platform_override("Android/Termux")
+    t.eq("Android/Termux", wf._unsupported_platform(), "覆盖应生效")
+    t.eq(0, #wf.get_tools(), "不支持的平台不应注册 web_fetch 工具")
+    local err, done = nil, false
+    wf._ensure_deps({ force = true }):then_(function()
+      done = true
+    end, function(e)
+      err = e
+      done = true
+    end)
+    t.true_(vim.wait(3000, function() return done end), "应完成")
+    t.not_nil(err, "应拒绝安装")
+    t.matches("不可用", tostring(err and (err.message or err)), "应说明平台不可用")
+    wf._set_platform_override(false)
   end)
 
   it("默认不启用时 get_tools() 为空", function(t)

@@ -191,7 +191,7 @@ tests.suite("sub_agent_result", function(_, it)
     store.reset()
   end)
 
-  it("子 Agent 会话在树中标为子 Agent 而非用户", function(t)
+  it("子 Agent 会话不在会话树中显示（避免与用户分支混排）", function(t)
     local store = require("NeoAI.core.session.session_store")
     local tree = require("NeoAI.ui.window.tree_view")
     tree.reset()
@@ -202,7 +202,7 @@ tests.suite("sub_agent_result", function(_, it)
       { role = "user", content = "主问题" },
       { role = "assistant", content = "主回答" },
     } })
-    store.create({
+    local sub = store.create({
       parent_id = root.id,
       name = "探测器",
       metadata = { tags = { "sub_agent" }, name = "探测器" },
@@ -214,11 +214,15 @@ tests.suite("sub_agent_result", function(_, it)
     local opened = tree.open()
     local lines = vim.api.nvim_buf_get_lines(opened.buf, 0, -1, false)
     local joined = table.concat(lines, "\n")
-    t.matches("子 Agent", joined)
-    t.matches("探测器", joined)
+    t.not_nil(store.get(sub.id), "子 Agent 会话本身仍保存在会话存储中")
+    t.false_(joined:find("探测器", 1, true) ~= nil, "子 Agent 会话名不应出现在会话树中")
+    t.false_(joined:find("扫描仓库", 1, true) ~= nil, "子 Agent 会话内容不应出现在会话树中")
+    t.matches("主问题", joined)
+    -- 主会话节点仍按用户分支渲染，且不显示出额外子节点
     for _, l in ipairs(lines) do
-      if l:find("探测器", 1, true) then
-        t.false_(l:find("用户", 1, true) ~= nil, "子 Agent 会话不应标为用户")
+      if l:find("主问题", 1, true) then
+        t.true_(l:find("用户", 1, true) ~= nil, "主会话节点应标为用户")
+        t.false_(l:find("子 Agent", 1, true) ~= nil, "主会话节点不应混入子 Agent 标记")
       end
     end
     tree.reset()

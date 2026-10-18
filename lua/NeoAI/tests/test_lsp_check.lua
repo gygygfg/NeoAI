@@ -91,4 +91,67 @@ tests.suite("lsp_check", function(_, it)
     t.nil_(out, "未配置的 server 不应有输出")
     t.not_nil(err, "应给出错误")
   end)
+
+  it("自动选择：按扩展名匹配已安装的 server，未安装的跳过", function(t)
+    local lsp = require("NeoAI.tools.builtin.lsp_ops")
+    local servers = {
+      ["lua-language-server"] = {
+        argv = { "definitely-not-installed-luals-xyz", "--check={path}" },
+        format = "lua-ls",
+        extensions = { "lua" },
+      },
+      pymock = { argv = { "/bin/sh", "-c", "true" }, format = "pyright", extensions = { "py" } },
+    }
+    local py = lsp._pick_check_server(servers, "/tmp/a.py", nil)
+    t.eq("pymock", py, "应选扩展名命中的已安装 server")
+    local lua = lsp._pick_check_server(servers, "/tmp/a.lua", nil)
+    t.eq("pymock", lua, "命中的 lua server 未安装时应回退到任一已安装 server")
+    local _, _, err = lsp._pick_check_server(
+      { only = { argv = { "definitely-not-installed-xyz" }, format = "text" } }, "/tmp/a.py", nil)
+    t.matches("没有可用的 server CLI", tostring(err), "全部未安装时应给出可操作诊断")
+  end)
+
+  it("显式指定未安装的 server：报可执行文件不可用（而非未配置）", function(t)
+    local lsp = require("NeoAI.tools.builtin.lsp_ops")
+    local name, _, err = lsp._pick_check_server(
+      { mock = { argv = { "definitely-not-installed-xyz" }, format = "text" } }, "/tmp/a.py", "mock")
+    t.nil_(name)
+    t.matches("可执行文件不可用", tostring(err))
+  end)
+
+  it("解析 pyright --outputjson", function(t)
+    local lsp = require("NeoAI.tools.builtin.lsp_ops")
+    local text = '{"generalDiagnostics":[{"file":"/a.py","severity":"error","message":"bad",'
+      .. '"rule":"reportX","range":{"start":{"line":2,"character":4}}}]}'
+    local diags = lsp._parse_pyright(text)
+    t.eq(1, #(diags or {}))
+    t.eq(3, (diags or {})[1].line, "pyright 行号应转 1-based")
+    t.eq(5, (diags or {})[1].col)
+    t.eq(1, (diags or {})[1].severity)
+    t.eq("reportX", (diags or {})[1].code)
+    t.nil_(lsp._parse_pyright("not json"), "非法 JSON 应回退原文")
+  end)
+
+  it("解析 clangd --check 文本诊断", function(t)
+    local lsp = require("NeoAI.tools.builtin.lsp_ops")
+    local diags = lsp._parse_clangd(
+      "/a.c:3:7: warning: unused variable 'x' [-Wunused-variable]\nAll checks completed, 1 errors")
+    t.eq(1, #(diags or {}))
+    t.eq(3, (diags or {})[1].line)
+    t.eq(2, (diags or {})[1].severity, "warning → 2")
+    t.eq("-Wunused-variable", (diags or {})[1].code)
+    local none = lsp._parse_clangd("All checks completed, 0 errors")
+    t.eq(0, #(none or {}), "无诊断应返回空表")
+    t.nil_(lsp._parse_clangd("random output"), "不可解析输出应回退原文")
+    -- clangd 17+ check 模式日志格式（无路径/列号）
+    local modern = lsp._parse_clangd(
+      "E[08:23:15.327] [undeclared_var_use] Line 2: use of undeclared identifier 'x'\n"
+        .. "All checks completed, 1 errors", "/a.c")
+    t.eq(1, #(modern or {}))
+    t.eq(2, (modern or {})[1].line)
+    t.eq(1, (modern or {})[1].severity)
+    t.eq("undeclared_var_use", (modern or {})[1].code)
+    t.eq("/a.c", (modern or {})[1].path)
+    t.nil_(lsp._parse_clangd("All checks completed, 2 errors"), "声称有错误却无法解析时应回退原文")
+  end)
 end)

@@ -422,6 +422,65 @@ tests.suite("tree_ui", function(_, it)
     session_store.reset()
   end)
 
+  it("子 Agent 会话不在树中显示，进入主会话不会顺延进子 Agent 会话", function(t)
+    local config_store = require("NeoAI.kernel.config_store")
+    local fs = require("NeoAI.utils.fs")
+    local session_mod = require("NeoAI.core.session.session")
+    local session_store = require("NeoAI.core.session.session_store")
+    local tree_view = require("NeoAI.ui.window.tree_view")
+    local chat_view = require("NeoAI.ui.window.chat_view")
+    local chat_service = require("NeoAI.services.chat_service")
+    config_store.load({ session = { save_path = "/tmp/neoai_tree_sub_agent_test", file = "sessions.jsonl" } })
+    tree_view.reset()
+    chat_view.reset()
+    chat_service.reset()
+    session_store.reset()
+    fs.delete_file("/tmp/neoai_tree_sub_agent_test/sessions.jsonl")
+    session_store.init()
+
+    local root = session_store.create({ messages = {
+      { role = "user", content = "主会话问题" },
+      { role = "assistant", content = "主会话回答" },
+    } })
+    -- 与 core.agent.sub_agent 创建子会话的方式一致：parent_id 指向主会话 + sub_agent 标签
+    local sub = session_store.create({
+      parent_id = root.id,
+      name = "子任务",
+      metadata = { tags = { session_mod.SUB_AGENT_TAG }, name = "子任务" },
+      messages = {
+        { role = "user", content = "子 Agent 的任务" },
+        { role = "assistant", content = "子 Agent 的结果" },
+      },
+    })
+
+    local opened = tree_view.open()
+    vim.api.nvim_set_current_win(opened.win_id)
+    t.true_(sub.id ~= root.id, "子 Agent 会话应为独立会话")
+    t.nil_(_row_of(opened.buf, "子 Agent 的任务"), "子 Agent 会话不应出现在会话树中")
+    t.nil_(_row_of(opened.buf, "子 Agent："), "子 Agent 会话节点不应渲染")
+    t.not_nil(_row_of(opened.buf, "主会话问题"), "主会话节点应正常渲染")
+    t.not_nil(_row_of(opened.buf, "1 个会话"), "分组计数不应把子 Agent 会话算进去")
+
+    -- 点主会话节点：不应被顺延到唯一的子会话（那个子会话是子 Agent 会话）
+    _cursor_to(opened.win_id, opened.buf, "主会话问题")
+    local mapping = vim.fn.maparg("<CR>", "n", false, true)
+    t.not_nil(mapping.callback)
+    mapping.callback()
+
+    t.true_(chat_view.has_window(), "聊天窗口应已打开")
+    t.eq(root.id, chat_service.get_current_session_id(), "进入主会话不应落到子 Agent 会话")
+    local messages = chat_service.get_messages()
+    t.eq(2, #messages, "上下文只应包含主会话消息")
+    for _, m in ipairs(messages) do
+      t.true_(m.content ~= "子 Agent 的结果", "子 Agent 会话消息不应拼入主会话上下文")
+    end
+
+    tree_view.reset()
+    chat_view.reset()
+    chat_service.reset()
+    session_store.reset()
+  end)
+
   it("关闭自动关闭配置时按 N 保留树窗口且新会话不被清理", function(t)
     local config_store = require("NeoAI.kernel.config_store")
     local fs = require("NeoAI.utils.fs")

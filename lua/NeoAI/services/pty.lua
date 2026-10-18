@@ -262,6 +262,29 @@ local function _fd0(pid)
   return nil
 end
 
+--- 读取 stdin 的 syscall 号集合（按架构）。
+--- `/proc/<pid>/syscall` 首字段是**内核 syscall 编号**，跨架构不同：
+---   x86_64: read=0 / readv=19；arm64(aarch64)/riscv64/loongarch64: read=63 / readv=65；
+---   i386/arm/ppc64(le)/s390x: read=3 / readv=145；mips: read=4003 / readv=4145。
+--- 旧实现只认 0（x86_64），在 aarch64（Termux/Android、ARM 服务器）上永远判定不出
+--- 「阻塞在读取终端」，导致交互式自动应答完全失效（判官从未被调用）。
+local READ_SYSCALLS = (function()
+  local ok, uname = pcall(function() return vim.uv.os_uname() end)
+  local arch = (ok and uname and uname.machine) or ""
+  local nums
+  if arch == "x86_64" or arch == "amd64" then
+    nums = { [0] = true, [19] = true }
+  elseif arch == "aarch64" or arch == "arm64" or arch == "riscv64" or arch == "loongarch64" then
+    nums = { [63] = true, [65] = true }
+  elseif arch:match("^mips") then
+    nums = { [4003] = true, [4145] = true }
+  else
+    -- 未知架构：兼容常见取值（仍要求 fd 为 0，误判概率极低）。
+    nums = { [0] = true, [19] = true, [3] = true, [63] = true, [65] = true, [145] = true }
+  end
+  return nums
+end)()
+
 --- pid 是否阻塞在读取终端（fd0）。返回 true 表示“等待输入”。
 --- @param pid number
 --- @return boolean
@@ -270,7 +293,10 @@ local function _blocked_on_tty(pid)
   local line = _read_line("/proc/" .. pid .. "/syscall")
   if line then
     local nr, a0 = line:match("^(%S+)%s+(%S+)")
-    if (nr == "0" or nr == "0x0") and a0 == "0x0" then return true end
+    -- `tonumber` 同时接受十进制（"63"）与十六进制（"0x3f"）。
+    local nr_num = tonumber(nr or "")
+    local fd = tonumber(a0 or "")
+    if nr_num and READ_SYSCALLS[nr_num] and fd == 0 then return true end
   end
   local wchan = _wchan(pid)
   if wchan == "n_tty_read" or wchan == "wait_woken" or wchan == "tty_read" then
@@ -883,6 +909,8 @@ end
 
 -- 测试钩子：判官决策解析（纯函数）
 M._extract_decision = _extract_decision
+-- 测试钩子：等待输入检测（依赖 /proc/<pid>/syscall，跨架构 syscall 号回归用）
+M._blocked_on_tty = _blocked_on_tty
 -- 测试钩子：悬浮终端弹出判定（纯函数，受 chat follow 与 show_window 影响）
 M._should_show_window = _should_show_window
 -- 测试钩子：隐藏 / 重弹全部会话终端窗（模拟跟随跳变，headless 下配合 _set_force_ui 使用）

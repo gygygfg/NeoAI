@@ -62,6 +62,33 @@ tests.suite("pty", function(_, it, before_each)
     config_store.set("tools.run_command.interactive.enabled", old_enabled)
   end)
 
+  it("等待输入检测跨架构：aarch64/arm 的 read syscall 号也能识别", function(t)
+    local pty = require("NeoAI.services.pty")
+    local old_enabled = config_store.get("tools.run_command.interactive.enabled")
+    local old_judge = config_store.get("tools.run_command.interactive.judge.enabled")
+    config_store.set("tools.run_command.interactive.enabled", true)
+    config_store.set("tools.run_command.interactive.judge.enabled", false)
+    pty.set_judge(nil)
+
+    local session = assert(pty.open({
+      argv = { "bash", "-c", "read -r a; echo GOT:$a" },
+      description = "测试阻塞读检测",
+      timeout_ms = 15000,
+    }))
+    local detected = vim.wait(5000, function()
+      return pty._blocked_on_tty(session.pid) == true
+    end, 30)
+    t.true_(detected, "应检测到进程阻塞在读取终端（read syscall 号随架构不同）")
+    pty.send_text(session.id, "ok")
+    local result = t.await(pty.await(session), 15000)
+    t.eq(0, (result or {}).code)
+    t.matches("GOT:ok", (result or {}).output or "")
+
+    config_store.set("tools.run_command.interactive.enabled", old_enabled)
+    config_store.set("tools.run_command.interactive.judge.enabled", old_judge)
+    pcall(pty.reset)
+  end)
+
   it("terminal_send_text 工具向活动会话注入文本", function(t)
     local pty = require("NeoAI.services.pty")
     local old_enabled = config_store.get("tools.run_command.interactive.enabled")

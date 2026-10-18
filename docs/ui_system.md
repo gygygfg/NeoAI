@@ -394,6 +394,12 @@ NeoAI 的聊天/输入框/悬浮窗等都是纯 UI 文本，若 LSP 客户端（
   分组的 cwd**；`d`/`D` 作用于组头时提示「分组行不可删除」。
 - **兼容**：组内仍按原树渲染（分支/多轮次缩进不变），分组折叠态存于 `state.expanded["group:<cwd>"]`
   （`nil` = 展开），关闭树窗口即清空。
+- **隐藏子 Agent 会话**：`metadata.tags` 含 `sub_agent` 的会话及其整支后代不在树中渲染，也不参与
+  分组计数（`_is_hidden_branch`）。它们是主会话的附属会话（`parent_id` 指向主会话），渲染出来会
+  与用户分支混排；且"主会话只有唯一子会话"时，`<CR>` 的单子链顺延会误入子 Agent 会话。因此
+  `_downstream_leaf` 用 `get_downstream(id, {skip_sub_agent = true})` 跳过子 Agent 会话，
+  `chat_service._build_chain_messages` 同样不把子 Agent 会话消息拼进主会话上下文。子 Agent 的
+  查看入口见 [sub_agent_system.md](sub_agent_system.md)（状态栏 / `switch_sub_agent` / 浮窗列表）。
 
 ## 8. 键位（ui/keymap.lua）
 

@@ -193,6 +193,7 @@ M.execute(agent, name, args, tool_call_id, opts)
 
 - **目标**：运行命令并完成其中的交互（`read` 输入、y/n 确认、菜单选择、口令等）。
 - **如何操作**：`command` 必填；`timeout_ms` 可选（默认 30000，-1 不限；交互多轮请显式传大，如 120000~600000）。命令等待输入时，NeoAI 轮询 `/proc/<pid>/{fd/0,syscall,wchan}` 检测“进程阻塞在读取终端”（OS 级判据，不解析终端文字），并用 `/proc/<pid>/io` 的 `rchar` 增长区分连续两次读取；每次等待发起**单轮大模型请求**（判官），模型返回 `{"action":"text"|"keys"|"kill"|"none",...}` JSON，直接注入文本/按键/结束进程；同时（聊天光标跟随时）弹出悬浮终端显示，可手动键入兜底。
+  syscall 判定按 **CPU 架构**取 `read`/`readv` 编号（x86_64 `0`/`19`；aarch64/riscv64/loongarch64 `63`/`65`；i386/arm `3`/`145`；mips `4003`/`4145`，未知架构兼容常见值），并要求第一个参数（fd）为 `0`；wchan 名（`n_tty_read`/`tty_read`/`wait_woken`）作兜底。旧实现只认 x86_64 的 `0`，在 ARM（含 Termux/Android、ARM 服务器）上永远检测不到等待输入。
 - **工具描述要求**：`description` 必填且要写清命令**目标与预期输入**（判官据此作答）；开启时给模型的工具描述会标明「可交互」并说明目标与操作方式。
 - `enabled=false` 时退回原非交互 jobstart 路径并恢复常驻沙箱语义。
 
@@ -293,14 +294,19 @@ M.execute(agent, name, args, tool_call_id, opts)
 > `path:line:col [Severity] message`（Severity 为 `Error`/`Warning`/`Info`/`Hint`）；
 > 符号类输出 `Name (Kind)  path:line:col`（`lsp_document_symbols` 层级按深度缩进两空格）。
 >
-> `lsp_check`：**项目级全量诊断**，对文件/目录/glob 运行 LSP server 的 **CLI 检查命令**
-> （如 `lua-language-server --check=.`，见 `tools.lsp.check.servers`），不依赖 buffer 是否打开、
-> 全量重算、可复现；命令在沙箱内执行（读暂存视图、写入不外泄），与编辑器 LSP 的挂载/缓存状态解耦。
+> `lsp_check`：**项目级全量诊断**，对文件/目录运行 LSP server 的 **CLI 检查命令**，
+> 不依赖 buffer 是否打开、全量重算、可复现；命令在沙箱内执行（读暂存视图、写入不外泄），
+> 与编辑器 LSP 的挂载/缓存状态解耦。
+> **内置 server**：`lua-language-server`（`lua-ls` 格式，读 `{out}` JSON）、`pyright`
+> （`--outputjson`）、`clangd`（`--check`，仅单文件）。未显式指定 `server` 时按目标扩展名
+> **自动选择已安装（PATH 可执行）的 server**；指定的 server 未安装会明确报「可执行文件不可用」，
+> 而不是含糊的「未配置」。`bashls` 没有 CLI 检查模式，请改用 `lsp_diagnostics`/`shellcheck`；
+> 其他工具可按 `tools.lsp.check.servers` 配置（`format=lua-ls|pyright|clangd|text`）。
 > 结果读取：lua-language-server 把 JSON 写到 `--check_out_path`（stdout 只有进度条），配置用 `{out}`
 > 占位符指向「沙箱可写、宿主可读」的文件，进程退出后读回解析；stdout 的进度/ANSI（`Initializing`、
 > `===017/322`、`Diagnosis complete` 等）被剥离，绝不回吐。解析容错 lua-language-server / pyright /
 > 通用 JSON，必要时从文本抽取 JSON。
-> 参数：`path`（文件/目录/glob，默认当前目录）、`severity`（最低级别 error|warning|information|hint，
+> 参数：`path`（文件/目录，默认当前目录）、`severity`（最低级别 error|warning|information|hint，
 > 同时下发给 CLI 与本地过滤）、`format`（`summary`（默认：文件/问题计数 + 按规则/按消息/文件统计）/
 > `text`（按 code 分组）/`json`）、`server`（默认自动）、`codes`/`exclude_codes`（按规则白/黑名单）、
 > `paths`/`exclude_paths`（按路径子串或 glob 白/黑名单）、`limit`（text/json 明细上限，默认 200）、
@@ -320,6 +326,10 @@ M.execute(agent, name, args, tool_call_id, opts)
 
 `parse_file` / `query_tree` / `get_node_at_position` / `get_node_type` / `get_node_range` /
 `is_named_node` / `get_parent_node` / `get_child_nodes` / `get_node_code` / `delete_node`。
+
+> `delete_node` **只删除节点原文**（按 `line`/`col` 定位命名节点），**不清理周围的逗号/分隔符/空白**：
+> 删除函数参数、表字段、列表元素后常残留 `,` 或空行，需再用 `edit_file` 清理。若删除使语法树新增
+> 错误节点，结果会附带警示（删除前已有语法错误时不重复告警）。
 
 ### 🪵 日志（log_ops.lua）
 
