@@ -80,6 +80,18 @@ function M.detect(start)
   return _walk_up(dir, git_markers) or _walk_up(dir, root_markers)
 end
 
+--- 标记全部未命中时的回退工作目录：优先 `$PWD`（nvim 启动时所在目录，由 shell 导出，
+--- 不受编辑器内 `:cd`/`:lcd` 影响），`$PWD` 未设置或目录已不存在时退回编辑器当前 cwd。
+--- @return string 规范化绝对目录
+function M.fallback_cwd()
+  local pwd = vim.env.PWD
+  if type(pwd) == "string" and pwd ~= "" then
+    local dir = _norm(pwd)
+    if dir ~= "" and vim.fn.isdirectory(dir) == 1 then return dir end
+  end
+  return vim.fn.getcwd()
+end
+
 --- 从当前上下文检测工作区根：优先 cwd；cwd 未命中时回退当前缓冲区所在目录（仅普通文件，
 --- 覆盖「在 home 启动 nvim 后打开项目内文件」的场景）。均未命中返回 nil。
 --- @return string|nil
@@ -94,6 +106,15 @@ function M.detect_from_context()
     end
   end
   return nil
+end
+
+--- 解析新建会话应绑定的工作目录。
+---   - `session.detect_root=false`：保持旧行为，直接用编辑器当前 cwd（不做标记检测与 $PWD 回退）。
+---   - 否则：标记检测（cwd → 当前缓冲区目录）命中则用命中根，全部未命中回退 `$PWD`。
+--- @return string
+function M.resolve()
+  if config_store.get("session.detect_root") == false then return vim.fn.getcwd() end
+  return M.detect_from_context() or M.fallback_cwd()
 end
 
 return M

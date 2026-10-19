@@ -341,8 +341,9 @@ local DEFAULT_CONFIG = {
     --      的 `.git` 文件）；典型用于把工作目录绑定到 git 仓库根，而非 cwd 子目录。
     --   2) `root_markers`（回退）：git 未命中时，用工程配置文件定位项目根（如 package.json /
     --      pyproject.toml 等）。同层多标记命中取先声明者。
-    -- 全部未命中时回退当前 cwd（同关闭检测）。子会话始终继承父会话工作目录，不做检测。
-    detect_root = true, -- 总开关；false 则直接使用 cwd（旧行为）
+    -- 全部未命中时回退 `$PWD`（nvim 启动所在目录，由 shell 导出、不受 `:cd`/`:lcd` 影响）；
+    -- `$PWD` 不可用时退回编辑器当前 cwd。子会话始终继承父会话工作目录，不做检测。
+    detect_root = true, -- 总开关；false 则直接使用 cwd（旧行为，不做检测与 $PWD 回退）
     git_markers = { ".git" },
     root_markers = {
       ".luarc.json", ".luarc.jsonc",

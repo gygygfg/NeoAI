@@ -97,4 +97,30 @@ tests.suite("workspace_root", function(_, it)
 
     vim.fn.delete(base, "rf")
   end)
+
+  it("标记全未命中时 resolve 回退 $PWD；关闭检测时仍用 cwd", function(t)
+    local wr = require("NeoAI.core.session.workspace_root")
+    local base = vim.fn.tempname()
+    fs.ensure_dir(base .. "/plain/x")
+    fs.ensure_dir(base .. "/pwd")
+    local old_pwd, old_cwd = vim.env.PWD, vim.fn.getcwd()
+    -- 用不存在的标记名，避免宿主祖先的 .git/配置文件干扰判定。
+    config.load({ session = { git_markers = { ".neoai_no_such_a" }, root_markers = { ".neoai_no_such_b" } } })
+
+    vim.cmd("cd " .. vim.fn.fnameescape(base .. "/plain/x"))
+    vim.env.PWD = base .. "/pwd"
+    t.eq(norm(base .. "/pwd"), wr.resolve(), "无标记时应回退 $PWD 而非编辑器 cwd")
+
+    vim.env.PWD = base .. "/gone"
+    t.eq(norm(base .. "/plain/x"), wr.resolve(), "$PWD 目录不存在时应退回编辑器 cwd")
+
+    config.load({ session = { detect_root = false } })
+    vim.env.PWD = base .. "/pwd"
+    t.eq(norm(base .. "/plain/x"), wr.resolve(), "关闭检测时应保持旧行为（直接用 cwd）")
+
+    if old_cwd ~= "" then vim.cmd("cd " .. vim.fn.fnameescape(old_cwd)) end
+    vim.env.PWD = old_pwd
+    config.load({})
+    vim.fn.delete(base, "rf")
+  end)
 end)
