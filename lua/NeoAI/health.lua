@@ -104,20 +104,56 @@ function M.collect()
     })
   end
 
-  -- 沙箱内核能力（可选；缺失时沙箱降级/拒绝执行）
-  local ok_probe, probe = pcall(require, "NeoAI.sandbox.execution.runtime_probe")
-  if ok_probe and probe and probe.executable then
-    local function has(bin) return probe.executable(bin) end
-    local caps = {}
-    if has("bwrap") then caps[#caps + 1] = "bwrap" end
-    if has("unshare") then caps[#caps + 1] = "unshare" end
-    if has("docker") then caps[#caps + 1] = "docker" end
-    local sandbox_status = #caps > 0 and "ok" or "warn"
-    add("沙箱内核能力", sandbox_status, {
-      #caps > 0 and ("可用工具: " .. table.concat(caps, ", "))
-        or "未检测到 bwrap/unshare：无命名空间隔离后端，将禁用沙箱并退回审批模式（命令经事前审批后直接在宿主执行，写入直接落盘、不冻结候选）。",
-      "详见 :NeoAISandboxCaps / docs/sandbox.md。",
-    })
+  -- 沙箱内核能力（可选；缺失时沙箱禁用并退回审批模式）
+  -- 判定与 runtime.backend()/isolation_available() 同源：**功能实测**（bwrap 真实启动、
+  -- unshare 真实建非特权 userns），不因「装了二进制」或「装了 docker」而误报可用。
+  do
+    local ok_runtime, runtime = pcall(require, "NeoAI.sandbox.execution.runtime")
+    local ok_deps, deps = pcall(require, "NeoAI.sandbox.execution.deps")
+    local report
+    if ok_runtime and ok_deps and type(runtime) == "table" and type(deps) == "table"
+      and type(runtime.capabilities) == "function" then
+      local ok_caps, caps = pcall(runtime.capabilities)
+      if ok_caps and type(caps) == "table" then
+        local ok_backend, backend = pcall(runtime.backend)
+        local ok_report, built = pcall(deps.backend_report, {
+          backend = (ok_backend and type(backend) == "string") and backend or nil,
+          bwrap = caps.bwrap, unshare = caps.unshare, userns = caps.userns,
+          overlayfs = caps.overlayfs, seccomp = caps.seccomp, cgroup2 = caps.cgroup2,
+          setpriv = vim.fn.executable("setpriv") == 1,
+          docker = vim.fn.executable("docker") == 1,
+          podman = vim.fn.executable("podman") == 1,
+        })
+        if ok_report and type(built) == "table" and type(built.lines) == "table" then
+          report = built
+        end
+      end
+    end
+    if report then
+      local info = {}
+      for _, line in ipairs(report.lines) do info[#info + 1] = line end
+      info[#info + 1] = "详见 :NeoAISandboxCaps / docs/sandbox.md。"
+      add("沙箱内核能力", report.status, info)
+    else
+      -- 探测不可用（极少数裁剪环境）：退回二进制检查，保证 :checkhealth 不报错，
+      -- 且「只装了 unshare」仍判 warn（无法确认非特权 userns 是否可用）。
+      local function has(bin) return vim.fn.executable(bin) == 1 end
+      local found = {}
+      for _, bin in ipairs({ "bwrap", "unshare" }) do
+        if has(bin) then found[#found + 1] = bin end
+      end
+      local lines = {}
+      if #found > 0 then
+        lines[#lines + 1] = "已找到：" .. table.concat(found, ", ")
+          .. "（沙箱能力探测不可用，未能确认 bwrap / 非特权 userns 是否真可隔离）"
+      else
+        lines[#lines + 1] = "未找到 bwrap（bubblewrap 包）与 unshare（util-linux 包）："
+          .. "无命名空间隔离后端，将禁用沙箱并退回审批模式"
+          .. "（命令经事前审批后直接在宿主执行，写入直接落盘、不冻结待审候选）。"
+      end
+      lines[#lines + 1] = "详见 :NeoAISandboxCaps / docs/sandbox.md。"
+      add("沙箱内核能力", has("bwrap") and "ok" or "warn", lines)
+    end
   end
 
   -- 沙箱网络同意（诊断「网络请求不弹窗 / 审批悬浮窗无条目」）

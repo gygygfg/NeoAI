@@ -129,7 +129,7 @@ tests.suite("observer", function(_, it)
     t.eq(0, calls, "关闭观测不应通知")
   end)
 
-  it("启动通知：回退命令解析时发出提示", function(t)
+  it("启动通知：回退命令解析时发出提示（合并为至多一条，含缺失依赖）", function(t)
     observer.reset()
     local msgs = {}
     local orig = vim.notify
@@ -141,6 +141,11 @@ tests.suite("observer", function(_, it)
     vim.notify = orig
     observer.reset()
     t.true_(#msgs >= 1, "应发出回退通知")
+    t.true_(#msgs <= 1, "回退通知应合并为一条（实际 " .. #msgs .. " 条）")
+    local text = table.concat(msgs, "\n")
+    t.matches("启发式", text, "应说明已回退命令解析")
+    t.true_(text:find("bpftrace", 1, true) ~= nil or text:find("strace", 1, true) ~= nil,
+      "应点名缺失的观测依赖（bpftrace / strace）")
   end)
 
   it("密钥文件路径判定", function(t)

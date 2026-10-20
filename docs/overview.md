@@ -160,8 +160,10 @@ lua/NeoAI/
 ## 安装
 
 **前置要求**：Neovim ≥ 0.10（推荐 0.13+，依赖 `vim.uv` 多线程 API）；建议安装 `curl`
-（HTTP 传输）；可选 `git`、`node`/`npm`（`web_fetch`）与沙箱内核能力（`bwrap`/`unshare`/`docker`）。
-安装后运行 `:NeoAIDoctor` 或 `:checkhealth NeoAI` 可一站式自检。
+（HTTP 传输）；可选 `git`、`node`/`npm`（`web_fetch`）与沙箱内核能力（`bwrap`（bubblewrap 包）
+或 `unshare` + 非特权 user namespace；`docker` 不参与隔离后端，容器门面仅用 `podman`；
+两者都缺失时沙箱禁用并退回审批模式）。安装后运行 `:NeoAIDoctor` 或 `:checkhealth NeoAI`
+可一站式自检。
 
 使用 lazy.nvim：
 

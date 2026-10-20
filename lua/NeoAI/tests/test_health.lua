@@ -77,4 +77,28 @@ tests.suite("health", function(_, it)
     local s = h.summary()
     t.true_(s:find("NeoAI 诊断", 1, true) ~= nil)
   end)
+
+  it("沙箱内核能力项与 runtime.backend() 同源：有后端 ok，无后端 warn 且点名缺 bwrap", function(t)
+    local h = require("NeoAI.health")
+    local item
+    for _, it2 in ipairs(h.collect()) do
+      if it2.name == "沙箱内核能力" then item = it2 end
+    end
+    t.not_nil(item, "应含沙箱内核能力检查")
+    t.true_(item.status == "ok" or item.status == "warn", "状态应为 ok/warn（无 error）")
+    local text = table.concat(item.info, "\n")
+    t.matches("bwrap", text, "文案应点名 bwrap（不再是笼统的「不可用」）")
+    t.true_(text:find("详见 :NeoAISandboxCaps", 1, true) ~= nil, "应保留诊断入口")
+    -- docker 不参与隔离后端：无论是否安装都不应作为能力列出
+    t.true_(text:find("可用工具: ", 1, true) == nil, "不应再输出「可用工具: docker」式的笼统列表")
+
+    local runtime = require("NeoAI.sandbox.execution.runtime")
+    local available = runtime.isolation_available()
+    if not available then
+      t.eq("warn", item.status, "无隔离后端时应为 warn")
+      t.matches("退回审批", text, "无后端时应说明退回审批模式")
+    else
+      t.eq("ok", item.status, "有隔离后端时应为 ok")
+    end
+  end)
 end)

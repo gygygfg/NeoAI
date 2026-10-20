@@ -168,7 +168,9 @@ Key architectural principles:
 
 **Prerequisites**: Neovim ≥ 0.10 (0.13+ recommended; uses the `vim.uv` multithreading API);
 `curl` recommended (HTTP transport); optional `git`, `node`/`npm` (`web_fetch`) and sandbox kernel
-capabilities (`bwrap`/`unshare`/`docker`). After installing, run `:NeoAIDoctor` or
+capabilities (`bwrap` (bubblewrap) or `unshare` + unprivileged user namespaces; `docker` is not an
+isolation backend — the container facade only uses `podman`; when both are missing the sandbox is
+disabled and falls back to approval mode). After installing, run `:NeoAIDoctor` or
 `:checkhealth NeoAI` for a one-stop self-check.
 
 Using lazy.nvim:

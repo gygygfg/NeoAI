@@ -12,6 +12,8 @@ local fs = require("NeoAI.utils.fs")
 local lock = require("NeoAI.utils.lock")
 local stringx = require("NeoAI.utils.stringx")
 local runtime_probe = require("NeoAI.sandbox.execution.runtime_probe")
+-- 依赖诊断话术（纯文案 + 只读探测，不反向依赖本模块）
+local deps = require("NeoAI.sandbox.execution.deps")
 -- 纯助手（自 runtime_probe 引入，保持原局部名以零改调用点）
 local _nproc, _executable, _is_root, _under, _prune_tmp_base, _append_proc_sys_ro =
   runtime_probe.nproc, runtime_probe.executable, runtime_probe.is_root, runtime_probe.under, runtime_probe.prune_tmp_base, runtime_probe.append_proc_sys_ro
@@ -3187,21 +3189,10 @@ function M.note_degrade(info)
   -- 的无隔离分支），不再额外弹右上角通知；审计仍写 evidence + SANDBOX_DEGRADED 事件（绝不静默）。
   if info.layer ~= "backend" and not state.degrade_notified[key] then
     state.degrade_notified[key] = true
-    local msg
-    if info.layer == "seccomp" and info.fallback == "ebpf" then
-      msg = "[NeoAI] 沙箱降级：seccomp 不可用（" .. tostring(info.reason or "")
-        .. "），已启用 eBPF 行为兜底"
-    elseif info.layer == "seccomp" then
-      msg = "[NeoAI] 沙箱降级：seccomp 不可用（" .. tostring(info.reason or "")
-        .. "），本次无行为强制层（仅告警）"
-    elseif info.layer == "sysctl_mask" then
-      msg = "[NeoAI] 沙箱降级：unshare 后端无法遮蔽 /proc/sys（core_pattern/modprobe 等），已放行并留痕"
-    elseif info.layer == "privilege" then
-      msg = "[NeoAI] 沙箱降级：unshare 后端不支持档位挂载/capability（"
-        .. tostring(info.reason or "") .. "），已忽略并放行（载荷为 userns 内 root）"
-    else
-      msg = "[NeoAI] 沙箱降级：" .. tostring(info.layer)
-    end
+    -- 文案统一由 deps 产出：把内部 reason 码翻成用户话术（缺哪个依赖 + 怎么装），
+    -- 并保留原码在括号内，便于与 evidence / 日志对账。
+    local msg = "[NeoAI] 沙箱降级："
+      .. deps.degrade_text(info.layer, info.mode, info.reason, info.fallback)
     pcall(vim.notify, msg, vim.log.levels.WARN)
   end
   -- 证据 + 事件：抑制同一命令内（<1.5s）的重复评估（审批与执行两处各评估一次）。

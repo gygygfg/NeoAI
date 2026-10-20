@@ -1644,6 +1644,36 @@ the facade (`sandbox/systemd/systemd.lua`) with a **fake parser** covering only 
     cached by `(dev_lower, dev_upper)`. A probe using same-source temp dirs can be a false positive
     when the real paths span mounts/userns, so a failed real-path probe follows the fail-closed
     policy above (rejected by default; neither a hard failure nor a silent downgrade).
+  - **Missing-dependency messages** (`sandbox/execution/deps.lua`, pure copy + read-only probe):
+    every user-facing "sandbox unavailable" message goes through this module and is structured as
+    "**which dependency is missing → why it is needed → one install hint**", keeping the internal
+    reason code for evidence/log reconciliation:
+    - The `:NeoAIDoctor` / `:checkhealth NeoAI` "sandbox kernel capabilities" item is **derived from
+      the same source as** `runtime.backend()` (functional probe, not binary existence): `ok` when a
+      backend exists, `warn` otherwise, naming each gap — `bwrap` missing (`bubblewrap` package),
+      `unshare` installed but unprivileged userns rejected by the kernel
+      (`unshare --user --map-root-user true` fails), or `unshare` missing (`util-linux` package) —
+      and stating that the sandbox is disabled and falls back to approval mode.
+    - `docker` is **not** an isolation backend (`backend()` only accepts `bwrap` and
+      `unshare`+userns; the container facade only uses `podman`), so it is no longer counted as a
+      capability — only a "detected but ignored" note.
+    - Degrade notifies (`runtime.note_degrade`) translate internal codes
+      (`setpriv_unavailable` / `filter_unavailable` / `tier_mounts` / `tier_cap_add` /
+      `proc_sys_unmaskable`) into plain language, e.g. "missing `setpriv --seccomp-filter`
+      (`util-linux` >= 2.32)" or "only the `bwrap` backend supports tier mounts/capabilities and
+      `/proc/sys` masking", plus an install hint.
+    - The fail-closed rejection message (`tools/executor.lua`) states the **cause** (sandbox disabled
+      in config / no isolation backend and which dependencies are missing / sandbox service not
+      initialized) and the **fix** (install per the hint and restart, or run `:NeoAIDoctor` /
+      `:NeoAISandboxCaps`).
+    - Observer backend fallback notices (`sandbox/observe/observer.lua`) are merged into **at most
+      one** message containing the eBPF-unavailable reason, the backend actually used, and install
+      hints for missing dependencies.
+    - Platform detection: `$PREFIX` containing `com.termux` means Termux, `/system/build.prop`
+      means Android; on those platforms the copy explicitly states that the **kernel forbids
+      unprivileged user namespaces** (`clone(CLONE_NEWUSER)` rejected by SELinux), so no package
+      install can enable sandbox isolation — only approval mode (or a desktop Linux / container
+      host) works.
 - A completely unavailable backend disables the sandbox and falls back to the original approval mode
   (`check_available` returns `fallback="approval"`; `process_prefix` returns `SANDBOX_BACKEND_UNAVAILABLE`):
   the command runs on the host after blocking pre-execution approval, and this is **never silent**

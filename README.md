@@ -44,7 +44,7 @@
 | curl | 建议安装 | **HTTP 请求传输依赖**；缺失可能导致无法发送请求 |
 | git | 可选 | `git_*` 工具与工作树管理 |
 | node / npm | 可选 | `web_fetch` 无头浏览器渲染（默认关闭，首次启用自动安装） |
-| 沙箱内核能力 | 可选 | `bwrap` / `unshare` / `docker` 等；缺失时工具沙箱隔离能力受限 |
+| 沙箱内核能力 | 可选 | `bwrap`（bubblewrap 包）或 `unshare` + 非特权 user namespace；缺失时沙箱禁用并退回审批模式（`docker` 不参与隔离后端，容器门面仅用 `podman`） |
 
 > 不确定环境是否就绪？安装后运行 **`:NeoAIDoctor`** 或 **`:checkhealth NeoAI`**，
 > 一站式检查版本、curl、API Key、沙箱能力与可选依赖。

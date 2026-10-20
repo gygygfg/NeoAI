@@ -44,7 +44,7 @@
 | curl | Recommended | **HTTP transport dependency**; without it requests may fail |
 | git | Optional | `git_*` tools and worktree management |
 | node / npm | Optional | `web_fetch` headless-browser rendering (off by default, auto-installed on first use) |
-| Sandbox kernel capabilities | Optional | `bwrap` / `unshare` / `docker`, etc.; when missing, tool sandbox isolation is limited |
+| Sandbox kernel capabilities | Optional | `bwrap` (bubblewrap) or `unshare` + unprivileged user namespaces; when missing the sandbox is disabled and falls back to approval mode (`docker` is not an isolation backend — the container facade only uses `podman`) |
 
 > Not sure whether your environment is ready? After installing, run **`:NeoAIDoctor`** or
 > **`:checkhealth NeoAI`** for a one-stop check of version, curl, API keys, sandbox capabilities

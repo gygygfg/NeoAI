@@ -276,6 +276,41 @@ local function _execute_tool_raw(tool, args, ctx, timer)
   return wrapped
 end
 
+--- 沙箱服务缺失/不可用时的原因诊断（写明缺哪个依赖，供用户自助排查）。
+--- 纯只读探测，全部 pcall 包裹：错误路径上绝不抛错、绝不阻塞。
+--- @param cfg table tools.sandbox 配置
+--- @return string
+local function _sandbox_unavailable_reason(cfg)
+  if cfg.enabled == false then
+    return "tools.sandbox.enabled = false（沙箱已在配置里关闭），而 fail_closed 不允许无沙箱执行"
+  end
+  local ok_rt, runtime = pcall(require, "NeoAI.sandbox.execution.runtime")
+  if not (ok_rt and type(runtime) == "table" and type(runtime.isolation_available) == "function") then
+    return "沙箱服务未初始化（沙箱插件未启动或被禁用）"
+  end
+  local ok_avail, avail = pcall(runtime.isolation_available)
+  if ok_avail and avail then
+    return "命名空间隔离后端可用，但沙箱服务未初始化（沙箱插件未启动或被禁用）"
+  end
+  -- 无隔离后端：点名缺哪个依赖（bwrap / unshare + 非特权 userns）并给安装提示。
+  local ok_deps, deps = pcall(require, "NeoAI.sandbox.execution.deps")
+  if ok_deps and type(deps) == "table" and type(deps.backend_report) == "function" then
+    local ok_caps, caps = pcall(runtime.capabilities)
+    if not (ok_caps and type(caps) == "table") then caps = {} end
+    local ok_report, report = pcall(deps.backend_report, {
+      backend = nil,
+      bwrap = caps.bwrap, unshare = caps.unshare, userns = caps.userns,
+      overlayfs = caps.overlayfs, seccomp = caps.seccomp, cgroup2 = caps.cgroup2,
+      docker = vim.fn.executable("docker") == 1,
+      podman = vim.fn.executable("podman") == 1,
+    })
+    if ok_report and type(report) == "table" and type(report.lines) == "table" then
+      return table.concat(report.lines, "；")
+    end
+  end
+  return "无命名空间隔离后端（缺 bwrap，或 unshare 的非特权 userns 被内核拒绝）"
+end
+
 --- 沙箱门禁包装：所有工具执行必须经控制面。
 --- 沙箱服务缺失且 fail_closed 时拒绝执行（不得静默降级，设计文档 §1.1 第 6/7 条）。
 --- @param tool table
@@ -290,7 +325,11 @@ local function _execute_tool(tool, args, ctx, timer)
     if cfg.enabled ~= false and cfg.fail_closed ~= false then
       return async.reject({
         kind = "sandbox",
-        message = "沙箱服务不可用且 fail_closed=true，拒绝执行工具: " .. tostring(tool and tool.name),
+        message = "沙箱服务不可用且 fail_closed=true，拒绝执行工具: " .. tostring(tool and tool.name)
+          .. "。原因：" .. _sandbox_unavailable_reason(cfg)
+          .. "。修复：按上面的依赖提示安装/启用后重启 Neovim，"
+          .. "或运行 :NeoAIDoctor / :NeoAISandboxCaps 查看逐项诊断"
+          .. "（临时放行可设 tools.sandbox.fail_closed=false，不推荐）。",
       })
     end
     return _execute_tool_raw(tool, args, ctx, timer)

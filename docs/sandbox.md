@@ -1297,6 +1297,29 @@ stdout/stderr/退出码返回。宿主侧由 `sandbox/systemd/systemd_ipc.lua` �
     （lower=真实 cwd、upper/work=私有层）再实测一次 overlay 挂载，按 `(dev_lower, dev_upper)`
     缓存结果。探测用同源临时目录、真实路径跨挂载/跨 userns 归属时会产生假阳性，因此
     真实路径实测失败即按上面的 fail-closed 策略处理（默认拒绝，不硬失败也不静默降级）。
+  - **依赖缺失提示**（`sandbox/execution/deps.lua`，纯文案 + 只读探测）：所有面向用户的
+    「沙箱不可用」文案统一走该模块，结构为「**缺哪个依赖 → 为什么需要 → 一句安装提示**」，
+    并保留内部原因码便于与 evidence/日志对账：
+    - `:NeoAIDoctor` / `:checkhealth NeoAI` 的「沙箱内核能力」项与 `runtime.backend()` **同源**
+      （功能实测，不看二进制存在性）：有后端为 `ok`，无后端为 `warn` 并逐项点名——缺
+      `bwrap`（`bubblewrap` 包）、`unshare` 已装但非特权 userns 被内核拒绝
+      (`unshare --user --map-root-user true` 失败)、或未装 `unshare`（`util-linux` 包）；
+      结果说明「沙箱禁用并退回审批模式」。
+    - `docker` **不是**隔离后端（`backend()` 只认 `bwrap` 与 `unshare`+userns；容器门面仅用
+      `podman`），因此不再计入能力，仅在检测到它时提示「已忽略」。
+    - 降级 notify（`runtime.note_degrade`）把 `setpriv_unavailable` / `filter_unavailable` /
+      `tier_mounts` / `tier_cap_add` / `proc_sys_unmaskable` 等内部码翻成人话：如
+      「缺 `setpriv --seccomp-filter`（`util-linux` ≥ 2.32）」、「仅 `bwrap` 后端支持档位
+      挂载/capability 与 `/proc/sys` 遮蔽」，并附安装提示。
+    - 门禁 fail-closed 拒绝消息（`tools/executor.lua`）写明「原因」（配置中已关闭沙箱 /
+      无隔离后端且缺哪些依赖 / 沙箱服务未初始化）与「修复」（按依赖提示安装并重启，
+      或运行 `:NeoAIDoctor` / `:NeoAISandboxCaps` 诊断）。
+    - 观测后端回退通知（`sandbox/observe/observer.lua`）合并为**至多一条**，含 eBPF 不可用
+      原因、实际回退到的后端与缺失依赖的安装提示。
+    - 平台判定：`$PREFIX` 含 `com.termux` 判 Termux、存在 `/system/build.prop` 判 Android；
+      该平台文案显式说明**内核禁止非特权 user namespace**（`clone(CLONE_NEWUSER)` 被
+      SELinux 拒绝），安装任何包都无法启用沙箱隔离——只能退回审批模式，或在桌面
+      Linux / 容器内使用。
 - 后端完全不可用时：沙箱禁用、退回原有审批模式（`check_available` 返回
   `fallback="approval"`，`process_prefix` 返回明确错误 `SANDBOX_BACKEND_UNAVAILABLE`），
   命令经事前阻塞审批后直接在宿主执行，**绝不静默**（evidence + `SANDBOX_DEGRADED` 事件；

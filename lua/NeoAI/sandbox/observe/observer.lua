@@ -13,6 +13,8 @@
 --- 文件打开/执行（无法可靠观测网络），且为轮询采样、可能漏掉瞬时进程。
 
 local config_store = require("NeoAI.kernel.config_store")
+-- 依赖诊断话术（纯文案 + 只读探测）：回退通知里附上「缺哪个依赖 + 怎么装」。
+local deps = require("NeoAI.sandbox.execution.deps")
 
 local M = {}
 
@@ -367,8 +369,9 @@ function M.backend()
   return state.backend, state.backend_reason
 end
 
---- 启动时探测并通知观测后端选择：eBPF 不可用、回退 strace 且未安装等均 `vim.notify`。
---- 仅在观测启用且未选定 ebpf 时通知；同一进程只通知一次。
+--- 启动时探测并通知观测后端选择：合并为**至多一条**提示（eBPF 不可用原因 + 实际回退到的后端 +
+--- 缺哪个依赖及安装提示），避免多条通知刷屏。回退到命令解析启发式（无内核级观测）为 WARN，
+--- 其余为 INFO。仅在观测启用且未选定 eBPF 时通知；同一进程只通知一次。
 function M.notify_backend()
   if state.notified then return end
   state.notified = true
@@ -376,19 +379,34 @@ function M.notify_backend()
   if cfg.enabled == false or cfg.notify == false then return end
   local p = M.probe()
   if p.backend == "ebpf" then return end
+
+  local parts = {}
   if not p.ebpf.ok then
-    vim.notify("[NeoAI] eBPF 观测不可用：" .. p.ebpf.reason, vim.log.levels.INFO)
+    local why = tostring(p.ebpf.reason or "")
+    if why == "未安装 bpftrace" then
+      parts[#parts + 1] = "eBPF 观测不可用：未安装 bpftrace（"
+        .. deps.install_hint("bpftrace", { mobile_note = false }) .. "）"
+    else
+      parts[#parts + 1] = "eBPF 观测不可用：" .. why
+    end
   end
   if p.backend == "strace" then
-    vim.notify("[NeoAI] 已回退到 strace 观测", vim.log.levels.INFO)
-  elseif not p.strace.ok then
-    vim.notify("[NeoAI] strace 观测不可用：" .. p.strace.reason, vim.log.levels.INFO)
+    parts[#parts + 1] = "已回退到 strace 观测"
+  elseif p.backend == "procfs" then
+    parts[#parts + 1] = "已回退到 procfs 观测（/proc/<pid>/fd，仅能观测文件打开/执行）"
+  else
+    parts[#parts + 1] = "无内核级观测，已回退命令解析启发式（越界访问/密钥告警可能漏判）"
   end
-  if p.backend == "procfs" then
-    vim.notify("[NeoAI] 已回退到 procfs 观测（/proc/<pid>/fd）", vim.log.levels.INFO)
-  elseif p.backend == "heuristic" then
-    vim.notify("[NeoAI] 无内核级观测，已回退命令解析启发式", vim.log.levels.WARN)
+  if p.backend ~= "strace" and not p.strace.ok then
+    local why = tostring(p.strace.reason or "")
+    if why == "未安装 strace" then
+      parts[#parts + 1] = "strace 也未安装（" .. deps.install_hint("strace", { mobile_note = false }) .. "）"
+    else
+      parts[#parts + 1] = "strace 不可用：" .. why
+    end
   end
+  local level = (p.backend == "heuristic") and vim.log.levels.WARN or vim.log.levels.INFO
+  vim.notify("[NeoAI] " .. table.concat(parts, "；"), level)
 end
 
 --- 是否有内核级观测后端可用（非命令解析回退）
