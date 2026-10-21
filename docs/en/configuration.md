@@ -914,6 +914,105 @@ plugins = {
 - `entries[id] = { module = "..." }` replaces a service/tool implementation (must be `require`-able with the same interface).
 - See [plugins.md](plugins.md) for the plugin protocol, cleanup, replacement and testing requirements.
 
+### 2.11 `resources`
+
+Resource-pressure adaptation: when the host is short on memory or CPU, the plugin
+automatically scales back **non-essential** work so that nvim and sshd stay responsive.
+The classic victim is a small cloud box (2 vCPU / 1.6 GB / no swap): the sandbox
+per-task memory cap, the cross-command eBPF observation prewarm, the worker
+parallelism and the UI render throttles are all tuned for generous hosts, and on a
+starved host they push the whole machine into memory exhaustion — nvim appears to
+"lag" and eventually sshd cannot even exchange an SSH banner.
+
+```lua
+resources = {
+  pressure = {
+    enabled = true,
+    sample_ttl_ms = 2000,
+    warn = { mem_ratio = 0.15, mem_bytes = 256 * 1024 * 1024, psi_avg10 = 10, load_factor = 2 },
+    critical = { mem_ratio = 0.05, mem_bytes = 96 * 1024 * 1024, psi_avg10 = 40, mem_ratio_no_swap = 0.08 },
+    sandbox_available_ratio = 0.6,          -- warn: memory.max <= MemAvailable x 0.6
+    sandbox_available_ratio_critical = 0.4, -- critical: memory.max <= MemAvailable x 0.4
+    notify = true,
+    simulate = nil,                          -- nil | "ok" | "warn" | "critical"
+    degrade = {
+      sandbox_memory = true, observe_prewarm = true, observe_kernel = true,
+      thread_pool = true, ui_throttle = true, pty_poll = true,
+    },
+  },
+}
+```
+
+#### Level classification
+
+Sources: `/proc/meminfo` (MemTotal / MemAvailable / SwapTotal),
+`/proc/pressure/{memory,cpu}` (PSI, kernel >= 4.20), `/proc/loadavg`, CPU count.
+One sample costs 3-4 `io.open` calls and is cached for `sample_ttl_ms` (2000 ms default);
+render hot paths and per-command decisions only read the cache and never re-read `/proc`.
+
+| Level | Triggered when (any) |
+| --- | --- |
+| `critical` | available memory < `max(critical.mem_bytes, MemTotal x critical.mem_ratio)`; or PSI memory `some avg10` >= `critical.psi_avg10`; or **SwapTotal = 0 and** available memory < `MemTotal x critical.mem_ratio_no_swap` |
+| `warn` | available memory < `max(warn.mem_bytes, MemTotal x warn.mem_ratio)`; or PSI memory `some avg10` >= `warn.psi_avg10`; or `load1 / cores` >= `warn.load_factor` |
+| `ok` | otherwise |
+
+Conservative by design:
+
+- **Undetectable means `ok`**: if `/proc/meminfo` cannot be read (Android/Termux, trimmed
+  containers), the plugin never degrades.
+- Missing `MemAvailable` (kernel < 3.14) falls back to `MemFree + Buffers + Cached`
+  (the same estimate `free` uses).
+- Without PSI, classification simply relies on memory and load.
+
+#### What degrades per level
+
+| Item | `ok` | `warn` | `critical` |
+| --- | --- | --- | --- |
+| Sandbox per-task `memory.max` cap | `MemTotal x memory_ratio` | also capped by `MemAvailable x sandbox_available_ratio` | also capped by `MemAvailable x sandbox_available_ratio_critical` |
+| eBPF observation prewarm | on | off | off |
+| Kernel observation probes (per-command eBPF / devwatch) | on | on | off (falls back to command-parsing heuristics) |
+| Worker parallelism | `max(1, cores-2)` | `ceil(n/2)` | `1` |
+| UI render throttling (chat 80 ms / tree 50 ms) | base | x2 | x4 |
+| PTY input polling (80 ms) | every tick | every 2nd tick | every 4th tick |
+
+The sandbox memory cap matters most: the old logic only looked at
+`MemTotal x memory_ratio` (0.75 by default), which on a 1613 MB host allowed a single
+task to consume ~1.2 GB while only tens of MB were actually available — the direct cause
+of the machine being knocked over. `ok` does not cap anything, so a roomy host keeps
+full headroom.
+
+#### The enforcement layer never degrades
+
+The following are unaffected by any resource-pressure level or switch:
+
+- the seccomp baseline (`require_seccomp` / `seccomp.on_unavailable`);
+- the eBPF behavior backstop (layer 2: observe violating syscalls and `cgroup.kill` the tree);
+- privilege tiers (`tools.sandbox.privilege`, `max_tier`, ...).
+
+Resource pressure only gates performance trade-offs such as "is a probe worth starting",
+never "is enforcement active". When `critical` disables kernel observation, write
+journalling (`journal_capture`) falls back to a full traversal of the overlay upper dir
+per the existing safety net (correctness first, changes are never silently dropped), so
+I/O is slightly higher at that level — an intentional trade-off.
+
+#### Debugging and verification
+
+Reproduce every degradation without actually stressing the host:
+
+```lua
+resources = { pressure = { simulate = "critical" } }
+```
+
+Then:
+
+- `:checkhealth NeoAI` shows a "resource pressure" item (level / available memory / PSI / active degradations);
+- `:NeoAISandboxCaps` appends `pressure=... observe=off(pressure:critical)` plus the degradation list;
+- `:NeoAISandboxDiag` prints the `pressure` snapshot, the capped sandbox memory limit and `pressure_degradations`.
+
+Per-item isolation: set `degrade.<item> = false` (e.g. disable only the render throttle), or
+`simulate = "ok"` to pin the lowest level. Setting `enabled = false` restores the pre-change
+behaviour entirely.
+
 ## 3. Plan Mode (tools/plan_mode)
 
 Plan mode is a **per-agent state** (`agent.plan_mode`); when active:

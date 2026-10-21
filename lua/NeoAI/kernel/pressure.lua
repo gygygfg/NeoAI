@@ -259,10 +259,10 @@ end
 
 -- ========== 快照（带 TTL 缓存，热路径唯一入口） ==========
 
---- 当前资源压力快照（TTL 缓存：`sample_ttl_ms` 内复用，热路径只读缓存）
---- @return table { level, mem_total_bytes, mem_available_bytes, psi_memory_avg10,
----   load1, cores, disabled }
-function M.snapshot()
+--- 构建快照（`publish=false` 时不发事件、不提示，供 health/diag 等只读探查使用）
+--- @param publish boolean
+--- @return table
+local function _build_snapshot(publish)
   local cfg = _cfg()
   if cfg.enabled == false then
     return { level = "ok", disabled = true }
@@ -270,6 +270,8 @@ function M.snapshot()
   local ttl = tonumber(cfg.sample_ttl_ms) or 2000
   local now = vim.uv.hrtime()
   if state.cached and (now - state.cached_at) < ttl * 1e6 then
+    -- 命中缓存：仍可能需要在首次发布时补齐事件（仅在 publish 且等级未发布过时）
+    if publish then _publish(state.cached) end
     return state.cached
   end
 
@@ -296,8 +298,21 @@ function M.snapshot()
   }
   state.cached = snap
   state.cached_at = now
-  _publish(snap)
+  if publish then _publish(snap) end
   return snap
+end
+
+--- 当前资源压力快照（TTL 缓存：`sample_ttl_ms` 内复用，热路径只读缓存）
+--- @return table { level, mem_total_bytes, mem_available_bytes, psi_memory_avg10,
+---   load1, cores, disabled }
+function M.snapshot()
+  return _build_snapshot(true)
+end
+
+--- 只读快照（**不**发事件、**不**提示）：供 :checkhealth / 诊断命令等要求无副作用的路径使用。
+--- @return table 同 `M.snapshot()`
+function M.inspect()
+  return _build_snapshot(false)
 end
 
 --- 当前等级（热路径友好：一次 hrtime + 缓存读 + 字段比较）
@@ -358,7 +373,7 @@ end
 --- @return string level
 function M.sandbox_memory_cap()
   if not M.degrade_enabled("sandbox_memory") then return nil, "ok" end
-  local snap = M.snapshot()
+  local snap = M.inspect()
   local lvl = snap.level or "ok"
   if lvl == "ok" then return nil, lvl end
   local avail = tonumber(snap.mem_available_bytes)
@@ -375,7 +390,7 @@ end
 --- @return string[]
 function M.degradations()
   local out = {}
-  local snap = M.snapshot()
+  local snap = M.inspect()
   local lvl = snap.level or "ok"
   if lvl == "ok" then return out end
   local function add(cond, text)
@@ -396,7 +411,7 @@ end
 --- 人类可读的一行描述（health / doctor / diag 用）
 --- @return string
 function M.describe()
-  local snap = M.snapshot()
+  local snap = M.inspect()
   if snap.disabled then return "资源压力自适应已关闭（resources.pressure.enabled=false）" end
   local parts = { "等级=" .. tostring(snap.level) }
   if snap.mem_total_bytes then

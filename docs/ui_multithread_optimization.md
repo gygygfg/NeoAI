@@ -71,6 +71,7 @@ end, { a = 1, b = 2 }):then_(function(res) ... end)
 | 沙箱遮蔽判定 | `runtime.is_masked_path` 的遮蔽路径列表（`vim.fn.glob` 通配展开）与各条目的规范化形式按配置表引用缓存；此前对每个候选文件逐次 glob + `vim.fn.resolve`（约 60 条 × 文件数），数千文件命令的异步后处理会把主线程 CPU 拉满（实测 2000 文件后处理主线程 4.2s → ~0.17s）（`sandbox/execution/runtime.lua`） |
 | 历史工具参数解码 | 按 arguments 串有界记忆化（`core/model/adapter.lua`） |
 | 流式 UI 渲染 | 生成中渲染节流（至多每 80ms 一次）+ markdown 渲染结果记忆化（`ui/window/chat_view.lua`、`ui/components/markdown_view.lua`） |
+| 节流间隔按资源压力缩放 | chat 渲染 80ms / tree 构建 50ms 的基线改为 `pressure.scaled_ms(base)`（`kernel/pressure.lua`）：`ok` ×1、`warn` ×2、`critical` ×4。渲染与树构建都是纯主线程开销，宿主内存/CPU 紧张时主动降帧才能把 CPU 让给 nvim 主循环与 sshd（小内存云主机上曾出现「nvim 卡顿直到 sshd 无法返回 SSH banner」）。消费方只读压力层的 TTL 缓存快照（默认 2000ms 重采样一次），热路径仅多一次表读 + 数字比较，**不读 `/proc`** |
 | 工具结果/参数展示 | 有界美化打印：超过 256KB 的结果/参数跳过全量 JSON 解码，按有界原始前缀渲染（实测 10MB 结果渲染 ~97ms → ~0.1ms）；同一工具块参数/结果只解码一次，供密钥扫描与渲染复用（`ui/components/message_list.lua`） |
 | 长会话流式渲染 | 块描述符按「廉价输入」（消息身份、content/reasoning 长度、推理开关、工具调用与结果身份及状态）复用；未变化块跳过指纹/签名拼接与 build 闭包分配，只重建变化块（`ui/components/message_list.lua`） |
 | 会话树构建 | 分组 / 排序 / 隐藏支标记 / 空会话判定 / `├─└─│` 连接线 / 每行文案整体下沉 `work.run_codec`（模块常量 `TREE_BUILD_SRC` 源码串传入线程内 `load`）；主线程只做快照拷贝、行片段 `concat`、`nvim_buf_set_lines`。回传格式按实测择优：**行文本单字符串 + 元数据字符串数组 + 每行 1 字节 depth**（嵌套小表解码 143ms、平铺数字数组 169ms、字符串 30ms @390 会话/9007 行）。摘要按 `updated_at`+消息数缓存，截断改纯 Lua 字符边界扫描（`vim.fn.strcharpart` 在 2 万条消息下约 1.1s → 70ms）；隐藏支由逐会话回溯祖先链（O(n·depth)）改为单遍向下传播（O(n)）。会话数 < 80 时直接主线程构建（比线程往返更快）。构建同 tick 合并 + 50ms 最小间隔 + 在途合并 + 代次校验（`ui/window/tree_view.lua`） |

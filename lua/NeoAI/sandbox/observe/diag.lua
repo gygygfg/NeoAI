@@ -222,6 +222,30 @@ function M.sandbox_limits()
       if ok_q then out.cgroup_quota = quota end
     end
   end
+  -- 资源压力（内存可用量 / PSI / 负载）与当前生效的降级项。
+  -- 147/137 之外的第三种「卡顿」归因：宿主内存枯竭导致整机抖动（连 sshd 都无法返回 banner）。
+  -- 使用 inspect（只读）以免诊断本身触发等级发布与提示。
+  local ok_p, pressure = pcall(require, "NeoAI.kernel.pressure")
+  if ok_p and pressure then
+    local ok_s, snap = pcall(pressure.inspect)
+    if ok_s and type(snap) == "table" then
+      out.pressure = {
+        level = snap.level,
+        disabled = snap.disabled,
+        mem_total_bytes = snap.mem_total_bytes,
+        mem_available_bytes = snap.mem_available_bytes,
+        swap_total_bytes = snap.swap_total_bytes,
+        psi_memory_avg10 = snap.psi_memory_avg10,
+        psi_cpu_avg10 = snap.psi_cpu_avg10,
+        load1 = snap.load1,
+        cores = snap.cores,
+      }
+      local ok_d, degs = pcall(pressure.degradations)
+      if ok_d then out.pressure_degradations = degs end
+      local ok_cap, cap = pcall(pressure.sandbox_memory_cap)
+      if ok_cap then out.pressure_sandbox_memory_cap = cap end
+    end
+  end
   -- 沙箱暂存磁盘用量与上限（异步统计的缓存；尚未就绪时 used=nil）。
   local ok_d, disk = pcall(require, "NeoAI.sandbox.execution.disk")
   if ok_d and disk then

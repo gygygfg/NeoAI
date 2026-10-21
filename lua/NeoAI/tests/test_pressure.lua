@@ -314,20 +314,26 @@ tests.suite("pressure", function(_, it)
 
   it("work.parallelism：ok=核预算、warn=⌈n/2⌉、critical=1", function(t)
     local work = require("NeoAI.utils.work")
-    local base = math.max(1, require("NeoAI.utils.host").core_budget())
-    local pool = tonumber(vim.env.UV_THREADPOOL_SIZE)
-    if pool and pool > 0 and base > pool then base = pool end
+    -- 即时计算基线（不预先缓存）：Android 等宿主的可在线核数会随热插拔波动，
+    -- 缓存一份会在用例中途失效造成假失败。
+    local function base_now()
+      local n = math.max(1, require("NeoAI.utils.host").core_budget())
+      local pool = tonumber(vim.env.UV_THREADPOOL_SIZE)
+      if pool and pool > 0 and n > pool then n = pool end
+      return n
+    end
     with_cfg({ resources = { pressure = { enabled = true, sample_ttl_ms = 0, notify = false } } }, function()
       pressure._set_sampler(function() return sample() end)
       pressure.reset()
-      t.eq(base, work.parallelism(), "ok 级不收敛")
+      t.eq(base_now(), work.parallelism(), "ok 级不收敛")
     end)
     with_cfg({
       resources = { pressure = { enabled = true, sample_ttl_ms = 0, notify = false, simulate = "warn" } },
     }, function()
       pressure._set_sampler(function() return sample() end)
       pressure.reset()
-      t.eq(math.max(1, math.ceil(base / 2)), work.parallelism(), "warn 级减半")
+      local expect = math.max(1, math.ceil(base_now() / 2))
+      t.eq(expect, work.parallelism(), "warn 级减半")
     end)
     with_cfg({
       resources = { pressure = { enabled = true, sample_ttl_ms = 0, notify = false, simulate = "critical" } },
@@ -347,7 +353,7 @@ tests.suite("pressure", function(_, it)
     }, function()
       pressure._set_sampler(function() return sample() end)
       pressure.reset()
-      t.eq(base, work.parallelism(), "单点关闭后不收敛")
+      t.eq(base_now(), work.parallelism(), "单点关闭后不收敛")
     end)
   end)
 

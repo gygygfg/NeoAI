@@ -817,6 +817,95 @@ plugins = {
 - `entries[id] = { module = "..." }` 替换服务/工具实现（模块需可 `require`，接口一致）。
 - 插件协议、清理、替换与测试要求详见 [plugins.md](plugins.md)。
 
+### 2.11 `resources`
+
+资源压力自适应：宿主内存/CPU 紧张时，自动收敛插件的**非必要开销**，优先保住 nvim 与 sshd
+的响应性。典型受害场景是小内存云主机（2 核 / 1.6 GB / 无 swap）：沙箱单任务内存上限、
+跨命令常驻的 eBPF 观测预热、线程池并行度、UI 渲染节流这些「为充裕环境设计」的默认值会把
+整机推到内存枯竭，表现为 nvim 卡顿直至 sshd 连 SSH banner 都返回不了。
+
+```lua
+resources = {
+  pressure = {
+    enabled = true,
+    sample_ttl_ms = 2000,
+    warn = { mem_ratio = 0.15, mem_bytes = 256 * 1024 * 1024, psi_avg10 = 10, load_factor = 2 },
+    critical = { mem_ratio = 0.05, mem_bytes = 96 * 1024 * 1024, psi_avg10 = 40, mem_ratio_no_swap = 0.08 },
+    sandbox_available_ratio = 0.6,          -- warn 级 memory.max ≤ MemAvailable × 0.6
+    sandbox_available_ratio_critical = 0.4, -- critical 级 memory.max ≤ MemAvailable × 0.4
+    notify = true,
+    simulate = nil,                          -- nil | "ok" | "warn" | "critical"
+    degrade = {
+      sandbox_memory = true, observe_prewarm = true, observe_kernel = true,
+      thread_pool = true, ui_throttle = true, pty_poll = true,
+    },
+  },
+}
+```
+
+#### 等级判定
+
+采样来源：`/proc/meminfo`（MemTotal / MemAvailable / SwapTotal）、
+`/proc/pressure/{memory,cpu}`（PSI，内核 ≥ 4.20）、`/proc/loadavg`、核数。
+每次采样仅 3~4 次 `io.open`，结果按 `sample_ttl_ms`（默认 2000ms）缓存——
+渲染热路径与每条命令只读缓存，**不会**重复读 `/proc`。
+
+| 等级 | 触发条件（满足任一） |
+| --- | --- |
+| `critical` | 可用内存 < `max(critical.mem_bytes, MemTotal × critical.mem_ratio)`；或 PSI memory `some avg10` ≥ `critical.psi_avg10`；或 **SwapTotal = 0 且** 可用内存 < `MemTotal × critical.mem_ratio_no_swap` |
+| `warn` | 可用内存 < `max(warn.mem_bytes, MemTotal × warn.mem_ratio)`；或 PSI memory `some avg10` ≥ `warn.psi_avg10`；或 `load1 / 核数` ≥ `warn.load_factor` |
+| `ok` | 其余情况 |
+
+保守设计：
+
+- **探测不到就当作 `ok`**：读不到 `/proc/meminfo`（Android/Termux、裁剪容器）时绝不降级。
+- 缺 `MemAvailable`（内核 < 3.14）时回退 `MemFree + Buffers + Cached`（与 `free` 的估算同源）。
+- 无 PSI 时仅按内存与负载判定，不会因此判不出 `warn`/`critical` 就误报。
+
+#### 各等级下的降级项
+
+| 降级项 | `ok` | `warn` | `critical` |
+| --- | --- | --- | --- |
+| 沙箱单任务 `memory.max` 上限 | `MemTotal × memory_ratio` | 再与 `MemAvailable × sandbox_available_ratio` 取 min | 再与 `MemAvailable × sandbox_available_ratio_critical` 取 min |
+| eBPF 观测预热（`prewarm`） | 开 | 关 | 关 |
+| 内核观测探针（每命令 eBPF/devwatch） | 开 | 开 | 关（回退命令解析启发式） |
+| 工作线程并行度 | `max(1, 核数-2)` | `⌈n/2⌉` | `1` |
+| UI 渲染节流（chat 80ms / tree 50ms） | 基准 | ×2 | ×4 |
+| PTY 输入检测轮询（80ms） | 每 tick | 每 2 tick | 每 4 tick |
+
+沙箱内存上限这一项最关键：原逻辑只看 `MemTotal × memory_ratio`（默认 0.75），在 1613 MB
+宿主上允许单任务吃约 1.2 GB，而当时实际可用只剩几十 MB——这正是整机被打爆的直接原因。
+`ok` 级不封顶，保留充裕环境下的全力发挥。
+
+#### 安全强制层永不降级
+
+以下能力**在任何资源压力等级下都按原逻辑生效**，不受本节任何开关影响：
+
+- seccomp 基线（`require_seccomp` / `seccomp.on_unavailable`）；
+- eBPF 行为兜底（第 2 层：观测违规 syscall 并 `cgroup.kill` 整树）；
+- 权限档位（`tools.sandbox.privilege` 的 `max_tier` 等）。
+
+资源压力只门控「观测探针是否值得启动」这类**性能取舍**，不触碰「强制是否生效」。
+`critical` 关闭内核观测后，写日志（`journal_capture`）会按既有安全网回退为全量遍历
+overlay upper（正确性优先，绝不静默丢改动），因此该等级下 I/O 会略高——这是刻意的取舍。
+
+#### 调试与验证
+
+无需真实施压即可复现全部降级路径：
+
+```lua
+resources = { pressure = { simulate = "critical" } }
+```
+
+随后：
+
+- `:checkhealth NeoAI` 可见「资源压力」项（等级 / 可用内存 / PSI / 已生效降级项）；
+- `:NeoAISandboxCaps` 末尾显示 `pressure=... observe=off(pressure:critical)` 与降级清单；
+- `:NeoAISandboxDiag` 输出 `pressure` 快照、封顶后的沙箱内存上限与 `pressure_degradations`。
+
+单点隔离排查：把 `degrade.<项>` 设为 `false`（如仅关渲染降频）；或
+`simulate = "ok"` 使所有降级判定恒为最低档。总开关 `enabled = false` 则完全退回改动前行为。
+
 ## 3. 计划模式（tools/plan_mode）
 
 计划模式作为 **per-agent 状态**（`agent.plan_mode`），激活时：

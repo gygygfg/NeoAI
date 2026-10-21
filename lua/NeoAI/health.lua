@@ -206,6 +206,40 @@ function M.collect()
   if vim.fn.executable("npm") == 1 then opt[#opt + 1] = "npm" end
   add("可选依赖", "ok", { #opt > 0 and ("已找到: " .. table.concat(opt, ", ")) or "未找到 git/node/npm（git 工具与 web_fetch 渲染将不可用）。" })
 
+  -- 资源压力（内存/PSI/负载）：低内存环境是「卡顿甚至无法 SSH」的常见真因，
+  -- 这里展示当前等级与已生效的降级项，便于用户理解「插件为什么变保守」。
+  local ok_p, pressure = pcall(require, "NeoAI.kernel.pressure")
+  if ok_p and pressure then
+    local snap = pressure.inspect()
+    if snap.disabled then
+      add("资源压力", "ok", { "自适应已关闭（resources.pressure.enabled=false），按原逻辑运行。" })
+    else
+      local lvl = snap.level or "ok"
+      local info = { pressure.describe() }
+      local degs = pressure.degradations()
+      if #degs > 0 then
+        info[#info + 1] = "已生效降级：" .. table.concat(degs, "；")
+      else
+        info[#info + 1] = "未触发任何降级（全速运行）。"
+      end
+      info[#info + 1] = "安全强制层（seccomp 基线 / eBPF 行为兜底 / 权限档位）在任何等级下都不降级。"
+      if lvl == "critical" then
+        add("资源压力", "warn", info)
+      elseif lvl == "warn" then
+        add("资源压力", "ok", info)
+      else
+        add("资源压力", "ok", info)
+      end
+      if snap.mem_total_bytes == nil then
+        add("资源压力探测", "ok", {
+          "读不到 /proc/meminfo（Android/Termux 或裁剪容器），按 ok 处理、绝不误降级。",
+        })
+      elseif snap.psi_memory_avg10 == nil then
+        add("资源压力探测", "ok", { "无 PSI（/proc/pressure，需要内核 >= 4.20），仅按内存与负载判定。" })
+      end
+    end
+  end
+
   -- 插件 / 服务状态
   local ok_plugins, plugins = pcall(require, "NeoAI.kernel.plugins")
   local ok_services, services = pcall(require, "NeoAI.kernel.services")

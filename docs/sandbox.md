@@ -2196,6 +2196,24 @@ UI 未注册但为**交互式 Neovim** 时，回退到内建 `confirm` **暂停�
 > 无需等待挂载。超时未被复用（默认 90s，`prewarm_ttl_ms`）则回收探针与 cgroup。仅 eBPF 后端
 > 需要预热（strace/procfs 启动廉价）。
 >
+> **资源压力下的观测降级**（`resources.pressure`，见 [configuration.md §2.11](configuration.md)）：
+> 预热与探针都是「用资源换观测精度」的交易，宿主内存/CPU 紧张时这笔交易不划算——每个 bpftrace
+> 常驻约 40 MB RSS，无 swap 的小内存机上足以压垮整机。
+>
+> - `warn` 及以上：**不做观测预热**（不再跨命令常驻探针与 cgroup）；
+> - `critical`：`observer.start` / `observer.start_devwatch` 直接早退（`OBSERVE_DEGRADED_PRESSURE`），
+>   即**不启动任何内核观测探针**，回退到既有的命令解析启发式（越界访问/密钥访问可能漏判，但
+>   工具执行、审批与全部强制层不受影响）。
+>
+> 由此带来的连带影响：`critical` 下 eBPF 事件不可用，写日志增量捕获（`journal_capture`）会按
+> 既有安全网**回退为全量遍历** overlay upper（正确性优先，绝不静默丢改动），该等级下 capture
+> 的 I/O 会略高于平时——这是刻意的取舍。
+>
+> **边界（重要）**：资源压力只门控「观测是否启动」，**绝不**影响 `observer.backend()` 的选路与
+> `observer.backstop_available()` 的返回值。seccomp 基线、eBPF 行为兜底（第 2 层：观测违规
+> syscall 并 `cgroup.kill` 整树）与权限档位属安全强制层，在任何压力等级下都按原逻辑生效；该约束
+> 由 `test_pressure` 单测锁定（对比压力升降前后 `backstop_available`/`backend` 是否一致）。
+>
 > **能力/overlay 探测预热**（`runtime.warm`）：进程命令开始处会同步实测 bwrap/overlay 能力
 > （功能实测需起 bwrap，约百 ms），首条命令因此可感知卡顿。沙箱 `init()` 后在启动空闲时机
 > （延迟 200ms，每进程一次）预跑 `runtime.probe` / `cgroup.probe` 并对进程 overlay 基目录与

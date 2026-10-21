@@ -295,7 +295,20 @@ function M.start()
       local obs = require("NeoAI.sandbox.observe.observer")
       parts[#parts + 1] = "backstop=" .. (obs.backstop_available() and "ebpf" or "none")
     end)
-    vim.notify("[NeoAI] 沙箱能力: " .. table.concat(parts, " "), vim.log.levels.INFO)
+    -- 资源压力等级与**观测**是否被降级。注意上面的 seccomp_mode/backstop 属安全强制层，
+    -- 绝不随资源压力降级；这里只反映「观测探针是否值得启动」这类性能取舍。
+    local pressure_line = ""
+    pcall(function()
+      local pressure = require("NeoAI.kernel.pressure")
+      parts[#parts + 1] = "pressure=" .. tostring(pressure.level())
+      local obs_ok, obs_reason = require("NeoAI.sandbox.observe.observer").observation_allowed()
+      parts[#parts + 1] = "observe=" .. (obs_ok and "on" or ("off(" .. tostring(obs_reason) .. ")"))
+      local degs = pressure.degradations()
+      pressure_line = #degs > 0
+        and ("\n资源压力降级: " .. table.concat(degs, "；"))
+        or "\n资源压力降级: 无（全速运行）"
+    end)
+    vim.notify("[NeoAI] 沙箱能力: " .. table.concat(parts, " ") .. pressure_line, vim.log.levels.INFO)
   end, { desc = "显示沙箱运行时能力探测结果" })
 
   --- 137 / OOM 归因：采集宿主/容器 cgroup 限制、负载与已解析沙箱限制
@@ -311,13 +324,19 @@ function M.start()
       "pid1", "systemd", "nproc", "loadavg", "mem_total_kb",
       "root_memory_max", "root_memory_events", "root_pids_max", "root_pids_events",
       "neoai_cpu_max", "neoai_memory_max", "cgroup_controllers", "resolved_limits",
+      "pressure", "pressure_sandbox_memory_cap", "pressure_degradations",
     }) do
       local v = info[k]
       if type(v) == "table" then v = vim.inspect(v):gsub("%s+", " ") end
       lines[#lines + 1] = string.format("%s=%s", k, tostring(v))
     end
+    -- 人类可读汇总（等级 + 已生效降级），避免用户自行解读上面的原始字节数
+    pcall(function()
+      local pressure = require("NeoAI.kernel.pressure")
+      lines[#lines + 1] = "压力描述: " .. pressure.describe()
+    end)
     vim.notify("[NeoAI] 沙箱诊断:\n" .. table.concat(lines, "\n"), vim.log.levels.INFO)
-  end, { desc = "显示沙箱资源域/负载诊断（137/OOM 归因）" })
+  end, { desc = "显示沙箱资源域/负载/资源压力诊断（137/OOM/卡顿归因）" })
 
   --- 异步审批：列出待审修改（按路径级别高亮），选择应用
   _cmd("NeoAISandboxReview", function()
