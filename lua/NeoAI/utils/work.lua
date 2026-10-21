@@ -119,17 +119,33 @@ end
 
 --- 实际工作并行度：统一 `max(1, 核数-2)`（`utils.host.core_budget`），并限制在显式设置的
 --- libuv 线程池大小（`UV_THREADPOOL_SIZE`）内，避免提交数超过池容量堆积。
+---
+--- 资源压力收敛：内存/CPU 紧张时把提交并发度减半（warn）或降到 1（critical），
+--- 把 CPU 让给 nvim 主循环与 sshd。注意这里只收敛**提交数**，不动线程池大小
+--- （`configure_threadpool` 设置的是 libuv 全局池，创建后不可变，见其注释）。
 --- @return number
 function M.parallelism()
   local n = require("NeoAI.utils.host").core_budget()
   local pool = tonumber(vim.env.UV_THREADPOOL_SIZE)
   if pool and pool > 0 and n > pool then n = pool end
-  return n
+  -- 压力收敛（探测模块缺失时按 ok 处理，保持原有行为）
+  local ok, pressure = pcall(require, "NeoAI.kernel.pressure")
+  if ok and pressure.degrade_enabled("thread_pool") then
+    local lvl = pressure.level()
+    if lvl == "critical" then
+      n = 1
+    elseif lvl == "warn" then
+      n = math.ceil(n / 2)
+    end
+  end
+  return math.max(1, n)
 end
 
 --- 启动早期设置 libuv 线程池大小（`UV_THREADPOOL_SIZE`），使 `new_work` 能用上多核。
 --- 必须在 libuv 线程池首次创建（任何 worker/异步 fs 任务）之前调用才生效；用户已显式
 --- 设置该环境变量时尊重用户值。libuv 线程池大小一旦创建不可再变，故只能尽力而为。
+--- 注：因「创建后不可变」，资源压力降级不在此处生效（运行期无法缩小池），
+--- 而是收敛 `M.parallelism()` 的提交并发度。
 --- @return number 目标线程数（未改写环境变量时返回既有的用户值）
 function M.configure_threadpool()
   local cur = vim.env.UV_THREADPOOL_SIZE

@@ -361,6 +361,12 @@ function M.resolve_limits()
     local cap = tonumber(cfg.memory_max_bytes) or 0
     if cap > 0 and (mb <= 0 or mb > cap) then mb = cap end
     if quota.memory_bytes and (mb <= 0 or quota.memory_bytes < mb) then mb = quota.memory_bytes end
+    -- 资源压力封顶：仅看 MemTotal 会无视「真实余量」。1613 MB 的宿主上 ratio=0.75 允许单任务
+    -- memory.max≈1.2 GB，而当时可用内存只剩几十 MB——无 swap 环境下这直接把整机打进抖动。
+    -- 故 warn/critical 时再与「MemAvailable × sandbox_available_ratio」取 min（ok 级不封顶，
+    -- 保留充裕环境下的全力发挥；探测不到内存信息时封顶值为 nil，退回原行为）。
+    local pcap = require("NeoAI.kernel.pressure").sandbox_memory_cap()
+    if pcap and (mb <= 0 or pcap < mb) then mb = pcap end
     if mb > 0 then out.memory_bytes = mb end
   end
   -- 动态：PID 上限

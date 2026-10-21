@@ -1234,6 +1234,11 @@ local function _prewarm_observer()
   local cfg = config_store.get("tools.sandbox.observe") or {}
   if cfg.enabled == false or cfg.prewarm == false then return end
   if prewarm.cg or prewarm.handle then return end
+  -- 资源压力门控：预热的意义是「用空闲时间换下一条命令的启动延迟」，代价是跨命令常驻一个
+  -- bpftrace（约 40 MB RSS）+ 一个 cgroup（最长 prewarm_ttl_ms 才回收）。资源紧张时这笔
+  -- 交易不划算——可用内存本就不足，再常驻探针会直接压垮整机。故 warn 及以上不预热。
+  local pressure = require("NeoAI.kernel.pressure")
+  if pressure.degrade_enabled("observe_prewarm") and pressure.at_least("warn") then return end
   local observer = require("NeoAI.sandbox.observe.observer")
   if observer.backend() ~= "ebpf" then return end
   local cgroup = require("NeoAI.sandbox.execution.cgroup")
@@ -2341,7 +2346,12 @@ local function _gate_inner(tool, args, ctx, call_original)
           -- （内核侧仅回传 `/dev/` 前缀路径），句柄随命令结束由 `_stop_observe` 停止。
           if inst.cg and type(inst.cg.path) == "string" and not ctx._resident_devwatch then
             local dcfg = config_store.get("tools.sandbox.devices") or {}
-            if dcfg.enabled ~= false and dcfg.dynamic ~= false then
+            -- 资源压力门控：常驻实例路径下每条命令都会额外拉起一个 bpftrace（仅过滤 /dev/）。
+            -- critical 时不挂探针以省下这份额外常驻开销；observer.start_devwatch 自身也有同样的
+            -- 门控（此处提前判定以避免无谓的 require/fs_stat）。
+            local ok_gate, pressure = pcall(require, "NeoAI.kernel.pressure")
+            local observe_ok = not ok_gate or pressure.observation_allowed()
+            if observe_ok and dcfg.enabled ~= false and dcfg.dynamic ~= false then
               local observer = require("NeoAI.sandbox.observe.observer")
               if observer.backend() == "ebpf" and type(observer.start_devwatch) == "function" then
                 local stat = vim.uv.fs_stat(inst.cg.path)

@@ -804,10 +804,25 @@ function M.open(opts)
   end
 
   -- 轮询检测
+  -- 资源压力降频：每次 _poll 要读 6 个 /proc 文件（syscall/wchan/io/stat/fd/children），
+  -- 80ms 一轮在临界资源下是不必要的主线程负担。这里**不改 timer 周期**（改动周期需重建
+  -- uv 句柄，既有会话会丢句柄/泄漏），只在回调内按压力隔次跳过：
+  --   ok → 每 tick 都 poll；warn → 每 2 tick；critical → 每 4 tick。
+  -- 代价仅是「等待输入」的判定最多延迟 (skip-1) × poll_ms，属可接受的人机交互延迟。
   local poll_ms = tonumber(cfg.poll_ms) or 80
+  session.tick = 0
   session.timer = vim.uv.new_timer()
   session.timer:start(poll_ms, poll_ms, vim.schedule_wrap(function()
-    if not session.done then pcall(_poll, session) end
+    if session.done then return end
+    session.tick = (session.tick or 0) + 1
+    local skip = 1
+    local okp, pressure = pcall(require, "NeoAI.kernel.pressure")
+    if okp and pressure.degrade_enabled("pty_poll") then
+      local lvl = pressure.level()
+      if lvl == "critical" then skip = 4 elseif lvl == "warn" then skip = 2 end
+    end
+    if skip > 1 and (session.tick % skip) ~= 0 then return end
+    pcall(_poll, session)
   end))
 
   event_bus.emit(events.PTY_STARTED, { id = session.id, pid = session.pid, command = opts.command })

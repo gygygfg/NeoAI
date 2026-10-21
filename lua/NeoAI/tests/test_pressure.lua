@@ -240,4 +240,239 @@ tests.suite("pressure", function(_, it)
     vim.notify = orig_notify
     un()
   end)
+
+  it("sandbox_memory_cap：ok 不封顶，warn/critical 按可用内存折算", function(t)
+    -- ok：不封顶（保留充裕环境下的全力发挥）
+    with_cfg({ resources = { pressure = { enabled = true, sample_ttl_ms = 0, notify = false } } }, function()
+      pressure._set_sampler(function() return sample() end)
+      pressure.reset()
+      t.eq(nil, pressure.sandbox_memory_cap(), "ok 级不封顶")
+    end)
+    -- warn：可用内存 × 0.6
+    with_cfg({
+      resources = {
+        pressure = { enabled = true, sample_ttl_ms = 0, notify = false, simulate = "warn" },
+      },
+    }, function()
+      pressure._set_sampler(function() return sample({ mem_available_bytes = 200 * MIB }) end)
+      pressure.reset()
+      local cap, lvl = pressure.sandbox_memory_cap()
+      t.eq("warn", lvl)
+      t.eq(math.floor(200 * MIB * 0.6), cap, "warn 级 = 可用内存 × 0.6")
+    end)
+    -- critical：可用内存 × 0.4
+    with_cfg({
+      resources = {
+        pressure = { enabled = true, sample_ttl_ms = 0, notify = false, simulate = "critical" },
+      },
+    }, function()
+      pressure._set_sampler(function() return sample({ mem_available_bytes = 200 * MIB }) end)
+      pressure.reset()
+      local cap = pressure.sandbox_memory_cap()
+      t.eq(math.floor(200 * MIB * 0.4), cap, "critical 级 = 可用内存 × 0.4")
+    end)
+    -- 单点关闭：degrade.sandbox_memory=false 时永不封顶
+    with_cfg({
+      resources = {
+        pressure = {
+          enabled = true, sample_ttl_ms = 0, notify = false, simulate = "critical",
+          degrade = { sandbox_memory = false },
+        },
+      },
+    }, function()
+      pressure._set_sampler(function() return sample({ mem_available_bytes = 200 * MIB }) end)
+      pressure.reset()
+      t.eq(nil, pressure.sandbox_memory_cap(), "单点关闭后不封顶")
+    end)
+  end)
+
+  it("cgroup.resolve_limits：动态内存上限受 MemAvailable 封顶（原有 total×ratio 不再放大）", function(t)
+    local cgroup = require("NeoAI.sandbox.execution.cgroup")
+    if not cgroup.probe().available then return end -- 无 cgroup v2 的环境跳过
+    -- ok 级：沿用 total × memory_ratio
+    with_cfg({ resources = { pressure = { enabled = true, sample_ttl_ms = 0, notify = false } } }, function()
+      pressure._set_sampler(function() return sample() end)
+      pressure.reset()
+      local lim = cgroup.resolve_limits()
+      t.true_((lim.memory_bytes or 0) > 0, "ok 级仍应有内存上限")
+    end)
+    -- critical 级：上限被压缩到 MemAvailable × 0.4
+    with_cfg({
+      resources = {
+        pressure = { enabled = true, sample_ttl_ms = 0, notify = false, simulate = "critical" },
+      },
+    }, function()
+      local avail = 200 * MIB
+      pressure._set_sampler(function() return sample({ mem_available_bytes = avail }) end)
+      pressure.reset()
+      local lim = cgroup.resolve_limits()
+      local expect = math.floor(avail * 0.4)
+      t.true_((lim.memory_bytes or 0) > 0, "封顶后仍应为正数（避免「不限制」）")
+      t.true_(lim.memory_bytes <= expect, "critical 级 memory_bytes 应 <= MemAvailable×0.4")
+    end)
+  end)
+
+  it("work.parallelism：ok=核预算、warn=⌈n/2⌉、critical=1", function(t)
+    local work = require("NeoAI.utils.work")
+    local base = math.max(1, require("NeoAI.utils.host").core_budget())
+    local pool = tonumber(vim.env.UV_THREADPOOL_SIZE)
+    if pool and pool > 0 and base > pool then base = pool end
+    with_cfg({ resources = { pressure = { enabled = true, sample_ttl_ms = 0, notify = false } } }, function()
+      pressure._set_sampler(function() return sample() end)
+      pressure.reset()
+      t.eq(base, work.parallelism(), "ok 级不收敛")
+    end)
+    with_cfg({
+      resources = { pressure = { enabled = true, sample_ttl_ms = 0, notify = false, simulate = "warn" } },
+    }, function()
+      pressure._set_sampler(function() return sample() end)
+      pressure.reset()
+      t.eq(math.max(1, math.ceil(base / 2)), work.parallelism(), "warn 级减半")
+    end)
+    with_cfg({
+      resources = { pressure = { enabled = true, sample_ttl_ms = 0, notify = false, simulate = "critical" } },
+    }, function()
+      pressure._set_sampler(function() return sample() end)
+      pressure.reset()
+      t.eq(1, work.parallelism(), "critical 级降到 1（下限恒为 1）")
+    end)
+    -- 单点关闭后回到原值
+    with_cfg({
+      resources = {
+        pressure = {
+          enabled = true, sample_ttl_ms = 0, notify = false, simulate = "critical",
+          degrade = { thread_pool = false },
+        },
+      },
+    }, function()
+      pressure._set_sampler(function() return sample() end)
+      pressure.reset()
+      t.eq(base, work.parallelism(), "单点关闭后不收敛")
+    end)
+  end)
+
+  it("observer.observation_allowed 与 start/start_devwatch 早退；强制层不随之降级", function(t)
+    local observer = require("NeoAI.sandbox.observe.observer")
+    -- 记录强制层判定（安全层），下降级前后必须完全一致
+    local function enforce_snapshot()
+      return {
+        backstop = observer.backstop_available(),
+        backend = (observer.backend()),
+      }
+    end
+    with_cfg({ resources = { pressure = { enabled = true, sample_ttl_ms = 0, notify = false } } }, function()
+      pressure._set_sampler(function() return sample() end)
+      pressure.reset()
+      local allowed, reason = observer.observation_allowed()
+      t.eq(true, allowed, "ok 级应允许观测")
+      t.eq(nil, reason)
+    end)
+    local before
+    with_cfg({ resources = { pressure = { enabled = true, sample_ttl_ms = 0, notify = false } } }, function()
+      pressure._set_sampler(function() return sample() end)
+      pressure.reset()
+      before = enforce_snapshot()
+    end)
+    with_cfg({
+      resources = { pressure = { enabled = true, sample_ttl_ms = 0, notify = false, simulate = "critical" } },
+    }, function()
+      pressure._set_sampler(function() return sample() end)
+      pressure.reset()
+      local allowed, reason = observer.observation_allowed()
+      t.eq(false, allowed, "critical 级应关闭观测")
+      t.eq("pressure:critical", reason)
+      -- M.start 按既有 nil 容错早退
+      local h, err = observer.start({ cgroup_id = 1, on_event = function() end })
+      t.eq(nil, h, "critical 级 start 应返回 nil")
+      t.eq("OBSERVE_DEGRADED_PRESSURE", err)
+      -- start_devwatch 同样早退（先满足 backend=ebpf 前置，确认是压力门控而非后端缺失）
+      local orig_backend = observer.backend
+      observer.backend = function() return "ebpf" end
+      local dh, derr = observer.start_devwatch({ cgroup_id = 1, on_event = function() end })
+      observer.backend = orig_backend
+      t.eq(nil, dh, "critical 级 devwatch 应返回 nil")
+      t.eq("OBSERVE_DEGRADED_PRESSURE", derr)
+      -- **安全强制层不降级**：backstop_available / backend 选路与压力无关
+      local after = enforce_snapshot()
+      t.eq(before.backstop, after.backstop, "security：eBPF 行为兜底可用性不得随资源压力变化")
+      t.eq(before.backend, after.backend, "security：观测后端选路不得随资源压力变化")
+    end)
+    -- 单点关闭：degrade.observe_kernel=false 时 critical 仍允许观测
+    with_cfg({
+      resources = {
+        pressure = {
+          enabled = true, sample_ttl_ms = 0, notify = false, simulate = "critical",
+          degrade = { observe_kernel = false },
+        },
+      },
+    }, function()
+      pressure._set_sampler(function() return sample() end)
+      pressure.reset()
+      t.eq(true, observer.observation_allowed(), "单点关闭后 critical 仍允许观测")
+    end)
+  end)
+
+  it("_prewarm_observer 在 warn 及以上不建 cgroup、不挂探针", function(t)
+    local wrapper = require("NeoAI.sandbox.execution.wrapper")
+    local cgroup = require("NeoAI.sandbox.execution.cgroup")
+    if not cgroup.probe().available then return end
+    local observer = require("NeoAI.sandbox.observe.observer")
+    wrapper.clear_prewarm()
+    -- 伪 eBPF 后端：只验证「是否被调用」，不依赖真实 bpftrace
+    local started = 0
+    local orig_backend, orig_available, orig_start = observer.backend, observer.available, observer.start
+    observer.backend = function() return "ebpf" end
+    observer.available = function() return true, "ebpf" end
+    observer.start = function()
+      started = started + 1
+      return { backend = "ebpf", ready = false, stop = function() end }
+    end
+    -- ok 级：应预热
+    with_cfg({
+      resources = { pressure = { enabled = true, sample_ttl_ms = 0, notify = false } },
+      tools = { sandbox = { observe = { enabled = true, prewarm = true, prewarm_ttl_ms = 60000 } } },
+    }, function()
+      pressure._set_sampler(function() return sample() end)
+      pressure.reset()
+      wrapper._prewarm_observer()
+      t.eq(true, wrapper.prewarm_info().active, "ok 级应建立预热 cgroup")
+      t.eq(1, started, "ok 级应启动一次探针")
+      wrapper.clear_prewarm()
+    end)
+    -- warn / critical 级：不预热
+    for _, lvl in ipairs({ "warn", "critical" }) do
+      started = 0
+      with_cfg({
+        resources = {
+          pressure = { enabled = true, sample_ttl_ms = 0, notify = false, simulate = lvl },
+        },
+        tools = { sandbox = { observe = { enabled = true, prewarm = true, prewarm_ttl_ms = 60000 } } },
+      }, function()
+        pressure._set_sampler(function() return sample() end)
+        pressure.reset()
+        wrapper._prewarm_observer()
+        t.eq(false, wrapper.prewarm_info().active, lvl .. " 级不应建立预热 cgroup")
+        t.eq(0, started, lvl .. " 级不应启动探针")
+      end)
+    end
+    -- 单点关闭：degrade.observe_prewarm=false 时 warn 级仍预热
+    with_cfg({
+      resources = {
+        pressure = {
+          enabled = true, sample_ttl_ms = 0, notify = false, simulate = "warn",
+          degrade = { observe_prewarm = false },
+        },
+      },
+      tools = { sandbox = { observe = { enabled = true, prewarm = true, prewarm_ttl_ms = 60000 } } },
+    }, function()
+      pressure._set_sampler(function() return sample() end)
+      pressure.reset()
+      started = 0
+      wrapper._prewarm_observer()
+      t.eq(true, wrapper.prewarm_info().active, "单点关闭后 warn 级仍应预热")
+      wrapper.clear_prewarm()
+    end)
+    observer.backend, observer.available, observer.start = orig_backend, orig_available, orig_start
+    wrapper.clear_prewarm()
+  end)
 end)

@@ -35,8 +35,20 @@ local M = {}
 
 -- ========== 私有常量 ==========
 
---- 两次构建之间的最小间隔（毫秒）：会话事件/按键密集时避免全量重建过密。
-local RENDER_MIN_INTERVAL_MS = 50
+--- 两次构建之间的最小间隔基数（毫秒）：会话事件/按键密集时避免全量重建过密。
+--- 实际生效值按资源压力放大（ok ×1 / warn ×2 / critical ×4）：全量重建是主线程开销，
+--- 资源紧张时让出 CPU 给 nvim 主循环。只读压力层的 TTL 缓存，不在热路径读 /proc。
+local RENDER_BASE_INTERVAL_MS = 50
+
+--- 当前生效的构建最小间隔（按资源压力缩放）
+--- @return number
+local function _render_interval_ms()
+  local ok, pressure = pcall(require, "NeoAI.kernel.pressure")
+  if ok and type(pressure.scaled_ms) == "function" then
+    return pressure.scaled_ms(RENDER_BASE_INTERVAL_MS)
+  end
+  return RENDER_BASE_INTERVAL_MS
+end
 --- 卸载阈值：会话数少于此值时直接在主线程构建（实测几十个会话 <2ms，
 --- 而跨线程往返固定开销约数百毫秒，卸载反而更慢）；超过才交给线程池。
 local OFFLOAD_MIN_SESSIONS = 80
@@ -888,7 +900,7 @@ _schedule_build = function()
   if #state.pending_ops > 0 or state.flush_in_flight then return end
   build_scheduled = true
   local epoch = build_epoch
-  local wait_ms = RENDER_MIN_INTERVAL_MS - (vim.uv.hrtime() / 1e6 - last_build_ms)
+  local wait_ms = _render_interval_ms() - (vim.uv.hrtime() / 1e6 - last_build_ms)
   local function _run()
     if epoch ~= build_epoch then
       build_scheduled = false

@@ -391,8 +391,21 @@ local render_flushed = false
 local render_epoch = 0
 -- 流式渲染最小间隔（毫秒）：分片到达极快时，每个 tick 全量重渲染仍是 O(n²) 主线程开销。
 -- 生成中把渲染频率限制为至多每此间隔一次（非流式事件仍即时渲染，保证响应性）。
-local RENDER_MIN_INTERVAL_MS = 80
+-- 资源紧张时基线由 pressure.scaled_ms 放大（ok ×1 / warn ×2 / critical ×4）：
+-- 渲染是纯主线程开销，让出 CPU 才能保住 nvim 与 sshd 的响应。读取的是 TTL 缓存快照，
+-- 热路径只多一次表读 + 数字比较，不读 /proc。
+local RENDER_BASE_INTERVAL_MS = 80
 local last_render_ms = 0
+
+--- 当前生效的渲染最小间隔（按资源压力缩放）
+--- @return number
+local function _render_interval_ms()
+  local ok, pressure = pcall(require, "NeoAI.kernel.pressure")
+  if ok and type(pressure.scaled_ms) == "function" then
+    return pressure.scaled_ms(RENDER_BASE_INTERVAL_MS)
+  end
+  return RENDER_BASE_INTERVAL_MS
+end
 
 --- 执行一次实际渲染（由调度回调或 flush 调用）
 local function _do_render()
@@ -454,7 +467,7 @@ local function _schedule_render(keep_view)
   local now = vim.uv.hrtime() / 1e6
   local has_pending = chat_service.has_pending_work_for_agent
   local streaming = type(has_pending) == "function" and has_pending(state.agent_id) or false
-  local wait_ms = RENDER_MIN_INTERVAL_MS - (now - last_render_ms)
+  local wait_ms = _render_interval_ms() - (now - last_render_ms)
   if streaming and wait_ms > 0 then
     vim.defer_fn(_run, math.ceil(wait_ms))
   else

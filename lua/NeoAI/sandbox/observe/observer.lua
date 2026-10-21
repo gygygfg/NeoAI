@@ -417,6 +417,23 @@ function M.available()
   return b == "ebpf" or b == "strace" or b == "procfs", b
 end
 
+--- 当前是否允许**启动**观测探针（资源压力门控）。
+---
+--- 语义边界（重要，勿混用）：
+---   * 本函数只门控「观测是否值得启动」——观测属于性能取舍，探针（bpftrace/strace）会常驻
+---     数十 MB 内存并在每条命令上产生 CPU 开销，临界资源下关掉它可换来整机响应性；
+---   * 本函数**绝不**参与 `M.backend()` / `M.backstop_available()` / `M.start_backstop()` 的判定。
+---     seccomp 基线、eBPF 行为兜底（第 2 层：观测违规 syscall 并 cgroup.kill 整树）、权限档位
+---     属于**安全强制层**，在任何资源压力等级下都按原逻辑生效，绝不因资源不足而降级。
+--- @return boolean allowed
+--- @return string|nil reason
+function M.observation_allowed()
+  local ok, pressure = pcall(require, "NeoAI.kernel.pressure")
+  if not ok or type(pressure.observation_allowed) ~= "function" then return true end
+  local allowed, reason = pressure.observation_allowed()
+  return allowed ~= false, reason
+end
+
 -- ========== eBPF 后端 ==========
 
 --- 线程内解析 bpftrace 输出：按行切分、保留文件事件（F 读/写打开、W 写入/创建、D 删除），
@@ -738,6 +755,9 @@ end
 function M.start_devwatch(opts)
   opts = opts or {}
   if M.backend() ~= "ebpf" then return nil, "OBSERVE_BACKEND_UNAVAILABLE" end
+  -- 资源压力门控：critical 时不挂探针（每命令一个 bpftrace 的开销在临界资源下得不偿失）。
+  -- 仅影响观测，不影响任何安全强制层（见 observation_allowed 注释）。
+  if not M.observation_allowed() then return nil, "OBSERVE_DEGRADED_PRESSURE" end
   local cg_id = tonumber(opts.cgroup_id)
   if not cg_id then return nil, "OBSERVE_NO_CGROUP" end
   local handle = { backend = "ebpf", stopped = false, pending = "", ready = false }
@@ -872,6 +892,9 @@ end
 --- @return table|nil handle  { backend, stop() }
 --- @return string|nil err
 function M.start(opts)  opts = opts or {}
+  -- 资源压力门控：critical 时不启动内核观测探针，调用方按「后端不可用」既有 nil 容错回退
+  -- 到命令解析启发式。仅影响观测面，安全强制层（seccomp/backstop/权限档位）不受影响。
+  if not M.observation_allowed() then return nil, "OBSERVE_DEGRADED_PRESSURE" end
   local backend = M.backend()
   if backend == "ebpf" then
     return _start_ebpf(opts)
