@@ -665,6 +665,9 @@ end
 --- 注入**禁用桩**：容器命令按真机「docker 守护进程未运行」样式报错，从而禁用容器内操作。
 --- @return table|nil { dir, podman, compose, disabled }
 local function _container_stubs()
+  -- 容器门面默认关闭（`tools.sandbox.container.enabled = false`）：不生成 docker/nerdctl/
+  -- docker-compose → podman 的入口桩，容器命令按宿主真实运行时执行（无封装）。
+  if (config_store.get("tools.sandbox.container") or {}).enabled == false then return nil end
   if state.container_stubs and vim.uv.fs_stat(state.container_stubs.dir) then return state.container_stubs end
   local podman = (vim.fn.executable("podman") == 1) and vim.fn.exepath("podman") or nil
   if podman == "" then podman = nil end

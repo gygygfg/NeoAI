@@ -2614,15 +2614,19 @@ seccomp 是**唯一**能拦住「不经 overlayfs 的效果」（典型：`mknod
 
 ### 18.3 容器门面（`sandbox/execution/container.lua`）
 
-AI 调用容器运行时（docker/podman 等）时，**在沙箱内管理、容器不改变宿主机**。门面
+**该门面默认关闭**（`tools.sandbox.container.enabled=false`）：AI 的 docker/podman 命令按原文
+执行，不改写运行时、不注入命名空间共享标志、不生成 docker→podman 入口桩、不注入
+containers.conf，也不把 docker 伪装成「daemon 未运行」错误——宿主装了什么运行时就用什么。
+
+开启后（`enabled=true`）语义如下：容器运行时**在沙箱内管理、容器不改变宿主机**。门面
 （`container.facade`）在 `effect="process"` 分支拦截命令并判定：
 
 - **无守护进程运行时**（`podman`/`buildah`）：支持。CLI 在沙箱内执行、容器是 CLI 子进程，
   命令重写为注入 `--net=host --pid=host --ipc=host --uts=host`，容器复用沙箱的
   pid/net/ipc/uts 命名空间，被沙箱隔离边界一并约束，写入进 overlay 暂存
-  （`tools.sandbox.container.share_namespace`，默认开）。
+  （`tools.sandbox.container.share_namespace`，门面开启时默认开）。
 - **docker / docker-compose / nerdctl**：一律**改写为 `podman` / `podman-compose`** 在沙箱内执行
-  （`tools.sandbox.container.docker_to_podman`，默认开）——podman 无守护进程，容器随沙箱
+  （`tools.sandbox.container.docker_to_podman`，门面开启时默认开）——podman 无守护进程，容器随沙箱
   namespace 隔离、写入进 overlay，**永不连接宿主 daemon、不碰宿主**。沙箱内无 podman 或改写关闭时
   **拒绝**（`CONTAINER_PODMAN_UNAVAILABLE` / `CONTAINER_REQUIRES_HOST_DAEMON`），并以**真机样式**
   docker 错误呈现（`Cannot connect to the Docker daemon …`，结构化 `ok=false`），**不回退 hostop**。

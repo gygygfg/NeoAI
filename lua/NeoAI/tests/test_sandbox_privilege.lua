@@ -326,47 +326,49 @@ tests.suite("sandbox_privilege", function(_, it)
   end)
 
   it("容器档位：docker 命令不挂载/不解除 docker.sock 遮蔽；容器命令注入 vfs 存储", function(t)
-    local runtime = require("NeoAI.sandbox.execution.runtime")
-    local privilege = require("NeoAI.sandbox.execution.privilege")
-    if runtime.backend() ~= "bwrap" then return end
-    local fs = require("NeoAI.utils.fs")
-    local dir = vim.fn.tempname()
-    fs.ensure_dir(dir)
-    local sock = dir .. "/docker.sock"
-    fs.write_file(sock, "")
-    -- 即便显式配了 controlled socket，也不再挂载宿主/受控 socket（永不连宿主 daemon）。
-    with_config({ tools = { sandbox = { docker = { mode = "controlled", socket = sock } } } }, function()
-      local d = privilege.resolve(1, { tier = 1, docker = true, network = true })
-      t.true_(d.ok, "docker 的 T1 应可解析（但不挂载 socket）")
-      t.eq(nil, d.privileges.env.DOCKER_HOST, "不应注入 DOCKER_HOST")
-      for _, m in ipairs(d.privileges.mounts) do
-        t.true_(m.dst ~= "/var/run/docker.sock", "不应挂载任何 docker.sock")
-      end
-      t.false_(vim.tbl_contains(d.privileges.unmask, "/var/run/docker.sock"),
-        "不应解除 docker.sock 遮蔽（保持遮蔽）")
-      local pre = table.concat(assert(runtime.process_prefix({ cwd = "/tmp", privileges = d.privileges })), " ")
-      t.true_(pre:find(sock, 1, true) == nil, "前缀不应绑定受控 socket")
+    with_config({ tools = { sandbox = { container = { enabled = true } } } }, function()
+      local runtime = require("NeoAI.sandbox.execution.runtime")
+      local privilege = require("NeoAI.sandbox.execution.privilege")
+      if runtime.backend() ~= "bwrap" then return end
+      local fs = require("NeoAI.utils.fs")
+      local dir = vim.fn.tempname()
+      fs.ensure_dir(dir)
+      local sock = dir .. "/docker.sock"
+      fs.write_file(sock, "")
+      -- 即便显式配了 controlled socket，也不再挂载宿主/受控 socket（永不连宿主 daemon）。
+      with_config({ tools = { sandbox = { docker = { mode = "controlled", socket = sock } } } }, function()
+        local d = privilege.resolve(1, { tier = 1, docker = true, network = true })
+        t.true_(d.ok, "docker 的 T1 应可解析（但不挂载 socket）")
+        t.eq(nil, d.privileges.env.DOCKER_HOST, "不应注入 DOCKER_HOST")
+        for _, m in ipairs(d.privileges.mounts) do
+          t.true_(m.dst ~= "/var/run/docker.sock", "不应挂载任何 docker.sock")
+        end
+        t.false_(vim.tbl_contains(d.privileges.unmask, "/var/run/docker.sock"),
+          "不应解除 docker.sock 遮蔽（保持遮蔽）")
+        local pre = table.concat(assert(runtime.process_prefix({ cwd = "/tmp", privileges = d.privileges })), " ")
+        t.true_(pre:find(sock, 1, true) == nil, "前缀不应绑定受控 socket")
+      end)
+      -- 容器运行时：注入无 mount 的存储后端（overlay 需挂载，沙箱内不可用）。
+      local c = privilege.resolve(1, { tier = 1, container = true, network = true })
+      t.true_(c.ok, "容器命令 T1 应可解析")
+      t.eq("vfs", c.privileges.env.STORAGE_DRIVER, "容器命令应注入 vfs 存储驱动")
+      t.true_(vim.tbl_contains(c.privileges.cap_add, "ALL"), "容器命令应授予运行时能力（默认 ALL）")
+      t.eq(false, c.privileges.seccomp, "容器命令应关闭 seccomp 基线")
+      t.true_(c.privileges.containers_conf, "容器命令应注入 containers.conf")
+      local cpre = table.concat(assert(runtime.process_prefix({ cwd = "/tmp", privileges = c.privileges })), " ")
+      t.true_(cpre:find("--seccomp", 1, true) == nil, "容器命令不应施加 seccomp 基线")
+      t.true_(cpre:find(".containers.conf", 1, true) ~= nil, "应绑定 containers.conf")
+      t.true_(cpre:find(".storage.conf", 1, true) ~= nil, "应绑定 storage.conf")
+      local cenv = runtime.sandbox_env(c.privileges)
+      t.true_(cenv.CONTAINERS_CONF ~= nil, "应设置 CONTAINERS_CONF")
+      t.true_(cenv.CONTAINERS_STORAGE_CONF ~= nil, "应设置 CONTAINERS_STORAGE_CONF")
+      -- 非容器命令仍施加 seccomp 基线（能力最小、无容器注入）。
+      local plain = privilege.resolve(0, { tier = 0, network = true })
+      local ppre = table.concat(assert(runtime.process_prefix({ cwd = "/tmp", privileges = plain.privileges })), " ")
+      t.true_(plain.privileges.seccomp ~= false, "非容器命令不关闭 seccomp")
+      t.true_(ppre:find(".containers.conf", 1, true) == nil, "非容器命令不应注入 containers.conf")
+      vim.fn.delete(dir, "rf")
     end)
-    -- 容器运行时：注入无 mount 的存储后端（overlay 需挂载，沙箱内不可用）。
-    local c = privilege.resolve(1, { tier = 1, container = true, network = true })
-    t.true_(c.ok, "容器命令 T1 应可解析")
-    t.eq("vfs", c.privileges.env.STORAGE_DRIVER, "容器命令应注入 vfs 存储驱动")
-    t.true_(vim.tbl_contains(c.privileges.cap_add, "ALL"), "容器命令应授予运行时能力（默认 ALL）")
-    t.eq(false, c.privileges.seccomp, "容器命令应关闭 seccomp 基线")
-    t.true_(c.privileges.containers_conf, "容器命令应注入 containers.conf")
-    local cpre = table.concat(assert(runtime.process_prefix({ cwd = "/tmp", privileges = c.privileges })), " ")
-    t.true_(cpre:find("--seccomp", 1, true) == nil, "容器命令不应施加 seccomp 基线")
-    t.true_(cpre:find(".containers.conf", 1, true) ~= nil, "应绑定 containers.conf")
-    t.true_(cpre:find(".storage.conf", 1, true) ~= nil, "应绑定 storage.conf")
-    local cenv = runtime.sandbox_env(c.privileges)
-    t.true_(cenv.CONTAINERS_CONF ~= nil, "应设置 CONTAINERS_CONF")
-    t.true_(cenv.CONTAINERS_STORAGE_CONF ~= nil, "应设置 CONTAINERS_STORAGE_CONF")
-    -- 非容器命令仍施加 seccomp 基线（能力最小、无容器注入）。
-    local plain = privilege.resolve(0, { tier = 0, network = true })
-    local ppre = table.concat(assert(runtime.process_prefix({ cwd = "/tmp", privileges = plain.privileges })), " ")
-    t.true_(plain.privileges.seccomp ~= false, "非容器命令不关闭 seccomp")
-    t.true_(ppre:find(".containers.conf", 1, true) == nil, "非容器命令不应注入 containers.conf")
-    vim.fn.delete(dir, "rf")
   end)
 
   it("权限档位：策略对越界档位硬拒绝", function(t)

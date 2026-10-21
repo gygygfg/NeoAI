@@ -545,15 +545,19 @@ sandbox = {
   },
   -- 已弃用：沙箱永不连宿主 docker daemon，无论取值都不再挂载/连接任何 socket（保留仅为兼容）。
   docker = { mode = "off", socket = "" },
-  -- 容器门面：docker/docker-compose/nerdctl 一律改写为 podman/podman-compose，在沙箱内真执行
-  -- （容器随沙箱 namespace 隔离、写入进 overlay 暂存）；podman/buildah 注入 --net/pid/ipc/uts=host
-  -- 共享沙箱命名空间，并注入 STORAGE_DRIVER=vfs（overlay 需挂载，沙箱内不可用）。
-  -- 容器运行时需创建命名空间/mount 等，故容器命令默认按 runtime_caps 授予能力并对容器命令关闭
-  -- seccomp 基线（seccomp=false），并注入 containers.conf（apparmor=unconfined、cgroupfs、存储落
-  -- 会话私有 /tmp 以便跨命令持久）。容器命令属高信任档，勿运行不可信镜像。
-  -- 沙箱内无 podman 或 docker_to_podman=false 时伪装为真机样式 docker 错误（不回传沙箱字样）。
+  -- 容器门面：**默认关闭**（enabled=false）——不做任何封装：AI 的 docker/podman 命令按原文执行，
+  -- 不改写运行时、不注入命名空间共享标志、不生成 docker→podman 入口桩、不注入 containers.conf，
+  -- 也不把 docker 伪装成「daemon 未运行」错误；宿主装了什么运行时就用什么。
+  -- 置 enabled=true 才启用下述沙箱内托管语义：docker/docker-compose/nerdctl 一律改写为
+  -- podman/podman-compose，在沙箱内真执行（容器随沙箱 namespace 隔离、写入进 overlay 暂存）；
+  -- podman/buildah 注入 --net/pid/ipc/uts=host 共享沙箱命名空间，并注入 STORAGE_DRIVER=vfs
+  -- （overlay 需挂载，沙箱内不可用）。容器运行时需创建命名空间/mount 等，故容器命令按
+  -- runtime_caps 授予能力并对容器命令关闭 seccomp 基线（seccomp=false），并注入 containers.conf
+  -- （apparmor=unconfined、cgroupfs、存储落会话私有 /tmp 以便跨命令持久）。容器命令属高信任档，
+  -- 勿运行不可信镜像。沙箱内无 podman 或 docker_to_podman=false 时伪装为真机样式 docker 错误
+  -- （不回传沙箱字样）。
   container = {
-    enabled = true, share_namespace = true, prefer = "podman", docker_to_podman = true,
+    enabled = false, share_namespace = true, prefer = "podman", docker_to_podman = true,
     runtime_caps = { "ALL" }, -- 容器运行时授予的宿主能力（仍经全局 cap_drop 收敛）；{} = 不额外授予
     seccomp = false,          -- 容器命令是否施加 seccomp 基线（podman 需 unshare/mount，须关闭）
     containers_conf = true,   -- 注入 apparmor=unconfined + cgroup_manager=cgroupfs + 会话私有存储

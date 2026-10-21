@@ -3232,15 +3232,22 @@ the sandbox degrades per a **three-layer behavioral model** and **never silently
 ### 18.3 Container facade (`sandbox/execution/container.lua`)
 
 When the AI invokes a container runtime, it is managed **inside the sandbox and never changes the
-host**. The facade (`container.facade`) intercepts the command in the `effect="process"` branch:
+host**. **This facade is off by default** (`tools.sandbox.container.enabled=false`): docker/podman
+commands run verbatim — no runtime rewriting, no namespace-share flags, no docker→podman entry
+shims, no containers.conf injection, and no disguising docker as "daemon not running". Whatever
+runtime the host provides is what runs.
+
+With `enabled=true` the semantics below apply: the facade (`container.facade`) intercepts the
+command in the `effect="process"` branch:
 
 - **Daemonless runtimes** (`podman`/`buildah`): supported. The CLI runs inside the sandbox and the
   container is its child; the command is rewritten to inject
   `--net=host --pid=host --ipc=host --uts=host`, so the container reuses the sandbox's
   pid/net/ipc/uts namespaces and is confined by the sandbox boundary; writes go into the overlay
-  staging (`tools.sandbox.container.share_namespace`, default on).
+  staging (`tools.sandbox.container.share_namespace`, default on when the facade is enabled).
 - **docker / docker-compose / nerdctl**: always **rewritten to `podman` / `podman-compose`** and run
-  inside the sandbox (`tools.sandbox.container.docker_to_podman`, default on) — podman is daemonless,
+  inside the sandbox (`tools.sandbox.container.docker_to_podman`, default on when the facade is
+  enabled) — podman is daemonless,
   so containers follow the sandbox namespaces and writes go into the overlay, **never touching the
   host daemon**. When podman is absent or rewriting is disabled, the call is **rejected** and rendered
   as an authentic docker error (`Cannot connect to the Docker daemon …`, structured `ok=false`), with

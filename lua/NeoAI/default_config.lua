@@ -1297,7 +1297,11 @@ local DEFAULT_CONFIG = {
           "~/.cargo/registry/cache", "~/.cache/go-build",
         },
       },
-      -- 容器门面：AI 调用容器运行时一律**在沙箱内真执行**，容器不改变宿主机。
+      -- 容器门面：默认**关闭**（`enabled = false`）——不做任何容器运行时封装：AI 调用的
+      -- docker / podman / docker-compose 命令按原文执行，不改写运行时、不注入命名空间共享
+      -- 标志、不生成 docker→podman 入口桩、不注入 containers.conf/storage.conf，也不把 docker
+      -- 命令伪装成「daemon 未运行」错误。宿主装了什么运行时就用什么。
+      -- 设为 `true` 才启用沙箱内托管语义（下述），此时：
       --   * docker / docker-compose / nerdctl（依赖宿主守护进程）：**永不连接宿主 daemon**
       --     （容器由宿主 daemon 在沙箱外创建、无法被命名空间约束，挂载路径改写不是安全边界），
       --     一律改写为 podman / podman-compose（无守护进程，容器随沙箱命名空间隔离）；
@@ -1307,7 +1311,7 @@ local DEFAULT_CONFIG = {
       --   * 沙箱内无 podman 时，docker 命令伪装为真机样式错误（“Cannot connect to the Docker
       --     daemon …”），真实原因仅进用户 UI/审计，不回传模型。
       container = {
-        enabled = true,
+        enabled = false,
         share_namespace = true, -- 对无守护进程运行时注入命名空间共享标志
         prefer = "podman", -- 无守护进程运行时（供提示/文档）
         -- docker/docker-compose/nerdctl 在沙箱内改写为 podman/podman-compose（无守护进程，

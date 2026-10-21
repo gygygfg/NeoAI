@@ -608,18 +608,23 @@ sandbox = {
   -- Deprecated: the sandbox never contacts a host docker daemon; no socket is mounted/connected
   -- regardless of the value (kept only for backward compatibility).
   docker = { mode = "off", socket = "" },
-  -- Container facade: docker/docker-compose/nerdctl are always rewritten to podman/podman-compose and
-  -- really executed inside the sandbox (containers follow the sandbox namespaces; writes go to the
-  -- overlay). podman/buildah get --net/pid/ipc/uts=host to share the sandbox namespaces and
-  -- STORAGE_DRIVER=vfs (overlay needs a mount, unavailable inside the sandbox). Container runtimes
-  -- must create namespaces/mounts, so container commands are granted runtime_caps and have the seccomp
-  -- baseline disabled (seccomp=false) by default, and a containers.conf is injected
-  -- (apparmor=unconfined, cgroupfs, storage under the session-private /tmp so it persists across
-  -- runs). Container commands are a high-trust profile — do not run untrusted images.
+  -- Container facade: **off by default** (enabled=false) — no wrapping at all: docker/podman commands
+  -- run verbatim (no runtime rewriting, no namespace-share flags, no docker→podman entry shims, no
+  -- containers.conf injection, and no disguising docker as "daemon not running"). Whatever runtime the
+  -- host provides is what runs.
+  -- Set enabled=true to opt into the in-sandbox controlled semantics below: docker/docker-compose/
+  -- nerdctl are rewritten to podman/podman-compose and really executed inside the sandbox (containers
+  -- follow the sandbox namespaces; writes go to the overlay). podman/buildah get
+  -- --net/pid/ipc/uts=host to share the sandbox namespaces and STORAGE_DRIVER=vfs (overlay needs a
+  -- mount, unavailable inside the sandbox). Container runtimes must create namespaces/mounts, so
+  -- container commands are granted runtime_caps and have the seccomp baseline disabled
+  -- (seccomp=false), and a containers.conf is injected (apparmor=unconfined, cgroupfs, storage under
+  -- the session-private /tmp so it persists across runs). Container commands are a high-trust
+  -- profile — do not run untrusted images.
   -- With no podman or docker_to_podman=false, docker commands are disguised as authentic docker errors
   -- (no sandbox wording).
   container = {
-    enabled = true, share_namespace = true, prefer = "podman", docker_to_podman = true,
+    enabled = false, share_namespace = true, prefer = "podman", docker_to_podman = true,
     runtime_caps = { "ALL" }, -- host caps granted to container runtimes (still trimmed by global cap_drop); {} = none
     seccomp = false,          -- apply the seccomp baseline to container commands (podman needs unshare/mount, so off)
     containers_conf = true,   -- inject apparmor=unconfined + cgroup_manager=cgroupfs + session-private storage

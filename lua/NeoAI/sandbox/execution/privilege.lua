@@ -606,22 +606,27 @@ function M.resolve(tier, req)
   -- podman/buildah 在沙箱内运行需要无 mount 的存储后端：overlay graph driver 需挂载（被
   -- seccomp 拦截），故注入 vfs（容器层落在暂存 overlay 内，写入仍冻结为候选）。
   if req and (req.container or req.docker) then
-    priv.env.STORAGE_DRIVER = priv.env.STORAGE_DRIVER or "vfs"
-    priv.env.BUILDAH_ISOLATION = priv.env.BUILDAH_ISOLATION or "chroot"
-    -- 容器运行时在沙箱内创建容器需要宿主能力（命名空间/mount/pivot_root/mknod/chown…），
-    -- 且需绕过 seccomp 基线（`unshare`/`clone(CLONE_NEW*)`/`mount` 被基线拦截会导致
-    -- `cannot re-exec process`）。按 `tools.sandbox.container` 配置授予能力并标记容器档；
-    -- 全局 cap_drop 仍会收敛宿主全局能力，写入仍全部进 overlay 暂存。
+    -- 容器门面默认关闭（`tools.sandbox.container.enabled = false`）：容器命令按普通命令处理
+    -- （不改写运行时、不注入 STORAGE_DRIVER/BUILDAH_ISOLATION、不授予容器档能力、不注入
+    -- containers.conf），运行时由宿主自身提供。
     local ccfg = config_store.get("tools.sandbox.container") or {}
-    priv.container = true
-    local rcaps = ccfg.runtime_caps
-    if type(rcaps) == "table" then
-      for _, c in ipairs(rcaps) do
-        if type(c) == "string" and c ~= "" then priv.cap_add[#priv.cap_add + 1] = c end
+    if ccfg.enabled ~= false then
+      priv.env.STORAGE_DRIVER = priv.env.STORAGE_DRIVER or "vfs"
+      priv.env.BUILDAH_ISOLATION = priv.env.BUILDAH_ISOLATION or "chroot"
+      -- 容器运行时在沙箱内创建容器需要宿主能力（命名空间/mount/pivot_root/mknod/chown…），
+      -- 且需绕过 seccomp 基线（`unshare`/`clone(CLONE_NEW*)`/`mount` 被基线拦截会导致
+      -- `cannot re-exec process`）。按 `tools.sandbox.container` 配置授予能力并标记容器档；
+      -- 全局 cap_drop 仍会收敛宿主全局能力，写入仍全部进 overlay 暂存。
+      priv.container = true
+      local rcaps = ccfg.runtime_caps
+      if type(rcaps) == "table" then
+        for _, c in ipairs(rcaps) do
+          if type(c) == "string" and c ~= "" then priv.cap_add[#priv.cap_add + 1] = c end
+        end
       end
+      if ccfg.seccomp == false then priv.seccomp = false end
+      if ccfg.containers_conf ~= false then priv.containers_conf = true end
     end
-    if ccfg.seccomp == false then priv.seccomp = false end
-    if ccfg.containers_conf ~= false then priv.containers_conf = true end
   end
   -- 包安装（受控启动）：dpkg/apt/pip/npm 需要 root 能力（--cap-drop ALL 下 root 失去
   -- DAC_OVERRIDE，连 `_apt` 拥有的 0700 目录都不可写；apt 还需 CAP_CHOWN/SETUID/SETGID 才能
