@@ -1542,6 +1542,31 @@ end
 
 --- 配置/内置的宿主敏感遮蔽路径（展开 glob、去重）。不含沙箱自身存储与按 cwd 的遮蔽目录。
 --- @return table 字符串数组
+--- 把遮蔽路径规范化为「真实路径」，用于消除经符号链接父目录的挂载点。
+---
+--- 必要性：Ubuntu 上 `/var/run` 是符号链接（→ `/run`），而默认遮蔽表同时列出
+--- `/run/podman` 与 `/var/run/podman`。bwrap 对「父目录是符号链接」的挂载点做 mkdir 会
+--- 报 `Can't mkdir /var/run/podman: No such file or directory`（实测 bubblewrap 0.9.0 与
+--- 0.11.2 行为一致，与版本无关），导致**每条命令**的沙箱 init 失败、退出码恒为 1。
+--- 把这类路径折算成真实路径后，两者归一为 `/run/podman`，既消除失败也避免重复挂载。
+---
+--- 目标本身不存在时（如 `/var/lib/containers` 未创建）`vim.fn.resolve` 原样返回，
+--- 此时再解析其父目录；仍无法解析则保留原值（绝不丢遮蔽项）。
+--- @param p string 绝对路径
+--- @return string
+local function _mask_real(p)
+  local ok, r = pcall(vim.fn.resolve, p)
+  if ok and type(r) == "string" and r ~= "" and r ~= p then return r end
+  local dir = p:match("^(.*)/[^/]+$")
+  if dir and dir ~= "" then
+    local okd, rd = pcall(vim.fn.resolve, dir)
+    if okd and type(rd) == "string" and rd ~= "" and rd ~= dir then
+      return rd .. "/" .. (p:match("[^/]+$") or "")
+    end
+  end
+  return p
+end
+
 local function _config_mask_paths()
   local cfg = config_store.get("tools.sandbox.mask_paths")
   local list = type(cfg) == "table" and cfg or DEFAULT_MASK_PATHS
@@ -1561,12 +1586,12 @@ local function _config_mask_paths()
         local okg, matches = pcall(vim.fn.glob, p, false, true)
         if okg and type(matches) == "table" then
           for _, m in ipairs(matches) do
-            m = m:gsub("/+$", "")
+            m = _mask_real((m:gsub("/+$", "")))
             if m ~= "" and m ~= "/" and not seen[m] then seen[m] = true; out[#out + 1] = m end
           end
         end
       else
-        p = p:gsub("/+$", "")
+        p = _mask_real((p:gsub("/+$", "")))
         if p ~= "" and p ~= "/" and not seen[p] then seen[p] = true; out[#out + 1] = p end
       end
     end
