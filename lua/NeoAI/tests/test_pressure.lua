@@ -312,12 +312,27 @@ tests.suite("pressure", function(_, it)
     end)
   end)
 
-  it("work.parallelism：ok=核预算、warn=⌈n/2⌉、critical=1", function(t)
+  it("work.io_threads：I/O 并发下限 4，绝不退化为单线程（2 核宿主的关键回归）", function(t)
+    local work = require("NeoAI.utils.work")
+    local host = require("NeoAI.utils.host")
+    local n = work.io_threads()
+    t.true_(n >= 4, "I/O 并发不得低于 libuv 默认 4（2 核机上 core_budget 会算出 1）")
+    t.true_(n <= 16, "I/O 并发上限 16，避免线程过多争抢内存与调度")
+    -- 关键：与 CPU 预算解耦。CPU 预算可为 1，但 I/O 并发必须仍 >= 4。
+    t.true_(host.core_budget() >= 1, "CPU 预算至少 1")
+    if host.core_budget() <= 1 then
+      t.true_(work.io_threads() >= 4, "CPU 预算为 1 时 I/O 并发仍须 >= 4（不得随 CPU 预算退化）")
+    end
+    -- parallelism 同样不得低于 2（压到 1 会让 I/O 完全串行、工具卡到超时）
+    t.true_(work.parallelism() >= 2, "批并发保底 2")
+  end)
+
+  it("work.parallelism：ok=池大小、warn=⌈n/2⌉、critical=⌈n/4⌉（保底 2）", function(t)
     local work = require("NeoAI.utils.work")
     -- 即时计算基线（不预先缓存）：Android 等宿主的可在线核数会随热插拔波动，
     -- 缓存一份会在用例中途失效造成假失败。
     local function base_now()
-      local n = math.max(1, require("NeoAI.utils.host").core_budget())
+      local n = work.io_threads()
       local pool = tonumber(vim.env.UV_THREADPOOL_SIZE)
       if pool and pool > 0 and n > pool then n = pool end
       return n
@@ -332,7 +347,7 @@ tests.suite("pressure", function(_, it)
     }, function()
       pressure._set_sampler(function() return sample() end)
       pressure.reset()
-      local expect = math.max(1, math.ceil(base_now() / 2))
+      local expect = math.max(2, math.ceil(base_now() / 2))
       t.eq(expect, work.parallelism(), "warn 级减半")
     end)
     with_cfg({
@@ -340,7 +355,9 @@ tests.suite("pressure", function(_, it)
     }, function()
       pressure._set_sampler(function() return sample() end)
       pressure.reset()
-      t.eq(1, work.parallelism(), "critical 级降到 1（下限恒为 1）")
+      local expect = math.max(2, math.ceil(base_now() / 4))
+      t.eq(expect, work.parallelism(), "critical 级降到 1/4，但保底 2（不得退化为串行）")
+      t.true_(work.parallelism() >= 2, "critical 也不得压到 1")
     end)
     -- 单点关闭后回到原值
     with_cfg({

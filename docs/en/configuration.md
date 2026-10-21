@@ -320,9 +320,11 @@ sandbox = {
   },
   max_file_bytes = 8 * 1024 * 1024, -- Max bytes per file embedded in a candidate; larger files are copied to a blob (candidate stores only the blob path + stat signature) and published/materialized by file copy, so huge files cannot block the main thread via JSON; 0 = unlimited (embed all)
   work_chunk_files = 128, -- Candidate files per worker task: freeze/hash/secret-scan are chunked and dispatched to the thread pool (multi-core) to avoid single-core serialization on many files; 0/default = 128
-  -- Concurrent chunk jobs and the libuv thread pool both use the internal max(1, cores-2)
-  -- (see utils/host.lua; UV_THREADPOOL_SIZE is enlarged at startup, an explicitly set env var
-  -- is respected) — no config knob anymore
+  -- Concurrent chunk jobs and the libuv thread pool both use the internal work.io_threads()
+  -- = clamp(cores x 2, 4, 16) (see utils/work.lua; UV_THREADPOOL_SIZE is set accordingly at
+  -- startup, an explicitly set env var is respected) — no config knob anymore. It deliberately
+  -- does NOT reuse the CPU budget max(1, cores-2): on a 2-core host that yields 1, collapsing the
+  -- libuv pool to a single thread and serializing all async file I/O (tools queue until 30s timeout).
   -- Read surface (on by default): when true the whole host root is exposed as a **writable overlay**
   -- (lower `/`, session-private upper/work; mounted as-is, any path under the root is writable). All
   -- writes go to the upper staging layer and freeze as candidates, leaving the host disk untouched;

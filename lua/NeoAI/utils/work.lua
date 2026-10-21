@@ -10,8 +10,12 @@
 --- - `M.run` 的参数与返回值必须是原始类型（string / number / boolean / nil），不能是 table。
 --- - `M.run_codec` 用 `vim.mpack` 编解码结构化 table。
 --- - 线程池大小 = libuv 线程池大小（默认 4，受 `UV_THREADPOOL_SIZE` 控制），文件系统操作
----   本身也在池里，排队共享。启动时经 `M.configure_threadpool()` 按宿主核数放大
----   （默认 `max(1, 核数-2)`），使大量读写文件的卸载获得真实并行。
+---   本身也在池里，排队共享。启动时经 `M.configure_threadpool()` 按 `M.io_threads()` 设置
+---   （`clamp(核数 × 2, 4, 16)`）。
+---   注意：这里**刻意不用** `utils.host.core_budget()`（`max(1, 核数-2)`）——那套「预留 2 核
+---   给 UI」的 CPU 预算不适用于 I/O 线程（见 `M.io_threads()` 注释）。2 核宿主上
+---   `core_budget()` = 1 会把池压成单线程，使整个 nvim 的异步文件 I/O 串行，导致文件类
+---   工具排队到超时、run_command 后处理迟迟不返回。
 
 local async = require("NeoAI.utils.async")
 
@@ -117,15 +121,39 @@ function M.require()
   M.selfcheck()
 end
 
---- 实际工作并行度：统一 `max(1, 核数-2)`（`utils.host.core_budget`），并限制在显式设置的
---- libuv 线程池大小（`UV_THREADPOOL_SIZE`）内，避免提交数超过池容量堆积。
+--- libuv 线程池目标大小（**I/O 型**并发，与 CPU 预算无关）。
 ---
---- 资源压力收敛：内存/CPU 紧张时把提交并发度减半（warn）或降到 1（critical），
+--- 为什么不复用 `core_budget()`（`max(1, 核数-2)`）：
+---   1. 池里的任务绝大多数是**阻塞 I/O**（read/write/stat/fsync）或读盘后的哈希计算，
+---      线程大部分时间在等内核，并不占 CPU。「预留 2 核给 nvim/UI」这个 CPU 预算前提
+---      在 I/O 线程上不成立。
+---   2. 2 核宿主上 `max(1, 2-2) = 1` 会把 libuv 池压成**单线程**——连 libuv 默认的 4 都不到。
+---      而 `vim.uv.fs_*`（nvim 自身所有异步文件操作）与 `work.run` **共享同一个池**，
+---      于是整个编辑器的异步 I/O 全部串行。
+---      实测（2 核 / 64 个 20ms 任务）：池=1 时约 1290ms（纯串行）；即使把 `work.batched`
+---      的并发上限提到 4 仍是 1285ms——因为瓶颈是**池线程数**而非提交数。
+---      后果：overlay 捕获上千文件时，read_file / edit_file 等无关工具在队列里排到
+---      30s 工具超时，run_command 的后处理（捕获/冻结）也迟迟无法返回，表现为
+---      「所有工具卡顿、命令执行完却不返回」。
+---   3. 故 I/O 并发**下限取 libuv 默认的 4**，并按核数适度放大；上限 16 避免线程过多
+---      争抢内存与调度（每线程有独立栈）。
+--- @return number
+function M.io_threads()
+  local cores = require("NeoAI.utils.host").cores()
+  return math.min(math.max(4, cores * 2), 16)
+end
+
+--- 实际工作并行度（`work.batched` 的批并发上限）。
+--- 取 libuv 池大小（`M.io_threads()`），并限制在用户显式设置的 `UV_THREADPOOL_SIZE` 内，
+--- 避免提交数超过池容量后只是排队堆积。
+---
+--- 资源压力收敛：内存/CPU 紧张时降低提交并发度（warn 减半、critical 降到 1/4），
 --- 把 CPU 让给 nvim 主循环与 sshd。注意这里只收敛**提交数**，不动线程池大小
 --- （`configure_threadpool` 设置的是 libuv 全局池，创建后不可变，见其注释）。
+--- critical 仍保底 2 路：压到 1 会让 I/O 完全串行，工具重新退化为「卡到超时」。
 --- @return number
 function M.parallelism()
-  local n = require("NeoAI.utils.host").core_budget()
+  local n = M.io_threads()
   local pool = tonumber(vim.env.UV_THREADPOOL_SIZE)
   if pool and pool > 0 and n > pool then n = pool end
   -- 压力收敛（探测模块缺失时按 ok 处理，保持原有行为）
@@ -133,12 +161,12 @@ function M.parallelism()
   if ok and pressure.degrade_enabled("thread_pool") then
     local lvl = pressure.level()
     if lvl == "critical" then
-      n = 1
+      n = math.max(2, math.ceil(n / 4))
     elseif lvl == "warn" then
       n = math.ceil(n / 2)
     end
   end
-  return math.max(1, n)
+  return math.max(2, n)
 end
 
 --- 启动早期设置 libuv 线程池大小（`UV_THREADPOOL_SIZE`），使 `new_work` 能用上多核。
@@ -150,9 +178,9 @@ end
 function M.configure_threadpool()
   local cur = vim.env.UV_THREADPOOL_SIZE
   if cur and cur ~= "" then
-    return tonumber(cur) or require("NeoAI.utils.host").core_budget()
+    return tonumber(cur) or M.io_threads()
   end
-  local n = require("NeoAI.utils.host").core_budget()
+  local n = M.io_threads()
   vim.env.UV_THREADPOOL_SIZE = tostring(n)
   return n
 end

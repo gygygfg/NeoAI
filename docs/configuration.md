@@ -301,8 +301,10 @@ sandbox = {
   },
   max_file_bytes = 8 * 1024 * 1024, -- 单文件内容内嵌候选上限（字节）；超过则内容复制为 blob（候选只记 blob 路径 + stat 签名），发布/物化按文件复制，防大文件嵌入 JSON 阻塞主线程；0 = 不限制（全部内嵌）
   work_chunk_files = 128, -- 每个工作线程任务的候选文件数：冻结/哈希/密钥扫描按此分块并发投递到线程池（多核），防大量文件时单核串行；0/缺省 = 128
-  -- 每批并发 chunk 数与 libuv 线程池统一走内部 max(1, 核数-2)（见 utils/host.lua；启动时据此放大
-  -- UV_THREADPOOL_SIZE，用户已显式设置该环境变量时尊重用户值），不再提供配置项
+  -- 每批并发 chunk 数与 libuv 线程池统一走内部 work.io_threads() = clamp(核数 x 2, 4, 16)
+  -- （见 utils/work.lua；启动时据此设置 UV_THREADPOOL_SIZE，用户已显式设置该环境变量时尊重用户值），
+  -- 不再提供配置项。注意它**不复用** CPU 预算 max(1, 核数-2)：2 核宿主上那会算出 1，
+  -- 把 libuv 池压成单线程，使 nvim 全部异步文件 I/O 串行（工具排队到 30s 超时）。
   -- 读取面（默认开）：true 时整机根以**可写 overlay** 方式暴露——以 `/` 为只读 lower、会话私有
   -- upper/work 为可写层（原样挂载、根内任意路径可写），所有写入进 upper 暂存并冻结为候选，
   -- 宿主盘不受影响；仅遮蔽 mask_paths 中的重要配置文件/凭据（~/.ssh、~/.aws、/etc/shadow、
@@ -869,7 +871,7 @@ resources = {
 | 沙箱单任务 `memory.max` 上限 | `MemTotal × memory_ratio` | 再与 `MemAvailable × sandbox_available_ratio` 取 min | 再与 `MemAvailable × sandbox_available_ratio_critical` 取 min |
 | eBPF 观测预热（`prewarm`） | 开 | 关 | 关 |
 | 内核观测探针（每命令 eBPF/devwatch） | 开 | 开 | 关（回退命令解析启发式） |
-| 工作线程并行度 | `max(1, 核数-2)` | `⌈n/2⌉` | `1` |
+| 工作线程并行度（I/O 批并发） | `clamp(核数×2, 4, 16)` | `⌈n/2⌉` | `⌈n/4⌉`（保底 2） |
 | UI 渲染节流（chat 80ms / tree 50ms） | 基准 | ×2 | ×4 |
 | PTY 输入检测轮询（80ms） | 每 tick | 每 2 tick | 每 4 tick |
 

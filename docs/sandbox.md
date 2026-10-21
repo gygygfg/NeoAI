@@ -257,11 +257,16 @@ token（`NEOKEY_…`）或格式保真假密钥时**拒绝写盘**（`SECRET_TOK
     写盘重叠；主线程只登记映射与 `fresh` 签名，数千/百万文件时不再单线程逐文件同步写。
   - **捕获的工作区一致性判定在线程内**：`_capture_worker` 接收工作区暂存映射，在线程内完成
     「命令改动是否只是暂存编辑的复现」的内容比对，主线程不再对每个改动文件重读两份内容。
-  - **分块 job 限批提交**：`work.batched` 每批最多内部 `max(1, 核数-2)`
-    （`utils/host.lua`）个在途，避免数百个 chunk job 一次排满队列、饿死后续 UI 关键
+  - **分块 job 限批提交**：`work.batched` 每批最多内部 `work.io_threads()`
+    = `clamp(核数 × 2, 4, 16)` 个在途，避免数百个 chunk job 一次排满队列、饿死后续 UI 关键
     job（脱敏 / 密钥 token 化 / 落盘）。**libuv 线程池默认仅 4 线程**，启动时经
-    `NeoAI.utils.work.configure_threadpool()` 按同一值放大 `UV_THREADPOOL_SIZE`（须在池首次
-    创建前；用户已显式设置时尊重用户值），否则再多核也只跑 4 个 worker。
+    `NeoAI.utils.work.configure_threadpool()` 按同一值设置 `UV_THREADPOOL_SIZE`（须在池首次
+    创建前；用户已显式设置时尊重用户值）。
+    该值**刻意与 CPU 预算 `max(1, 核数-2)` 解耦**：池里是阻塞 I/O 任务（线程大部分时间等内核、
+    不占 CPU），而 CPU 预算的「预留 2 核给 UI」前提在这里不成立；2 核宿主上
+    `max(1, 2-2) = 1` 会把池压成单线程（连 libuv 默认 4 都不到），使 nvim 自身的
+    `vim.uv.fs_*` 与本题 `work.run` 全部串行——实测 overlay 捕获上千文件时，无关的
+    `read_file`/`edit_file` 会在队列里排到 30s 工具超时，`run_command` 的后处理也迟迟不返回。
   - **会话轮换迁移下线程池**：`rotate_session` 的文件复制（含目录）交给工作线程；暂存访问前经
     `_await_rotation` 等待迁移完成（通常已完成，等待为 0）。长会话未发布改动多时，agentEnd
     不再逐文件主线程复制。
