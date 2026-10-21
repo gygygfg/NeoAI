@@ -1394,9 +1394,22 @@ local DEFAULT_CONFIG = {
       degraded_seed_max_bytes = 2 * 1024 * 1024 * 1024,
       -- 整机根 overlay 不可用（嵌套 overlay/跨挂载 EINVAL）时，是否尝试用 `fuse-overlayfs`
       -- 在宿主建立「lower=/ 只读 + 会话 upper/work」的用户态合并视图，以保持整机可写。
-      -- 注意：FUSE 挂载 `/` 在嵌套容器/VM 上可能卡死内核（进而触发硬件看门狗整机复位），
-      -- 故测试默认关闭（见 tests/init.lua 的测试默认），降级为 bind+seed。真实主机内核
-      -- overlay 可用时不会走到此路径。
+      --
+      -- ⚠ 已知缺陷（默认仍开启，需按需关闭）：该兜底在**部分宿主**上会自引用死锁——
+      -- 挂载点位于 `/` 之内，而 lowerdir 也是 `/`，`fuse-overlayfs` 服务该视图时需 opendir
+      -- 到包含挂载点的路径，于是阻塞在自己尚未应答的 FUSE 请求上。内核栈可证：
+      --   request_wait_answer ← fuse_simple_request ← fuse_send_open
+      --   ← fuse_file_open ← fuse_dir_open ← do_sys_openat2
+      -- 后果：fuse-overlayfs 进入不可中断等待，此后任何访问该视图的进程（含沙箱 init 与
+      -- `echo alive`）全部阻塞，工具表现为「超时且无输出」，最终 cgroup.kill 收尾
+      -- （exit_code=137）；`umount -l` 也无法解除。已观测于 Ubuntu 24.04 + bubblewrap 0.9.0。
+      --
+      -- 该兜底并非可有可无：当沙箱存储基目录位于 cwd 之内（默认 `~/.cache/nvim/...` 且
+      -- cwd 在 ~ 下）时，bind+seed 降级会因「upper 在 lower 之下」跳过该根而拿不到可写根，
+      -- 此时真正可用的是本兜底或内核 overlay。故**不要**在未验证降级路径可用前贸然关闭。
+      -- 根治方向：升级 bubblewrap ≥ 0.10（支持 `--overlay-src`，让内核 overlay 生效），
+      -- 或把沙箱存储基目录移出 cwd。出现上述卡死时应先 `tools.sandbox.fuse_root_overlay=false`
+      -- 应急，再把基目录移出 cwd 以恢复可写根。
       fuse_root_overlay = true,
       retention = {
         candidate_days = 7, -- 未应用候选保留期（天）

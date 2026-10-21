@@ -24,6 +24,7 @@ local M = {}
 
 local state = {
   caps = nil,
+  bwrap_overlay_capable = nil, -- boolean|nil：bwrap 是否支持 --overlay-src（版本相关，进程内缓存）
   overlay_probe = {}, -- "dev_lower:dev_upper" -> boolean（按文件系统对缓存实测结果）
   overlay_probe_neg = {}, -- 同键 -> 到期 hrtime(ms)：失败结果短 TTL 缓存，避免瞬时失败永久降级
   overlay_write_probe = {}, -- "w|lower|dev_upper|uid|gid" -> boolean（可写性依赖载荷身份）
@@ -1261,12 +1262,38 @@ function M.overlay_lock_keys(argv)
   return keys
 end
 
+--- bwrap 是否支持 `--overlay-src`（内核 overlay 后端的前置条件）。
+---
+--- bubblewrap 的 `--overlay-src`/`--overlay` 是较新版本才有的选项：Ubuntu 24.04 自带
+--- 的 bubblewrap 0.9.0 **完全没有**（`--help` 无任何 overlay 选项，传了会报
+--- `init: Unknown option --overlay-src`，因为 bwrap 用 argv[0] 作错误前缀）。
+--- 不先判定就会稳定误报「内核 overlay 不可用」，把真实原因
+--- （bwrap 太旧）掩盖成「内核/挂载不支持」，进而误导排障并触发危险的 fuse 兜底。
+---
+--- 结果按进程缓存（bwrap 版本不会在运行期变化）。探测失败一律**按不支持处理**（保守）。
+--- @return boolean
+local function _bwrap_overlay_capable()
+  if state.bwrap_overlay_capable ~= nil then return state.bwrap_overlay_capable end
+  local capable = false
+  local ok, out = pcall(function()
+    return vim.fn.system({ "bwrap", "--help" })
+  end)
+  if ok and type(out) == "string" then
+    capable = out:find("overlay", 1, true) ~= nil
+  end
+  state.bwrap_overlay_capable = capable
+  return capable
+end
+
 --- @param lower string
 --- @param upper string
 --- @param work string
 --- @param flags table 隔离标志
 --- @return boolean
 local function _overlay_mount_works(lower, upper, work, flags)
+  -- bwrap 不支持 --overlay-src 时直接判为不可用：既避免徒劳 spawn，
+  -- 也让调用方按「不可用」走 bind+seed 安全降级，而不是误以为内核不支持。
+  if not _bwrap_overlay_capable() then return false end
   local argv = {}
   local is_root = (lower == "/")
   if is_root then
@@ -2623,6 +2650,18 @@ function M.overlay_reason(root, upper, work)
   local caps = M.capabilities()
   if not caps.bwrap then return "NO_BWRAP_BACKEND" end
   if not caps.overlayfs then
+    -- bwrap 版本过旧（无 --overlay-src）：这是最常见的误判来源，必须优先报出，
+    -- 否则会被误读成「内核/挂载不支持」，把排查引向错误方向。
+    if not _bwrap_overlay_capable() then
+      local ver = "?"
+      pcall(function()
+        local v = vim.fn.system({ "bwrap", "--version" })
+        if type(v) == "string" then ver = (v:gsub("%s+$", "")) end
+      end)
+      return "BWRAP_OVERLAY_UNSUPPORTED(" .. ver
+        .. "; 该 bwrap 无 --overlay-src，无法建立内核 overlay，"
+        .. "需 bubblewrap >= 0.10 或改用 bind+seed 降级视图)"
+    end
     -- 粗粒度探测失败：区分是否缺少 user namespace（root 下免 userns 可用）
     local flags = caps.bwrap_flags or M.bwrap_flags()
     local userns = false
