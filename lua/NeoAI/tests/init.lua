@@ -241,6 +241,14 @@ local function _install_test_defaults()
     if uc.tools.sandbox.observe == nil then
       uc.tools.sandbox.observe = { enabled = false }
     end
+    -- 测试默认关闭资源压力自适应：降级与否取决于**运行测试的宿主**当前内存/负载，
+    -- 低内存 CI/开发机会偶发进入 warn/critical，导致沙箱内存上限、并行度、渲染节流
+    -- 随机器状态漂移，产生不可复现的失败。压力专项用例（test_pressure）显式开启并注入伪采样。
+    uc.resources = uc.resources or {}
+    uc.resources.pressure = uc.resources.pressure or {}
+    if uc.resources.pressure.enabled == nil then
+      uc.resources.pressure.enabled = false
+    end
     -- 测试默认同步后处理（进程命令结果在捕获/冻结/结算完成后返回），保持既有断言确定性；
     -- 异步后处理专项用例显式覆盖 tools.sandbox.postprocess="async" 并用 wrapper.await_postprocess 等待。
     if uc.tools.sandbox.postprocess == nil then
@@ -300,6 +308,11 @@ local function _install_test_defaults()
       -- 当前（已合并）配置里默认值为 true，必须强制关闭（不代表用户显式开启）；
       -- 需要自动安装的用例通过 config_store.load({ herder = { auto_install = true } }) 显式开启。
       cur.herder.auto_install = false
+      -- 同上：resources.pressure 默认值为 true，必须强制关闭到与上面包装一致，
+      -- 否则已合并配置里的 true 会让 pressure 生效并随宿主内存状态漂移测试结果。
+      cur.resources = cur.resources or {}
+      cur.resources.pressure = cur.resources.pressure or {}
+      cur.resources.pressure.enabled = false
       orig_config_load(cur)
     end
   end)

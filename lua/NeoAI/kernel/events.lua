@@ -223,4 +223,12 @@ M.PLAN_DISTILL_STARTED = "plan_distill:started"
 M.PLAN_DISTILL_CHUNK = "plan_distill:chunk"
 M.PLAN_DISTILLED = "plan_distilled"
 
+-- ========== 资源压力 ==========
+-- 资源压力等级变化（ok → warn → critical 及恢复）。
+-- payload={level="ok"|"warn"|"critical", prev=..., mem_total_bytes=..., mem_available_bytes=...,
+--          psi_memory_avg10=..., load1=..., cores=...}
+-- 语义：等级只影响「非必要开销」（观测探针、预热、并行度、渲染/轮询节流），
+-- **绝不影响安全强制层**（seccomp 基线 / eBPF 行为兜底 / 权限档位）。
+M.RESOURCE_PRESSURE = "resource:pressure"
+
 return M

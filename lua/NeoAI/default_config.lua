@@ -1639,6 +1639,58 @@ local DEFAULT_CONFIG = {
     },
   },
 
+  -- ===== 资源压力自适应 =====
+  -- 宿主资源不足（内存枯竭 / CPU 排队 / 内存停顿）时，自动收敛本插件的**非必要开销**，
+  -- 优先保住 nvim 与 sshd 的响应性。小内存云主机（2 核 / 1.6 GB / 无 swap）上，
+  -- 沙箱单任务内存上限、eBPF 观测预热、线程池并行度、UI 渲染节流这些「为充裕环境设计」
+  -- 的默认值会把整机推到 OOM / 抖动，表现为卡顿甚至无法 SSH 登录。
+  --
+  -- **安全强制层永不因资源压力降级**：seccomp 基线、eBPF 行为兜底（第 2 层观测
+  -- 违规 syscall 并 cgroup.kill）、权限档位（privilege tier）在任何等级下都按原逻辑生效。
+  -- 本段只门控「观测是否值得启动」「并行度」「节流间隔」这类性能取舍。
+  resources = {
+    pressure = {
+      enabled = true, -- 总开关；false 则完全退回改动前行为（各级降级点均不生效）
+      sample_ttl_ms = 2000, -- 采样缓存 TTL（ms）：热路径只读缓存，绝不重复读 /proc
+      -- warn 级（省资源）：可用内存跌破 max(mem_bytes, MemTotal × mem_ratio)，
+      -- 或 PSI memory some avg10 ≥ psi_avg10，或 load1/核数 ≥ load_factor。
+      warn = {
+        mem_ratio = 0.15, -- 可用内存占 MemTotal 比例下限
+        mem_bytes = 256 * 1024 * 1024, -- 可用内存绝对下限（与比例取较高者）
+        psi_avg10 = 10, -- PSI 内存停顿阈值（avg10，%）
+        load_factor = 2, -- 每核可运行任务数阈值（load1 / 核数）
+      },
+      -- critical 级（保命优先）：可用内存跌破 max(mem_bytes, MemTotal × mem_ratio)，
+      -- 或 PSI memory some avg10 ≥ psi_avg10，或「无 swap 且可用内存 < MemTotal × mem_ratio_no_swap」。
+      critical = {
+        mem_ratio = 0.05, -- 可用内存占 MemTotal 比例下限
+        mem_bytes = 96 * 1024 * 1024, -- 可用内存绝对下限（与比例取较高者）
+        psi_avg10 = 40, -- PSI 内存停顿阈值（avg10，%）
+        -- 无 swap 时缺少缓冲，OOM 会直接杀进程/整机抖动：可用内存低于该比例即判为 critical
+        mem_ratio_no_swap = 0.08,
+      },
+      -- 沙箱单任务 memory.max 的「可用内存封顶」折算比例（warn 级与 critical 级分别取值）。
+      -- 原行为只看 MemTotal × memory_ratio（默认 0.75）：1613 MB 的机器上允许单任务吃 1.2 GB，
+      -- 而实际可用可能只剩几十 MB——这正是远端被打爆的直接原因。
+      -- ok 级不封顶（保留原有全力发挥），仅在 warn/critical 时按可用内存折算。
+      sandbox_available_ratio = 0.6, -- warn 级：memory.max ≤ MemAvailable × 0.6
+      sandbox_available_ratio_critical = 0.4, -- critical 级：memory.max ≤ MemAvailable × 0.4
+      notify = true, -- 首次进入 critical 时是否 vim.notify 提示一次（不重复打扰）
+      -- 调试/验证用：强制等级，无需真实施压即可复现全部降级路径。
+      -- nil（默认，按真实采样）| "ok" | "warn" | "critical"
+      simulate = nil,
+      -- 分项降级开关（false = 该项永不因资源压力降级，用于隔离排查）
+      degrade = {
+        sandbox_memory = true, -- 沙箱单任务 memory.max 受可用内存封顶
+        observe_prewarm = true, -- warn 及以上关闭 eBPF 观测预热（跨命令常驻的 bpftrace）
+        observe_kernel = true, -- critical 关闭内核观测探针（回退既有命令解析启发式）
+        thread_pool = true, -- 工作线程并行度按压力收敛（warn ⌈n/2⌉、critical 1）
+        ui_throttle = true, -- UI 渲染节流与 PTY 轮询间隔按压力放大（warn ×2、critical ×4）
+        pty_poll = true, -- PTY 输入检测轮询降频（不改 timer 周期，仅在回调内跳过）
+      },
+    },
+  },
+
   -- ===== MCP（Model Context Protocol）=====
   mcp = {
     enabled = true, -- 是否启用 MCP 客户端
