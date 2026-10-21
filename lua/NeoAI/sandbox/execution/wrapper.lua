@@ -13,6 +13,8 @@ local control = require("NeoAI.sandbox.execution.control")
 local policy = require("NeoAI.sandbox.review.policy")
 local candidate = require("NeoAI.sandbox.execution.candidate")
 local runtime = require("NeoAI.sandbox.execution.runtime")
+-- 依赖诊断话术（纯文案 + 只读探测）：UI 降级提示与 notify 用同一套「缺哪个依赖 + 怎么装」。
+local deps = require("NeoAI.sandbox.execution.deps")
 local store = require("NeoAI.sandbox.state.store")
 local logger = require("NeoAI.kernel.logger")
 local impact = require("NeoAI.sandbox.observe.impact")
@@ -2026,12 +2028,11 @@ local function _gate_inner(tool, args, ctx, call_original)
       -- 结果提示：仅用户可见（不进入模型上下文，与 T2 特权档提示一致）。
       -- 此处只可能是「后端存在时的防御层缺失」（seccomp 基线不可施加）；无命名空间后端的
       -- 「禁用沙箱、退回审批模式」已在 M.gate 顶部提前处理，不进入本函数。
-      if degrade_info.layer == "seccomp" and degrade_info.fallback == "ebpf" then
+      if degrade_info.layer == "seccomp" then
+        -- 与 notify 同一话术：写清缺的是 setpriv --seccomp-filter / 过滤器，还是落到第 3 层。
         ctx.ui_notice = ctx.ui_notice
-          or "[NeoAI] 沙箱降级：seccomp 不可用，已启用 eBPF 行为兜底（补救型，非等价于发生前拦截）"
-      elseif degrade_info.layer == "seccomp" then
-        ctx.ui_notice = ctx.ui_notice
-          or "[NeoAI] 沙箱降级：本次无行为强制层（seccomp 与 eBPF 兜底均不可用，仅告警）"
+          or ("[NeoAI] 沙箱降级：" .. deps.degrade_text(
+            degrade_info.layer, degrade_info.mode, degrade_info.reason, degrade_info.fallback))
       end
     end
     -- systemctl/journalctl 门面：独立调用在沙箱内路由到长驻服务，不触碰宿主 systemd；

@@ -36,18 +36,65 @@
 
 ---
 
-## 📋 前置要求
+## 📋 前置要求（依赖清单）
+
+### 必需依赖
 
 | 依赖 | 要求 | 说明 |
 | --- | --- | --- |
-| Neovim | **>= 0.10**（推荐 0.13+） | 依赖 `vim.uv` 多线程 API；0.13+ 的外部文件自动重载更佳 |
-| curl | 建议安装 | **HTTP 请求传输依赖**；缺失可能导致无法发送请求 |
-| git | 可选 | `git_*` 工具与工作树管理 |
-| node / npm | 可选 | `web_fetch` 无头浏览器渲染（默认关闭，首次启用自动安装） |
-| 沙箱内核能力 | 可选 | `bwrap`（bubblewrap 包）或 `unshare` + 非特权 user namespace；缺失时沙箱禁用并退回审批模式（`docker` 不参与隔离后端，容器门面仅用 `podman`） |
+| **Neovim** | **≥ 0.10**（推荐 0.13+） | 依赖 `vim.uv` 多线程 API；0.13+ 额外获得外部文件自动重载。低版本直接报错不可用 |
+| **curl** | 需可执行 | **HTTP 传输依赖**：所有模型请求经 curl 发送；未安装（或不在 `PATH`）时请求发不出去 |
 
-> 不确定环境是否就绪？安装后运行 **`:NeoAIDoctor`** 或 **`:checkhealth NeoAI`**，
-> 一站式检查版本、curl、API Key、沙箱能力与可选依赖。
+> 除上述两项外，NeoAI 本体**纯 Lua 编写**，不需要额外 Lua/Node 运行时依赖。
+
+### 可选依赖（按需启用对应功能）
+
+| 功能 | 依赖 | 发行版包名 | 缺失后果 |
+| --- | --- | --- | --- |
+| `git_*` 工具、工作树管理 | `git` | `git` | git 相关工具不注册 |
+| `web_fetch` 网页渲染 | `node` + `npm` | `nodejs` / `npm` | 该工具默认关闭；开启时首次自动安装（Android/Termux 不支持，工具会直接不注册） |
+| **沙箱隔离（推荐）** | `bwrap` | `bubblewrap` | 沙箱禁用 → **退回审批模式**（命令经事前审批后直接在宿主执行，写入直接落盘、不冻结待审候选）。bwrap 是唯一支持 overlay 暂存层、档位挂载/capability 与 `/proc/sys` 遮蔽的后端 |
+| **沙箱隔离（兜底）** | `unshare` + 非特权 user namespace | `util-linux` | `bwrap` 缺失时用它兜底；但内核若禁止非特权 userns（`/proc/sys/kernel/unprivileged_userns_clone=0`、SELinux 拦截 `clone(CLONE_NEWUSER)`），该后端同样不可用 → 退回审批模式 |
+| seccomp 基线（unshare 后端） | `setpriv --seccomp-filter` | `util-linux` **≥ 2.32** | seccomp 无法施加 → 按三层模型降级：启用 eBPF 行为兜底，或落到「仅强告警 + 审计」 |
+| 沙箱行为观测（eBPF 兜底） | `bpftrace` + **root** + 内核 BTF + tracefs | `bpftrace` | 观测回退到 `strace` / `procfs` / 命令解析启发式（越界访问与密钥告警可能漏判） |
+| 观测回退 | `strace` | `strace` | 观测回退到 `procfs`（仅能观测文件打开/执行）或命令解析启发式 |
+| 容器门面 | `podman`（+ `podman-compose`） | `podman` | 沙箱内 `docker*` / `nerdctl` 命令被门禁拒绝（容器门面**只用 podman**，永不连接宿主 docker daemon；装了 `docker` 也不参与隔离后端） |
+| 资源限额、取消/超时整树终止 | cgroup v2 | （内核） | 资源限额与 `cgroup.kill` 整树终止失效，取消命令可能残留子进程 |
+| overlay 暂存层 | overlayfs | （内核） | 降级为 bind + 播种，写入仍冻结为待审候选 |
+
+### 安装示例
+
+```bash
+# Debian / Ubuntu
+sudo apt install -y bubblewrap util-linux strace git curl
+sudo apt install -y bpftrace podman nodejs npm     # 可选：eBPF 兜底 / 容器门面 / web_fetch
+
+# Fedora / RHEL
+sudo dnf install -y bubblewrap util-linux strace git curl
+
+# Arch / Manjaro
+sudo pacman -S --needed bubblewrap util-linux strace git curl
+
+# Alpine
+sudo apk add bubblewrap util-linux strace git curl
+
+# Android / Termux（注意：见下方平台限制）
+pkg install bubblewrap util-linux strace git curl
+```
+
+### 平台限制：Android / Termux
+
+内核禁止**非特权 user namespace**（SELinux 拦截 `clone(CLONE_NEWUSER)`），
+`unshare --user --map-root-user true` 会返回 `Operation not permitted`。因此：
+
+- 即使安装 `bubblewrap` / `util-linux` 也**无法启用沙箱隔离** → 沙箱自动禁用并退回**审批模式**
+  （`tools.approval.mode` 由 `async` 强制为 `prompt`：命令事前阻塞审批后直接在宿主执行）；
+- `web_fetch`（Playwright 浏览器内核）在该平台不可用，不会注册工具、也不会触发依赖安装；
+- 其余功能（对话、工具、LSP、会话树、MCP、Skills 等）不受影响。
+
+> 不确定环境是否就绪？运行 **`:NeoAIDoctor`** 或 **`:checkhealth NeoAI`** 一站式检查版本、curl、
+> API Key、沙箱能力与可选依赖；沙箱逐项能力（`bwrap`/`unshare`/`userns`/`overlayfs`/`seccomp`/
+> `cgroup2`/`podman`）用 **`:NeoAISandboxCaps`** 查看。诊断项会直接写明**缺哪个依赖**与安装命令。
 
 ---
 

@@ -60,11 +60,15 @@ function M.collect()
     add("autoread（可选）", "warn", { "Neovim < 0.13：外部改动文件不自动重载，内置工具写盘需手动 :edit。" })
   end
 
-  -- curl（HTTP 传输依赖）
+  -- curl（HTTP 传输依赖：唯一传输后端，无内置回退，见 utils/http.lua）
   if vim.fn.executable("curl") == 1 then
-    add("curl", "ok", { "已找到 curl（HTTP 请求使用），或存在内置回退。" })
+    add("curl", "ok", { "已找到 curl（所有模型请求经 curl 发送）。" })
   else
-    add("curl", "warn", { "未找到 curl；若无其他传输后端，发送请求可能失败。" })
+    add("curl", "error", {
+      "未找到 curl：NeoAI 的 HTTP 请求无内置回退，无法发送任何模型请求。",
+      "安装：Debian/Ubuntu `sudo apt install -y curl`｜Fedora `sudo dnf install -y curl`｜"
+        .. "Arch `sudo pacman -S curl`｜Alpine `sudo apk add curl`｜Termux `pkg install curl`。",
+    })
   end
 
   -- libuv 线程池（CPU/IO 卸载）

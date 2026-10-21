@@ -166,12 +166,15 @@ Key architectural principles:
 
 ## Installation
 
-**Prerequisites**: Neovim ≥ 0.10 (0.13+ recommended; uses the `vim.uv` multithreading API);
-`curl` recommended (HTTP transport); optional `git`, `node`/`npm` (`web_fetch`) and sandbox kernel
-capabilities (`bwrap` (bubblewrap) or `unshare` + unprivileged user namespaces; `docker` is not an
-isolation backend — the container facade only uses `podman`; when both are missing the sandbox is
-disabled and falls back to approval mode). After installing, run `:NeoAIDoctor` or
-`:checkhealth NeoAI` for a one-stop self-check.
+**Prerequisites**: Neovim >= 0.10 (0.13+ recommended; uses the `vim.uv` multithreading API) and
+`curl` (the only HTTP transport — without it no model request can be sent). Optional dependencies by
+feature: `git`, `node`/`npm` (`web_fetch`), and sandbox-related ones (`bwrap` (bubblewrap) or
+`unshare` + unprivileged user namespaces; seccomp needs `setpriv --seccomp-filter` from
+`util-linux` >= 2.32; observation uses `bpftrace`/`strace`; the container facade uses `podman` only).
+When none of the isolation backends is available the sandbox is disabled and falls back to approval
+mode. The full list (per-distro install commands and the Android/Termux limitation) is in
+[README "Prerequisites (dependencies)"](../README.en.md#-prerequisites-dependencies). After
+installing, run `:NeoAIDoctor` or `:checkhealth NeoAI` for a one-stop self-check.
 
 Using lazy.nvim:
 

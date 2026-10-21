@@ -36,19 +36,68 @@
 
 ---
 
-## 📋 Prerequisites
+## 📋 Prerequisites (dependencies)
+
+### Required
 
 | Dependency | Requirement | Notes |
 | --- | --- | --- |
-| Neovim | **>= 0.10** (0.13+ recommended) | Uses the `vim.uv` multithreading API; 0.13+ gives better external-file autoread |
-| curl | Recommended | **HTTP transport dependency**; without it requests may fail |
-| git | Optional | `git_*` tools and worktree management |
-| node / npm | Optional | `web_fetch` headless-browser rendering (off by default, auto-installed on first use) |
-| Sandbox kernel capabilities | Optional | `bwrap` (bubblewrap) or `unshare` + unprivileged user namespaces; when missing the sandbox is disabled and falls back to approval mode (`docker` is not an isolation backend — the container facade only uses `podman`) |
+| **Neovim** | **>= 0.10** (0.13+ recommended) | Uses the `vim.uv` multithreading API; 0.13+ additionally gives external-file autoread. Older versions are unsupported |
+| **curl** | Must be executable | **HTTP transport**: every model request goes through curl; requests fail to send when it is missing (or not on `PATH`) |
 
-> Not sure whether your environment is ready? After installing, run **`:NeoAIDoctor`** or
-> **`:checkhealth NeoAI`** for a one-stop check of version, curl, API keys, sandbox capabilities
-> and optional dependencies.
+> Beyond these two, NeoAI itself is **pure Lua** — no extra Lua/Node runtime dependencies.
+
+### Optional (enable the corresponding feature)
+
+| Feature | Dependency | Distro package | When missing |
+| --- | --- | --- | --- |
+| `git_*` tools, worktrees | `git` | `git` | git tools are not registered |
+| `web_fetch` rendering | `node` + `npm` | `nodejs` / `npm` | Off by default, auto-installed on first use (unsupported on Android/Termux — the tool is simply not registered) |
+| **Sandbox isolation (preferred)** | `bwrap` | `bubblewrap` | Sandbox disabled → **falls back to approval mode** (commands run on the host after blocking pre-approval; writes land on disk directly, no staged candidates). bwrap is the only backend supporting the overlay staging layer, tier mounts/capabilities and `/proc/sys` masking |
+| **Sandbox isolation (fallback)** | `unshare` + unprivileged user namespaces | `util-linux` | Used when `bwrap` is absent; if the kernel forbids unprivileged userns (`/proc/sys/kernel/unprivileged_userns_clone=0`, SELinux rejecting `clone(CLONE_NEWUSER)`) this backend is unusable too → approval mode |
+| seccomp baseline (unshare backend) | `setpriv --seccomp-filter` | `util-linux` **>= 2.32** | seccomp cannot be applied → three-layer model: eBPF behavior backstop, or "warn + audit only" |
+| Sandbox behavior observation (eBPF backstop) | `bpftrace` + **root** + kernel BTF + tracefs | `bpftrace` | Observation falls back to `strace` / `procfs` / command-parsing heuristics (out-of-bounds and secret warnings may be missed) |
+| Observation fallback | `strace` | `strace` | Falls back to `procfs` (file open/exec only) or command-parsing heuristics |
+| Container facade | `podman` (+ `podman-compose`) | `podman` | In-sandbox `docker*` / `nerdctl` commands are rejected by the gate (the facade uses **podman only** and never contacts the host docker daemon; an installed `docker` is not an isolation backend either) |
+| Resource limits, whole-tree kill on cancel/timeout | cgroup v2 | (kernel) | Resource limits and `cgroup.kill` stop working; cancelled commands may leave children behind |
+| overlay staging layer | overlayfs | (kernel) | Degrades to bind + seed; writes are still frozen as pending candidates |
+
+### Install examples
+
+```bash
+# Debian / Ubuntu
+sudo apt install -y bubblewrap util-linux strace git curl
+sudo apt install -y bpftrace podman nodejs npm     # optional: eBPF backstop / container facade / web_fetch
+
+# Fedora / RHEL
+sudo dnf install -y bubblewrap util-linux strace git curl
+
+# Arch / Manjaro
+sudo pacman -S --needed bubblewrap util-linux strace git curl
+
+# Alpine
+sudo apk add bubblewrap util-linux strace git curl
+
+# Android / Termux (see the platform limitation below)
+pkg install bubblewrap util-linux strace git curl
+```
+
+### Platform limitation: Android / Termux
+
+The kernel forbids **unprivileged user namespaces** (SELinux rejects `clone(CLONE_NEWUSER)`), so
+`unshare --user --map-root-user true` returns `Operation not permitted`. Therefore:
+
+- Installing `bubblewrap` / `util-linux` still **cannot enable sandbox isolation** → the sandbox is
+  disabled automatically and falls back to **approval mode** (`tools.approval.mode` is forced from
+  `async` to `prompt`: commands run on the host after blocking pre-approval);
+- `web_fetch` (Playwright browser engine) is unavailable on this platform: the tool is not
+  registered and no dependency installation is triggered;
+- Everything else (chat, tools, LSP, session tree, MCP, Skills, ...) is unaffected.
+
+> Not sure whether your environment is ready? Run **`:NeoAIDoctor`** or **`:checkhealth NeoAI`** for a
+> one-stop check of version, curl, API keys, sandbox capabilities and optional dependencies; use
+> **`:NeoAISandboxCaps`** for per-item sandbox capabilities (`bwrap`/`unshare`/`userns`/`overlayfs`/
+> `seccomp`/`cgroup2`/`podman`). Diagnostics name the **missing dependency** and its install command.
 
 ---
 
