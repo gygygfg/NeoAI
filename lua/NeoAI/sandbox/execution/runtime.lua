@@ -2684,8 +2684,10 @@ function M.overlay_reason(root, upper, work)
         if type(v) == "string" then ver = (v:gsub("%s+$", "")) end
       end)
       return "BWRAP_OVERLAY_UNSUPPORTED(" .. ver
-        .. "; 该 bwrap 无 --overlay-src，无法建立内核 overlay，"
-        .. "需 bubblewrap >= 0.10 或改用 bind+seed 降级视图)"
+        .. "; 该 bwrap 无 --overlay-src，无法建立内核 overlay；"
+        .. "需 bubblewrap >= 0.11.0（注意：0.12.0 起为修 CVE 而拒绝向符号链接目标挂载，"
+        .. "Ubuntu 的 /etc/resolv.conf 是符号链接，会报 Can't mount on symlink destination，"
+        .. "故当前有效区间为 0.11.x），或改用 bind+seed 降级视图)"
     end
     -- 粗粒度探测失败：区分是否缺少 user namespace（root 下免 userns 可用）
     local flags = caps.bwrap_flags or M.bwrap_flags()

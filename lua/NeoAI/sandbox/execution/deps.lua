@@ -174,6 +174,10 @@ function M.backend_report(opts)
       add("overlay 可写层：可用（工具写入冻结为待审候选）")
     else
       add("overlay 可写层：不可用（降级为 bind + 播种；写入仍冻结为待审候选）")
+      -- 版本约束（实测）：--overlay-src 自 0.11.0 引入；而 0.12.0 起为修 CVE 拒绝向
+      -- 符号链接目标挂载，Ubuntu 的 /etc/resolv.conf 是符号链接，会直接 init 失败。
+      add("bubblewrap 需 >= 0.11.0 才有 --overlay-src；0.12.0+ 因拒绝符号链接目标挂载"
+        .. "（/etc/resolv.conf）而不兼容，当前有效区间为 0.11.x")
     end
     if opts.seccomp == false then
       add("seccomp 基线：内核不支持（缺 /proc/sys/kernel/seccomp/actions_avail），"
