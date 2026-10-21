@@ -263,6 +263,21 @@ vim.api.nvim_create_autocmd("User", {
 > `files` / `background` / `constraints` / `verify` / `fallback`），且 `content` 为「各通道带标题合并」后的视图、
 > `reasoning` 已并入 `content`（不再单独给出）；开始/完成仍各发射一次。
 
+### 资源压力
+
+| 常量 | 值 | 触发时机 | payload 关键字段 |
+| --- | --- | --- | --- |
+| `RESOURCE_PRESSURE` | `resource:pressure` | 资源压力等级变化（`ok` ↔ `warn` ↔ `critical`） | `{ level, prev, mem_total_bytes, mem_available_bytes, psi_memory_avg10, load1, cores }` |
+
+> 等级只影响**非必要开销**（观测探针是否启动、沙箱单任务内存上限、工作线程并行度、
+> UI 渲染节流与 PTY 轮询频率），**绝不影响安全强制层**——seccomp 基线、eBPF 行为兜底
+> （第 2 层）与权限档位在任何等级下都按原逻辑生效。详见
+> [configuration.md §2.11](configuration.md) 与 [sandbox.md](sandbox.md) 观测章节。
+>
+> 等级由 `kernel/pressure.lua` 按 `/proc/meminfo`、PSI、`/proc/loadavg` 判定，结果按
+> `resources.pressure.sample_ttl_ms`（默认 2000ms）缓存；仅在等级**变化**时发射一次，
+> 且仅在首次进入 `critical` 时 `vim.notify` 提示一次（避免刷屏）。
+
 ### 沙箱
 
 | 常量 | 值 | 触发时机 | payload 关键字段 |

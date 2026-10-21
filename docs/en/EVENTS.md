@@ -263,6 +263,24 @@ All event constants are defined in `NeoAI.kernel.events`. They are listed below 
 > `files` / `background` / `constraints` / `verify` / `fallback`), and `content` is a "per-channel merged with headings" view with `reasoning` folded into
 > `content` (no longer sent separately); start/complete still fire exactly once each.
 
+### Resource Pressure
+
+| Constant | Value | When emitted | Key payload fields |
+| --- | --- | --- | --- |
+| `RESOURCE_PRESSURE` | `resource:pressure` | Pressure level changed (`ok` <-> `warn` <-> `critical`) | `{ level, prev, mem_total_bytes, mem_available_bytes, psi_memory_avg10, load1, cores }` |
+
+> The level only affects **non-essential work** (whether observation probes start, the
+> sandbox per-task memory cap, worker parallelism, UI render throttling and PTY polling
+> frequency). It **never affects the enforcement layer** — the seccomp baseline, the eBPF
+> behavior backstop (layer 2) and privilege tiers behave exactly as configured at any level.
+> See [configuration.md §2.11](configuration.md) and the observation section of
+> [sandbox.md](sandbox.md).
+>
+> Levels are classified by `kernel/pressure.lua` from `/proc/meminfo`, PSI and
+> `/proc/loadavg`, and cached for `resources.pressure.sample_ttl_ms` (2000 ms default). The
+> event is emitted only when the level **changes**, and `vim.notify` fires only on the first
+> transition into `critical` (no notification spam).
+
 ### Sandbox
 
 | Constant | Value | When it fires | Key payload fields |
