@@ -25,19 +25,34 @@ local function with_config(overrides, fn)
 end
 
 tests.suite("sandbox_hardening", function(_, it)
-  it("能力门禁：CAP_NET_ADMIN 授予时 iptables 放行，缺失时拒绝", function(t)
+  it("能力形迹只做分级提示：iptables 不因缺少 CAP_NET_ADMIN 而被拒绝", function(t)
     local risk = require("NeoAI.sandbox.review.risk")
-    -- 缺省（无能力）→ 拒绝
-    t.not_nil(risk.deny_reason("iptables -F"), "无能力应拒绝 iptables")
-    t.not_nil(risk.deny_reason("iptables -F", { caps = {} }), "显式空能力应拒绝")
-    -- 授予能力 → 放行
-    t.eq(nil, risk.deny_reason("iptables -F", { caps = { CAP_NET_ADMIN = true } }),
-      "授予 CAP_NET_ADMIN 后应放行")
-    t.eq(nil, risk.deny_reason("nft list ruleset", { caps = { CAP_NET_ADMIN = true } }),
-      "授予 CAP_NET_ADMIN 后 nft 应放行")
-    -- 无条件拒绝表不受能力影响
-    t.not_nil(risk.deny_reason("modprobe x", { caps = { CAP_NET_ADMIN = true } }),
-      "modprobe 始终拒绝")
+    -- 核心不变量 6：字符/命令名静态判定不得作为拒绝依据——真实约束是内核（EPERM）。
+    t.eq(nil, risk.deny_reason("iptables -F"), "deny_reason 恒为 nil（不再拒绝）")
+    t.eq(nil, risk.deny_reason("iptables -F", { caps = {} }), "deny_reason 恒为 nil")
+    t.eq(nil, risk.deny_reason("modprobe x", { caps = { CAP_NET_ADMIN = true } }),
+      "deny_reason 恒为 nil（modprobe 由 seccomp 拦，不靠名字）")
+
+    -- advisory 给出形迹与提示，能力状态只影响文案（MISSING vs GRANTED），不影响放行与否。
+    local adv = risk.advisory("iptables -F")
+    t.not_nil(adv, "应给出 advisory 形迹")
+    local has_missing = false
+    for _, r in ipairs(adv.reasons) do
+      if r:find("CAPABILITY_MISSING:iptables", 1, true) then has_missing = true end
+    end
+    t.ok(has_missing, "未授予能力时提示 CAPABILITY_MISSING")
+
+    local adv2 = risk.advisory("iptables -F", { caps = { CAP_NET_ADMIN = true } })
+    t.not_nil(adv2, "能力已授予时仍有形迹提示")
+    local has_granted = false
+    for _, r in ipairs(adv2.reasons) do
+      if r:find("CAPABILITY_GRANTED:iptables", 1, true) then has_granted = true end
+    end
+    t.ok(has_granted, "已授予能力时提示 CAPABILITY_GRANTED")
+
+    -- 纯查看类命令（help/version）也只是 advisory，绝不拒绝。
+    t.eq(nil, risk.deny_reason("kmod --help"), "kmod --help 不得被拒绝")
+    t.not_nil(risk.advisory("kmod --help"), "但应作为形迹提示")
   end)
 
   it("privilege.effective_caps：T2 默认 ALL 不展开，显式 cap_add 才授予", function(t)

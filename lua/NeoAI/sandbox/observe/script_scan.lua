@@ -8,9 +8,11 @@
 ---   * 高级语言（Python/Node/Ruby/Perl/PHP）中调用 shell 的字符串字面量
 ---     （`os.system` / `subprocess.*` / `child_process.exec` / 反引号 / `%x{}` 等）；
 ---   * 递归引用的脚本（限深度/文件数/字节数，检测环）。
---- 结果折叠为一段 `effective` 文本，供 `risk.deny_reason`（硬拒绝）、
+--- 结果折叠为一段 `effective` 文本，供 `risk.advisory`（**风险形迹，仅抬级与提示**）、
 --- `privilege.classify`（权限档/包识别）与 `risk.classify`（安全级别）复用，
 --- 使脚本内的破坏性命令、包安装、系统写入等不再被漏判。
+--- 注意：本模块**不产生拒绝**（docs/sandbox.md 核心不变量 6）——它判定的是文本形迹，
+--- 真实拦截由 seccomp/capability/设备门禁/exec 调用链守卫等运行时强制层承担。
 ---
 --- 无法静态解析的间接执行（`eval`、`base64 -d | sh`、`python -m`、`-c "$VAR"`、
 --- 读不到脚本内容等）标记为 `opaque`：调用方据此**提升级别并强制人工复核**，

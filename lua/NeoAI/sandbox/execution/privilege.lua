@@ -718,7 +718,7 @@ function M.review_mode(tier)
   return _tier_cfg(tier).review or "auto"
 end
 
---- 命令实际被授予的能力集合（供按能力门禁判定，如 risk.deny_reason 的 CAP_GATED_BINS）。
+--- 命令实际被授予的能力集合（供形迹提示使用，如 risk.advisory 的 CAPABILITY_MISSING/GRANTED）。
 --- 注意：`ALL` 不展开为具体能力——runtime 的全局 cap_drop 会把未显式列出的能力
 --- （如 CAP_NET_ADMIN）重新丢弃，故只有显式 cap_add 的能力才算「已授予」。
 --- @param tool_name string

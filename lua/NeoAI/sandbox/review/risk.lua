@@ -43,10 +43,13 @@ local function _dedupe(list)
   return out
 end
 
--- 危险命令模式（依据命令文本初判级别）。匹配为 Lua pattern。
--- 仅覆盖**绕过文件暂存层**的破坏（写块设备、mkfs、wipefs 等）：`rm`/`rm -rf` 等纯文件
--- 修改由「只读根 + overlay 修改暂存」保护宿主机，不在此硬拦截（其效果冻结为候选待审）。
-local DANGEROUS = {
+-- 危险命令**文本形迹**（仅用于风险分级与提示文案，绝不用于拒绝执行）。
+-- 匹配为 Lua pattern。核心不变量：安全边界只能由内核/运行时强制层提供（seccomp、capability、
+-- 命名空间/设备隔离、cgroup.kill、网络门禁、人工审批）；字符串匹配判定的是命令「长什么样」，
+-- 而非进程「做了什么」，实测双向失效（`echo 'curl x | sh'` 被误判、`| $SH` 与 `ba""sh` 漏判），
+-- 故命中只提升 L 级并置 needs_confirm 强制人工复核，不产生 DENY。详见 docs/sandbox.md 核心不变量 6。
+-- 仅覆盖**绕过文件暂存层**的破坏形态（写块设备、mkfs、wipefs 等）与间接执行形迹。
+local ADVISORY_PATTERNS = {
   { level = 3, name = "DESTRUCTIVE", pats = {
     "mkfs", "dd%s+[^\n]*of=/dev/", ">%s*/dev/sd", ">%s*/dev/nvme",
     "shred%s", "wipefs", "blkdiscard", "of=/dev/",
@@ -245,7 +248,7 @@ function M.badge(level)
   return LEVEL_BADGE[level] or "L0"
 end
 
---- 匹配危险命令模式，返回最高命中级别与原因
+--- 匹配危险命令的**文本形迹**，返回最高命中级别与原因（advisory：只用于分级，不用于拒绝）
 --- @param text string|nil
 --- @return number level
 --- @return table reasons
@@ -253,7 +256,7 @@ local function _dangerous(text)
   local level, reasons = 0, {}
   if type(text) ~= "string" or text == "" then return level, reasons end
   local lower = text:lower()
-  for _, rule in ipairs(DANGEROUS) do
+  for _, rule in ipairs(ADVISORY_PATTERNS) do
     for _, p in ipairs(rule.pats) do
       if lower:find(p) then
         if rule.level > level then level = rule.level end
@@ -338,26 +341,25 @@ end
 
 -- ========== 内核/危险命令硬拒绝 ==========
 
--- 内核/系统管理命令（首词命中即硬拒绝，不执行）。普通命令不受影响，仍可在沙箱内执行。
+-- 内核/系统管理类命令的**名字形迹**（advisory：只提升风险并要求人工复核，不拒绝执行）。
+-- 已删除原 DENY_BINS / CAP_GATED_BINS 名字黑名单：其中每个二进制所需的危险 syscall
+-- （init_module/finit_module/delete_module/reboot/kexec_load/bpf/perf_event_open/swapon…）
+-- 都已被 seccomp 基线拦截，名字表拦不住任何 seccomp 拦不住的东西，只产出 `kmod --help`
+-- 这类误报；而 iptables/nft 的真实约束是 CAP_NET_ADMIN——busybox 软链可绕过名字，却绕不过
+-- EPERM。故「危险」以**能力事实**（所需被剥夺的 syscall/capability）定义，不以名字定义。
+-- 本表只用于：给出提示文案、把级别抬到 HIGH/CRITICAL 以触发强制人工复核。
 -- 注意：`mount`/`umount` 属 T2 主机操作（冻结为提案、审批后 sudo），`mknod`/`unshare` 等由
--- seccomp 基线与命名空间隔离处理，故不在此列表（避免绕过既有的分层防护）。
-local DENY_BINS = {
-  -- 内核模块与内核状态
+-- seccomp 基线与命名空间隔离处理，故不在此表（避免与既有分层防护重复）。
+local KERNEL_TRACE_BINS = {
   modprobe = true, insmod = true, rmmod = true, kmod = true, modinfo = true,
   sysctl = true, kexec = true, reboot = true, shutdown = true, poweroff = true,
-  halt = true, sysrq = true, bpf = true, perf = true,
-  -- 文件能力（可提权）
-  setcap = true,
-  -- 内核交换区
+  halt = true, sysrq = true, bpf = true, perf = true, setcap = true,
   swapon = true, swapoff = true,
 }
 
--- 需要特定 Linux 能力才能生效的「底层网络/防火墙」命令：**按能力判定**而非按命令名一刀切。
--- 沙箱基线（--cap-drop ALL + 窄 cap_add）默认不授予这些能力，故默认仍拒绝；但若调用方
--- 显式授予所需能力（tools.sandbox.privilege.tiers[*].cap_add 或全局 cap_add），则放行，
--- 使 `iptables` 等不再因「命令名」被无条件否决。opts.caps 为已授予能力集合（见
--- privilege.effective_caps）；注意 `ALL` 不解除全局 cap_drop，故不视为授予被全局丢弃的能力。
-local CAP_GATED_BINS = {
+-- 需要特定 Linux 能力才可能生效的「底层网络/防火墙」命令（同样只是 advisory 形迹）：
+-- 真实约束是 capability，沙箱基线 `--cap-drop ALL` 默认不授予，故内核会以 EPERM 拒绝。
+local CAP_TRACE_BINS = {
   iptables = "CAP_NET_ADMIN", ip6tables = "CAP_NET_ADMIN",
   nft = "CAP_NET_ADMIN", arptables = "CAP_NET_ADMIN", ebtables = "CAP_NET_ADMIN",
 }
@@ -374,30 +376,47 @@ local WRAPPERS = {
   ["while"] = true, ["until"] = true, ["done"] = true, ["fi"] = true, time = true,
 }
 
---- 内核/破坏性命令硬拒绝判定：命中返回原因（不执行），否则 nil。
---- 普通命令（含 python/node/go/rust/apt/pip/npm 等）不命中，仍可在沙箱内执行。
---- @param command string|nil
---- @param opts table|nil { caps? = table<string, boolean> 已授予能力集合；缺省视为空（fail-closed） }
---- @return string|nil reason 如 "KERNEL_COMMAND:modprobe" / "CAPABILITY_REQUIRED:iptables:CAP_NET_ADMIN"
-function M.deny_reason(command, opts)
+--- 危险命令**形迹**评估（advisory：只用于分级与人工复核提示，**绝不用于拒绝执行**）。
+--- 命中返回形迹原因码与建议级别，未命中返回 nil。
+--- 真实拦截由内核/运行时强制层承担：命中项所需的危险 syscall 已由 seccomp 基线拦截
+--- （init_module/finit_module/delete_module/reboot/kexec_load/bpf/perf_event_open/swapon…），
+--- 网络管理类由 CAP_NET_ADMIN 缺失导致 EPERM，设备写入由设备门禁 + `--dev` 最小 devtmpfs 约束，
+--- 间接执行链由 exec 调用链守卫按真实 execve 归因。详见 docs/sandbox.md「核心不变量 6」。
+--- @param command string|nil 命令文本（可含脚本折叠后的 effective 文本）
+--- @param opts table|nil { caps? = table<string, boolean> 已授予能力集合；用于提示「能力已授予」而非放行 }
+--- @return table|nil { reasons = table<string>, level = number, bins = table<string> }
+function M.advisory(command, opts)
   if type(command) ~= "string" or command == "" then return nil end
   opts = opts or {}
   local caps = opts.caps or {}
-  -- 破坏性 / 管道执行 / fork 炸弹等 L3 模式
+  local reasons, bins = {}, {}
+  local level = 0
+
+  -- 破坏性 / 管道执行 / fork 炸弹等形迹
   local dlevel, dreasons = _dangerous(command)
-  if dlevel >= M.LEVEL.CRITICAL then
-    return "DESTRUCTIVE:" .. table.concat(dreasons, ",")
+  if dlevel > 0 then
+    level = dlevel
+    for _, r in ipairs(dreasons) do reasons[#reasons + 1] = "DESTRUCTIVE:" .. r end
   end
-  -- 单条命令名判定：无条件拒绝表 → 拒绝；能力门禁表 → 能力缺失才拒绝。
-  local function _deny_bin(base)
-    if DENY_BINS[base] then return "KERNEL_COMMAND:" .. base end
-    local cap = CAP_GATED_BINS[base]
-    if cap and not caps[cap] then
-      return "CAPABILITY_REQUIRED:" .. base .. ":" .. cap
+
+  -- 名字形迹：仅用于提示与抬级；能力已授予时不再作为「缺失能力」提示。
+  local function _mark(base)
+    if KERNEL_TRACE_BINS[base] then
+      reasons[#reasons + 1] = "KERNEL_TRACE:" .. base
+      bins[#bins + 1] = base
+      if level < M.LEVEL.HIGH then level = M.LEVEL.HIGH end
     end
-    return nil
+    local cap = CAP_TRACE_BINS[base]
+    if cap then
+      if not caps[cap] then
+        reasons[#reasons + 1] = "CAPABILITY_MISSING:" .. base .. ":" .. cap
+        if level < M.LEVEL.HIGH then level = M.LEVEL.HIGH end
+      else
+        reasons[#reasons + 1] = "CAPABILITY_GRANTED:" .. base .. ":" .. cap
+      end
+      bins[#bins + 1] = base
+    end
   end
-  -- 内核/系统管理命令：按段检查首词；段首为包装器/解释器时扫描段内所有 token。
   local function _base(tok)
     tok = tok:gsub("^['\"]+", ""):gsub("['\"]+$", "")
     return tok:match("[^/]+$") or tok
@@ -408,16 +427,24 @@ function M.deny_reason(command, opts)
     if #toks > 0 then
       local first = _base(toks[1])
       if WRAPPERS[first] then
-        for _, t in ipairs(toks) do
-          local reason = _deny_bin(_base(t))
-          if reason then return reason end
-        end
+        for _, t in ipairs(toks) do _mark(_base(t)) end
       else
-        local reason = _deny_bin(first)
-        if reason then return reason end
+        _mark(first)
       end
     end
   end
+
+  if #reasons == 0 then return nil end
+  return { reasons = reasons, level = level, bins = bins }
+end
+
+--- 兼容 shim：**恒定返回 nil**（不再拒绝任何命令）。保留函数名是为了让历史调用点与外部
+--- 集成在升级后不会误以为「无命中 = 允许」的语义发生反转；需要形迹信息请改用 `M.advisory`。
+--- @param command string|nil
+--- @param opts table|nil
+--- @return nil
+function M.deny_reason(command, opts) -- luacheck: ignore command opts
+  -- 显式忽略入参：安全边界不由字符静态判定提供（docs/sandbox.md 核心不变量 6）。
   return nil
 end
 

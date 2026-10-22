@@ -1,7 +1,8 @@
 --- 脚本间接执行静态扫描专项测试
 --- @module 'NeoAI.tests.test_sandbox_script_scan'
 --- 覆盖：Shell 脚本正文提取、高级语言内嵌 shell 提取、递归/环、注释剥离、
---- 不透明判定，以及折叠进 risk.deny_reason / privilege.classify / risk.classify 的效果。
+--- 不透明判定，以及折叠进 risk.advisory / privilege.classify / risk.classify 的效果。
+--- 注意：静态扫描**不产生拒绕**（核心不变量 6）——命中只提升级别并强制人工复核。
 
 local tests = require("NeoAI.tests")
 
@@ -33,7 +34,10 @@ tests.suite("sandbox_script_scan", function(_, it)
     local r = ss.scan("bash ./deploy.sh", { cwd = dir })
     t.eq(true, r.indirect, "应识别间接执行")
     t.eq(3, r.danger, "脚本内设备级破坏命令应为 L3")
-    t.not_nil(risk.deny_reason(r.effective), "折叠后应硬拒绝")
+    t.eq(nil, risk.deny_reason(r.effective), "静态形迹不得拒绝执行")
+    local adv = risk.advisory(r.effective)
+    t.not_nil(adv, "应给出 advisory 形迹")
+    t.eq(3, adv.level, "形迹应抬到 L3 以强制复核")
     t.matches("pip install", r.effective, "应包含脚本正文")
   end)
 
@@ -44,7 +48,8 @@ tests.suite("sandbox_script_scan", function(_, it)
     write(dir, "safe.sh", { "#!/bin/sh", "# modprobe evil", "echo ok # rm -rf /", "echo a#b" })
     local r = ss.scan("sh safe.sh", { cwd = dir })
     t.eq(0, r.danger, "注释中的 modprobe / rm -rf 不应命中")
-    t.eq(nil, risk.deny_reason(r.effective), "不应硬拒绝")
+    t.eq(nil, risk.deny_reason(r.effective), "任意情况均不拒绝")
+    t.eq(nil, risk.advisory(r.effective), "注释中的危险命令不产生 advisory")
   end)
 
   it("scan：脚本内内核命令可硬拒绝", function(t)
@@ -53,11 +58,13 @@ tests.suite("sandbox_script_scan", function(_, it)
     local dir = tmpdir()
     write(dir, "k.sh", { "#!/bin/bash", "sudo modprobe nvidia" })
     local r = ss.scan("bash k.sh", { cwd = dir })
-    t.not_nil(risk.deny_reason(r.effective), "应硬拒绝内核命令")
+    t.eq(nil, risk.deny_reason(r.effective), "内核命令形迹不拒绝执行（由 seccomp 拦）")
+    t.not_nil(risk.advisory(r.effective), "但应作为 advisory 形迹强制复核")
 
     write(dir, "k2.sh", { "#!/bin/bash", "if true; then modprobe evil; fi" })
     local r2 = ss.scan("bash k2.sh", { cwd = dir })
-    t.not_nil(risk.deny_reason(r2.effective), "then 分支内的内核命令也应硬拒绝")
+    t.eq(nil, risk.deny_reason(r2.effective), "then 分支内的内核命令同样不拒绝")
+    t.not_nil(risk.advisory(r2.effective), "then 分支内的形迹应被识别")
   end)
 
   it("scan：Python 内嵌 shell（subprocess/os.system）被提取并递归", function(t)
@@ -74,7 +81,8 @@ tests.suite("sandbox_script_scan", function(_, it)
     t.eq(true, r.indirect)
     t.true_(r.danger >= 2, "内嵌 modprobe 应被识别（L2/L3）")
     t.matches("inner", r.effective, "应递归展开被引用的脚本")
-    t.not_nil(risk.deny_reason(r.effective), "内嵌内核命令应硬拒绝")
+    t.eq(nil, risk.deny_reason(r.effective), "内嵌内核命令不拒绝执行")
+    t.not_nil(risk.advisory(r.effective), "但应作为 advisory 形迹强制复核")
   end)
 
   it("scan：Node/Ruby/Perl 内嵌 shell 被提取", function(t)
@@ -159,7 +167,7 @@ tests.suite("sandbox_script_scan", function(_, it)
     t.true_(vim.tbl_contains(r.reasons, "OPAQUE_SCRIPT_EXECUTION"), "应记录原因")
   end)
 
-  it("门禁：脚本内内核命令经 run_command 被硬拒绝（不执行）", function(t)
+  it("门禁：脚本内内核命令不再被文本拒绝（交由 seccomp 拦）", function(t)
     local dir = tmpdir()
     write(dir, "k.sh", { "#!/bin/bash", "modprobe nonexistent_neoai_script" })
     local tools = require("NeoAI.tools")
@@ -169,7 +177,10 @@ tests.suite("sandbox_script_scan", function(_, it)
     }, {}):then_(function(r) out = tostring(r); done = true end,
       function(e) out = "ERR:" .. tostring(e and e.message or e); done = true end)
     t.true_(vim.wait(10000, function() return done end), "命令应完成")
-    t.matches("硬拒绝", tostring(out), "应硬拒绝脚本内的内核命令")
+    -- 核心不变量 6：脚本正文的文本形迹只提升风险/强制复核，不拒绝执行；
+    -- `modprobe` 的真实阻断来自 seccomp 基线（init_module EPERM）。
+    local msg = tostring(out)
+    t.eq(nil, msg:find("沙箱硬拒绝", 1, true), "不得以脚本正文文本拒绝（实际: " .. msg .. "）")
   end)
 
   it("scan：禁用时不扫描", function(t)
