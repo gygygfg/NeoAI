@@ -70,11 +70,11 @@ viol_4=""
 #     允许的文件：risk.lua 的形迹表（advisory）与 exec_guard.lua 的能力类别表（syscall 层）。
 viol_4a=$(grep -nE '^\s*local\s+(DENY_BINS|CAP_GATED_BINS|DENY_COMMANDS|HARD_DENY_BINS)\s*=' "${SRC[@]}" 2>/dev/null || true)
 [ -n "$viol_4a" ] && viol_4="$viol_4$viol_4a"$'\n'
-# 4b) 禁止把 risk.deny_reason 的返回值直接用于拒绝执行。
-#     唯一允许的调用点在 wrapper.lua 的 text_guard="enforce" 应急回滚分支。
-viol_4b=$(grep -nE 'deny_reason\(' "${SRC[@]}" 2>/dev/null \
-  | grep -v '^lua/NeoAI/sandbox/review/risk.lua:' \
-  | grep -v '^lua/NeoAI/sandbox/execution/wrapper.lua:' || true)
+# 4b) 禁止任何形式的「文本判定拒绝」API 复活——`deny_reason` 已彻底删除，
+#     连同 text_guard="enforce" 逃生口。不设 allowlist：连定义都不允许出现。
+#     注释行（`--` 开头）允许提及该名字，用于说明「为何删除」；只拦真实代码引用。
+viol_4b=$(grep -nE '\bdeny_reason\b' "${SRC[@]}" 2>/dev/null \
+  | grep -vE ':[0-9]+:[[:space:]]*--' || true)
 [ -n "$viol_4b" ] && viol_4="$viol_4$viol_4b"$'\n'
 # 4c) 禁止在沙箱门禁里以 async.reject 表达「命令文本命中」类拒绝。
 viol_4c=$(grep -nE 'async\.reject\(.*(沙箱硬拒绝|KERNEL_COMMAND|CAPABILITY_REQUIRED)' "${SRC[@]}" 2>/dev/null || true)

@@ -115,17 +115,22 @@ tests.suite("sandbox_consent_wait", function(_, it)
   it("同意模块的 request 均已接入等待暂停机制", function(t)
     --- 各模块 `request` 被包装为返回 `timer.await(...)` 的结果；无 UI 时立即结算，
     --- 此处只校验接入存在（源码断言），避免依赖真实弹窗。
-    local files = {
-      "lua/NeoAI/sandbox/review/device_consent.lua",
-      "lua/NeoAI/sandbox/review/policy_consent.lua",
-      "lua/NeoAI/sandbox/net/net_consent.lua",
-      "lua/NeoAI/sandbox/secret/secret_alert.lua",
+    --- 路径必须绝对化：多套件并行时 cwd 不保证是仓库根（相对路径会 E484）。
+    local mods = {
+      "NeoAI.sandbox.review.device_consent",
+      "NeoAI.sandbox.review.policy_consent",
+      "NeoAI.sandbox.net.net_consent",
+      "NeoAI.sandbox.secret.secret_alert",
     }
-    for _, f in ipairs(files) do
-      local content = table.concat(vim.fn.readfile(f), "\n")
+    for _, m in ipairs(mods) do
+      local mod = require(m)
+      local info = debug.getinfo(mod.request, "S")
+      local path = info and info.source and info.source:gsub("^@", "") or nil
+      t.not_nil(path, "应能定位模块源文件: " .. m)
+      local content = table.concat(vim.fn.readfile(path), "\n")
       t.ok(content:find("timer", 1, true) ~= nil and
-        content:find('await(_request(', 1, true) ~= nil,
-        f .. " 的 request 应包装为等待不计入超时")
+        content:find("await(_request(", 1, true) ~= nil,
+        m .. " 的 request 应包装为等待不计入超时")
     end
   end)
 end)

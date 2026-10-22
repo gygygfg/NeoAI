@@ -1669,7 +1669,7 @@ local function _gate_inner(tool, args, ctx, call_original)
     and type(args.command) == "string" then
     local dc_ok, dc = pcall(require, "NeoAI.sandbox.review.device_consent")
     if dc_ok and dc and dc.enabled() then
-      -- 脚本间接执行静态扫描：结果缓存复用（下面 deny_reason 阶段也使用，避免二次扫描）。
+      -- 脚本间接执行静态扫描：结果缓存复用（下面 advisory 阶段也使用，避免二次扫描）。
       if ctx.sandbox_device_scan == nil then
         local scan = nil
         local ok_ss, ss = pcall(require, "NeoAI.sandbox.observe.script_scan")
@@ -1893,34 +1893,15 @@ local function _gate_inner(tool, args, ctx, call_original)
         effective_command = scan and scan.effective,
       })
     end)
-    local risk_mod = require("NeoAI.sandbox.review.risk")
-    local text_guard = (config_store.get("tools.sandbox.risk") or {}).text_guard
-    if text_guard == "enforce" then
-      -- 应急回滚路径（tools.sandbox.risk.text_guard="enforce"）：恢复旧的文本硬拒绝波形。
-      -- **不可靠、不是安全边界**——仅用于排查兼容问题时短时使用（见 default_config 注释）。
-      local deny = risk_mod.deny_reason((scan and scan.effective) or args.command, { caps = caps })
-      if deny then
-        control.transition(attempt, "PARSED")
-        control.transition(attempt, "BLOCKED")
-        require("NeoAI.kernel.logger").warn(
-          "[sandbox:advisory] text_guard=enforce（应急回滚，非安全边界）命中: %s", tostring(deny))
-        return async.reject({
-          kind = "sandbox",
-          message = "沙箱拒绝（内核/危险命令形迹，text_guard=enforce 应急模式）: " .. deny,
-          reason_codes = { deny },
-          command_id = attempt.command_id,
-        })
-      end
-    else
-      local adv = risk_mod.advisory((scan and scan.effective) or args.command, { caps = caps })
-      if adv and #adv.reasons > 0 then
-        ctx.sandbox_advisory = adv
-        ctx.needs_confirm = true
-        attempt.advisory_reasons = adv.reasons
-        require("NeoAI.kernel.logger").info(
-          "[sandbox:advisory] 命中危险命令形迹（仅复核，不拒绝）: %s",
-          table.concat(adv.reasons, ", "))
-      end
+    local adv = require("NeoAI.sandbox.review.risk").advisory(
+      (scan and scan.effective) or args.command, { caps = caps })
+    if adv and #adv.reasons > 0 then
+      ctx.sandbox_advisory = adv
+      ctx.needs_confirm = true
+      attempt.advisory_reasons = adv.reasons
+      require("NeoAI.kernel.logger").info(
+        "[sandbox:advisory] 命中危险命令形迹（仅复核，不拒绝）: %s",
+        table.concat(adv.reasons, ", "))
     end
   end
   control.transition(attempt, "PARSED")

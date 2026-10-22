@@ -839,12 +839,12 @@ detection and `risk.classify` security level or message text) and **produces no 
 > attributes by the real `execve` chain and `cgroup.kill`s; overlay effect observation captures real
 > file changes. The value of the static scan is **escalating risk to human review**, not blocking.
 >
-> **Emergency rollback**: `tools.sandbox.risk.text_guard="enforce"` restores the old text-based hard
-> deny shape (reasons stay compatible: `KERNEL_COMMAND:*` / `CAPABILITY_REQUIRED:*` /
-> `DESTRUCTIVE:*`). It is **unreliable and not a security boundary** — use it only to debug
-> compatibility problems. Under the default `"advisory"`, `risk.deny_reason` always returns `nil`;
-> use `risk.advisory` for trace information (`reasons`/`level`/`bins`). Staying in `enforce` makes
-> users believe automatic blocking is in effect, exactly the illusion this invariant removes.
+> **Emergency rollback**: there is none. The `risk` module exposes **no denial API**
+> (`deny_reason` was deleted) and no `text_guard="enforce"` escape hatch — keeping a switch that
+> restores text-based hard denial would mean permanently keeping an unreliable path that users
+> would mistake for a boundary, exactly the illusion this invariant removes. Use `risk.advisory`
+> for trace information (`reasons`/`level`/`bins`). If you must roll back, use `git revert`
+> (batches are independently revertible) so the revert is explicit, visible and reviewed.
 
 ### Dangerous-device access gate (`tools.sandbox.devices`, on by default)
 

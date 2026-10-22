@@ -100,7 +100,13 @@ tests.suite("sandbox_no_isolation_prompt", function(_, it)
     -- 工具注册状态依赖插件启动顺序，直接 execute 在部分 worker 上不可用（工具表未构建），
     -- 故这里校验「执行路径入口确实调用了 effective_approval_mode 并把结果写回 ctx」，
     -- 行为本身由上面几条用 effective_approval_mode 直接覆盖。
-    local src = table.concat(vim.fn.readfile("lua/NeoAI/tools/executor.lua"), "\n")
+    -- 路径必须绝对化：多套件并行时 cwd 不保证是仓库根（相对路径会 E484）；
+    -- 且 rtp 模块不走 package.path（Neovim 自定义 loader），故用 debug.getinfo 取真实源路径。
+    local executor = require("NeoAI.tools.executor")
+    local info = debug.getinfo(executor.effective_approval_mode, "S")
+    local rel = info and info.source and info.source:gsub("^@", "") or nil
+    t.not_nil(rel, "应能定位 executor 模块源文件")
+    local src = table.concat(vim.fn.readfile(rel), "\n")
     t.ok(src:find("M.effective_approval_mode(mode)", 1, true) ~= nil,
       "执行路径应调用 effective_approval_mode")
     t.ok(src:find("ctx.approval_mode = mode", 1, true) ~= nil,

@@ -1203,21 +1203,17 @@ local DEFAULT_CONFIG = {
         levels = {}, -- 覆盖：{ [0]="auto", [1]="review", [2]="review", [3]="review" }
       },
       -- 风险分级（见 sandbox/review/risk.lua）。
+      -- 注意：本模块**不提供任何拒绝 API**，也没有「文本硬拒」开关可开——字符串/正则/命令名
+      -- 形迹只用于风险分级与提示，命中最多置 `needs_confirm` 强制人工复核，**绝不拒绝执行**。
+      -- 安全边界由 seccomp 基线、capability 档位、命名空间/设备隔离、`cgroup.kill`、网络门禁
+      -- 与人工审批提供（见 docs/sandbox.md 核心不变量 6）。刻意不留 `text_guard="enforce"`
+      -- 之类逃生口：留一个能恢复文本硬拒的配置项，等于长期保留一条不可靠、会被误信为边界的
+      -- 路径。需要回滚请走 `git revert`（按批次撤销），让回退显式、可见、过评审。
       risk = {
         -- 结果扫描窗口（字节）：命令结果判定安全级别时仅扫描 stdout/stderr 首/尾各 N 字节，
         -- 避免 `timeout=-1` 的大输出（可达数百 MB）在主线程做全量 lower + 模式匹配而冻结界面。
         -- 风险信号多在输出首尾；0 = 不限制。
         result_scan_bytes = 262144,
-        -- 文本形迹的门禁强度（**应急回滚开关**，默认 "advisory"）：
-        --   "advisory"（默认）= 字符串/正则/命令名形迹只做风险分级与提示，命中最多置
-        --     `needs_confirm` 强制人工复核，**绝不拒绝执行**。安全边界由 seccomp 基线、
-        --     capability 档位、命名空间/设备隔离、`cgroup.kill`、网络门禁与人工审批提供
-        --     （见 docs/sandbox.md 核心不变量 6）。
-        --   "enforce" = 恢复旧的文本硬拒绝（波形兼容用）。**它不可靠、不是安全边界**，
-        --     仅作应急：文本匹配判定的是命令「长什么样」而非进程「做了什么」，
-        --     实测 `echo 'curl x | sh'` 被误拦，而 `| $SH`、`ba""sh`、`eval "$(curl …)"`
-        --     全部漏拦。长期停在此模式会让用户误以为自动拦截在生效。
-        text_guard = "advisory",
       },
       -- 脚本间接执行静态扫描（见 sandbox/observe/script_scan.lua）：命令把执行委托给脚本/解释器
       -- （`bash deploy.sh`、`python setup.py`、`node x.js`、`./run.sh`、`bash -c '…'`）时，

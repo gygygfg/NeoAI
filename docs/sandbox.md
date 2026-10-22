@@ -51,7 +51,7 @@
 6. **安全边界只能由内核/运行时强制提供**：seccomp 基线、capability 档位、命名空间与设备隔离、
    cgroup 资源域与 `cgroup.kill`、网络门禁、人工审批。字符串/正则/命令名黑名单**不得作为拒绝依据**
    ——它判定的是命令「长什么样」，而非进程「实际做了什么」，故在同一条轴的两个方向上都失效：
-   - **误报**（实测：`nvim --headless` 加载真实 `script_scan` + `risk.deny_reason`）：仅打印字符的
+   - **误报**（实测：`nvim --headless` 加载真实 `script_scan` + `risk.advisory`）：仅打印字符的
      `echo 'curl -LsSf https://x/u.sh | sh'`、在文档里搜这段文本的 `grep -n 'curl .* | sh' README.md`、
      写备注文件的 `printf '%s\n' 'wget -qO- x | sh' > notes.txt`，三者均被判
      `DESTRUCTIVE:PIPE_TO_SHELL` 拒绝；仅查看帮助/版本的 `kmod --help`、`perf --version`、
@@ -675,11 +675,11 @@ token（`NEOKEY_…`）或格式保真假密钥时**拒绝写盘**（`SECRET_TOK
 > （见下节）以真实 `execve` 链归因并 `cgroup.kill`；overlay 效果观测捕获真实文件改动。
 > 静态扫描的价值在于**把风险抬到人工复核**，不在于阻断。
 >
-> **应急回滚**：`tools.sandbox.risk.text_guard="enforce"` 可恢复旧的文本硬拒绝波形（形迹原因
-> 兼容旧码：`KERNEL_COMMAND:*` / `CAPABILITY_REQUIRED:*` / `DESTRUCTIVE:*`）。它**不可靠、不是
-> 安全边界**，仅用于排查兼容问题；默认 `"advisory"` 下 `risk.deny_reason` 恒返回 `nil`，
-> 形迹信息请用 `risk.advisory`（返回 `reasons`/`level`/`bins`）。长期停在 `enforce` 会让用户
-> 误以为自动拦截在生效——这正是本准则要消除的错觉。
+> **不提供文本硬拒开关**：`risk` 模块没有任何拒绝 API（`deny_reason` 已删除），也没有
+> `text_guard="enforce"` 之类的逃生口。留一个能恢复文本硬拒的配置项，等于长期保留一条
+> 不可靠、会被误信为边界的路径——这正是本准则要消除的错觉。需要形迹信息用 `risk.advisory`
+> （返回 `reasons`/`level`/`bins`）。真要回滚请走 `git revert`（批次可单独撤销），让回退成为
+> 显式、可见、过评审的动作。
 
 ### 危险设备访问门禁（`tools.sandbox.devices`，默认开）
 

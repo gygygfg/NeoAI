@@ -705,15 +705,12 @@ sandbox = {
   -- scan; 0 = unlimited.
   risk = {
     result_scan_bytes = 262144,
-    -- Textual-trace gate strength (**emergency rollback switch**, default "advisory"):
-    --   "advisory" = string/regex/command-name traces only grade risk and text; a hit may at most
-    --     set needs_confirm for forced human review and **never denies execution**; security
-    --     boundaries come from seccomp/capabilities/namespace+device isolation/cgroup.kill/
-    --     network gate/human approval.
-    --   "enforce" = restore the old text-based hard deny. **Unreliable, not a security boundary**
-    --     (it judges what the command looks like, not what the process does: `echo 'curl x | sh'`
-    --     is falsely denied while `| $SH` and `ba""sh` slip through) — emergency use only.
-    text_guard = "advisory",
+    -- This module exposes **no denial API** and no "text hard-denial" switch: string/regex/
+    -- command-name traces only grade risk and text; a hit may at most set needs_confirm for forced
+    -- human review and never denies execution. Boundaries come from seccomp/capabilities/
+    -- namespace+device isolation/cgroup.kill/network gate/human approval. There is deliberately no
+    -- text_guard="enforce" escape hatch (unreliable and easily mistaken for a boundary); roll back
+    -- via git revert instead.
   },
   -- Static scan of indirect script execution: when a command delegates to a script/interpreter
   -- (`bash deploy.sh`, `python setup.py`, `node x.js`, `./run.sh`, `bash -c '…'`), the script is

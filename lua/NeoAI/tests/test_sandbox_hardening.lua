@@ -28,10 +28,8 @@ tests.suite("sandbox_hardening", function(_, it)
   it("能力形迹只做分级提示：iptables 不因缺少 CAP_NET_ADMIN 而被拒绝", function(t)
     local risk = require("NeoAI.sandbox.review.risk")
     -- 核心不变量 6：字符/命令名静态判定不得作为拒绝依据——真实约束是内核（EPERM）。
-    t.eq(nil, risk.deny_reason("iptables -F"), "deny_reason 恒为 nil（不再拒绝）")
-    t.eq(nil, risk.deny_reason("iptables -F", { caps = {} }), "deny_reason 恒为 nil")
-    t.eq(nil, risk.deny_reason("modprobe x", { caps = { CAP_NET_ADMIN = true } }),
-      "deny_reason 恒为 nil（modprobe 由 seccomp 拦，不靠名字）")
+    -- 拒绝 API 已彻底移除（连 text_guard="enforce" 逃生口一并删除），故直接断言不存在。
+    t.eq(nil, risk.deny_reason, "拒绝 API 已移除（不得再以文本判定拒绝命令）")
 
     -- advisory 给出形迹与提示，能力状态只影响文案（MISSING vs GRANTED），不影响放行与否。
     local adv = risk.advisory("iptables -F")
@@ -51,8 +49,8 @@ tests.suite("sandbox_hardening", function(_, it)
     t.ok(has_granted, "已授予能力时提示 CAPABILITY_GRANTED")
 
     -- 纯查看类命令（help/version）也只是 advisory，绝不拒绝。
-    t.eq(nil, risk.deny_reason("kmod --help"), "kmod --help 不得被拒绝")
-    t.not_nil(risk.advisory("kmod --help"), "但应作为形迹提示")
+    t.not_nil(risk.advisory("kmod --help"), "kmod --help 应作为形迹提示")
+    t.not_nil(risk.advisory("modprobe x"), "modprobe 应作为形迹提示（由 seccomp 拦）")
   end)
 
   it("privilege.effective_caps：T2 默认 ALL 不展开，显式 cap_add 才授予", function(t)
