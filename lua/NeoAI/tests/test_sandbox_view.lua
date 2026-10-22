@@ -639,7 +639,11 @@ tests.suite("sandbox_view", function(_, it)
     local host = require("NeoAI.utils.host")
     local g = cgroup.global_cpu_max()
     t.true_(g >= 1, "全局预算至少 1 核")
-    t.true_(g <= host.core_budget(), "全局预算应不超内部 max(1, 核数-2)")
+    -- Android 会动态热插拔 CPU（`vim.uv.cpus()` / `nproc` 在 8 与 6 之间波动），
+    -- 故不能断言 `g <= host.core_budget()`——两次读取可能落在不同的在线核数上而假失败。
+    -- 这里改用「不超过总核数」这一稳定上界；预算的「预留 2 核」语义由下式在单次采样内校验。
+    t.true_(g <= host.cores(), "全局预算应不超总核数")
+    t.eq(math.max(1, host.cores() - 2), g, "全局预算应为 max(1, 核数-2)（单次采样内校验）")
     t.eq(g * 100000, cgroup.effective_cpu_max((g + 5) * 100000), "单任务配额应被全局预算封顶")
     t.eq(100000, cgroup.effective_cpu_max(100000), "低于预算的单任务配额保持")
     t.eq(0, cgroup.effective_cpu_max(0), "0 表示不限制")

@@ -117,9 +117,18 @@ local function _build_btrace_script()
     end
   end
   -- exec / net（原行为）
+  -- X 帧：`X\texecve\t<pid>\t<filename>`。ppid 不在这里取（bpftrace 访问 `task_struct->real_parent`
+  -- 在新内核上可能编译失败，一旦整脚本编译失败则所有探针都不挂载），改由 exec_guard 在 Lua 侧
+  -- 读 `/proc/<pid>/stat` 第 4 字段获得（廉价、可靠、不影响探针）。
   if _has_tp("sys_enter_execve") then
     add('tracepoint:syscalls:sys_enter_execve /cgroup == $1 && comm != "bwrap"/ {')
     add('  printf("X\\texecve\\t%d\\t%s\\n", pid, str(args->filename));')
+    add('}')
+  end
+  -- execveat（`execveat(AT_FDCWD, path, …)`）：与 execve 同样记 X，避免改接入口绕过调用链。
+  if _has_tp("sys_enter_execveat") then
+    add('tracepoint:syscalls:sys_enter_execveat /cgroup == $1 && comm != "bwrap"/ {')
+    add('  printf("X\\texecveat\\t%d\\t%s\\n", pid, str(args->filename));')
     add('}')
   end
   if _has_tp("sys_enter_connect") then
@@ -658,7 +667,9 @@ local function _parse_strace_worker(encoded)
     local pid, rest = line:match("^%[pid%s+(%d+)%]%s+(.*)$")
     if not pid then pid, rest = line:match("^(%d+)%s+(.*)$") end
     if pid then
-      -- 仅文件打开事件（与 eBPF 后端一致）；execve 归 exec 类，观测消费方不使用。
+      -- 仅文件打开事件（与 eBPF 后端一致）。execve 由 eBPF 的 X 帧与 procfs 后端提供；
+      -- strace 工作线程保持原样（仅文件路径），故 strace 后端下 exec 调用链如实缺失
+      -- （见 docs/sandbox.md「动态调用链判定」的后端降级说明）。
       local p = rest:match('^openat%(%s*[^,]+,%s*"([^"]*)"')
         or rest:match('^open%("([^"]*)"')
       if p then

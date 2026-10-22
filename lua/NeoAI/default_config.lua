@@ -1011,6 +1011,18 @@ local DEFAULT_CONFIG = {
         prewarm = true,
         -- 预热有效期（毫秒）：超时未被下一条进程命令复用则回收（停止探针、释放 cgroup）。
         prewarm_ttl_ms = 90000,
+        -- 动态 exec 调用链守卫（sandbox/observe/exec_guard.lua）：消费 eBPF `sys_enter_execve`/
+        -- `execveat` 与 procfs 的 exec 事件，还原「根命令 → 各级子进程」的真实调用链，按
+        -- **能力类别**（内核模块/时钟/防火墙/裸 IO/挂载/重启/bpf/交换区/ptrace）归因，命中危险
+        -- syscall 时由调用方 `cgroup.kill` 整树终止并写 evidence（`exec_chain` 字段）。
+        -- 为什么不用命令名/文本：文本判定实测双向失效（`echo 'curl x | sh'` 误拦、`| $SH` 漏拦），
+        -- 而 `busybox iptables`、软链、`$VAR`、`eval` 派生都会在真实 execve 链上暴露。
+        -- **能力边界**：属「观测 + 补救」，命中时副作用可能已发生一次，不等价于 seccomp 的发生前
+        -- 拦截；无 eBPF/procfs 后端时如实缺失（见 docs/sandbox.md「动态调用链判定」）。
+        exec_guard = {
+          enabled = true, -- 总开关
+          max_chain = 64, -- 每条命令调用链保留的节点上限（环形淘汰最旧）
+        },
         -- 越界访问留痕忽略路径：这些目录（软件包/依赖缓存）的读取是包管理/构建的正常行为，
         -- 不记为「越界访问」、不在审批悬浮窗的「越界访问留痕」区展示，避免 `~/.cache/uv`、
         -- `~/.npm` 等大量缓存读取刷屏。支持 `~` 展开与 glob（`*`）。默认还会合并

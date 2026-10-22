@@ -1116,6 +1116,14 @@ end
 --- @param evt table { kind, op, pid, path?, host?, port? }
 local function _on_observed(attempt, ctx, evt)
   if type(evt) ~= "table" then return end
+  -- exec 事件：喂给动态调用链守卫，还原「哪个二进制被真正执行」。
+  -- 属观测+补救（命中后 cgroup.kill，副作用可能已发生一次），不等价于 seccomp 拦截。
+  if evt.kind == "exec" then
+    pcall(function()
+      require("NeoAI.sandbox.observe.exec_guard").observe(evt, attempt and attempt.attempt_id)
+    end)
+    return
+  end
   if evt.kind ~= "file" then return end
   local p = evt.path
   if type(p) ~= "string" or p == "" then return end
@@ -2255,11 +2263,23 @@ local function _gate_inner(tool, args, ctx, call_original)
             on_violation = function(syscall, pid)
               if ctx.sandbox_behavior_violation then return end
               ctx.sandbox_behavior_violation = syscall
+              -- 动态 exec 调用链归因：用真实 execve 链说明「哪个二进制触发了哪个能力」，
+              -- 而非猜命令文本。属观测+补救（副作用可能已发生一次），不等价于 seccomp 拦截。
+              local attribution = nil
+              pcall(function()
+                local guard = require("NeoAI.sandbox.observe.exec_guard")
+                attribution = guard.violation(attempt.attempt_id, syscall, pid)
+                ctx.sandbox_exec_chain = attribution and attribution.chain or nil
+              end)
               pcall(cgroup.kill, cg_handle)
               pcall(function()
                 require("NeoAI.sandbox.review.evidence").add("sandbox_behavior_violation", {
                   syscall = syscall, pid = pid, tool = attempt.tool_name,
                   command = args and args.command, source = "observed",
+                  capability_class = attribution and attribution.class or nil,
+                  exec_path = attribution and attribution.path or nil,
+                  exec_argv0 = attribution and attribution.argv0 or nil,
+                  exec_chain = attribution and require("NeoAI.sandbox.observe.exec_guard").chain_evidence(attribution.chain) or nil,
                 }, { tool = attempt.tool_name, command_id = attempt.command_id,
                   attempt_id = attempt.attempt_id })
               end)
@@ -2268,11 +2288,21 @@ local function _gate_inner(tool, args, ctx, call_original)
                   require("NeoAI.kernel.events").SANDBOX_BEHAVIOR_VIOLATION, {
                     syscall = syscall, pid = pid, command_id = attempt.command_id,
                     attempt = attempt.attempt_id,
+                    capability_class = attribution and attribution.class or nil,
+                    exec_path = attribution and attribution.path or nil,
                   })
               end)
-              pcall(vim.notify,
-                "[NeoAI] 沙箱行为违规：检测到危险系统调用 " .. tostring(syscall) .. "，已终止命令",
-                vim.log.levels.WARN)
+              do
+                local detail = ""
+                if attribution then
+                  local okd, txt = pcall(require("NeoAI.sandbox.observe.exec_guard").describe, attribution)
+                  if okd and type(txt) == "string" and txt ~= "" then detail = "（" .. txt .. "）" end
+                end
+                pcall(vim.notify,
+                  "[NeoAI] 沙箱行为违规：检测到危险系统调用 " .. tostring(syscall) .. detail
+                    .. "，已终止命令",
+                  vim.log.levels.WARN)
+              end
             end,
             on_error = function(msg)
               require("NeoAI.kernel.logger").debug("[sandbox] 行为兜底观测: %s", tostring(msg))
