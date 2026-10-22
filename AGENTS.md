@@ -88,8 +88,18 @@ nvim --headless --clean -u NONE --cmd "set rtp+=$PWD" \
    挂载/capability 则忽略并留痕（载荷在 userns 内为 root，T0 所需能力等效具备）。
    任何降级均写 evidence（`sandbox_degrade`）+ 发 `SANDBOX_DEGRADED` 事件 + `vim.notify`（会话去重）+
    结果提示。安全优先可经 `tools.sandbox.seccomp.on_unavailable="deny"`（或 `require_backstop=true`）
-   恢复 fail-closed。文本匹配（`risk.deny_reason` 等）只做审批分级，**绝不冒充安全边界**，不新增危险
-   命令文本名单。默认异步审批（`tools.approval.mode="async"`）：效果类工具立即在沙箱内
+   恢复 fail-closed。**禁止以字符/文本静态判定作为拒绝依据**：字符串/正则/命令名黑名单只能用于
+   **风险分级与提示文案**（命中最多 `needs_confirm` + 强制人工复核），**绝不拒绝执行**、绝不新增
+   危险命令名或危险文本模式的黑名单。理由（实测见 `docs/sandbox.md` 核心不变量 6）：文本匹配判定
+   的是命令「长什么样」而非进程「做了什么」，`kmod --help`、`echo 'curl x | sh'` 被误拦，而
+   `| $SH`、`ba""sh`、`eval "$(curl …)"`、先落盘再 `source` 全部漏判。新增拒绝必须落在**内核/运行时
+   强制层**：seccomp 基线（syscall）、capability 档位（`CAP_NET_ADMIN` 等）、命名空间与设备隔离、
+   cgroup 资源域与 `cgroup.kill`、网络门禁、人工审批。危险二进制以**所需被剥夺的 syscall/capability**
+   定义，**不以名字定义**（busybox 软链可绕名字，绕不过 `EPERM`）。动态侧（exec 调用链守卫）只做
+   **观测 + 补救**，不等价于 seccomp 的发生前拦截；classic seccomp 无法解引用路径参数，「按二进制
+   路径发生前拦截」需 LSM/bwrap。**无任何动态强制层**（既无 seccomp 又无 eBPF backstop）时强制
+   `approval_mode="prompt"`（同步事前审批），**禁止** `async` 的「先执行后审批」。默认异步审批
+   （`tools.approval.mode="async"`）：效果类工具立即在沙箱内
    执行并冻结候选，真实修改进入待审队列，用户经 `:NeoAISandboxReview` 异步确认后应用。
    详见 `docs/sandbox.md`。
 

