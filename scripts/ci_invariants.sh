@@ -58,6 +58,35 @@ else
   echo "OK: 无直接 require services.*（allowlist：services/、plugins/、init.lua、lualine 集成）"
 fi
 
+# ---------- 不变量 4：安全边界禁止由字符静态判定提供 ----------
+# 依据：docs/sandbox.md 核心不变量 6 / AGENTS.md 约定 9。字符串/正则/命令名黑名单判定的是
+# 命令「长什么样」，而非进程「做了什么」，实测双向失效（`echo 'curl x | sh'` 被误拦，
+# `| $SH`、`ba""sh`、`eval "$(curl …)"` 全部漏拦）。新增拒绝必须落在内核/运行时强制层：
+# seccomp 基线、capability 档位、命名空间与设备隔离、cgroup 资源域与 cgroup.kill、网络门禁、
+# 人工审批。危险二进制以「所需被剥夺的 syscall/capability」定义，不以名字定义。
+section "不变量 4：安全边界禁止由字符静态判定提供"
+viol_4=""
+# 4a) 禁止重建「命令名黑名单」式的硬拒表（如旧 DENY_BINS / CAP_GATED_BINS）。
+#     允许的文件：risk.lua 的形迹表（advisory）与 exec_guard.lua 的能力类别表（syscall 层）。
+viol_4a=$(grep -nE '^\s*local\s+(DENY_BINS|CAP_GATED_BINS|DENY_COMMANDS|HARD_DENY_BINS)\s*=' "${SRC[@]}" 2>/dev/null || true)
+[ -n "$viol_4a" ] && viol_4="$viol_4$viol_4a"$'\n'
+# 4b) 禁止把 risk.deny_reason 的返回值直接用于拒绝执行。
+#     唯一允许的调用点在 wrapper.lua 的 text_guard="enforce" 应急回滚分支。
+viol_4b=$(grep -nE 'deny_reason\(' "${SRC[@]}" 2>/dev/null \
+  | grep -v '^lua/NeoAI/sandbox/review/risk.lua:' \
+  | grep -v '^lua/NeoAI/sandbox/execution/wrapper.lua:' || true)
+[ -n "$viol_4b" ] && viol_4="$viol_4$viol_4b"$'\n'
+# 4c) 禁止在沙箱门禁里以 async.reject 表达「命令文本命中」类拒绝。
+viol_4c=$(grep -nE 'async\.reject\(.*(沙箱硬拒绝|KERNEL_COMMAND|CAPABILITY_REQUIRED)' "${SRC[@]}" 2>/dev/null || true)
+[ -n "$viol_4c" ] && viol_4="$viol_4$viol_4c"$'\n'
+if [ -n "$viol_4" ]; then
+  echo "$viol_4"
+  echo "FAIL: 不得以字符/文本静态判定作为拒绝依据（见 docs/sandbox.md 核心不变量 6）"
+  fail=1
+else
+  echo "OK: 无字符静态硬拒（文本形迹仅用于分级/复核）"
+fi
+
 printf '\n----------------------------------------\n'
 if [ "$fail" -eq 0 ]; then
   echo "不变量门禁：全部通过"
