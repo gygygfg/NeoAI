@@ -630,13 +630,16 @@ local function _execute_after_secret_guard(tool, resolved, args, ctx)
   -- 予以保留（strict 更严，不得被降级为 prompt）。降级留痕由沙箱门禁（wrapper.gate）写
   -- evidence/事件；无隔离时不弹 notify、不写主界面降级文案——唯一用户可见交互是由工具审批
   -- 悬浮窗（tool_approval）把关（mode~="async" 时 validator.check_approval 触发 needs_approval）。
-  local sandbox_cfg = config_store.get("tools.sandbox") or {}
-  local no_isolation = sandbox_cfg.enabled ~= false and not require("NeoAI.sandbox.execution.runtime").isolation_available()
-  if no_isolation and mode == "async" then
-    mode = "prompt"
-  end
-  if no_isolation then
+  -- 无隔离后端 / 无动态强制层 → 强制同步事前审批（详见 M.effective_approval_mode）。
+  local resolve_mode = M.effective_approval_mode(mode)
+  mode = resolve_mode.mode
+  local no_isolation = resolve_mode.no_isolation
+  local no_enforcement = resolve_mode.no_enforcement
+  if no_isolation or no_enforcement then
     ctx.approval_mode = mode
+  end
+  if no_enforcement then
+    ctx.sandbox_no_enforcement = true
   end
   local masked_hit, masked_hard = _masked_target(resolved, args, ctx)
   local approval_on = config_store.get("tools.sandbox.mask_dirs_approval") ~= false
@@ -734,6 +737,65 @@ local function _execute_after_secret_guard(tool, resolved, args, ctx)
 
   -- 直接执行
   return _tokenize_out(_execute_tool(tool, args, ctx, timer), ctx, resolved, args)
+end
+
+--- 计算生效的审批模式：无隔离后端 / 无任何动态强制层时强制退回同步事前审批。
+---
+--- 为什么必须退回：撤掉字符静态判定后（docs/sandbox.md 核心不变量 6），无强制层的机器上
+--- 不存在任何自动拒绝能力；此时若仍用 `async`（先执行、事后确认），事故已经发生。唯一诚实的
+--- 处置是让人在**执行前**决策，并如实标注「本机无强制层」，而不是用文本匹配假装有边界。
+--- 用户显式配置的 `strict`/`prompt`/`auto_allow` 予以保留（`strict` 更严，不降级）。
+--- @param mode string|nil 期望模式（ctx.approval_mode 或配置值）
+--- @return table { mode = string, no_isolation = boolean, no_enforcement = boolean }
+function M.effective_approval_mode(mode)
+  mode = mode or "async"
+  local cfg = config_store.get("tools.sandbox") or {}
+  local out = { mode = mode, no_isolation = false, no_enforcement = false }
+  if cfg.enabled == false then
+    -- 沙箱整体关闭属用户显式选择（直跑），不在此处干预审批模式。
+    return out
+  end
+  -- 1) 无命名空间隔离后端（无 init、unshare/userns 被内核拒绝，如 Android/Termux）：
+  --    沙箱不成立，async 依赖「沙箱内先执行、事后确认应用」，故退回 prompt。
+  local ok_rt, runtime = pcall(require, "NeoAI.sandbox.execution.runtime")
+  if ok_rt then
+    local okiso, iso = pcall(runtime.isolation_available)
+    out.no_isolation = (not okiso) or (not iso)
+  else
+    out.no_isolation = true
+  end
+  -- 2) 无任何**动态强制层**（既无 seccomp 基线又无 eBPF 行为兜底，见 docs/sandbox.md §12）：
+  --    沙箱内没有任何「运行时告诉我们该不该拦」的信号，同样不得用字符串匹配假装有边界。
+  local ok_sc, seccomp = pcall(require, "NeoAI.sandbox.execution.seccomp")
+  local smode = "none"
+  if ok_rt then
+    local okm, v = pcall(runtime.seccomp_mode)
+    smode = (okm and v) or "none"
+  end
+  local has_enforcement = false
+  if ok_sc and pcall(seccomp.enabled) and seccomp.enabled() and smode ~= "none" then
+    has_enforcement = true -- 第 1 层：seccomp 已施加（bwrap 原生 --seccomp / setpriv 补装）
+  end
+  if not has_enforcement then
+    local scfg = config_store.get("tools.sandbox.seccomp") or {}
+    if (scfg.backstop or "ebpf") ~= "off" and smode == "none" then
+      local ok_ob, observer = pcall(require, "NeoAI.sandbox.observe.observer")
+      if ok_ob and type(observer.backstop_available) == "function" then
+        local okb, avail = pcall(observer.backstop_available)
+        has_enforcement = okb and avail == true
+      end
+    end
+  end
+  out.no_enforcement = not has_enforcement
+  if (out.no_isolation or out.no_enforcement) and out.mode == "async" then
+    out.mode = "prompt"
+    pcall(function()
+      require("NeoAI.kernel.logger").warn(
+        "[sandbox] %s：审批模式强制退回同步事前审批（prompt），不启用 async 先执行后审批",
+        out.no_isolation and "无命名空间隔离后端" or "无任何动态强制层（无 seccomp 基线且无 eBPF 行为兜底）")
+    end)
+  end
+  return out
 end
 
 --- 执行工具

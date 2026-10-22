@@ -828,11 +828,23 @@ detection and `risk.classify` security level or message text) and **produces no 
   `python -m`, dynamic `-c "$VAR"`, unreadable/oversized scripts) is marked **opaque**, raised to L1
   (`OPAQUE_SCRIPT_EXECUTION`) and forced into review.
 
-> This module is **static** analysis only. It does not trace at runtime: the sandbox seccomp
-> baseline blocks `ptrace`/`bpf`/`process_vm_*`, so `strace`/eBPF are unavailable inside, and shims
-> (`LD_PRELOAD`/PATH wrappers) are trivially bypassable by the AI. The robust dynamic signal is
-> **effect observation** (overlay-captured real file changes, network targets, package-path
-> detection), which complements this static scan.
+> **This module is not a security boundary** (core invariant 6). It judges the **textual traces** of
+> a script body, which was measured to fail in both directions: harmless commands that merely treat a
+> dangerous command as a literal are falsely flagged (`echo 'curl x | sh'`, `grep 'curl .* | sh'`,
+> `printf '… | sh' > notes.txt`), while genuinely dangerous forms are missed (variable indirection
+> `| $SH`, quote splicing `| ba""sh`, `eval "$(curl …)"`, download-then-`source`,
+> `python3 -c exec(urlopen(...))`). Real interception comes from **kernel/runtime enforcement**: the
+> seccomp baseline blocks `init_module`/`bpf`/`perf_event_open`/`mount`/`reboot` and `mknod` device
+> creation; the device gate blocks dangerous device nodes; the exec call-chain guard (next section)
+> attributes by the real `execve` chain and `cgroup.kill`s; overlay effect observation captures real
+> file changes. The value of the static scan is **escalating risk to human review**, not blocking.
+>
+> **Emergency rollback**: `tools.sandbox.risk.text_guard="enforce"` restores the old text-based hard
+> deny shape (reasons stay compatible: `KERNEL_COMMAND:*` / `CAPABILITY_REQUIRED:*` /
+> `DESTRUCTIVE:*`). It is **unreliable and not a security boundary** — use it only to debug
+> compatibility problems. Under the default `"advisory"`, `risk.deny_reason` always returns `nil`;
+> use `risk.advisory` for trace information (`reasons`/`level`/`bins`). Staying in `enforce` makes
+> users believe automatic blocking is in effect, exactly the illusion this invariant removes.
 
 ### Dangerous-device access gate (`tools.sandbox.devices`, on by default)
 

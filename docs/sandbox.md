@@ -674,6 +674,12 @@ token（`NEOKEY_…`）或格式保真假密钥时**拒绝写盘**（`SECRET_TOK
 > `mount`/`reboot` 等 syscall 与 `mknod` 设备位；设备门禁拦危险设备节点；exec 调用链守卫
 > （见下节）以真实 `execve` 链归因并 `cgroup.kill`；overlay 效果观测捕获真实文件改动。
 > 静态扫描的价值在于**把风险抬到人工复核**，不在于阻断。
+>
+> **应急回滚**：`tools.sandbox.risk.text_guard="enforce"` 可恢复旧的文本硬拒绝波形（形迹原因
+> 兼容旧码：`KERNEL_COMMAND:*` / `CAPABILITY_REQUIRED:*` / `DESTRUCTIVE:*`）。它**不可靠、不是
+> 安全边界**，仅用于排查兼容问题；默认 `"advisory"` 下 `risk.deny_reason` 恒返回 `nil`，
+> 形迹信息请用 `risk.advisory`（返回 `reasons`/`level`/`bins`）。长期停在 `enforce` 会让用户
+> 误以为自动拦截在生效——这正是本准则要消除的错觉。
 
 ### 危险设备访问门禁（`tools.sandbox.devices`，默认开）
 
@@ -744,6 +750,13 @@ UI 见 `ui/components/device_consent`，与网络同意/工具审批同款浮窗
   可用时 exec 守卫**如实缺失为「无动态强制层」**——此时按核心不变量 6 强制
   `approval_mode="prompt"`（见「无任何隔离后端」），并写 `sandbox_degrade` + `SANDBOX_DEGRADED`，
   绝不假装有边界。
+  - 当前实现中，**能提供 exec 事件的后端是 `ebpf` 与 `procfs`**（`exec_guard.source_available()`
+    如实报告）；`strace` 后端只采集文件路径（工作线程只保留 `openat/open`），故其下调用链缺失，
+    守卫视为不可用。此为已知取舍：strace 的 `execve` 行解析会改变工作线程输出格式与去重语义，
+    收益不抵风险。
+  - **ppid 来源**：刻意不走 bpftrace 的 `task_struct->real_parent`（新内核上可能编译失败，一旦
+    整脚本编译失败则所有探针都不挂载），改由 Lua 侧读 `/proc/<pid>/stat` 第 4 字段（廉价、可靠）。
+  - **配置**：`tools.sandbox.observe.exec_guard={ enabled=true, max_chain=64 }`。
 - **能力边界（务必如实理解）**：
   - 观测是**尽力而为**：tracepoint 缺失、事件丢失、`procfs` 后端轮询采样漏掉瞬时进程、极短命进程
     在探针就绪前已完成 exec，都可能漏采；不承诺无漏采。

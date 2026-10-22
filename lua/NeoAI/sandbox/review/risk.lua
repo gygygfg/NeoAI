@@ -438,14 +438,43 @@ function M.advisory(command, opts)
   return { reasons = reasons, level = level, bins = bins }
 end
 
---- 兼容 shim：**恒定返回 nil**（不再拒绝任何命令）。保留函数名是为了让历史调用点与外部
---- 集成在升级后不会误以为「无命中 = 允许」的语义发生反转；需要形迹信息请改用 `M.advisory`。
+--- 兼容 shim：默认**恒定返回 nil**（不再拒绝任何命令）。
+---
+--- 安全边界由内核/运行时强制层提供（docs/sandbox.md 核心不变量 6）。保留本函数名是为了让
+--- 历史调用点与外部集成在升级后不会语义反转；需要形迹信息请改用 `M.advisory`。
+---
+--- **应急回滚**：`tools.sandbox.risk.text_guard="enforce"` 可恢复旧的文本硬拒绝波形，
+--- 但它**不可靠、不是安全边界**（判定命令「长什么样」而非进程「做了什么」），仅供排查
+--- 兼容问题时短时使用；默认 `"advisory"` 下本函数永远返回 nil。
 --- @param command string|nil
 --- @param opts table|nil
---- @return nil
-function M.deny_reason(command, opts) -- luacheck: ignore command opts
-  -- 显式忽略入参：安全边界不由字符静态判定提供（docs/sandbox.md 核心不变量 6）。
-  return nil
+--- @return string|nil reason 仅当 text_guard="enforce" 时可能返回形迹原因
+function M.deny_reason(command, opts)
+  local mode
+  pcall(function()
+    mode = (require("NeoAI.kernel.config_store").get("tools.sandbox.risk") or {}).text_guard
+  end)
+  if mode ~= "enforce" then return nil end
+  -- 应急路径：按旧语义返回形迹原因（调用方据此拒绝）。
+  local adv = M.advisory(command, opts)
+  if not adv then return nil end
+  local reasons = {}
+  for _, r in ipairs(adv.reasons) do
+    -- 兼容旧返回格式："DESTRUCTIVE:<names>" / "KERNEL_COMMAND:<bin>" / "CAPABILITY_REQUIRED:<bin>:<cap>"
+    local kernel = r:match("^KERNEL_TRACE:(.+)$")
+    if kernel then
+      reasons[#reasons + 1] = "KERNEL_COMMAND:" .. kernel
+    else
+      local capbin, cap = r:match("^CAPABILITY_MISSING:(.-):(CAP_%w+)$")
+      if capbin then
+        reasons[#reasons + 1] = "CAPABILITY_REQUIRED:" .. capbin .. ":" .. cap
+      elseif not r:match("^CAPABILITY_GRANTED:") then
+        reasons[#reasons + 1] = r
+      end
+    end
+  end
+  if #reasons == 0 then return nil end
+  return table.concat(reasons, ",")
 end
 
 --- 代理规避判定：显式清除/绕过 HTTP(S)_PROXY/ALL_PROXY 的命令。

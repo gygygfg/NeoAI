@@ -1202,18 +1202,28 @@ local DEFAULT_CONFIG = {
         default = "review",
         levels = {}, -- 覆盖：{ [0]="auto", [1]="review", [2]="review", [3]="review" }
       },
-      -- 风险分级（见 sandbox/risk.lua）。
+      -- 风险分级（见 sandbox/review/risk.lua）。
       risk = {
         -- 结果扫描窗口（字节）：命令结果判定安全级别时仅扫描 stdout/stderr 首/尾各 N 字节，
         -- 避免 `timeout=-1` 的大输出（可达数百 MB）在主线程做全量 lower + 模式匹配而冻结界面。
         -- 风险信号多在输出首尾；0 = 不限制。
         result_scan_bytes = 262144,
+        -- 文本形迹的门禁强度（**应急回滚开关**，默认 "advisory"）：
+        --   "advisory"（默认）= 字符串/正则/命令名形迹只做风险分级与提示，命中最多置
+        --     `needs_confirm` 强制人工复核，**绝不拒绝执行**。安全边界由 seccomp 基线、
+        --     capability 档位、命名空间/设备隔离、`cgroup.kill`、网络门禁与人工审批提供
+        --     （见 docs/sandbox.md 核心不变量 6）。
+        --   "enforce" = 恢复旧的文本硬拒绝（波形兼容用）。**它不可靠、不是安全边界**，
+        --     仅作应急：文本匹配判定的是命令「长什么样」而非进程「做了什么」，
+        --     实测 `echo 'curl x | sh'` 被误拦，而 `| $SH`、`ba""sh`、`eval "$(curl …)"`
+        --     全部漏拦。长期停在此模式会让用户误以为自动拦截在生效。
+        text_guard = "advisory",
       },
-      -- 脚本间接执行静态扫描（见 sandbox/script_scan.lua）：命令把执行委托给脚本/解释器
+      -- 脚本间接执行静态扫描（见 sandbox/observe/script_scan.lua）：命令把执行委托给脚本/解释器
       -- （`bash deploy.sh`、`python setup.py`、`node x.js`、`./run.sh`、`bash -c '…'`）时，
       -- 执行前读取脚本内容（优先沙箱暂存副本）并提取 Shell 正文与高级语言内嵌 shell 调用，
-      -- 折叠进危险识别/权限分类；脚本内破坏性命令硬拒绝，其余命中或不透明（eval、base64|sh、
-      -- 动态 `-c "$VAR"`、读不到内容等）提升级别并强制复核（不自动应用）。
+      -- 折叠进风险分级/权限分类；命中或不透明（eval、base64|sh、`curl|sh`、读不到内容）
+      -- **提升级别并强制人工复核**，但**不产生拒绝**（本模块不是安全边界，见核心不变量 6）。
       script_scan = {
         enabled = true, -- 总开关
         max_depth = 3, -- 递归扫描被引用脚本的最大深度

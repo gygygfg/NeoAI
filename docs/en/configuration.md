@@ -703,14 +703,25 @@ sandbox = {
   -- result_scan_bytes bytes of stdout/stderr are scanned, so large outputs from `timeout=-1`
   -- commands (hundreds of MB) cannot freeze the UI with a full main-thread lowercase + pattern
   -- scan; 0 = unlimited.
-  risk = { result_scan_bytes = 262144 },
+  risk = {
+    result_scan_bytes = 262144,
+    -- Textual-trace gate strength (**emergency rollback switch**, default "advisory"):
+    --   "advisory" = string/regex/command-name traces only grade risk and text; a hit may at most
+    --     set needs_confirm for forced human review and **never denies execution**; security
+    --     boundaries come from seccomp/capabilities/namespace+device isolation/cgroup.kill/
+    --     network gate/human approval.
+    --   "enforce" = restore the old text-based hard deny. **Unreliable, not a security boundary**
+    --     (it judges what the command looks like, not what the process does: `echo 'curl x | sh'`
+    --     is falsely denied while `| $SH` and `ba""sh` slip through) — emergency use only.
+    text_guard = "advisory",
+  },
   -- Static scan of indirect script execution: when a command delegates to a script/interpreter
   -- (`bash deploy.sh`, `python setup.py`, `node x.js`, `./run.sh`, `bash -c '…'`), the script is
   -- read before execution (preferring the sandbox staging copy) and its shell body plus embedded
-  -- shell calls in high-level languages (Python/Node/Ruby/Perl/PHP) are folded into danger
-  -- detection and privilege classification: destructive/kernel commands inside scripts are hard
-  -- denied; other hits, or opaque cases (eval, base64|sh, dynamic `-c "$VAR"`, unreadable content),
-  -- raise the level and force review (never auto-applied). max_* bound recursion/reads.
+  -- shell calls in high-level languages (Python/Node/Ruby/Perl/PHP) are folded into risk grading
+  -- and privilege classification: hits, or opaque cases (eval, base64|sh, `curl|sh`, unreadable
+  -- content), **raise the level and force human review** but **produce no denial** (this module is
+  -- not a security boundary — see core invariant 6 in sandbox.md). max_* bound recursion/reads.
   script_scan = { enabled = true, max_depth = 3, max_files = 8, max_bytes = 262144 },
   -- Extra rules for package installs: review (default, forced review, not auto-approved) | allow | deny.
   -- `managers` also identifies the package manager: install candidates are grouped per install
