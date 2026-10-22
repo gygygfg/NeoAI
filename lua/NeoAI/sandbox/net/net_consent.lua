@@ -700,4 +700,11 @@ function M.reset()
   state.history = {}
 end
 
+-- 同意窗属「等待人类交互」：等待期间暂停工具计时器（不累计耗时、不消耗超时预算）。
+-- 以 Deferred 结算为驱动（不依赖配对），故早返回/无 UI 直接拒绝等路径均安全。
+local _request = M.request
+M.request = function(...)
+  return require("NeoAI.utils.timer").await(_request(...))
+end
+
 return M

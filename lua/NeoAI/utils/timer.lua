@@ -1,13 +1,84 @@
 --- 可暂停的工具执行计时器
 --- @module 'NeoAI.utils.timer'
 --- 跟踪"活跃执行时间"（剔除等待人类交互的暂停时长），并基于活跃时间执行超时。
---- 工具执行期间若需等待用户交互（审批、ask_user 回答）则 pause()，交互结束后 resume()，
---- 从而等待时间不计入工具执行耗时，也不会消耗超时预算。
+--- 工具执行期间若需等待用户交互（审批、ask_user 回答、设备/策略/网络同意窗）则 pause()，
+--- 交互结束后 resume()，从而等待时间不计入工具执行耗时，也不会消耗超时预算。
+--- 对于拿不到 `ctx.timer` 的交互窗口（如沙箱内部在命令执行途中弹出的同意窗），走
+--- `await()`：它按「活跃计时器登记」暂停当前所有正在计时的工具计时器，交互结算后恢复。
 
 local M = {}
 
 local function _now_ms()
   return vim.uv.hrtime() / 1e6
+end
+
+-- ========== 活跃计时器登记 ==========
+-- start() 登记、stop()/_fire() 注销；供无 ctx 的交互窗口批量暂停/恢复。
+-- 交互窗口可能嵌套（同意窗里再触发子流程），故用深度计数：只在 0→1 暂停、1→0 恢复。
+local _active = {}      -- 数组：正在计时的工具计时器
+local _wait_depth = 0   -- 当前嵌套的交互等待层数
+
+--- 登记活跃计时器（幂等）
+--- @param t table
+--- @return table
+function M._register(t)
+  for _, v in ipairs(_active) do
+    if v == t then return t end
+  end
+  _active[#_active + 1] = t
+  -- 进入等待中时新登记（极少见）：立即暂停，保持「等待期间不累计」。
+  if _wait_depth > 0 and t.running then pcall(M.pause, t) end
+  return t
+end
+
+--- 注销活跃计时器（幂等）
+--- @param t table
+--- @return table
+function M._unregister(t)
+  for i = #_active, 1, -1 do
+    if _active[i] == t then table.remove(_active, i) end
+  end
+  return t
+end
+
+--- 进入交互等待：暂停所有正在计时的工具计时器（嵌套安全）。
+--- @return boolean 本次调用是否真正完成了 0→1 的暂停（用于配对 resume）
+function M.begin_wait()
+  _wait_depth = _wait_depth + 1
+  if _wait_depth > 1 then return false end
+  for _, t in ipairs(_active) do
+    if t.running then pcall(M.pause, t) end
+  end
+  return true
+end
+
+--- 结束交互等待：恢复计时（仅在深度回到 0 时真正恢复）。
+function M.end_wait()
+  if _wait_depth <= 0 then return end
+  _wait_depth = _wait_depth - 1
+  if _wait_depth > 0 then return end
+  for _, t in ipairs(_active) do
+    if not t.settled and not t.running then pcall(M.resume, t) end
+  end
+end
+
+--- 包装一个「等待人类交互」的 Deferred：等待期间不累计耗时、不消耗超时预算。
+--- 结算值/错误原样透传。无 vim.schedule 依赖，纯回调挂载。
+--- @param d table Deferred（async.Deferred）
+--- @return table 包装后的 Deferred
+function M.await(d)
+  if type(d) ~= "table" or type(d.then_) ~= "function" then return d end
+  local async = require("NeoAI.utils.async")
+  local out = async.Deferred.new()
+  M.begin_wait()
+  d:then_(function(v)
+    M.end_wait()
+    out:resolve(v)
+  end, function(e)
+    M.end_wait()
+    out:reject(e)
+  end)
+  return out
 end
 
 --- 创建可暂停计时器
@@ -36,6 +107,7 @@ function M.start(t, timeout_ms)
   t.settled = false
   t.running = true
   t._last = _now_ms()
+  M._register(t)
   t:_arm()
   return t
 end
@@ -70,6 +142,7 @@ end
 --- @return table
 function M.stop(t)
   t.settled = true
+  M._unregister(t)
   if t.running then
     t.active = t.active + (_now_ms() - t._last)
     t.running = false
@@ -121,6 +194,7 @@ end
 function M._fire(t)
   if t.settled then return end
   t.settled = true
+  M._unregister(t)
   if t.running then
     t.active = t.active + (_now_ms() - t._last)
     t.running = false
