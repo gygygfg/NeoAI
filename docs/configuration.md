@@ -655,7 +655,7 @@ sandbox = {
     apt_sandbox_user = "root", -- apt 系列：注入 APT::Sandbox::User（默认 "root" 关闭 apt 自身的 `_apt` 降权，避免嵌套 userns/受限容器中 setgroups EPERM 使 apt update/install 失败）；"_apt" 或空串保留 apt 默认行为
   },
   lsp_overlay = { enabled = true, idle_timeout_ms = 600000 }, -- AI 专用沙箱 LSP：AI 的 lsp_* 工具克隆的 server 读暂存内容（默认开，仅 bwrap+overlay；不可用时回退编辑器客户端）。克隆体在最后一次调用后保活 idle_timeout_ms（默认 10 分钟）再自动关闭，期间后续诊断/查询无需等待 server 重启；设 0/负数则永不空闲回收
-  secrets = { enabled = true, min_length = 20, max_length = 200, min_entropy = 3.5, min_distinct = 8, exclude_pure_hex = true, entropy_requires_context = true, entropy_secret_paths_only = true, generated_scan_max_bytes = 2097152, generated_scan_max_files = 200, tokenize_env = true, binary_fake = true, disclose_fakes = false, flow_tracking = true, alert = { enabled = true, timeout_ms = 0 }, trusted_services = {}, auto_trust_providers = true, extra_rules = {}, allowlist = {} }, -- 密钥/敏感信息防护：熵检测 + 具名规则（私钥块/AKIA/ghp_/sk-/JWT/Bearer…）+ **格式保真假密钥**（同长度/同字符类/熵不低于原始；进程内映射表不落盘）；env 名含 KEY/TOKEN/SECRET/PASSWORD/CREDENTIAL 的值无视熵强制假化；裸熵串须含 -/_ 且非代码标识符（snake_case 函数/常量名）或处于敏感名上下文；非敏感名且值含 / 的环境变量只按具名规则处理（不破坏 PATH/LD_LIBRARY_PATH 等）；entropy_secret_paths_only=true 时全文熵扫描仅对疑似密钥文件执行。**假密钥**出现在工具参数/AI 上下文时警告用户（不阻断）；**真实密钥**出现时立即停止 Agent 并弹窗，用户确认后才继续（headless 无 UI 时失败关闭）。binary_fake=true 时敏感二进制密钥文件（.p12/.pfx/keystore/raw key）被读取/暂存时用同长度随机字节假化（base64 标记传输，落盘/执行时精确还原）。flow_tracking=true 时记录假密钥来源与所有流经点（工具/命令/环境变量/落盘），命令/脚本加密等不可逆变换产生的派生文件标记「不透明派生」并在发布前强制人工确认。trusted_services 为出网白名单（精确主机/`*.suffix`/IP/CIDR）：向白名单发送密钥不弹窗也不警告；auto_trust_providers=true 时已配置的模型供应商 base_url 主机自动信任；disclose_fakes=true 时向 AI 披露「这是假密钥」（默认不披露以保持格式保真）
+  secrets = { enabled = true, min_length = 20, max_length = 200, min_entropy = 3.5, min_distinct = 8, exclude_pure_hex = true, exclude_uuid = true, entropy_skip_urls = true, entropy_requires_context = true, entropy_secret_paths_only = true, generated_scan_max_bytes = 2097152, generated_scan_max_files = 200, tokenize_env = true, binary_fake = true, disclose_fakes = false, flow_tracking = true, alert = { enabled = true, timeout_ms = 0 }, trusted_services = {}, auto_trust_providers = true, extra_rules = {}, allowlist = {} }, -- 密钥/敏感信息防护：熵检测 + 具名规则（私钥块/AKIA/ghp_/sk-/JWT/Bearer…）+ **格式保真假密钥**（同长度/同字符类/熵不低于原始；进程内映射表不落盘）；env 名含 KEY/TOKEN/SECRET/PASSWORD/CREDENTIAL 的值无视熵强制假化；裸熵串须含 -/_ 且非代码标识符（snake_case 函数/常量名）或处于敏感名上下文；exclude_uuid=true 排除 UUID（请求 ID/webhook 路径段等标识符），entropy_skip_urls=true 让通用熵扫描跳过 URL/域名/IP 片段（网址与 IP 是地址不是凭据，误判会导致后续提到该地址的命令被硬拦截；具名规则/敏感名赋值/已知环境变量密钥仍作用于 URL 内部）；非敏感名且值含 / 的环境变量只按具名规则处理（不破坏 PATH/LD_LIBRARY_PATH 等）；entropy_secret_paths_only=true 时全文熵扫描仅对疑似密钥文件执行。**假密钥**出现在工具参数/AI 上下文时警告用户（不阻断）；**真实密钥**出现时立即停止 Agent 并弹窗，用户确认后才继续（headless 无 UI 时失败关闭）。binary_fake=true 时敏感二进制密钥文件（.p12/.pfx/keystore/raw key）被读取/暂存时用同长度随机字节假化（base64 标记传输，落盘/执行时精确还原）。flow_tracking=true 时记录假密钥来源与所有流经点（工具/命令/环境变量/落盘），命令/脚本加密等不可逆变换产生的派生文件标记「不透明派生」并在发布前强制人工确认。trusted_services 为出网白名单（精确主机/`*.suffix`/IP/CIDR）：向白名单发送密钥不弹窗也不警告；auto_trust_providers=true 时已配置的模型供应商 base_url 主机自动信任；disclose_fakes=true 时向 AI 披露「这是假密钥」（默认不披露以保持格式保真）
   retention = { candidate_days = 7, max_pending = 20 },
   policy = {
     version = "1",                 -- 策略版本（用于审计回放；规则变更时递增）
@@ -759,8 +759,9 @@ herder = {
 - 识别走 Herdr 的**主动上报**通道（`pane report-agent` / `pane report-metadata`）：Herdr 的 agent 身份为
   编译期固定集合，本地检测清单只能**覆盖已有** agent、无法新增。
 - 多会话聚合优先级 `blocked > working > idle`，`--seq` 严格递增防旧包回退。
-- **`blocked` 来源**：工具审批（`TOOL_APPROVAL_REQUESTED`）与 `ask_user` 提问等待
-  （`ASK_USER_WAITING`）。**pty 会话等待输入不参与**（`run_command` 的交互式 PTY 等待输入/判官
+- **`blocked` 来源**：工具审批（`TOOL_APPROVAL_REQUESTED`）、`ask_user` 提问等待
+  （`ASK_USER_WAITING`），以及审批分流中心里的阻塞类弹窗（密钥/网络/设备/策略等，
+  `SANDBOX_APPROVAL_BLOCKING_OPENED`/`_CLOSED`）。**pty 会话等待输入不参与**（`run_command` 的交互式 PTY 等待输入/判官
   注入**不**影响 pane 生命周期状态，pane 始终按 agent 作态显示，不因此标红）；`PTY_*` 事件仍由 pty
   服务发射，仅不再被 Herder 消费。
 - 展示增强片段：`auto_install = true` 时启动即**异步、静默、幂等**写入 `~/.config/herdr/config.toml`

@@ -855,8 +855,9 @@ herder = {
   agent identities are a compile-time fixed set, and a local detection manifest can only **override an existing**
   agent, never add a new one.
 - Multi-session aggregation priority `blocked > working > idle`, with a strictly increasing `--seq` to avoid rollback.
-- **Sources of `blocked`**: tool approval (`TOOL_APPROVAL_REQUESTED`) and `ask_user` waiting for an answer
-  (`ASK_USER_WAITING`). **pty sessions waiting for input do not participate**: an interactive PTY `run_command`
+- **Sources of `blocked`**: tool approval (`TOOL_APPROVAL_REQUESTED`), `ask_user` waiting for an answer
+  (`ASK_USER_WAITING`), and blocking approval dialogs in the approval hub (secret/network/device/policy,
+  `SANDBOX_APPROVAL_BLOCKING_OPENED`/`_CLOSED`). **pty sessions waiting for input do not participate**: an interactive PTY `run_command`
   waiting for input / the judge's injection does **not** affect the pane lifecycle state — the pane always
   reflects the agent's activity and is not turned red for this; the `PTY_*` events are still emitted by the pty
   service, they are simply no longer consumed by Herder.

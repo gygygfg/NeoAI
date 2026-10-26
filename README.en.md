@@ -672,7 +672,7 @@ detected first.
 | NeoAI Agent state | Herder report |
 |---|---|
 | `generating` / `tool_running` | `working` |
-| Tool approval wait / `ask_user` waiting for the user's answer | `blocked` |
+| Tool approval wait / `ask_user` waiting / secret, network and other blocking approval dialogs | `blocked` |
 | `idle` / `aborted` / `error` | `idle` |
 
 **Multi-session aggregation**: a single Neovim pane may host multiple AI sessions (including sub-agents); NeoAI

@@ -470,6 +470,29 @@ tests.suite("ui_components", function(_, it)
     vim.api.nvim_set_current_win(win)
     t.false_(au.is_collapsed(), "初始应展开")
 
+    -- 同一窗口切换到其它 buffer：BufLeave 收起后不得被 BufEnter 重新展开
+    local ask_buf = buf
+    local other_buf = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_win_set_buf(win, other_buf)
+    t.true_(au.is_collapsed(), "同一窗口切到其它 buffer 应收起")
+    vim.api.nvim_win_set_buf(win, ask_buf)
+    t.false_(au.is_collapsed(), "切回提问 buffer 应展开")
+
+    -- 窗口仍显示其它 buffer 时重新进入该窗口，也不应误展开
+    vim.api.nvim_win_set_buf(win, other_buf)
+    local cur = vim.api.nvim_get_current_win()
+    vim.cmd("vsplit")
+    local tmp_win = vim.api.nvim_get_current_win()
+    vim.api.nvim_set_current_win(win)
+    t.true_(au.is_collapsed(), "窗口显示其它 buffer 时进入该窗口仍应保持收起")
+    vim.api.nvim_set_current_win(tmp_win)
+    pcall(vim.api.nvim_win_close, tmp_win, true)
+    vim.api.nvim_set_current_win(win)
+    vim.api.nvim_win_set_buf(win, ask_buf)
+    t.false_(au.is_collapsed(), "回到提问 buffer 后应恢复展开")
+    pcall(vim.api.nvim_buf_delete, other_buf, { force = true })
+    vim.api.nvim_set_current_win(cur)
+
     vim.cmd("vsplit")
     local other = vim.api.nvim_get_current_win()
     t.true_(au.is_collapsed(), "焦点移出提问窗应收起")
@@ -488,6 +511,51 @@ tests.suite("ui_components", function(_, it)
     vim.api.nvim_set_current_win(win)
     vim.api.nvim_exec_autocmds("FocusGained", {})
     t.false_(au.is_collapsed(), "应用重新聚焦且光标在提问窗应展开")
+
+    au.hide()
+    pcall(vim.api.nvim_win_close, other, true)
+    t.nil_(au.get_buf(), "hide 后应无提问弹窗")
+  end)
+
+  it("ask_user：WinLeave 即收起、自动命令可重装、无自动命令时按焦点自愈", function(t)
+    local au = require("NeoAI.ui.components.ask_user")
+    require("NeoAI.ui.focus")._set_app_focused(true)
+    au.reset()
+    local function show()
+      au.show({
+        batch_id = "ask-fix-test",
+        questions = { { question = "Q", options = { "A" } } },
+        on_submit = function() end,
+        on_cancel = function() end,
+      })
+    end
+    show()
+    local buf = assert(au.get_buf(), "应打开提问弹窗")
+    local win = vim.fn.bufwinid(buf)
+    vim.api.nvim_set_current_win(win)
+    t.false_(au.is_collapsed(), "初始应展开")
+
+    -- 仅 WinLeave（光标离开本窗）即收起：不依赖目标窗口触发 WinEnter，
+    -- 覆盖鼠标点击其它窗口 / 切标签页等离开方式。
+    vim.api.nvim_exec_autocmds("WinLeave", { buffer = buf })
+    t.true_(au.is_collapsed(), "WinLeave 应即时收起")
+
+    -- 自动命令组被外部清空后，重渲染应自动重装（否则收起事件永不触发）。
+    vim.api.nvim_set_current_win(win)
+    vim.api.nvim_del_augroup_by_name("NeoAIAskUserWin")
+    t.false_(au._debug().autocmds, "清空后应无自动命令")
+    show()
+    t.true_(au._debug().autocmds, "重渲染应重装自动命令")
+
+    -- 自动命令缺失 + 光标已经不在提问窗：重渲染按实际焦点自愈为收起态。
+    vim.api.nvim_del_augroup_by_name("NeoAIAskUserWin")
+    vim.cmd("noautocmd vsplit")
+    local other = vim.api.nvim_get_current_win()
+    show()
+    t.true_(au.is_collapsed(), "无自动命令时重渲染应按焦点收起")
+    local cfg = vim.api.nvim_win_get_config(win)
+    local cg = au._collapsed_geom()
+    t.eq(cg.width, cfg.width, "自愈后应为收起小窗宽度")
 
     au.hide()
     pcall(vim.api.nvim_win_close, other, true)

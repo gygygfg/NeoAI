@@ -35,6 +35,7 @@ local state = {
   auto_install = true, -- 启动时是否异步自动安装 Herder 展示增强片段（幂等）
   metadata_sent = false, -- 本次权威生命周期内是否已上报过展示元数据
   agents = {}, -- agent_id -> { state, blocked, ask_user_waiting }
+  blocking_dialogs = {}, -- dialog_id -> true：密钥/网络/设备/策略/工具审批等阻塞弹窗
   seq = 0, -- 单调递增信号序号（init/reset 时用挂钟基数 _seq_base() 起始，见下）
   last_reported = nil, -- 上次已上报的 pane 状态；nil = 尚未接管权威
 }
@@ -199,7 +200,7 @@ end
 --- 注：交互式 PTY 会话等待输入不参与聚合（不镜像为 blocked/红），pane 状态始终按 agent 作态显示。
 --- @return string
 local function _aggregate()
-  local blocked, working = false, false
+  local blocked, working = next(state.blocking_dialogs or {}) ~= nil, false
   for _, e in pairs(state.agents) do
     if e.blocked > 0 or e.ask_user_waiting then
       blocked = true
@@ -312,6 +313,25 @@ local function _blocked_dec(agent_id)
   _recompute()
 end
 
+--- 阻塞类审批弹窗打开：与 ask_user 等待同语义（pane 标记 blocked）。
+--- 以弹窗 id 去重，避免 dedupe/重复事件造成计数漂移。
+--- @param d table|nil { id, page, title, kind }
+local function _dialog_open(d)
+  local id = d and d.id
+  if not id or state.blocking_dialogs[id] then return end
+  state.blocking_dialogs[id] = true
+  _recompute()
+end
+
+--- 阻塞类审批弹窗关闭/决策：恢复工作/空闲态。
+--- @param d table|nil { id }
+local function _dialog_close(d)
+  local id = d and d.id
+  if not id or not state.blocking_dialogs[id] then return end
+  state.blocking_dialogs[id] = nil
+  _recompute()
+end
+
 --- 设置/清除 ask_user 等待用户回答状态
 --- @param agent_id string
 --- @param waiting boolean
@@ -345,6 +365,8 @@ local function _subscribe()
   on(ev.TOOL_APPROVAL_CANCELLED, function(d) _blocked_dec(d and d.agent_id) end)
   on(ev.ASK_USER_WAITING, function(d) _ask_waiting(d and d.agent_id, true) end)
   on(ev.ASK_USER_ANSWERED, function(d) _ask_waiting(d and d.agent_id, false) end)
+  on(ev.SANDBOX_APPROVAL_BLOCKING_OPENED, function(d) _dialog_open(d) end)
+  on(ev.SANDBOX_APPROVAL_BLOCKING_CLOSED, function(d) _dialog_close(d) end)
 end
 
 -- ========== 公开 API ==========
@@ -496,6 +518,7 @@ function M.reset()
     auto_install = true,
     metadata_sent = false,
     agents = {},
+    blocking_dialogs = {},
     seq = _seq_base(),
     last_reported = nil,
   }

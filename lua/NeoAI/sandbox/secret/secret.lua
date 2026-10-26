@@ -67,6 +67,12 @@ local DEFAULTS = {
   -- 排除纯小写十六进制串（git SHA / sha256 / md5 等哈希与校验和），避免把常见
   -- 标识符当密钥导致 token 化后不可用；代价是纯小写 hex 形式的密钥不被覆盖。
   exclude_pure_hex = true,
+  -- 排除 UUID（8-4-4-4-12 十六进制）：请求 ID / webhook 路径段 / 对象 ID 等标识符。
+  exclude_uuid = true,
+  -- 通用熵扫描跳过 URL / 域名 / IP 片段（网络目标是地址，不是凭据）。结构化凭据不受影响：
+  -- 具名规则（sk-/AKIA/ghp_…）、敏感变量名赋值（token=…）与已知环境变量密钥仍作用于 URL
+  -- 内部。设为 false 退回「URL 里也做熵检测」（会把 UUID / 带数字 slug 当密钥）。
+  entropy_skip_urls = true,
   -- 缩小认定范围：裸熵串须呈密钥形态（含 - / _ 分隔符）且不是代码标识符（snake_case 符号，
   -- 如 `create_urllib3_context`），或处于敏感变量名赋值上下文（KEY=/TOKEN:/PASSWORD= 等），
   -- 才视为密钥；纯字母数字/base64 串（SRI integrity、内容哈希、构建产物摘要等元数据）不再
@@ -128,9 +134,83 @@ local function looks_like_identifier(run)
   return segs >= 2
 end
 
+-- ===== URL / 主机 / IP / UUID：地址与标识符不是凭据 =====
+--- 网址、域名、IP 里的高熵片段（UUID、带数字的 slug、构建产物路径、对象存储 key）常被误判
+--- 为密钥。一旦登记，该地址会在 AI 可见面被替换成假密钥，并被当作「原始密钥」→ 后续任何
+--- 提到该 URL 的命令都会被硬拦截（`SANDBOX_SECRET_BLOCKED`），且界面标注「假密钥：https://…」。
+--- 故通用熵扫描**跳过 URL/主机/IP 片段**；结构化凭据不受影响（具名规则如 `sk-`/`AKIA`、
+--- 敏感变量名赋值如 `token=`、已知环境变量密钥均在全文本上先行作用于 URL 内部）。
+local URL_PATS = {
+  "%a[%w%+%-%.]*://[^%s\"'<>%(%)%[%]{}`]+", -- scheme://...
+  "%f[%d]%d+%.%d+%.%d+%.%d+[:/]?%d*",           -- IPv4[:port]
+  "%f[%w%-][%w%-]+%.%a%a[%w%-%.]*",             -- 域名 label.tld[...]
+}
+
+--- 计算文本中 URL / 主机 / IP 片段的范围（1-based，含两端）
+--- @param text string
+--- @return table 数组 { { start, stop } }
+local function url_spans(text)
+  local spans = {}
+  for _, pat in ipairs(URL_PATS) do
+    local pos = 1
+    while true do
+      local s, e = text:find(pat, pos)
+      if not s then break end
+      spans[#spans + 1] = { s, e }
+      pos = e + 1
+    end
+  end
+  return spans
+end
+
+--- 区间是否落在某片段范围内
+--- @param spans table
+--- @param s number
+--- @param e number
+--- @return boolean
+local function in_spans(spans, s, e)
+  for i = 1, #spans do
+    local sp = spans[i]
+    if s >= sp[1] and e <= sp[2] then return true end
+  end
+  return false
+end
+
+--- 值是否呈 URL / 域名 / IP 形态（这些是地址，不应登记为密钥值）
+--- 判定刻意收紧：点分**凭据**（如 `dfe946fb…49164d.rwbWDAfnQjlHuMFt`）与长十六进制段不是域名，
+--- 否则按名脱敏会漏掉这类「两段式」密钥。
+--- @param v any
+--- @return boolean
+local function looks_like_url_or_host(v)
+  if type(v) ~= "string" or #v < 4 then return false end
+  if v:match("^%a[%w%+%-%.]*://") then return true end
+  if v:match("^%d+%.%d+%.%d+%.%d+") then return true end
+  local host = v:match("^([%w%-%.]+):?%d*$")
+  if not host or host:find("_", 1, true) then return false end
+  local labels = {}
+  for l in host:gmatch("[^%.]+") do labels[#labels + 1] = l end
+  if #labels < 2 then return false end
+  -- 顶级标签须为纯字母（TLD），且不是超长串
+  local tld = labels[#labels]
+  if #tld < 2 or #tld > 24 or not tld:match("^%a+$") then return false end
+  for _, l in ipairs(labels) do
+    if #l > 63 or not l:match("^%w[%w%-]*$") then return false end
+    -- 长十六进制段是凭据/哈希的典型形态（如 32 位摘要），不是域名标签
+    if #l >= 12 and l:match("^%x+$") then return false end
+  end
+  return true
+end
+
+--- 是否 UUID（8-4-4-4-12 十六进制）：标识符，不是凭据
+--- @param run string
+--- @return boolean
+local function is_uuid(run)
+  if #run ~= 36 then return false end
+  return run:match("^%x%x%x%x%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%x%x%x%x%x%x%x%x$") ~= nil
+end
+
 local function is_candidate(run, cfg, context, known, fakes)
-  if known and known[run] then return false end
-  -- 已知假密钥的子串（被 `.` 等分隔符切分）不再二次假化，避免「假密钥的假密钥」。
+  if known and known[run] then return false end  -- 已知假密钥的子串（被 `.` 等分隔符切分）不再二次假化，避免「假密钥的假密钥」。
   if fakes then
     for i = 1, #fakes do
       if #fakes[i] > #run and fakes[i]:find(run, 1, true) then return false end
@@ -153,6 +233,10 @@ local function is_candidate(run, cfg, context, known, fakes)
     -- 裸熵串还须不是代码标识符（snake_case 符号），否则会把函数名/常量名当密钥。
     if looks_like_identifier(run) then return false end
   end
+  -- UUID（8-4-4-4-12 十六进制）是**标识符**（请求 ID / webhook 路径段 / 对象 ID），不是凭据：
+  -- 它熵高、带 `-`、分段以数字开头，恰好通过下面的熵检测 —— 一旦登记成「原始密钥」，该值会
+  -- 在 AI 可见面被替换成假密钥，并被判为「原始密钥泄漏」而硬拦截后续提到它的命令。
+  if cfg.exclude_uuid ~= false and is_uuid(run) then return false end
   local distinct = {}
   local nd = 0
   for i = 1, #run do
@@ -473,8 +557,10 @@ local function apply_secret_names(text, token_for, known)
     if value:sub(1, #TOKEN_PREFIX) == TOKEN_PREFIX then return nil end
     -- 已是已知假密钥：不再二次假化（否则产生「假密钥的假密钥」，破坏往返还原）。
     if known and known[value] then return nil end
-    -- 值不像凭据（普通单词/路径/短值）时不登记，避免污染原始密钥映射表。
+    -- 值不像凭据（普通单词/路径/URL/域名/IP/短值）时不登记，避免污染原始密钥映射表。
     if not looks_like_assigned_secret(value) then return nil end
+    -- 网络地址（URL / 域名 / IP）不是凭据：登记后会令牌化该地址并硬拦截后续提到它的命令。
+    if looks_like_url_or_host(value) then return nil end
     return token_for(value, "env_name:" .. name)
   end
   text = text:gsub("([%a_][%w_]*)(%s*=%s*)(" .. NAME_VALUE_CHARS .. ")([%(]?)", function(name, sep, value, paren)
@@ -496,6 +582,7 @@ end
 --- run 是否紧邻路径分隔符（`/`）——即某个文件系统路径的分量。路径分量是 PATH/
 --- LD_LIBRARY_PATH/PYTHONPATH 等环境变量与日志中路径的组成部分，token 化会让程序找不到
 --- 库/模块（如 pip 报 `without an ssl module`），故不参与通用熵 token 化。
+--- 文件系统路径分量 / URL 片段 / UUID 的判定与工具
 --- @param text string
 --- @param s number 起点（1-based）
 --- @param e number 终点（1-based）
@@ -545,6 +632,13 @@ local function process(text, cfg, token_for, opts)
   text = apply_secret_names(text, token_for, opts and opts.known)
   text = apply_plain_secrets(text, opts and opts.plain_secrets, token_for)
   if opts and opts.entropy == false then return text end
+  -- URL/主机/IP 片段范围（惰性计算：无候选时不做额外全扫描）。
+  local spans, spans_ready
+  local function skip_url(s, e)
+    if cfg.entropy_skip_urls == false then return false end
+    if not spans_ready then spans = url_spans(text); spans_ready = true end
+    return in_spans(spans, s, e)
+  end
   local parts, pos = {}, 1
   while true do
     local s, e = text:find(RUN_PAT, pos)
@@ -554,7 +648,8 @@ local function process(text, cfg, token_for, opts)
     end
     parts[#parts + 1] = text:sub(pos, s - 1)
     local run = text:sub(s, e)
-    if not is_path_component(text, s, e) and is_candidate(run, cfg, nil, opts and opts.known, opts and opts.fakes) then
+    if not is_path_component(text, s, e) and not skip_url(s, e)
+      and is_candidate(run, cfg, nil, opts and opts.known, opts and opts.fakes) then
       parts[#parts + 1] = token_for(run, nil)
     else
       parts[#parts + 1] = run
@@ -566,7 +661,9 @@ end
 
 return { process = process, apply_rules = apply_rules, is_candidate = is_candidate, entropy = entropy,
   validate = validate, secret_name = secret_name, secret_name_prefix = secret_name_prefix,
-  looks_like_env_name_ref = looks_like_env_name_ref, fake_for = fake_for }
+  looks_like_env_name_ref = looks_like_env_name_ref, fake_for = fake_for,
+  url_spans = url_spans, in_spans = in_spans, looks_like_url_or_host = looks_like_url_or_host,
+  is_uuid = is_uuid }
 ]==]
 
 local _scan = assert(load(SCAN_SRC))()
@@ -759,6 +856,8 @@ function M.detect(text)
     out[#out + 1] = { value = v, start = s, stop = e, entropy = _scan.entropy(v), rule = rule }
   end
   local pos = 1
+  -- URL / 主机 / IP 片段内的熵串是地址成分，不是密钥（同 `process` 口径）。
+  local spans = _scan.url_spans(text)
   while true do
     local s, e = text:find(RUN_PAT, pos)
     if not s then break end
@@ -766,7 +865,10 @@ function M.detect(text)
     -- 裸熵串的上下文信号：紧邻的敏感变量名赋值（KEY=/TOKEN:/PASSWORD=）使其无需分隔符。
     -- 只回看有限窗口，避免在大文本上对每个 run 复制整段前缀（O(n²)）。
     local prefix = text:sub(s > 64 and s - 64 or 1, s - 1)
-    if _scan.is_candidate(run, cfg, _scan.secret_name_prefix(prefix), state.fake_set, fake_list) then add(s, e) end
+    if not _scan.in_spans(spans, s, e)
+      and _scan.is_candidate(run, cfg, _scan.secret_name_prefix(prefix), state.fake_set, fake_list) then
+      add(s, e)
+    end
     pos = e + 1
   end
   -- 具名规则：补充结构化敏感信息（私钥块/带前缀 token 等熵检测盲区）；与熵检测重叠时去重。
@@ -1670,6 +1772,9 @@ function M.find_real_secret(text, opts)
   local skip_env = opts and opts.skip_env
   for secret in pairs(state.by_secret) do
     if #secret >= 8 and not _is_env_name_secret(secret)
+      -- 地址形态（URL / 域名 / IP）不是凭据：即便历史遗留登记过（旧版本把网址误当密钥），
+      -- 也不硬拦截后续提到它的命令。
+      and not (_scan.looks_like_url_or_host and _scan.looks_like_url_or_host(secret))
       and not (skip_env and state.env_secrets[secret]) and text:find(secret, 1, true) then
       return secret
     end

@@ -766,10 +766,17 @@ function M.net_consent_allowances()
   return require("NeoAI.sandbox.net.net_consent").list_allowances()
 end
 
---- 网络请求页：决策历史（新→旧，只读：单次允许 / 拒绝 / 已撤销）
---- @return table 数组 { host, port, local_, proto, svc, comm, decision, at_ms }
+--- 网络请求页：决策历史（新→旧，只读；**按目标合并**：同目标多条记录并为一条，附次数/最近时间）
+--- @return table 数组 { key, host, port, local_, proto, svc, comm, pid, decision, reason, at_ms, first_ms, count, timed_out, remedied }
 function M.net_consent_history()
   return require("NeoAI.sandbox.net.net_consent").list_history()
+end
+
+--- 网络请求页：把一条「超时自动拒绝」的历史条目升级为本次会话允许（重新允许/补救）。
+--- @param key string 目标键（`net_consent_history` 返回的 key）
+--- @return boolean 是否确实补救
+function M.net_consent_allow_history(key)
+  return require("NeoAI.sandbox.net.net_consent").allow_from_history(key)
 end
 
 --- 网络请求页：撤销一条本次会话允许（按 key）；撤销后下次访问重新询问。

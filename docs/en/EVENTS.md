@@ -290,6 +290,8 @@ All event constants are defined in `NeoAI.kernel.events`. They are listed below 
 | `SANDBOX_CONTAINER_PLANNED` | `sandbox:container_planned` | Container control plan (namespace sharing / controlled socket) | `{ manager, mode, share_namespace, reason, command_id }` |
 | `SANDBOX_CONTAINER_UNSUPPORTED` | `sandbox:container_unsupported` | Container facade rejects host-daemon/remote/host subcommands | `{ manager, sub, reason, command_id }` |
 | `SANDBOX_BACKGROUND_ROUTED` | `sandbox:background_routed` | A `run_command` background command (`&`/nohup/setsid) is routed by the facade to a long-lived service | `{ name, service_id, kind, command_id }` |
+| `SANDBOX_APPROVAL_BLOCKING_OPENED` | `sandbox:approval_blocking_opened` | A blocking approval dialog opened (secret/network/device/policy/tool approval); the agent is paused and Herder marks the pane `blocked` | `{ id, page, title?, kind? }` |
+| `SANDBOX_APPROVAL_BLOCKING_CLOSED` | `sandbox:approval_blocking_closed` | A blocking approval dialog closed/decided; Herder restores `working`/`idle` | `{ id, page, title?, kind? }` |
 
 ## 4. Event Subscription Best Practices
 

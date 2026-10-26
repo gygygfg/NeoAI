@@ -79,6 +79,16 @@ local function _key(host, port, svc)
   return base
 end
 
+--- 目标键（与白名单/历史/待批准去重同一口径）：按 (端口, 服务进程) 颗粒度。
+--- @param host string|nil
+--- @param port number|string|nil
+--- @param owner table|nil
+--- @return string
+local function _target_key(host, port, owner)
+  local svc = _granular() and _svc_id(owner) or nil
+  return _key(tostring(host or "?"), port, svc)
+end
+
 --- 追加一条已结束的网络访问决策历史（新→旧；受 HISTORY_MAX 约束）。
 --- @param rec table { host, port, local_?, proto?, comm?, decision, at_ms }
 local function _push_history(rec)
@@ -523,17 +533,76 @@ function M.revoke_allowance(key)
   return true
 end
 
---- 列出网络访问决策历史（新→旧，仅记录：单次允许 / 拒绝 / 已撤销）。
---- @return table 数组 { host, port, local_, proto, svc, comm, decision, at_ms }
+--- 列出网络访问决策历史（**按目标合并**：同一 `host:port@<服务进程>` 的多条记录并为一条，
+--- 展示最近决策/最近时间与累计次数）。新→旧。
+--- @return table 数组 {
+---   key, host, port, local_, proto, svc, comm, pid,
+---   decision,      -- 最近一次决策（allow_once/deny/revoked）
+---   reason,        -- 最近一次决策原因（"timeout" = 弹窗无响应自动拒绝）
+---   at_ms,         -- 最近时间
+---   first_ms,      -- 最早时间
+---   count,         -- 合并条数
+---   timed_out,     -- 含**尚未补救**的超时自动拒绝（可按 S 重新允许）
+---   remedied,      -- 已通过「重新允许」补救
+--- }
 function M.list_history()
-  local out = {}
+  local out, index = {}, {}
   for _, h in ipairs(state.history) do
-    out[#out + 1] = {
-      host = h.host, port = h.port, local_ = h.local_, proto = h.proto,
-      svc = h.svc, comm = h.comm, decision = h.decision, at_ms = h.at_ms,
-    }
+    local key = h.key or _key(tostring(h.host or "?"), h.port, h.svc)
+    local rec = index[key]
+    if not rec then
+      rec = {
+        key = key, host = h.host, port = h.port, local_ = h.local_, proto = h.proto,
+        svc = h.svc, comm = h.comm, pid = h.pid,
+        decision = h.decision, reason = h.reason, at_ms = h.at_ms, first_ms = h.at_ms,
+        count = 1, timed_out = false, remedied = h.remedied == true,
+      }
+      index[key] = rec
+      out[#out + 1] = rec
+    else
+      rec.count = rec.count + 1
+      -- 历史为新→旧：首见即最近，持续覆写即为最早时间
+      rec.first_ms = h.at_ms or rec.first_ms
+      if h.remedied == true then rec.remedied = true end
+    end
+    if h.decision == "deny" and h.reason == "timeout" and h.remedied ~= true then
+      rec.timed_out = true
+    end
   end
   return out
+end
+
+--- 「重新允许」：把一条因**超时自动拒绝**（用户未应答）的历史条目升级为本次会话允许。
+--- 典型场景：用户离开时连接被超时兜底拒绝，回来后可在审批悬浮窗「网络请求」页历史区
+--- 按 `S` 补救，无需重跑命令。已补救的条目会被标记（`list_history().remedied`），不会重复允许。
+--- @param key string 目标键（`list_history` 返回的 key）
+--- @return boolean 是否确实补救（非超时拒绝 / 已补救 / 未命中返回 false）
+function M.allow_from_history(key)
+  key = tostring(key or "")
+  if key == "" then return false end
+  local target, changed
+  for _, h in ipairs(state.history) do
+    local k = h.key or _key(tostring(h.host or "?"), h.port, h.svc)
+    if k == key then
+      target = target or h
+      if h.decision == "deny" and h.reason == "timeout" and h.remedied ~= true then
+        h.remedied = true
+        changed = true
+      end
+    end
+  end
+  if not (target and changed) then return false end
+  local owner = nil
+  if target.svc or target.comm or target.pid then
+    -- `_svc_id` 优先取 exe（即历史里的 svc），回退 comm；与批准时的键口径一致。
+    owner = { exe = target.svc, comm = target.comm, pid = target.pid }
+  end
+  M.allow_session(target.host, target.port, owner)
+  pcall(function()
+    require("NeoAI.kernel.event_bus").emit(
+      require("NeoAI.kernel.events").SANDBOX_APPROVAL_CHANGED, { page = "network" })
+  end)
+  return true
 end
 
 --- 本会话中与当前目标「相关」的历史批准（供弹窗提示：同进程的其它端口 / 同端口的其它进程）。
@@ -589,25 +658,37 @@ function M.request(ctx)
 
   local done = false
   local hub_id
-  local function decide(decision)
+  local function decide(decision, reason)
     if done then return end
     done = true
     if decision ~= "allow_once" and decision ~= "allow_session" and decision ~= "deny" then
       decision = "deny"
     end
     -- 记录已结束决策历史（单次允许 / 拒绝）；allow_session 由「本会话已允许」区承载，不入历史。
+    -- `reason` 标明自动兜底原因（"timeout" = 弹窗无响应自动拒绝），供审批悬浮窗区分并支持补救。
     if decision ~= "allow_session" then
+      local svc = _granular() and _svc_id(owner) or nil
+      local h = tostring(ctx.host or "?")
+      local p = tonumber(ctx.port) or ctx.port
       _push_history({
-        host = tostring(ctx.host or "?"), port = tonumber(ctx.port) or ctx.port,
+        key = _key(h, p, svc),
+        host = h, port = p,
         local_ = ctx.local_ == true, proto = ctx.proto,
-        svc = owner and owner.comm or nil, comm = owner and owner.comm or nil,
-        decision = decision, at_ms = os.time() * 1000,
+        svc = svc, comm = owner and owner.comm or nil, pid = owner and owner.pid or nil,
+        decision = decision, reason = reason, at_ms = os.time() * 1000,
       })
     end
     -- 决策后关闭独立弹窗（若打开）并取消其「失焦延迟展示」暂存：经审批中心决策 / 超时时，
     -- 独立弹窗可能仍处于待展示状态，需一并清理，避免切回后弹出已过期的弹窗。
     if state.ui and state.ui.hide then pcall(state.ui.hide) end
-    if hub_id then pcall(function() require("NeoAI.sandbox.review.approval_hub").clear(hub_id) end) end
+    -- 经审批中心结算：同一目标（端口 + 服务进程）的并发请求已被中心合并为一条，走中心决策
+    -- 可让**所有**挂起请求一起结算（各自记账/结算 Deferred），避免「弹窗被后一个请求替换后，
+    -- 前一个请求无人决策、一直挂到超时」这类悬挂。条目已不存在（本函数由中心触发）时清空即可。
+    if hub_id then
+      local hh = require("NeoAI.sandbox.review.approval_hub")
+      local okr, hit = pcall(hh.resolve, hub_id, decision)
+      if not (okr and hit) then pcall(hh.clear, hub_id) end
+    end
     d:resolve(decision)
   end
 
@@ -640,7 +721,10 @@ function M.request(ctx)
     service = ctx.service,
   })
   -- 镜像到审批分流中心「网络请求」页（窗口可决策；独立弹窗仍在时以先决策者为准）。
+  -- `dedupe_key`：同一目标（端口 + 服务进程）的并发/重复待批准请求在中心**合并为一条**
+  -- （条目 `count` 累加），一次决策让所有挂起连接一起生效，避免同一目标刷出多行要逐个点。
   hub_id = hub.submit("network", {
+    dedupe_key = _target_key(ctx.host, ctx.port, owner),
     title = string.format("%s:%s%s", tostring(ctx.host or "?"), tostring(ctx.port or "?"),
       owner and owner.comm and ("（" .. owner.comm .. (owner.pid and (" pid " .. owner.pid) or "") .. "）") or ""),
     detail = {},
@@ -674,7 +758,7 @@ function M.request(ctx)
         local presented = (ui == nil) or (type(ui.is_open) ~= "function") or ui.is_open()
         if presented then
           if ui and ui.hide then pcall(ui.hide) end
-          decide("deny")
+          decide("deny", "timeout")
         else
           arm() -- 仍暂存（未呈现）：继续等待
         end

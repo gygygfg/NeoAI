@@ -10,6 +10,7 @@ local M = {}
 
 local state = {
   ui = nil,
+  dialog_seq = 0, -- 无审批中心时的本地阻塞弹窗 id 计数（Herder 联动）
 }
 
 --- 注册/注销 UI（ui 组件 init/reset 调用）
@@ -23,6 +24,19 @@ end
 local function _interactive()
   local ok, uis = pcall(vim.api.nvim_list_uis)
   return ok and type(uis) == "table" and #uis > 0
+end
+
+--- 广播阻塞弹窗生命周期（无审批中心条目时兜底，保证 Herder 仍能标记 blocked）。
+--- @param event_name string
+--- @param id string
+--- @param ctx table
+local function _emit_dialog(event_name, id, ctx)
+  pcall(function()
+    require("NeoAI.kernel.event_bus").emit(event_name, {
+      id = id, page = "behavior",
+      kind = (ctx and ctx.kind) or "secret",
+    })
+  end)
 end
 
 --- 是否可用（未禁用，且有专用弹窗 UI 或可交互 Neovim 供内建确认回退）
@@ -94,9 +108,22 @@ function M.request(ctx)
   end
   local done = false
   local hub_id
+  local local_dialog_id = nil
+  local function close_local_dialog()
+    if not local_dialog_id then return end
+    _emit_dialog(require("NeoAI.kernel.events").SANDBOX_APPROVAL_BLOCKING_CLOSED, local_dialog_id, ctx)
+    local_dialog_id = nil
+  end
+  local function open_local_dialog()
+    if hub_id or local_dialog_id then return end
+    state.dialog_seq = state.dialog_seq + 1
+    local_dialog_id = "secret_alert_" .. tostring(state.dialog_seq)
+    _emit_dialog(require("NeoAI.kernel.events").SANDBOX_APPROVAL_BLOCKING_OPENED, local_dialog_id, ctx)
+  end
   local function decide(decision)
     if done then return end
     done = true
+    close_local_dialog()
     if decision ~= "allow_once" and decision ~= "fake"
       and decision ~= "whitelist" and decision ~= "stop" then
       decision = "stop"
@@ -148,6 +175,8 @@ function M.request(ctx)
     })
   end
 
+  -- 没有审批中心条目时（hub 不可用/无 UI），仍广播本地阻塞弹窗生命周期给 Herder。
+  open_local_dialog()
   if state.ui ~= nil and type(state.ui.show) == "function" then
     local ok = pcall(state.ui.show, ctx, decide)
     if not ok then decide("stop") end

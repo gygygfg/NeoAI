@@ -293,6 +293,32 @@ tests.suite("herder", function(_, it)
     restore_env(orig)
   end)
 
+  it("密钥/网络等阻塞审批弹窗联动 blocked（与 ask_user 同语义）", function(t)
+    local orig = reset_herder_env()
+    local herder = init_herder()
+    local eb = require("NeoAI.kernel.event_bus")
+    local ev = require("NeoAI.kernel.events")
+
+    emit_created("a1")
+    emit_state("a1", "generating")
+    t.eq("working", report_states()[1])
+
+    eb.emit(ev.SANDBOX_APPROVAL_BLOCKING_OPENED, { id = "dlg_secret", page = "behavior" })
+    t.eq("blocked", report_states()[2], "密钥弹窗打开应上报 blocked")
+    eb.emit(ev.SANDBOX_APPROVAL_BLOCKING_OPENED, { id = "dlg_net", page = "network" })
+    t.eq("blocked", herder.get_state(), "多个阻塞弹窗仍为 blocked")
+
+    eb.emit(ev.SANDBOX_APPROVAL_BLOCKING_CLOSED, { id = "dlg_secret" })
+    t.eq("blocked", herder.get_state(), "仍有弹窗未关闭时应保持 blocked")
+    eb.emit(ev.SANDBOX_APPROVAL_BLOCKING_CLOSED, { id = "dlg_net" })
+    t.eq("working", herder.get_state(), "全部关闭后应回落 working")
+
+    -- 重复关闭/重复打开不产生计数漂移
+    eb.emit(ev.SANDBOX_APPROVAL_BLOCKING_CLOSED, { id = "dlg_net" })
+    t.eq("working", herder.get_state())
+    restore_env(orig)
+  end)
+
   it("pty 会话等待输入不影响 pane 状态（不标红）", function(t)
     local orig = reset_herder_env()
     local herder = init_herder()

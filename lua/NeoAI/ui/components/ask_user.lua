@@ -121,9 +121,34 @@ function M._collapsed_geom()
   return { width = width, height = height, col = col, row = row }
 end
 
+--- 光标是否确实在提问窗内：窗口与 buffer 都必须匹配。
+--- 只判断窗口会漏掉「同一窗口内切到其它 buffer」：BufLeave 收起后紧接的 BufEnter
+--- 仍会把该窗口误判为提问窗并重新展开，表现为「切 buffer 不收起」。
+--- @return boolean
+local function _is_current_win()
+  return state.win_id ~= nil and vim.api.nvim_win_is_valid(state.win_id)
+    and state.buf ~= nil and vim.api.nvim_buf_is_valid(state.buf)
+    and vim.api.nvim_get_current_win() == state.win_id
+    and vim.api.nvim_get_current_buf() == state.buf
+end
+
+--- 自愈：光标已不在提问窗时强制置为收起态。
+--- 只依赖自动命令（WinEnter/WinLeave）有一个失败面：事件在某些路径上不触发（窗口以
+--- `noautocmd` 切换、切标签页、其它插件重载时清掉 augroup、弹窗在非当前窗口时被重渲染等），
+--- 弹窗就会停在展开态——表现为「光标跳出弹窗却不收起」。故每次应用几何前按**实际焦点**再校正
+--- 一次，自动命令只是让收起更即时的加速通道。
+local function _sync_collapsed()
+  if not (state.win_id and vim.api.nvim_win_is_valid(state.win_id)) then return end
+  -- 单向校正：只要窗口/buffer 已不在提问窗就强制收起（含同一窗口切到其它 buffer）。
+  -- 不在此处强制展开：FocusLost/WinLeave 等显式收起可能发生在光标仍位于本窗时，
+  -- 必须在真正回到提问窗（WinEnter/BufEnter 回调）时由 M.expand() 展开。
+  if not _is_current_win() then state.collapsed = true end
+end
+
 --- 按当前折叠状态把几何写回窗口（并更新标题提示）。
 local function _apply_geom()
   if not state.win_id or not vim.api.nvim_win_is_valid(state.win_id) then return end
+  _sync_collapsed()
   local geom = state.collapsed and M._collapsed_geom() or _expanded_geom()
   local title = state.collapsed
     and string.format("❓ 待回答问题（%d）· 聚焦展开", #state.questions)
@@ -139,39 +164,54 @@ local function _apply_geom()
   })
 end
 
---- 安装焦点联动：焦点进入本窗口展开；移到其它窗口/应用失焦时折叠。
+--- 焦点联动自动命令组是否仍有效（组被外部删除/清空时需重装）。
+--- @return boolean
+local function _autocmds_alive()
+  if not state.win_group then return false end
+  local ok, list = pcall(vim.api.nvim_get_autocmds, { group = state.win_group })
+  return ok and type(list) == "table" and #list > 0
+end
+
+--- 安装焦点联动：光标在提问窗内展开；离开提问窗 / 切标签页 / 应用失焦时收起为右上角小窗。
+--- 幂等且可重装：自动命令组丢失（插件重载、外部清理 augroup）时自动重建，避免「收起永不触发」。
+--- 收起以 `WinLeave`（离开本窗）为主：不依赖目标窗口是否触发 `WinEnter`，覆盖 `<C-w>w`、
+--- 鼠标点击其它窗口、切标签页等所有离开方式。
 local function _install_win_autocmds()
-  if state.win_group or not (state.win_id and vim.api.nvim_win_is_valid(state.win_id)) then return end
+  if not (state.win_id and vim.api.nvim_win_is_valid(state.win_id)) then return end
+  if _autocmds_alive() then return end
+  if state.win_group then pcall(vim.api.nvim_del_augroup_by_id, state.win_group) end
   state.win_group = vim.api.nvim_create_augroup("NeoAIAskUserWin", { clear = true })
-  vim.api.nvim_create_autocmd("WinEnter", {
-    group = state.win_group,
+  local group = state.win_group
+  -- 光标离开提问窗：立即收起（回调执行时 current win 仍是本窗）。
+  vim.api.nvim_create_autocmd({ "WinLeave", "BufLeave", "TabLeave" }, {
+    group = group,
     callback = function()
       if state.win_id and vim.api.nvim_win_is_valid(state.win_id)
         and vim.api.nvim_get_current_win() == state.win_id then
-        M.expand()
-      else
         M.collapse()
       end
     end,
   })
-  vim.api.nvim_create_autocmd("FocusLost", {
-    group = state.win_group,
+  vim.api.nvim_create_autocmd({ "WinEnter", "BufEnter", "TabEnter" }, {
+    group = group,
+    callback = function()
+      if _is_current_win() then M.expand() else M.collapse() end
+    end,
+  })
+  vim.api.nvim_create_autocmd({ "FocusLost", "VimSuspend" }, {
+    group = group,
     callback = function() M.collapse() end,
   })
-  vim.api.nvim_create_autocmd("FocusGained", {
-    group = state.win_group,
-    callback = function()
-      if state.win_id and vim.api.nvim_win_is_valid(state.win_id)
-        and vim.api.nvim_get_current_win() == state.win_id then
-        M.expand()
-      end
-    end,
+  vim.api.nvim_create_autocmd({ "FocusGained", "VimResume" }, {
+    group = group,
+    callback = function() if _is_current_win() then M.expand() end end,
   })
 end
 
 --- 展开提问弹窗（获得焦点时调用）。
 function M.expand()
   if not state.win_id or not vim.api.nvim_win_is_valid(state.win_id) then return end
+  if state.collapsed == false then return end -- 已展开：避免每次 WinEnter 重复设几何
   state.collapsed = false
   _apply_geom()
 end
@@ -179,6 +219,7 @@ end
 --- 折叠提问弹窗为右上角小窗（失去焦点时调用）。
 function M.collapse()
   if not state.win_id or not vim.api.nvim_win_is_valid(state.win_id) then return end
+  if state.collapsed == true then return end -- 已收起：幂等
   state.collapsed = true
   _apply_geom()
 end
@@ -187,6 +228,25 @@ end
 --- @return boolean
 function M.is_collapsed()
   return state.collapsed == true
+end
+
+--- 诊断快照（排查「焦点移出后未收起」用）。
+--- @return table { win_id, buf, collapsed, win_group, autocmds, current, width, height }
+function M._debug()
+  local cfg = {}
+  if state.win_id and vim.api.nvim_win_is_valid(state.win_id) then
+    cfg = vim.api.nvim_win_get_config(state.win_id)
+  end
+  return {
+    win_id = state.win_id,
+    buf = state.buf,
+    collapsed = state.collapsed,
+    win_group = state.win_group,
+    autocmds = _autocmds_alive(),
+    current = vim.api.nvim_get_current_win(),
+    width = cfg.width,
+    height = cfg.height,
+  }
 end
 
 --- 关闭窗口并复位全部状态
@@ -611,6 +671,9 @@ end
 --- 重渲染 buffer（内容 + 高亮 + 快捷键 + 动态高度）
 _render = function()
   _ensure_window()
+  -- 每次渲染确保焦点联动在心（自动命令组可能被外部清理/重载清空）：否则会退化为「光标移出
+  -- 提问窗也不收起」。
+  _install_win_autocmds()
   local total = _tab_total()
   if total < 1 then total = 1 end
   if state.active < 1 then state.active = 1 end

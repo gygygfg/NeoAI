@@ -98,6 +98,12 @@ local function _net_revoke(key)
   return sb and sb.net_consent_revoke and sb.net_consent_revoke(key)
 end
 
+--- 把一条「超时自动拒绝」的历史条目重新允许（本次会话）
+local function _net_allow_history(key)
+  local sb = _sb()
+  return sb and sb.net_consent_allow_history and sb.net_consent_allow_history(key)
+end
+
 -- ========== 工具审批条件门面访问器（「工具行为」页集中管理，仅本会话内存态） ==========
 -- 全部经 services.sandbox 语义化 API；服务缺失时降级（列表返回空、mutator 返回 false）。
 
@@ -233,6 +239,7 @@ local state = {
   line_to_target = {}, -- 行号 -> { change_set_id, path? }
   line_to_hub = {}, -- 行号 -> 审批分流中心条目 id（阻塞类页面）
   line_to_allowance = {}, -- 行号 -> 网络请求页「本会话已允许」条目 key（`d` 撤销）
+  line_to_history = {}, -- 行号 -> 网络请求页历史条目 key（超时自动拒绝 → `S` 重新允许）
   line_to_trace = {}, -- 行号 -> 越界留痕路径（`i` 查看详情，非审批目标）
   line_to_cmd = {}, -- 行号 -> { command = string|nil } 越界命令（`i` 查看该命令涉及的文件）
   fold_levels = {}, -- 行号 -> 折叠级别（仅「已应用」区 > 0）：区标题=1，条目及其文件行=2
@@ -2877,7 +2884,14 @@ local function _page_count(page, ctx)
   if page == "files" then return #(ctx.items or {}) + #(ctx.saved or {}) + #(ctx.rejected or {}) end
   if page == "behavior" then return _hub_pending("behavior") + #(ctx.hostops or {}) end
   if page == "resource" then return _hub_pending("resource") end
-  if page == "network" then return _hub_pending("network") end
+  if page == "network" then
+    -- 待批准 + 可补救的「超时自动拒绝」历史条目（按 S 重新允许，属待处理事项）。
+    local n = _hub_pending("network")
+    for _, h in ipairs(_net_history()) do
+      if h.timed_out then n = n + 1 end
+    end
+    return n
+  end
   if page == "anomaly" then
     local n = 0
     for _ in ipairs(ctx.traces or {}) do n = n + 1 end
@@ -2921,11 +2935,12 @@ end
 local function _build_blocking_page(page, ctx)
   local lines, marks, line_to_hub, line_to_target = {}, {}, {}, {}
   local line_to_allowance = {}
+  local line_to_history = {}
   local entries = _hub_list(page)
   local head = ("── %s（待批准 %d）──"):format(_page_label(page) or page, #entries)
   lines[#lines + 1] = head
   lines[#lines + 1] = page == "network"
-    and "快捷键: <CR> 仅本次允许    S 本次会话允许    d 拒绝（本会话已允许行按 d 撤销）"
+    and "快捷键: <CR> 仅本次允许    S 本次会话允许    d 拒绝（允许行 d 撤销 / 历史超时拒绝行 S 重新允许）"
     or (page == "behavior"
       and "快捷键: <CR> 仅本次允许    S 本次会话允许    d 拒绝    E 设备组件    T 工具审批条件"
       or "快捷键: <CR> 仅本次允许    S 本次会话允许    d 拒绝")
@@ -2935,7 +2950,10 @@ local function _build_blocking_page(page, ctx)
     lines[#lines + 1] = ""
   end
   for _, e in ipairs(entries) do
-    local text = string.format("[%s] %s", e.id, _one_line(e.title))
+    -- 同目标并发请求在审批中心已合并：附「×N」提示一次决策覆盖 N 条挂起请求。
+    local dup = tonumber(e.count) or 1
+    local dup_tag = dup > 1 and ("（×" .. tostring(dup) .. " 个请求）") or ""
+    local text = string.format("[%s] %s%s", e.id, _one_line(e.title), dup_tag)
     local hln = #lines + 1
     lines[#lines + 1] = text
     line_to_hub[hln] = e.id
@@ -2964,20 +2982,30 @@ local function _build_blocking_page(page, ctx)
     end
     lines[#lines + 1] = ""
     local hist = _net_history()
-    lines[#lines + 1] = ("── 历史（仅记录 %d）──"):format(#hist)
+    lines[#lines + 1] = ("── 历史（按目标合并 %d；超时拒绝行可按 S 重新允许）──"):format(#hist)
     if #hist == 0 then
       lines[#lines + 1] = "（无）"
     else
       for _, h in ipairs(hist) do
-        local label = h.decision == "allow_once" and "已允许(单次)"
-          or (h.decision == "revoked" and "已撤销" or "已拒绝")
+        -- 标签优先级：已补救 > 单次允许 > 已撤销 > 超时自动拒绝 > 拒绝
+        local label
+        if h.remedied and h.decision == "deny" then label = "已允许(补救)"
+        elseif h.decision == "allow_once" then label = "已允许(单次)"
+        elseif h.decision == "revoked" then label = "已撤销"
+        elseif h.timed_out then label = "已拒绝(超时)"
+        else label = "已拒绝" end
+        local n = tonumber(h.count) or 1
+        local cnt = n > 1 and (" ×" .. tostring(n)) or ""
         local who = h.comm and ("（" .. _one_line(h.comm) .. "）") or ""
         local tm = h.at_ms and ("  " .. os.date("%H:%M:%S", math.floor(h.at_ms / 1000))) or ""
-        local text = string.format("  [%s] %s:%s%s%s",
-          label, _one_line(h.host), tostring(h.port), who, tm)
+        local act = h.timed_out and "   S 重新允许" or ""
+        local text = string.format("  [%s%s] %s:%s%s%s%s",
+          label, cnt, _one_line(h.host), tostring(h.port), who, tm, act)
         local ln = #lines + 1
         lines[#lines + 1] = text
-        marks[#marks + 1] = { line = ln, start_col = 0, end_col = #text, level = "note" }
+        if h.timed_out then line_to_history[ln] = h.key end
+        marks[#marks + 1] = { line = ln, start_col = 0, end_col = #text,
+          level = h.timed_out and "pending1" or "note" }
       end
     end
     lines[#lines + 1] = ""
@@ -3031,7 +3059,8 @@ local function _build_blocking_page(page, ctx)
     end
   end
   return { lines = lines, marks = marks, line_to_hub = line_to_hub,
-    line_to_target = line_to_target, line_to_allowance = line_to_allowance }
+    line_to_target = line_to_target, line_to_allowance = line_to_allowance,
+    line_to_history = line_to_history }
 end
 
 --- 构建「越界/异常」页：越界访问留痕（按文件，只读）+ 越界命令（命令 → 文件，只读）
@@ -3164,6 +3193,22 @@ local function _blocking_decide(value)
     end
     return
   end
+  -- 网络请求页历史行：仅「超时自动拒绝」（用户未应答）支持 `S` 重新允许（本次会话）——
+  -- 补救「用户离开时连接被超时兜底拒绝，回来后无需重跑命令」。
+  local hkey = state.line_to_history and state.line_to_history[ln]
+  if hkey then
+    if value == "allow_session" then
+      if _net_allow_history(hkey) then
+        vim.notify("[NeoAI] 已重新允许该目标（本次会话），后续访问不再询问", vim.log.levels.INFO)
+        _schedule_refresh()
+      else
+        vim.notify("[NeoAI] 该历史行不可重新允许（非超时自动拒绝或已补救）", vim.log.levels.WARN)
+      end
+    else
+      vim.notify("[NeoAI] 该历史行仅支持 S 重新允许（本次会话）", vim.log.levels.INFO)
+    end
+    return
+  end
   local id = state.line_to_hub and state.line_to_hub[ln]
   if id then
     if _hub_resolve(id, value) then
@@ -3183,6 +3228,22 @@ end
 --- 资源访问页便捷键：把光标所在条目命中的遮蔽路径加入工作目录列表。
 local function _add_masked_to_workspace()
   local ln = vim.api.nvim_win_get_cursor(0)[1]
+  -- 网络请求页历史行：仅「超时自动拒绝」（用户未应答）支持 `S` 重新允许（本次会话）——
+  -- 补救「用户离开时连接被超时兜底拒绝，回来后无需重跑命令」。
+  local hkey = state.line_to_history and state.line_to_history[ln]
+  if hkey then
+    if value == "allow_session" then
+      if _net_allow_history(hkey) then
+        vim.notify("[NeoAI] 已重新允许该目标（本次会话），后续访问不再询问", vim.log.levels.INFO)
+        _schedule_refresh()
+      else
+        vim.notify("[NeoAI] 该历史行不可重新允许（非超时自动拒绝或已补救）", vim.log.levels.WARN)
+      end
+    else
+      vim.notify("[NeoAI] 该历史行仅支持 S 重新允许（本次会话）", vim.log.levels.INFO)
+    end
+    return
+  end
   local id = state.line_to_hub and state.line_to_hub[ln]
   local entry = id and _hub_get(id)
   local masked = entry and entry.meta and entry.meta.masked
@@ -3480,6 +3541,7 @@ function M.refresh()
   state.line_to_cmd = _shift(body.line_to_cmd)
   state.line_to_hub = _shift(body.line_to_hub)
   state.line_to_allowance = _shift(body.line_to_allowance)
+  state.line_to_history = _shift(body.line_to_history)
   vim.api.nvim_buf_clear_namespace(state.buf, state.ns, 0, -1)
   for _, m in ipairs(marks) do
     if LEVEL_HL[m.level] then
@@ -3542,6 +3604,7 @@ function M.close()
   state.line_to_target = {}
   state.line_to_hub = {}
   state.line_to_allowance = {}
+  state.line_to_history = {}
   state.line_to_trace = {}
   state.line_to_cmd = {}
   state.fold_levels = {}
@@ -3620,6 +3683,7 @@ function M.reset()
   state.page = "files"
   state.line_to_hub = {}
   state.line_to_allowance = {}
+  state.line_to_history = {}
   if state.unwait then
     pcall(state.unwait)
     state.unwait = nil

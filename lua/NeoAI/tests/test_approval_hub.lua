@@ -29,6 +29,32 @@ tests.suite("approval_hub", function(_, it)
     hub.reset()
   end)
 
+  it("dedupe_key：同键在途条目合并，一次决策回调全部", function(t)
+    local hub = require("NeoAI.sandbox.review.approval_hub")
+    hub.reset()
+    local got = {}
+    local id1 = hub.submit("network", { title = "a", dedupe_key = "k1",
+      on_decision = function(v) got[1] = v end })
+    local id2 = hub.submit("network", { title = "a", dedupe_key = "k1",
+      on_decision = function(v) got[2] = v end })
+    t.eq(id1, id2, "同页同键应复用同一 id")
+    t.eq(1, hub.pending_count("network"), "只保留一条待处理")
+    t.eq(2, hub.list("network")[1].count, "计数应累加")
+    -- 不同键 / 不同页不合并
+    local other = hub.submit("network", { title = "b", dedupe_key = "k2" })
+    t.true_(other ~= id1, "不同键应新建")
+    hub.submit("behavior", { title = "c", dedupe_key = "k1" })
+    t.eq(2, hub.pending_count("network"), "跨页不合并")
+    t.true_(hub.resolve(id1, "allow_once"), "应能决策合并条目")
+    t.eq("allow_once", got[1], "第 1 个决策者应回调")
+    t.eq("allow_once", got[2], "合并的决策者均应回调")
+    t.eq(0, hub.get(id1) and 1 or 0, "决策后条目应移除")
+    -- 已结算后同键再次提交应新建
+    local id3 = hub.submit("network", { title = "a", dedupe_key = "k1" })
+    t.true_(id3 ~= id1, "已结算后同键应新建条目")
+    hub.reset()
+  end)
+
   it("clear 移除条目不触发决策回调", function(t)
     local hub = require("NeoAI.sandbox.review.approval_hub")
     hub.reset()
@@ -44,6 +70,31 @@ tests.suite("approval_hub", function(_, it)
     local hub = require("NeoAI.sandbox.review.approval_hub")
     hub.reset()
     t.throws(function() hub.submit("nope", { title = "x" }) end)
+    hub.reset()
+  end)
+
+  it("阻塞审批条目广播 opened/closed（Herder blocked 联动）", function(t)
+    local hub = require("NeoAI.sandbox.review.approval_hub")
+    local eb = require("NeoAI.kernel.event_bus")
+    local ev = require("NeoAI.kernel.events")
+    hub.reset()
+    local opened, closed = {}, {}
+    local u1 = eb.on(ev.SANDBOX_APPROVAL_BLOCKING_OPENED, function(d) opened[#opened + 1] = d end)
+    local u2 = eb.on(ev.SANDBOX_APPROVAL_BLOCKING_CLOSED, function(d) closed[#closed + 1] = d end)
+
+    local id = hub.submit("network", { title = "example.com:443" })
+    t.eq(1, #opened, "阻塞条目提交应广播 opened")
+    t.eq(id, opened[1].id)
+    t.eq("network", opened[1].page)
+    hub.resolve(id, "allow_once")
+    t.eq(1, #closed, "决策后应广播 closed")
+    t.eq(id, closed[1].id)
+
+    local id2 = hub.submit("behavior", { title = "secret" })
+    hub.clear(id2)
+    t.eq(2, #closed, "clear 也应广播 closed")
+
+    u1(); u2()
     hub.reset()
   end)
 

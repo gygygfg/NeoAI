@@ -85,7 +85,12 @@ tests.suite("secret_fake", function(_, it)
     t.eq(2, select(2, fj:gsub("%.", ".")), "JWT 应保留两个分隔点")
     t.matches("^eyJ", fj, "JWT 首段应保留 eyJ 头")
     t.eq(jwt, (secret.detokenize((secret.tokenize(jwt)))), "JWT 应可还原")
-    local pem = "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA1234567890abcdefGHIJ\n-----END RSA PRIVATE KEY-----"
+    -- 私钥块 fixture 在运行时拼装：源码字节里不出现完整的 BEGIN..END 块，
+    -- 避免沙箱密钥层把测试样本本身当成真实密钥（写入被假化会写坏源码）。
+    local dash5 = ("-"):rep(5)
+    local pem = dash5 .. "BEGIN RSA PRIVATE KEY" .. dash5 .. "\n"
+      .. ("MIIEowIBAAKCAQEA"):rep(6) .. "\n"
+      .. dash5 .. "END RSA PRIVATE KEY" .. dash5
     local fp = fake_of(pem)
     t.eq(#pem, #fp, "私钥块长度应一致")
     t.true_(fp:find("BEGIN RSA PRIVATE KEY", 1, true) ~= nil, "应保留头")

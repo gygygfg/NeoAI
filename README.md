@@ -661,7 +661,7 @@ NeoAI 可以在 **Herder** 管理的 pane 内向 Herder 上报 AI Agent 的真�
 | NeoAI Agent 状态 | Herder 上报 |
 |---|---|
 | `generating` / `tool_running` | `working` |
-| 工具审批等待 / `ask_user` 等待用户回答 | `blocked` |
+| 工具审批等待 / `ask_user` 等待用户回答 / 密钥、网络等阻塞审批弹窗 | `blocked` |
 | `idle` / `aborted` / `error` | `idle` |
 
 **多会话聚合**：单个 Neovim pane 内可能有多个 AI 会话（含子 Agent），NeoAI 聚合成一个固定的

@@ -427,6 +427,90 @@ tests.suite("net_consent", function(_, it)
     nc.reset()
   end)
 
+  it("历史按目标去重，且超时自动拒绝条目可重新允许（补救）", function(t)
+    local nc = require("NeoAI.sandbox.net.net_consent")
+    nc.reset()
+    local owner = { comm = "postgres", pid = 77, exe = "/usr/bin/postgres" }
+    -- 同一目标两次拒绝（其中一次超时）；另一目标一次单次允许
+    with_config({ tools = { sandbox = { network = { consent_timeout_ms = 100 } } } }, function()
+      nc.set_ui({ show = function() end }) -- 永不决策 → 超时自动拒绝
+      local d1
+      nc.request({ host = "127.0.0.1", port = 5432, local_ = true, owner = owner, owner_resolved = true })
+        :then_(function(v) d1 = v end)
+      t.true_(vim.wait(1500, function() return d1 ~= nil end, 20), "超时后应 resolve")
+      t.eq("deny", d1)
+    end)
+    nc.set_ui({ show = function(_, decide) decide("allow_once") end })
+    local d2
+    nc.request({ host = "127.0.0.1", port = 5432, local_ = true, owner = owner, owner_resolved = true })
+      :then_(function(v) d2 = v end)
+    t.true_(vim.wait(1000, function() return d2 ~= nil end), "单次允许应 resolve")
+    local d3
+    nc.request({ host = "example.com", port = 443, local_ = false })
+      :then_(function(v) d3 = v end)
+    t.true_(vim.wait(1000, function() return d3 ~= nil end), "外部目标应 resolve")
+
+    local hist = nc.list_history()
+    t.eq(2, #hist, "同目标应合并为一条")
+    local local_rec
+    for _, h in ipairs(hist) do
+      if h.host == "127.0.0.1" and h.port == 5432 then local_rec = h end
+    end
+    t.not_nil(local_rec, "应含 127.0.0.1:5432")
+    t.eq(2, local_rec.count, "应累计同目标次数")
+    t.eq("allow_once", local_rec.decision, "取最近一次决策")
+    t.true_(local_rec.timed_out, "同目标仍存在未补救的超时拒绝")
+    t.not_nil(local_rec.key, "应提供目标键")
+    -- 超时拒绝条目被历史合并后仍可按键补救
+    t.true_(nc.allow_from_history(local_rec.key), "应能重新允许")
+    t.true_(nc.is_session_allowed("127.0.0.1", 5432, owner), "重新允许后应本会话免弹窗")
+    local after = nc.list_history()
+    local rec2
+    for _, h in ipairs(after) do
+      if h.key == local_rec.key then rec2 = h end
+    end
+    t.true_(rec2.remedied, "应标记为已补救")
+    t.false_(rec2.timed_out, "补救后不再提示重新允许")
+    t.false_(nc.allow_from_history(local_rec.key), "重复补救应返回 false")
+    t.false_(nc.allow_from_history("不存在"), "未知键应返回 false")
+    -- 单次允许（非超时）不可补救
+    local ext
+    for _, h in ipairs(after) do
+      if h.host == "example.com" then ext = h end
+    end
+    t.false_(nc.allow_from_history(ext.key), "非超时拒绝不可重新允许")
+    nc.set_ui(nil)
+    nc.reset()
+  end)
+
+  it("并发同目标请求在审批中心合并为一条，一次决策全部生效", function(t)
+    local nc = require("NeoAI.sandbox.net.net_consent")
+    local hub = require("NeoAI.sandbox.review.approval_hub")
+    nc.reset()
+    hub.reset()
+    local owner = { comm = "postgres", pid = 9, exe = "/usr/bin/postgres" }
+    with_config({ tools = { sandbox = { network = { consent_timeout_ms = 0 } } } }, function()
+      nc.set_ui({ show = function() end }) -- 独立弹窗不决策，留给中心决策
+      local got = {}
+      for i = 1, 2 do
+        nc.request({ host = "127.0.0.1", port = 5432, local_ = true, owner = owner, owner_resolved = true })
+          :then_(function(v) got[i] = v end)
+      end
+      local list = hub.list("network")
+      t.eq(1, #list, "同目标应合并为一条待批准")
+      t.eq(2, list[1].count, "合并计数应为 2")
+      t.eq(1, hub.pending_count("network"), "待批准计数按去重后计")
+      t.true_(hub.resolve(list[1].id, "allow_session"), "应能决策")
+      vim.wait(1000, function() return got[1] ~= nil and got[2] ~= nil end, 10)
+      t.eq("allow_session", got[1], "第 1 个请求应结算")
+      t.eq("allow_session", got[2], "第 2 个请求应结算")
+      t.eq(0, hub.pending_count("network"), "决策后条目应移除")
+    end)
+    nc.set_ui(nil)
+    nc.reset()
+    hub.reset()
+  end)
+
   it("弹窗无响应超时自动拒绝（fail-closed）", function(t)
     local nc = require("NeoAI.sandbox.net.net_consent")
     nc.reset()

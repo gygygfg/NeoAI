@@ -14,6 +14,8 @@
 ---
 --- 阻塞类请求由来源模块（tool_service / net_consent）提交；来源仍可自行弹独立弹窗以保证
 --- 即时响应，同时把条目镜像到本中心（同一 `id`），中心窗口亦可决策（决策幂等）。
+--- **可选去重**：提交时给 `dedupe_key`，同页同键的**在途**条目合并为一条（`count` 累加、
+--- 决策回调追加），一次决策让该目标下所有挂起请求一起结算（网络请求页即按「端口 + 服务进程」去重）。
 --- 观测类页面由 provider 函数按需列举。
 ---
 --- 本模块**无 UI 依赖**：headless / 测试下 `set_ui(nil)` 时仅保留条目不渲染。
@@ -54,6 +56,41 @@ local function _emit_changed(page)
   end
 end
 
+--- 页面是否属于「阻塞 agent 执行」的审批页。
+--- @param page string
+--- @return boolean
+local function _is_blocking_page(page)
+  for _, p in ipairs(M.PAGES) do
+    if p.id == page then return p.kind == "blocking" end
+  end
+  return false
+end
+
+--- 广播阻塞类审批弹窗生命周期（Herder 据此标记 pane blocked / 恢复）。
+--- @param event_name string SANDBOX_APPROVAL_BLOCKING_OPENED/CLOSED
+--- @param rec table 审批条目
+local function _emit_blocking(event_name, rec)
+  if not rec then return end
+  pcall(function()
+    require("NeoAI.kernel.event_bus").emit(event_name, {
+      id = rec.id, page = rec.page,
+      title = rec.title, kind = rec.meta and rec.meta.kind or nil,
+    })
+  end)
+end
+
+--- 查找同页同 dedupe_key 的待处理条目（仍在等待决策）。
+--- @param page string
+--- @param key string
+--- @return table|nil
+local function _find_dedupe(page, key)
+  for _, id in ipairs(state.order) do
+    local rec = state.entries[id]
+    if rec and rec.page == page and rec.dedupe_key == key then return rec end
+  end
+  return nil
+end
+
 -- ========== 公开 API ==========
 
 --- 注册页面窗口（ui/components/sandbox_review 调用）；传 nil 注销。
@@ -82,18 +119,37 @@ end
 --- 提交一条阻塞类审批请求（来源模块调用）。
 --- @param page string PAGES 中的 id（blocking 类）
 --- @param entry table {
+---   id: string|nil,                -- 缺省自动生成
 ---   title: string,
----   detail: string[]|nil,       -- 展示用详情行（已单行化）
----   decisions: table[]|nil,     -- { { key, label, value } }；缺省为 allow_once/allow_session/deny
----   on_decision: function(value), -- 幂等决策回调（重复调用只生效一次由来源保证）
+---   detail: string[]|nil,          -- 展示用详情行（已单行化）
+---   decisions: table[]|nil,        -- { { key, label, value } }；缺省为 allow_once/allow_session/deny
+---   on_decision: function(value),  -- 幂等决策回调（重复调用只生效一次由来源保证）
+---   dedupe_key: string|nil,        -- 同页同键的在途条目合并为一条（并发/重复请求去重）
 ---   meta: table|nil,
 --- }
 --- @return string id
 function M.submit(page, entry)
   assert(PAGE_IDS[page], "approval_hub: unknown page " .. tostring(page))
   entry = entry or {}
+  -- 去重（可选）：同页 + 同 dedupe_key 且**仍在待处理**时合并——只保留一条展示，
+  -- 追加决策回调并把 `count` 累加；一次决策让该目标下所有挂起请求一起生效。
+  local dk = entry.dedupe_key
+  if type(dk) == "string" and dk ~= "" then
+    local exist = _find_dedupe(page, dk)
+    if exist then
+      exist.deciders = exist.deciders or {}
+      if type(entry.on_decision) == "function" then
+        exist.deciders[#exist.deciders + 1] = entry.on_decision
+      end
+      exist.count = (tonumber(exist.count) or 1) + 1
+      _emit_changed(page)
+      return exist.id
+    end
+  end
   state.seq = state.seq + 1
   local id = entry.id or string.format("ah_%d_%d", state.seq, os.time())
+  local deciders = {}
+  if type(entry.on_decision) == "function" then deciders[1] = entry.on_decision end
   local rec = {
     id = id,
     page = page,
@@ -102,16 +158,24 @@ function M.submit(page, entry)
     detail = type(entry.detail) == "table" and entry.detail or {},
     decisions = entry.decisions,
     on_decision = entry.on_decision,
+    deciders = deciders,
+    dedupe_key = (type(dk) == "string" and dk ~= "") and dk or nil,
+    count = 1,
     meta = entry.meta,
+    blocking = _is_blocking_page(page),
     created_at = os.time(),
   }
   if state.entries[id] == nil then state.order[#state.order + 1] = id end
   state.entries[id] = rec
   _emit_changed(page)
+  if rec.blocking then
+    _emit_blocking(require("NeoAI.kernel.events").SANDBOX_APPROVAL_BLOCKING_OPENED, rec)
+  end
   return id
 end
 
 --- 决策一条阻塞类条目（幂等：不存在则忽略）。由窗口 / 来源调用。
+--- 去重条目会把**所有**挂起请求的决策回调各调一次（每条请求各自结算）。
 --- @param id string
 --- @param value any 决策值（如 "allow_once"|"allow_session"|"deny"）
 --- @return boolean 是否找到并调用
@@ -122,7 +186,18 @@ function M.resolve(id, value)
   for i, oid in ipairs(state.order) do
     if oid == id then table.remove(state.order, i); break end
   end
-  if type(rec.on_decision) == "function" then pcall(rec.on_decision, value) end
+  local deciders = rec.deciders
+  if type(deciders) ~= "table" then
+    deciders = {}
+    if type(rec.on_decision) == "function" then deciders[1] = rec.on_decision end
+  end
+  if rec.blocking then
+    _emit_blocking(require("NeoAI.kernel.events").SANDBOX_APPROVAL_BLOCKING_CLOSED, rec)
+  end
+  -- 先快照再回调：回调内可能再次 submit（新请求）/clear（同条目）修改集合。
+  local list = {}
+  for i, fn in ipairs(deciders) do list[i] = fn end
+  for _, fn in ipairs(list) do pcall(fn, value) end
   _emit_changed(rec.page)
   return true
 end
@@ -131,7 +206,11 @@ end
 --- @param id string
 function M.clear(id)
   if state.entries[id] == nil then return end
-  local page = state.entries[id].page
+  local rec = state.entries[id]
+  local page = rec.page
+  if rec.blocking then
+    _emit_blocking(require("NeoAI.kernel.events").SANDBOX_APPROVAL_BLOCKING_CLOSED, rec)
+  end
   state.entries[id] = nil
   for i, oid in ipairs(state.order) do
     if oid == id then table.remove(state.order, i); break end
@@ -189,6 +268,11 @@ end
 
 --- 重置（测试用）
 function M.reset()
+  for _, rec in pairs(state.entries) do
+    if rec.blocking then
+      _emit_blocking(require("NeoAI.kernel.events").SANDBOX_APPROVAL_BLOCKING_CLOSED, rec)
+    end
+  end
   state.ui = nil
   state.seq = 0
   state.entries = {}

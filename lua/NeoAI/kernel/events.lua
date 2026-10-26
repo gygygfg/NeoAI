@@ -183,6 +183,11 @@ M.SANDBOX_CONSENT_REQUESTED = "sandbox:consent_requested"
 -- 审批分流中心：阻塞类审批条目或观测类页面内容变化（多级页面审批悬浮窗据此自动刷新）
 M.SANDBOX_APPROVAL_CHANGED = "sandbox:approval_changed"
 
+-- 阻塞类审批弹窗生命周期（密钥/网络/设备/策略/工具审批等）：打开时 agent 暂停等待用户；
+-- 关闭/决策后恢复。Herder 据此把 pane 标记为 blocked（与 ask_user 的等待信号同语义）。
+M.SANDBOX_APPROVAL_BLOCKING_OPENED = "sandbox:approval_blocking_opened"
+M.SANDBOX_APPROVAL_BLOCKING_CLOSED = "sandbox:approval_blocking_closed"
+
 -- 越界访问留痕：读取/操作当前工作区（cwd）之外的用户目录（home/root 等）
 M.SANDBOX_OUTSIDE_ACCESS = "sandbox:outside_access"
 

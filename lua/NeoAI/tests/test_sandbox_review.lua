@@ -1655,6 +1655,72 @@ tests.suite("sandbox_review", function(_, it)
     services.provide("services.sandbox", saved)
   end)
 
+  it("网络请求页：历史去重与超时拒绝行按 S 重新允许（含待批准去重计数）", function(t)
+    local services = require("NeoAI.kernel.services")
+    local sr = require("NeoAI.ui.components.sandbox_review")
+    local hub = require("NeoAI.sandbox.review.approval_hub")
+    sr.reset()
+    local saved = services.use("services.sandbox")
+    local granted
+    _provide_sandbox({
+      list_reviews = function() return {} end,
+      list_traces = function() return {} end,
+      list_saved = function() return {} end,
+      apply = function() return { ok = true } end,
+      reject = function() end,
+      net_consent_allowances = function() return {} end,
+      net_consent_history = function()
+        return {
+          { key = "127.0.0.1:5432@/usr/bin/postgres", host = "127.0.0.1", port = 5432,
+            comm = "postgres", decision = "deny", reason = "timeout",
+            at_ms = 1700000000000, count = 3, timed_out = true },
+          { key = "example.com:443", host = "example.com", port = 443,
+            decision = "allow_once", at_ms = 1700000000000, count = 1 },
+        }
+      end,
+      net_consent_revoke = function() return true end,
+      net_consent_allow_history = function(key) granted = key; return true end,
+    })
+    -- 同一目标两个并发请求 → 审批中心合并为一条（×2）
+    local decisions = {}
+    for i = 1, 2 do
+      hub.submit("network", {
+        title = "127.0.0.1:9999（mockd pid 42）",
+        dedupe_key = "127.0.0.1:9999@/usr/bin/mockd",
+        on_decision = function(v) decisions[i] = v end,
+      })
+    end
+    sr.open()
+    sr.open_page("network")
+    local buf = sr.get_buf()
+    local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+    local text = table.concat(lines, "\n")
+    t.matches("×2 个请求", text, "待批准条目应提示合并的请求数")
+    t.matches("已拒绝%(超时%) ×3", text, "历史应展示超时拒绝与合并次数")
+    t.matches("S 重新允许", text, "历史行应提示可重新允许")
+    t.matches("已允许%(单次%)", text, "历史应展示单次允许")
+    -- 定位历史超时行并 S 重新允许
+    local hist_line
+    for i, l in ipairs(lines) do
+      if l:find("已拒绝(超时)", 1, true) then hist_line = i end
+    end
+    t.not_nil(hist_line, "应能定位超时拒绝历史行")
+    vim.api.nvim_win_set_cursor(0, { hist_line, 0 })
+    for _, m in ipairs(vim.api.nvim_buf_get_keymap(buf, "n")) do
+      if m.lhs == "S" then m.callback() end
+    end
+    t.eq("127.0.0.1:5432@/usr/bin/postgres", granted, "S 应请求重新允许对应目标")
+    -- d 在该行不支持（仅提示，不调撤销/决策）
+    vim.api.nvim_win_set_cursor(0, { hist_line, 0 })
+    for _, m in ipairs(vim.api.nvim_buf_get_keymap(buf, "n")) do
+      if m.lhs == "d" then m.callback() end
+    end
+    t.eq(1, hub.pending_count("network"), "历史行 d 不应影响待批准条目")
+    sr.close()
+    hub.reset()
+    services.provide("services.sandbox", saved)
+  end)
+
   it("工具行为页并入主机操作提案", function(t)
     local services = require("NeoAI.kernel.services")
     local sr = require("NeoAI.ui.components.sandbox_review")
