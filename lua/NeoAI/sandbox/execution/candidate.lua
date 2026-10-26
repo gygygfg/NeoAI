@@ -400,7 +400,8 @@ local function _base_entry(attempt, real)
       if stat.mode then fs.chmod(staged, assert(_perm(stat.mode))) end
     end
     state.workspace[real] = {
-      staged = staged, base_hash = base_hash, mode = _perm(stat and stat.mode),
+      staged = staged, base_hash = base_hash, real_hash = base_hash,
+      mode = _perm(stat and stat.mode), tokenized = false,
       version = _bump_version(),
     }
   end
@@ -428,6 +429,11 @@ local function _base_entry(attempt, real)
         end
       end
       view_base_hash = _sha(tok)
+      local ws_ent = state.workspace[real]
+      if ws_ent then
+        ws_ent.tokenized = (tok ~= c)
+        ws_ent.real_hash = base_hash
+      end
     end
   end
   entry = {
@@ -541,16 +547,25 @@ function M.rotate_session()
     local is_dir = entry.staged and vim.fn.isdirectory(entry.staged) == 1
     local staged_exists = is_dir or (entry.staged and fs.exists(entry.staged))
     if entry.deleted then
-      migrated[real] = { staged = new_path, base_hash = entry.base_hash, deleted = true, mode = entry.mode }
+      migrated[real] = {
+        staged = new_path, base_hash = entry.base_hash, deleted = true, mode = entry.mode,
+        real_hash = entry.real_hash, tokenized = entry.tokenized,
+      }
     elseif staged_exists then
       -- 复制任务移入线程池（长会话未发布改动多时，逐文件主线程复制是 agentEnd 卡顿源）。
       jobs[#jobs + 1] = {
         src = entry.staged, dst = new_path, kind = is_dir and "d" or "f", mode = entry.mode,
       }
-      migrated[real] = { staged = new_path, base_hash = entry.base_hash, mode = entry.mode }
+      migrated[real] = {
+        staged = new_path, base_hash = entry.base_hash, mode = entry.mode,
+        real_hash = entry.real_hash, tokenized = entry.tokenized,
+      }
     else
       -- 暂存副本缺失（删除态未显式标记）：按删除态迁移，保持一致性。
-      migrated[real] = { staged = new_path, base_hash = entry.base_hash, deleted = true, mode = entry.mode }
+      migrated[real] = {
+        staged = new_path, base_hash = entry.base_hash, deleted = true, mode = entry.mode,
+        real_hash = entry.real_hash, tokenized = entry.tokenized,
+      }
     end
     migrated_rev[new_path] = real
   end
@@ -772,12 +787,17 @@ function M.mirror_overlay(real_path)
     tok = _tokenize_ok(secret, real) and secret.tokenize(raw, { entropy = secret.is_secret_path(real) }) or raw
   end
   fs.write_file(staged, tok)
+  local real_hash = _sha(raw)
+  local tokenized = (tok ~= raw)
   if entry then
     entry.deleted = false
+    entry.real_hash = real_hash
+    entry.tokenized = tokenized
     entry.version = _bump_version()
   else
     state.workspace[real] = {
-      staged = staged, base_hash = nil, deleted = false, version = _bump_version(),
+      staged = staged, base_hash = nil, deleted = false,
+      real_hash = real_hash, tokenized = tokenized, version = _bump_version(),
     }
   end
 end
@@ -817,8 +837,50 @@ function M.workspace_overrides()
       fresh_ssig = entry.fresh_ssig,
       -- 命令确在常驻 overlay 内执行：产物已存在于该 overlay，常驻物化可安全跳过。
       fresh_resident = entry.fresh_resident == true,
+      tokenized = entry.tokenized == true,
     }
   end
+  return out
+end
+
+--- 列出某目录子树内「已进入沙箱视图但尚未发布到真实盘」的文件/目录路径。
+--- 排除 `.git` 内部与 NeoAI 自身运行时路径。供 git_add/git_commit 前置门禁使用：
+--- 有未发布编辑时拒绝提交，保证 HEAD 与真实工作区一致。
+--- @param root string
+--- @return string[] 绝对路径数组
+function M.unpublished_under(root)
+  _await_rotation()
+  local out = {}
+  if type(root) ~= "string" or root == "" then return out end
+  local runtime = require("NeoAI.sandbox.execution.runtime")
+  local base = _abs(root):gsub("/+$", "")
+  if base == "" then base = "/" end
+  for real, ws in pairs(state.workspace) do
+    local under = (base == "/") or real == base or real:sub(1, #base + 1) == base .. "/"
+    if under and not runtime.is_git_internal(real) and not runtime.is_self_runtime_path(real) then
+      local unpublished = false
+      if ws.deleted then
+        unpublished = true
+      elseif ws.staged and (fs.exists(ws.staged) or vim.fn.isdirectory(ws.staged) == 1) then
+        if vim.fn.isdirectory(ws.staged) == 1 then
+          -- 目录暂存：真实目录不存在即视为未发布（新建目录）。
+          unpublished = vim.fn.isdirectory(real) ~= 1
+        else
+          local after = _read(real)
+          if ws.real_hash then
+            unpublished = (after == nil) or (_sha(after) ~= ws.real_hash)
+          else
+            local before = _read(ws.staged)
+            unpublished = before ~= after
+          end
+        end
+      else
+        unpublished = true
+      end
+      if unpublished then out[#out + 1] = real end
+    end
+  end
+  table.sort(out)
   return out
 end
 
@@ -1088,7 +1150,16 @@ function M.materialize_overlay(specs, opts)
                   -- 暂存视图对 AI 遮蔽了密钥（token 化），但命令执行层必须拿到**真实内容**：
                   -- 物化进 overlay 前把 token 还原，否则程序（pip/build/python 等）读到
                   -- NEOKEY_* 会失败（如 import 报错、构建 KeyError）。AI 侧仍读 token 视图。
-                  content = (require("NeoAI.sandbox.secret.secret").detokenize(content))
+                  local detok, unresolved = require("NeoAI.sandbox.secret.secret").detokenize(content)
+                  if (unresolved or 0) > 0 then
+                    -- 映射缺失（如热重载后）无法还原：fail-closed，命令不执行。
+                    conflicts[#conflicts + 1] = {
+                      real = real, dest = dest, reason = "SECRET_UNRESOLVED",
+                    }
+                    content = nil
+                  else
+                    content = detok
+                  end
                 end
               end
               if is_large or content ~= nil then
@@ -1212,11 +1283,16 @@ local function _apply_view_files(view_files, opts)
     local ws = state.workspace[f.path]
     if ws and ws.staged and not ws.deleted then
       local content = f.content or ""
+      local real_content = content
       if not opts.package and _is_text_content(content) and _tokenize_ok(secret, f.path) then
         content = secret.tokenize(content, { entropy = secret.is_secret_path(f.path) })
+        local detok, unresolved = secret.detokenize(content)
+        if (unresolved or 0) == 0 then real_content = detok end
       end
       fs.write_file(ws.staged, content)
       if f.mode then fs.chmod(ws.staged, f.mode) end
+      ws.real_hash = _sha(real_content)
+      ws.tokenized = (content ~= real_content)
       ws.version = _bump_version()
       paths[#paths + 1] = f.path
     end
@@ -1260,13 +1336,17 @@ function M.merge_candidate(cand, opts)
         -- 检测一致，避免对 venv/依赖树逐文件多次全文扫描（实测数十 MB 需数秒）。
         local content = f.content or ""
         local secret = require("NeoAI.sandbox.secret.secret")
+        local real_content = content
         if not opts.package and _is_text_content(content) and _tokenize_ok(secret, f.path) then
           content = secret.tokenize(content, { entropy = secret.is_secret_path(f.path) })
+          local detok, unresolved = secret.detokenize(content)
+          if (unresolved or 0) == 0 then real_content = detok end
         end
         fs.write_file(staged, content)
         if f.mode then fs.chmod(staged, f.mode) end
         state.workspace[f.path] = {
           staged = staged, base_hash = f.before_hash, deleted = false, mode = f.mode,
+          real_hash = _sha(real_content), tokenized = (content ~= real_content),
           fresh = opts.from_command == true,
           fresh_ssig = opts.from_command and _file_sig(staged) or nil,
           -- 仅当命令确实在常驻 overlay 内执行时，产物才已存在于该 overlay，常驻物化方可跳过回写。
@@ -1349,11 +1429,19 @@ function M.merge_candidate_async(cand, opts)
             large = true, version = _bump_version(),
           }
         else
+          local view_content = tok_of[f] or (f.content or "")
+          local real_content = view_content
+          if _is_text_content(view_content) then
+            local secret = require("NeoAI.sandbox.secret.secret")
+            local detok, unresolved = secret.detokenize(view_content)
+            if (unresolved or 0) == 0 then real_content = detok end
+          end
           writes[#writes + 1] = {
-            path = staged, mode = f.mode, content = tok_of[f] or (f.content or ""),
+            path = staged, mode = f.mode, content = view_content,
           }
           state.workspace[f.path] = {
             staged = staged, base_hash = f.before_hash, deleted = false, mode = f.mode,
+            real_hash = _sha(real_content), tokenized = (view_content ~= real_content),
             fresh = opts.from_command == true,
             fresh_resident = opts.from_command == true and opts.resident == true,
             version = _bump_version(),
@@ -1411,6 +1499,13 @@ function M.merge_candidate_async(cand, opts)
           fs.ensure_dir(vim.fn.fnamemodify(ws.staged, ":h"))
           fs.write_file(ws.staged, content)
           if f.mode then fs.chmod(ws.staged, f.mode) end
+          local real_content = content
+          if _is_text_content(content) then
+            local detok, unresolved = secret.detokenize(content)
+            if (unresolved or 0) == 0 then real_content = detok end
+          end
+          ws.real_hash = _sha(real_content)
+          ws.tokenized = (content ~= real_content)
           ws.version = _bump_version()
           view_paths[#view_paths + 1] = f.path
         end
@@ -1808,7 +1903,12 @@ local function _capture_entry(attempt, real_root, staged, child_rel, prefetch, c
       elseif ws.staged and fs.exists(ws.staged) then
         local before = _read(ws.staged)
         local after = _read(staged)
-        if before ~= nil and before == after then
+        local same = before ~= nil and before == after
+        if not same and ws.real_hash and after ~= nil then
+          -- 暂存副本可能是 token 化视图：用真实内容哈希比较，避免误判为命令改动。
+          same = (_sha(after) == ws.real_hash)
+        end
+        if same then
           -- 内容与暂存一致；但命令可能仅改了权限（如 `chmod +x`）：此时不能跳过，
           -- 否则权限变化丢失（可执行位回归）。仅当权限位也一致时才视为未改动。
           local dst = vim.uv.fs_stat(staged)
@@ -2012,7 +2112,16 @@ end
 --- @param package boolean 包/生成内容（`uv sync` 等）：现有 base 文件用 stat 签名代替内容哈希，
 ---   避免逐文件读取+纯 Lua SHA（主线程/线程池的 CPU 热点）。
 --- @return string 编码记录
-local function _capture_worker(upper_root, real_root, session_basename, expected_encoded, ws_encoded, cap, paths_encoded, package, self_encoded)
+local function _capture_worker(payload)
+  local upper_root = payload and payload.upper_root
+  local real_root = payload and payload.real_root
+  local session_basename = payload and payload.session_basename
+  local expected_encoded = payload and payload.expected_encoded
+  local ws_encoded = payload and payload.ws_encoded
+  local cap = payload and payload.cap
+  local paths_encoded = payload and payload.paths_encoded
+  local package = payload and payload.package
+  local self_encoded = payload and payload.self_encoded
   --- 解码路径集（`<n>\n<len>:<path>...`），返回 set 或 nil。
   local function decode_set(encoded)
     if type(encoded) ~= "string" then return nil end
@@ -2082,14 +2191,20 @@ local function _capture_worker(upper_root, real_root, session_basename, expected
         local real = field()
         local staged = field()
         local mode = field()
+        local real_hash = field()
         if real then
-          wsm[real] = { deleted = (staged == "D"), staged = staged, mode = tonumber(mode) or nil }
+          wsm[real] = {
+            deleted = (staged == "D"), staged = staged, mode = tonumber(mode) or nil,
+            real_hash = (real_hash ~= "" and real_hash) or nil,
+          }
         end
       end
     end
   end
   -- 自身运行时/状态根目录（整棵子树不捕获）：解码后按前缀跳过。
+  -- 该编码串末尾额外携带一段纯 Lua SHA 源码（规避 libuv queue 参数数量上限）。
   local self_roots = {}
+  local sha_src = nil
   do
     local nl = type(self_encoded) == "string" and self_encoded:find("\n", 1, true)
     if nl then
@@ -2102,8 +2217,14 @@ local function _capture_worker(upper_root, real_root, session_basename, expected
         self_roots[#self_roots + 1] = self_encoded:sub(colon + 1, colon + len)
         pos = colon + len + 1
       end
+      local colon = self_encoded:find(":", pos, true)
+      if colon then
+        local len = tonumber(self_encoded:sub(pos, colon - 1)) or 0
+        sha_src = self_encoded:sub(colon + 1, colon + len)
+      end
     end
   end
+  local sha = assert(load(sha_src))()
   --- 路径是否位于某个自身运行时/状态根之下（含根本身）。
   --- @param real string
   --- @return boolean
@@ -2158,9 +2279,18 @@ local function _capture_worker(upper_root, real_root, session_basename, expected
       return not (sstat and sstat.type == "file")
     end
     if w.staged ~= "" then
-      local before = read_all(w.staged)
-      local after = read_all(dest)
-      if before ~= nil and before == after then
+      local same = false
+      if w.real_hash and w.real_hash ~= "" then
+        -- 暂存副本是 token 化视图；用写入时记录的真实内容哈希与 overlay 内容比较，
+        -- 避免「含密钥的暂存文件永远不相等」被误判为命令改动。
+        local after = read_all(dest)
+        if after ~= nil and ("sha256:" .. sha(after)) == w.real_hash then same = true end
+      else
+        local before = read_all(w.staged)
+        local after = read_all(dest)
+        if before ~= nil and before == after then same = true end
+      end
+      if same then
         -- 内容一致；但命令可能仅改了权限（chmod）：权限位不同则不能跳过。
         local dmode = sstat and sstat.mode and (sstat.mode % 4096)
         if not (w.mode and dmode and w.mode ~= dmode) then return true end
@@ -2403,6 +2533,7 @@ local function _encode_ws(ws_map, root, paths)
       if paths == nil or paths[real] == true then
         local staged = ws.deleted and "D" or (ws.staged or "")
         out[#out + 1] = f(real) .. f(staged) .. f(tostring(ws.mode or ""))
+          .. f(ws.real_hash or "")
         n = n + 1
       end
     end
@@ -2681,8 +2812,18 @@ function M.capture_overlay_async(attempt_id, real_root, upper_root, hint, opts)
   local ws_encoded = _encode_ws(state.workspace, root, paths_set)
   -- 自身运行时/状态根目录：传入 worker 以在遍历/按路径处理时整棵子树跳过。
   local self_encoded = _encode_paths(runtime.self_runtime_roots())
-  return work.run(_capture_worker, upper_root, root, session_basename, expected_encoded, ws_encoded, cap,
-    paths_encoded, package, self_encoded):then_(function(encoded)
+    .. tostring(#sha_src) .. ":" .. sha_src
+  return work.run_codec(_capture_worker, {
+    upper_root = upper_root,
+    real_root = root,
+    session_basename = session_basename,
+    expected_encoded = expected_encoded,
+    ws_encoded = ws_encoded,
+    cap = cap,
+    paths_encoded = paths_encoded,
+    package = package,
+    self_encoded = self_encoded,
+  }):then_(function(encoded)
     local records = _decode_records(encoded, 12)
     -- 需要 base 内容哈希的记录（base 为文件，且非超大 blob 文件）：由分块并行 job 补算。
     -- 包/生成内容已被 worker 以 stat 签名（rec[6] 前缀 `sig:`）填充，无需内容哈希；
@@ -3091,7 +3232,19 @@ function M.finish(attempt_id, prefetch, classify)
       if action then
         -- 同步工作区暂存状态：删除态标记，使后续 read/list/search 一致地看不到该文件。
         local ws = state.workspace[real]
-        if ws then ws.deleted = (action == "delete" or action == "rmdir") end
+        if ws then
+          ws.deleted = (action == "delete" or action == "rmdir")
+          -- 文件工具直接写暂存副本时 real_hash 仍是编辑前基线；冻结时按最终视图内容更新，
+          -- 使后续 ws_skip 能用真实内容哈希判断「命令是否改动」。
+          if action ~= "delete" and action ~= "rmdir" and content ~= nil then
+            local secret = require("NeoAI.sandbox.secret.secret")
+            local detok, unresolved = secret.detokenize(content)
+            if (unresolved or 0) == 0 then
+              ws.real_hash = _sha(detok)
+              ws.tokenized = (content ~= detok)
+            end
+          end
+        end
         files[#files + 1] = {
           path = real,
           action = action,
@@ -3115,6 +3268,14 @@ function M.finish(attempt_id, prefetch, classify)
             -- 内容已磁盘化为 blob 时按需读取，供 merge 同步暂存视图。
             local view_content = content
             if not view_content and blob then view_content = _read(blob) end
+            if view_content ~= nil then
+              local secret = require("NeoAI.sandbox.secret.secret")
+              local detok, unresolved = secret.detokenize(view_content)
+              if (unresolved or 0) == 0 then
+                ws.real_hash = _sha(detok)
+                ws.tokenized = (view_content ~= detok)
+              end
+            end
             view_files[#view_files + 1] = {
               path = real, action = "modify", content = view_content, mode = entry.mode,
             }

@@ -691,9 +691,26 @@ function M.materialize()
   if #pending == 0 then return async.resolve() end
 
   local out = async.Deferred.new()
+  local max_file_bytes = tonumber(config_store.get("tools.sandbox.max_file_bytes"))
+  if max_file_bytes == nil then max_file_bytes = 8 * 1024 * 1024 end
+
+  --- 暂存内容是 token 化视图：写入沙箱命名空间前必须还原真实值。
+  --- @param content string
+  --- @param real string
+  --- @return string|nil restored
+  --- @return string|nil err
+  local function _restore_secret(content, real)
+    local secret = require("NeoAI.sandbox.secret.secret")
+    if not secret.enabled() then return content end
+    local out_content, unresolved = secret.detokenize(content)
+    if (unresolved or 0) > 0 then
+      return nil, "SECRET_UNRESOLVED: " .. tostring(real)
+    end
+    return out_content
+  end
 
   --- 构建单条物化记录（追加到 lines；大文件复制进收件箱登记 created）。
-  --- @return string|nil line 追加的行（nil 表示跳过）
+  --- @return string|nil line 追加的行（nil 表示跳过；第二返回值=致命错误）
   local function build_line(o, created)
     if o.deleted then
       return "d\t" .. vim.base64.encode(o.real)
@@ -707,6 +724,9 @@ function M.materialize()
     local is_file = st ~= nil and st.type == "file"
     local big = is_file
       and (o.large == true or (max_embed > 0 and (st.size or 0) > max_embed))
+    local secret = require("NeoAI.sandbox.secret.secret")
+    local needs_restore = is_file and (o.tokenized == true
+      or (secret.is_sensitive_path and secret.is_sensitive_path(o.real)))
     if big then
       if not (inbox_host and inbox_mount) then
         logger.warn("[sandbox:resident] 无收件箱，跳过超大文件物化：%s", tostring(o.real))
@@ -715,6 +735,23 @@ function M.materialize()
       local name = token .. "_" .. tostring(#created) .. "_" .. vim.fn.sha256(o.real):sub(1, 16)
       local host_src = inbox_host .. "/" .. name
       fs.ensure_dir(inbox_host)
+      if needs_restore then
+        -- 含密钥/被 token 化的大文件：宿主侧还原后再放进收件箱；超过上限 fail-closed，
+        -- 绝不把假密钥送进沙箱执行。
+        if max_file_bytes > 0 and (st.size or 0) > max_file_bytes then
+          return nil, "SANDBOX_SECRET_TOO_LARGE: " .. tostring(o.real)
+        end
+        local content = fs.read_file(o.staged)
+        if content == nil then return nil, "SANDBOX_READ_FAILED: " .. tostring(o.real) end
+        local restored, err = _restore_secret(content, o.real)
+        if not restored then return nil, err end
+        if not fs.write_file(host_src, restored) then
+          return nil, "SANDBOX_WRITE_FAILED: " .. tostring(o.real)
+        end
+        created[#created + 1] = host_src
+        return "c\t" .. vim.base64.encode(o.real)
+          .. "\t" .. vim.base64.encode(inbox_mount .. "/" .. name)
+      end
       if fs.copy_file(o.staged, host_src) then
         created[#created + 1] = host_src
         return "c\t" .. vim.base64.encode(o.real)
@@ -728,6 +765,11 @@ function M.materialize()
       if content == nil then
         return "D\t" .. vim.base64.encode(o.real)
       end
+      if needs_restore then
+        local restored, err = _restore_secret(content, o.real)
+        if not restored then return nil, err end
+        content = restored
+      end
       return "w\t" .. vim.base64.encode(o.real) .. "\t" .. vim.base64.encode(content)
     end
     -- 目录（或非常规文件）：建目录。与原行为一致。
@@ -740,9 +782,15 @@ function M.materialize()
     local lines, created = {}, {}
     local bytes, n = 0, 0
     while idx <= #pending and n < MAT_CHUNK_ENTRIES and bytes < MAT_CHUNK_BYTES do
-      local line = build_line(pending[idx], created)
+      local line, err = build_line(pending[idx], created)
       idx = idx + 1
       n = n + 1
+      if err then
+        -- 密钥还原失败/超大敏感文件：中止整次物化，命令不执行（绝不把假密钥送进沙箱）。
+        for _, p in ipairs(created) do pcall(vim.uv.fs_unlink, p) end
+        out:reject({ kind = "sandbox", message = tostring(err) })
+        return
+      end
       if line then
         lines[#lines + 1] = line
         bytes = bytes + #line

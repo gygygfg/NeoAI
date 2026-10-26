@@ -330,6 +330,10 @@ require("NeoAI").setup({
       min_height = 5,                    -- 光标在输入框内时的最小高度（起始）
       max_ratio = 0.8,                   -- 随内容增长的上限（主窗口高度占比）
     },
+    chat = {
+      fold = "reasoning_tools",          -- 折叠程度：none / reasoning_tools / process
+      process_keep_steps = 3,            -- process 模式每轮保留展开的最近中间步数
+    },
     trajectory = {
       log_dir = vim.fn.stdpath("cache") .. "/NeoAI/logs", -- 轨迹日志保存目录
     },

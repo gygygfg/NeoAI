@@ -434,13 +434,85 @@ tests.suite("chat_ui", function(_, it)
     event_bus.emit(events.AGENT_ABORTED, { agent_id = "sub_agent_xyz" })
     t.eq(0, focus_calls, "子 Agent 完成/失败/取消不应调用输入框 focus")
 
-    -- 主 Agent 完成：才应把光标移回输入框
+    -- 主 Agent 完成：只有光标停在聊天主消息区且为 Normal 模式时才移回输入框。
+    -- open() 会把焦点放在输入框（插入模式），先按真实使用路径切回主窗口普通模式。
+    vim.api.nvim_set_current_win(opened.win_id)
+    vim.cmd("stopinsert")
     event_bus.emit(events.GENERATION_COMPLETED, { agent_id = agent.id })
-    t.eq(1, focus_calls, "仅主 Agent 完成应调用输入框 focus")
+    t.eq(1, focus_calls, "仅主 Agent 完成且光标在主消息区时应调用输入框 focus")
 
     inst_ib.focus = orig_focus
     chat_view.reset()
     chat_service.reset()
+  end)
+
+  it("Agent 结束仅在聊天主消息区 Normal 模式时自动聚焦输入框", function(t)
+    local chat_view = require("NeoAI.ui.window.chat_view")
+    local chat_service = require("NeoAI.services.chat_service")
+    local input_box = require("NeoAI.ui.components.input_box")
+    local event_bus = require("NeoAI.kernel.event_bus")
+    local events = require("NeoAI.kernel.events")
+    chat_view.reset(); chat_service.reset()
+
+    local opened = chat_view.open()
+    local agent = assert(chat_service.get_current_agent())
+    local inst_ib = assert(input_box._instance())
+    local focus_calls = 0
+    local orig_focus = inst_ib.focus
+    inst_ib.focus = function()
+      focus_calls = focus_calls + 1
+      return orig_focus()
+    end
+    local function emit() event_bus.emit(events.GENERATION_COMPLETED, { agent_id = agent.id }) end
+
+    -- 主消息区 + Normal：允许
+    vim.api.nvim_set_current_win(opened.win_id)
+    vim.cmd("stopinsert")
+    emit()
+    t.eq(1, focus_calls, "主消息区 Normal 模式应聚焦输入框")
+
+    -- 审批/伪终端浮窗：不抢焦点
+    for _, ft in ipairs({ "neoai_sandbox_review", "neoai_terminal" }) do
+      focus_calls = 0
+      local buf = vim.api.nvim_create_buf(false, true)
+      vim.bo[buf].filetype = ft
+      local win = vim.api.nvim_open_win(buf, true, {
+        relative = "editor", width = 20, height = 3, row = 1, col = 1,
+      })
+      emit()
+      t.eq(0, focus_calls, ft .. " 聚焦时 Agent 结束不应抢焦点")
+      t.eq(win, vim.api.nvim_get_current_win(), ft .. " 应保持焦点")
+      pcall(vim.api.nvim_win_close, win, true)
+    end
+
+    -- 光标在输入框（插入模式）：不重复聚焦/进入插入
+    focus_calls = 0
+    local input_win = input_box.get_win()
+    vim.api.nvim_set_current_win(input_win)
+    pcall(vim.cmd, "startinsert")
+    emit()
+    t.eq(0, focus_calls, "光标已在输入框时不应重复 focus")
+
+    -- 主消息区但非 Normal（可视模式）：不进入插入
+    focus_calls = 0
+    vim.api.nvim_set_current_win(opened.win_id)
+    pcall(vim.cmd, "normal! V")
+    t.true_(vim.api.nvim_get_mode().mode:sub(1, 1) ~= "n", "应处于非 Normal 模式")
+    emit()
+    t.eq(0, focus_calls, "非 Normal 模式不应自动进入插入")
+    pcall(vim.cmd, "normal! " .. string.char(27))
+
+    -- 普通文件窗口：不抢焦点
+    focus_calls = 0
+    vim.cmd("vsplit")
+    local code_win = vim.api.nvim_get_current_win()
+    vim.bo[vim.api.nvim_get_current_buf()].filetype = "lua"
+    emit()
+    t.eq(0, focus_calls, "普通文件窗口聚焦时不应抢焦点")
+    t.eq(code_win, vim.api.nvim_get_current_win(), "普通文件窗口应保持焦点")
+
+    inst_ib.focus = orig_focus
+    chat_view.reset(); chat_service.reset()
   end)
 
   it("聊天窗口失去焦点时收起输入框，返回时恢复且内容保留", function(t)

@@ -47,6 +47,22 @@ local function _show_for(buf)
   return state.default_show
 end
 
+--- 聊天折叠程度（ui.chat.fold）：none | reasoning_tools | process
+--- @return string
+local function _fold_mode()
+  local v = config_store.get("ui.chat.fold")
+  if v == "none" or v == "process" then return v end
+  return "reasoning_tools"
+end
+
+--- process 模式每轮保留最近 N 个中间 Step 展开
+--- @return number
+local function _process_keep_steps()
+  local n = tonumber(config_store.get("ui.chat.process_keep_steps"))
+  if not n or n < 0 then return 3 end
+  return math.floor(n)
+end
+
 -- ========== 私有函数 ==========
 
 --- 将文本拆分为不含换行符的行数组（统一 \r\n/\r，避免 nvim_buf_set_lines 报错）
@@ -892,16 +908,27 @@ end
 local function _sync_fold_kinds(buf, marks)
   local reasoning = {}
   local body = {}
+  local proc_levels, proc_headers = {}, {}
   -- 用 pairs 而非 `#marks`：marks 与 lines 并行但多数元素为 nil（角色头/空行），
   -- `#` 会在首个空洞处截断，漏掉靠后的推理/工具/正文元数据。
   for i, m in pairs(marks or {}) do
     if m then
       if m.fold_kind == "reasoning" then reasoning[i] = true end
       if m.body then body[i] = true end
+      if m.process_old then proc_levels[i] = 1 end
+      if m.process_header then
+        proc_levels[i] = ">1"
+        proc_headers[i] = m.process_label or "  🧩 过程"
+      end
     end
   end
   fold.set_reasoning_lines(buf, reasoning)
   fold.set_body_lines(buf, body)
+  if next(proc_levels) then
+    fold.set_process_folds(buf, proc_levels, proc_headers)
+  else
+    fold.clear_process_folds(buf)
+  end
 end
 
 --- 是否为子 Agent 结果消息：优先看标记 msg.sub_agent；兼容旧数据（无标记）按投递包装
@@ -953,8 +980,15 @@ end
 --- @param lines table
 --- @param marks table 与 lines 并行的元数据数组
 --- @param message table
-local function _append_role_header(lines, marks, message)
+local function _append_role_header(lines, marks, message, step)
   local label = ROLE_LABELS[message.role] or message.role
+  if step and (step.total or 0) > 1 then
+    if step.final then
+      label = label .. " · 最终回答"
+    else
+      label = label .. " · Step " .. tostring(step.index)
+    end
+  end
   _push(lines, marks, label, nil)
 end
 
@@ -1033,6 +1067,192 @@ local function _tool_result_failed(content)
   local decoded = json_mod.decode_or_nil(content)
   if type(decoded) ~= "table" then return false end
   return decoded.error ~= nil
+end
+
+-- ========== process 折叠：Step 识别与汇总指标 ==========
+
+--- 解析一次请求的 usage（兼容 OpenAI/DeepSeek/Anthropic/Gemini 常见字段）。
+--- @param u table|nil
+--- @return table|nil { prompt, completion, cache_read }
+local function _usage_tokens(u)
+  if type(u) ~= "table" then return nil end
+  local meta = type(u.usageMetadata) == "table" and u.usageMetadata or nil
+  local prompt = tonumber(u.prompt) or tonumber(u.prompt_tokens)
+    or (meta and tonumber(meta.promptTokenCount)) or tonumber(u.input_tokens) or 0
+  local completion = tonumber(u.completion) or tonumber(u.completion_tokens)
+    or (meta and tonumber(meta.candidatesTokenCount)) or tonumber(u.output_tokens) or 0
+  local cache_read = tonumber(u.prompt_cache_hit_tokens) or tonumber(u.cache_read)
+    or tonumber(u.cache_read_input_tokens)
+    or (meta and tonumber(meta.cachedContentTokenCount))
+    or tonumber(u.prompt_tokens_details and u.prompt_tokens_details.cached_tokens) or 0
+  local total_prompt
+  if u.input_tokens ~= nil then
+    -- Anthropic：input_tokens 不含缓存读写，需相加得到总输入
+    total_prompt = (tonumber(u.input_tokens) or 0) + cache_read
+      + (tonumber(u.cache_creation_input_tokens) or 0)
+  elseif meta and meta.promptTokenCount ~= nil then
+    total_prompt = tonumber(meta.promptTokenCount) or 0
+  elseif u.prompt ~= nil then
+    total_prompt = tonumber(u.prompt) or 0
+  else
+    total_prompt = tonumber(u.prompt_tokens) or 0
+  end
+  return { prompt = total_prompt, completion = completion, cache_read = cache_read }
+end
+
+--- 数字紧凑格式：1234 -> 1.2k，1234567 -> 1.2M
+--- @param n number
+--- @return string
+local function _fmt_num(n)
+  n = tonumber(n) or 0
+  if n >= 1e6 then return string.format("%.1fM", n / 1e6) end
+  if n >= 1e3 then return string.format("%.1fk", n / 1e3) end
+  return tostring(math.floor(n + 0.5))
+end
+
+--- 汇总一组被折叠 Step 的指标。
+--- @param msgs table
+--- @param indices number[] 被折叠的 assistant 消息下标
+--- @param results table tool_call_id -> tool 结果消息
+--- @return table { rounds, tools_ok, tools_fail, prompt, completion, cache_read, cache_total }
+local function _collect_step_stats(msgs, indices, results)
+  local st = {
+    rounds = #indices, tools_ok = 0, tools_fail = 0,
+    prompt = 0, completion = 0, cache_read = 0, cache_total = 0,
+  }
+  for _, idx in ipairs(indices) do
+    local m = msgs[idx] or {}
+    for _, tc in ipairs(m.tool_calls or {}) do
+      local r = tc and tc.id and results[tc.id] or nil
+      if r then
+        if _tool_result_failed(r.content) then st.tools_fail = st.tools_fail + 1
+        else st.tools_ok = st.tools_ok + 1 end
+      end
+    end
+    local u = m.usage or (m.response and m.response.usage)
+    local t = _usage_tokens(u)
+    if t then
+      st.prompt = st.prompt + t.prompt
+      st.completion = st.completion + t.completion
+      st.cache_read = st.cache_read + t.cache_read
+      st.cache_total = st.cache_total + t.prompt
+    end
+  end
+  return st
+end
+
+--- 过程折叠首行汇总文本。
+--- @param st table
+--- @return string
+local function _process_label(st)
+  local parts = { string.format("🧩 过程 · %d 轮", st.rounds or 0) }
+  local total_tools = (st.tools_ok or 0) + (st.tools_fail or 0)
+  if total_tools > 0 then
+    if (st.tools_fail or 0) > 0 then
+      parts[#parts + 1] = string.format("工具 %d✓/%d✗", st.tools_ok or 0, st.tools_fail or 0)
+    else
+      parts[#parts + 1] = string.format("工具 %d✓", st.tools_ok or 0)
+    end
+  end
+  if (st.prompt or 0) + (st.completion or 0) > 0 then
+    parts[#parts + 1] = string.format("↑%s ↓%s", _fmt_num(st.prompt), _fmt_num(st.completion))
+    if (st.cache_total or 0) > 0 then
+      local pct = math.floor((st.cache_read or 0) / st.cache_total * 100 + 0.5)
+      parts[#parts + 1] = string.format("缓存 %d%%", pct)
+    end
+  end
+  return "  " .. table.concat(parts, " · ")
+end
+
+--- 预计算每个 assistant 消息的 Step 元数据（序号/总数/是否折叠/是否最终回答）。
+--- Step 以 user 轮为边界；子 Agent 结果不是新的用户轮。
+--- @param msgs table
+--- @param keep_steps number
+--- @return table msg_index -> { index, total, old, final, first_old, stats? }
+local function _process_meta(msgs, keep_steps)
+  local results = {}
+  for _, m in ipairs(msgs or {}) do
+    if m.role == "tool" and m.tool_call_id then results[m.tool_call_id] = m end
+  end
+  local meta = {}
+  local i = 1
+  local n = #(msgs or {})
+  while i <= n do
+    local m = msgs[i]
+    if m.role == "user" and not m.runtime_context and not _is_sub_agent_result(m) then
+      local steps = {}
+      local j = i + 1
+      while j <= n do
+        local x = msgs[j]
+        if x.role == "user" and not x.runtime_context and not _is_sub_agent_result(x) then break end
+        if x.role == "assistant" then steps[#steps + 1] = j end
+        j = j + 1
+      end
+      local total = #steps
+      -- 最终回答始终展开：即使 keep_steps=0，也只折叠 final 之前的步骤。
+      local old_count = math.min(math.max(0, total - 1), math.max(0, total - keep_steps))
+      local old_indices = {}
+      for k = 1, old_count do old_indices[#old_indices + 1] = steps[k] end
+      local stats = old_count > 0 and _collect_step_stats(msgs, old_indices, results) or nil
+      for k, idx in ipairs(steps) do
+        meta[idx] = {
+          index = k,
+          total = total,
+          old = k <= old_count,
+          final = (k == total),
+          first_old = (k == 1 and old_count > 0),
+          stats = (k == 1 and old_count > 0) and stats or nil,
+        }
+      end
+      i = j
+    else
+      i = i + 1
+    end
+  end
+  return meta
+end
+
+--- 给一个渲染块的所有行打上 process_old 标记（保留已有元数据）。
+--- @param marks table
+--- @param count number
+local function _mark_process_old(marks, count)
+  for i = 1, count do
+    local m = marks[i]
+    if not m then m = {}; marks[i] = m end
+    m.process_old = true
+  end
+end
+
+--- 追加「过程」折叠首行（只有需要折叠旧步骤时调用）。
+--- @param lines table
+--- @param marks table
+--- @param step table
+local function _append_process_header(lines, marks, step)
+  _push(lines, marks, "🧩 过程", {
+    process_old = true,
+    process_header = true,
+    process_label = _process_label(step.stats or {}),
+  })
+end
+
+--- Step 元数据的缓存签名（影响过程折叠文本/锚点/可见性）。
+--- @param step table|nil
+--- @return string
+local function _step_sig(step)
+  if not step then return "nil" end
+  local s = step.stats
+  local sp = ""
+  if s then
+    sp = table.concat({
+      tostring(s.rounds or 0), tostring(s.tools_ok or 0), tostring(s.tools_fail or 0),
+      tostring(s.prompt or 0), tostring(s.completion or 0),
+      tostring(s.cache_read or 0), tostring(s.cache_total or 0),
+    }, ":")
+  end
+  return table.concat({
+    tostring(step.index or 0), tostring(step.total or 0),
+    step.old and "1" or "0", step.final and "1" or "0", step.first_old and "1" or "0", sp,
+  }, "|")
 end
 
 --- 提取工具调用的目的说明（description 参数）
@@ -1457,14 +1677,20 @@ end
 --- @param opts table|nil 渲染选项（流式表格）
 --- @param show_header boolean|nil 是否绘制角色头（false 时省略；缺省绘制）
 --- @param show boolean|nil 是否显示推理（缺省回退全局默认）
-local function _format_message(lines, marks, message, is_turn_end, opts, show_header, show)
+local function _format_message(lines, marks, message, is_turn_end, opts, show_header, show, step)
+  if step and step.old and step.first_old then
+    _append_process_header(lines, marks, step)
+  end
   if show_header ~= false then
-    _append_role_header(lines, marks, message)
+    _append_role_header(lines, marks, message, step)
   end
   _append_reasoning(lines, marks, message, opts, show)
   _append_content(lines, marks, message, opts)
   if is_turn_end then
     _append_turn_sep(lines, marks)
+  end
+  if step and step.old then
+    _mark_process_old(marks, #lines)
   end
 end
 
@@ -1553,9 +1779,13 @@ local function _blocks(msgs, opts, prev, show)
   local tw = opts and opts.table_width
   if show == nil then show = _show_for(nil) end
   local streaming = opts and opts.streaming
+  local fold_mode = _fold_mode()
+  local pmeta = fold_mode == "process" and _process_meta(msgs, _process_keep_steps()) or nil
   -- Agent loop 内同一用户轮次会连续产生多条 assistant 消息（工具调用 → 结果 → 再调用…）。
   -- 角色头 "🤖 AI" 只在本轮第一条 assistant 消息上展示，后续条省略；遇真实用户消息重置。
+  -- process 模式下每个 assistant Step 都显示角色头（作为折叠锚点）。
   local assistant_header_shown = false
+  local current_proc_step = nil
   while i <= #msgs do
     local idx = i
     local msg = msgs[idx]
@@ -1581,8 +1811,11 @@ local function _blocks(msgs, opts, prev, show)
       local turn_end = _is_turn_end(msgs, idx)
       local is_stream = (streaming == true) and idx == #msgs
       local eopts = _msg_opts(is_stream, opts)
-      local show_header = not assistant_header_shown
+      local step = pmeta and pmeta[idx] or nil
+      local step_sig = _step_sig(step)
+      local show_header = fold_mode == "process" or not assistant_header_shown
       assistant_header_shown = true
+      current_proc_step = step
       local key = "c:" .. idx
       local role = snap.role or ""
       local clen, rlen = #(snap.content or ""), #(snap.reasoning or "")
@@ -1591,7 +1824,7 @@ local function _blocks(msgs, opts, prev, show)
       local same = p ~= nil and p.key == key and p.in_msg == snap and p.in_role == role
         and p.in_clen == clen and p.in_rlen == rlen and p.in_turn == turn_end
         and p.in_stream == is_stream and p.in_tw == tw and p.in_show == show
-        and p.in_header == show_header
+        and p.in_header == show_header and p.in_step_sig == step_sig
         and p.in_tc ~= nil and #p.in_tc == #paired
       if same then
         for k, pp in ipairs(paired) do
@@ -1609,7 +1842,7 @@ local function _blocks(msgs, opts, prev, show)
         blocks[n] = p
       else
         local extra = { "assistant", _fingerprint(snap.content), _fingerprint(snap.reasoning),
-          show_header and "H" or "-" }
+          show_header and "H" or "-", "step", step_sig }
         local in_tc, in_res, in_status, in_reslen, in_resdur = {}, {}, {}, {}, {}
         for k, pp in ipairs(paired) do
           local fn = pp.tc["function"] or {}
@@ -1638,12 +1871,15 @@ local function _blocks(msgs, opts, prev, show)
           sig = sig,
           in_msg = snap, in_role = role, in_clen = clen, in_rlen = rlen,
           in_turn = turn_end, in_stream = is_stream, in_tw = tw, in_show = show,
-          in_header = show_header,
+          in_header = show_header, in_step_sig = step_sig,
           in_tc = in_tc, in_res = in_res, in_status = in_status,
           in_reslen = in_reslen, in_resdur = in_resdur,
           build = function()
             local lines, marks = {}, {}
-            if show_header then _append_role_header(lines, marks, snap) end
+            if step and step.old and step.first_old then
+              _append_process_header(lines, marks, step)
+            end
+            if show_header then _append_role_header(lines, marks, snap, step) end
             _append_reasoning(lines, marks, snap, eopts, show)
             _append_content(lines, marks, snap, eopts)
             for _, pp in ipairs(paired) do
@@ -1652,6 +1888,7 @@ local function _blocks(msgs, opts, prev, show)
             if turn_end then
               _append_turn_sep(lines, marks)
             end
+            if step and step.old then _mark_process_old(marks, #lines) end
             return { lines = lines, marks = marks }
           end,
         }
@@ -1666,19 +1903,24 @@ local function _blocks(msgs, opts, prev, show)
       local p = prev and prev[n]
       local clen = #(snap.content or "")
       local sa_status = (snap.sub_agent and snap.sub_agent.status) or ""
+      local proc_old = (current_proc_step and current_proc_step.old) and "1" or "0"
       if p and p.key == key and p.in_msg == snap and p.in_clen == clen
-        and p.in_sa == sa_status and p.in_header == false then
+        and p.in_sa == sa_status and p.in_header == false and p.in_proc_old == proc_old then
         blocks[n] = p
       else
         local sig = _sig(eopts, false,
-          { "sub_agent", _fingerprint(snap.content), sa_status }, show)
+          { "sub_agent", _fingerprint(snap.content), sa_status, "proc", proc_old }, show)
         blocks[n] = {
           key = key,
           sig = sig,
           in_msg = snap, in_clen = clen, in_sa = sa_status, in_header = false,
+          in_proc_old = proc_old,
           build = function()
             local lines, marks = {}, {}
             _append_sub_agent_block(lines, marks, snap)
+            if current_proc_step and current_proc_step.old then
+              _mark_process_old(marks, #lines)
+            end
             return { lines = lines, marks = marks }
           end,
         }
@@ -1690,12 +1932,16 @@ local function _blocks(msgs, opts, prev, show)
       local turn_end = _is_turn_end(msgs, idx)
       local is_stream = (streaming == true) and idx == #msgs
       local eopts = _msg_opts(is_stream, opts)
+      local step = pmeta and pmeta[idx] or nil
+      local step_sig = _step_sig(step)
       local show_header = true
       if snap.role == "assistant" then
-        show_header = not assistant_header_shown
+        show_header = fold_mode == "process" or not assistant_header_shown
         assistant_header_shown = true
+        current_proc_step = step
       elseif snap.role == "user" then
         assistant_header_shown = false
+        current_proc_step = nil
       end
       local key = "c:" .. idx
       local role = snap.role or ""
@@ -1705,21 +1951,21 @@ local function _blocks(msgs, opts, prev, show)
       if p and p.key == key and p.in_msg == snap and p.in_role == role
         and p.in_clen == clen and p.in_rlen == rlen and p.in_turn == turn_end
         and p.in_stream == is_stream and p.in_tw == tw and p.in_show == show
-        and p.in_header == show_header
+        and p.in_header == show_header and p.in_step_sig == step_sig
         and p.in_tc == nil then
         blocks[n] = p
       else
         local sig = _sig(eopts, turn_end, { role, _fingerprint(snap.content), _fingerprint(snap.reasoning),
-          show_header and "H" or "-" }, show)
+          show_header and "H" or "-", "step", step_sig }, show)
         blocks[n] = {
           key = key,
           sig = sig,
           in_msg = snap, in_role = role, in_clen = clen, in_rlen = rlen,
           in_turn = turn_end, in_stream = is_stream, in_tw = tw, in_show = show,
-          in_header = show_header,
+          in_header = show_header, in_step_sig = step_sig,
           build = function()
             local lines, marks = {}, {}
-            _format_message(lines, marks, snap, turn_end, eopts, show_header, show)
+            _format_message(lines, marks, snap, turn_end, eopts, show_header, show, step)
             return { lines = lines, marks = marks }
           end,
         }

@@ -961,6 +961,10 @@ network-consent / tool-approval ones, subject to focus gating):
       `git_commit` / `git_stash` / `git_restore` / `git_worktree` / `git_fetch` / `git_pull` enter the
       review window together with the worktree changes and are applied atomically on confirmation
       (`SANDBOX_GIT_INTERNAL` only backstops transient/config targets).
+    - **Unpublished-edits precondition**: before `git_add`/`git_commit`, the target repo is checked
+      for sandbox file modifications that have not been applied. If any exist, the tool returns
+      `SANDBOX_UNPUBLISHED_EDITS` and asks to apply them first, keeping `HEAD` consistent with the real
+      worktree (no spurious `modified` after committing).
     - These git mutation tools run **inside the sandbox** (`effect=process`, seeing the staged
       worktree); their changes freeze as candidates and dry_run does not touch the real `.git`.
       git **mutation** subcommands inside `run_command` are refused by a guard
@@ -1231,6 +1235,11 @@ network-consent / tool-approval ones, subject to focus gating):
   the namespace); the server receives only a small frame and `cp`s it into place inside the
   namespace. If the inbox copy fails it fails closed (skips the file rather than embedding oversized
   content).
+- **Secret restoration (fail-closed)**: before writing into the namespace, `resident.materialize()`
+  calls `secret.detokenize` on the staged view (text and binary fakes) so commands (git commit,
+  builds, scripts) receive real values. If the mapping is missing and restoration is impossible,
+  the whole materialization is **rejected** and the command is not executed — fake secrets are never
+  committed or embedded into build artifacts.
 - **Command output is not written back**: when a command ran inside the resident overlay, its output
   already exists there; if the staged copy has not been edited since the command
   (`fresh_resident` signature matches), materialization **skips the write-back**, avoiding resending

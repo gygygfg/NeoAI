@@ -1689,4 +1689,57 @@ tests.suite("sandbox_core", function(_, it)
     end)
   end)
 
+
+  it("git 工具：存在未发布文件修改时拒绝 add/commit（先应用再提交）", function(t)
+    local runtime = require("NeoAI.sandbox.execution.runtime")
+    if runtime.backend() ~= "bwrap" then return end
+    if vim.fn.executable("git") ~= 1 then return end
+    local fs = require("NeoAI.utils.fs")
+    local sandbox = require("NeoAI.sandbox")
+    local dir = vim.fn.tempname()
+    fs.ensure_dir(dir)
+    local path = dir .. "/a.txt"
+    fs.write_file(path, "base\n")
+    vim.fn.system({ "git", "-C", dir, "init", "-q" })
+    vim.fn.system({ "git", "-C", dir, "config", "user.email", "t@t" })
+    vim.fn.system({ "git", "-C", dir, "config", "user.name", "t" })
+    vim.fn.system({ "git", "-C", dir, "add", "a.txt" })
+    vim.fn.system({ "git", "-C", dir, "commit", "-qm", "init" })
+    local prev = vim.fn.getcwd()
+    vim.fn.chdir(dir)
+    with_config({ tools = { approval = { mode = "auto_allow" },
+      sandbox = { mode = "dry_run", review = { enabled = true } } } }, function()
+      sandbox.reset()
+      local tools = require("NeoAI.tools")
+      local function exec(name, args)
+        local done, value, err = false, nil, nil
+        tools.execute(name, args, {}):then_(function(v) value = v; done = true end,
+          function(e) err = e; done = true end)
+        t.true_(vim.wait(30000, function() return done end, 50), name .. " 应完成")
+        return value, err
+      end
+      local _, e1 = exec("edit_file", {
+        filepath = path, mode = "write", content = "edited\n", description = "t",
+      })
+      t.nil_(e1, "edit_file 应完成: " .. tostring(e1 and (e1.message or e1)))
+      local _, e2 = exec("git_add", { all = true, description = "t" })
+      t.true_(tostring(e2 and (e2.message or e2)):find("SANDBOX_UNPUBLISHED_EDITS", 1, true) ~= nil,
+        "存在未发布编辑时 git_add 应拒绝: " .. tostring(e2 and (e2.message or e2)))
+      local _, e3 = exec("git_commit", { message = "c", description = "t" })
+      t.true_(tostring(e3 and (e3.message or e3)):find("SANDBOX_UNPUBLISHED_EDITS", 1, true) ~= nil,
+        "存在未发布编辑时 git_commit 应拒绝")
+
+      -- 应用编辑后应可正常 git_add。
+      for _, item in ipairs(sandbox.list_reviews({ review_state = "PENDING" })) do
+        if item.tool == "edit_file" then
+          local r = sandbox.apply(item.change_set_id, { auto_approve = true })
+          t.true_(r and r.ok, "应用编辑应成功: " .. tostring(r and r.reason))
+        end
+      end
+      local _, e4 = exec("git_add", { all = true, description = "t" })
+      t.nil_(e4, "应用后 git_add 应成功: " .. tostring(e4 and (e4.message or e4)))
+    end)
+    vim.fn.chdir(prev)
+    vim.fn.delete(dir, "rf")
+  end)
 end)

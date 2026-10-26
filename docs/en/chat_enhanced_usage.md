@@ -116,7 +116,7 @@ popup (`ui/components/ask_user`) supports quick option selection (single-select 
 `[n] [x]/[ ]`, with the index mapping to the `1-9` shortcuts); for multi-select the text typed via `i` (free input)
 is appended as an extra item and combined with the checked options (it does not overwrite them), whereas for
 single-select it replaces the sole option. The answer is passed back to the AI as a tool result. When no UI is
-registered, it falls back to `vim.ui.input`.
+registered, it falls back to `vim.ui.input`. While unfocused, the popup collapses to a small top-right window and expands again when focused, so it does not block other windows.
 
 ## 8. Related Documentation
 

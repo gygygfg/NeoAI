@@ -252,6 +252,14 @@ local DEFAULT_CONFIG = {
       -- 增量刷新：仅重渲染变化的消息块并只写入差异行（默认开启）。
       -- 设为 false 时降级回整 buffer 全量重写（用于排查渲染问题）。
       incremental = true,
+      -- 折叠程度：
+      --   "none"            不折叠（思考/工具/步骤全部展开）
+      --   "reasoning_tools" 现状：推理与每个工具块各自折叠
+      --   "process"         在现状基础上，把每轮 user 请求中较早的 AI 中间步骤
+      --                     收进「过程」折叠，折叠文本汇总轮次/工具成败/token/缓存命中率
+      fold = "reasoning_tools",
+      -- process 模式：每轮保留最近 N 个 assistant 中间步骤展开（最终回答始终展开）
+      process_keep_steps = 3,
     },
     trajectory = {
       log_dir = vim.fn.stdpath("cache") .. "/NeoAI/logs", -- 轨迹日志保存目录（可自定义；缺省 ~/.cache/nvim/NeoAI/logs）

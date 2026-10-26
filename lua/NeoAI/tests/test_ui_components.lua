@@ -454,6 +454,46 @@ tests.suite("ui_components", function(_, it)
     tw.reset()
   end)
 
+  it("ask_user：失焦收起为右上角小窗，重新聚焦展开", function(t)
+    local au = require("NeoAI.ui.components.ask_user")
+    require("NeoAI.ui.focus")._set_app_focused(true)
+    au.reset()
+    au.show({
+      batch_id = "ask-collapse-test",
+      questions = { { question = "Q", options = { "A", "B" } } },
+      on_submit = function() end,
+      on_cancel = function() end,
+    })
+    local buf = assert(au.get_buf(), "应打开提问弹窗")
+    local win = vim.fn.bufwinid(buf)
+    t.true_(win > 0, "应能定位提问窗口")
+    vim.api.nvim_set_current_win(win)
+    t.false_(au.is_collapsed(), "初始应展开")
+
+    vim.cmd("vsplit")
+    local other = vim.api.nvim_get_current_win()
+    t.true_(au.is_collapsed(), "焦点移出提问窗应收起")
+    local cg = au._collapsed_geom()
+    local cfg = vim.api.nvim_win_get_config(win)
+    t.eq(cg.width, cfg.width, "收起后应为右上角小窗宽度")
+    t.eq(cg.height, cfg.height, "收起后应为右上角小窗高度")
+
+    vim.api.nvim_set_current_win(win)
+    t.false_(au.is_collapsed(), "焦点回到提问窗应展开")
+    local cfg2 = vim.api.nvim_win_get_config(win)
+    t.true_(cfg2.width > cg.width or cfg2.height > cg.height, "展开后应大于折叠小窗")
+
+    vim.api.nvim_exec_autocmds("FocusLost", {})
+    t.true_(au.is_collapsed(), "应用失焦应收起")
+    vim.api.nvim_set_current_win(win)
+    vim.api.nvim_exec_autocmds("FocusGained", {})
+    t.false_(au.is_collapsed(), "应用重新聚焦且光标在提问窗应展开")
+
+    au.hide()
+    pcall(vim.api.nvim_win_close, other, true)
+    t.nil_(au.get_buf(), "hide 后应无提问弹窗")
+  end)
+
   it("display_modes.chat：注册、load/unload 调用 host", function(t)
     local manager = require("NeoAI.ui.components.display_modes")
     manager.reset()

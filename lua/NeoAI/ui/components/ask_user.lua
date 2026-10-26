@@ -31,6 +31,10 @@ local state = {
   cursor = {}, -- cursor[i] = 当前高亮的选项序号（1-based）
   active = 1, -- 当前 tab（1..#questions，或最右的确认 tab = #questions+1）
   mode = "tab", -- "tab" | "confirm"（仅用于 get_state 快照）
+  collapsed = false, -- 失焦时缩为右上角小窗，获得焦点时展开
+  geom_opts = nil, -- 展开态几何参数
+  last_lines = nil, -- 最近一次渲染行（展开态按内容自适应高度）
+  win_group = nil, -- WinEnter/FocusLost/FocusGained 自动命令组
   require_confirm = true,
   on_submit = nil, -- function(answers) answers[i] = 第 i 题最终答案字符串
   on_cancel = nil, -- function(reason)
@@ -79,12 +83,110 @@ local _render
 
 --- 关闭窗口但保留状态（同批次重渲染用）
 local function _close_win()
+  if state.win_group then
+    pcall(vim.api.nvim_del_augroup_by_id, state.win_group)
+    state.win_group = nil
+  end
   if state.win_id and vim.api.nvim_win_is_valid(state.win_id) then
     pcall(vim.api.nvim_win_close, state.win_id, true)
   end
   geometry.untrack(state.win_id)
   state.win_id = nil
   state.buf = nil
+end
+
+--- 展开态几何：按内容自适应高度（与现有浮窗一致）。
+--- @return table { width, height, col, row }
+local function _expanded_geom()
+  local geom_opts = state.geom_opts or { w_ratio = 0.66, h_ratio = 0.72, fit_h = 12 }
+  local opts = {}
+  for k, v in pairs(geom_opts) do opts[k] = v end
+  if state.last_lines then
+    opts.fit_lines = state.last_lines
+    opts.fit_pad = 4
+    opts.fit_h = nil
+  end
+  return geometry.compute(opts)
+end
+
+--- 折叠态几何：贴屏幕右上角的小窗（与伪终端悬浮窗一致）。
+--- @return table { width, height, col, row }
+function M._collapsed_geom()
+  local cols = math.max(1, vim.o.columns or 1)
+  local lines = math.max(1, vim.o.lines or 1)
+  local width = math.max(8, math.min(30, cols - 4))
+  local height = math.min(3, lines)
+  local col = math.max(0, cols - width - 2)
+  local row = math.max(0, math.min(2, lines - height))
+  return { width = width, height = height, col = col, row = row }
+end
+
+--- 按当前折叠状态把几何写回窗口（并更新标题提示）。
+local function _apply_geom()
+  if not state.win_id or not vim.api.nvim_win_is_valid(state.win_id) then return end
+  local geom = state.collapsed and M._collapsed_geom() or _expanded_geom()
+  local title = state.collapsed
+    and string.format("❓ 待回答问题（%d）· 聚焦展开", #state.questions)
+    or "❓ 向用户提问"
+  pcall(vim.api.nvim_win_set_config, state.win_id, {
+    relative = "editor",
+    width = geom.width,
+    height = geom.height,
+    col = geom.col,
+    row = geom.row,
+    title = title,
+    title_pos = "center",
+  })
+end
+
+--- 安装焦点联动：焦点进入本窗口展开；移到其它窗口/应用失焦时折叠。
+local function _install_win_autocmds()
+  if state.win_group or not (state.win_id and vim.api.nvim_win_is_valid(state.win_id)) then return end
+  state.win_group = vim.api.nvim_create_augroup("NeoAIAskUserWin", { clear = true })
+  vim.api.nvim_create_autocmd("WinEnter", {
+    group = state.win_group,
+    callback = function()
+      if state.win_id and vim.api.nvim_win_is_valid(state.win_id)
+        and vim.api.nvim_get_current_win() == state.win_id then
+        M.expand()
+      else
+        M.collapse()
+      end
+    end,
+  })
+  vim.api.nvim_create_autocmd("FocusLost", {
+    group = state.win_group,
+    callback = function() M.collapse() end,
+  })
+  vim.api.nvim_create_autocmd("FocusGained", {
+    group = state.win_group,
+    callback = function()
+      if state.win_id and vim.api.nvim_win_is_valid(state.win_id)
+        and vim.api.nvim_get_current_win() == state.win_id then
+        M.expand()
+      end
+    end,
+  })
+end
+
+--- 展开提问弹窗（获得焦点时调用）。
+function M.expand()
+  if not state.win_id or not vim.api.nvim_win_is_valid(state.win_id) then return end
+  state.collapsed = false
+  _apply_geom()
+end
+
+--- 折叠提问弹窗为右上角小窗（失去焦点时调用）。
+function M.collapse()
+  if not state.win_id or not vim.api.nvim_win_is_valid(state.win_id) then return end
+  state.collapsed = true
+  _apply_geom()
+end
+
+--- 当前提问弹窗是否处于折叠态。
+--- @return boolean
+function M.is_collapsed()
+  return state.collapsed == true
 end
 
 --- 关闭窗口并复位全部状态
@@ -97,6 +199,9 @@ local function _close()
   state.cursor = {}
   state.active = 1
   state.mode = "tab"
+  state.collapsed = false
+  state.geom_opts = nil
+  state.last_lines = nil
   state.require_confirm = true
   state.on_submit = nil
   state.on_cancel = nil
@@ -472,8 +577,10 @@ local function _ensure_window()
   end
   state.buf = vim.api.nvim_create_buf(false, true)
   vim.bo[state.buf].filetype = "neoai_ask_user"
-  local geom_opts = { w_ratio = 0.66, h_ratio = 0.72, fit_h = 12 }
-  local geom = geometry.compute(geom_opts)
+  state.geom_opts = { w_ratio = 0.66, h_ratio = 0.72, fit_h = 12 }
+  state.last_lines = nil
+  state.collapsed = false
+  local geom = _expanded_geom()
   local ok, wid = pcall(vim.api.nvim_open_win, state.buf, true, {
     relative = "editor",
     width = geom.width,
@@ -490,7 +597,10 @@ local function _ensure_window()
     error("无法打开提问弹窗: " .. tostring(wid))
   end
   state.win_id = wid
-  geometry.track(state.win_id, geom_opts)
+  geometry.track(state.win_id, state.geom_opts, function()
+    _apply_geom()
+  end)
+  _install_win_autocmds()
   vim.wo[state.win_id].wrap = true
   -- 提问内容禁止折叠：minimal 浮窗会继承全局 foldenable/foldmethod
   vim.wo[state.win_id].foldenable = false
@@ -524,19 +634,16 @@ _render = function()
     pcall(vim.api.nvim_buf_add_highlight, state.buf, HL_NS, h.group, h.line, h.col, h.end_col)
   end
   pcall(vim.api.nvim_win_set_cursor, state.win_id, { 1, 0 })
-  pcall(vim.cmd, "stopinsert")
+  -- 仅在提问窗本身就是当前窗口时退出插入模式；否则延迟追加 Tab 的重渲染会把
+  -- 正在其他文件里输入的用户踢出插入模式。
+  if vim.api.nvim_get_current_win() == state.win_id then
+    pcall(vim.cmd, "stopinsert")
+  end
   _set_keymaps()
-  -- 动态高度：随内容（题目 + 选项 + 汇总行）自适应，按显示宽度折行后适配，避免截断
-  local geom_opts = { w_ratio = 0.66, h_ratio = 0.72, fit_lines = lines, fit_pad = 4 }
-  local geom = geometry.compute(geom_opts)
-  geometry.track(state.win_id, geom_opts)
-  pcall(vim.api.nvim_win_set_config, state.win_id, {
-    relative = "editor",
-    width = geom.width,
-    height = geom.height,
-    col = geom.col,
-    row = geom.row,
-  })
+  -- 动态高度：随内容（题目 + 选项 + 汇总行）自适应，按显示宽度折行后适配，避免截断。
+  -- 折叠态保持右上角小窗；展开态按最新内容重算。
+  state.last_lines = lines
+  _apply_geom()
 end
 
 --- 展示（合并同批次 config，保留已作答状态；首次或新批次时复位）

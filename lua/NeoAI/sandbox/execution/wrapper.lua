@@ -2184,10 +2184,15 @@ local function _gate_inner(tool, args, ctx, call_original)
         local first = conflicts[1]
         candidate.cleanup(attempt.attempt_id)
         control.transition(attempt, "FAILED")
+        local reason = first and first.reason
+        local code = reason == "SECRET_UNRESOLVED"
+          and "SANDBOX_SECRET_UNRESOLVED" or "SANDBOX_MATERIALIZE_TYPE_CONFLICT"
+        local detail = reason == "SECRET_UNRESOLVED"
+          and "暂存内容含无法还原的假密钥（映射缺失，如热重载后），拒绝执行"
+          or "暂存文件与目录类型冲突，拒绝执行"
         return async.reject({
           kind = "sandbox",
-          message = "SANDBOX_MATERIALIZE_TYPE_CONFLICT: 暂存文件与目录类型冲突，拒绝执行: "
-            .. tostring(first and first.real or "?"),
+          message = code .. ": " .. detail .. ": " .. tostring(first and first.real or "?"),
           command_id = attempt.command_id,
         })
       end

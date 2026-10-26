@@ -233,6 +233,13 @@ local function _install_test_defaults()
     local uc = vim.deepcopy(user_config or {})
     uc.tools = uc.tools or {}
     uc.tools.sandbox = uc.tools.sandbox or {}
+    -- 测试默认自动应答工具审批：headless 下没有用户点击审批浮窗，`prompt`/`async` 的弹窗
+    -- 等待会让工具循环一直挂着（表现为「测试卡住」）。审批专项用例仍可显式覆盖
+    -- （如 mode="prompt" + 较小 timeout_ms 验证超时兜底）。
+    uc.tools.approval = uc.tools.approval or {}
+    if uc.tools.approval.mode == nil then
+      uc.tools.approval.mode = "auto_allow"
+    end
     if uc.tools.sandbox.run_as == nil then
       uc.tools.sandbox.run_as = { uid = 0, gid = 0 }
     end
@@ -289,6 +296,10 @@ local function _install_test_defaults()
       cur.tools = cur.tools or {}
       cur.tools.sandbox = cur.tools.sandbox or {}
       cur.tools.sandbox.run_as = { uid = 0, gid = 0 }
+      -- 同上面的 load 包装：默认值 async 会弹审批浮窗并等待点击，headless 下等不到人 →
+      -- 工具循环挂起。这里强制为 auto_allow（需要审批流程的用例自行 load 覆盖）。
+      cur.tools.approval = cur.tools.approval or {}
+      cur.tools.approval.mode = "auto_allow"
       cur.tools.sandbox.observe = cur.tools.sandbox.observe or { enabled = false }
       cur.tools.sandbox.postprocess = cur.tools.sandbox.postprocess or "sync"
       cur.tools.sandbox.systemd = cur.tools.sandbox.systemd or {}

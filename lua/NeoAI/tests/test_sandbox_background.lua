@@ -336,4 +336,42 @@ tests.suite("sandbox_background", function(_, it)
       pcall(function() require("NeoAI.sandbox.execution.wrapper").release_persistent_backgrounds() end)
     end)
   end)
+
+  it("resident：物化时还原假密钥（run_command 看到真实内容）", function(t)
+    local runtime = require("NeoAI.sandbox.execution.runtime")
+    if runtime.backend() ~= "bwrap" then return end
+    local resident = require("NeoAI.sandbox.execution.resident")
+    if not resident.available() then return end
+    local fs = require("NeoAI.utils.fs")
+    local candidate = require("NeoAI.sandbox.execution.candidate")
+    local control = require("NeoAI.sandbox.execution.control")
+    local store = require("NeoAI.sandbox.state.store")
+    local real_secret = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    local real_content = "TOKEN=" .. real_secret .. "\n"
+    local path = "/root/neoai_resident_secret_test.txt"
+    fs.write_file(path, real_content)
+    with_config({
+      tools = { approval = { mode = "auto_allow" }, sandbox = resident_sandbox_config() },
+    }, function()
+      require("NeoAI.sandbox").reset()
+      -- 直接建立 token 化暂存副本（模拟 AI 编辑后尚未发布的文件）。
+      local a = control.new_attempt("edit_file", {}, {}, { effect = "in_process" })
+      candidate.begin(a, assert(store.root()))
+      local staged = candidate.stage_path(a.attempt_id, path)
+      t.not_nil(staged, "应建立暂存副本")
+      local staged_content = fs.read_file(staged) or ""
+      t.true_(staged_content ~= real_content, "暂存副本应为 token 化视图")
+      candidate.cleanup(a.attempt_id)
+
+      local out, done = nil, false
+      require("NeoAI.tools").execute("run_command",
+        { command = "sha256sum " .. vim.fn.shellescape(path), description = "t" }, {})
+        :then_(function(v) out = tostring(v); done = true end, function() done = true end)
+      t.true_(vim.wait(20000, function() return done end, 50), "命令应完成")
+      local got = tostring(out or ""):match("(%x%x%x%x%x%x%x%x+)")
+      t.eq(vim.fn.sha256(real_content), got, "沙箱内应看到真实内容（而非假密钥）")
+      resident.stop({ timeout_ms = 5000 })
+    end)
+    pcall(vim.fn.delete, path)
+  end)
 end)

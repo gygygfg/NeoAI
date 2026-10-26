@@ -53,7 +53,7 @@ column `base_col`); thresholds/padding are currently hard-coded:
 `M.init()` is idempotent and registers three kinds of UI implementations:
 
 - **Approval UI**: `ui/components/tool_approval.init()` (injected via `tool_service.set_approval_ui`).
-- **User questioning UI**: `ui/components/ask_user.init()` (injected via `ask_user.set_ui`). Multiple questions within the same round are aggregated into **a single multi-tab popup** (opencode-aligned): the top tab bar marks answered/unanswered with `✓/○`, the **current tab is reverse-highlighted**, and the **rightmost tab is the "Confirm" tab**; `h/l`/`←/→` (or `<Tab>`/`<S-Tab>`, `]`/`[`) switch tabs; `1-9` select/toggle (`multi_select` questions render `[x]/[ ]` checkboxes; **in a multi-question batch a single-select answer auto-advances to the next tab** — the last question moves to the confirm tab; multi-select stays on the tab), `k/j`/`↑/↓` move the option focus (focused row background-highlighted), `<CR>` selects the focused option, `i` opens free-text input. **A single single-select question submits on selection (no second confirmation, no confirm tab)**; multi-select/multi-question batches confirm on the rightmost "Confirm" tab (`y`/`<CR>` submits, `h`/`←` returns to editing, `Esc` cancels the whole batch).
+- **User questioning UI**: `ui/components/ask_user.init()` (injected via `ask_user.set_ui`). Multiple questions within the same round are aggregated into **a single multi-tab popup** (opencode-aligned): the top tab bar marks answered/unanswered with `✓/○`, the **current tab is reverse-highlighted**, and the **rightmost tab is the "Confirm" tab**; `h/l`/`←/→` (or `<Tab>`/`<S-Tab>`, `]`/`[`) switch tabs; `1-9` select/toggle (`multi_select` questions render `[x]/[ ]` checkboxes; **in a multi-question batch a single-select answer auto-advances to the next tab** — the last question moves to the confirm tab; multi-select stays on the tab), `k/j`/`↑/↓` move the option focus (focused row background-highlighted), `<CR>` selects the focused option, `i` opens free-text input. **A single single-select question submits on selection (no second confirmation, no confirm tab)**; multi-select/multi-question batches confirm on the rightmost "Confirm" tab (`y`/`<CR>` submits, `h`/`←` returns to editing, `Esc` cancels the whole batch). The popup collapses to a small top-right window when focus leaves (title shows the pending question count) and expands back to full size when focused again.
 - **Sub-agent monitoring**: `ui/components/sub_agent_dock.init()`.
 
 `open_default()` opens the corresponding view according to `ui.default_view` (chat/tree).
@@ -116,6 +116,10 @@ instance); the module table at the end is the **instance manager**:
   `trajectory`'s `:w` save the session bound to the buffer's instance).
 - Reuse semantics preserved: `reload_all` / tree session selection / `toggle_ui` use the default
   `open()` (reuse the current instance, never create).
+
+### 4.0.1 Focus guard when the agent finishes
+
+After the agent completes/errors/aborts, the input box is auto-focused and insert mode entered **only when the current window is the chat message area, still shows the chat buffer, and is in Normal mode** (and the editor itself has focus). When the cursor is in an approval/pty/ask_user float, another chat instance, or an ordinary file window — or already in the input box / a non-Normal mode — focus is not stolen and insert mode is not forced.
 
 ### 4.1 Layout
 
@@ -185,7 +189,13 @@ To keep large bodies readable:
 ### 4.4 Folds
 
 The main window uses `expr` folds (`components.fold.foldexpr`); reasoning / each tool call block (call + result)
-becomes its own independent fold. **Every line inside a fold block is single-line** (`_append_fold_block`
+becomes its own independent fold.
+
+**Fold level (`ui.chat.fold`)**:
+- `none`: disables `foldenable` in the main window; reasoning/tool/step content is fully expanded;
+- `reasoning_tools` (default): the current behavior above;
+- `process`: keeps the current folds and additionally folds the **earlier AI intermediate steps** of each user turn into one “process” fold (the most recent `ui.chat.process_keep_steps` intermediate steps and the final answer stay expanded). The process fold text summarizes folded rounds, tool success/failure counts, input/output tokens, and cache hit rate; expanding it reveals the full steps.
+ **Every line inside a fold block is single-line** (`_append_fold_block`
 splits content containing real newlines): streaming/invalid tool arguments may contain real newlines, and
 writing them as one line would make `nvim_buf_set_lines` error and half-write the buffer, splitting one
 tool fold into two. The fold placeholder text is provided uniformly by `components.fold`. **Only folds

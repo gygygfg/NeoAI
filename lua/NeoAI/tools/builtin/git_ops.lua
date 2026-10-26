@@ -132,6 +132,40 @@ local function _git_text(r)
   return ("git 退出码 %d\n%s"):format(r.code, body)
 end
 
+--- git_add/git_commit 前置门禁：仓库存在未发布的沙箱文件修改时拒绝执行。
+--- 提交作用在沙箱暂存视图上；若这些内容尚未落盘，提交后 HEAD 与真实工作区会不一致
+--- （git status 又显示 modified）。要求先应用修改，保证提交的原子一致性。
+--- @param ctx table|nil
+--- @param repo string|nil 目标仓库目录
+--- @param on_ok function
+--- @param on_error function
+local function _guard_unpublished(ctx, repo, on_ok, on_error)
+  _git({ "rev-parse", "--show-toplevel" }, ctx, repo):then_(function(r)
+    if r.code ~= 0 then
+      -- 不是仓库/路径错误：交给真正的 git 写命令报错，保持原有错误信息。
+      on_ok()
+      return
+    end
+    local root = vim.trim(r.output or "")
+    local ok, cand = pcall(require, "NeoAI.sandbox.execution.candidate")
+    if not ok or not cand or type(cand.unpublished_under) ~= "function" then
+      on_ok()
+      return
+    end
+    local paths = cand.unpublished_under(root)
+    if type(paths) ~= "table" or #paths == 0 then
+      on_ok()
+      return
+    end
+    local preview = {}
+    for i = 1, math.min(5, #paths) do preview[#preview + 1] = paths[i] end
+    on_error("SANDBOX_UNPUBLISHED_EDITS: 仓库存在 " .. tostring(#paths)
+      .. " 个未应用的沙箱修改，请先在审批界面应用后再执行 git_add/git_commit: "
+      .. table.concat(preview, ", ")
+      .. (#paths > #preview and " …" or ""))
+  end, function(e) on_error(e and e.message or tostring(e)) end)
+end
+
 --- 计算 `<commit>` 相对 HEAD 落后的提交数（只读，走沙箱只读通道）。
 --- 用于回退前的「多版本越界」守卫：数值越大表示目标越久远。
 --- 解析失败（非法修订 / rev-list 报错）时返回 0，交由真正的 checkout 抛出可读错误。
@@ -322,18 +356,20 @@ git_tools.git_add = helpers.define_tool(
       return
     end
     local repo = _repo(args)
-    _git_write(argv, ctx, repo):then_(function(r)
-      if r.code == 0 then
-        for _, p in ipairs(args.paths or {}) do
-          -- 相对路径需拼到目标仓库目录，重载的才是该仓库的 buffer（缺省仓库行为不变）。
-          local target = (repo and not p:match("^/")) and (repo .. "/" .. p) or p
-          helpers.reload_buffers_for(target)
+    _guard_unpublished(ctx, repo, function()
+      _git_write(argv, ctx, repo):then_(function(r)
+        if r.code == 0 then
+          for _, p in ipairs(args.paths or {}) do
+            -- 相对路径需拼到目标仓库目录，重载的才是该仓库的 buffer（缺省仓库行为不变）。
+            local target = (repo and not p:match("^/")) and (repo .. "/" .. p) or p
+            helpers.reload_buffers_for(target)
+          end
+          on_success(_git_text(r))
+        else
+          on_error(_git_text(r))
         end
-        on_success(_git_text(r))
-      else
-        on_error(_git_text(r))
-      end
-    end, function(e) on_error(e.message) end)
+      end, function(e) on_error(e.message) end)
+    end, on_error)
   end,
   { category = "git", approval = { auto_allow = false } }
 )
@@ -357,9 +393,12 @@ git_tools.git_commit = helpers.define_tool(
     end
     local argv = { "commit", "-m", args.message }
     if args.all == true then argv[#argv + 1] = "-a" end
-    _git_write(argv, ctx, _repo(args)):then_(function(r)
-      if r.code == 0 then on_success(_git_text(r)) else on_error(_git_text(r)) end
-    end, function(e) on_error(e.message) end)
+    local repo = _repo(args)
+    _guard_unpublished(ctx, repo, function()
+      _git_write(argv, ctx, repo):then_(function(r)
+        if r.code == 0 then on_success(_git_text(r)) else on_error(_git_text(r)) end
+      end, function(e) on_error(e.message) end)
+    end, on_error)
   end,
   { category = "git", approval = { auto_allow = false } }
 )

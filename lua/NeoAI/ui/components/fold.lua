@@ -120,6 +120,47 @@ function M.is_body_line(buf, line)
   return (set ~= nil) and (set[line] == true)
 end
 
+-- ========== 「过程」折叠（process 折叠程度） ==========
+-- process 模式下，message_list 会把每轮 user 请求中较早的 AI 中间步骤收进
+-- 一个「过程」折叠，并给出该折叠首行的汇总文本（轮次/工具成败/token/缓存命中率）。
+-- 行级折叠表由渲染层预计算后登记到这里；foldexpr/foldtext 只做查表，避免在
+-- fold 求值热路径里重复遍历消息。
+local process_levels = setmetatable({}, { __mode = "k" })
+local process_headers = setmetatable({}, { __mode = "k" })
+
+--- 登记某 buffer 的 process 行级折叠表与过程折叠首行文本。
+--- @param buf number
+--- @param levels table<number, string|number> 行号 -> foldexpr 返回值
+--- @param headers table<number, string> 行号 -> 折叠文本
+function M.set_process_folds(buf, levels, headers)
+  if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
+  process_levels[buf] = levels or {}
+  process_headers[buf] = headers or {}
+end
+
+--- 清除某 buffer 的 process 折叠登记。
+--- @param buf number
+function M.clear_process_folds(buf)
+  process_levels[buf] = nil
+  process_headers[buf] = nil
+end
+
+--- 某 buffer 是否登记了 process 折叠（测试/诊断用）。
+--- @param buf number
+--- @return boolean
+function M.has_process_folds(buf)
+  return process_levels[buf] ~= nil
+end
+
+--- 取某行登记的过程折叠文本。
+--- @param buf number
+--- @param line number
+--- @return string|nil
+function M.get_process_header(buf, line)
+  local h = process_headers[buf]
+  return h and h[line] or nil
+end
+
 local function _now_ms()
   return vim.uv.hrtime() / 1e6
 end
@@ -362,6 +403,9 @@ function M.foldtext()
   end
   local start = vim.v.foldstart
   local count = vim.v.foldend - start + 1
+  local buf0 = vim.api.nvim_get_current_buf()
+  local proc_label = M.get_process_header(buf0, start)
+  if proc_label then return proc_label end
   local first = vim.fn.getline(start) or ""
   local kind = M.detect(first)
   if kind == "tool_call" or kind == "tool_result" or kind == "sub_agent" then
@@ -402,8 +446,13 @@ function M.foldexpr()
     return foldexpr_override()
   end
   local ln = vim.v.lnum
-  local text = vim.fn.getline(ln)
   local buf = vim.api.nvim_get_current_buf()
+  local proc = process_levels[buf]
+  if proc then
+    local v = proc[ln]
+    if v ~= nil then return v end
+  end
+  local text = vim.fn.getline(ln)
   local prev = vim.fn.getline(ln - 1)
   local next = vim.fn.getline(ln + 1)
 

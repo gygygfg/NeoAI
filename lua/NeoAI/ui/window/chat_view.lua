@@ -156,6 +156,34 @@ local function _win_shows_buf()
   return ok and shown == state.buf
 end
 
+--- 当前聊天折叠程度（ui.chat.fold）
+--- @return string
+local function _fold_mode()
+  local v = config_store.get("ui.chat.fold")
+  if v == "none" or v == "process" then return v end
+  return "reasoning_tools"
+end
+
+--- 按 ui.chat.fold 应用主窗口折叠选项（none 关闭；其余启用 expr 折叠）。
+local function _apply_fold_mode()
+  if not state.win_id or not vim.api.nvim_win_is_valid(state.win_id) then return end
+  local mode = _fold_mode()
+  if mode == "none" then
+    vim.wo[state.win_id].foldenable = false
+    vim.wo[state.win_id].foldmethod = "manual"
+    vim.wo[state.win_id].foldexpr = ""
+    vim.wo[state.win_id].foldtext = ""
+    return
+  end
+  _G.NeoAIFoldExpr = fold.foldexpr
+  vim.wo[state.win_id].foldmethod = "expr"
+  vim.wo[state.win_id].foldexpr = "v:lua.NeoAIFoldExpr()"
+  vim.wo[state.win_id].foldtext = "v:lua.require'NeoAI.ui.components.fold'.foldtext()"
+  vim.wo[state.win_id].foldenable = true
+  vim.wo[state.win_id].foldlevel = 0
+  vim.wo[state.win_id].foldminlines = 0
+end
+
 --- 光标是否位于 buffer 最后 5 行内
 --- @return boolean
 local function _cursor_within_follow_margin()
@@ -203,6 +231,10 @@ end
 ---   3) 恢复用户此前已展开的折叠（重算会丢失手动开合状态）。
 local function _recompute_folds()
   if not state.folds_dirty then return end
+  if _fold_mode() == "none" then
+    state.folds_dirty = false
+    return
+  end
   -- 仍处于插入模式（如用户切到其它窗口继续编辑）时不补算：补算会被再次抑制。
   if vim.api.nvim_get_mode().mode:sub(1, 1) == "i" then return end
   if not M.has_window() or not _win_shows_buf() then return end
@@ -283,14 +315,14 @@ local function _render(keep_view)
   -- 插入/替换模式期间 nvim 全局不计算折叠（见 _recompute_folds）：本次写入的新折叠块
   -- 不会被收起。记下 dirty，待 InsertLeave 后由 _recompute_folds 统一补算。
   local mode = vim.api.nvim_get_mode().mode
-  if mode:find("^[iR]") then
+  if mode:find("^[iR]") and _fold_mode() ~= "none" then
     state.folds_dirty = true
   end
   -- 折叠/视口操作只在窗口确实显示聊天 buffer 时执行：nvim_win_call 内的 foldlevel/
   -- foldclose!/set_cursor/getline/foldexpr 都作用于窗口当前 buffer，若窗口已被 :bnext
   -- 切到别的文件，这些会按聊天 buffer 的行号作用到用户文件上（误关折叠、挪动光标、
   -- 覆盖 foldexpr）。内容写入已在上面无条件写入 state.buf，不受此保护影响。
-  if _win_shows_buf() then
+  if _fold_mode() ~= "none" and _win_shows_buf() then
     vim.api.nvim_win_call(state.win_id, function()
       -- 折叠由 nvim 在 buffer 变更后按 foldexpr 自动重算。这里**不再**整块 `zx`/`zM`：
       -- 那会对整个 buffer 重新求值折叠并刷新所有旧折叠文本（旧块摘要闪烁、视口跳动），
@@ -933,6 +965,25 @@ local function _focus_input_insert()
   input_box.focus()
 end
 
+--- Agent 结束是否允许自动跳到输入框并进入插入模式。
+--- 仅在「光标确实停在聊天主消息区 + Normal 模式」时为真：
+---   * 审批/伪终端/ask_user 等浮窗、其他聊天实例、普通文件窗口 → 不抢焦点；
+---   * 光标已在输入框、或当前处于插入/可视等非 Normal 模式 → 不重复进入插入；
+---   * 应用本身失焦（用户切到其他程序）→ 不自动插入。
+--- @return boolean
+local function _can_auto_focus_input()
+  if not state.win_id or not vim.api.nvim_win_is_valid(state.win_id) then return false end
+  if vim.api.nvim_get_current_win() ~= state.win_id then return false end
+  if not _win_shows_buf() then return false end
+  if vim.api.nvim_get_mode().mode ~= "n" then return false end
+  local ok, ui_focus = pcall(require, "NeoAI.ui.focus")
+  if ok and ui_focus and type(ui_focus.is_focused) == "function" then
+    local ok2, focused = pcall(ui_focus.is_focused)
+    if ok2 and focused == false then return false end
+  end
+  return true
+end
+
 --- Agent 结束（完成 / 出错 / 取消）：渲染最终状态并回到输入框
 --- @param payload table
 local function _on_agent_end(payload)
@@ -949,8 +1000,10 @@ local function _on_agent_end(payload)
     _stop_tool_tick()
     -- 回收已完成工具的计时记录：耗时已落库到结果消息，fold 表无需继续持有（避免长会话膨胀）。
     fold.prune_finished()
-    -- 仅当本实例是当前聚焦实例时才把光标移回输入框：后台实例结束不应抢走焦点。
-    if _focused() then _focus_input_insert() end
+    -- 仅当本实例是当前聚焦实例、且光标确实停在聊天主消息区的 Normal 模式时才把光标
+    -- 移回输入框：后台实例结束、审批/伪终端浮窗聚焦、光标已在输入框或非 Normal 模式时
+    -- 都不应抢焦点/重复进入插入模式。
+    if _focused() and _can_auto_focus_input() then _focus_input_insert() end
   end
 end
 
@@ -1489,6 +1542,18 @@ local function _on_display_mode_changed(payload)
   end
 end
 
+--- 折叠程度配置热更新：重设窗口折叠选项、失效消息缓存并重渲染。
+--- @param payload table|nil { path, old, new }
+local function _on_config_changed(payload)
+  local path = payload and payload.path
+  if path ~= "ui.chat.fold" and path ~= "ui.chat.process_keep_steps" then return end
+  _apply_fold_mode()
+  if state.buf and vim.api.nvim_buf_is_valid(state.buf) then
+    message_list.invalidate(state.buf)
+  end
+  _schedule_render(true)
+end
+
 local function _register_focus_tracking()
   if state.focus_augroup then
     pcall(vim.api.nvim_del_augroup_by_id, state.focus_augroup)
@@ -1763,17 +1828,9 @@ function M.open(opts)
   -- 显式开启 foldenable，避免继承用户全局 foldenable=false 导致无法折叠
   -- foldexpr 用全局函数引用而非 v:lua.require'...'：后者在带 UI 的会话里求值会
   -- 失败导致 foldlevel 全部为 0（折叠失效），全局函数则稳定可用。
-  local fold_mod = require("NeoAI.ui.components.fold")
-  _G.NeoAIFoldExpr = fold_mod.foldexpr
-  vim.wo[state.win_id].foldmethod = "expr"
-  vim.wo[state.win_id].foldexpr = "v:lua.NeoAIFoldExpr()"
-  vim.wo[state.win_id].foldtext = "v:lua.require'NeoAI.ui.components.fold'.foldtext()"
   vim.bo[state.buf].shiftwidth = 2
-  vim.wo[state.win_id].foldenable = true
-  vim.wo[state.win_id].foldlevel = 0
-  -- 允许单行折叠被收起（如单行推理、结果未到达的单行工具调用），
-  -- 否则 foldminlines=1 会让单行折叠无法 zM 关闭。
-  vim.wo[state.win_id].foldminlines = 0
+  -- 按 ui.chat.fold 应用折叠（none 关闭；reasoning_tools/process 用 expr 折叠）。
+  _apply_fold_mode()
   -- 获取/创建 Agent（若有 session_id 则加载已有会话）
   local agent
   if opts.session_id then
@@ -1833,6 +1890,7 @@ function M.open(opts)
   state.unsubs[#state.unsubs + 1] = event_bus.on(events.AGENT_ABORTED, _on_agent_end)
   -- 轨迹模式保存随显示模式启停
   state.unsubs[#state.unsubs + 1] = event_bus.on(events.DISPLAY_MODE_CHANGED, _on_display_mode_changed)
+  state.unsubs[#state.unsubs + 1] = event_bus.on(events.CONFIG_CHANGED, _on_config_changed)
   -- 打开窗口时按当前显示模式同步一次（activate 的 DISPLAY_MODE_CHANGED 在订阅前已发出）
   _sync_trajectory_save()
   -- 同步当前显示模式标签给状态栏（订阅前 activate 已发出事件，此处补推一次）。
@@ -1860,6 +1918,7 @@ function M.close()
   state.closing = true
   _stop_tool_tick()
   fold.clear_timing()
+  if state.buf and vim.api.nvim_buf_is_valid(state.buf) then fold.clear_process_folds(state.buf) end
   -- 本实例拥有**自己的**流式浮窗（思考/接收参数/上下文压缩）：无论是否聚焦都必须关闭，
   -- 否则后台实例被关闭时其浮窗会泄漏（窗口/buffer 残留）。
   reasoning_panel.close()

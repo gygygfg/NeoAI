@@ -817,6 +817,9 @@ UI 见 `ui/components/device_consent`，与网络同意/工具审批同款浮窗
       `git_commit` / `git_stash` / `git_restore` / `git_worktree` / `git_fetch` / `git_pull` 的
       `.git` 改动与工作区改动一起进入审批悬浮窗，用户确认后原子应用（`SANDBOX_GIT_INTERNAL` 仅
       兜底拒绝瞬态/配置类目标）。
+    - **未发布编辑前置门禁**：执行 `git_add`/`git_commit` 前检查目标仓库下是否存在尚未应用的
+      沙箱文件修改；存在则返回 `SANDBOX_UNPUBLISHED_EDITS`，要求先在审批界面应用，保证提交后
+      `HEAD` 与真实工作区一致（避免提交后 `git status` 又显示 modified）。
     - 这些 git 变更工具在**沙箱内**执行（`effect=process`，看到暂存工作区），改动冻结为候选、
       dry_run 下不改真实 `.git`。`run_command` 中的 git **变更**子命令被守卫拒绝
       （`SANDBOX_GIT_MUTATION_VIA_COMMAND`，`sandbox/observe/git_guard.lua`），须改用上述专用工具；
@@ -1014,6 +1017,9 @@ UI 见 `ui/components/device_consent`，与网络同意/工具审批同款浮窗
   未被再次编辑（`fresh_resident` 签名一致）时物化**跳过回写**，避免每次命令后把上千个包产物
   （实测近百 MB）重发一遍。仅命令确在常驻 overlay 内执行（`ctx.sandbox_resident`）时成立，
   一次性回退路径不受影响。
+- **密钥还原（fail-closed）**：`resident.materialize()` 写回命名空间前会 `secret.detokenize`
+  暂存视图中的假密钥（文本与二进制假内容），使命令（git commit/build/脚本）拿到真实值；
+  映射缺失导致无法还原时**拒绝整次物化**，命令不执行（绝不把假密钥写入提交/构建产物）。
 - **资源域**：会话级 cgroup；命令是服务器（已在资源域内）的子进程，继承资源域。超时/取消按
   进程组精确终止当前命令（`setsid` 独立进程组），不波及常驻实例与其它后台进程。
 - **回退**：overlay 不可用、嵌套 userns（T2）档位、特权档升级、启动/健康检查失败时自动回退

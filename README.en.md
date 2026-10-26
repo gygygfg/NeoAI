@@ -338,6 +338,10 @@ require("NeoAI").setup({
       min_height = 5,                    -- minimum height when the cursor is inside the input box (starting value)
       max_ratio = 0.8,                   -- upper limit as content grows (share of the main window height)
     },
+    chat = {
+      fold = "reasoning_tools",          -- fold level: none / reasoning_tools / process
+      process_keep_steps = 3,            -- process mode: keep this many recent intermediate steps expanded per turn
+    },
     trajectory = {
       log_dir = vim.fn.stdpath("cache") .. "/NeoAI/logs", -- directory for saving trajectory logs
     },
