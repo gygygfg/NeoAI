@@ -512,6 +512,18 @@ tests.suite("ui_components", function(_, it)
     vim.api.nvim_exec_autocmds("FocusGained", {})
     t.false_(au.is_collapsed(), "应用重新聚焦且光标在提问窗应展开")
 
+    -- 原生 SafeState 兜底：noautocmd 切换窗口不会触发 WinLeave，但随后的稳定态事件
+    -- 应按实际焦点收起；回到提问窗后再次校正为展开。
+    vim.cmd("noautocmd vsplit")
+    local noacmd_win = vim.api.nvim_get_current_win()
+    t.false_(au.is_collapsed(), "noautocmd 切窗暂不触发收起")
+    vim.api.nvim_exec_autocmds("CursorMoved", {})
+    t.true_(au.is_collapsed(), "CursorMoved 应按实际焦点收起")
+    vim.api.nvim_set_current_win(win)
+    vim.api.nvim_exec_autocmds("SafeState", {})
+    t.false_(au.is_collapsed(), "SafeState 在光标回到提问窗时应展开")
+    pcall(vim.api.nvim_win_close, noacmd_win, true)
+
     au.hide()
     pcall(vim.api.nvim_win_close, other, true)
     t.nil_(au.get_buf(), "hide 后应无提问弹窗")
