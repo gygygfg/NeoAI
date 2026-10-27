@@ -401,17 +401,21 @@ tests.suite("incremental", function(_, it)
     }
     chat_view.refresh()
 
+    -- 渲染宽度必须与 chat_view.refresh 一致（用户消息右对齐的补白宽度依赖它），
+    -- 否则宽度变化会被正确判定为「内容变化」而重写 buffer。
+    local tw = math.max(20, vim.api.nvim_win_get_width(opened.win_id) - 2)
+
     -- 消息与 fold 计时都没变：再次渲染不应触碰 buffer
     local tick = vim.api.nvim_buf_get_changedtick(opened.buf)
-    message_list.render(opened.buf, agent.messages, { table_width = 80 })
+    message_list.render(opened.buf, agent.messages, { table_width = tw })
     t.eq(tick, vim.api.nvim_buf_get_changedtick(opened.buf), "内容未变时不应重写 buffer")
 
     -- 工具完成（只改 fold 计时，不改消息）：应被识别为变化并刷新折叠文本
     fold.clear_timing()
-    message_list.render(opened.buf, agent.messages, { table_width = 80 })
+    message_list.render(opened.buf, agent.messages, { table_width = tw })
     local before_tick = vim.api.nvim_buf_get_changedtick(opened.buf)
     fold.record_end("c1", 1500, "success")
-    local diff = assert(message_list.render(opened.buf, agent.messages, { table_width = 80 }))
+    local diff = assert(message_list.render(opened.buf, agent.messages, { table_width = tw }))
     t.true_(diff.changed, "工具状态变化后应有写入")
     t.true_(vim.api.nvim_buf_get_changedtick(opened.buf) ~= before_tick, "应实际重写 buffer")
     t.matches("1%.5s", _joined(opened.buf), "折叠文本应显示耗时 1.5s")

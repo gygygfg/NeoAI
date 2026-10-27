@@ -3,6 +3,8 @@
 --- 列出待审变更单元，按文件路径级别高亮：
 ---   工作区文件=绿色 / 用户目录=黄色 / 系统路径=红色；「待审」状态标签按安全等级着色
 ---   （L0 灰 / L1 黄 / L2 橙 / L3 红）。
+--- 「工作区」= 当前工作区根（会话绑定工作目录优先，见 `core/session/workspace_root.base_dir`），
+---   而不是编辑器 cwd：在工程子目录里启动 nvim 时，父目录内的工程文件仍算工作区内。
 ---   风险徽标配色：L0 灰 / L1·L2 黄 / L3 红（仅 L3 用红色危险高亮）。
 --- 审批单位为单个文件：<CR> 仅应用光标所在文件 / d 仅拒绝该文件（其余文件保留待审）。
 --- 「已应用」区默认整体折叠（区标题一级 / 条目头行二级，za/zo 逐级展开），
@@ -452,14 +454,28 @@ local function _under(path, base)
   return path == base or path:sub(1, #base + 1) == base .. "/"
 end
 
+--- 分级基准目录（= 工作区根）。
+--- 会话绑定工作目录优先（与工具/沙箱执行基准一致）：在工程子目录里启动 nvim 时工作区仍是
+--- 整个工程根，`A` 一键同意与绿色「工作区」分级都覆盖到父目录内的工程文件。
+--- 经 core/session/workspace_root 获取（非沙箱内部模块），缺失时退回编辑器 cwd。
+--- @return string
+local function _ws_base()
+  local ok, wr = pcall(require, "NeoAI.core.session.workspace_root")
+  if ok and type(wr) == "table" and type(wr.base_dir) == "function" then
+    local ok2, dir = pcall(wr.base_dir)
+    if ok2 and type(dir) == "string" and dir ~= "" then return dir end
+  end
+  return vim.fn.getcwd()
+end
+
 --- 判断文件路径级别
 --- @param path string
---- @param ctx table|nil { cwd?, home? } 预计算的规范 cwd/home（build_lines 批量传入以复用）
+--- @param ctx table|nil { cwd?, home? } 预计算的规范工作区根/home（build_lines 批量传入以复用）
 --- @return string "workspace" | "user" | "system"
 function M.level_of(path, ctx)
   if type(path) ~= "string" or path == "" then return "system" end
   local abs = _norm(path)
-  local cwd = (ctx and ctx.cwd) or _canon_base(vim.fn.getcwd())
+  local cwd = (ctx and ctx.cwd) or _canon_base(_ws_base())
   if _under(abs, cwd) then return "workspace" end
   local home = (ctx and ctx.home) or _canon_base(vim.fn.expand("~"))
   if home ~= "" and _under(abs, home) then return "user" end
@@ -482,7 +498,7 @@ function M.build_lines(items, traces, audit, saved, rejected)
   -- （展开整区后条目仍各自收起）。待审区/留痕区不登记，保持不折叠。
   local fold_levels = {}
   -- 本次渲染复用一次 cwd/home 规范形式，避免逐文件重复 fs.canonical。
-  local lvl_ctx = { cwd = _canon_base(vim.fn.getcwd()), home = _canon_base(vim.fn.expand("~")) }
+  local lvl_ctx = { cwd = _canon_base(_ws_base()), home = _canon_base(vim.fn.expand("~")) }
   lines[#lines + 1] = LEGEND
   for _, m in ipairs(LEGEND_MARKS) do
     marks[#marks + 1] = { line = #lines, start_col = m.start_col, end_col = m.end_col, level = m.level }
@@ -1107,6 +1123,8 @@ local function _set_review_title(title)
 end
 
 --- 一键同意：应用所有「工作区内」的待审文件（按文件粒度）。
+--- 「工作区」按工作区根判定（会话绑定工作目录优先），因此编辑器停在工程子目录时，
+--- 父目录内同属该工程的待审文件同样在一次 `A` 内被应用。
 --- 工作区外的文件与主机操作提案保留待审，供用户逐条确认；同一变更单元中工作区外的
 --- 文件同样保留（选择性应用），不影响已应用的工作区部分。
 ---
@@ -1120,12 +1138,14 @@ local function _apply_all_workspace()
     return
   end
   local pending = sandbox.list_reviews({ review_state = "PENDING" })
+  -- 复用一份规范化的工作区根/home：待审文件可能上万，逐文件重复规范化是主线程热点。
+  local lvl_ctx = { cwd = _canon_base(_ws_base()), home = _canon_base(vim.fn.expand("~")) }
   local jobs = {}
   for _, item in ipairs(pending) do
     if item.kind ~= "host_op" then
       local files = {}
       for _, f in ipairs(item.files or {}) do
-        if type(f.path) == "string" and M.level_of(f.path) == "workspace" then
+        if type(f.path) == "string" and M.level_of(f.path, lvl_ctx) == "workspace" then
           files[#files + 1] = f.path
         end
       end
@@ -1921,7 +1941,7 @@ local function _open_command_detail(command)
     vim.notify("[NeoAI] 越界命令已不存在", vim.log.levels.WARN)
     return
   end
-  local lvl_ctx = { cwd = _canon_base(vim.fn.getcwd()), home = _canon_base(vim.fn.expand("~")) }
+  local lvl_ctx = { cwd = _canon_base(_ws_base()), home = _canon_base(vim.fn.expand("~")) }
   local grouped = _group_traces(matched)
   local lines = { "越界命令详情（工作区外，仅记录）", "q/Esc 返回审批", "" }
   lines[#lines + 1] = "命令: " .. (command and ("$ " .. _one_line(command)) or "（非命令工具访问）")
@@ -2159,7 +2179,7 @@ local function _build_dirs_section()
     lines[#lines + 1] = text
     if level then marks[#marks + 1] = { line = #lines, start_col = 0, end_col = #text, level = level } end
   end
-  local lvl_ctx = { cwd = _canon_base(vim.fn.getcwd()), home = _canon_base(vim.fn.expand("~")) }
+  local lvl_ctx = { cwd = _canon_base(_ws_base()), home = _canon_base(vim.fn.expand("~")) }
   add("── 目录设置（仅本会话，E 编辑）──", "note")
   local ws_entries = _workspace_entries(snap)
   add(string.format("工作目录列表（命令审批自动放行，共 %d）:", #ws_entries))
@@ -3069,7 +3089,7 @@ end
 --- @return table
 local function _build_anomaly_page(ctx)
   local lines, marks, line_to_trace, line_to_cmd = {}, {}, {}, {}
-  local lvl_ctx = { cwd = _canon_base(vim.fn.getcwd()), home = _canon_base(vim.fn.expand("~")) }
+  local lvl_ctx = { cwd = _canon_base(_ws_base()), home = _canon_base(vim.fn.expand("~")) }
   -- === 越界访问留痕（按文件路径合并）===
   lines[#lines + 1] = "── 越界访问留痕（工作区外，仅记录，i 查看文件涉及的命令）──"
   local grouped = _group_traces(ctx.traces or {})

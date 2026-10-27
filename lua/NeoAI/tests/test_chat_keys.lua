@@ -223,10 +223,8 @@ tests.suite("chat_keys", function(_, it)
     vim.cmd("new")
     local win = vim.api.nvim_get_current_win()
     input_box.attach_window(win)
-    -- 模拟输入窗口显示了别的 buffer（winfixbuf 已阻止用户切换；这里是 focus() 的兜底防御路径，
-    -- 需先临时关闭 winfixbuf 才能构造该状态）。
-    local fix = vim.fn.exists("&winfixbuf") == 1
-    if fix then pcall(function() vim.wo[win].winfixbuf = false end) end
+    -- 模拟输入窗口显示了别的 buffer（输入框**不再** winfixbuf 锁窗，外部切换会被放行；
+    -- 真实保护由 chat_view 的 BufEnter/WinEnter 重定向提供，这里验证 focus() 的兜底路径）。
     local file_buf = vim.api.nvim_create_buf(false, true)
     vim.api.nvim_buf_set_lines(file_buf, 0, -1, false, { "FILE-ORIG" })
     vim.api.nvim_win_set_buf(win, file_buf)
@@ -243,10 +241,12 @@ tests.suite("chat_keys", function(_, it)
     input_box.reset()
   end)
 
-  it("输入窗口锁定 winfixbuf：:e 文件不改写输入 buffer（回归 N1）", function(t)
-    -- 本用例锁定的是【低层 winfixbuf 兜底】：用 nvim_win_call + vim.cmd 直接执行 :edit，
-    -- 不经过 Cmdline，故不会触发 chat_view 的 CmdlineLeave 拦截（详见 test_chat_ui 的
-    -- 「输入框内 :e 文件不报 E1513」用例）；此处验证 winfixbuf 仍会拦下并保留输入 buffer。
+  it("输入窗口不再用 winfixbuf 锁窗：插件切换被放行而不报 E1513（回归 N1）", function(t)
+    -- 历史实现靠 'winfixbuf' 锁住输入窗口，代价是 bufferline 点击标签（`:buffer %d`）等
+    -- 不经过 Cmdline 的路径会把 `E1513: Cannot switch buffer` 抛给用户。现改为「放行 + chat_view
+    -- 重定向」（见 test_chat_ui 的重定向用例），本用例只锁定 input_box 层的行为：
+    --   1) attach_window **不**设置 winfixbuf，因此插件/API 切换不会抛 E1513；
+    --   2) 输入 buffer 自身不被复用（内容/nofile 属性不变），focus() 仍能把它绑回窗口。
     local input_box = require("NeoAI.ui.components.input_box")
     input_box.reset()
     input_box.create({ on_submit = function() end })
@@ -255,29 +255,26 @@ tests.suite("chat_keys", function(_, it)
     local win = vim.api.nvim_get_current_win()
     input_box.attach_window(win)
 
-    if vim.fn.exists("&winfixbuf") == 0 then
-      -- 旧版 Neovim 无 winfixbuf：跳过（功能本就不支持）
-      pcall(vim.api.nvim_win_close, win, true)
-      input_box.reset()
-      return
+    if vim.fn.exists("&winfixbuf") == 1 then
+      t.false_(vim.wo[win].winfixbuf, "绑定输入窗口不应再开启 winfixbuf（会把 E1513 抛给用户）")
     end
-
-    t.true_(vim.wo[win].winfixbuf, "绑定输入窗口后应开启 winfixbuf")
 
     -- 输入框写入内容
     vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "用户输入" })
     vim.api.nvim_win_set_buf(win, buf)
 
-    -- 用户在输入窗口执行 :e <file>：winfixbuf 应拦下，输入 buffer 不被复用为文件 buffer
+    -- 模拟 bufferline 左键标签：在输入窗口内执行 `:buffer <别的 buffer>`，不应报错
     local tmp = vim.fn.tempname()
     local ok, err = pcall(function()
       vim.api.nvim_win_call(win, function() vim.cmd("edit " .. vim.fn.fnameescape(tmp)) end)
     end)
-    t.false_(ok, "winfixbuf 下 :e 其它文件应失败（E1513）")
-    t.true_(tostring(err):find("1513") ~= nil, "应报 E1513（Cannot switch buffer），实际: " .. tostring(err))
-    t.eq(buf, vim.api.nvim_win_get_buf(win), "输入窗口应仍显示输入 buffer")
-    t.eq("用户输入", vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1], "输入内容不应被 :e 覆盖")
+    t.true_(ok, "输入窗口内切换 buffer 不应报错（旧实现会抛 E1513），实际: " .. tostring(err))
+    t.eq("用户输入", vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1], "输入内容不应被改写")
     t.eq("nofile", vim.bo[buf].buftype, "输入 buffer 仍应为 nofile（未被复用为文件 buffer）")
+
+    -- focus() 兜底：把输入 buffer 绑回窗口，文件 buffer 不被写入任何字符
+    t.true_(input_box.focus(), "focus 应成功")
+    t.eq(buf, vim.api.nvim_win_get_buf(win), "focus 后输入窗口应重新显示输入 buffer")
 
     pcall(vim.api.nvim_win_close, win, true)
     pcall(vim.api.nvim_buf_delete, buf, { force = true })

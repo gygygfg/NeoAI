@@ -249,26 +249,26 @@ function M.create(opts)
 end
 
 --- 绑定到已存在的窗口（用于 split 布局）
---- 用 'winfixbuf' 锁住输入窗口，作为**低层兜底**：输入 buffer 是无名 nofile 暂存 buffer，
---- 用户在此窗口执行 :e <file> / :bnext 等会**复用该窗口的 buffer**、把输入 buffer 变成一个
---- 命名文件 buffer（buftype 变空），之后输入就会落进用户文件、且 :wq 会误保存。
---- 开启 winfixbuf 后，此类切换会抛 E1513（Cannot switch buffer. 'winfixbuf' is enabled），
---- 保持输入 buffer 不变。Neovim 0.10+ 才有该选项，旧版本 pcall 静默跳过。
---- 注意：正常用户在输入框敲 :e / :bnext 时，**更高层**的 chat_view 已用 CmdlineLeave
---- （_on_input_cmdline_leave）拦截并改在新标签页打开，不会把 E1513 抛给用户；
---- winfixbuf 只兜住不触发 Cmdline 事件的路径（插件直接 nvim_win_set_buf / <Cmd> 等）。
---- 顺序：先临时关闭 winfixbuf（否则 set_buf 自身也会被 E1513 拦下）→ 绑定输入 buffer → 重新开启。
+--- **不再**用 'winfixbuf' 锁窗（历史实现见 docs/ui_system.md「输入框 buffer 保护」）。
+--- 原做法靠 winfixbuf 阻止 :e / :bnext / 插件切换复用输入窗口的 buffer，代价是**插件路径**
+--- （bufferline 标签左键 `:buffer %d`、插件直接 nvim_win_set_buf、`<Cmd>` 映射等）会把
+--- `E1513: Cannot switch buffer. 'winfixbuf' is enabled` 直接抛给用户——这类路径不经过 Cmdline
+--- 事件，chat_view 的 CmdlineLeave 拦截拦不住，也无从提前判断。
+--- 现改为「**放行 + 重定向**」：切换照常发生，chat_view 的 WinEnter/BufEnter 守卫
+--- （_redirect_input_hijack）随即把目标 buffer 交给主聊天窗口显示（等价于在主窗口 :b）、
+--- 收起输入框；输入 buffer 因 bufhidden=hide 内容原样保留，回到聊天时照常恢复。
+--- 因此「输入落进用户文件 / :wq 误保存」仍被挡住（窗口在用户继续敲键盘前已重定向），
+--- 而不会再出现 E1513 报错。输入 buffer 本身仍是无名 nofile 暂存 buffer。
 --- @param win_id number
 function M.attach_window(win_id)
   state.win_id = win_id
   if win_id and vim.api.nvim_win_is_valid(win_id) then
+    -- 兜底：外部（插件/旧配置）可能仍给本窗口开了 winfixbuf，先关掉再绑定，否则 set_buf 会被
+    -- E1513 拦下、输入 buffer 绑不回来。
     if vim.fn.exists("&winfixbuf") == 1 then
       pcall(function() vim.wo[win_id].winfixbuf = false end)
     end
     vim.api.nvim_win_set_buf(win_id, state.buf)
-    if vim.fn.exists("&winfixbuf") == 1 then
-      pcall(function() vim.wo[win_id].winfixbuf = true end)
-    end
   end
 end
 
@@ -312,8 +312,8 @@ function M.focus()
   if state.buf and vim.api.nvim_buf_is_valid(state.buf) then
     local shown = vim.api.nvim_win_get_buf(state.win_id)
     if shown ~= state.buf then
-      -- winfixbuf 已开启时 set_buf 会抛 E1513（正常情况不会走到这里，因为 winfixbuf 阻止了
-      -- 输入窗切到别的 buffer）；兜底临时关闭再绑定，确保焦点/输入落在正确的 buffer 上。
+      -- 防御：若外部（插件/旧配置）给输入窗口开了 winfixbuf，set_buf 会抛 E1513，
+      -- 先临时关掉再绑定，确保焦点/输入落在正确的 buffer 上。
       local fix = vim.fn.exists("&winfixbuf") == 1
       if fix then pcall(function() vim.wo[state.win_id].winfixbuf = false end) end
       pcall(vim.api.nvim_win_set_buf, state.win_id, state.buf)

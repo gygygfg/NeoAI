@@ -340,7 +340,7 @@ require("NeoAI").setup({
     },
     chat = {
       fold = "reasoning_tools",          -- fold level: none / reasoning_tools / process
-      process_keep_steps = 3,            -- process mode: keep this many recent intermediate steps expanded per turn
+      process_keep_steps = 3,            -- process mode: steps kept expanded while the current turn is running (all folded once it ends)
     },
     trajectory = {
       log_dir = vim.fn.stdpath("cache") .. "/NeoAI/logs", -- directory for saving trajectory logs

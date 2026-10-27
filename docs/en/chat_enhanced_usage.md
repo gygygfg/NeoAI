@@ -27,11 +27,14 @@ The chat window = **main message area (top)** + **input box (bottom, split, heig
   viewport (`_wheel_scroll`), clamping the blank space below the last line to `ui.chat.mousescroll_max_blank`
   (default 3) lines instead of leaving more and more white space like the native behavior.
 - Input box: a regular buffer with a `virt_text`-rendered `> ` prefix (not using `buftype=prompt`, to avoid
-  conflicts with nvim-cmp); completion is enabled for the `neoai_input` filetype; the input window is locked with
-  `'winfixbuf'` (0.10+) as a low-level backstop, and `chat_view` **generically intercepts any `:` command** typed there
-  via `CmdlineLeave`: the original command is replayed as-is and only falls back to a **new tab** when it fails with
-  E1513. So whether it is `:e <file>` or `:terminal`/`:help` etc., it neither raises `E1513` nor turns the input box
-  into that buffer (avoiding input landing in the user's file / a wrong `:wq`).
+  conflicts with nvim-cmp); completion is enabled for the `neoai_input` filetype. The input window is **no longer**
+  locked with `'winfixbuf'` (that made bufferline left-clicks and plugin file-opening paths raise
+  `E1513: Cannot switch buffer`); instead it is "allow + redirect": the switch happens, then `chat_view` redirects the
+  target buffer to the **main window** (equivalent to `:b` in the main window) in `WinEnter`/`BufEnter` and collapses
+  the input box, while `:terminal`/`:help` and other special buffers open in a **new tab**. So whether it is
+  `:e <file>`, a bufferline click or a plugin jump, it neither raises `E1513` nor turns the input box into that buffer
+  (avoiding input landing in the user's file / a wrong `:wq`); the typed text is preserved and restored when you
+  return to the chat.
 - `:terminal`/`:help` in the main message area: these **take over the current window** and may later close the whole
   chat window (including the input box) along with their own `:q`; they are redirected to open in a **new tab**.
   Ordinary buffer switches such as `:e`/`:bnext` still act on the main window, collapsing/restoring the input box via

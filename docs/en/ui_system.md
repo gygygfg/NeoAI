@@ -186,6 +186,28 @@ To keep large bodies readable:
   fences `NeoAICodeFence`, rules `NeoAIHr`. Table styles (`tbl`) still use the zebra-stripe namespace, and the two
   do not interfere.
 
+**Role headers appear only on role switches**: `_blocks` tracks `last_role` and inserts a header
+(`👤 用户` / `🤖 AI`) only when the current message's role differs from the previous **rendered** message. So the
+multiple assistant messages inside one agent tool loop (tool call → result → call again…) no longer repeat `🤖 AI`.
+Under `process` folding the header is rendered **outside** the process fold (order: header → `🧩 过程` → expanded
+steps), so the “it is the AI's turn” cue is never swallowed by the fold even when the turn's first step is folded away.
+
+**Left/right alignment**: user messages are **right-aligned** and AI messages **left-aligned** (chat-bubble feel).
+In a plain-text buffer this can only be done with leading padding, with these rules:
+
+- the body block is padded **uniformly** (padding computed from the widest line of the block), not line by line —
+  the internal indentation and relative alignment of code blocks / lists are preserved and only the whole block
+  shifts right;
+- the role header is padded separately to the same right edge (`table width = window width - 2`, leaving a 2-column
+  right margin);
+- when the body exceeds the available width (long paragraph / over-wide table) **nothing is padded** (header
+  included), avoiding the “header far right, body far left” mismatch;
+- the byte offsets of inline highlights (`md_span` / `ansi` / `secret_spans`) are shifted by the padding, otherwise
+  they would be misaligned;
+- since padding introduces leading spaces, role headers and body lines are all registered as “body lines”
+  (`body = true`) so `foldexpr` returns `0` — otherwise the indented lines would be mistaken for fold blocks.
+  The turn separator is outside the padded range and stays full width.
+
 ### 4.4 Folds
 
 The main window uses `expr` folds (`components.fold.foldexpr`); reasoning / each tool call block (call + result)
@@ -194,7 +216,18 @@ becomes its own independent fold.
 **Fold level (`ui.chat.fold`)**:
 - `none`: disables `foldenable` in the main window; reasoning/tool/step content is fully expanded;
 - `reasoning_tools` (default): the current behavior above;
-- `process`: keeps the current folds and additionally folds the **earlier AI intermediate steps** of each user turn into one “process” fold (the most recent `ui.chat.process_keep_steps` intermediate steps and the final answer stay expanded). The process fold text summarizes folded rounds, tool success/failure counts, input/output tokens, and cache hit rate; expanding it reveals the full steps.
+- `process`: keeps the current folds and additionally folds each turn's **AI intermediate steps** into one “process” fold. The folded range depends on the turn state: **while the turn is running** (the agent is still `generating`/`tool_running`) the most recent `ui.chat.process_keep_steps` steps stay expanded so you can watch the current calls; **once the turn ends** (back to `idle`) those steps are folded too, leaving only the final step expanded — so historical turns do not keep 3 calls spread open. The fold text starts by naming the folded **Step range** (`🧩 过程 · Step 1-18 · 工具 5✓ · ↑12.0k ↓1.2k · 缓存 62%`) and then summarizes tool success/failure counts, input/output tokens, and cache hit rate. **The Step marker lives in the fold text, not on its own line**: every “thinking process” and “tool call” fold gets `· Step N` appended (e.g. `🤔 思考过程 1 行 · Step 18`, `🔧 grep · 搜索 ✅ 0.3s · Step 18`); the role header is a plain `🤖 AI` shown only on role switches, and folded steps no longer render a separate header line. The renderer registers the marker per fold start line (`fold.set_step_labels`) and `foldtext` only looks it up; single-step turns (`total < 2`) get no marker.
+
+**The “process” fold is a two-level structure**: “process” itself is a level 1 fold, while the reasoning blocks
+and each tool block inside it remain level 2 nested folds. So expanding the “process” fold leaves the inner
+thinking/tool content **still collapsed**, revealing them one by one on demand instead of dumping everything at
+once. Implementation-wise `fold.foldexpr` no longer hard-codes the process range to level 1: it first computes the
+default level of the line (indented block start `>1` / continuation `1` / other `0`) and then shifts everything down
+one level (`>2` / `2` / `1`), so role headers and body lines inside the process fold still belong to the level 1
+process fold while the inner blocks become level 2 folds.
+
+The role header is rendered **outside** the process fold (order: header → `🧩 过程` → expanded steps), so the
+“it is the AI's turn” cue stays visible even when the turn's first step is folded away.
  **Every line inside a fold block is single-line** (`_append_fold_block`
 splits content containing real newlines): streaming/invalid tool arguments may contain real newlines, and
 writing them as one line would make `nvim_buf_set_lines` error and half-write the buffer, splitting one
@@ -305,25 +338,45 @@ Main message area (top) + input split (bottom, height 3). After sending, focus r
 normal mode (you can scroll and browse during generation); the main body and the input box share the same set of chat
 context keymaps (`_build_chat_actions`). `input_box` renders the `> ` prefix with `virt_text` (it does not use
 `buftype=prompt`, to avoid conflicts with nvim-cmp), and enables completion for the `neoai_input` filetype.
-`attach_window` uses `'winfixbuf'` (Neovim 0.10+, `pcall` for older versions) to **lock the input window**: the input
-buffer is an unnamed `nofile` scratch buffer, and if `:e <file>` / `:bnext` etc. were allowed in the input window, that
-window would **reuse the input buffer** (`buftype` becomes empty, content replaced by the filename), after which input
-lands in the user's file and `:wq` saves the wrong thing.
+`attach_window` binds the input buffer into the input split window. The input buffer is a `nofile` scratch buffer
+(named `NeoAI Input`; with multiple instances the name is derived from the chat title, e.g. `NeoAI Input 2`/
+`NeoAI Input 3`, so session restore can identify/clean it and `:ls` is readable).
 
-To avoid surfacing the low-level `E1513` (Cannot switch buffer) to the user, `chat_view` additionally
-**generically intercepts any `:` command typed in the input window** at a higher layer via `CmdlineLeave`
-(`_on_input_cmdline_leave`): it aborts the original command and replays it as-is in the same window; only when the
-replay fails with E1513 (winfixbuf) does it fall back to running it in a **new tab page** (`tabnew`). Since the set of
-commands that can switch the input window's buffer cannot be enumerated (`:e`/`:bnext` plus `:terminal`/`:help` and
-countless plugin commands), a whitelist would inevitably leak, so the strategy is "execute as-is first, flip to a new tab
-only on E1513": the chat main window and input box stay unchanged, the user never sees E1513, and normal input (Enter to
-send), `:set`/`:w`/`:q` etc. are unaffected. `winfixbuf` remains the **low-level backstop**: paths that do not fire
-Cmdline events (plugins calling `nvim_win_set_buf` directly, `<Cmd>`, etc.) are still blocked by it.
+**Input buffer protection: allow + redirect (no more window locking)**. The historical implementation used
+`'winfixbuf'` (Neovim 0.10+) to hard-lock the input window, blocking `:e <file>` / `:bnext` etc. from **reusing the
+input buffer** (`buftype` becomes empty, content replaced by the filename), after which input would land in the user's
+file and `:wq` would save the wrong thing. The price was that **plugin paths** (bufferline's left-click `:buffer %d`,
+plugins calling `nvim_win_set_buf` directly, `<Cmd>` mappings, LSP goto / nvim-tree / telescope opening files, etc.)
+surfaced the low-level `E1513: Cannot switch buffer. 'winfixbuf' is enabled` straight to the user — those paths do
+not fire Cmdline events, so `CmdlineLeave` cannot catch them and they cannot be predicted upfront.
+
+The current design is **do not lock the window, let the switch happen, then redirect**: `chat_view` checks for
+"the input window now shows a non-input buffer" in `WinEnter`/`BufEnter` (`_check_input_hijack`) and hands it to
+`_redirect_input_hijack`:
+
+| Target buffer | Handling |
+| --- | --- |
+| This instance's chat buffer | Put the input buffer back and focus the main window (equivalent to returning to the chat UI) |
+| Another chat instance's buffer | Route to that instance (same as `:b <other instance buffer>` in the input box, see §4.0) |
+| A regular file buffer | Collapse the input box (window closed, content kept by `bufhidden=hide`) → the main window shows that buffer (equivalent to `:b` in the main window) → leave insert mode and focus the main window |
+| A special buffer (`buftype ≠ ""`: `:terminal`/`:help`/quickfix/nofile…) | Put the input buffer back in the input window and open the target buffer in a **new tab page** (keeping the "never take over the chat UI" semantics) |
+
+The redirect runs on the next tick via `vim.schedule` (closing/switching windows inside `WinEnter`/`BufEnter` trips
+E242 and similar state errors) and is guarded against re-entrancy by `_input_redirecting`. Because the window is
+redirected **before** the user can type again, input never lands in the user's file (regression N1 still holds); the
+input buffer keeps its content and is restored when returning to the chat (see §4.7).
+
+`CmdlineLeave` (`_on_input_cmdline_leave`) still **generically intercepts any `:` command typed in the input window**:
+it aborts the original command and replays it as-is in the same window (switch-type commands are immediately picked up
+by the redirect above); only when the replay still fails with E1513 (an external plugin/old config set `winfixbuf` on
+the input window) does it fall back to a **new tab page** (`tabnew`). No whitelist is used — the set of commands that
+can switch the input window's buffer cannot be enumerated (`:e`/`:bnext` plus `:terminal`/`:help` and countless plugin
+commands). The chat main window and input box stay unchanged, the user never sees E1513, and normal input (Enter to
+send), `:set`/`:w`/`:q` etc. are unaffected.
 
 > Key point: assigning `ev.abort`/`vim.v.event.abort` directly from a Lua callback does not work; only
 > `let v:event.abort = v:true` truly aborts. Note: `:sp`/`:vsp`/`:tabedit`/`:tabnew`/`:sbuffer`/`:sview` etc. open new
-> windows without touching this window's buffer, so `winfixbuf` lets them through and replaying them as-is succeeds
-> (no spurious tab).
+> windows without touching this window's buffer, so replaying them as-is succeeds (no spurious tab).
 
 The main chat window has an extra targeted protection: commands like `:terminal`/`:help` **take over the current
 window and may be closed together with it via `:q`**. If run directly in the main chat window, they reuse its buffer
@@ -360,7 +413,8 @@ that instance (see §4.0) — avoiding a view that shows chat content with no in
 
 `_restore_aux` now means **"ensure the input area exists"**: whenever the chat main window is valid and the input window
 is missing/invalid it is recreated, not only when `state.collapsed` is true. So even if the user closes the input window
-with `:q`/`<C-w>c` (which `winfixbuf` does not block, and `collapsed` is still false at that point), the input box is
+with `:q`/`<C-w>c` (closing the window is not restricted by the input buffer protection, and `collapsed` is still false
+at that point), the input box is
 automatically restored when returning to the chat rather than staying gone forever. `WinClosed` promptly clears the
 stale handle when the input window is closed; when the main chat window is closed by a non-NeoAI path (not `M.close`,
 e.g. `:q`/`:close` after a terminal/help takeover) it also cleans up the instance, so a vanished window does not leave
@@ -431,7 +485,7 @@ Following deepseek-harness's Cordis plugin model, the chat view's "display modes
 
 | Component | Responsibility |
 | --- | --- |
-| `input_box` | Chat input box. `create`/`attach_window`/`focus`/`submit`/`on_submitted`/`clear`; renders the `>` prefix with `virt_text`; enables completion for the `neoai_input` filetype; `attach_window` locks the window with `'winfixbuf'` (0.10+) as a low-level backstop against `:e`/`:bnext`/`:terminal` etc. reusing the input buffer (user-typed commands are generically intercepted by `chat_view`'s `CmdlineLeave`). |
+| `input_box` | Chat input box. `create`/`attach_window`/`focus`/`submit`/`on_submitted`/`clear`; renders the `>` prefix with `virt_text`; enables completion for the `neoai_input` filetype; the input window is **not** locked with `'winfixbuf'` (that surfaced `E1513` on plugin paths such as bufferline clicks); instead `chat_view`'s `WinEnter`/`BufEnter` guard `_redirect_input_hijack` redirects the target buffer to the main window (special buffers go to a new tab) and collapses the input box, so `:e`/`:bnext`/`:terminal` etc. cannot reuse the input buffer. |
 | `message_list` | Message list rendering. `render(buf, messages)`; `toggle_reasoning()`. |
 | `float_stream_window` | Reusable streaming floating window. `open(title,{filetype,max_height})`/`set_text`/`append`/`get_text`/`close`/`is_open`/`reset`; reasoning process / receiving arguments / plan distillation share the same window. The window **opens at screen-relative ratios** (width 0.70×columns, height 0.60×lines, top-anchored); its height adapts to the number of display lines (`nvim_win_text_height`), bounded by `max_height`, `smoothscroll` is enabled, and after writing it grows first then scrolls, with the cursor moved to the end of the content followed by `zb` to stick to the bottom. |
 | `reasoning_panel` | Reasoning process floating window (`float_stream_window` adapter, height capped at 5 lines). `open`/`show`/`append`/`close`/`is_open`; `filetype=neoai_reasoning`. |

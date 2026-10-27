@@ -332,7 +332,7 @@ require("NeoAI").setup({
     },
     chat = {
       fold = "reasoning_tools",          -- 折叠程度：none / reasoning_tools / process
-      process_keep_steps = 3,            -- process 模式每轮保留展开的最近中间步数
+      process_keep_steps = 3,            -- process 模式：本轮进行中保留展开的最近中间步数（轮次结束后全部收起）
     },
     trajectory = {
       log_dir = vim.fn.stdpath("cache") .. "/NeoAI/logs", -- 轨迹日志保存目录

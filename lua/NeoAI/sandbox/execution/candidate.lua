@@ -2735,7 +2735,11 @@ local function _classify_paths_async(paths, unmask)
   if not work.available() or #paths == 0 then return async.resolve(nil) end
   local runtime = require("NeoAI.sandbox.execution.runtime")
   local ctx = runtime.mask_context()
-  local cwd = fs.canonical(vim.fn.getcwd() or "")
+  -- 分级基准 = 工作区根（会话绑定工作目录优先，见 core/session/workspace_root.base_dir）：
+  -- 与 risk.path_level 同一口径，避免「在工程子目录里启动 nvim」时把父目录内的工程文件误判为
+  -- 用户目录写入（L1）。
+  local cwd_raw = require("NeoAI.core.session.workspace_root").base_dir() or vim.fn.getcwd() or ""
+  local cwd = fs.canonical(cwd_raw)
   local home = fs.canonical(vim.fn.expand("~"))
   return work.run_codec(_classify_paths_worker, {
     paths = paths,

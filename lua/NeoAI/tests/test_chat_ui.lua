@@ -667,6 +667,99 @@ tests.suite("chat_ui", function(_, it)
     chat_service.reset()
   end)
 
+  it("角色头只在角色切换时出现，用户消息右对齐 / AI 消息左对齐", function(t)
+    local message_list = require("NeoAI.ui.components.message_list")
+    local chat_view = require("NeoAI.ui.window.chat_view")
+    local chat_service = require("NeoAI.services.chat_service")
+    message_list.reset()
+    chat_view.reset()
+    chat_service.reset()
+
+    local opened = chat_view.open()
+    local agent = assert(chat_service.get_current_agent())
+    agent.state = "idle"
+    agent.messages = {
+      { role = "user", content = "帮我看下这个文件" },
+      -- 同一轮内多条 assistant（工具循环）：只在第一条前出现角色头
+      { role = "assistant", content = "我先读一下。", tool_calls = {
+        { id = "c1", ["function"] = { name = "read_file", arguments = "{}" } },
+      } },
+      { role = "tool", tool_call_id = "c1", content = "ok" },
+      { role = "assistant", content = "看完了，没问题。" },
+      { role = "user", content = "谢谢" },
+      { role = "assistant", content = "不客气" },
+    }
+    chat_view.refresh()
+    vim.api.nvim_set_current_win(opened.win_id)
+    local lines = vim.api.nvim_buf_get_lines(opened.buf, 0, -1, false)
+
+    -- 1) 角色头只出现在切换点：两条用户消息各 1 个，AI 一侧每轮各 1 个
+    local n_user, n_ai = 0, 0
+    for _, l in ipairs(lines) do
+      if l:find("👤 用户", 1, true) then n_user = n_user + 1 end
+      if l:find("🤖 AI", 1, true) then n_ai = n_ai + 1 end
+    end
+    t.eq(2, n_user, "两条用户消息应各有一个角色头（切换点）")
+    t.eq(2, n_ai, "同一轮的多个 assistant 消息只应有一个角色头")
+
+    -- 2) 用户消息右对齐、AI 消息左对齐
+    local tw = math.max(20, vim.api.nvim_win_get_width(opened.win_id) - 2)
+    local function line_of(needle)
+      for _, l in ipairs(lines) do
+        if l:find(needle, 1, true) then return l end
+      end
+      return nil
+    end
+    local user_line = assert(line_of("帮我看下这个文件"), "用户消息应渲染")
+    t.eq(tw, vim.fn.strdisplaywidth(user_line), "用户消息应右对齐到窗口可用宽度")
+    t.true_(user_line:match("^%s+") ~= nil, "用户消息左侧应有补白")
+    for _, needle in ipairs({ "我先读一下。", "看完了，没问题。", "不客气" }) do
+      local l = assert(line_of(needle), needle .. " 应渲染")
+      t.eq(needle, l, "AI 消息应左对齐（行首无补白）")
+    end
+    -- 3) 用户角色头本身也靠右（与用户消息右边缘对齐）
+    local user_header = assert(line_of("👤 用户"), "应渲染用户角色头")
+    t.eq(tw, vim.fn.strdisplaywidth(user_header), "用户角色头也应右对齐")
+
+    chat_view.reset()
+    chat_service.reset()
+  end)
+
+  it("用户消息右对齐不影响折叠：补白行不被 expr 折叠误判为折叠块", function(t)
+    local message_list = require("NeoAI.ui.components.message_list")
+    local chat_view = require("NeoAI.ui.window.chat_view")
+    local chat_service = require("NeoAI.services.chat_service")
+    local config_store = require("NeoAI.kernel.config_store")
+    message_list.reset()
+    chat_view.reset()
+    chat_service.reset()
+    config_store.load({ ui = { chat = { fold = "reasoning_tools" } } })
+
+    local opened = chat_view.open()
+    local agent = assert(chat_service.get_current_agent())
+    agent.state = "idle"
+    agent.messages = {
+      { role = "user", content = "第一行\n\n第二段" },
+      { role = "assistant", content = "收到" },
+    }
+    chat_view.refresh()
+    vim.api.nvim_set_current_win(opened.win_id)
+
+    local total = vim.api.nvim_buf_line_count(opened.buf)
+    for ln = 1, total do
+      local text = vim.api.nvim_buf_get_lines(opened.buf, ln - 1, ln, false)[1] or ""
+      if text:find("第一行", 1, true) or text:find("第二段", 1, true)
+        or text:find("👤 用户", 1, true) then
+        t.eq(0, vim.fn.foldlevel(ln), "补白后的用户消息行不应被折叠: " .. text)
+        t.eq(-1, vim.fn.foldclosed(ln), "补白后的用户消息行不应在折叠块内: " .. text)
+      end
+    end
+
+    config_store.load({ ui = { chat = { fold = "reasoning_tools" } } })
+    chat_view.reset()
+    chat_service.reset()
+  end)
+
   it("多行工具结果可渲染且不中断聊天窗口", function(t)
     local message_list = require("NeoAI.ui.components.message_list")
     local chat_view = require("NeoAI.ui.window.chat_view")
@@ -2827,7 +2920,7 @@ tests.suite("chat_ui", function(_, it)
     vim.wait(50, function() return false end)
     vim.api.nvim_buf_set_lines(ibuf, 0, -1, false, { "draft keep" })
 
-    -- 用户在输入框里按 :q / <C-w>c 关掉输入窗口（winfixbuf 不阻止关窗）
+    -- 用户在输入框里按 :q / <C-w>c 关掉输入窗口（关窗本身不需要 winfixbuf 参与）
     vim.api.nvim_set_current_win(iwin)
     vim.cmd("stopinsert")
     vim.cmd("q")
@@ -2855,7 +2948,7 @@ tests.suite("chat_ui", function(_, it)
     chat_service.reset()
   end)
 
-  it("输入框内 :e 文件不报 E1513，改为新标签页打开且聊天界面不变（回归 N1）", function(t)
+  it("输入框内 :e 文件不报 E1513：文件在主窗口打开、输入框收起、输入内容保留（回归 N1）", function(t)
     local chat_view = require("NeoAI.ui.window.chat_view")
     local chat_service = require("NeoAI.services.chat_service")
     local input_box = require("NeoAI.ui.components.input_box")
@@ -2866,12 +2959,14 @@ tests.suite("chat_ui", function(_, it)
     local ibuf = input_box.get_buf()
     local iwin = input_box.get_win()
     t.true_(iwin ~= nil and vim.api.nvim_win_is_valid(iwin), "打开后应创建输入窗口")
+    t.false_(vim.wo[iwin].winfixbuf, "输入窗口不应再用 winfixbuf 锁窗（那会把 E1513 抛给用户）")
 
     vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<Esc>", true, false, true), "x", false)
     vim.wait(50, function() return false end)
     vim.api.nvim_set_current_win(iwin)
     vim.cmd("stopinsert")
     vim.api.nvim_buf_set_lines(ibuf, 0, -1, false, { "用户输入" })
+    local tabs_before = vim.fn.tabpagenr("$")
 
     vim.cmd("messages clear")
     local tmp = vim.fn.tempname() .. "_n1.txt"
@@ -2883,16 +2978,100 @@ tests.suite("chat_ui", function(_, it)
     -- 1) 不再向用户抛 E1513
     local msgs = vim.api.nvim_exec2("messages", { output = true }).output or ""
     t.true_(msgs:find("1513") == nil, "输入框内 :e 不应报 E1513，实际消息: " .. msgs)
-    -- 2) 输入 buffer 未被复用（winfixbuf 低层兜底仍成立）
-    t.eq(ibuf, vim.api.nvim_win_get_buf(iwin), "输入窗口应仍显示输入 buffer")
+    -- 2) 文件在主窗口打开（等价于在主窗口 :e），不额外开标签页
+    local shown_name = vim.api.nvim_buf_get_name(vim.api.nvim_win_get_buf(opened.win_id))
+    t.eq(vim.fn.fnamemodify(tmp, ":t"), vim.fn.fnamemodify(shown_name, ":t"),
+      "主窗口应显示 :e 的文件")
+    t.eq(tabs_before, vim.fn.tabpagenr("$"), "不应新增标签页（改为在主窗口打开）")
+    -- 3) 输入 buffer 未被复用（内容与 nofile 属性不变），输入框已收起
     t.eq("nofile", vim.bo[ibuf].buftype, "输入 buffer 仍应为 nofile")
     t.eq("用户输入", vim.api.nvim_buf_get_lines(ibuf, 0, 1, false)[1], "输入内容不应被改写")
-    -- 3) 文件在新标签页打开，聊天界面的主窗口与输入框保持不变
-    t.eq(vim.fn.fnamemodify(tmp, ":t"), vim.fn.fnamemodify(vim.api.nvim_buf_get_name(0), ":t"),
-      "新标签页应显示 :e 的文件")
-    t.true_(chat_view.has_window(), "聊天窗口应仍然存在")
-    t.true_(vim.api.nvim_win_is_valid(opened.win_id), "聊天主窗口应仍然有效")
+    -- 4) 回到聊天 buffer：输入框恢复且内容仍在
+    vim.cmd("buffer " .. opened.buf)
+    vim.wait(300, function() return false end)
+    local iwin2 = input_box.get_win()
+    t.true_(iwin2 ~= nil and vim.api.nvim_win_is_valid(iwin2), "回到聊天界面应恢复输入框")
+    t.eq(ibuf, vim.api.nvim_win_get_buf(assert(iwin2)), "恢复的输入窗口应显示输入 buffer")
+    t.eq("用户输入", vim.api.nvim_buf_get_lines(ibuf, 0, 1, false)[1], "收起再恢复后输入内容应保留")
 
+    chat_view.reset()
+    chat_service.reset()
+  end)
+
+  it("输入框内点 bufferline 标签（:buffer N）不报 E1513：目标 buffer 在主窗口打开并收起输入框", function(t)
+    -- 复现回归：bufferline 的 left_mouse_command = "buffer %d" 在 vim.schedule 里执行
+    -- vim.cmd("buffer N")，作用于**当前窗口**（输入框）。旧实现用 winfixbuf 锁窗，会把
+    -- `E1513: Cannot switch buffer. 'winfixbuf' is enabled` 直接抛给用户。
+    local chat_view = require("NeoAI.ui.window.chat_view")
+    local chat_service = require("NeoAI.services.chat_service")
+    local input_box = require("NeoAI.ui.components.input_box")
+    chat_view.reset()
+    chat_service.reset()
+
+    local opened = chat_view.open()
+    local ibuf = input_box.get_buf()
+    local iwin = input_box.get_win()
+    vim.api.nvim_set_current_win(iwin)
+    vim.cmd("stopinsert")
+    vim.api.nvim_buf_set_lines(ibuf, 0, -1, false, { "写了一半的提问" })
+
+    -- 目标：一个已加载的普通文件 buffer（bufferline 里点它）
+    local tmp = vim.fn.tempname() .. "_bl.txt"
+    vim.fn.writefile({ "FILE" }, tmp)
+    local filebuf = vim.fn.bufadd(tmp)
+    vim.fn.bufload(filebuf)
+
+    vim.cmd("messages clear")
+    local ok, err = pcall(vim.cmd, "buffer " .. filebuf)
+    t.true_(ok, "输入框内 :buffer N 不应报错（旧实现抛 E1513），实际: " .. tostring(err))
+    vim.wait(300, function() return false end)
+
+    local msgs = vim.api.nvim_exec2("messages", { output = true }).output or ""
+    t.true_(msgs:find("1513") == nil, "不应出现 E1513，实际消息: " .. msgs)
+    t.eq(filebuf, vim.api.nvim_win_get_buf(opened.win_id), "目标 buffer 应在主窗口显示")
+    t.eq(opened.win_id, vim.api.nvim_get_current_win(), "焦点应落在主窗口（可直接阅读/编辑该文件）")
+    t.true_(not vim.api.nvim_win_is_valid(iwin), "输入框应已收起（关窗，不是留在输入窗口里显示文件）")
+    t.eq("写了一半的提问", vim.api.nvim_buf_get_lines(ibuf, 0, -1, false)[1], "输入内容应原样保留")
+    t.eq("nofile", vim.bo[ibuf].buftype, "输入 buffer 不应被复用为文件 buffer")
+    t.true_(vim.api.nvim_buf_is_valid(ibuf), "输入 buffer 应存活（bufhidden=hide）")
+
+    chat_view.reset()
+    chat_service.reset()
+  end)
+
+  it("输入窗口被切到特殊 buffer（nofile/terminal 类）时在新标签页打开，输入框恢复", function(t)
+    local chat_view = require("NeoAI.ui.window.chat_view")
+    local chat_service = require("NeoAI.services.chat_service")
+    local input_box = require("NeoAI.ui.components.input_box")
+    chat_view.reset()
+    chat_service.reset()
+
+    local opened = chat_view.open()
+    local ibuf = input_box.get_buf()
+    local iwin = input_box.get_win()
+    vim.api.nvim_set_current_win(iwin)
+    vim.cmd("stopinsert")
+    vim.api.nvim_buf_set_lines(ibuf, 0, -1, false, { "用户输入" })
+
+    local scratch = vim.api.nvim_create_buf(true, true)
+    vim.api.nvim_buf_set_name(scratch, "neoai-test-special-buf")
+    vim.bo[scratch].buftype = "nofile"
+    local tabs_before = vim.fn.tabpagenr("$")
+
+    vim.cmd("messages clear")
+    local ok, err = pcall(vim.cmd, "buffer " .. scratch)
+    t.true_(ok, "切换不应报错，实际: " .. tostring(err))
+    vim.wait(300, function() return false end)
+
+    -- 特殊 buffer 不接管聊天窗口：在新标签页打开，输入窗口放回输入 buffer
+    t.eq(tabs_before + 1, vim.fn.tabpagenr("$"), "特殊 buffer 应在新标签页打开")
+    t.eq(scratch, vim.api.nvim_get_current_buf(), "新标签页应显示目标 buffer")
+    t.true_(vim.api.nvim_win_is_valid(iwin), "输入窗口应仍有效")
+    t.eq(ibuf, vim.api.nvim_win_get_buf(iwin), "输入窗口应仍显示输入 buffer")
+    t.eq(opened.buf, vim.api.nvim_win_get_buf(opened.win_id), "聊天主窗口应仍显示聊天 buffer")
+    t.eq("用户输入", vim.api.nvim_buf_get_lines(ibuf, 0, 1, false)[1], "输入内容不应被改写")
+
+    pcall(vim.api.nvim_buf_delete, scratch, { force = true })
     chat_view.reset()
     chat_service.reset()
   end)
@@ -3233,7 +3412,7 @@ tests.suite("chat_ui", function(_, it)
     -- 1) 不再向用户抛 E1513（旧白名单只覆盖 :e/:bnext，:terminal 会漏网）
     local msgs = vim.api.nvim_exec2("messages", { output = true }).output or ""
     t.true_(msgs:find("1513") == nil, "输入框内 :terminal 不应报 E1513，实际消息: " .. msgs)
-    -- 2) 终端在新标签页打开（winfixbuf 锁住输入窗口 → 翻转到新标签页兜底）
+    -- 2) 终端在新标签页打开（输入窗口的重定向守卫把特殊 buffer 翻转到新标签页）
     t.eq(tabs_before + 1, vim.fn.tabpagenr("$"), "应在新标签页打开终端")
     -- 3) 输入 buffer 未被复用；聊天窗口仍在
     t.eq(ibuf, vim.api.nvim_win_get_buf(iwin), "输入窗口应仍显示输入 buffer")

@@ -168,6 +168,22 @@ Agent 完成/出错/取消后，仅当**当前窗口就是聊天主消息区、�
   代码块 `NeoAICode`（随 Normal 背景微差的自适应底色）、围栏 `NeoAICodeFence`、分隔线 `NeoAIHr`。
   表格样式（`tbl`）仍走斑马纹高亮命名空间，二者互不干扰。
 
+**角色头只在角色切换时出现**：`_blocks` 维护 `last_role`，仅当本条消息的角色与上一条**已渲染**消息不同时
+才插入角色头（`👤 用户` / `🤖 AI`）。因此 Agent 工具循环内同一轮的多条 assistant 消息（工具调用 → 结果 →
+再调用…）之间不再重复刷 `🤖 AI`。process 折叠程度下，即使本轮首个 Step 被收进「过程」折叠，角色头也会渲染
+在过程折叠**之外**（行序：角色头 → `🧩 过程` → 展开的步骤），保证「轮到 AI 说话」的提示不被折叠吞掉。
+
+**左右分栏对齐**：用户消息**右对齐**、AI 消息**左对齐**（聊天软件的「气泡」观感）。纯文本 buffer 只能用
+行首补白实现，规则是：
+
+- 正文整块**统一补白**（按块内最长行算补白量），而非逐行补白——代码块 / 列表的内部缩进与相对对齐得以
+  完整保留，只有整块整体右移；
+- 角色头单独补白到同一条右边缘（`表格可用宽度 = 窗口宽 - 2`，右侧留 2 列余量）；
+- 正文超过可用宽度（长段落 / 超宽表格）时**整体不补白**（含角色头），避免「角色头在最右、正文在最左」；
+- 补白后同步平移行内高亮的字节偏移（`md_span` / `ansi` / `secret_spans`），否则高亮错位；
+- 补白会让行首出现空格，故角色头与正文行一律登记为「正文行」（`body = true`），`foldexpr` 直接返回 `0`——
+  否则缩进行会被 expr 折叠误判成折叠块。轮次分割线不在补白范围内，保持满宽。
+
 ### 4.4 折叠
 
 主窗口用 `expr` 折叠（`components.fold.foldexpr`），推理 / 每个工具调用块（调用+结果）各自独立成折叠。
@@ -175,7 +191,24 @@ Agent 完成/出错/取消后，仅当**当前窗口就是聊天主消息区、�
 **折叠程度（`ui.chat.fold`）**：
 - `none`：关闭主窗口 `foldenable`，推理/工具/步骤内容全部展开；
 - `reasoning_tools`（默认）：上述现状；
-- `process`：保留现状，同时把每个 user 轮中**较早的 AI 中间步骤**收进一个「过程」折叠（最近 `ui.chat.process_keep_steps` 个中间步与最终回答保持展开）。过程折叠文本汇总折叠范围内的轮次、工具成功/失败数、输入/输出 token 与缓存命中率；展开后显示这些步骤的完整内容。
+- `process`：保留现状，同时把每轮的 **AI 中间步骤**收进一个「过程」折叠。折叠范围按轮次状态区分：
+  **本轮进行中**（agent 仍在 `generating`/`tool_running`）保留最近 `ui.chat.process_keep_steps` 步展开，
+  方便实时观察当前调用；**本轮一结束**（回到 `idle`）最近这几步也随之收起，只留最终步骤展开——
+  避免历史轮次长期摊开 3 步调用。过程折叠文本首段直接标明被折叠的 **Step 范围**
+  （`🧩 过程 · Step 1-18 · 工具 5✓ · ↑12.0k ↓1.2k · 缓存 62%`），其后汇总轮次内工具成功/失败数、
+  输入/输出 token 与缓存命中率。**Step 标记挂在折叠文本上，不占行**：每个「思考过程」与「工具调用」
+  折叠的折叠文本末尾带 `· Step N`（如 `🤔 思考过程 1 行 · Step 18`、`🔧 grep · 搜索 ✅ 0.3s · Step 18`），
+  角色头只在角色切换时出现且最终为纯 `🤖 AI`（不带 Step），被折叠的 Step 也不再各自渲染一行角色头。
+  标记由渲染层登记折叠首行（`fold.set_step_labels`），`foldtext` 只查表；单步轮次（`total < 2`）不加标记。
+
+**「过程」折叠是二级结构**：「过程」本身是 level 1 折叠，其内部的推理块与每个工具块仍各自是
+level 2 嵌套折叠。因此展开「过程」折叠后，内部思考/工具内容**仍各自收起**，可逐个按需展开，
+而不是一展开就全部摊开。实现上 `fold.foldexpr` 不再把过程范围内的行硬编码为 level 1：它先按默认
+规则算出该行等级（缩进块起始 `>1` / 延续 `1` / 其他 `0`），再整体下沉一级（`>2` / `2` / `1`），
+使过程折叠内的角色头与正文行仍归属于 level 1 过程折叠、而内部块成为 level 2 折叠。
+
+角色头渲染在「过程」折叠**之外**（行序：角色头 → `🧩 过程` → 展开的步骤）：即使本轮首个 Step 被折叠收走，
+「轮到 AI 说话」的提示依然可见。
 
 折叠块内**每行必为单行**（`_append_fold_block` 会把含真实换行的内容按行拆开）：流式未完成/非法的
 工具参数可能含真实换行，若原样作为一行写入，`nvim_buf_set_lines` 会报错并使 buffer 半写、把一个
@@ -257,24 +290,40 @@ Agent 完成/出错/取消后，仅当**当前窗口就是聊天主消息区、�
 主消息区（上）+ 输入 split（下，高度 3）。发送后切回主窗口并进入普通模式（生成期间可滚动浏览）；
 主体与输入框共用一套 chat 上下文键位（`_build_chat_actions`）。`input_box` 用 `virt_text` 渲染 `> `
 前缀（不用 `buftype=prompt`，避免与 nvim-cmp 冲突），并放开 `neoai_input` filetype 的补全。
-`attach_window` 会用 `'winfixbuf'`（Neovim 0.10+，`pcall` 兼容旧版）**锁定输入窗口**：输入 buffer 是
-`nofile` 暂存 buffer（命名为 `NeoAI Input`；多实例按聊天名派生唯一名 `NeoAI Input 2`/`NeoAI Input 3`…，
-便于会话恢复识别/清理与 `:ls` 辨识），若允许在输入窗口执行
-`:e <file>` / `:bnext` 等，该窗口会**复用输入 buffer**
-（`buftype` 变空、内容被文件名替换），此后输入落进用户文件、`:wq` 误保存。
+`attach_window` 负责把输入 buffer 绑进输入 split 窗口。输入 buffer 是 `nofile` 暂存 buffer（命名为
+`NeoAI Input`；多实例按聊天名派生唯一名 `NeoAI Input 2`/`NeoAI Input 3`…，便于会话恢复识别/清理与
+`:ls` 辨识）。
 
-为避免把底层的 `E1513`（Cannot switch buffer）直接抛给用户，`chat_view` 另在高层用 `CmdlineLeave`
-（`_on_input_cmdline_leave`）**通用拦截输入窗口内的任意 `:` 命令行**：中止原命令后在当前窗口原样
-重放；仅当重放因 `winfixbuf` 报 E1513 时，才改用**新标签页**（`tabnew`）执行。因为无法穷举会切换到
-输入窗口 buffer 的命令（`:e`/`:bnext` 之外还有 `:terminal`/`:help` 及各类插件命令），白名单必然漏网，
-所以改用「先原样执行、仅对 E1513 翻转到新标签页」的通用策略：聊天主窗口与输入框保持不变，
-用户拿不到 E1513，且普通输入（回车发送）、`:set`/`:w`/`:q` 等一概不受影响。`winfixbuf` 仍是
-**低层兜底**：未触发 Cmdline 事件的路径（插件直接 `nvim_win_set_buf`、`<Cmd>` 等）仍被它拦下，
-保输入 buffer 不被复用。（顺序：临时关 `winfixbuf` → `set_buf` → 重开。）
+**输入 buffer 保护：放行 + 重定向（不再锁窗）**。历史实现用 `'winfixbuf'`（Neovim 0.10+）硬锁输入窗口，
+拦住 `:e <file>` / `:bnext` 等会复用输入窗口 buffer 的切换（否则该窗口的 `buftype` 变空、内容被文件名
+替换，此后输入落进用户文件、`:wq` 误保存）。代价是**插件路径**（bufferline 左键标签的 `:buffer %d`、插件
+直接 `nvim_win_set_buf`、`<Cmd>` 映射、LSP goto / nvim-tree / telescope 打开文件等）会把底层的
+`E1513: Cannot switch buffer. 'winfixbuf' is enabled` 直接抛给用户——这类路径不经过 Cmdline 事件，
+`CmdlineLeave` 拦不住，也无从提前判定。
+
+现改为**不锁窗、放行切换、随即重定向**：`chat_view` 在 `WinEnter`/`BufEnter` 处用 `_check_input_hijack`
+检测「输入窗口显示了非输入 buffer」，交给 `_redirect_input_hijack` 处理：
+
+| 目标 buffer | 处理 |
+| --- | --- |
+| 本实例聊天 buffer | 输入窗口放回输入 buffer，聚焦主窗口（等价于回到聊天界面） |
+| 其它聊天实例的 buffer | 路由到该实例（与输入框内 `:b <别的实例 buffer>` 一致，见 §4.0） |
+| 普通文件 buffer | 收起输入框（关窗，`bufhidden=hide` 保留内容）→ 主窗口显示该 buffer（等价于在主窗口 `:b`）→ 退出插入模式并聚焦主窗口 |
+| 特殊 buffer（`buftype ≠ ""`：`:terminal`/`:help`/quickfix/nofile…） | 输入窗口放回输入 buffer，目标 buffer 改在**新标签页**打开（沿用「不接管聊天界面」语义） |
+
+重定向在 `vim.schedule` 的下一拍执行（在 `WinEnter`/`BufEnter` 内直接关窗/切窗会撞上 E242 等状态问题），
+并带 `_input_redirecting` 重入守卫。因为窗口在用户继续敲键盘**之前**已被重定向，输入绝不会落进用户文件
+（回归 N1 仍成立）；输入 buffer 内容原样保留，回到聊天界面时自动恢复（见 §4.7）。
+
+`CmdlineLeave`（`_on_input_cmdline_leave`）仍**通用拦截输入窗口内的任意 `:` 命令行**：中止原命令后在
+当前窗口原样重放（切换类命令重放后立即被上面的重定向接走）；仅当重放仍报 E1513（外部插件/旧配置给
+输入窗口设了 `winfixbuf`）时才退回**新标签页**（`tabnew`）执行。仍不做白名单——因为无法穷举会切换到
+输入窗口 buffer 的命令（`:e`/`:bnext` 之外还有 `:terminal`/`:help` 及各类插件命令）。聊天主窗口与输入框
+保持不变，用户拿不到 E1513，且普通输入（回车发送）、`:set`/`:w`/`:q` 等一概不受影响。
 
 > 关键技术点：Lua 回调里直接给 `ev.abort`/`vim.v.event.abort` 赋值无效，必须 `let v:event.abort = v:true`。
 > 注：`:sp`/`:vsp`/`:tabedit`/`:tabnew`/`:sbuffer`/`:sview` 等会新开窗口、不碰本窗口 buffer，
-> `winfixbuf` 本就放行，原样重放即成功，不会误开标签。
+> 原样重放即成功，不会误开标签。
 
 主聊天窗口另有一层针对性保护：`:terminal`/`:help` 这类**会接管当前窗口、并可能随其 `:q` 一并关闭**
 的命令，若直接作用于聊天主窗口，会复用其 buffer（聊天 buffer 被隐藏），随后关窗时把整个聊天界面
@@ -302,11 +351,12 @@ Agent 完成/出错/取消后，仅当**当前窗口就是聊天主消息区、�
 焦点离开（或主窗口被 `:bnext` 切到别的文件）时收起输入框（`_collapse_aux`），回到聊天时恢复
 （`_restore_aux`，输入 buffer 内容保留）。**特例**：主窗口被切到的 buffer 若属于**另一聊天实例**
 （聊天主 buffer 或其输入 buffer），不收起了事，而是路由到那个实例（见 §4.0）——避免出现「显示着
-聊天内容却没有输入框」的残缺界面。
+聊天内容却没有输入框」的残缺界面。输入窗口被外部切到别的 buffer 时同样先重定向（见 §4.6），
+重定向到普通文件的那条路径正是「收起输入框 + 主窗口显示文件」。
 
 `_restore_aux` 为**「确保输入区存在」**语义：只要聊天主窗口有效且输入窗口缺失/失效就重建，不再只在
-`state.collapsed` 为真时才建。这样即使用户在输入框里 `:q`/`<C-w>c` 把输入窗口关掉（`winfixbuf` 并不阻止关窗，
-且此时 `collapsed` 仍为 false），回到聊天界面时输入框也会自动补回，不会永久消失。
+`state.collapsed` 为真时才建。这样即使用户在输入框里 `:q`/`<C-w>c` 把输入窗口关掉（关窗本身不受
+输入 buffer 保护限制，且此时 `collapsed` 仍为 false），回到聊天界面时输入框也会自动补回，不会永久消失。
 `WinClosed` 负责在输入窗口被关掉时及时清除失效句柄；主聊天窗口被 NeoAI 以外的路径关闭（非 `M.close`，
 如终端/帮助接管后 `:q`、`:close`）时，也由 `WinClosed` 清理本实例，避免窗口已消失而实例与焦点自动命令
 仍响应全局事件空转（表现为卡顿、输入框无法恢复）。创建时用重入守卫 `_input_creating` 防止 `:split`
@@ -373,7 +423,7 @@ NeoAI 的聊天/输入框/悬浮窗等都是纯 UI 文本，若 LSP 客户端（
 
 | 组件 | 职责 |
 | --- | --- |
-| `input_box` | 聊天输入框。`create`/`attach_window`/`focus`/`submit`/`on_submitted`/`clear`；`virt_text` 渲染 `>` 前缀；放开 `neoai_input` 文件类型补全；`attach_window` 用 `'winfixbuf'`（0.10+）锁窗，作为低层兜底防止 `:e`/`:bnext`/`:terminal` 等复用输入 buffer（用户级通用拦截见 `chat_view` 的 `CmdlineLeave`）。 |
+| `input_box` | 聊天输入框。`create`/`attach_window`/`focus`/`submit`/`on_submitted`/`clear`；`virt_text` 渲染 `>` 前缀；放开 `neoai_input` 文件类型补全；输入窗口**不**用 `'winfixbuf'` 锁窗（那会把 `E1513` 抛给 bufferline 点击等插件路径），改由 `chat_view` 的 `WinEnter`/`BufEnter` 守卫 `_redirect_input_hijack` 把目标 buffer 重定向到主窗口（特殊 buffer 走新标签页）并收起输入框，防止 `:e`/`:bnext`/`:terminal` 等复用输入 buffer。 |
 | `message_list` | 消息列表渲染。`render(buf, messages)`；`toggle_reasoning()`。 |
 | `float_stream_window` | 复用流式悬浮窗。`open(title,{filetype,max_height})`/`set_text`/`append`/`get_text`/`close`/`is_open`/`reset`；思考过程 / 接收参数 / 计划蒸馏共享同一窗口（上下文压缩为后台异步、不弹窗，不再使用）。窗口**按屏幕比例**（宽 0.70×列数、高 0.60×行数、顶部对齐）开窗，高度上限按显示行数（`nvim_win_text_height`）自适应，受 `max_height` 限制，开启 `smoothscroll`，写入后先增高再滚、光标移到内容末尾后 `zb` 贴底。 |
 | `reasoning_panel` | 思考过程悬浮窗（`float_stream_window` 适配器，高度上限 5 行）。`open`/`show`/`append`/`close`/`is_open`；`filetype=neoai_reasoning`。 |

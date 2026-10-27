@@ -161,6 +161,43 @@ function M.get_process_header(buf, line)
   return h and h[line] or nil
 end
 
+-- ========== Step 标记（process 折叠程度） ==========
+-- process 模式下每个 assistant Step 的「思考过程 / 工具调用」折叠文本会带上 `· Step N`，
+-- 让人一眼看出该折叠属于本轮第几步（轮次汇总信息在「过程」折叠首行）。
+-- 标记由渲染层（message_list）按折叠首行登记，foldtext 只查表，避免在折叠求值热路径里
+-- 重复遍历消息。以 buffer 为单位保存（弱键），随每次渲染全量重建。
+local step_labels = setmetatable({}, { __mode = "k" })
+
+--- 登记某 buffer 的行级 Step 标记。
+--- @param buf number
+--- @param map table<number, string> 行号 -> Step 标记文本（如 "Step 18"）
+function M.set_step_labels(buf, map)
+  if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
+  step_labels[buf] = map or {}
+end
+
+--- 清除某 buffer 的 Step 标记。
+--- @param buf number
+function M.clear_step_labels(buf)
+  step_labels[buf] = nil
+end
+
+--- 取某行的 Step 标记文本（如 "Step 18"）。
+--- @param buf number
+--- @param line number
+--- @return string|nil
+function M.get_step_label(buf, line)
+  local m = step_labels[buf]
+  return m and m[line] or nil
+end
+
+--- 某 buffer 是否登记了 Step 标记（测试/诊断用）。
+--- @param buf number
+--- @return boolean
+function M.has_step_labels(buf)
+  return step_labels[buf] ~= nil
+end
+
 local function _now_ms()
   return vim.uv.hrtime() / 1e6
 end
@@ -344,13 +381,17 @@ end
 --- 生成折叠占位文本（纯函数，供 foldtext 与测试使用）
 --- 工具折叠格式：工具 emoji + 工具名称 + 目的 + 状态 emoji + 耗时
 --- （🔧 name · 目的 ✅ 1.2s）。推理折叠沿用思考过程摘要。
+--- process 模式下思考过程 / 工具调用折叠文本末尾追加 ` · Step N`（`step_txt`），
+--- 让每个折叠自述所属的 assistant 步骤（子 Agent 折叠不带，Step 范围由过程折叠文本汇总）。
 --- 密钥警告不在此展示（由 message_list 在折叠块外单独一行高亮）。
 --- @param first string 折叠首行
 --- @param count number 折叠行数
 --- @param is_reasoning boolean|nil 是否为已登记的推理块（默认 true，保持旧语义）
+--- @param step_txt string|nil Step 标记（如 "Step 3"），仅添加到思考过程/工具调用折叠
 --- @return string
-function M.label(first, count, is_reasoning)
+function M.label(first, count, is_reasoning, step_txt)
   local kind, status, name, desc = M.detect(first)
+  local suffix = (type(step_txt) == "string" and step_txt ~= "") and (" · " .. step_txt) or ""
   if kind == "sub_agent" then
     local status_emoji = STATUS_EMOJI[status] or "🤖"
     local time_str = _extract_time(first)
@@ -364,14 +405,14 @@ function M.label(first, count, is_reasoning)
     local desc_str = desc and (desc ~= "") and (" · " .. desc) or ""
     local time_str = _extract_time(first)
     if time_str then
-      return string.format("  🔧 %s%s %s %s", name, desc_str, status_emoji, time_str)
+      return string.format("  🔧 %s%s %s %s%s", name, desc_str, status_emoji, time_str, suffix)
     end
-    return string.format("  🔧 %s%s %s", name, desc_str, status_emoji)
+    return string.format("  🔧 %s%s %s%s", name, desc_str, status_emoji, suffix)
   end
   if is_reasoning == false then
     return M.generic_label(first, count)
   end
-  return string.format("  🤔 思考过程 %d 行", count)
+  return string.format("  🤔 思考过程 %d 行%s", count, suffix)
 end
 
 --- 未识别折叠的中性占位文本（不冒充思考过程）：优先显示首行预览，否则显示行数
@@ -406,13 +447,15 @@ function M.foldtext()
   local buf0 = vim.api.nvim_get_current_buf()
   local proc_label = M.get_process_header(buf0, start)
   if proc_label then return proc_label end
+  -- process 模式的 Step 标记（`· Step N`）：只加在思考过程 / 工具调用折叠上。
+  local step_txt = M.get_step_label(buf0, start)
   local first = vim.fn.getline(start) or ""
   local kind = M.detect(first)
   if kind == "tool_call" or kind == "tool_result" or kind == "sub_agent" then
-    return M.label(first, count, true)
+    return M.label(first, count, true, step_txt)
   end
   local buf = vim.api.nvim_get_current_buf()
-  return M.label(first, count, M.is_reasoning_start(buf, start))
+  return M.label(first, count, M.is_reasoning_start(buf, start), step_txt)
 end
 
 -- ========== expr 折叠 ==========
@@ -433,29 +476,14 @@ local function _is_tool_block_start(text)
   return false
 end
 
---- 逐行计算折叠等级（foldmethod=expr 的 foldexpr 回调）。
---- 默认块折叠：推理、每个工具块（调用+结果）各自独立成折叠，且块与块之间不需要任何分隔行：
---- - 缩进 2 格的连续行构成一个折叠块；
---- - 每个工具块首行（含 ⏳/✅/❌ 状态 emoji + 调用工具:/工具:）通过返回 ">1"
----   强制结束上一个折叠并开启新折叠，从而在同一缩进级别下也能把相邻工具块拆成独立折叠；
---- - 空白行如果紧邻缩进内容则并入该折叠（推理/工具结果内的空行不会中断折叠）。
---- 有显示模式覆盖时委托给当前插件的 foldexpr。
---- @return string|number
-function M.foldexpr()
-  if foldexpr_override then
-    return foldexpr_override()
-  end
-  local ln = vim.v.lnum
-  local buf = vim.api.nvim_get_current_buf()
-  local proc = process_levels[buf]
-  if proc then
-    local v = proc[ln]
-    if v ~= nil then return v end
-  end
-  local text = vim.fn.getline(ln)
-  local prev = vim.fn.getline(ln - 1)
-  local next = vim.fn.getline(ln + 1)
-
+--- 默认块折叠的逐行等级（不含「过程」折叠的叠加）。
+--- @param buf number
+--- @param ln number
+--- @param text string
+--- @param prev string
+--- @param next_ string
+--- @return string 折叠等级（"0" / "1" / ">1"）
+local function _base_level(buf, ln, text, prev, next_)
   -- 已登记的正文行（含带缩进的代码块 / 嵌套列表）不折叠：其行首缩进是排版而非折叠块。
   if M.is_body_line(buf, ln) then
     return "0"
@@ -481,7 +509,7 @@ function M.foldexpr()
     if M.is_body_line(buf, ln - 1) or M.is_body_line(buf, ln + 1) then
       return "0"
     end
-    if prev:match("^  ") or next:match("^  ") then
+    if prev:match("^  ") or next_:match("^  ") then
       return "1"
     end
     return "0"
@@ -489,6 +517,54 @@ function M.foldexpr()
 
   -- 非缩进内容（角色头 / 正文 / 分割线）
   return "0"
+end
+
+--- 把默认等级整体下沉一级（用于「过程」折叠内部，形成**二级折叠**）：
+--- 过程折叠内的行至少要属于 level 1，而其中的推理/工具块则成为 level 2 的**嵌套折叠**，
+--- 于是展开过程折叠后，内部的每个思考/工具块仍各自保持收起，而不是一展开就全部摊开。
+--- @param base string 默认等级
+--- @return string
+local function _nest_level(base)
+  if base == ">1" then return ">2" end
+  if base == "1" then return "2" end
+  -- "0"：该行本身不折叠，但仍属于过程折叠（level 1），否则展开过程折叠后角色头/正文行会
+  -- 漏到折叠外（表现为折叠只包住缩进内容）。
+  return "1"
+end
+
+--- 逐行计算折叠等级（foldmethod=expr 的 foldexpr 回调）。
+--- 默认块折叠：推理、每个工具块（调用+结果）各自独立成折叠，且块与块之间不需要任何分隔行：
+--- - 缩进 2 格的连续行构成一个折叠块；
+--- - 每个工具块首行（含 ⏳/✅/❌ 状态 emoji + 调用工具:/工具:）通过返回 ">1"
+---   强制结束上一个折叠并开启新折叠，从而在同一缩进级别下也能把相邻工具块拆成独立折叠；
+--- - 空白行如果紧邻缩进内容则并入该折叠（推理/工具结果内的空行不会中断折叠）。
+--- process 折叠程度下额外一层「过程」折叠（level 1）：其首行返回 ">1"，范围内其它行按默认规则
+--- 判定后**整体下沉一级**，使内部推理/工具块成为 level 2 嵌套折叠。
+--- 有显示模式覆盖时委托给当前插件的 foldexpr。
+--- @return string|number
+function M.foldexpr()
+  if foldexpr_override then
+    return foldexpr_override()
+  end
+  local ln = vim.v.lnum
+  local buf = vim.api.nvim_get_current_buf()
+  local text = vim.fn.getline(ln)
+  local prev = vim.fn.getline(ln - 1)
+  local next_line = vim.fn.getline(ln + 1)
+  local base = nil
+  -- 行级等级由渲染层预计算后登记（见 message_list 的 _sync_fold_kinds），foldexpr 只查表：
+  --   ">1" = 过程折叠首行；
+  --   1    = 处于过程折叠**范围内**的行（按默认规则判定后下沉一级，形成二级嵌套折叠）。
+  local proc = process_levels[buf]
+  if proc then
+    local v = proc[ln]
+    if v == ">1" then return ">1" end
+    if v then
+      base = base or _base_level(buf, ln, text, prev, next_line)
+      return _nest_level(base)
+    end
+  end
+  return base or _base_level(buf, ln, text, prev, next_line)
 end
 
 return M

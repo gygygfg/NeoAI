@@ -1360,9 +1360,102 @@ local function _restore_aux()
   end)
 end
 
+-- 输入窗口「被外部切到别的 buffer」的重定向守卫状态（防递归）。
+local _input_redirecting = false
+
+--- 输入窗口被外部切到别的 buffer 时，把目标 buffer 交给主聊天窗口（等价于在主窗口 :b）并收起输入框。
+--- 触发来源：bufferline 左键标签的 `:buffer %d`、插件直接 nvim_win_set_buf、`<Cmd>` 映射、
+--- 子进程插件跳转（LSP goto / nvim-tree / telescope 打开文件）等——这些路径都不经过 Cmdline 事件，
+--- 无法用 _on_input_cmdline_leave 提前拦截；而 input_box 也不再靠 'winfixbuf' 硬锁（那会把
+--- `E1513: Cannot switch buffer. 'winfixbuf' is enabled` 抛给用户）。
+--- 因此统一在 WinEnter/BufEnter 处兜住：切换照常发生，随即把目标 buffer 搬到主窗口。
+--- 目标 buffer 分四类：
+---   1. 本实例聊天 buffer：等价于「回到聊天界面」——输入窗口放回输入 buffer，聚焦主窗口；
+---   2. 其它聊天实例的 buffer：路由到该实例（与输入框内 `:b <别的实例 buffer>` 语义一致）；
+---   3. 普通文件 buffer：收起输入框 → 主窗口显示该 buffer（等价于在主窗口 :b）；
+---   4. 特殊 buffer（terminal/help/quickfix/nofile 等 buftype ≠ ""）：输入窗口放回输入
+---      buffer，目标 buffer 改在新标签页打开（沿用 :terminal/:help 不接管聊天界面的既有语义）。
+--- 输入 buffer 是无名 nofile 暂存 buffer（bufhidden=hide），收起后内容原样保留，回到聊天时恢复；
+--- 因为窗口在用户继续敲键盘前已被重定向，输入绝不会落进用户文件（回归 N1 仍成立）。
+--- @param buf number 输入窗口当前显示的（非输入 buffer）目标 buffer
+local function _redirect_input_hijack(buf)
+  if _input_redirecting then return end
+  if not buf or not vim.api.nvim_buf_is_valid(buf) then return end
+  _input_redirecting = true
+  -- 下一拍执行：WinEnter/BufEnter 内直接关窗/切窗容易撞上 E242（不能在关窗时切窗口），
+  -- 且必须让本拍先返回，自动命令链才不会在切换过程中被自己的重定向打断。
+  vim.schedule(function()
+    local ok, err = pcall(function()
+      if not M.has_window() then return end
+      local main_win = state.win_id
+      local iwin = state.input_win_id
+      local ib = input_box.get_buf()
+      if not (main_win and vim.api.nvim_win_is_valid(main_win)) then return end
+      if not (iwin and vim.api.nvim_win_is_valid(iwin)) then return end
+      if not (ib and vim.api.nvim_buf_is_valid(ib)) then return end
+      -- 把输入 buffer 放回输入窗口（覆盖前要校验，避免实例已关闭）
+      local function restore()
+        if vim.api.nvim_win_is_valid(iwin) then pcall(vim.api.nvim_win_set_buf, iwin, ib) end
+      end
+      if buf == state.buf then
+        -- 1) 目标是本实例聊天 buffer：等价于「回到聊天界面」
+        restore()
+        -- 用户可能正在输入框插入模式里点的标签：回到聊天 buffer 后继续敲键盘会写进聊天内容，先退出插入模式。
+        pcall(vim.cmd, "stopinsert")
+        pcall(vim.api.nvim_set_current_win, main_win)
+        return
+      end
+      local target = _inst_by_buf and _inst_by_buf(buf) or nil
+      if target and target ~= M then
+        -- 2) 目标是别的聊天实例：路由过去（_route_to_inst 内部会把本实例主窗口回退到自己的
+        --    聊天 buffer，并聚焦目标实例）。输入窗口先放回输入 buffer，避免残留显示目标 buffer。
+        restore()
+        _route_to_inst(target, M)
+        return
+      end
+      if vim.bo[buf].buftype == "" then
+        -- 3) 普通文件：先收起输入框（关掉输入窗口；输入 buffer 因 bufhidden=hide 保留内容），
+        --    再让主窗口显示目标 buffer，最后把焦点给主窗口。
+        _collapse_aux()
+        if pcall(vim.api.nvim_win_set_buf, main_win, buf) then
+          -- 用户可能正处在输入框的插入模式里点的标签：切到文件后继续敲键盘会误写文件，先退出插入模式。
+          pcall(vim.cmd, "stopinsert")
+        end
+        pcall(vim.api.nvim_set_current_win, main_win)
+        return
+      end
+      -- 4) 特殊 buffer（terminal/help/quickfix/nofile…）：输入窗口恢复输入 buffer，改在新标签页打开。
+      restore()
+      if pcall(vim.cmd, "tabnew") then
+        pcall(vim.api.nvim_win_set_buf, 0, buf)
+      end
+    end)
+    _input_redirecting = false
+    if not ok then
+      local msg = tostring(err)
+      vim.notify(msg:match("E%d+:[^\n]*") or msg, vim.log.levels.ERROR)
+    end
+  end)
+end
+
+--- 检测「输入窗口被外部切到了别的 buffer」，是则转入重定向流程。
+--- @return boolean 是否已接管（调用方应直接 return，不再走既有收起/恢复判定）
+local function _check_input_hijack()
+  if _input_redirecting then return false end
+  local iwin = state.input_win_id
+  if not iwin or not vim.api.nvim_win_is_valid(iwin) then return false end
+  local ib = input_box.get_buf()
+  if not ib or not vim.api.nvim_buf_is_valid(ib) then return false end
+  local ok, shown = pcall(vim.api.nvim_win_get_buf, iwin)
+  if not ok or shown == ib then return false end
+  _redirect_input_hijack(shown)
+  return true
+end
+
 --- WinEnter：焦点进入某窗口时同步收起/恢复并按焦点调整输入框高度（in insert 与否无关）。
 local function _on_win_enter()
   if not M.has_window() then return end
+  if _check_input_hijack() then return end
   local cur_win = vim.api.nvim_get_current_win()
   if _is_chat_affiliated(cur_win) then
     if _note_focus then _note_focus(inst_id) end
@@ -1389,17 +1482,21 @@ end
 
 --- 输入框窗口内的任何命令都可能复用输入窗口的 nofile 暂存 buffer（buftype 变空、内容被文件名替换），
 --- 既而输入落进用户文件 / :wq 误保存；除了 :e/:bnext，还有 :terminal / :help / 各类插件命令等，
---- 无法穷举。input_box 的 'winfixbuf' 会在低层阻止这种切换，但会向用户抛 E1513。
---- 因此这里不做命令白名单，而是**通用拦截所有 `:` 命令行**：中止原命令 → 在当前窗口原样重放；
---- 仅当重放因 winfixbuf 报 E1513 时，才改用**新标签页**执行（:terminal/:help 这类会接管当前窗口的
---- 命令也能正确在新标签页打开）。普通输入（回车发送）、:set/:w/:q 等一概不受影响。
+--- 无法穷举。如今不再用 'winfixbuf' 硬锁输入窗口（那会把
+--- `E1513: Cannot switch buffer` 抛给用户），改由 WinEnter/BufEnter 的 _redirect_input_hijack
+--- 兜住「输入窗口被切到别的 buffer」：切换照常发生，随即把目标 buffer 搬到主窗口并收起输入框。
+--- 这里仍然**通用拦截所有 `:` 命令行**（中止原命令 → 在当前窗口原样重放），原因有二：
+---   1) 只在输入窗口内生效的命令（:set/:w/:q 等）语义不变；
+---   2) 切换类命令重放后立即由 BufEnter 重定向（文件出现在主窗口），不会留在输入窗口里。
+--- 仅当重放仍报 E1513（外部插件/旧配置给输入窗口设了 winfixbuf）时，才退回**新标签页**执行。
+--- 普通输入（回车发送）、:set/:w/:q 等一概不受影响。
 --- 主聊天窗口同理：:terminal/:help 会接管主窗口，其关闭会连带把聊天窗口关掉（输入框消失），
 --- 故只对这类「接管命令」在新标签页打开；:e/:bnext 等缓冲区切换仍作用于主窗口（由 _on_buf_enter
 --- 收起/恢复输入框），不受影响。
 --- 关键：Lua 回调里 ev.abort / vim.v.event.abort 均无效（实测命令仍执行），
 --- 必须用 vim.cmd("let v:event.abort = v:true") 才能真正中止。
---- 注：新标签页兜底只在确实撞上 E1513（winfixbuf）时发生；:sp/:vsp/:tabnew 等新开窗口的命令
---- 由 winfixbuf 直接放行，重放即成功，不会误开标签。
+--- 注：新标签页兜底只在确实撞上 E1513（外部 winfixbuf）时发生；:sp/:vsp/:tabnew 等新开窗口的命令
+--- 重放即成功，不会误开标签。
 local function _on_input_cmdline_leave(_)
   -- 参数为 CmdlineLeave 事件对象，本实现不使用，故以 `_` 占位。
   if not M.has_window() then return end
@@ -1428,7 +1525,7 @@ local function _on_input_cmdline_leave(_)
   -- CmdlineLeave 在 cmdwin 等场景也会触发，只处理「当前窗口恰为输入窗口」的情况。
   if cur ~= state.input_win_id then return end
   -- 中止原命令后在主循环下一拍重放：一是让输入框的按键映射（如回车发送）不被本拦截吞掉，
-  -- 二是用 pcall 捕获错误，从而仅对 winfixbuf(E1513) 做新标签页兜底，其它错误原样提示。
+  -- 二是用 pcall 捕获错误，从而仅对 E1513（外部 winfixbuf）做新标签页兜底，其它错误原样提示。
   pcall(vim.cmd, "let v:event.abort = v:true")
   vim.schedule(function()
     if not M.has_window() then return end
@@ -1443,7 +1540,8 @@ local function _on_input_cmdline_leave(_)
     local ok, err = pcall(vim.cmd, line)
     if ok then return end
     if type(err) == "string" and err:find("E1513", 1, true) then
-      -- 输入窗口被 winfixbuf 锁住：在新标签页重放（:terminal/:help 等也能正确打开）。
+      -- 保留兜底：外部（插件/旧配置）仍可能给输入窗口设了 winfixbuf，此时在新标签页重放
+      -- （:terminal/:help 等也能正确打开）。
       pcall(vim.cmd, "tabnew")
       local ok2, err2 = pcall(vim.cmd, line)
       if not ok2 then
@@ -1479,10 +1577,12 @@ local function _on_win_closed(ev) -- luacheck: ignore ev
   end
 end
 
---- BufEnter：主聊天窗口里 :bnext/:bprev 切换 buffer 时同步收起/恢复。
+--- BufEnter：主聊天窗口里 :bnext/:bprev 切换 buffer 时同步收起/恢复；
+--- 输入窗口被外部切到别的 buffer 时先转 _redirect_input_hijack（重定向到主窗口）。
 --- 只在主窗口（state.win_id）当前显示的 buffer 变化时动作，避免输入窗口/浮窗的 BufEnter 误触发。
 local function _on_buf_enter()
   if not M.has_window() then return end
+  if _check_input_hijack() then return end
   if not state.win_id or not vim.api.nvim_win_is_valid(state.win_id) then return end
   if vim.api.nvim_get_current_win() ~= state.win_id then return end
   local shown = vim.api.nvim_win_get_buf(state.win_id)
@@ -1572,7 +1672,7 @@ local function _register_focus_tracking()
     group = state.focus_augroup,
     callback = _on_win_closed,
   })
-  -- 输入窗口内 buffer 切换命令拦截：改在新标签页打开，避免 E1513（回归 N1）。
+  -- 输入窗口内 buffer 切换命令拦截：重放后由 BufEnter 重定向到主窗口（旧实现靠 winfixbuf 抛 E1513）。
   vim.api.nvim_create_autocmd("CmdlineLeave", {
     group = state.focus_augroup,
     callback = _on_input_cmdline_leave,

@@ -24,10 +24,12 @@
   鼠标滚轮用 `<C-E>`/`<C-Y>` 平滑滚动视口（`_wheel_scroll`），滚到底时末行下方留白钳制在
   `ui.chat.mousescroll_max_blank`（默认 3）行内，不会像原生那样越滚越白。
 - 输入框：普通 buffer + `virt_text` 渲染 `> ` 前缀（不用 `buftype=prompt`，避免与 nvim-cmp 冲突）；
-  放开 `neoai_input` filetype 的补全；输入窗口用 `'winfixbuf'`（0.10+）低层锁定，并在 `chat_view` 用
-  `CmdlineLeave` **通用拦截**其中执行的任意 `:` 命令：原命令在当前窗口原样重放，仅当因 winfixbuf 报
-  E1513 时改在**新标签页**打开。因此不论是 `:e <file>` 还是 `:terminal`/`:help` 等，都既不报 `E1513`，
-  也**不会**把输入框变成该 buffer（避免输入落进用户文件 / `:wq` 误保存）。
+  放开 `neoai_input` filetype 的补全。输入窗口**不再**用 `'winfixbuf'` 锁窗（那会让 bufferline 左键标签、
+  插件打开文件等路径抛出 `E1513: Cannot switch buffer`）：改为「放行 + 重定向」——切换照常发生，随后
+  `chat_view` 在 `WinEnter`/`BufEnter` 处把目标 buffer 交给**主窗口**显示（等价于在主窗口 `:b`）并收起输入框；
+  `:terminal`/`:help` 等特殊 buffer 则改在**新标签页**打开。因此不论是 `:e <file>`、点 bufferline 标签还是
+  插件跳转，都既不报 `E1513`，也**不会**把输入框变成该 buffer（避免输入落进用户文件 / `:wq` 误保存），
+  输入内容原样保留，回到聊天界面时自动恢复。
 - 主消息区内的 `:terminal`/`:help`：这类会**接管当前窗口**、随后可能随其 `:q` 把整个聊天窗口
   （含输入框）一并带走的命令，会被改到**新标签页**打开；`:e`/`:bnext` 等普通缓冲区切换仍作用于主窗口，
   由焦点追踪收起/恢复输入框。主窗口被 NeoAI 以外的路径关闭时会自动清理该聊天实例，避免界面卡顿。

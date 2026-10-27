@@ -255,10 +255,13 @@ local DEFAULT_CONFIG = {
       -- 折叠程度：
       --   "none"            不折叠（思考/工具/步骤全部展开）
       --   "reasoning_tools" 现状：推理与每个工具块各自折叠
-      --   "process"         在现状基础上，把每轮 user 请求中较早的 AI 中间步骤
-      --                     收进「过程」折叠，折叠文本汇总轮次/工具成败/token/缓存命中率
+      --   "process"         在现状基础上，把每轮 user 请求中的 AI 中间步骤收进
+      --                     「过程」折叠，折叠文本汇总 Step 范围/工具成败/token/缓存命中率。
+      --                     本轮进行中按 process_keep_steps 保留最近几步展开；轮次一结束
+      --                     中间步骤全部收起，只留最终 Step。Step 标记（· Step N）追加在
+      --                     思考过程 / 工具调用折叠文本上，角色头保持纯 "🤖 AI"。
       fold = "reasoning_tools",
-      -- process 模式：每轮保留最近 N 个 assistant 中间步骤展开（最终回答始终展开）
+      -- process 模式：**本轮进行中**保留最近 N 个 assistant 步骤展开（轮次结束后全部收起）
       process_keep_steps = 3,
     },
     trajectory = {
