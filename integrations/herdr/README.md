@@ -23,6 +23,14 @@ pane 级状态（`blocked > working > idle`），带严格递增 `--seq` 上报�
 不残留本次会话的 `working`/`blocked` 状态（实现见 `herder.shutdown()`，由 `plugins` 卸载时调用）。
 仅当**确实接管过权威**时才释放，避免多余上报。
 
+**`blocked` 必然解除**：Herdr 侧只在收到后续 `working`/`idle` 上报时才离开 `blocked`，因此
+NeoAI 保证每个「阻塞」都有配对终局信号——密钥告警 / 网络请求 / 设备访问 / 策略确认四类浮窗经
+`ui/consent_slot` 单槽位串行、按**票据**作用域关闭（一个请求超时只关自己的窗），决策 / 超时兜底 /
+异常关窗（安全默认结算）都会结算该请求 Deferred 并清理审批中心镜像条目；工具审批则在决策 / 超时 /
+展示失败 / 窗口关闭取消 / 会话允许批量放行等**所有**退出路径上恰好配对一次
+`TOOL_APPROVED` 或 `TOOL_APPROVAL_CANCELLED`。若仍观察到 pane 停在「等待确认」，可用
+`herdr pane release-agent <pane-id> --source custom:neoai --agent neoai` 手动释放权威。
+
 ### 为什么没有「检测清单（manifest）」
 
 Herdr 支持本地清单覆盖：`~/.config/herdr/agent-detection/<id>.toml`。实测结论：

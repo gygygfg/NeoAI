@@ -415,8 +415,25 @@ end
 --- @return table|nil err
 local function _handle_scan_result(scan, tool, tool_name, args, ctx)
   if scan.secret then
-    secret.trace("blocked", { tool = tool_name })
     local agent = ctx and ctx.agent
+    -- 本会话已放行（用户此前在弹窗里选过「仅本次允许」）：不再弹窗、不再终止 Agent，
+    -- 只留痕，并在首次命中时提示一次「本会话已允许」。fs_write 仍做 token 化（落盘前替换、
+    -- commit 时还原），与 allow_once 的既有语义一致。
+    if secret.is_allowed and secret.is_allowed(scan.secret) then
+      secret.trace("allowed", { tool = tool_name })
+      if secret.take_allow_notice and secret.take_allow_notice(scan.secret) then
+        pcall(vim.notify,
+          string.format("[NeoAI] 本会话已允许该真实密钥继续使用（工具: %s），后续命中不再询问",
+            tostring(tool_name)),
+          vim.log.levels.INFO)
+      end
+      local spec_allowed = require("NeoAI.sandbox.execution.tool_spec").get(tool_name, tool and tool.category)
+      if spec_allowed and spec_allowed.effect == "fs_write" then
+        secret.tokenize_args(args, { entropy = _entropy_enabled(tool_name, args, ctx) })
+      end
+      return true
+    end
+    secret.trace("blocked", { tool = tool_name })
     pcall(function()
       require("NeoAI.kernel.event_bus").emit(require("NeoAI.kernel.events").SANDBOX_SECRET_BLOCKED, {
         tool = tool_name, agent_id = agent and agent.id,
@@ -457,7 +474,7 @@ local function _handle_scan_result(scan, tool, tool_name, args, ctx)
       end)
       return true
     end
-    -- 先立即停止 Agent，再弹窗请用户确认；确认后继续，否则保持停止。
+    -- 弹窗请用户确认：同意（allow_once）→ 登记本会话放行并继续执行；否则停止。
     local alert = require("NeoAI.sandbox.secret.secret_alert")
     if not alert.available() then return stop() end
     return alert.request({
@@ -474,6 +491,14 @@ local function _handle_scan_result(scan, tool, tool_name, args, ctx)
         return async.reject(err)
       end
       if decision == "fake" then return replace_with_fake() end
+      -- 用户同意：登记会话放行，之后同一密钥不再询问、不再终止 Agent（留痕 + 首次提示）。
+      if decision == "allow_once" and secret.allow_for_session then
+        secret.allow_for_session(scan.secret)
+        pcall(vim.notify,
+          "[NeoAI] 已允许本次使用真实密钥（工具: " .. tostring(tool_name)
+            .. "）；本会话内同一密钥将不再询问",
+          vim.log.levels.INFO)
+      end
       pcall(function()
         require("NeoAI.kernel.event_bus").emit(require("NeoAI.kernel.events").SANDBOX_SECRET_ALERT, {
           tool = tool_name, agent_id = agent and agent.id, scope = "tool", decision = decision,

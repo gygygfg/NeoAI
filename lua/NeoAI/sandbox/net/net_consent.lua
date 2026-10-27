@@ -658,6 +658,7 @@ function M.request(ctx)
 
   local done = false
   local hub_id
+  local ticket -- 独立弹窗票据（ui/consent_slot）：hide/is_open 按票据作用域生效
   local function decide(decision, reason)
     if done then return end
     done = true
@@ -680,7 +681,9 @@ function M.request(ctx)
     end
     -- 决策后关闭独立弹窗（若打开）并取消其「失焦延迟展示」暂存：经审批中心决策 / 超时时，
     -- 独立弹窗可能仍处于待展示状态，需一并清理，避免切回后弹出已过期的弹窗。
-    if state.ui and state.ui.hide then pcall(state.ui.hide) end
+    -- **按票据**关闭：只关自己的窗，不误关其它请求正在展示的窗（否则那个请求的决策回调
+    -- 会永久丢失、审批中心条目残留 pending → Herder pane 一直 blocked）。
+    if state.ui and state.ui.hide then pcall(state.ui.hide, ticket) end
     -- 经审批中心结算：同一目标（端口 + 服务进程）的并发请求已被中心合并为一条，走中心决策
     -- 可让**所有**挂起请求一起结算（各自记账/结算 Deferred），避免「弹窗被后一个请求替换后，
     -- 前一个请求无人决策、一直挂到超时」这类悬挂。条目已不存在（本函数由中心触发）时清空即可。
@@ -739,32 +742,49 @@ function M.request(ctx)
 
   -- 独立弹窗（即时阻塞响应）：存在时优先展示；决策后同步清理中心条目。
   if standalone then
-    local ok = pcall(state.ui.show, ctx, decide)
-    if not ok then decide("deny") end
+    -- 保留票据：超时判定与隐藏都按「我这一个弹窗」作用域（旧实现用全局 is_open/hide，
+    -- 会误把其它请求的窗当成自己的、并关掉别人的窗）。
+    local ok, tk = pcall(state.ui.show, ctx, decide)
+    if ok then ticket = tk else decide("deny") end
   else
     -- 仅统一窗口可用：拉起窗口到「网络请求」页，由其决策。
     pcall(function() hub.open_page("network") end)
   end
 
   -- 超时兜底（fail-closed）：**仅在弹窗已呈现**时到时自动拒绝；弹窗因聊天界面不在前台而
-  -- **暂存待弹**时不自动拒绝（请求已镜像到统一审批悬浮窗，可切回后弹窗或经窗口决策），
-  -- 避免「用户不在聊天界面时连接被静默拒绝」。每 `tms` 复查一次。
+  -- **暂存待弹**、或因单槽位串行而**排队等待**时不自动拒绝（请求已镜像到统一审批悬浮窗，
+  -- 可切回后弹窗或经窗口决策），避免「用户不在聊天界面/前一个弹窗还没答完时连接被静默拒绝」。
+  -- 判定与关闭均按票据作用域：只看**本请求**的窗是否在展示，且只关自己的窗。
+  -- 计时从「用户真正看到弹窗」开始（首次呈现重置一个完整预算）：排队/暂存的等待时间不计入，
+  -- 否则刚被展示就被判超时，用户根本没有应答机会。
   local tms = _timeout_ms()
   if tms > 0 then
-    local function arm()
+    local presented_at = nil
+    local function arm(delay)
       vim.defer_fn(function()
         if done then return end
         local ui = state.ui
-        local presented = (ui == nil) or (type(ui.is_open) ~= "function") or ui.is_open()
-        if presented then
-          if ui and ui.hide then pcall(ui.hide) end
-          decide("deny", "timeout")
-        else
-          arm() -- 仍暂存（未呈现）：继续等待
+        local presented = (ui == nil) or (type(ui.is_open) ~= "function") or ui.is_open(ticket)
+        if not presented then
+          arm(tms) -- 仍暂存/排队（未呈现）：继续等待，不计时
+          return
         end
-      end, tms)
+        local now = vim.uv.now()
+        if not presented_at then
+          presented_at = now
+          arm(tms)
+          return
+        end
+        local left = tms - (now - presented_at)
+        if left > 0 then
+          arm(left)
+          return
+        end
+        if ui and ui.hide then pcall(ui.hide, ticket) end
+        decide("deny", "timeout")
+      end, delay or tms)
     end
-    arm()
+    arm(tms)
   end
   return d
 end

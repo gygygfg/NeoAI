@@ -668,6 +668,15 @@ NeoAI 可以在 **Herder** 管理的 pane 内向 Herder 上报 AI Agent 的真�
 `source`（默认 `custom:neoai`）统一上报，聚合优先级为 `blocked > working > idle`。所有上报带
 严格递增的 `--seq`，令 Herder 忽略同一 `source` 的旧包，避免并发/异步回调导致状态回退。seq 以**挂钟微秒**为基数（而非每次从 1 开始），因此插件热重载（`:NeoAIReloadAll`）或同一 pane 内重开 nvim 后序号不会回退——否则 Herder 会把新报告当过期包丢弃，表现为“不再跟随生命周期”。
 
+**`blocked` 必然解除**：密钥告警 / 网络请求 / 设备访问 / 策略确认四类**阻塞**浮窗共用
+`ui/consent_slot` 的**单槽位**（跨组件串行，任一时刻只展示一个，其余排队），并且每次请求持有
+独立**票据**——`hide`/`is_open` 按票据作用域生效，一个请求超时只关自己的窗。无论走**用户决策**、
+**超时兜底**（fail-closed 自动拒绝，且计时从用户真正看到弹窗开始）、还是**异常关窗**
+（`:q` / `<C-w>c` 按安全默认结算：密钥 → 停止 Agent，其余 → 拒绝），该请求的 Deferred 都会恰好
+结算一次、审批中心镜像条目同步清理，因此 `blocked` 不会滞留、pane 必定回到 `working`（再回
+`idle`）。工具审批同理：`TOOL_APPROVAL_REQUESTED` 在**所有**退出路径（决策 / 超时 / 展示失败 /
+窗口关闭取消 / 会话允许批量放行）都恰好配对一次 `TOOL_APPROVED` 或 `TOOL_APPROVAL_CANCELLED`。
+
 **展示识别**：接管权威时会附带一次 `report-metadata`，令 Herder 侧边栏/边框显示
 `display_agent = "NeoAI"` 与本地化状态文案（`生成中` / `等待确认` / `就绪`），而非裸 `neoai` 标签；
 最后一个 Agent 退出时先清除展示元数据再 `release-agent`，避免残留。

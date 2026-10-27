@@ -203,6 +203,22 @@ function M.cancel_gate(key)
   if type(key) == "string" then gated[key] = nil end
 end
 
+--- 按 key 前缀批量取消待展示登记（同意类浮窗 reset / 卸载时用：票据 key 形如
+--- `net_consent#cs3`，按前缀一次清干净，避免卸载后暂存闭包仍执行建窗）。
+--- @param prefix string
+--- @return number cancelled 取消的登记数
+function M.cancel_gate_prefix(prefix)
+  if type(prefix) ~= "string" or prefix == "" then return 0 end
+  local n = 0
+  for k in pairs(gated) do
+    if type(k) == "string" and k:sub(1, #prefix) == prefix then
+      gated[k] = nil
+      n = n + 1
+    end
+  end
+  return n
+end
+
 --- 是否存在某 key 的待展示登记（测试用）。
 --- @param key string
 --- @return boolean

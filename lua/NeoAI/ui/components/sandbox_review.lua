@@ -2973,7 +2973,13 @@ local function _build_blocking_page(page, ctx)
     -- 同目标并发请求在审批中心已合并：附「×N」提示一次决策覆盖 N 条挂起请求。
     local dup = tonumber(e.count) or 1
     local dup_tag = dup > 1 and ("（×" .. tostring(dup) .. " 个请求）") or ""
-    local text = string.format("[%s] %s%s", e.id, _one_line(e.title), dup_tag)
+    -- 资源访问页：命中凭据/密钥文件时在标题行显式标「🔑 密钥」——用户批准前就能看出
+    -- 这次资源访问动的是密钥材料，而不是一条普通目录路径。
+    local secret_tag = ""
+    if page == "resource" and e.meta and e.meta.secret_path then
+      secret_tag = "  🔑 密钥"
+    end
+    local text = string.format("[%s] %s%s%s", e.id, _one_line(e.title), secret_tag, dup_tag)
     local hln = #lines + 1
     lines[#lines + 1] = text
     line_to_hub[hln] = e.id

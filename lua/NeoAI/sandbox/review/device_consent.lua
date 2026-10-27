@@ -275,6 +275,7 @@ function M.request(devices)
 
   local done = false
   local hub_id
+  local ticket -- 独立弹窗票据（ui/consent_slot）：hide/is_open 按票据作用域生效
   local function decide(decision)
     if done then return end
     done = true
@@ -283,7 +284,9 @@ function M.request(devices)
     end
     -- 会话允许：并入本会话白名单（幂等；门禁侧另有同语义写入，二者互为兜底）。
     if decision == "allow_session" then M.allow_session(devices) end
-    if state.ui and state.ui.hide then pcall(state.ui.hide) end
+    -- **按票据**关闭自己的窗与暂存：避免误关其它请求正在展示的同意浮窗（那会让那个请求的
+    -- 决策回调永久丢失、审批中心条目残留 pending → Herder pane 一直 blocked）。
+    if state.ui and state.ui.hide then pcall(state.ui.hide, ticket) end
     if hub_id then
       pcall(function()
         require("NeoAI.sandbox.review.approval_hub").clear(hub_id)
@@ -330,30 +333,44 @@ function M.request(devices)
 
   -- 独立弹窗（即时阻塞响应）：存在时优先展示；决策后同步清理中心条目。
   if standalone then
-    local ok = pcall(state.ui.show, ctx, decide)
-    if not ok then decide("deny") end
+    local ok, tk = pcall(state.ui.show, ctx, decide)
+    if ok then ticket = tk else decide("deny") end
   else
     pcall(function() hub.open_page("behavior") end)
   end
 
-  -- 超时兜底（fail-closed）：**仅在弹窗已呈现**时到时自动拒绝；暂存待弹时不自动拒绝
-  -- （已镜像到统一审批悬浮窗），避免用户不在聊天界面时被静默拒绝。每 `tms` 复查。
+  -- 超时兜底（fail-closed）：**仅在弹窗已呈现**时到时自动拒绝；暂存待弹 / 单槽位排队时不自动
+  -- 拒绝（已镜像到统一审批悬浮窗），避免用户不在聊天界面或前一个弹窗未答完时被静默拒绝。
+  -- 判定与关闭均按票据作用域：只看**本请求**的窗是否在展示，且只关自己的窗。
+  -- 计时从「用户真正看到弹窗」开始（首次呈现重置完整预算），排队等待时间不计入。
   local tms = M.timeout_ms()
   if tms > 0 then
-    local function arm()
+    local presented_at = nil
+    local function arm(delay)
       vim.defer_fn(function()
         if done then return end
         local ui = state.ui
-        local presented = (ui == nil) or (type(ui.is_open) ~= "function") or ui.is_open()
-        if presented then
-          if ui and ui.hide then pcall(ui.hide) end
-          decide("deny")
-        else
-          arm()
+        local presented = (ui == nil) or (type(ui.is_open) ~= "function") or ui.is_open(ticket)
+        if not presented then
+          arm(tms) -- 仍暂存/排队（未呈现）：继续等待，不计时
+          return
         end
-      end, tms)
+        local now = vim.uv.now()
+        if not presented_at then
+          presented_at = now
+          arm(tms)
+          return
+        end
+        local left = tms - (now - presented_at)
+        if left > 0 then
+          arm(left)
+          return
+        end
+        if ui and ui.hide then pcall(ui.hide, ticket) end
+        decide("deny")
+      end, delay or tms)
     end
-    arm()
+    arm(tms)
   end
   return d
 end

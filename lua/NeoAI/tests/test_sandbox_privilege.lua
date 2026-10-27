@@ -917,6 +917,124 @@ tests.suite("sandbox_privilege", function(_, it)
     secret.reset()
   end)
 
+  it("密钥防护：同意一次后同密钥在本会话内不再询问、不再终止 Agent", function(t)
+    local secret = require("NeoAI.sandbox.secret.secret")
+    secret.reset()
+    local real = "sk-sessionAllowAAAABBBBCCCCDDDDEEEE"
+    secret.tokenize(real) -- 登记为已知真实密钥
+    local alert = require("NeoAI.sandbox.secret.secret_alert")
+    local asked = 0
+    alert.set_ui({
+      show = function(_, decide)
+        asked = asked + 1
+        decide("allow_once") -- 用户点「仅本次允许」
+      end,
+      hide = function() end,
+    })
+    local aborted
+    local function new_agent()
+      return {
+        id = "a_allow_" .. tostring(asked),
+        signal = {
+          abort = function(_, r) aborted = r end,
+          reason = function() return aborted end,
+          aborted = function() return aborted ~= nil end,
+        },
+      }
+    end
+    local function run_once()
+      local done, rejected = false, nil
+      require("NeoAI.tools").execute("run_command",
+        { command = "echo " .. real, description = "t" }, { agent = new_agent() })
+        :then_(function() done = true end, function(e) rejected = e; done = true end)
+      return vim.wait(5000, function() return done end), rejected
+    end
+
+    local ok1, rej1 = run_once()
+    t.true_(ok1, "首次应完成")
+    t.eq(nil, rej1, "首次同意后应继续执行")
+    t.eq(1, asked, "首次应询问一次")
+    t.true_(secret.is_allowed(real), "同意后应登记本会话放行")
+
+    -- 第二次：不再弹窗、不再终止，直接继续执行
+    local ok2, rej2 = run_once()
+    t.true_(ok2, "第二次应完成")
+    t.eq(nil, rej2, "已放行的密钥不应被拒绝")
+    t.eq(1, asked, "第二次不应再弹窗")
+    t.eq(nil, aborted, "已放行的密钥不应终止 Agent")
+    t.true_(#secret.traces() > 0, "仍应留痕")
+
+    alert.set_ui(nil)
+    secret.reset()
+  end)
+
+  it("密钥防护：上下文命中已放行密钥时不再弹窗/终止", function(t)
+    local secret = require("NeoAI.sandbox.secret.secret")
+    secret.reset()
+    local real = "sk-ctxAllowAAAABBBBCCCCDDDDEEEEFF"
+    secret.tokenize(real)
+    local alert = require("NeoAI.sandbox.secret.secret_alert")
+    local asked = 0
+    alert.set_ui({ show = function() asked = asked + 1 end, hide = function() end })
+    local recovery = require("NeoAI.core.agent.recovery")
+    local aborted
+    local agent = {
+      id = "a_ctx_allow",
+      signal = {
+        abort = function(_, r) aborted = r end,
+        reason = function() return aborted end,
+        aborted = function() return aborted ~= nil end,
+      },
+    }
+    -- 未放行前：应请求确认（弹窗）
+    local r1 = recovery._guard_secret_context(agent, { { role = "assistant", content = "K=" .. real } })
+    if type(r1) == "table" and r1.then_ then vim.wait(1000, function() return asked > 0 end) end
+    t.eq(1, asked, "首次上下文命中应询问")
+    -- 登记放行后：直接通过，不再询问
+    secret.allow_for_session(real)
+    local r2 = recovery._guard_secret_context(agent, { { role = "assistant", content = "K=" .. real } })
+    t.eq(true, r2, "已放行的密钥应直接通过上下文守卫")
+    t.eq(1, asked, "已放行后不应再弹窗")
+    t.eq(nil, aborted, "已放行后不应终止 Agent")
+    alert.set_ui(nil)
+    secret.reset()
+  end)
+
+  it("资源访问页：命中凭据/密钥文件的条目标明「密钥」", function(t)
+    local secret = require("NeoAI.sandbox.secret.secret")
+    secret.reset()
+    local hub = require("NeoAI.sandbox.review.approval_hub")
+    local review = require("NeoAI.ui.components.sandbox_review")
+    review.reset()
+    -- 直接构造资源访问条目（模拟 tool_service 提交时的 meta.secret_path）
+    local id_secret = hub.submit("resource", {
+      title = "read_file",
+      detail = { "🔑 密钥: /root/.ssh/id_rsa（凭据/密钥文件）" },
+      meta = { tool_name = "read_file", masked = "/root/.ssh", secret_path = "/root/.ssh/id_rsa" },
+    })
+    local id_plain = hub.submit("resource", {
+      title = "read_file",
+      detail = { "参数: {}" },
+      meta = { tool_name = "read_file", masked = "/root/data" },
+    })
+    t.not_nil(id_secret)
+    t.not_nil(id_plain)
+    -- 打开审批悬浮窗并切到「资源访问」页
+    local ok = pcall(function()
+      review.open()
+      review.open_page("resource")
+    end)
+    t.true_(ok, "应能打开审批悬浮窗资源访问页")
+    local buf = vim.api.nvim_get_current_buf()
+    local text = table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n")
+    t.matches("🔑 密钥", text, "资源访问页应标明密钥")
+    t.matches("/root/%.ssh/id_rsa", text, "应给出密钥路径")
+    review.close()
+    hub.clear(id_secret)
+    hub.clear(id_plain)
+    secret.reset()
+  end)
+
   it("密钥防护：commit 发布时把 token 还原为真实密钥并留痕警告", function(t)
     local secret = require("NeoAI.sandbox.secret.secret")
     local fs = require("NeoAI.utils.fs")

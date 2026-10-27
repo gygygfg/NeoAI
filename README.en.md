@@ -680,6 +680,17 @@ aggregates them into one fixed `source` (default `custom:neoai`) and reports the
 priority of `blocked > working > idle`. Every report carries a strictly increasing `--seq`, so Herder ignores stale
 packets from the same `source`, preventing status regressions caused by concurrent/asynchronous callbacks.
 
+**`blocked` always clears**: the four *blocking* consent popups (secret alert, network request, device access, policy
+confirmation) share a **single slot** from `ui/consent_slot` (cross-component serialization: at most one popup is shown
+at a time, the rest queue), and every request holds its own **ticket** — `hide`/`is_open` are ticket-scoped, so one
+request timing out only closes its own window. Whether the request ends by **user decision**, by the **timeout
+fallback** (fail-closed auto-deny, timed from when the popup actually became visible) or by an **external window close**
+(`:q` / `<C-w>c`, resolved with a safe default: secret → stop the agent, everything else → deny), its Deferred settles
+exactly once and the mirrored approval-center entry is cleared, so `blocked` never lingers and the pane always returns
+to `working` (then `idle`). The same holds for tool approval: `TOOL_APPROVAL_REQUESTED` is paired with exactly one
+`TOOL_APPROVED` or `TOOL_APPROVAL_CANCELLED` on **every** exit path (decision, timeout, popup-show failure,
+window-close cancellation, session-wide allow).
+
 **Display recognition**: when it takes over authority, NeoAI sends one `report-metadata`, so the Herder sidebar/border
 shows `display_agent = "NeoAI"` with localized state labels (`生成中` / `等待确认` / `就绪`) instead of the bare `neoai`
 tag; when the last Agent exits it clears the display metadata before `release-agent`.

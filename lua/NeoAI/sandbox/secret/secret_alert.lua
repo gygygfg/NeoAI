@@ -108,6 +108,7 @@ function M.request(ctx)
   end
   local done = false
   local hub_id
+  local ticket -- 独立弹窗票据（ui/consent_slot）：hide/is_open 按票据作用域生效
   local local_dialog_id = nil
   local function close_local_dialog()
     if not local_dialog_id then return end
@@ -128,7 +129,9 @@ function M.request(ctx)
       and decision ~= "whitelist" and decision ~= "stop" then
       decision = "stop"
     end
-    if state.ui and state.ui.hide then pcall(state.ui.hide) end
+    -- **按票据**关闭自己的窗与暂存：避免误关其它请求正在展示的同意浮窗（那会让那个请求的
+    -- 决策回调永久丢失、审批中心条目残留 pending → Herder pane 一直 blocked）。
+    if state.ui and state.ui.hide then pcall(state.ui.hide, ticket) end
     if hub_id then
       pcall(function() require("NeoAI.sandbox.review.approval_hub").clear(hub_id) end)
     end
@@ -178,8 +181,8 @@ function M.request(ctx)
   -- 没有审批中心条目时（hub 不可用/无 UI），仍广播本地阻塞弹窗生命周期给 Herder。
   open_local_dialog()
   if state.ui ~= nil and type(state.ui.show) == "function" then
-    local ok = pcall(state.ui.show, ctx, decide)
-    if not ok then decide("stop") end
+    local ok, tk = pcall(state.ui.show, ctx, decide)
+    if ok then ticket = tk else decide("stop") end
     return d
   end
   -- 专用 UI 未注册：交互式 Neovim 用内建确认（暂停 Agent 直到用户选择）

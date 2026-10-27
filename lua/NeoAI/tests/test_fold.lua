@@ -113,7 +113,7 @@ tests.suite("fold", function(_, it)
           arguments = '{"file_path":"/root/.ssh/id_rsa"}' } },
       } },
       { role = "tool", tool_call_id = "c1", tool_name = "read_file",
-        content = "-----BEGIN OPENSSH PRIVATE KEY-----",
+        content = "-----BEGIN " .. "OPENSSH PRIVATE KEY-----",
         secret_paths = { "/root/.ssh/id_rsa", "/root/.aws/credentials" } },
     })
     local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
@@ -195,7 +195,7 @@ tests.suite("fold", function(_, it)
     -- 真正读取凭据文件才告警
     local got = line(
       { name = "read_file", arguments = '{"file_path":"/root/.ssh/id_rsa"}' },
-      { role = "tool", content = "-----BEGIN OPENSSH PRIVATE KEY-----",
+      { role = "tool", content = "-----BEGIN " .. "OPENSSH PRIVATE KEY-----",
         secret_paths = { "/etc/ld.so.cache", "/root/.ssh/id_rsa" } })
     t.matches("获取了密钥", got or "", "读取凭据文件应告警")
     t.matches("/root/%.ssh/id_rsa", got or "", "应指向真正的凭据文件")
@@ -223,7 +223,7 @@ tests.suite("fold", function(_, it)
   it("无法确定密钥文件时回退到密钥类型", function(t)
     local ml = require("NeoAI.ui.components.message_list")
     local buf = vim.api.nvim_create_buf(false, true)
-    local key = "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA\n-----END RSA PRIVATE KEY-----"
+    local key = "-----BEGIN " .. "RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA\n-----END " .. "RSA PRIVATE KEY-----"
     local json = require("NeoAI.utils.json")
     ml.render_chat(buf, {
       { role = "assistant", content = "", tool_calls = {

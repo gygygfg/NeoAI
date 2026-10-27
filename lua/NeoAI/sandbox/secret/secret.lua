@@ -680,6 +680,13 @@ local state = {
   seq = 0,
   salt = nil,
   traces = {}, -- 留痕：{ event, tool, path, tokens, at }
+  -- 会话级放行：用户在真实密钥确认弹窗里选「仅本次允许」后被放行的密钥。
+  -- 同一密钥在本会话内不再弹窗、不再终止 Agent（仍留痕 + 首次提示一次）。
+  -- 语义边界：只作用于 **agent 侧**（工具参数扫描 / AI 上下文守卫）；
+  -- 密钥**外发**（egress，发往非白名单地址）仍单独询问——那是把密钥送出本机，
+  -- 与「在本机继续执行」不同性质，不随本集合放行。
+  allowed = {}, -- secret -> true
+  allowed_notified = {}, -- secret -> true（提示只打一次）
 }
 
 -- ========== 私有函数 ==========
@@ -812,6 +819,42 @@ end
 --- @return boolean
 function M.enabled()
   return _cfg().enabled ~= false
+end
+
+--- 登记「本会话内允许继续使用」的真实密钥。
+--- 用户在真实密钥确认弹窗里选「仅本次允许」后由调用方登记：之后同一密钥在 agent 侧
+--- （工具参数扫描 / AI 上下文守卫）命中时不再弹窗、不再终止 Agent，只留痕（+ 首次提示一次）。
+--- 密钥外发（egress）不受此放行影响，仍单独询问。
+--- @param secret string
+function M.allow_for_session(secret)
+  if type(secret) ~= "string" or secret == "" then return end
+  state.allowed[secret] = true
+end
+
+--- 该真实密钥是否已被本会话放行。
+--- @param secret string|nil
+--- @return boolean
+function M.is_allowed(secret)
+  if type(secret) ~= "string" or secret == "" then return false end
+  return state.allowed[secret] == true
+end
+
+--- 本会话放行集合（测试/审计用；返回副本）。
+--- @return table<string, boolean>
+function M.allowed_secrets()
+  local out = {}
+  for k in pairs(state.allowed) do out[k] = true end
+  return out
+end
+
+--- 取该密钥的「首次放行提示」是否需要打印（每密钥只返回一次 true）。
+--- @param secret string
+--- @return boolean
+function M.take_allow_notice(secret)
+  if type(secret) ~= "string" or secret == "" then return false end
+  if state.allowed_notified[secret] then return false end
+  state.allowed_notified[secret] = true
+  return true
 end
 
 --- 文本是否含插件密钥 token（`NEOKEY_…`）或已登记的格式保真假密钥。
@@ -2522,6 +2565,8 @@ function M.reset()
   state.seq = 0
   state.salt = nil
   state.traces = {}
+  state.allowed = {}
+  state.allowed_notified = {}
 end
 
 return M

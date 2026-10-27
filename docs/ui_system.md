@@ -15,6 +15,8 @@
 | `ui/window/chat_view.lua` | 聊天视图（**支持多实例**，见 §4.0）：绑定事件、流式更新、折叠、悬浮窗调度、输入框联动、后台收起/恢复、显示模式宿主。 |
 | `ui/window/tree_view.lua` | 会话树视图：按工作目录分组的**分支树**展示与 CRUD（见 §7）。 |
 | `ui/components/*` | 可复用组件（见下）。 |
+| `ui/consent_slot.lua` | 同意/告警类**阻塞**浮窗的展示单槽位：密钥告警 / 网络同意 / 设备同意 / 策略确认四类共用，跨组件互斥（任一时刻只展示一个，其余排队逐个展示）。`acquire{ key, dedupe?, open, close }` → **票据**（槽位空闲立即 `open`，否则入队；同 `key`+`dedupe` 在途返回 `suppressed` 票据，交由审批中心按 `dedupe_key` 合并代表）、`mark_presented`/`is_presented`、`release`（决策完成让位）、`cancel`（超时/隐藏/外部关窗：出队或调 `close` 关窗）、`reset`。`open` 用 `pcall` 包裹且失败自动让位并记日志——槽位卡死会让后续请求永久 pending（表现为 Herder pane 永不回 `working`）。 |
+| `ui/focus.lua` | 焦点信号与门控（见 §4.8）：`gate`/`gate_app`/`cancel_gate`/`cancel_gate_prefix`/`is_focused`。 |
 | `ui/geometry.lua` | 浮窗几何计算：按屏幕**相对比例**推导浮窗宽高与居中/贴边位置，避免硬编码像素尺寸。`compute{ w_ratio, h_ratio, fit_h, min_w, max_w, min_h, max_h, margin, anchor, row, narrow }` → `{ width, height, col, row }`。内置全局最小尺寸兜底（`ui.float.min_width/min_height`，默认 24/4），并提供 `track/untrack/refresh/reset`：已登记的浮窗在编辑器窗口 resize（`VimResized`）时实时重算尺寸与位置跟随（流式窗可用自定义 `apply` 保留内容自适应高度）。另支持**窄屏留白**（见 §2.1）。 |
 | `ui/session_cleanup.lua` | 会话恢复残留清理：`:restart`/`-S` 后清掉界面孤儿 buffer（见 §4.9）。 |
 | `ui/keymap.lua` | 键位注册（`register_context`）与展示。 |
@@ -56,6 +58,10 @@
 `M.init()` 幂等，注册三类 UI 实现：
 
 - **审批 UI**：`ui/components/tool_approval.init()`（经 `tool_service.set_approval_ui` 注入）。
+- **同意/告警 UI**：`net_consent`/`device_consent`/`policy_consent`/`secret_alert` 四类**阻塞**浮窗经
+  `ui/consent_slot` 单槽位串行展示（跨组件互斥；每次请求持票据，`hide`/`is_open` 按票据作用域；
+  外部关窗按安全默认结算），任一请求的决策 / 超时 / 异常关窗都会解开 `blocked`（详见 §6 组件表与
+  README「`blocked` 必然解除」）。
 - **向用户提问 UI**：`ui/components/ask_user.init()`（经 `ask_user.set_ui` 注入）。同一轮的多次提问聚合成**一个多 Tab 弹窗**统一作答（对齐 opencode）：顶部 Tab 栏 `✓/○` 标记已答/未答、**当前标签反显加粗**、最右为**「确认」标签**；`h/l`/`←/→`（或 `<Tab>`/`<S-Tab>`、`]`/`[`）切页；`1-9` 选择/多选切换勾选（**多题单选作答后自动跳到下一 Tab**；多选不跳转、留在本题继续勾选），`k/j`/`↑/↓` 移动选项焦点（焦点行背景高亮），`<CR>` 选中焦点选项，`i` 自由输入；`multi_select` 题目以 `[x]/[ ]` 复选框展示。**单题单选选中即提交（不二次确认、无确认标签）**；多选/多题在最右「确认」标签二次确认（`y`/`<CR>` 提交、`h`/`←` 返回编辑、`Esc` 取消整批）。弹窗在**光标离开弹窗**（`WinLeave`/`BufLeave`/`TabLeave`，覆盖 `<C-w>w`、鼠标点击其它窗口、切标签页）或**应用失焦**（`FocusLost`/`VimSuspend`）时自动缩为右上角小窗（标题提示待回答数），光标重新进入/回焦时恢复全尺寸；自动命令组为**可重装**（被外部清理后下一次渲染自动重建），且每次应用几何前按**实际焦点**自愈校正收起态——避免「光标跳出弹窗却不收起」。
 - **子 Agent 监控**：`ui/components/sub_agent_dock.init()`。
 
@@ -430,7 +436,7 @@ NeoAI 的聊天/输入框/悬浮窗等都是纯 UI 文本，若 LSP 客户端（
 | `tool_args_panel` | 工具参数接收悬浮窗（`float_stream_window` 适配器，流式工具调用参数，高度上限 5 行）。单工具时按分片增量 `append`，否则整段重建；`open`/`show`/`close`/`is_open`/`get_content`/`reset`；`filetype=neoai_tool_args`。 |
 | `lsp_guard` | 界面 buffer 的 LSP 隔离。`install()`/`uninstall()`/`disable(buf)`；按 `neoai*` filetype 关闭 LSP/Copilot 并解绑已挂载客户端（见 §4.8）。 |
 | `model_picker` | 模型选择器（异步加载模型列表）。`open(callback)`。 |
-| `tool_approval` | 工具审批弹窗。`init()`；串行单槽位展示。**聊天界面焦点门控**（`focus.gate`）：当前窗口是 NeoAI 界面时**立即弹出**；否则**暂存**，待切回 NeoAI 界面再弹。审批分流中心（多级审批悬浮窗）始终**直接新建条目**，故暂存期间不会丢请求、可在窗口内决策；审批超时/经中心决策会 `hide()` 取消暂存。`net_consent`（网络同意）/`device_consent`（设备同意）/`policy_consent`（策略确认）同理。`sandbox_review` 多级页面的**页标签采用 Mason 风格高亮**（存在 mason.nvim 高亮组时链接复用，见 `ui/mason_hl.lua`）。 |
+| `tool_approval` | 工具审批弹窗。`init()`；串行单槽位展示。**聊天界面焦点门控**（`focus.gate`）：当前窗口是 NeoAI 界面时**立即弹出**；否则**暂存**，待切回 NeoAI 界面再弹。审批分流中心（多级审批悬浮窗）始终**直接新建条目**，故暂存期间不会丢请求、可在窗口内决策；审批超时/经中心决策会 `hide()` 取消暂存。`net_consent`（网络同意）/`device_consent`（设备同意）/`policy_consent`（策略确认）/`secret_alert`（密钥告警）同理，且这四类**阻塞**浮窗共用 `ui/consent_slot` 的**单槽位**：跨组件互斥、任一时刻只展示一个、其余排队；每次请求持**票据**（`show` 返回，`hide(ticket)`/`is_open(ticket)` 按票据作用域），一个请求超时只关自己的窗；窗口被外部关闭（`WinClosed` / `:q` / `<C-w>c`）时按**安全默认**结算（密钥 → 停止 Agent，其余 → 拒绝）并清审批中心镜像条目——否则该请求的决策回调会永久丢失、条目残留 pending，使 Herder pane 一直停在 `blocked`。`sandbox_review` 多级页面的**页标签采用 Mason 风格高亮**（存在 mason.nvim 高亮组时链接复用，见 `ui/mason_hl.lua`）。 |
 | `ask_user` | 向用户提问弹窗。`init()`；经 `ask_user.set_ui` 注入。同轮多次提问聚合为单窗口多 Tab（Tab 栏 `✓/○` 标记已答、当前标签反显、最右「确认」标签，**Tab 高亮采用 Mason 风格**：存在 mason.nvim 高亮组时链接复用，见 `ui/mason_hl.lua`），`multi_select` 题以复选框展示；**单题单选选中即提交**、**多题单选作答后自动跳到下一 Tab（最后一题到确认标签；多选不跳转）**，多选/多题在最右确认标签二次确认（`y`/`<CR>` 提交、`h`/`←` 返回编辑、`Esc` 取消整批，见 `ui.ask_user.*` 配置）。**焦点门控为应用级**（`focus.gate_app`）：只要 nvim 有 OS 焦点即**立即弹出**，不因当前窗口不是 NeoAI 界面而延迟（ask_user 是 agent 阻塞等待回答的交互）；仅 nvim 失焦（`FocusLost`）时暂存，`FocusGained`/`VimResume` 回焦再弹。**收起联动**：光标离开弹窗（`WinLeave`/`BufLeave`/`TabLeave`）或应用失焦即缩为右上角小窗，光标回来/回焦展开；自动命令组可重装（被外部清理后下次渲染自动重建），并在应用几何前按实际焦点自愈，避免「跳出弹窗未收起」。 |
 | `sub_agent_dock` | 子 Agent 状态监控。`init()`。winbar 身份行同时展示子 Agent 名字（超出窗口宽度折叠为 `N个子agent正在运行`，见 `services/status.sub_agents_segment`）；`keymaps.chat.switch_sub_agent`（默认 `<leader>as`）在新窗口打开子 Agent 会话。 |
 | `sub_agent_list` | 子 Agent 列表弹出窗（无边框悬浮窗，相对聊天主窗口顶部居中、`<leader>al` 切换）。`↑/↓`(k/j) 移动、`<CR>` 进入会话、`q`/`<Esc>` 关闭；窗口尺寸变化时重算几何跟随。`open`/`close`/`toggle`/`is_open`/`reset`。 |

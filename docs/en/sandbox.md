@@ -462,7 +462,13 @@ is only kept for other `approval.mode` values (`prompt`/`strict`).
     **session-only (never written to disk; reopening nvim restores defaults)**. With the cursor on a
     resource entry, `W` quickly adds that entry's masked parent dir to the workspace allowlist. Note
     that with `read_all=true` (default) masked dirs are inactive (read-only pass + out-of-bounds trace
-    instead), and clearing the list falls back to the defaults (`/home`, `/root`). **The "applied" section is
+    instead), and clearing the list falls back to the defaults (`/home`, `/root`).
+    **Credential hits are labelled as secrets**: when a resource-access entry's masked path is
+    credential material (`~/.ssh/`, `~/.aws/`, `*.pem` / `*.key`, `.env`, …; decided with the strict
+    `secret.is_sensitive_path` / `is_secret_path` rules so ordinary system files are not mislabelled),
+    the header line gets a `🔑 密钥` badge, the details add `🔑 密钥: <path>（凭据/密钥文件）`, and
+    `meta.secret_path` is recorded — so you can tell before approving that this access touches key
+    material rather than a plain directory. **The "applied" section is
     collapsed by default** (whole section collapsed via `za`/`zo`, then each item collapsed again);
     **after any successful apply the whole review window is folded** (`fold_all`: fold level reset to 0
     and `zM` closes any manually opened folds), so the "applied" section returns to its default collapsed
@@ -504,7 +510,19 @@ is only kept for other `approval.mode` values (`prompt`/`strict`).
       (secret_alert) / network consent (net_consent) / device consent (device_consent) / policy
       confirmation (policy_consent)** (stash and show on return; their timeout /
       decision via the approval hub calls `hide()` to cancel the stash so no stale popup appears on
-      return). While waiting, the Herder lifecycle reports `blocked` (red). The review window also
+      return). The four popups secret alert / network consent / device consent / policy confirmation
+      additionally **share the single slot of `ui/consent_slot`**: **mutually exclusive across
+      components** (at most one popup at a time, the rest queue and are shown one by one instead of
+      overlapping), and every request holds a **ticket** so `hide`/`is_open` are ticket-scoped — a
+      timeout closes **only its own** window and never the window of another pending request (the old
+      implementation used a global `is_open()` check plus an argument-less `hide()`, which closed
+      somebody else's window, permanently losing that request's decision callback and leaving its
+      approval-center entry pending, so the Herder pane stayed at `blocked`). The timeout is only
+      counted while **this request's** window is actually presented (a full budget from the moment the
+      user can see it; queueing/stash wait time does not count). Externally closed windows (`:q` /
+      `<C-w>c`) are settled with a **safe default** (secret → `stop`, others → `deny`) and their
+      approval-center mirror entry is cleared. While waiting, the Herder lifecycle reports `blocked`
+      (red). The review window also
       force-refreshes once on switching back. There is no suppression when there is no attached UI
       (headless/tests) — there is no "other window" to switch to.
     - **Package installs are grouped per install command**: candidates produced by npm/pip/apt
@@ -2901,7 +2919,18 @@ The popup shows **which command/tool obtained it** (tool name + command/path; fo
 the matched message index and role), **which secret was obtained** (the matched raw secret value), and
 the **fake key that will be used for replacement**. Options:
 
-- **keep the raw secret, allow once**: execution/sending continues (emits `SANDBOX_SECRET_ALERT`);
+- **keep the raw secret, allow once**: execution/sending continues (emits `SANDBOX_SECRET_ALERT`).
+  **After consent the secret is allowed for the rest of the session**: choosing “allow once” registers
+  the secret in a session allow-list (`secret.allow_for_session` / `is_allowed`), so later hits on the
+  **same secret** on the agent side (tool-argument scan, AI-context guard) **no longer pop up and never
+  stop the agent** — they only leave a trace (`allowed` / `allowed_context`) plus a one-time notice.
+  Boundaries: the allow-list only covers “keep running on this machine” and **does not cover key
+  egress** (sending it to a non-whitelisted host still asks separately); `fs_write` tools still
+  tokenize arguments (replaced before writing, restored on commit); entries are keyed by the secret
+  value and cleared on session end (`secret.reset`), so a restart asks again.
+- **Resource-access entries name secrets**: resource-access approvals (masked-directory hits) whose
+  paths are credential material get a `🔑 密钥` badge on the header line plus the secret path in the
+  details (see the approval hub section);
 - **replace with a fake key and continue**: the raw secret in the tool arguments
   (`secret.tokenize_args`) or in the AI-visible context/history messages (`secret.replace_value`) is
   replaced in place with a format-preserving fake key, then execution/sending continues;

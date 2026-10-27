@@ -381,8 +381,9 @@ end
 --- 生成折叠占位文本（纯函数，供 foldtext 与测试使用）
 --- 工具折叠格式：工具 emoji + 工具名称 + 目的 + 状态 emoji + 耗时
 --- （🔧 name · 目的 ✅ 1.2s）。推理折叠沿用思考过程摘要。
---- process 模式下思考过程 / 工具调用折叠文本末尾追加 ` · Step N`（`step_txt`），
---- 让每个折叠自述所属的 assistant 步骤（子 Agent 折叠不带，Step 范围由过程折叠文本汇总）。
+--- process 模式下 Step 标记紧跟在 emoji 之后（`🤔 Step 18 思考过程 1 行` /
+--- `🔧 Step 18 grep · 搜索 ✅ 0.3s`），让每个折叠自述所属的 assistant 步骤；
+--- 子 Agent 折叠不带（Step 范围由过程折叠文本汇总）。
 --- 密钥警告不在此展示（由 message_list 在折叠块外单独一行高亮）。
 --- @param first string 折叠首行
 --- @param count number 折叠行数
@@ -391,7 +392,9 @@ end
 --- @return string
 function M.label(first, count, is_reasoning, step_txt)
   local kind, status, name, desc = M.detect(first)
-  local suffix = (type(step_txt) == "string" and step_txt ~= "") and (" · " .. step_txt) or ""
+  -- Step 标记插在 emoji 之后、内容之前（`🔧 Step 18 grep…`），而非追加到尾部：
+  -- 尾部信息是状态与耗时，同一行里靠前的 Step 号更容易一眼对齐扫读。
+  local prefix = (type(step_txt) == "string" and step_txt ~= "") and (step_txt .. " ") or ""
   if kind == "sub_agent" then
     local status_emoji = STATUS_EMOJI[status] or "🤖"
     local time_str = _extract_time(first)
@@ -405,14 +408,14 @@ function M.label(first, count, is_reasoning, step_txt)
     local desc_str = desc and (desc ~= "") and (" · " .. desc) or ""
     local time_str = _extract_time(first)
     if time_str then
-      return string.format("  🔧 %s%s %s %s%s", name, desc_str, status_emoji, time_str, suffix)
+      return string.format("  🔧 %s%s%s %s %s", prefix, name, desc_str, status_emoji, time_str)
     end
-    return string.format("  🔧 %s%s %s%s", name, desc_str, status_emoji, suffix)
+    return string.format("  🔧 %s%s%s %s", prefix, name, desc_str, status_emoji)
   end
   if is_reasoning == false then
     return M.generic_label(first, count)
   end
-  return string.format("  🤔 思考过程 %d 行%s", count, suffix)
+  return string.format("  🤔 %s思考过程 %d 行", prefix, count)
 end
 
 --- 未识别折叠的中性占位文本（不冒充思考过程）：优先显示首行预览，否则显示行数

@@ -111,6 +111,33 @@ local function _approval_text(tool_name, args, ctx)
   return text
 end
 
+--- 结算一条待审批条目的**阻塞账目**：恰好一次发出 TOOL_APPROVED / TOOL_APPROVAL_CANCELLED，
+--- 并清理审批中心镜像条目（`hub.clear` 幂等）。
+--- 必须由**所有**退出路径调用（决策 / 超时兜底 / 弹窗展示失败 / 窗口关闭取消），否则
+--- TOOL_APPROVAL_REQUESTED 得不到配对终局事件，Herder 侧的 blocked 计数永久 +1——表现为
+--- pane 一直停留在「等待确认」，审批交互完成后也不回到「运行中」。
+--- @param item table { tool_name, ctx, mirror_id?, blocking_settled? }
+--- @param allowed boolean|nil 是否允许（假值 = 取消/拒绝）
+--- @param reason string|nil 取消原因
+local function _settle_blocking(item, allowed, reason)
+  if type(item) ~= "table" or item.blocking_settled then return end
+  item.blocking_settled = true
+  local agent_id = item.ctx and item.ctx.agent and item.ctx.agent.id
+  if allowed then
+    event_bus.emit(events.TOOL_APPROVED, { tool_name = item.tool_name, agent_id = agent_id })
+  else
+    event_bus.emit(events.TOOL_APPROVAL_CANCELLED, {
+      tool_name = item.tool_name, reason = reason, agent_id = agent_id,
+    })
+  end
+  -- 镜像条目：无论走哪条退出路径都清掉，避免审批悬浮窗残留「待批准」（进而 pin 住 blocked）。
+  if item.mirror_id then
+    local mid = item.mirror_id
+    item.mirror_id = nil
+    pcall(function() require("NeoAI.sandbox.review.approval_hub").clear(mid) end)
+  end
+end
+
 --- 结算一条待审批条目：resolve/reject 其 Deferred 并发相应事件（幂等）。
 --- 供当前条目决策与会话允许批量放行复用：条目已决策（item.d == nil）时不重复 settle。
 --- @param item table { tool_name, args, ctx, continue_fn, d }
@@ -120,12 +147,10 @@ local function _resolve_approval_item(item, allowed, reason)
   local d = item.d
   item.d = nil -- 已决策：审批超时不再作用于本条目（避免杀掉已批准的长耗时执行）
   if not (d and d:is_pending()) then return end
-  local agent_id = item.ctx and item.ctx.agent and item.ctx.agent.id
+  _settle_blocking(item, allowed, reason)
   if allowed then
-    event_bus.emit(events.TOOL_APPROVED, { tool_name = item.tool_name, agent_id = agent_id })
     item.continue_fn():then_(function(r) d:resolve(r) end, function(e) d:reject(e) end)
   else
-    event_bus.emit(events.TOOL_APPROVAL_CANCELLED, { tool_name = item.tool_name, reason = reason, agent_id = agent_id })
     d:reject({ kind = "approval", message = reason or ("用户拒绝了工具调用: " .. item.tool_name) })
   end
 end
@@ -181,10 +206,11 @@ end
 --- @param args table
 --- @param decision_cb function(allowed=boolean, reason=string|nil)
 --- @param ctx table
-local function _show_approval(tool_name, args, decision_cb, ctx)
+--- @param item table|nil 队列条目（用于回填审批中心镜像 id，供后续退出路径清理）
+local function _show_approval(tool_name, args, decision_cb, ctx, item)
   local text = _approval_text(tool_name, args, ctx)
   local done = false
-  local hub_id = nil
+  local mirror_id = nil
   -- 归一决策值：allow_once | allow_session | deny（与 net_consent / device_consent 一致）。
   -- 幂等：done 标记保证先决策者生效，重复决策不重复 settle Deferred / 不重复发事件。
   -- 联动：先关自身弹窗（若还开着），再清除悬浮窗镜像条目（hub.resolve，幂等），最后回调。
@@ -195,8 +221,10 @@ local function _show_approval(tool_name, args, decision_cb, ctx)
       value = value and "allow_once" or "deny"
     end
     if approval_ui and approval_ui.hide then pcall(approval_ui.hide) end
-    if hub_id then
-      pcall(require("NeoAI.sandbox.review.approval_hub").resolve, hub_id, value)
+    if mirror_id then
+      pcall(require("NeoAI.sandbox.review.approval_hub").resolve, mirror_id, value)
+      mirror_id = nil
+      if type(item) == "table" then item.mirror_id = nil end
     end
     decision_cb(value ~= "deny", reason)
   end
@@ -257,7 +285,26 @@ local function _show_approval(tool_name, args, decision_cb, ctx)
         detail[#detail + 1] = "参数: " .. js
       end
     end
-    hub_id = hub.submit(page, {
+    -- 资源访问页：命中的遮蔽路径若属于凭据/密钥文件（~/.ssh/id_rsa、*.pem、.env 等），
+    -- 在条目里直接标明「密钥」，让用户在批准资源访问前就知道这次读的是密钥材料
+    -- （而不是只看到一条普通目录路径）。判定用密钥模块的严口径规则，避免误标。
+    local secret_path
+    if page == "resource" and type(ctx) == "table" and type(ctx.sandbox_unmask) == "table" then
+      local oksec, secret = pcall(require, "NeoAI.sandbox.secret.secret")
+      if oksec and secret then
+        for _, p in ipairs(ctx.sandbox_unmask) do
+          if type(p) == "string" and ((secret.is_sensitive_path and secret.is_sensitive_path(p))
+            or (secret.is_secret_path and secret.is_secret_path(p))) then
+            secret_path = p
+            break
+          end
+        end
+      end
+      if secret_path then
+        detail[#detail + 1] = "🔑 密钥: " .. tostring(secret_path) .. "（凭据/密钥文件）"
+      end
+    end
+    mirror_id = hub.submit(page, {
       title = tool_name,
       detail = detail,
       on_decision = function(v)
@@ -268,11 +315,20 @@ local function _show_approval(tool_name, args, decision_cb, ctx)
       meta = { tool_name = tool_name,
         -- 资源访问页：记录命中的遮蔽路径，供审批悬浮窗「W」便捷加入工作目录。
         masked = page == "resource" and type(ctx.sandbox_unmask) == "table"
-          and ctx.sandbox_unmask[1] or nil },
+          and ctx.sandbox_unmask[1] or nil,
+        -- 资源访问页：该条目命中的密钥路径（供悬浮窗标「🔑 密钥」标签）。
+        secret_path = secret_path },
     })
+    -- 回填到队列条目：超时 / 展示失败 / 窗口关闭取消等退出路径据此清理镜像条目
+    -- （否则条目永久 pending → Herder pane 一直 blocked）。
+    if type(item) == "table" then item.mirror_id = mirror_id end
     -- 弹窗在提交镜像前已同步决策（如 fake UI 在 show 内即回调）：清掉刚建的镜像条目，
     -- 避免悬浮窗残留「待批准」（此处用 hub.clear 不触发 on_decision，防重复决策）。
-    if done then pcall(hub.clear, hub_id) end
+    if done and mirror_id then
+      pcall(hub.clear, mirror_id)
+      mirror_id = nil
+      if type(item) == "table" then item.mirror_id = nil end
+    end
   end
 end
 
@@ -302,10 +358,11 @@ local function _drain_approval_queue()
     -- on_confirm() 返回后还会调用 _close()；若这里同步打开下一个弹窗，会被那个
     -- _close() 立即关掉，导致下一个工具的 Deferred 永不 settle，工具循环卡在第一轮。
     vim.schedule(_drain_approval_queue)
-  end, item.ctx)
+  end, item.ctx, item)
   if not show_ok then
     local d = item.d
     item.d = nil
+    _settle_blocking(item, false, "审批弹窗展示失败: " .. tostring(show_err))
     if d and d:is_pending() then
       d:reject({ kind = "approval", message = "审批弹窗展示失败: " .. tostring(show_err) })
     end
@@ -317,6 +374,8 @@ local function _drain_approval_queue()
   -- 审批超时兜底：弹窗被覆盖/丢失或用户长时间不响应时，拒绝而不是永久挂起，
   -- 否则工具循环会无限等待（表现为"卡住"）。超时后由 _execute_single 转成工具错误结果。
   -- 条目一旦决策（item.d = nil），超时即失效，不干扰已批准工具的执行。
+  -- 超时也必须结算阻塞账目并清掉审批中心镜像条目：否则 Herder 侧计数永久 +1、
+  -- 悬浮窗残留「待批准」，pane 停在「等待确认」不回「运行中」。
   local timeout_ms = config_store.get("tools.approval.timeout_ms")
   if timeout_ms and timeout_ms > 0 then
     vim.defer_fn(function()
@@ -324,8 +383,12 @@ local function _drain_approval_queue()
       if approval_ui and approval_ui.hide then
         pcall(approval_ui.hide)
       end
-      item.d:reject({ kind = "approval", message = "工具审批超时: " .. item.tool_name })
+      local d = item.d
       item.d = nil
+      _settle_blocking(item, false, "工具审批超时: " .. item.tool_name)
+      if d and d:is_pending() then
+        d:reject({ kind = "approval", message = "工具审批超时: " .. item.tool_name })
+      end
       _settle()
       vim.schedule(_drain_approval_queue)
     end, timeout_ms)
@@ -438,16 +501,24 @@ function M.execute(agent, tool_name, args, tool_call_id, opts)
 end
 
 --- 拒绝队列中所有待审批工具（窗口关闭/取消）。
---- 必须 reject 挂起的 Deferred 并释放串行槽位，否则工具循环会永久挂起。
+--- 必须 reject 挂起的 Deferred 并释放串行槽位，否则工具循环会永久挂起；
+--- 同时为每一条已发过 TOOL_APPROVAL_REQUESTED 的条目补发终局事件并清理审批中心镜像条目，
+--- 否则 Herder 侧的 blocked 计数永久残留（pane 停在「等待确认」不回「运行中」）。
 function M.clear_approval()
-  if state.current_approval and state.current_approval.d and state.current_approval.d:is_pending() then
-    state.current_approval.d:reject({ kind = "approval", message = "审批已取消（窗口关闭）" })
-    state.current_approval.d = nil
-  end
-  for _, item in ipairs(state.approval_queue) do
+  if state.current_approval then
+    local item = state.current_approval
+    _settle_blocking(item, false, "审批已取消（窗口关闭）")
     if item.d and item.d:is_pending() then
       item.d:reject({ kind = "approval", message = "审批已取消（窗口关闭）" })
     end
+    item.d = nil
+  end
+  for _, item in ipairs(state.approval_queue) do
+    _settle_blocking(item, false, "审批已取消（窗口关闭）")
+    if item.d and item.d:is_pending() then
+      item.d:reject({ kind = "approval", message = "审批已取消（窗口关闭）" })
+    end
+    item.d = nil
   end
   state.approval_queue = {}
   state.current_approval = nil

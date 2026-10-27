@@ -71,6 +71,15 @@ local function _guard_secret_context(agent, messages)
     leaked = secret.context_leak(messages)
   end
   if not leaked then return true end
+  -- 本会话已放行（用户此前同意过该密钥）：不再弹窗、不再终止 Agent，仅留痕 + 首次提示一次。
+  if secret.is_allowed and secret.is_allowed(leaked) then
+    secret.trace("allowed_context", { tool = "request", agent_id = agent and agent.id })
+    if secret.take_allow_notice and secret.take_allow_notice(leaked) then
+      pcall(vim.notify, "[NeoAI] 本会话已允许该真实密钥继续使用，上下文命中不再询问",
+        vim.log.levels.INFO)
+    end
+    return true
+  end
   secret.trace("context_blocked", { tool = "request", agent_id = agent and agent.id })
   local err = { kind = "secret", message = "SANDBOX_SECRET_BLOCKED: AI 上下文包含原始密钥，已终止 Agent" }
   local function stop()
@@ -97,6 +106,10 @@ local function _guard_secret_context(agent, messages)
     secret = leaked, secret_preview = tostring(leaked):sub(1, 6) .. "…", fake = fake,
   }):then_(function(decision)
     if decision == "stop" then return stop() end
+    -- 用户同意：登记会话放行，之后同一密钥的上下文命中不再询问/终止（留痕 + 首次提示）。
+    if decision == "allow_once" and secret.allow_for_session then
+      secret.allow_for_session(leaked)
+    end
     if decision == "fake" and fake then
       -- 替换为假密钥并继续：脱去 wire 消息与历史消息中的真实密钥，避免后续轮次再次泄漏。
       pcall(function() secret.replace_value(messages, leaked, fake) end)
