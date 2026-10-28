@@ -3432,7 +3432,12 @@ function M.finish(attempt_id, prefetch, classify)
           path = real,
           action = action,
           before_hash = entry.base_hash,
-          before_sig = entry.base_sig,
+          -- 超大文件（> tools.sandbox.max_file_bytes）在 `_base_hash_worker` 中**按设计不读内容**
+          -- → base_hash 为 nil。删除类候选的 CAS 需要基线，故退化为 stat 签名
+          -- （publish 的 delete 分支支持 `before_sig`）；否则该删除会永久卡在
+          -- `CONFLICT: BASELINE_CHANGED`（实测：删除 10.5MB 的 wheels/*.whl 必然失败）。
+          before_sig = entry.base_sig or ((action == "delete" and entry.base_type == "file"
+            and not entry.base_hash) and _stat_sig(vim.uv.fs_stat(real)) or nil),
           after_hash = after_hash,
           base_exists = entry.base_exists,
           base_type = entry.base_type,
@@ -4264,10 +4269,20 @@ function M.publish(candidate, opts)
           return { ok = false, state = "CONFLICT", reason = "TARGET_ALREADY_EXISTS: " .. f.path }
         end
       else
+        local is_del = (f.action == "delete" or f.action == "rmdir")
         if not exists then
-          return { ok = false, state = "CONFLICT", reason = "TARGET_MISSING: " .. f.path }
+          -- 删除幂等：目标已被外部删除时视为「已满足」，不视为冲突（与 writer 的删除语义一致）。
+          -- 否则一个删除候选在目标消失后会被永久卡在 CAS 冲突里无法结算。
+          if is_del then
+            -- 跳过该条（`applied` 计数由后续 `action=nil` 分支处理）
+            skip_paths[f.path] = "deleted"
+          else
+            return { ok = false, state = "CONFLICT", reason = "TARGET_MISSING: " .. f.path }
+          end
         end
-        if f.base_type == "link" then
+        if skip_paths[f.path] == "deleted" then
+          -- 目标不存在：无需再校验基线。
+        elseif f.base_type == "link" then
           -- 基线是符号链接（disable/替换）：用 lstat/readlink 做 CAS。
           if lstat.type ~= "link" or vim.uv.fs_readlink(f.path) ~= f.before_hash then
             return { ok = false, state = "CONFLICT", reason = "BASELINE_CHANGED: " .. f.path }
@@ -4277,6 +4292,17 @@ function M.publish(candidate, opts)
             -- 超大文件：用 stat 签名做 CAS（不读取数百 MB 内容）。
             if _stat_sig(stat) ~= f.before_sig then
               return { ok = false, state = "CONFLICT", reason = "BASELINE_CHANGED: " .. f.path }
+            end
+          elseif f.before_hash then
+            local cur = _read(f.path)
+            if _sha(cur) ~= f.before_hash then
+              return { ok = false, state = "CONFLICT", reason = "BASELINE_CHANGED: " .. f.path }
+            end
+          elseif is_del then
+            -- 删除候选缺少基线（历史候选/超大文件未哈希）：无法做 CAS，放行删除
+            -- （删除本身是幂等且可恢复的；卡在 BASELINE_CHANGED 会让单元永久无法结算）。
+            if trace_log.enabled() then
+              trace_log.log("publish delete-no-baseline allow path=%s", tostring(f.path))
             end
           else
             local cur = _read(f.path)

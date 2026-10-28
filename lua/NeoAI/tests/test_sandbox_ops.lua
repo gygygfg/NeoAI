@@ -1256,8 +1256,7 @@ tests.suite("sandbox_ops", function(_, it)
     vim.fn.delete(root, "rf")
   end)
 
-  it("发布（异步）：同一候选内 rmdir 目录 + 该目录下写入同样按目录重建", function(t)
-    local fs = require("NeoAI.utils.fs")
+  it("发布（异步）：同一候选内 rmdir 目录 + 该目录下写入同样按目录重建", function(t)    local fs = require("NeoAI.utils.fs")
     local candidate = require("NeoAI.sandbox.execution.candidate")
     local root = fs.canonical(vim.fn.tempname())
     local d = root .. "/d"
@@ -1277,6 +1276,104 @@ tests.suite("sandbox_ops", function(_, it)
     t.eq("NEW\n", fs.read_file(d .. "/sub/new.txt"), "新文件应写入")
     t.eq(nil, io.open(d .. "/old.txt"), "旧残留应被清理")
     vim.fn.delete(root, "rf")
+  end)
+
+  it("发布：删除超大文件（> max_file_bytes，无内容哈希）必须有 stat 签名基线并可应用", function(t)
+    -- 回归：`_base_hash_worker` 对 > max_file_bytes 的文件按设计不读内容 → base_hash=nil，
+    -- 删除候选因此在 CAS 处永久 BASELINE_CHANGED（实测：删除 10.5MB 的 wheels/*.whl 必失败）。
+    local fs = require("NeoAI.utils.fs")
+    local candidate = require("NeoAI.sandbox.execution.candidate")
+    local root = fs.canonical(vim.fn.tempname())
+    fs.ensure_dir(root)
+    local big = root .. "/big.whl"
+    fs.write_file(big, string.rep("A", 9 * 1024 * 1024))
+    local st = vim.uv.fs_stat(big)
+    local sig = ("sig:%s:%s:%s"):format(tostring(st.mtime.sec), tostring(st.mtime.nsec), tostring(st.size))
+    local res = candidate.publish({
+      candidate_digest = "sha256:del_big_sig",
+      files = {
+        { path = big, action = "delete", base_exists = true, base_type = "file", before_sig = sig },
+      },
+    })
+    t.true_(res.ok, "带 stat 签名的超大文件删除应成功: " .. tostring(res.reason))
+    t.eq(nil, io.open(big), "文件应被删除")
+    vim.fn.delete(root, "rf")
+  end)
+
+  it("发布：删除无基线（历史候选）或目标已消失时幂等成功（不卡在 CONFLICT）", function(t)
+    local fs = require("NeoAI.utils.fs")
+    local candidate = require("NeoAI.sandbox.execution.candidate")
+    local root = fs.canonical(vim.fn.tempname())
+    fs.ensure_dir(root)
+    -- 1) 目标已不存在
+    local gone = root .. "/gone.txt"
+    local res = candidate.publish({
+      candidate_digest = "sha256:del_gone_idem",
+      files = { { path = gone, action = "delete", base_exists = true, base_type = "file" } },
+    })
+    t.true_(res.ok, "目标已不存在的删除应幂等成功: " .. tostring(res.reason))
+    -- 2) 目标存在但候选缺基线（历史候选：超大文件未哈希 → before_hash/before_sig 均 nil）
+    local exists = root .. "/nobase.txt"
+    fs.write_file(exists, "X\n")
+    local res2 = candidate.publish({
+      candidate_digest = "sha256:del_nobase",
+      files = { { path = exists, action = "delete", base_exists = true, base_type = "file" } },
+    })
+    t.true_(res2.ok, "无基线的删除候选应放行: " .. tostring(res2.reason))
+    t.eq(nil, io.open(exists), "文件应被删除")
+    vim.fn.delete(root, "rf")
+  end)
+
+  it("捕获：超大文件的 whiteout 会补 stat 签名基线（保证删除候选可发布）", function(t)
+    local fs = require("NeoAI.utils.fs")
+    local sandbox = require("NeoAI.sandbox")
+    local candidate = require("NeoAI.sandbox.execution.candidate")
+    local control = require("NeoAI.sandbox.execution.control")
+    local store = require("NeoAI.sandbox.state.store")
+    local function await(d, timeout)
+      local done, val, err = false, nil, nil
+      d:then_(function(v) val = v; done = true end, function(e) err = e; done = true end)
+      vim.wait(timeout or 30000, function() return done end, 10)
+      return val, err
+    end
+    with_config({ tools = { sandbox = { workspace_root = vim.fn.tempname() .. "/sb" } } }, function()
+      sandbox.reset()
+      local dir = fs.canonical(vim.fn.tempname())
+      local base = vim.fn.tempname()
+      local upper = base .. "/upper"
+      fs.ensure_dir(dir)
+      fs.ensure_dir(upper)
+      local big = dir .. "/big.whl"
+      fs.write_file(big, string.rep("B", 9 * 1024 * 1024))
+      -- overlay whiteout 标记：真实 overlay 用 `0:0` 字符设备表示被删除的 lower 文件。
+      local mok = vim.fn.system({ "mknod", upper .. "/big.whl", "c", "0", "0" })
+      if vim.v.shell_error ~= 0 then
+        vim.fn.delete(dir, "rf"); vim.fn.delete(base, "rf")
+        return -- 环境不允许 mknod（非特权容器）：跳过
+      end
+      t.eq(0, vim.v.shell_error, "应能创建 whiteout 设备节点: " .. tostring(mok))
+      local a = control.new_attempt("run_command", { command = "rm big.whl" }, {}, { effect = "process" })
+      a.package = true
+      candidate.begin(a, assert(store.root()))
+      local _, err = await(candidate.capture_overlay_async(a.attempt_id, dir, upper, nil,
+        { package = true, since = os.time() }))
+      t.eq(nil, err, "捕获应完成")
+      local cand, ferr = await(candidate.finish_async(a.attempt_id, { blob = true, classify = true }))
+      t.eq(nil, ferr, "冻结应完成")
+      local entry
+      for _, f in ipairs((cand and cand.files) or {}) do
+        if f.path == big then entry = f end
+      end
+      t.not_nil(entry, "应登记该删除")
+      t.eq("delete", entry.action, "动作应为 delete")
+      t.not_nil(entry.before_sig, "超大文件删除必须带 stat 签名基线（否则 CAS 永远失败）")
+      local pub = candidate.publish(cand)
+      t.true_(pub.ok, "该删除候选应可发布: " .. tostring(pub.reason))
+      t.eq(nil, io.open(big), "真实文件应被删除")
+      candidate.cleanup(a.attempt_id)
+      vim.fn.delete(dir, "rf")
+      vim.fn.delete(base, "rf")
+    end)
   end)
 
 

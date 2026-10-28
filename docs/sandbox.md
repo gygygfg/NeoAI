@@ -363,6 +363,12 @@ token（`NEOKEY_…`）或格式保真假密钥时**拒绝写盘**（`SECRET_TOK
     并在批量应用会话中逐项让出主循环。
   - **删除/rmdir 幂等**：发布时目标已不存在（被外部删除）不再视为失败——`delete`/`rmdir` 均
     以「删除成功或删除后目标已不存在」为成功，避免 `WRITE_FAILED: ... rmdir 失败` 误报。
+    CAS 预检同样按此处理：删除类候选的目标已消失时视为「已满足」而非 `TARGET_MISSING` 冲突。
+  - **超大文件的删除基线**：内容超过 `tools.sandbox.max_file_bytes`（默认 8MB）的文件不做内容
+    哈希（避免读数百 MB），但**删除**候选仍需基线做 CAS——此类删除改用 stat 签名
+    （`sig:mtime.nsec:size`，`before_sig`）。历史候选若连基线都没有（旧版本冻结），删除本身幂等
+    可恢复，故放行而不是永久卡在 `BASELINE_CHANGED`（实测：删除 10.5MB 的 `wheels/*.whl`
+    曾必然失败）。
   - **递归删除目录的捕获补全**：`rm -rf <dir>` 在 overlay 中可能只在父目录留下**目录本身**的
     whiteout，而不逐子项留 whiteout。若据此只生成一条 `rmdir`，则候选与真实盘不一致：审批界面
     看似「空目录」，应用时 `rmdir` 却命中非空目录（`ENOTEMPTY`）失败。捕获阶段（同步

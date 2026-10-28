@@ -627,7 +627,15 @@ is only kept for other `approval.mode` values (`prompt`/`strict`).
         async publish by default and yields the main loop per item in a batch-apply session.
       - **Idempotent delete/rmdir**: publishing no longer fails when the target is already gone
         (removed externally) — `delete`/`rmdir` succeed when the removal succeeded **or** the target
-        no longer exists, avoiding spurious `WRITE_FAILED: ... rmdir` errors.
+        no longer exists, avoiding spurious `WRITE_FAILED: ... rmdir` errors. The CAS precheck follows
+        the same rule: a delete candidate whose target vanished counts as satisfied, not
+        `TARGET_MISSING`.
+      - **Baseline for very large deletions**: files above `tools.sandbox.max_file_bytes` (8MB) are
+        deliberately not content-hashed (that would read hundreds of MB), but a **delete** candidate
+        still needs a baseline for CAS — such deletions use the stat signature
+        (`sig:mtime.nsec:size`, `before_sig`). Legacy candidates with no baseline at all (frozen by an
+        older version) are **allowed** rather than stuck forever on `BASELINE_CHANGED`, since a delete
+        is idempotent and recoverable (measured: deleting a 10.5MB `wheels/*.whl` used to always fail).
       - **Recursive directory deletion capture completion**: `rm -rf <dir>` may leave only a whiteout
         for the **directory itself** in the overlay upper, with no per-child whiteouts. Producing a
         single `rmdir` from that makes the change unit disagree with the real disk: the review UI looks
