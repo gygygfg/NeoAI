@@ -1278,6 +1278,120 @@ tests.suite("sandbox_ops", function(_, it)
     vim.fn.delete(root, "rf")
   end)
 
+  it("发布：嵌套删除按「子先于父」排列（比较器必须是严格弱序，否则 rmdir 早于子项 → ENOTEMPTY）", function(t)
+    -- 回归：旧 `_apply_order` 用「成对祖先比较 + 字典序兜底」，非传递；`table.sort` 结果未定义。
+    -- 实测 8012 文件的包安装单元里有 489 处子项删除被排在父 rmdir 之后 → RMDIR_NOT_EMPTY。
+    local fs = require("NeoAI.utils.fs")
+    local candidate = require("NeoAI.sandbox.execution.candidate")
+    local root = fs.canonical(vim.fn.tempname())
+    local pkgs = root .. "/dist-packages"
+    local files = {}
+    for i = 1, 12 do
+      local pkg = ("%s/pkg%02d"):format(pkgs, i)
+      local pycache = pkg .. "/__pycache__"
+      fs.ensure_dir(pycache)
+      for _, p in ipairs({
+        pkg .. "/__init__.py", pkg .. "/_ext.so", pycache .. "/__init__.cpython-313.pyc",
+        pkgs .. ("/pkg%02d-1.0.dist-info/METADATA"):format(i),
+      }) do
+        fs.write_file(p, "x\n")
+        files[#files + 1] = { path = p, action = "delete", base_exists = true, base_type = "file" }
+      end
+      local metadir = ("%s/pkg%02d-1.0.dist-info"):format(pkgs, i)
+      files[#files + 1] = { path = metadir, action = "rmdir", base_exists = true, base_type = "directory" }
+      files[#files + 1] = { path = pycache, action = "rmdir", base_exists = true, base_type = "directory" }
+      files[#files + 1] = { path = pkg, action = "rmdir", base_exists = true, base_type = "directory" }
+    end
+    files[#files + 1] = { path = pkgs, action = "rmdir", base_exists = true, base_type = "directory" }
+    local res = candidate.publish({ candidate_digest = "sha256:order_nested_del", files = files })
+    t.true_(res.ok, "嵌套删除应全部成功（顺序错误会报 RMDIR_NOT_EMPTY）: " .. tostring(res.reason))
+    t.eq(0, #((res and res.failed) or {}), "不应有失败条目")
+    t.eq(nil, vim.uv.fs_lstat(pkgs), "整棵目录树应被删除")
+    vim.fn.delete(root, "rf")
+  end)
+
+  it("发布：create 目标已存在且内容已是候选结果 → 幂等跳过（不报 TARGET_ALREADY_EXISTS）", function(t)
+    local fs = require("NeoAI.utils.fs")
+    local candidate = require("NeoAI.sandbox.execution.candidate")
+    local root = fs.canonical(vim.fn.tempname())
+    fs.ensure_dir(root)
+    local p = root .. "/q1_ensemble.py"
+    fs.write_file(p, "SAME\n")
+    local same_hash = "sha256:" .. vim.fn.sha256("SAME\n")
+    local ok = candidate.publish({
+      candidate_digest = "sha256:create_idem",
+      files = {
+        { path = p, action = "create", content = "SAME\n", after_hash = same_hash },
+      },
+    })
+    t.true_(ok.ok, "内容一致时 create 应幂等成功: " .. tostring(ok.reason))
+    t.eq("SAME\n", fs.read_file(p), "内容不应被改写")
+    -- 内容不同 → 仍然是真冲突（绝不静默覆盖外部改动）
+    local conflict = candidate.publish({
+      candidate_digest = "sha256:create_conflict",
+      files = {
+        { path = p, action = "create", content = "OTHER\n",
+          after_hash = "sha256:" .. vim.fn.sha256("OTHER\n") },
+      },
+    })
+    t.false_(conflict.ok, "内容不同时 create 应冲突")
+    t.matches("TARGET_ALREADY_EXISTS", tostring(conflict.reason), "应报 TARGET_ALREADY_EXISTS")
+    t.eq("SAME\n", fs.read_file(p), "冲突时不得覆盖")
+    vim.fn.delete(root, "rf")
+  end)
+
+  it("部分应用：失败 rmdir 回队时必须带上其子项删除（否则重试永远 ENOTEMPTY）", function(t)
+    local fs = require("NeoAI.utils.fs")
+    local sandbox = require("NeoAI.sandbox")
+    local store = require("NeoAI.sandbox.state.store")
+    local review = require("NeoAI.sandbox.review.review")
+    with_config({ tools = { sandbox = { workspace_root = vim.fn.tempname() .. "/sb" } } }, function()
+      store.init(vim.fn.tempname())
+      review.reset()
+      sandbox.reset()
+      local root = fs.canonical(vim.fn.tempname())
+      local d = root .. "/pkg"
+      fs.ensure_dir(d)
+      fs.write_file(d .. "/a.py", "A\n")
+      fs.write_file(d .. "/b.py", "B\n")
+      -- 额外文件：不在候选里 → rmdir 必然失败（模拟「宿主出现候选未覆盖的残留」）
+      fs.write_file(d .. "/extra.py", "E\n")
+      local cand = {
+        candidate_digest = "sha256:requeue_rmdir_children",
+        files = {
+          { path = d, action = "rmdir", base_exists = true, base_type = "directory" },
+          { path = d .. "/a.py", action = "delete", base_exists = true, base_type = "file" },
+          { path = d .. "/b.py", action = "delete", base_exists = true, base_type = "file" },
+        },
+        effect = "fs_write",
+      }
+      store.write_candidate(cand)
+      local item = assert(review.enqueue(cand))
+      sandbox.approve(item.change_set_id)
+      local r = sandbox.apply(item.change_set_id, { auto_approve = true })
+      t.eq("PARTIAL", tostring(r and r.state), "应部分应用（rmdir 因 extra.py 失败）")
+      local requeued
+      for _, it in ipairs(sandbox.list_reviews({ review_state = "PENDING" }) or {}) do
+        if it.change_set_id ~= item.change_set_id then requeued = it end
+      end
+      t.not_nil(requeued, "失败项应回队")
+      local got = {}
+      for _, f in ipairs(requeued.files or {}) do got[f.path] = f.action end
+      t.eq("rmdir", tostring(got[d]), "回队应含 rmdir")
+      t.eq("delete", tostring(got[d .. "/a.py"]), "回队应含已应用的子项删除（幂等重放）")
+      t.eq("delete", tostring(got[d .. "/b.py"]), "回队应含已应用的子项删除（幂等重放）")
+      -- 清掉宿主残留后重试应成功
+      pcall(vim.fn.delete, d .. "/extra.py")
+      sandbox.approve(requeued.change_set_id)
+      local r2 = sandbox.apply(requeued.change_set_id, { auto_approve = true })
+      t.true_(r2 and r2.ok, "重试应成功: " .. tostring(r2 and r2.reason))
+      t.eq(nil, vim.uv.fs_lstat(d), "目录应被删除")
+      vim.fn.delete(root, "rf")
+    end)
+  end)
+
+    -- 回归：`_base_hash_worker` 对 > max_file_bytes 的文件按设计不读内容 → base_hash=nil，
+    -- 删除候选因此在 CAS 处永久 BASELINE_CHANGED（实测：删除 10.5MB 的 wheels/*.whl 必失败）。
   it("发布：删除超大文件（> max_file_bytes，无内容哈希）必须有 stat 签名基线并可应用", function(t)
     -- 回归：`_base_hash_worker` 对 > max_file_bytes 的文件按设计不读内容 → base_hash=nil，
     -- 删除候选因此在 CAS 处永久 BASELINE_CHANGED（实测：删除 10.5MB 的 wheels/*.whl 必失败）。

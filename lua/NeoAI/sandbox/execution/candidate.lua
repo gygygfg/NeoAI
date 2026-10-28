@@ -3687,8 +3687,13 @@ function M.finish_async(attempt_id, opts)
 end
 
 --- 发布应用顺序：删除/rmdir 先于写入，且同组内「子路径先于父路径」（删除）/
---- 「父路径先于子路径」（写入）。否则 `rm -rf <dir>` 产生的候选会按路径升序先对
---- 非空父目录 rmdir，导致整个变更单元 WRITE_FAILED。
+--- 「父路径先于子路径」（写入）。否则 `rm -rf <dir>` 产生的候选会先对非空父目录 rmdir，
+--- 导致整个变更单元 WRITE_FAILED。
+---
+--- 实现必须用**严格弱序**（按深度排序），不能写成「成对祖先比较 + 字典序兜底」：
+--- 后者不是传递关系（父子规则与字典序可构成环），`table.sort` 在非传递比较器下结果未定义。
+--- 实测（8012 文件的包安装单元）会出现 `rmdir` 排在子项删除**之前**——共 489 处——
+--- 于是 rmdir 命中非空目录，报 `WRITE_FAILED: ... RMDIR_NOT_EMPTY`。
 --- @param files table
 --- @return table 排序后的副本
 local function _apply_order(files)
@@ -3696,7 +3701,8 @@ local function _apply_order(files)
   local out = {}
   for i, f in ipairs(files) do out[i] = f end
   local function is_del(f) return f.action == "delete" or f.action == "rmdir" end
-  local function is_ancestor(a, b) return #a < #b and b:sub(1, #a + 1) == a .. "/" end
+  --- 路径深度（`/a/b/c` → 3）；同深度再按字典序，保证比较器传递。
+  local function depth(p) return select(2, p:gsub("/", "")) end
   -- 原子顺序：git 对象库（不可变/可累加）→ 普通文件 → git 指针（index/refs/HEAD）。
   -- 对象先于指针，保证任何被写入的索引/refs 所引用的对象都已存在（绝不悬空）。
   local function rank(f)
@@ -3710,8 +3716,12 @@ local function _apply_order(files)
     if ra ~= rb then return ra < rb end
     local da, db = is_del(a), is_del(b)
     if da ~= db then return da end
-    if is_ancestor(a.path, b.path) then return not da end
-    if is_ancestor(b.path, a.path) then return da end
+    if da then
+      -- 删除：深度降序（子先于父），同深度按路径。
+      local la, lb = depth(a.path), depth(b.path)
+      if la ~= lb then return la > lb end
+    end
+    -- 写入：字典序（父路径是子路径的前缀，故天然「父先于子」）。
     return a.path < b.path
   end)
   return out
@@ -4211,6 +4221,32 @@ function M.publish(candidate, opts)
     end
     return false
   end
+  --- 目标已存在时，其内容是否**已经是候选结果**（幂等判定：该改动此前已落盘）。
+  --- 仅用于 `create`/`mkdir` 的冲突路径，不改变正常写入语义。
+  --- @param f table 候选文件条目
+  --- @param stat table|nil 目标 stat
+  --- @param lstat table|nil 目标 lstat
+  --- @return boolean
+  local function _already_applied(f, stat, lstat)
+    if f.action == "mkdir" then return (lstat and lstat.type == "directory") == true end
+    if not (stat and stat.type == "file") then return false end
+    -- 有 blob（大文件/包内容）：以内容为准（签名模式下的 sig 是暂存侧签名，不能与宿主比）。
+    if f.blob then
+      local want = _read(f.blob)
+      local cur = _read(f.path)
+      return want ~= nil and cur ~= nil and want == cur
+    end
+    local after = f.after_hash
+    if type(after) == "string" and after:sub(1, 7) == "sha256:" then
+      local cur = _read(f.path)
+      return cur ~= nil and _sha(cur) == after -- `_sha` 自带 `sha256:` 前缀
+    end
+    if type(after) == "string" and after:sub(1, 4) == "sig:" then
+      return _stat_sig(stat) == after
+    end
+    return false
+  end
+
   for _, f in ipairs(candidate.files or {}) do
     local gc = f.git_class or runtime.git_path_class(f.path)
     if gc ~= "object" and not under_recreated(f.path) then
@@ -4266,7 +4302,13 @@ function M.publish(candidate, opts)
         end
       elseif f.action == "create" or f.action == "mkdir" then
         if exists then
-          return { ok = false, state = "CONFLICT", reason = "TARGET_ALREADY_EXISTS: " .. f.path }
+          -- 幂等：目标已存在且内容已是候选结果（该单元先前被部分应用过、或同一改动已经由
+          -- 另一单元落盘）→ 视为已满足并跳过；内容不同才是真冲突（绝不静默覆盖外部改动）。
+          if _already_applied(f, stat, lstat) then
+            skip_paths[f.path] = "exists"
+          else
+            return { ok = false, state = "CONFLICT", reason = "TARGET_ALREADY_EXISTS: " .. f.path }
+          end
         end
       else
         local is_del = (f.action == "delete" or f.action == "rmdir")
@@ -4288,27 +4330,29 @@ function M.publish(candidate, opts)
             return { ok = false, state = "CONFLICT", reason = "BASELINE_CHANGED: " .. f.path }
           end
         elseif stat and stat.type == "file" then
+          -- 基线是否仍与候选一致（change 尚未发生）。
+          local same_before = false
           if f.before_sig then
             -- 超大文件：用 stat 签名做 CAS（不读取数百 MB 内容）。
-            if _stat_sig(stat) ~= f.before_sig then
-              return { ok = false, state = "CONFLICT", reason = "BASELINE_CHANGED: " .. f.path }
-            end
+            same_before = (_stat_sig(stat) == f.before_sig)
           elseif f.before_hash then
             local cur = _read(f.path)
-            if _sha(cur) ~= f.before_hash then
-              return { ok = false, state = "CONFLICT", reason = "BASELINE_CHANGED: " .. f.path }
-            end
-          elseif is_del then
+            same_before = (cur ~= nil and _sha(cur) == f.before_hash)
+          end
+          if same_before then
+            -- 基线未变：按候选写入。
+          elseif _already_applied(f, stat, lstat) then
+            -- 幂等：真实内容**已经是候选结果**（该改动此前已由本单元的部分应用或另一单元落盘）
+            -- → 跳过，不再报 BASELINE_CHANGED。重试/重复审批历史单元因此可以收敛。
+            skip_paths[f.path] = "applied"
+          elseif is_del and not f.before_sig and not f.before_hash then
             -- 删除候选缺少基线（历史候选/超大文件未哈希）：无法做 CAS，放行删除
             -- （删除本身是幂等且可恢复的；卡在 BASELINE_CHANGED 会让单元永久无法结算）。
             if trace_log.enabled() then
               trace_log.log("publish delete-no-baseline allow path=%s", tostring(f.path))
             end
           else
-            local cur = _read(f.path)
-            if _sha(cur) ~= f.before_hash then
-              return { ok = false, state = "CONFLICT", reason = "BASELINE_CHANGED: " .. f.path }
-            end
+            return { ok = false, state = "CONFLICT", reason = "BASELINE_CHANGED: " .. f.path }
           end
         end
       end
@@ -4360,7 +4404,7 @@ function M.publish(candidate, opts)
         end)
       end
     elseif f.action == "mkdir" then
-      action = "mkdir"
+      if skip_paths[f.path] then action = nil else action = "mkdir" end
     elseif f.action == "delete" then
       action = "delete"
     elseif f.action == "rmdir" then

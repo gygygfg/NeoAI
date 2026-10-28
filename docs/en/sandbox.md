@@ -630,12 +630,30 @@ is only kept for other `approval.mode` values (`prompt`/`strict`).
         no longer exists, avoiding spurious `WRITE_FAILED: ... rmdir` errors. The CAS precheck follows
         the same rule: a delete candidate whose target vanished counts as satisfied, not
         `TARGET_MISSING`.
+      - **CAS idempotency (content already equals the candidate result)**: when a `create`/`modify`
+        target already exists and its **content is exactly the candidate result** (`after_hash`
+        matches, or the large-file blob compares equal), it counts as **already applied** and is
+        skipped instead of failing with `TARGET_ALREADY_EXISTS` / `BASELINE_CHANGED`; differing
+        content is still a conflict (external changes are never silently overwritten). This lets
+        "retry a requeued unit", "re-approve a historic unit" and "the same change already landed via
+        another unit" all converge.
+      - **Apply order must be a strict weak order**: `_apply_order` sorts by
+        `(git rank, deletes-first, depth, path)` — deletes by **descending** depth (children before
+        parents), writes by plain path order (a parent path is a prefix of its children, so parents
+        come first naturally). Never use "pairwise ancestor checks + lexicographic fallback": that
+        comparator is not transitive and `table.sort` is undefined for it — measured on an 8012-file
+        unit, **489** child deletes were scheduled after their parent `rmdir` → `RMDIR_NOT_EMPTY`.
+      - **Requeued failed rmdir carries its child deletes**: on partial apply, the requeued unit
+        re-includes the deletes of that directory's children from the original candidate (already
+        applied children are skipped idempotently on retry); otherwise the requeued unit holds a lone
+        `rmdir` that hits a non-empty directory and fails with `RMDIR_NOT_EMPTY` forever.
       - **Baseline for very large deletions**: files above `tools.sandbox.max_file_bytes` (8MB) are
         deliberately not content-hashed (that would read hundreds of MB), but a **delete** candidate
         still needs a baseline for CAS — such deletions use the stat signature
         (`sig:mtime.nsec:size`, `before_sig`). Legacy candidates with no baseline at all (frozen by an
         older version) are **allowed** rather than stuck forever on `BASELINE_CHANGED`, since a delete
         is idempotent and recoverable (measured: deleting a 10.5MB `wheels/*.whl` used to always fail).
+
       - **Recursive directory deletion capture completion**: `rm -rf <dir>` may leave only a whiteout
         for the **directory itself** in the overlay upper, with no per-child whiteouts. Producing a
         single `rmdir` from that makes the change unit disagree with the real disk: the review UI looks

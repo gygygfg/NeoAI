@@ -1381,6 +1381,27 @@ local function _apply_settle(ctx, pub)
       local f = by_path[x.path]
       if f then ctx.remaining[#ctx.remaining + 1] = f end
     end
+    -- 失败的 `rmdir` 必须把它在原候选里的**子项删除**一起回队：子项通常已在本次成功应用，
+    -- 若不回队，重试单元只剩一条 rmdir，命中非空目录 → 永远 `RMDIR_NOT_EMPTY`（无限失败）。
+    -- 已应用的子项在重试时按「删除幂等」跳过，故重复回队无副作用。
+    do
+      local seen = {}
+      for _, f in ipairs(ctx.remaining) do seen[f.path] = true end
+      local extra = {}
+      for _, f in ipairs(ctx.remaining) do
+        if f.action == "rmdir" then
+          local pre = f.path .. "/"
+          for _, g in ipairs(ctx.cand.files or {}) do
+            if (g.action == "delete" or g.action == "rmdir")
+              and g.path:sub(1, #pre) == pre and not seen[g.path] then
+              seen[g.path] = true
+              extra[#extra + 1] = g
+            end
+          end
+        end
+      end
+      for _, g in ipairs(extra) do ctx.remaining[#ctx.remaining + 1] = g end
+    end
   end
   if pub.ok or partial then
     local first_fail = partial and pub.failed and pub.failed[1]
