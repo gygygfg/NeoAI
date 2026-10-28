@@ -473,6 +473,22 @@ function M.reject_file(id, path, reason)
   return review.reject_file(id, path, reason)
 end
 
+--- 列出「可恢复的已拒绝」变更单元（显式拒绝时另存了 /tmp 副本者），按拒绝时间倒序。
+--- 供审批界面「已拒绝」区展示，`u` 可将其恢复为待审。
+--- @return table 数组
+function M.list_rejected()
+  return review.list_rejected()
+end
+
+--- 恢复一个已被拒绝的变更单元为待审（普通候选从 /tmp 副本重建；host_op 恢复提案状态）。
+--- 恢复后仍需用户显式审批才会发布 / 在主机 replay。
+--- @param id string change_set_id
+--- @return table { ok, state, reason?, item? }
+function M.restore(id)
+  M.init()
+  return review.restore(id)
+end
+
 --- 应用变更单元（CAS 发布；opts.files 支持选择性应用）
 --- @param id string
 --- @param opts table|nil

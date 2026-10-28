@@ -277,6 +277,7 @@ sandbox = {
   -- stdpath('cache')/NeoAI/shared (same path on host and sandbox).
   mode = "dry_run",                -- dry_run (default, only freezes candidates) | commit (CAS publish after authorization)
   postprocess = "async",           -- Process-command post-processing mode: async (default) = return the result to the main loop as soon as the process exits, while overlay capture/candidate freeze/staging merge/persist/settle run in the background (the FIFO slot is held until the background chain finishes so the next command sees consistent staging; subsequent read/write tools wait for in-flight post-processing); sync = wait for post-processing before returning (deterministic; tests inject this)
+  attach_await_ms = 3000,          -- Max time (ms) to wait for the previous command's in-flight post-processing before materializing staging into the new overlay: without the wait the next command overwrites last round's overlay products with stale staging (content rollback); 0 = no wait (legacy); on timeout execution continues and evidence is recorded (never blocks a command forever)
   shutdown_timeout_ms = 3000,      -- Max time (ms) to wait for background post-processing and staging migration on exit/close (`:qall`, plugin hot reload); the wait is abandoned on timeout so quitting never hangs; 0 = don't wait (the last unfinished freeze/pending enqueue may be lost)
   backend = "auto",                -- auto | bwrap | unshare
   -- When NO isolation backend is available (no bwrap, unshare/userns rejected by kernel, e.g. Android/Termux

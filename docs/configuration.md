@@ -265,6 +265,7 @@ sandbox = {
   -- 创建；工具自身缓存/临时目录经可写绑定暴露，共享根 stdpath('cache')/NeoAI/shared（宿主与沙箱同路径）。
   mode = "dry_run",                -- dry_run（默认，仅冻结候选）| commit（授权后立即 CAS 发布）
   postprocess = "async",           -- 进程命令后处理模式：async（默认）= 命令进程退出后立即返回结果给主循环，overlay 捕获/候选冻结/暂存合并/落盘/结算在后台完成（FIFO 槽位保持到后台完成，保证下一命令看到一致暂存；后续读写工具会等待在途后处理）；sync = 等待后处理完成后再返回（确定性，测试默认）
+  attach_await_ms = 3000,          -- 物化前等待「上一条命令在途后处理」完成的最长时间（ms）：async 模式下若不等，下一条命令会用旧暂存覆盖 overlay 中上一轮的产物（内容回退）；0 = 不等待（旧行为）；超时仍继续执行并写证据（绝不永久阻塞命令）
   shutdown_timeout_ms = 3000,      -- 退出/关闭（`:qall`、插件热重载）时等待后台后处理与暂存迁移完成的最长时间（ms）；超时即放弃等待，避免卡住退出；0 = 不等待（可能丢失最后一笔未完成的冻结/待审入队）
   backend = "auto",                -- auto | bwrap | unshare
   -- 无任何可用隔离后端（无 bwrap、unshare/userns 被内核拒绝，如 Android/Termux 拦 clone(CLONE_NEWUSER)）时：

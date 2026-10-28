@@ -139,10 +139,25 @@ LSP/treesitter 的写盘仍走各自既有的暂存路径（`persist_target` →
 
 - **搭建捕获屏障**：`_serialize_setup` 在物化（暂存→overlay）前**先等上一条命令的后台捕获/合并
   完成**（`postprocess.pending`；`sync` 模式无需等待）。否则下一条命令会用陈旧暂存覆盖 overlay 中
-  的命令改动（`wrapper.lua`）。
+  的命令改动（`wrapper.lua`）。等待**有界**（`tools.sandbox.attach_await_ms`，默认 3000ms）：后处理
+  卡住/失败时超时继续执行并写证据（`postprocess_await_timeout`）——后台链卡死绝不能让之后每条命令
+  一起挂到超时。
 - **物化对账**：`materialize_overlay` 判定「暂存未变、overlay 目标变了」时视为**命令改动**
   （overlay 权威），**不回写**，仅更新记录的目标签名；只有暂存自身变化才把暂存物化进 overlay
   （`candidate.lua`）。这消除了「就地修改被回退」。
+- **写日志（journal）提示绝不当穷举**：使用 eBPF 写日志路径时，capture 只把它当「本轮改动范围」
+  提示，同时做一次纯元数据（`lstat`）的 upper 遍历；若发现未被日志覆盖、且 mtime 落在本次命令窗口
+  内的条目，则丢弃 hint 改**全量遍历**（`candidate.capture_overlay_async`）。理由：写日志会丢事件
+  （bpftrace 环形缓冲丢弃、写入来自未被观测的 cgroup/连接），静默跳过未被记录的写入意味着该改动
+  永不进入暂存，此后每条命令都看不到它。
+- **符号链接必须保持为链接**：会话轮换（`rotate_session` → `_rotate_copy_worker`）与物化
+  （`materialize_overlay`、常驻 `M` 帧 `l` 操作）都以**链接形式**重建暂存符号链接，且「暂存副本是否
+  存在」一律用 `lstat` 判定，绝不用跟随式判定（`filereadable`/`isdirectory`）。暂存副本按路径 hash
+  分散存放，相对链接（venv `.venv/bin/python -> python3`、`.venv/lib64 -> lib`）在暂存树里**天然悬空**；
+  跟随式判定会把它误判为删除 → 下个 overlay 生成 whiteout → 文件消失、`uv run` 重建环境（看起来像挂死）。
+- **后处理失败绝不静默**：后台捕获→冻结→合并链失败时（例如包候选分类中的缺陷），本轮改动并不在
+  暂存里，后续命令会丢失它。wrapper 记录 `sandbox_postprocess_failed` 证据、写 WARN 日志并
+  `vim.notify` 提示，不能只留在日志里。
 
 > 遗留：LSP/treesitter 是宿主进程、无法直接读 bwrap overlay，仍读暂存镜像；屏障保证每次工具/
 > 命令前镜像已并入命令改动，故 AI 各读路径（`read_file` overlay / `list_files` 镜像）在同一
@@ -402,7 +417,8 @@ token（`NEOKEY_…`）或格式保真假密钥时**拒绝写盘**（`SECRET_TOK
   - **可恢复的已拒绝项**：显式拒绝（审批界面 `d`）时把候选内容**原样另存**到
     `tools.sandbox.review.rejected_dir`（默认 `/tmp/neoai-rejected`，目录 0700 / 文件 0600——
     候选可能含密钥 token）副本；被拒条目随后仍展示在审批界面**「已拒绝」区**（默认折叠），
-    在条目行按 `u` 即可**恢复为待审**（从副本重建候选；主机操作则恢复提案，`hostop.restore`）。
+    在条目行按 `u` 即可**恢复为待审**（从副本重建候选；主机操作则恢复提案，`hostop.restore`；
+    仅 `REJECTED` 可恢复——已 `APPLIED`/`FAILED` 的提案拒绝恢复，否则再次审批会在主机重复执行）。
     这些可恢复项**不参与**常规终态淘汰（需持续可见），改由 `tools.sandbox.review.rejected_max`
     （默认 50）约束：超限时删除最旧项的副本并移出内存（磁盘 review 记录仍在）；`0` = 不保留
     任何已拒绝项。副本随 `sandbox.prune`（保留期清理）与 `sandbox.reset` 一并回收。
@@ -1308,6 +1324,16 @@ stdout/stderr/退出码返回。宿主侧由 `sandbox/systemd/systemd_ipc.lua` �
   systemd，systemctl/service 不可用；请直接运行前台命令」。门面启用时 `systemctl`/`journalctl`
   独立与复合调用均由门面处理、且 `/proc/1` 被伪装为 systemd，故不注入该提示（避免与沙箱内视图
   「PID1 非 systemd」自相矛盾）。
+
+### 视图取证日志（`NEOAI_SANDBOX_TRACE`，默认关）
+
+排查「命令产物在下一条命令丢失/回退」时，设 `NEOAI_SANDBOX_TRACE=1`（可选
+`NEOAI_SANDBOX_TRACE_FILE=<路径>`，默认 `<沙箱存储根>/trace.log`）。每次进程命令记录一行结构化
+事件：`attach`（backend / 一次性或常驻 / 每个可写根的 root+mode / 后处理在途）、`journal`（写日志
+是否被信任、写/删条目数、最终走 hint 还是全量）、`capture`（捕获模式、upper 条目数、hint 未覆盖
+条目数、`gap` 即「本轮改动中写日志漏掉的条数」、样本路径）、`merge`（进入暂存层的路径）、
+`materialize`（写入条数 / overlay 权威跳过条数 / 尺寸变化样本）与 `finish`（捕获 vs 保留条数、
+不可发布剔除统计）。该日志只做诊断，**不参与任何门禁判定**。
 
 ### 网络镜像（`tools.sandbox.network.mirrors`）
 

@@ -1102,9 +1102,20 @@ function M.restore(id)
   end
   local digest = item.candidate_digest
   if item.kind == "host_op" then
-    local ok = pcall(function() return require("NeoAI.sandbox.execution.hostop").restore(item.host_op_id) end)
-    if not ok then
-      return { ok = false, state = "FAILED", reason = "HOST_OP_RESTORE_FAILED: " .. tostring(id) }
+    -- 必须检查返回值：`hostop.restore` 会对「已应用/已失败/不存在」的提案返回 false，
+    -- 若仅用 pcall 判断（旧实现），失败也会被当成成功，把已应用的提案放回待审并在
+    -- 下次审批时**在主机重复执行**同一条命令。
+    local hok, hres, herr = pcall(function()
+      return require("NeoAI.sandbox.execution.hostop").restore(item.host_op_id)
+    end)
+    if not hok then
+      return { ok = false, state = "FAILED", reason = "HOST_OP_RESTORE_FAILED: " .. tostring(hres) }
+    end
+    if hres ~= true then
+      return {
+        ok = false, state = "FAILED",
+        reason = "HOST_OP_RESTORE_FAILED: " .. tostring(herr or hres),
+      }
     end
   else
     local raw = store.read_rejected_copy(id, digest)

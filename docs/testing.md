@@ -216,6 +216,8 @@ end)
 | `test_net_consent` | 沙箱网络访问同意：策略 ask/allow/deny、内部端口登记免权限、headless 失败关闭、弹窗 allow_once/deny/allow_session 记忆、外部目标按策略处理 |
 | `test_device_consent` | 危险设备访问门禁：`risk.device_access`/`device_path_match` 检测（/dev/kvm、/dev/net/tun、of=、重定向、引号、glob）与不误判；动作/超时/本会话允许列表；request 决策（headless 拒绝、弹窗允许、会话记住、超时自动阻止）；`bind_mounts` 生成 `--dev-bind`；动态监测 `_device_observe`（命中记录并终止命令树、已允许/无害不阻断）；静态回退端到端（deny 拒绝 / ask 批准后执行 / allow 直接放行）；eBPF 动态端到端（可用时） |
 | `test_sandbox_overlay_invalidate` | overlay 视图同步：发布/拒绝后 `resident.sync_real` 使命令读到真实盘新内容（不再读到旧物化，修复视图分裂）；权限位变化触发重新物化 |
+| `test_sandbox_view_persistence` | 跨命令视图持久性：会话轮换保留暂存符号链接（venv `bin/python`/`lib64` 不被解引用/whiteout）、物化以链接形式重建、写日志漏掉的路径由全量兜底捕获、包候选冻结不因工作区根解析失败而中断、后处理卡死时搭建屏障有界（不永久阻塞）；重资源端到端（`NEOAI_TEST_HEAVY=1`）验证「背靠背命令 + 轮换」后产物与链接存活 |
+| `test_sandbox_restore` | 审批「已拒绝 → 恢复为待审」：`hostop.restore` 把已拒绝提案恢复为 PENDING（清理拒绝原因）、已 APPLIED/FAILED 的提案拒绝恢复（防主机重复执行）、清单层 `sandbox.list_rejected`/`sandbox.restore` 存在且可用、普通候选恢复后可重新应用 |
 | `test_grant` | 沙箱任务授权：scope 精确/前缀/`/**`、操作白名单、预算累计、ttl 过期、撤销、`find_covering`、active_only 列表 |
 | `test_replay` | 策略回放：同规则同事实可复现、被篡改裁决 `same=false`、策略版本漂移、缺事实/非裁决/不存在证据的错误码 |
 | `test_mcp_cache` | MCP 描述缓存：set/get/has、部分更新合并、update_all 清 pending/stale、pending/stale 生命周期、持久化、损坏/缺字段容错 |

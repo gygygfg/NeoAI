@@ -166,10 +166,31 @@ command). Guarantees:
 - **Setup capture barrier**: before materializing (staging→overlay), `_serialize_setup` first waits for
   the previous command's background capture/merge to finish (`postprocess.pending`; no wait in `sync`
   mode). Otherwise the next command would overwrite the overlay with stale staging (`wrapper.lua`).
+  The wait is **bounded** (`tools.sandbox.attach_await_ms`, default 3000): if post-processing is stuck
+  or failed, execution continues after the timeout and evidence (`postprocess_await_timeout`) is
+  recorded — a stuck background chain must never make every later command hang.
 - **Materialize reconciliation**: when `materialize_overlay` finds "staging unchanged but overlay
   target changed", it treats it as a **command change** (overlay wins), **does not write back**, and
   only updates the recorded target signature; it writes staging into the overlay only when staging
   itself changed (`candidate.lua`). This removes "in-place edit rolled back".
+- **Write-journal hints are never exhaustive**: when eBPF write-journal paths are used, capture treats
+  them only as a *scope hint*. A metadata-only (`lstat`) walk of the overlay upper runs as well; if any
+  entry not covered by the journal has an mtime inside the command window, the hint is dropped and a
+  **full traversal** capture runs (`candidate.capture_overlay_async`). Rationale: the journal can lose
+  events (bpftrace ring-buffer drops, writers outside the observed cgroup/connection), and silently
+  skipping an unrecorded write means the change never reaches staging — it then disappears from every
+  later command.
+- **Symbolic links must stay links**: session rotation (`rotate_session` → `_rotate_copy_worker`) and
+  materialization (`materialize_overlay`, resident `M` frame op `l`) recreate staged symlinks *as
+  symlinks* and decide "staged copy exists?" with `lstat` — never with follow-up checks
+  (`filereadable`/`isdirectory`). Staged copies are content-addressed into per-path hash dirs, so a
+  relative link (venv `.venv/bin/python -> python3`, `.venv/lib64 -> lib`) is *dangling inside the
+  staging tree*; follow-up checks used to mark it deleted → a whiteout in the next overlay → the file
+  vanished and `uv run` rebuilt the environment (looked like a hang).
+- **Post-processing failures are never silent**: if the background capture→freeze→merge chain fails
+  (e.g. a bug in package-candidate classification), the change is *not* in staging, so later commands
+  would lose it. The wrapper records `sandbox_postprocess_failed` evidence, logs a warning and shows a
+  `vim.notify`. Fixing such a failure must not be left to log-reading.
 
 > Remaining: LSP/treesitter are host processes and cannot read the bwrap overlay directly, so they
 > still read the staging mirror; the barrier ensures the mirror already includes command changes before
@@ -683,7 +704,9 @@ is only kept for other `approval.mode` values (`prompt`/`strict`).
         `/tmp/neoai-rejected`, dir 0700 / files 0600 — candidates may hold secret tokens). The rejected
         entry then stays visible in the review window's **"Rejected" section** (collapsed by default);
         pressing `u` on it **restores it to pending** (rebuilding the candidate from the copy; for host
-        ops the proposal is restored via `hostop.restore`). These restorable items do **not** take part
+        ops the proposal is restored via `hostop.restore`; only `REJECTED` is restorable —
+        `APPLIED`/`FAILED` proposals are refused, otherwise a later approval would re-run the command on
+        the host). These restorable items do **not** take part
         in the normal terminal eviction (they must stay visible); instead
         `tools.sandbox.review.rejected_max` (default 50) bounds them: beyond the cap the oldest item's
         copy is deleted and it is dropped from memory (the disk review record remains); `0` = keep none.
@@ -1602,6 +1625,18 @@ the facade (`sandbox/systemd/systemd.lua`) with a **fake parser** covering only 
   foreground command directly". When the facade is enabled, `systemctl`/`journalctl` (standalone
   and compound) are handled by the facade and `/proc/1` is spoofed as systemd, so the hint is not
   appended (it would contradict the in-sandbox view that "PID1 is not systemd").
+
+### View forensics log (`NEOAI_SANDBOX_TRACE`, off by default)
+
+When diagnosing "a command's output vanished / rolled back in the next command", set
+`NEOAI_SANDBOX_TRACE=1` (optionally `NEOAI_SANDBOX_TRACE_FILE=<path>`; default
+`<sandbox store>/trace.log`). Every process command emits structured events: `attach` (backend,
+one-shot vs resident, per-writable-root root+mode, in-flight post-processing), `journal` (whether the
+write journal is trusted, write/delete counts, hint vs full traversal), `capture` (capture mode, upper
+entry count, entries not covered by the hint, `gap` = changes missed by the journal, sample paths),
+`merge` (paths entering the staging layer), `materialize` (writes / overlay-authoritative skips /
+size-change samples) and `finish` (captured vs kept, unpublishable-drop stats). This log is diagnostic
+only and **never** participates in any gate decision.
 
 ### Network mirrors (`tools.sandbox.network.mirrors`)
 

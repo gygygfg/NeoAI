@@ -6,6 +6,7 @@
 local fs = require("NeoAI.utils.fs")
 local async = require("NeoAI.utils.async")
 local candidate_util = require("NeoAI.sandbox.execution.candidate_util")
+local trace_log = require("NeoAI.sandbox.execution.trace_log")
 -- 纯工具函数（自 candidate_util 引入，保持原局部名以零改调用点）
 local _perm, _sha, _stat_sig, _read, _candidate_content, _is_text_content =
   candidate_util.perm, candidate_util.sha, candidate_util.stat_sig,
@@ -279,8 +280,9 @@ end
 
 --- 线程内批量迁移会话暂存（纯 vim.uv，自包含）：轮换时把旧会话的暂存文件复制到新会话目录。
 --- 逐文件 `fs_copyfile` 此前在主线程执行，长会话（未发布改动多）时每个 agentEnd 都卡顿。
---- 输入编码：`<n>\n` + n 条 `<src_len>:<src><dst_len>:<dst><kind_len>:<kind><mode_len>:<mode>`；
---- kind: "f"（文件）| "d"（目录）。返回 "\1"。
+--- 输入编码：`<n>\n` + n 条
+--- `<src_len>:<src><dst_len>:<dst><kind_len>:<kind><mode_len>:<mode><link_len>:<link>`；
+--- kind: "f"（文件）| "d"（目录）| "l"（符号链接，`link` 为链接目标字符串）。返回 "\1"。
 --- @param encoded string
 --- @return string
 local function _rotate_copy_worker(encoded)
@@ -309,10 +311,18 @@ local function _rotate_copy_worker(encoded)
     local dst = field()
     local kind = field()
     local mode = tonumber(field())
+    local link = field()
     if dst then
       if kind == "d" then
         mkdirp(dst)
         if mode then pcall(uv.fs_chmod, dst, mode) end
+      elseif kind == "l" then
+        -- 符号链接必须**重建为链接**（不可复制目标内容）：venv 的 `bin/python -> python3`、
+        -- `lib64 -> lib` 等一旦被解引用成普通文件，沙箱视图与真实语义即分裂。
+        local dir = dst:match("^(.*)/[^/]*$")
+        mkdirp(dir)
+        pcall(uv.fs_unlink, dst)
+        if type(link) == "string" and link ~= "" then pcall(uv.fs_symlink, link, dst) end
       else
         local dir = dst:match("^(.*)/[^/]*$")
         mkdirp(dir)
@@ -327,7 +337,7 @@ local function _rotate_copy_worker(encoded)
 end
 
 --- 编码轮换迁移任务供 `_rotate_copy_worker`。
---- @param jobs table 数组 { { src, dst, kind, mode } }
+--- @param jobs table 数组 { { src, dst, kind, mode?, link? } }
 --- @return string
 local function _encode_copy_jobs(jobs)
   local out, n = {}, 0
@@ -337,6 +347,7 @@ local function _encode_copy_jobs(jobs)
   end
   for _, j in ipairs(jobs) do
     out[#out + 1] = f(j.src) .. f(j.dst) .. f(j.kind) .. f(tostring(j.mode or 420))
+      .. f(j.link or "")
     n = n + 1
   end
   return tostring(n) .. "\n" .. table.concat(out)
@@ -543,28 +554,44 @@ function M.rotate_session()
     -- 目录暂存（create_directory / run_command 新建目录）不能用 fs.exists 判定：
     -- fs.exists 基于 filereadable，对目录恒为 false，会把目录误判为「暂存副本缺失」而
     -- 标记删除，随后 materialize 生成 whiteout，把沙箱视图里的目录变成设备节点/文件
-    -- （表现为 `ls dir/: Not a directory`）。目录用 isdirectory 判定并迁移。
-    local is_dir = entry.staged and vim.fn.isdirectory(entry.staged) == 1
-    local staged_exists = is_dir or (entry.staged and fs.exists(entry.staged))
+    -- （表现为 `ls dir/: Not a directory`）。目录用 lstat 判定并迁移。
+    -- 符号链接同理**必须用 lstat**：`fs.exists`/`vim.fn.isdirectory` 都会跟随链接，而暂存副本
+    -- 按内容寻址分散在不同 hash 目录，相对链接（如 venv `bin/python -> python3`）在暂存树里
+    -- 天然是悬空的 —— 用跟随式判定会把它们误判为「缺失」→ 标记删除 → 物化成 whiteout，
+    -- 表现为轮换后 `ls -la .venv` 正常但 `.venv/bin/python` 消失 / `uv run` 重建环境卡死。
+    local lst = entry.staged and vim.uv.fs_lstat(entry.staged) or nil
+    local staged_type = lst and lst.type or nil
+    local is_link = (type(entry.link) == "string") or staged_type == "link"
+    local is_dir = staged_type == "directory"
+    local staged_exists = is_link or is_dir or (entry.staged and fs.exists(entry.staged))
+    -- 链接目标：优先用登记值，其次读暂存副本自身的链接目标（容忍历史登记缺 link 的条目）。
+    local link_target = entry.link
+    if link_target == nil and staged_type == "link" then
+      link_target = vim.uv.fs_readlink(entry.staged)
+    end
     if entry.deleted then
       migrated[real] = {
         staged = new_path, base_hash = entry.base_hash, deleted = true, mode = entry.mode,
-        real_hash = entry.real_hash, tokenized = entry.tokenized,
+        real_hash = entry.real_hash, tokenized = entry.tokenized, link = link_target,
       }
     elseif staged_exists then
       -- 复制任务移入线程池（长会话未发布改动多时，逐文件主线程复制是 agentEnd 卡顿源）。
+      -- 符号链接以 `kind="l"` 重建链接（绝不复制目标内容）。
       jobs[#jobs + 1] = {
-        src = entry.staged, dst = new_path, kind = is_dir and "d" or "f", mode = entry.mode,
+        src = entry.staged, dst = new_path,
+        kind = is_link and "l" or (is_dir and "d" or "f"),
+        mode = entry.mode, link = link_target,
       }
       migrated[real] = {
         staged = new_path, base_hash = entry.base_hash, mode = entry.mode,
         real_hash = entry.real_hash, tokenized = entry.tokenized,
+        link = link_target, large = entry.large,
       }
     else
       -- 暂存副本缺失（删除态未显式标记）：按删除态迁移，保持一致性。
       migrated[real] = {
         staged = new_path, base_hash = entry.base_hash, deleted = true, mode = entry.mode,
-        real_hash = entry.real_hash, tokenized = entry.tokenized,
+        real_hash = entry.real_hash, tokenized = entry.tokenized, link = link_target,
       }
     end
     migrated_rev[new_path] = real
@@ -591,6 +618,10 @@ function M.rotate_session()
         if j.kind == "d" then
           fs.ensure_dir(j.dst)
           if j.mode then fs.chmod(j.dst, j.mode) end
+        elseif j.kind == "l" then
+          fs.ensure_dir(vim.fn.fnamemodify(j.dst, ":h"))
+          pcall(vim.uv.fs_unlink, j.dst)
+          if type(j.link) == "string" and j.link ~= "" then vim.uv.fs_symlink(j.link, j.dst) end
         else
           fs.ensure_dir(vim.fn.fnamemodify(j.dst, ":h"))
           fs.copy_file(j.src, j.dst)
@@ -811,7 +842,10 @@ function M.view_is_dir(real_path)
   local st = vim.uv.fs_stat(real)
   if st and st.type == "directory" then return true end
   local ws = state.workspace[real]
-  if ws and not ws.deleted and ws.staged and vim.fn.isdirectory(ws.staged) == 1 then return true end
+  -- 用 lstat：暂存副本是符号链接时（venv `lib64 -> lib`），目标是否为目录不改变
+  -- 「该路径本身是链接而非目录」的事实，否则会误拒对该路径的写入。
+  local lst = ws and not ws.deleted and ws.staged and vim.uv.fs_lstat(ws.staged) or nil
+  if lst and lst.type == "directory" then return true end
   return false
 end
 
@@ -823,11 +857,18 @@ function M.workspace_overrides()
   for real, entry in pairs(state.workspace) do
     -- fs.exists 基于 filereadable，对目录恒为 false；目录暂存（create_directory/
     -- run_command 新建目录）必须用 isdirectory 判定，否则会被误判为删除态。
-    local exists = fs.exists(entry.staged) or vim.fn.isdirectory(entry.staged) == 1
+    -- 符号链接必须用 lstat：暂存副本按内容寻址、相对链接在暂存树里天然悬空，
+    -- 跟随式判定（filereadable / isdirectory）会把「链接存在但目标暂不在」误判为缺失，
+    -- 常驻物化据此生成删除/whiteout，表现为 `.venv/bin/python` 消失。
+    local lst = entry.staged and vim.uv.fs_lstat(entry.staged) or nil
+    local stype = lst and lst.type or nil
+    local exists = stype == "link" or stype == "directory" or (entry.staged and fs.exists(entry.staged))
     out[#out + 1] = {
       real = real,
       staged = entry.staged,
       deleted = entry.deleted == true or not exists,
+      -- 符号链接暂存：物化方必须**重建链接**而不是复制目标内容。
+      link = entry.link or (stype == "link" and vim.uv.fs_readlink(entry.staged)) or nil,
       -- 超大文件（内容以 blob 承载）：物化方据此后走「按文件复制」而非内嵌内容，
       -- 避免把数百 MB 内容经常驻命令服务器 stdin（bash 逐字节 read）传输。
       large = entry.large == true,
@@ -859,10 +900,17 @@ function M.unpublished_under(root)
     local under = (base == "/") or real == base or real:sub(1, #base + 1) == base .. "/"
     if under and not runtime.is_git_internal(real) and not runtime.is_self_runtime_path(real) then
       local unpublished = false
+      -- 符号链接以**链接目标字符串**为内容：用 `lstat` 判定存在性并直接比较目标，
+      -- 不能走 `filereadable`/`_read`（会跟随链接读到目标内容，得出错误的「已发布」结论）。
+      local lst = ws.staged and vim.uv.fs_lstat(ws.staged) or nil
       if ws.deleted then
         unpublished = true
-      elseif ws.staged and (fs.exists(ws.staged) or vim.fn.isdirectory(ws.staged) == 1) then
-        if vim.fn.isdirectory(ws.staged) == 1 then
+      elseif lst and lst.type == "link" then
+        local target = vim.uv.fs_readlink(ws.staged)
+        local real_lst = vim.uv.fs_lstat(real)
+        unpublished = not (real_lst and real_lst.type == "link" and vim.uv.fs_readlink(real) == target)
+      elseif ws.staged and (fs.exists(ws.staged) or (lst and lst.type == "directory")) then
+        if lst and lst.type == "directory" then
           -- 目录暂存：真实目录不存在即视为未发布（新建目录）。
           unpublished = vim.fn.isdirectory(real) ~= 1
         else
@@ -1025,6 +1073,9 @@ function M.materialize_overlay(specs, opts)
   -- 命令/只读工具看到真实目录、而暂存视图认为它是文件，二者分裂。此处收集并返回，
   -- 由调用方显式报错（H4）。
   local conflicts = {}
+  -- 取证（默认关闭）：统计本次物化「写入暂存覆盖上层」的样本。若上层已有内容且尺寸与暂存不同，
+  -- 说明本次写入把命令刚产生的版本替换成了暂存里的旧版本（即「内容回退」现场）。
+  local tr = trace_log.enabled() and { writes = 0, auth = 0, over = {} } or nil
   for real, entry in pairs(state.workspace) do
     -- `.git` 内部也参与物化（对象先于指针的原子顺序在 apply 阶段保证；物化仅为沙箱视图）。
     local spec = _match_root(real, specs)
@@ -1053,22 +1104,31 @@ function M.materialize_overlay(specs, opts)
             if not mat then mat = {}; state.materialized[base] = mat end
             mat[real] = { dest = dest, deleted = true, version = entry.version }
           end
-        elseif entry.link then
+        elseif entry.link or (entry.staged and (vim.uv.fs_lstat(entry.staged) or {}).type == "link") then
           -- 符号链接暂存：在 overlay/bind 层建立同名链接（覆盖既有文件/链接，不覆盖目录）。
           -- 目标本身是目录才冲突；指向目录的符号链接（如 venv `lib64 -> lib`）可安全替换。
-          if _is_real_dir(dest) then
+          -- 链接目标优先取登记值，缺失时读暂存副本自身（历史条目/轮换迁移可能只带链接本体）。
+          local target = entry.link
+          if target == nil then target = vim.uv.fs_readlink(entry.staged) end
+          if target == nil then
+            -- 读不出目标：保守跳过（不把链接当普通文件复制，绝不写坏视图）。
+            if trace_log.enabled() then
+              trace_log.log("materialize skip-link-unreadable real=%s", tostring(real))
+            end
+          elseif _is_real_dir(dest) then
             conflicts[#conflicts + 1] = { real = real, dest = dest }
           else
             pcall(vim.uv.fs_unlink, dest)
             fs.ensure_dir(vim.fn.fnamemodify(dest, ":h"))
-            vim.uv.fs_symlink(entry.link, dest)
+            vim.uv.fs_symlink(target, dest)
             local mat = state.materialized[base]
             if not mat then mat = {}; state.materialized[base] = mat end
-            mat[real] = { dest = dest, link = entry.link, version = entry.version }
+            mat[real] = { dest = dest, link = target, version = entry.version }
           end
-        elseif entry.staged and vim.fn.isdirectory(entry.staged) == 1 then
+        elseif entry.staged and (vim.uv.fs_lstat(entry.staged) or {}).type == "directory" then
           -- 目录暂存（create_directory/ensure_dir）：在 overlay/bind 层建立同名目录，
           -- 使 run_command 能看到沙箱内新建的目录（含空目录）。
+          -- 用 lstat：`vim.fn.isdirectory` 会跟随符号链接，把「指向目录的链接」误建为目录。
           fs.ensure_dir(dest)
           if entry.mode then fs.chmod(dest, entry.mode) end
         elseif entry.staged and fs.exists(entry.staged) then
@@ -1133,6 +1193,7 @@ function M.materialize_overlay(specs, opts)
               -- 已物化且未改动：无需处理
             elseif s_same and not d_same then
               -- overlay 被命令改动、暂存未变：overlay 权威，不回写；更新目标签名以免反复判定。
+              if tr then tr.auth = tr.auth + 1 end
               rec.d_sec = dstat.mtime.sec
               rec.d_nsec = dstat.mtime.nsec
               rec.d_size = dstat.size
@@ -1142,6 +1203,14 @@ function M.materialize_overlay(specs, opts)
             else
               -- 原子替换：同目录临时文件 + rename。原先「先 delete 再 copy」在并行运行的
               -- 命令读到该路径时会看到缺失/半写内容（暂存文件系统原子性）；rename 原子生效。
+              if tr then
+                tr.writes = tr.writes + 1
+                if dstat and sstat and dstat.size and sstat.size and dstat.size ~= sstat.size
+                  and #tr.over < 10 then
+                  tr.over[#tr.over + 1] = string.format("%s(%d->%d)", tostring(real),
+                    dstat.size, sstat.size)
+                end
+              end
               local is_large = entry.large == true
               local content
               if not is_large then
@@ -1220,6 +1289,15 @@ function M.materialize_overlay(specs, opts)
         end
       end
     end
+  end
+  if tr then
+    local parts = {}
+    for _, s in ipairs(specs) do
+      parts[#parts + 1] = string.format("%s=%s", tostring(s.root), tostring(s.mode))
+    end
+    trace_log.log("materialize specs=%s entries=%d writes=%d auth=%d conflicts=%d size_change=%s",
+      table.concat(parts, " "), vim.tbl_count(state.workspace), tr.writes, tr.auth,
+      #conflicts, trace_log.sample(tr.over, 8))
   end
   return conflicts
 end
@@ -1306,6 +1384,15 @@ end
 -- run_command 产生的改动（双向互通）。
 function M.merge_candidate(cand, opts)
   opts = opts or {}
+  if trace_log.enabled() then
+    local samples = {}
+    for i, f in ipairs(cand.files or {}) do
+      if i > 8 then break end
+      samples[#samples + 1] = tostring(f.action) .. ":" .. tostring(f.path)
+    end
+    trace_log.log("merge(sync) n=%d view=%d sample=%s", #(cand.files or {}),
+      #(cand.view_files or {}), trace_log.sample(samples, 8))
+  end
   _apply_view_files(cand.view_files, opts)
   for _, f in ipairs(cand.files or {}) do
     local staged = _workspace_path(f.path)
@@ -1375,6 +1462,16 @@ end
 function M.merge_candidate_async(cand, opts)
   opts = opts or {}
   local files = cand and cand.files or {}
+  if trace_log.enabled() then
+    local samples = {}
+    for i, f in ipairs(files) do
+      if i > 8 then break end
+      samples[#samples + 1] = tostring(f.action) .. ":" .. tostring(f.path)
+    end
+    trace_log.log("merge n=%d view=%d from_command=%s resident=%s sample=%s", #files,
+      #(cand and cand.view_files or {}), tostring(opts.from_command == true),
+      tostring(opts.resident == true), trace_log.sample(samples, 8))
+  end
   local texts, entropy_flags, text_files = {}, {}, {}
   local secret = require("NeoAI.sandbox.secret.secret")
   for _, f in ipairs(files) do
@@ -2735,10 +2832,21 @@ local function _classify_paths_async(paths, unmask)
   if not work.available() or #paths == 0 then return async.resolve(nil) end
   local runtime = require("NeoAI.sandbox.execution.runtime")
   local ctx = runtime.mask_context()
-  -- 分级基准 = 工作区根（会话绑定工作目录优先，见 core/session/workspace_root.base_dir）：
+  -- 分级基准 = 工作区根（会话绑定工作目录优先，见 core/session/workspace_root.resolve）：
   -- 与 risk.path_level 同一口径，避免「在工程子目录里启动 nvim」时把父目录内的工程文件误判为
   -- 用户目录写入（L1）。
-  local cwd_raw = require("NeoAI.core.session.workspace_root").base_dir() or vim.fn.getcwd() or ""
+  -- 注意：本模块曾调用不存在的 `workspace_root.base_dir()`，导致**所有包管理器命令**（uv/pip/
+  -- npm/apt…，走 classify 的包候选路径）在冻结阶段抛错 → 整条捕获链失败 → 暂存层不更新 →
+  -- 表现为「命令产物在下一条命令丢失/回退」。必须按模块现有 API 解析，且失败不得中断冻结。
+  local cwd_raw
+  do
+    local okr, wr = pcall(require, "NeoAI.core.session.workspace_root")
+    if okr and wr then
+      local okv, v = pcall(function() return wr.resolve() end)
+      if okv and type(v) == "string" and v ~= "" then cwd_raw = v end
+    end
+    if not cwd_raw then cwd_raw = vim.fn.getcwd() or "" end
+  end
   local cwd = fs.canonical(cwd_raw)
   local home = fs.canonical(vim.fn.expand("~"))
   return work.run_codec(_classify_paths_worker, {
@@ -2811,6 +2919,77 @@ function M.capture_overlay_async(attempt_id, real_root, upper_root, hint, opts)
           "[sandbox] 检测到 .git 可能被改动，改用全量遍历捕获（防悬空引用）")
       end)
     end
+  end
+  -- 写日志（hint）只作「本轮改动范围」提示，**绝不当作穷举**：做一次纯元数据（lstat）级 upper
+  -- 遍历，若发现「未被 hint 覆盖、但修改时间落在本次命令窗口内」的条目，说明写日志漏事件
+  -- （bpftrace 环形缓冲丢事件、写入经未被观测的连接/daemon 等）。此时放弃 hint、改全量遍历：
+  -- 正确性优先，绝不静默丢改动。遗留条目（上一条命令产生的、已并入暂存的）mtime 早于窗口，
+  -- 不会触发回退，故长期会话不会因此反复全量捕获。
+  if paths_set then
+    local covered = paths_set
+    local total, uncovered, gap = 0, 0, 0
+    local samples = {}
+    -- 命令窗口起点（秒，含小数）；缺失时按「不启用时间判定」处理，退回覆盖率判定兜底。
+    local since = tonumber(opts.since)
+    local function scan(dir, rel)
+      local handle = vim.uv.fs_scandir(dir)
+      if not handle then return end
+      while true do
+        local name, t = vim.uv.fs_scandir_next(handle)
+        if not name then break end
+        if name ~= ".wh..wh..opq" and name ~= session_basename then
+          local child = rel == "" and name or (rel .. "/" .. name)
+          if t == "directory" then
+            scan(dir .. "/" .. name, child)
+          else
+            total = total + 1
+            local real = (root == "" and "/" or (root .. "/")) .. child
+            if not covered[real] and not runtime.is_self_runtime_path(real) then
+              uncovered = uncovered + 1
+              local st = vim.uv.fs_lstat(dir .. "/" .. name)
+              -- 时间窗口判定：mtime 落在命令窗口内 → 本次命令确实改过它，而写日志没记到。
+              -- 未提供窗口起点时保守按「可能改过」处理（宁可多一次全量遍历，也不静默丢改动）。
+              local recent = false
+              if st and st.mtime then
+                recent = (since == nil) or ((tonumber(st.mtime.sec) or 0) >= since - 1)
+              end
+              if recent then
+                gap = gap + 1
+                if #samples < 10 then samples[#samples + 1] = child end
+              end
+            end
+          end
+        end
+      end
+    end
+    scan(upper_root, "")
+    if gap > 0 then
+      paths_encoded, paths_set = nil, nil
+      pcall(function()
+        require("NeoAI.kernel.logger").warn(
+          "[sandbox] 写日志遗漏 %d 个本轮改动路径（未覆盖=%d），改用全量遍历捕获：%s",
+          gap, uncovered, table.concat(samples, ", "))
+      end)
+    end
+    trace_log.log("capture attempt=%s root=%s mode=%s hint=%d upper=%d uncovered=%d gap=%d -> %s sample=%s",
+      attempt_id, root, paths_set and "hint" or "full", vim.tbl_count(covered), total,
+      uncovered, gap, paths_set and "hint" or "full(fallback)", trace_log.sample(samples, 8))
+  elseif trace_log.enabled() then
+    -- 全量遍历也统计一次 upper 条目数，便于与 hint 路径对照（仅 trace 开启时）。
+    local total = 0
+    local function count(dir)
+      local handle = vim.uv.fs_scandir(dir)
+      if not handle then return end
+      while true do
+        local name, t = vim.uv.fs_scandir_next(handle)
+        if not name then break end
+        if name ~= ".wh..wh..opq" and name ~= session_basename then
+          if t == "directory" then count(dir .. "/" .. name) else total = total + 1 end
+        end
+      end
+    end
+    count(upper_root)
+    trace_log.log("capture attempt=%s root=%s mode=full upper=%d", attempt_id, root, total)
   end
   local expected_encoded = _encode_expected(state.materialized[upper_root], paths_set)
   local ws_encoded = _encode_ws(state.workspace, root, paths_set)
@@ -3292,7 +3471,14 @@ function M.finish(attempt_id, prefetch, classify)
   table.sort(files, function(a, b) return a.path < b.path end)
   -- 剔除运行时遮蔽（发布硬拒绝）与易变包缓存（CAS 冲突）文件，避免整单元失败。
   local dropped
+  local _n_before = #files
   files, dropped = _filter_unpublishable(files, attempt.attempt, classify)
+  if trace_log.enabled() then
+    trace_log.log("finish attempt=%s mapping=%d files=%d kept=%d view=%d dropped=%s", attempt_id,
+      vim.tbl_count(attempt.mapping), _n_before, #files, #view_files,
+      dropped and string.format("masked=%d volatile=%d git=%d self=%d",
+        dropped.masked or 0, dropped.volatile or 0, dropped.git or 0, dropped.self or 0) or "-")
+  end
   -- 三方合并基线捕获（发布时间检测到外部改动时使用），须在过滤后避免为被剔除文件做无用读取。
   _capture_base_blobs(files)
   local manifest = {}

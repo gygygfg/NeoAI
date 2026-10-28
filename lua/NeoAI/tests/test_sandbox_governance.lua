@@ -403,22 +403,39 @@ tests.suite("sandbox_governance", function(_, it)
     local sandbox = require("NeoAI.sandbox")
     local hostop = require("NeoAI.sandbox.execution.hostop")
     local fs = require("NeoAI.utils.fs")
-    local probe = "/etc/neoai_sandbox_hostop_probe"
-    -- 包管理器段（pip）+ 写只读系统路径（/etc 在沙箱内只读）→ 退出非零且含
-    -- 「read-only file system」信号，旧实现会据此升 T2 并冻结主机提案。
+    -- 唯一探针名：避免不同轮次/历史残留互相干扰（曾因固定名 + 未清理在宿主留下永久残留文件）。
+    local probe = ("/etc/neoai_sandbox_hostop_probe_%d_%d"):format(vim.fn.getpid(), os.time())
+    -- 注意：整机根 overlay 下 `/etc` 在沙箱内**是可写的**（写入落在 overlay upper），
+    -- 因此本用例要保证的是「包安装命令的系统路径写入既不冻结为主机提案，也不会被自动发布到
+    -- 宿主（dry_run 下只入待审队列）」，而不是「写入失败」。
     local cmd = "pip --version >/dev/null 2>&1; echo x > " .. probe
-    with_config({ tools = { sandbox = { mode = "dry_run" } } }, function()
-      sandbox.reset()
-      local done, out = false, nil
-      require("NeoAI.tools").execute("run_command", { command = cmd, description = "t" }, {})
-        :then_(function(r) out = tostring(r); done = true end,
-          function(e) out = "ERR:" .. tostring(e and e.message or e); done = true end)
-      t.true_(vim.wait(20000, function() return done end), "命令应完成")
-      for _, h in ipairs(hostop.list({}) or {}) do
-        t.true_(h.command ~= cmd, "包安装命令不应冻结为主机提案")
-      end
-      t.false_(fs.exists(probe), "宿主机系统路径不应被写入（实际: " .. tostring(out) .. "）")
+    local ok_body, body_err = pcall(function()
+      with_config({ tools = { sandbox = { mode = "dry_run" } } }, function()
+        sandbox.reset()
+        local done, out = false, nil
+        require("NeoAI.tools").execute("run_command", { command = cmd, description = "t" }, {})
+          :then_(function(r) out = tostring(r); done = true end,
+            function(e) out = "ERR:" .. tostring(e and e.message or e); done = true end)
+        t.true_(vim.wait(20000, function() return done end), "命令应完成")
+        for _, h in ipairs(hostop.list({}) or {}) do
+          t.true_(h.command ~= cmd, "包安装命令不应冻结为主机提案")
+        end
+        -- 未自动发布到宿主（dry_run 只入待审）
+        t.false_(fs.exists(probe), "宿主机系统路径不应被写入（实际: " .. tostring(out) .. "）")
+        -- 反向断言：该写入**确实被捕获为待审候选**（不是被静默丢弃）。
+        local captured = nil
+        for _, item in ipairs(sandbox.list_reviews({ review_state = "PENDING" }) or {}) do
+          for _, f in ipairs(item.files or {}) do
+            if f.path == probe then captured = item end
+          end
+        end
+        t.not_nil(captured, "沙箱内的 /etc 写入应冻结为待审候选（而非静默丢弃）")
+        t.ne("APPLIED", tostring(captured and captured.apply_state), "包安装候选不得自动应用")
+      end)
     end)
+    -- 无论断言成败都清理宿主探针（历史上这条用例在宿主留下过 /etc/neoai_sandbox_hostop_probe）。
+    if fs.exists(probe) then pcall(vim.fn.delete, probe) end
+    if not ok_body then error(body_err, 0) end
   end)
 
   it("沙箱 CPU 亲和性：绑定到 nvim 之外的核（可显式/关闭）", function(t)

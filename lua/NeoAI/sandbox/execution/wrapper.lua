@@ -24,6 +24,7 @@ local envelope = require("NeoAI.sandbox.observe.envelope")
 local replay = require("NeoAI.sandbox.review.replay")
 local fs = require("NeoAI.utils.fs")
 local wrapper_util = require("NeoAI.sandbox.execution.wrapper_util")
+local trace_log = require("NeoAI.sandbox.execution.trace_log")
 
 -- 纯助手（自 wrapper_util 引入，保持原局部名以零改调用点）
 local _rewrite_value, _enc_root, _is_sudo_bin, _split_shell, _cand_paths, _package_manager_of, _limits_key =
@@ -242,14 +243,28 @@ local function _serialize_setup(fn)
   local run = function()
     -- 捕获屏障：若上一条命令的捕获/合并仍在后台（async），先等其完成再物化，避免用陈旧暂存
     -- 覆盖 overlay 中的命令改动。sync 模式或队列为空时 `pending` 为 nil，无额外等待。
+    -- **有界**（`tools.sandbox.attach_await_ms`，默认 3s）：后处理卡住/异常时绝不让后续每条命令
+    -- 永久阻塞（曾表现为「命令不返回、不报错，最后被当成超时杀掉」），超时继续执行并留证据。
     local pending = postprocess.pending
-    if pending then
-      pending:then_(
-        function() vim.schedule(proceed) end,
-        function() vim.schedule(proceed) end)
-    else
-      proceed()
+    if not pending then proceed(); return end
+    local wait_ms = tonumber(config_store.get("tools.sandbox.attach_await_ms"))
+    if wait_ms == nil then wait_ms = 3000 end
+    if wait_ms <= 0 then proceed(); return end
+    local done = false
+    local function go(settled)
+      if done then return end
+      done = true
+      if settled ~= true then
+        logger.warn("[sandbox] 上一条命令的后处理未在 %dms 内完成，继续物化（本轮视图可能较旧）", wait_ms)
+        pcall(function()
+          require("NeoAI.sandbox.review.evidence").add("postprocess_await_timeout", { waited_ms = wait_ms })
+        end)
+      end
+      trace_log.log("setup-await settled=%s", tostring(settled == true))
+      vim.schedule(proceed)
     end
+    pending:then_(function() go(true) end, function() go(true) end)
+    vim.defer_fn(function() go(false) end, wait_ms)
   end
   setup_mutex.queue[#setup_mutex.queue + 1] = run
   if not setup_mutex.busy then
@@ -2151,6 +2166,19 @@ local function _gate_inner(tool, args, ctx, call_original)
     end
     -- 用户态 overlay（fuse）与常驻沙箱不兼容：强制走一次性路径（其物化/捕获已支持 fuse）。
     for _, s in ipairs(specs) do if s.mode == "fuse" then resident_ok = false end end
+    -- 取证（默认关闭）：本条命令的视图来源与后处理在途状态（跨命令丢文件的首要嫌疑面）。
+    if trace_log.enabled() then
+      local parts = {}
+      for _, sp in ipairs(specs) do
+        parts[#parts + 1] = string.format("%s=%s", tostring(sp.root), tostring(sp.mode))
+      end
+      trace_log.log(
+        "attach attempt=%s tool=%s backend=%s resident=%s cross_mount=%s post_pending=%s pending_capture=%s specs=[%s]",
+        attempt.attempt_id, tostring(attempt.tool_name), tostring(runtime.backend()),
+        tostring(resident_ok), tostring(ctx.sandbox_cross_mount_approved == true),
+        tostring(M.postprocess_pending()), tostring(capture_mutex.busy),
+        table.concat(parts, " "))
+    end
     -- 无 overlay 播种视图：把可写根真实内容复制进会话私有 bind 目录，使降级视图也能看到
     -- 真实磁盘文件（写入仍落私有副本、冻结为候选；真实盘保持只读）。仅在无 overlay 且
     -- `degraded_seed=true` 时启用；T2 的私有 cwd（staging）在 _build_prefix 内单独播种。
@@ -2878,9 +2906,18 @@ local function _gate_inner(tool, args, ctx, call_original)
           journal_hint = { writes = ctx._observed_writes, deletes = ctx._observed_deletes }
         end
       end
+      if trace_log.enabled() then
+        local nw, nd = 0, 0
+        for _ in pairs(ctx._observed_writes or {}) do nw = nw + 1 end
+        for _ in pairs(ctx._observed_deletes or {}) do nd = nd + 1 end
+        trace_log.log("journal attempt=%s cfg=%s ready=%s drained=%s relative=%s writes=%d deletes=%d -> %s",
+          attempt.attempt_id, tostring(cfg.journal_capture), tostring(ctx._journal_ready),
+          tostring(ctx._journal_drained), tostring(ctx._observed_relative), nw, nd,
+          journal_hint and "hint(incremental)" or "full")
+      end
       local chain = _serialize_capture(function()
         local captures = {}
-        local pkg_opts = { package = attempt.package == true }
+        local pkg_opts = { package = attempt.package == true, since = attempt.started_at }
         -- git 写工具（git_add/commit/stash/restore/rollback）：**强制全量捕获**，绝不带
         -- 写日志 hint——`.git` 漏捕获任一对象都会产生悬空引用（详见顶部 GIT_WRITE_TOOLS 注释）。
         local cap_hint = GIT_WRITE_TOOLS[attempt.tool_name] and nil or journal_hint
@@ -2932,14 +2969,29 @@ local function _gate_inner(tool, args, ctx, call_original)
         -- 避免并发命令的捕获互相覆盖（按完成顺序归因，改动不丢失/不重复）。
         _track_postprocess(chain)
         d:resolve(res)
+        -- 后台结算失败 = 本轮文件改动**没有进入暂存视图**：下一条命令将看不到它们（甚至按旧暂存
+        -- 物化而「回退」）。这属于用户可感知的数据一致性问题，绝不静默：日志 + 证据 + 界面提示。
+        local function _postprocess_failed(message)
+          logger.warn("[sandbox] 后台结算失败（本轮改动可能未反映到后续命令）: %s", message)
+          pcall(function()
+            evidence.add("sandbox_postprocess_failed", {
+              attempt_id = attempt.attempt_id, tool = attempt.tool_name, message = message,
+            }, {
+              command_id = attempt.command_id, attempt_id = attempt.attempt_id, tool = attempt.tool_name,
+            })
+          end)
+          pcall(vim.notify,
+            "[NeoAI] 沙箱后处理失败，本轮命令的文件改动可能未反映到后续命令："
+              .. tostring(message) .. "（可用 :NeoAISandboxDiag 查看）",
+            vim.log.levels.WARN)
+        end
         chain:then_(function(settled)
           if not (settled and settled.ok) then
-            require("NeoAI.kernel.logger").warn("[sandbox] 后台结算失败: %s",
-              tostring(settled and settled.err and (settled.err.message or settled.err) or "unknown"))
+            _postprocess_failed(tostring(
+              settled and settled.err and (settled.err.message or settled.err) or "unknown"))
           end
         end, function(e)
-          require("NeoAI.kernel.logger").warn("[sandbox] 后台后处理异常: %s",
-            tostring(e and (e.message or e) or e))
+          _postprocess_failed(tostring(e and (e.message or e) or e))
         end)
       end
     end
@@ -2947,6 +2999,12 @@ local function _gate_inner(tool, args, ctx, call_original)
     --- 执行一次；权限/网络失败时自动发起升级并在隔离内重跑（记录，不静默）。
     --- 全档位生效：T0 失败升 T1，T1 失败升 T2（直到 max_tier），每步写证据/事件/审计。
     local function run(_, current_tier)
+      -- 命令窗口起点（wall clock，秒含小数）：写日志漏检哨兵据此判定「upper 中哪些条目是
+      -- 本轮命令真正改过的」（见 candidate.capture_overlay_async）。重试/提权重跑时刷新。
+      do
+        local ok_t, sec, usec = pcall(vim.uv.gettimeofday)
+        attempt.started_at = (ok_t and sec and (sec + (usec or 0) / 1e6)) or os.time()
+      end
       call_original():then_(function(res)
         if pcfg.auto_escalate ~= false and not attempt.package
           and current_tier < (pcfg.max_tier or 2) then

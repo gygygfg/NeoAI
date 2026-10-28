@@ -187,6 +187,31 @@ function M.replay(id)
   return { ok = result.code == 0, state = rec.state, receipt = receipt, result = rec.result }
 end
 
+--- 把**已拒绝**的主机操作提案恢复为待审（不产生任何主机副作用）。
+--- 供审批界面「已拒绝 → u 恢复为待审」使用；恢复后仍需用户显式审批才会 replay。
+--- 已 APPLIED / FAILED 的提案**不可**恢复：恢复后再次审批会在主机**重新执行**同一条命令。
+--- @param id string host_op_id
+--- @return boolean ok
+--- @return string|nil err 失败原因（`HOST_OP_NOT_FOUND` / `HOST_OP_NOT_RESTORABLE`）
+function M.restore(id)
+  local store = require("NeoAI.sandbox.state.store")
+  local rec = store.read_host_op(id)
+  if not rec then return false, "HOST_OP_NOT_FOUND: " .. tostring(id) end
+  if rec.state == "PENDING" then return true end
+  if rec.state == "APPLIED" or rec.state == "FAILED" then
+    return false, "HOST_OP_NOT_RESTORABLE: " .. tostring(rec.state)
+  end
+  rec.state = "PENDING"
+  rec.reject_reason = nil
+  rec.rejected_at = nil
+  rec.restored_at = os.time()
+  store.write_host_op(rec)
+  _emit(require("NeoAI.kernel.events").SANDBOX_HOST_OP_ENQUEUED, {
+    host_op_id = id, command = rec.command, restored = true,
+  })
+  return true
+end
+
 --- 重置（测试用）
 function M.reset()
   state.seq = 0

@@ -211,6 +211,10 @@ local function _server_script(boot)
     "        case \"$__op\" in",
     "          d) rm -rf -- \"$__pp\" ;;",
     "          D) mkdir -p -- \"$__pp\" ;;",
+    -- 符号链接物化：路径必须以**链接**形式重建（`__b` 为链接目标），否则 venv
+    -- `bin/python -> python3` / `lib64 -> lib` 会被解引用成普通文件或目录。
+    "          l) __t=$(printf '%s' \"$__b\" | base64 -d); "
+      .. "mkdir -p -- \"$(dirname -- \"$__pp\")\"; rm -rf -- \"$__pp\"; ln -sfn -- \"$__t\" \"$__pp\" ;;",
     -- 大文件物化：内容不内嵌于帧，改为从收件箱（会话目录 bind 进命名空间）按文件复制，
     -- 临时文件 + rename 原子替换，避免 bash 逐字节 read 读取数百 MB 内容撑爆 CPU。
     "          c) mkdir -p -- \"$(dirname -- \"$__pp\")\"; "
@@ -721,6 +725,15 @@ function M.materialize()
       return nil
     end
     local st = vim.uv.fs_stat(o.staged)
+    -- 符号链接（venv `bin/python -> python3`、`lib64 -> lib`）：必须以链接形式重建。
+    -- 用 lstat 判定类型：fs_stat 会跟随链接，把链接当成普通文件/目录写入视图。
+    if o.link ~= nil or (vim.uv.fs_lstat(o.staged) or {}).type == "link" then
+      local target = o.link or vim.uv.fs_readlink(o.staged)
+      if type(target) == "string" and target ~= "" then
+        return "l\t" .. vim.base64.encode(o.real) .. "\t" .. vim.base64.encode(target)
+      end
+      return nil
+    end
     local is_file = st ~= nil and st.type == "file"
     local big = is_file
       and (o.large == true or (max_embed > 0 and (st.size or 0) > max_embed))
