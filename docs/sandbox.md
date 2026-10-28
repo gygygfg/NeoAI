@@ -371,6 +371,14 @@ token（`NEOKEY_…`）或格式保真假密钥时**拒绝写盘**（`SECRET_TOK
     再删除父目录；界面也会完整列出被删子项（超过 `max_display_files` 时折叠，见上）。
   - **非空目录 rmdir 明确报因**：`writer` 对非空目录 rmdir 直接返回 `RMDIR_NOT_EMPTY: <path>`
     （区别于权限/其他失败），不再静默为笼统失败。
+  - **目录重建归一化（rmdir + 同目录写入）**：同一候选里既有 `rmdir D` 又有 `D` 下的写入时
+    （典型：包安装重建 venv，或跨命令合并后的包候选单元——`rmdir` 来自删除侧、`create` 来自
+    重建侧），rmdir 在两种顺序下都不成立：先删则宿主仍有旧内容（`ENOTEMPTY`），后删则候选刚写
+    的子项让它非空；此外 `create`/`modify` 的 CAS 也会与重建语义冲突
+    （`TARGET_ALREADY_EXISTS`/`BASELINE_CHANGED`）。发布端（`candidate.publish`）按 overlay 的
+    **不透明目录**语义归一化：CAS 预检放行这些路径 → 清理宿主 `D` 下**不在候选视图**的旧残留 →
+    丢弃该 `rmdir` → 按正常顺序写入（目录由写入自然建出）。此类单元一律走同步发布（异步路径的
+    CAS 与写入在线程池内合并完成，无法插入清理）。
   - **部分应用的失败原因可见**：`PARTIAL` 结果的 `reason` 携带**首条**失败原因，并逐条
     （上限 5 条）写入日志；回队的新待审单元携带 `fail_reason`，避免「同因再失败」无从排查。
   - **非原子整包部分应用**：非原子变更单元（不含 `atomic_group="git"` 的对象/指针）在写入阶段

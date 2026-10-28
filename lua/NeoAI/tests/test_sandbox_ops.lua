@@ -1227,6 +1227,59 @@ tests.suite("sandbox_ops", function(_, it)
     vim.fn.delete(root, "rf")
   end)
 
+  it("发布：同一候选内 rmdir 目录 + 该目录下写入 → 按目录重建应用（不 ENOTEMPTY）", function(t)
+    -- 典型来源：包安装重建 venv（`rm -rf .venv && uv sync`）或跨命令合并后的包候选单元。
+    -- 直接 rmdir 在两种顺序下都不成立（先删：宿主仍有旧内容；后删：候选刚写的子项非空），
+    -- 必须按「不透明目录」语义：清掉旧残留 + 丢弃 rmdir，由写入重建目录树。
+    local fs = require("NeoAI.utils.fs")
+    local candidate = require("NeoAI.sandbox.execution.candidate")
+    local root = fs.canonical(vim.fn.tempname())
+    local venv = root .. "/.venv"
+    fs.ensure_dir(venv .. "/bin")
+    fs.ensure_dir(venv .. "/lib/site-packages")
+    fs.write_file(venv .. "/bin/python", "OLD\n")
+    fs.write_file(venv .. "/lib/site-packages/stale.py", "STALE\n")
+
+    local res = candidate.publish({
+      candidate_digest = "sha256:recreate_dir_test",
+      files = {
+        { path = venv, action = "rmdir" },
+        { path = venv .. "/bin", action = "rmdir" },
+        { path = venv .. "/bin/python", action = "create", content = "NEW\n" },
+        { path = venv .. "/lib/site-packages/fresh.py", action = "create", content = "FRESH\n" },
+      },
+    })
+    t.true_(res.ok, "不应失败（rmdir 与同目录写入冲突应被归一化）: " .. tostring(res.reason))
+    t.eq("NEW\n", fs.read_file(venv .. "/bin/python"), "新文件应写入")
+    t.eq("FRESH\n", fs.read_file(venv .. "/lib/site-packages/fresh.py"), "新依赖文件应写入")
+    t.eq(nil, io.open(venv .. "/lib/site-packages/stale.py"), "旧残留应被清理（不透明目录语义）")
+    vim.fn.delete(root, "rf")
+  end)
+
+  it("发布（异步）：同一候选内 rmdir 目录 + 该目录下写入同样按目录重建", function(t)
+    local fs = require("NeoAI.utils.fs")
+    local candidate = require("NeoAI.sandbox.execution.candidate")
+    local root = fs.canonical(vim.fn.tempname())
+    local d = root .. "/d"
+    fs.ensure_dir(d .. "/sub")
+    fs.write_file(d .. "/old.txt", "OLD\n")
+    local done, res = false, nil
+    candidate.publish_async({
+      candidate_digest = "sha256:recreate_dir_async",
+      files = {
+        { path = d, action = "rmdir" },
+        { path = d .. "/sub/new.txt", action = "create", content = "NEW\n" },
+      },
+    }):then_(function(r) res = r; done = true end, function(e) res = { ok = false, reason = tostring(e) }; done = true end)
+    vim.wait(20000, function() return done end, 10)
+    t.true_(done, "异步发布应完成")
+    t.true_(res and res.ok, "异步发布不应失败: " .. tostring(res and res.reason))
+    t.eq("NEW\n", fs.read_file(d .. "/sub/new.txt"), "新文件应写入")
+    t.eq(nil, io.open(d .. "/old.txt"), "旧残留应被清理")
+    vim.fn.delete(root, "rf")
+  end)
+
+
   it("发布：非原子整包部分写入失败仅失败该文件，其余照常应用", function(t)
     local fs = require("NeoAI.utils.fs")
     local candidate = require("NeoAI.sandbox.execution.candidate")

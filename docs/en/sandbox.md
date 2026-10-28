@@ -638,6 +638,17 @@ is only kept for other `approval.mode` values (`prompt`/`strict`).
         lists the deleted children (folded beyond `max_display_files`, see above).
       - **Explicit reason for non-empty rmdir**: `writer` returns `RMDIR_NOT_EMPTY: <path>` for a
         non-empty directory (distinct from permission/other failures) instead of a generic failure.
+      - **Directory-recreate normalization (`rmdir` + writes under it)**: when a unit contains both
+        `rmdir D` and writes under `D` (typical: a package install rebuilding its venv, or a package
+        unit merged across commands — the `rmdir` comes from the delete side, the `create` from the
+        rebuild side), the rmdir cannot hold in either order: delete-first still leaves the old host
+        content (`ENOTEMPTY`), delete-last hits the children the unit just wrote; the `create`/`modify`
+        CAS also conflicts with the rebuild semantics (`TARGET_ALREADY_EXISTS`/`BASELINE_CHANGED`).
+        Publish (`candidate.publish`) therefore normalizes it with overlay **opaque-directory**
+        semantics: exempt those paths from the CAS precheck → prune host entries under `D` that are
+        **not** in the candidate view → drop the rmdir → write normally (the directory is recreated by
+        the writes). Such units always publish synchronously (the async path merges CAS and writes
+        inside the worker, leaving no place for the prune).
       - **Visible partial-apply failures**: the `PARTIAL` result's `reason` carries the **first**
         failure reason, all reasons (up to 5) are logged, and the requeued pending unit carries
         `fail_reason`, so repeated same-cause failures are diagnosable.

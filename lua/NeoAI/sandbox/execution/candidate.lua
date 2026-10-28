@@ -3712,6 +3712,80 @@ local function _apply_order(files)
   return out
 end
 
+--- 目录「重建」归一化：同一候选里既有 `rmdir D` 又有 D 下的写入时，rmdir 在两种顺序下都不成立
+--- （先删：宿主目录仍有旧内容 → ENOTEMPTY；后删：候选刚写的子项使它非空）。
+--- 语义上这等价于 overlay 的「不透明目录」：旧内容作废、按候选视图重建。故：
+---   * 丢弃该 rmdir（目录会由随后的写入自然建出）；
+---   * 发布前删除宿主 D 下**不在候选写入集**的残留项（否则旧文件会被悄悄留下）。
+--- 典型来源：包安装重建 venv（`rm -rf .venv && uv sync`）、跨命令合并后的包候选单元。
+--- @param files table 候选文件数组
+--- @return table files 归一化后的文件数组（已去掉无法成立的 rmdir）
+--- @return string[] recreated 需要「先清理旧残留」的目录
+--- @return table keep { writes = 路径集合, dirs = 写入路径的祖先目录集合 }
+local function _normalize_recreated_dirs(files)
+  local writes, dirs = {}, {}
+  for _, f in ipairs(files) do
+    if f.action == "create" or f.action == "modify" or f.action == "mkdir" or f.link then
+      writes[f.path] = true
+      local parent = f.path:match("^(.*)/[^/]*$")
+      while parent and parent ~= "" and not dirs[parent] do
+        dirs[parent] = true
+        parent = parent:match("^(.*)/[^/]*$")
+      end
+    end
+  end
+  local function has_write_under(p)
+    local pre = p .. "/"
+    for w in pairs(writes) do
+      if w:sub(1, #pre) == pre then return true end
+    end
+    return false
+  end
+  local out, recreated = {}, {}
+  for _, f in ipairs(files) do
+    if f.action == "rmdir" and has_write_under(f.path) then
+      recreated[#recreated + 1] = f.path
+    else
+      out[#out + 1] = f
+    end
+  end
+  return out, recreated, { writes = writes, dirs = dirs }
+end
+
+--- 深度优先清理「重建目录」下不属于候选视图的残留（文件/链接直接删；目录递归后删除）。
+--- 只清理候选明确要重建的目录，绝不触碰其他路径。
+--- 候选里某路径是文件/链接、宿主却是目录时（类型冲突），整棵删掉以便写入。
+--- @param dir string
+--- @param keep table { writes = table, dirs = table }
+local function _prune_stale_under(dir, keep)
+  local handle = vim.uv.fs_scandir(dir)
+  if not handle then return end
+  while true do
+    local name = vim.uv.fs_scandir_next(handle)
+    if not name then break end
+    local p = dir .. "/" .. name
+    local st = vim.uv.fs_lstat(p)
+    if keep.writes[p] and not keep.dirs[p] then
+      -- 候选在此写文件/链接：宿主若是目录（类型冲突）要整棵删掉，否则保留。
+      if st and st.type == "directory" then pcall(vim.fn.delete, p, "rf") end
+    elseif keep.dirs[p] or keep.writes[p] then
+      if st and st.type == "directory" then _prune_stale_under(p, keep) end
+    else
+      pcall(vim.fn.delete, p, "rf")
+    end
+  end
+end
+
+--- 对一批「重建目录」执行残留清理（幂等）。
+--- @param dirs string[]
+--- @param keep table { writes = table, dirs = table }
+local function _prune_recreated(dirs, keep)
+  for _, dir in ipairs(dirs or {}) do
+    local st = vim.uv.fs_lstat(dir)
+    if st and st.type == "directory" then _prune_stale_under(dir, keep) end
+  end
+end
+
 --- 候选是否为「原子整组」（含 git 对象/指针：索引↔对象库↔refs 强耦合，不可部分应用）。
 --- 非原子单元允许部分写入（成功文件落盘、失败文件由上层回队重试）；原子组仍整体失败。
 --- @param files table
@@ -4109,6 +4183,9 @@ function M.publish(candidate, opts)
   local runtime = require("NeoAI.sandbox.execution.runtime")
   local secret = require("NeoAI.sandbox.secret.secret")
   local merge_mod = require("NeoAI.utils.merge3")
+  -- 目录重建归一化：先算出「被重建目录」与其写入集，CAS 预检据此放行这些路径，
+  -- 清理旧残留发生在 CAS 通过之后、写入之前（冲突时不预先破坏宿主目录）。
+  local ordered_files, recreated_dirs, recreate_keep = _normalize_recreated_dirs(candidate.files or {})
   -- 三方合并决策：skip_paths（幂等，真实内容已是候选结果，无需写）；
   -- merged_paths（外部已改动，写入 base/ours/theirs 行级合并结果，内容为真实文本）。
   local skip_paths = {}
@@ -4119,10 +4196,19 @@ function M.publish(candidate, opts)
       and f.base_type == "file" and f.base_blob and not f.large and not f.link
   end
   -- 冲突预检：任一文件真实状态偏离基线则整体拒绝（可合并者例外，做三方合并）。
-  -- 例外：git 对象库（内容寻址、不可变、可累加）不做 CAS——写前已存在即幂等满足。
+  -- 例外 1：git 对象库（内容寻址、不可变、可累加）不做 CAS——写前已存在即幂等满足。
+  -- 例外 2：处于「被重建目录」下的路径（rmdir + 同目录写入，见 `_normalize_recreated_dirs`）：
+  --   其宿主旧内容会在写入前整段清理并按候选视图重建，故既不能要求「目标不存在」（create），
+  --   也不能要求「目标仍等于旧基线」（modify），否则重建 venv 一类候选永远无法发布。
+  local function under_recreated(p)
+    for _, dir in ipairs(recreated_dirs) do
+      if p == dir or p:sub(1, #dir + 1) == dir .. "/" then return true end
+    end
+    return false
+  end
   for _, f in ipairs(candidate.files or {}) do
     local gc = f.git_class or runtime.git_path_class(f.path)
-    if gc ~= "object" then
+    if gc ~= "object" and not under_recreated(f.path) then
       local lstat = vim.uv.fs_lstat(f.path)
       local stat = vim.uv.fs_stat(f.path)
       local exists = lstat ~= nil
@@ -4223,7 +4309,9 @@ function M.publish(candidate, opts)
   local atomic = opts.atomic == true or _atomic_group(candidate.files or {})
   local allow_partial = not atomic and opts.partial ~= false
   local applied, failed = {}, {}
-  for _, f in ipairs(_apply_order(candidate.files or {})) do
+  -- 目录重建：CAS 已通过 → 清掉宿主旧残留（保留候选视图内的路径），随后按顺序写入。
+  _prune_recreated(recreated_dirs, recreate_keep)
+  for _, f in ipairs(_apply_order(ordered_files)) do
     local action, content
     if f.link then
       action = "symlink"
@@ -4568,7 +4656,13 @@ function M.publish_async(candidate, opts)
   opts = opts or {}
   local invalid = _publish_validate(candidate)
   if invalid then return async.resolve(invalid) end
-  local files = _apply_order(candidate.files or {})
+  -- 目录重建归一化：必须在派发写入前完成；重建目录需要「先 CAS → 清残留 → 写入」的同步顺序，
+  -- 而异步路径把 CAS 与写入合并在线程池内完成，无法插入清理，故此类单元一律回退同步发布。
+  local ordered, recreated = _normalize_recreated_dirs(candidate.files or {})
+  if #recreated > 0 then
+    return async.resolve(M.publish(candidate, opts))
+  end
+  local files = _apply_order(ordered)
   -- 非原子单元允许部分写入（成功文件落盘、失败文件由 review 层回队重试）；git 原子组仍整体失败。
   local atomic = opts.atomic == true or _atomic_group(candidate.files or {})
   local allow_partial = not atomic and opts.partial ~= false
