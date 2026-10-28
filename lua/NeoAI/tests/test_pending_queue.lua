@@ -39,6 +39,8 @@ tests.suite("pending_queue", function(_, it)
     t.eq(1, #agent.messages, "轮末应把暂存消息注入对话")
     t.eq("user", agent.messages[1].role)
     t.eq("用户后续消息", agent.messages[1].content)
+    t.true_(agent.messages[1].mid_turn == true,
+      "注入消息应带 mid_turn 标记（聊天渲染据此不在中途重置 Step 编号）")
     t.true_(d:is_resolved(), "注入后 Deferred 应 resolve")
   end)
 
@@ -88,6 +90,22 @@ tests.suite("pending_queue", function(_, it)
     tool_loop.inject_pending(agent)
     agent:set_state("idle")
     t.false_(chat.has_pending_work(), "注入且空闲后无工作")
+  end)
+
+  it("is_agent_busy：只看本轮是否还在处理，暂存队列非空不算", function(t)
+    local chat = init_chat()
+    local agent = chat.new_session({})
+    t.false_(chat.is_agent_busy(agent.id), "空闲时应为 false")
+    agent:set_state("tool_running")
+    t.true_(chat.is_agent_busy(agent.id), "工具执行中应为 true")
+    chat.send_message("排队消息"):catch(function() end)
+    t.eq(1, chat.pending_count_for_agent(agent.id), "忙碌期间的发送应入队")
+    -- 直接改状态（不触发 AGENT_STATE_CHANGED）：模拟「本轮已结束、暂存消息还没发出去」的瞬间
+    agent.state = "idle"
+    t.false_(chat.is_agent_busy(agent.id),
+      "只有暂存队列非空（本轮已结束）时不算进行中——否则已结束的轮会一直按 keep_steps 摊开")
+    t.true_(chat.has_pending_work_for_agent(agent.id), "对照：has_pending_work 仍为 true（队列有待发）")
+    chat.reset()
   end)
 
   it("按 agent 取消息/工作状态（多实例隔离）", function(t)

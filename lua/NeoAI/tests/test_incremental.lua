@@ -401,7 +401,7 @@ tests.suite("incremental", function(_, it)
     }
     chat_view.refresh()
 
-    -- 渲染宽度必须与 chat_view.refresh 一致（用户消息右对齐的补白宽度依赖它），
+    -- 渲染宽度必须与 chat_view.refresh 一致（表格自适应宽度依赖它），
     -- 否则宽度变化会被正确判定为「内容变化」而重写 buffer。
     local tw = math.max(20, vim.api.nvim_win_get_width(opened.win_id) - 2)
 

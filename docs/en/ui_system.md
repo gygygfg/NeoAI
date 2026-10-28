@@ -199,21 +199,14 @@ multiple assistant messages inside one agent tool loop (tool call → result →
 Under `process` folding the header is rendered **outside** the process fold (order: header → `🧩 过程` → expanded
 steps), so the “it is the AI's turn” cue is never swallowed by the fold even when the turn's first step is folded away.
 
-**Left/right alignment**: user messages are **right-aligned** and AI messages **left-aligned** (chat-bubble feel).
-In a plain-text buffer this can only be done with leading padding, with these rules:
+**Alignment**: user messages and AI messages are **both left-aligned** (start at column 0, no leading
+padding). The role header (`👤 用户` / `🤖 AI`) shares the same left edge as the body; in a plain-text buffer
+no indentation/padding is used for alignment, so:
 
-- the body block is padded **uniformly** (padding computed from the widest line of the block), not line by line —
-  the internal indentation and relative alignment of code blocks / lists are preserved and only the whole block
-  shifts right;
-- the role header is padded separately to the same right edge (`table width = window width - 2`, leaving a 2-column
-  right margin);
-- when the body exceeds the available width (long paragraph / over-wide table) **nothing is padded** (header
-  included), avoiding the “header far right, body far left” mismatch;
-- the byte offsets of inline highlights (`md_span` / `ansi` / `secret_spans`) are shifted by the padding, otherwise
-  they would be misaligned;
-- since padding introduces leading spaces, role headers and body lines are all registered as “body lines”
-  (`body = true`) so `foldexpr` returns `0` — otherwise the indented lines would be mistaken for fold blocks.
-  The turn separator is outside the padded range and stays full width.
+- the internal indentation and relative alignment of code blocks / lists / tables stay exactly as written;
+- role headers and body lines are still registered as “body lines” (`body = true`) so `foldexpr` returns `0` —
+  otherwise space-prefixed lines would be mistaken for fold blocks;
+- the turn separator spans the full width and is unrelated to messages.
 
 ### 4.4 Folds
 
@@ -223,7 +216,17 @@ becomes its own independent fold.
 **Fold level (`ui.chat.fold`)**:
 - `none`: disables `foldenable` in the main window; reasoning/tool/step content is fully expanded;
 - `reasoning_tools` (default): the current behavior above;
-- `process`: keeps the current folds and additionally folds each turn's **AI intermediate steps** into one “process” fold. The folded range depends on the turn state: **while the turn is running** (the agent is still `generating`/`tool_running`) the most recent `ui.chat.process_keep_steps` steps stay expanded so you can watch the current calls; **once the turn ends** (back to `idle`) those steps are folded too, leaving only the final step expanded — so historical turns do not keep 3 calls spread open. The fold text starts by naming the folded **Step range** (`🧩 过程 · Step 1-18 · 工具 5✓ · ↑12.0k ↓1.2k · 缓存 62%`) and then summarizes tool success/failure counts, input/output tokens, and cache hit rate. **The Step marker lives in the fold text, not on its own line**: every “thinking process” and “tool call” fold gets `· Step N` appended (e.g. `🤔 思考过程 1 行 · Step 18`, `🔧 grep · 搜索 ✅ 0.3s · Step 18`); the role header is a plain `🤖 AI` shown only on role switches, and folded steps no longer render a separate header line. The renderer registers the marker per fold start line (`fold.set_step_labels`) and `foldtext` only looks it up; single-step turns (`total < 2`) get no marker.
+- `process`: keeps the current folds and additionally folds each turn's **AI intermediate steps** into one “process” fold. The folded range depends on the turn state: **while the turn is running** (the agent is still `generating`/`tool_running`) the most recent `ui.chat.process_keep_steps` steps stay expanded so you can watch the current calls; **once the turn ends** (back to `idle`) those steps are folded too, leaving only the final step expanded — so historical turns do not keep 3 calls spread open. “Running” is decided **only by whether the agent is still working on this turn** (`chat_service.is_agent_busy`), **not** by the pending queue: a message the user sent while the turn was wrapping up still sits in the pending queue, and counting that as “running” would keep an already-finished turn spread open by `keep_steps`. The fold text starts by naming the folded **Step range** (`🧩 过程 · Step 1-18 · 工具 5✓ · ↑12.0k ↓1.2k · 缓存 62%`) and then summarizes tool success/failure counts, input/output tokens, and cache hit rate. **The Step marker lives in the fold text, not on its own line**: every “thinking process” and “tool call” fold gets `· Step N` appended (e.g. `🤔 思考过程 1 行 · Step 18`, `🔧 grep · 搜索 ✅ 0.3s · Step 18`); the role header is a plain `🤖 AI` shown only on role switches, and folded steps no longer render a separate header line. The renderer registers the marker per fold start line (`fold.set_step_labels`) and `foldtext` only looks it up; single-step turns (`total < 2`) get no marker.
+
+**A user message inserted mid-run** (typed and submitted while the agent is busy; injected by the tool loop at the
+end of a round with `mid_turn = true`) **does not start a new turn**: Step numbering continues across the whole run
+instead of restarting at `Step 1`, and the insertion splits the “process” fold into two segments (a fold is a
+contiguous line range and cannot skip over the user's own message). The segment **before** the insertion is folded
+**entirely** — the run continues after it, so its last step is only an intermediate call and must not be treated as
+the “final answer” left outside the fold. The run therefore renders as
+`🧩 过程 · Step 1-3` / `👤 用户 (inserted message)` / `🧩 过程 · Step 4-6` with continuous numbering and the user's
+message never swallowed by a fold. The marker is persisted with the session; old data without it is recognized by
+“a user message directly following a tool result”.
 
 **The “process” fold is a two-level structure**: “process” itself is a level 1 fold, while the reasoning blocks
 and each tool block inside it remain level 2 nested folds. So expanding the “process” fold leaves the inner

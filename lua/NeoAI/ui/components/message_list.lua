@@ -849,55 +849,6 @@ local function _push(lines, marks, text, mark)
   marks[#lines] = mark
 end
 
---- 把 [from, #lines] 这一段行**右对齐**：左侧补足空格，使内容右边缘贴到 width 列。
---- 用户消息右对齐（AI 消息保持左对齐），在纯文本 buffer 里只能用行首补白实现。
---- 采用「整块统一补白」（按块内最长行算补白量）而不是逐行补白：代码块 / 列表的内部缩进
---- 与相对对齐得以完整保留，只有整块整体向右平移。
---- 补白后同步平移行内高亮的**字节偏移**（md_span / ansi / secret_spans），否则高亮会错位。
---- 空行不补白（避免尾随空格）；块内最长行已超过 width 时（超宽表格/长代码行）整体不补白。
---- @param lines table
---- @param marks table 与 lines 并行的元数据数组
---- @param from number 起始行下标（含）；`from > #lines` 时无操作
---- @param width number|nil 目标右边缘列（缺省 / <=0 时不对齐）
---- @return number pad 实际补白列数（0 = 未补白：无宽度、空块或块内最长行已超宽）
-local function _right_align(lines, marks, from, width)
-  local to = #lines
-  if not width or width <= 0 or from > to then return 0 end
-  local maxw = 0
-  for i = from, to do
-    local w = textmetrics.strwidth(lines[i])
-    if w > maxw then maxw = w end
-  end
-  local pad = width - maxw
-  if pad <= 0 then return 0 end
-  local spaces = string.rep(" ", pad)
-  for i = from, to do
-    local text = lines[i]
-    if text ~= "" then
-      lines[i] = spaces .. text
-      local m = marks[i]
-      if m then
-        if m.md_span then
-          m.md_span = { m.md_span[1] + pad, m.md_span[2] + pad }
-        end
-        if m.ansi then
-          for _, sp in ipairs(m.ansi) do
-            sp[1] = sp[1] + pad
-            sp[2] = sp[2] + pad
-          end
-        end
-        if m.secret_spans then
-          for _, sp in ipairs(m.secret_spans) do
-            sp[1] = sp[1] + pad
-            sp[2] = sp[2] + pad
-          end
-        end
-      end
-    end
-  end
-  return pad
-end
-
 --- 追加一个可折叠块（推理 / 单个工具块）。所有行缩进 2 格，由聊天窗口的
 --- expr 折叠（components.fold.foldexpr）把每块独立成折叠，块与块之间无需分隔行。
 --- 空行保留为空白分隔（expr 折叠会把紧邻缩进内容的空行并入折叠）。
@@ -1000,9 +951,38 @@ local function _is_sub_agent_result(msg)
   return type(c) == "string" and c:match("^%s*【子 Agent ") ~= nil
 end
 
+--- 是否为「AI 运行途中插入」的用户消息（agent 忙碌期间发送、由工具循环轮末注入）。
+--- 这类消息不构成新的用户轮次：同一 run 的 Step 编号在其中途不重置，但它会切断
+--- 「过程」折叠的连续行区间（折叠不能跨行跳过用户自己刚说的话）。
+--- 优先看标记 `msg.mid_turn`（chat_service 注入时写入、随会话持久化）；兼容旧数据：
+--- 紧跟在 tool 结果之后的用户消息只可能来自轮末注入（正常用户轮次前必有一条 assistant）。
+--- @param messages table
+--- @param i number
+--- @return boolean
+local function _is_mid_turn_user(messages, i)
+  local m = messages[i]
+  if not m or m.role ~= "user" or m.runtime_context or _is_sub_agent_result(m) then return false end
+  if m.mid_turn == true then return true end
+  local p = i - 1
+  while p >= 1 and messages[p] and messages[p].runtime_context do p = p - 1 end
+  return p >= 1 and messages[p] ~= nil and messages[p].role == "tool"
+end
+
+--- 是否为开启新一轮（run）的真实用户消息（排除运行时快照、子 Agent 结果与途中注入）。
+--- @param messages table
+--- @param i number
+--- @return boolean
+local function _is_user_turn_start(messages, i)
+  local m = messages[i]
+  if not m or m.role ~= "user" then return false end
+  if m.runtime_context or _is_sub_agent_result(m) then return false end
+  return not _is_mid_turn_user(messages, i)
+end
+
 --- 判断消息是否为轮次边界（其后应绘制分割线）。
---- 一轮 = 从用户消息开始，到下一个用户消息（或消息列表末尾）结束。
+--- 一轮 = 从真实用户消息开始，到下一个真实用户消息（或消息列表末尾）结束。
 --- 轮内（推理/工具调用/工具结果与正文之间）一律不画分割线，只保留轮间分割。
+--- 途中注入的用户消息属于同一 run（见 `_is_mid_turn_user`），不画分割线。
 --- @param messages table
 --- @param i number 当前消息下标
 --- @return boolean
@@ -1017,7 +997,8 @@ local function _is_turn_end(messages, i)
     return false
   end
   if msg.role == "user" then
-    return true -- 用户消息始终后接分割线（与 AI 回复的视觉分隔）
+    -- 真实用户消息后接分割线（与 AI 回复的视觉分隔）；途中注入的消息属同一 run，不画。
+    return not _is_mid_turn_user(messages, i)
   end
   if msg.role ~= "assistant" then
     return false -- 工具结果不带分割线（与所属 AI 轮保持连续）
@@ -1027,15 +1008,15 @@ local function _is_turn_end(messages, i)
     local m = messages[j]
     -- 子 Agent 结果块与运行时快照不构成轮次边界，继续向后找真正的下一条消息
     if not m.runtime_context and m.role ~= "system" and not _is_sub_agent_result(m) then
-      return m.role == "user"
+      return m.role == "user" and not _is_mid_turn_user(messages, j)
     end
   end
   return true
 end
 
 --- 追加角色头（非工具消息）
---- 角色头只在角色切换时出现（见 _blocks）。标记 `body = true`：用户消息右对齐会在行首
---- 补白，若不加此标记，缩进行会被 expr 折叠误判为折叠块。
+--- 角色头只在角色切换时出现（见 _blocks）。标记 `body = true`：角色头是排版行而非折叠块，
+--- 不加此标记时以空格开头的角色头会被 expr 折叠误判为折叠块首行。
 --- @param lines table
 --- @param marks table 与 lines 并行的元数据数组
 --- @param message table
@@ -1181,12 +1162,16 @@ end
 --- @param msgs table
 --- @param indices number[] 被折叠的 assistant 消息下标
 --- @param results table tool_call_id -> tool 结果消息
---- @return table { rounds, tools_ok, tools_fail, prompt, completion, cache_read, cache_total }
-local function _collect_step_stats(msgs, indices, results)
+--- @param first_step number|nil 本段首个 Step 在一轮内的序号（缺省 1）
+--- @return table { rounds, first_step, last_step, tools_ok, tools_fail, prompt, completion, cache_read, cache_total }
+local function _collect_step_stats(msgs, indices, results, first_step)
   local st = {
     rounds = #indices, tools_ok = 0, tools_fail = 0,
     prompt = 0, completion = 0, cache_read = 0, cache_total = 0,
   }
+  local base = math.max(1, tonumber(first_step) or 1)
+  st.first_step = base
+  st.last_step = base + math.max(0, #indices - 1)
   for _, idx in ipairs(indices) do
     local m = msgs[idx] or {}
     for _, tc in ipairs(m.tool_calls or {}) do
@@ -1208,13 +1193,14 @@ local function _collect_step_stats(msgs, indices, results)
   return st
 end
 
---- 过程折叠首行汇总文本。首段标明被折叠的 Step 范围（如 `Step 1-5` / `Step 1`），
+--- 过程折叠首行汇总文本。首段标明被折叠的 Step 范围（如 `Step 1-5` / `Step 4`），
 --- 被折叠的步骤因此不再各自渲染角色头行。工具成败 / token / 缓存命中率仍照旧汇总在同一行。
 --- @param st table
 --- @return string
 local function _process_label(st)
-  local n = tonumber(st.rounds) or 0
-  local step_txt = (n > 1) and string.format("Step 1-%d", n) or string.format("Step %d", n)
+  local first = math.max(1, tonumber(st.first_step) or 1)
+  local last = math.max(first, tonumber(st.last_step) or first)
+  local step_txt = (last > first) and string.format("Step %d-%d", first, last) or string.format("Step %d", last)
   local parts = { "🧩 过程 · " .. step_txt }
   local total_tools = (st.tools_ok or 0) + (st.tools_fail or 0)
   if total_tools > 0 then
@@ -1235,59 +1221,90 @@ local function _process_label(st)
 end
 
 --- 预计算每个 assistant 消息的 Step 元数据（序号/总数/是否折叠/是否最终回答）。
---- Step 以 user 轮为边界；子 Agent 结果不是新的用户轮。
+--- 「轮（run）」以真实用户消息为边界；子 Agent 结果、运行时快照与**途中注入**的用户消息
+--- （agent 忙碌期间发送、由工具循环轮末插入，见 `_is_mid_turn_user`）都不开启新 run。
+--- 途中注入的用户消息会切断「过程」折叠的**连续行区间**（折叠不能跨行跳过用户刚说的话），
+--- 因此一个 run 被切成若干「段」，但：
+---   - Step 序号在全 run 内**连续**（`Step 1-3` → `Step 4-6`），不因插入而重新从 1 开始；
+---   - 以途中注入收尾的段（后面还有同一 run 的步骤）**整段收起**——该段最后一步只是中间调用，
+---     不是最终回答，不能留在折叠外；
+---   - 最后一段只留真正的最终回答展开（`active` 时再按 `keep_steps` 保留最近若干步）。
 --- 折叠范围：
----   - **已完成的轮**（以及历史上更早的轮）：所有中间 Step 全部收进「过程」折叠，只留最终回答；
----   - **进行中的最后一轮**（`active=true`，即 agent 仍在 generating/tool_running）：
+---   - **已完成的轮**：所有中间 Step 全部收进「过程」折叠，只留最终回答；
+---   - **进行中的最后一轮**（`active=true`，即该 run 仍在 generating/tool_running）：
 ---     保留最近 `keep_steps` 个 Step 展开，便于实时观察当前正在跑的工具调用。
---- 因此 `process_keep_steps` 只影响正在进行的轮，轮次结束后所有中间调用一律收起。
+--- 因此 `process_keep_steps` 只影响正在进行的 run，run 结束后所有中间调用一律收起。
 --- @param msgs table
 --- @param keep_steps number
---- @param active boolean|nil 最后一轮是否仍在进行（agent 正忙）
+--- @param active boolean|nil 最后一个 run 是否仍在进行（agent 正在处理它）
 --- @return table msg_index -> { index, total, old, final, first_old, stats? }
 local function _process_meta(msgs, keep_steps, active)
+  msgs = msgs or {}
   local results = {}
-  for _, m in ipairs(msgs or {}) do
+  for _, m in ipairs(msgs) do
     if m.role == "tool" and m.tool_call_id then results[m.tool_call_id] = m end
   end
   local meta = {}
+  local n = #msgs
   local i = 1
-  local n = #(msgs or {})
   while i <= n do
-    local m = msgs[i]
-    if m.role == "user" and not m.runtime_context and not _is_sub_agent_result(m) then
-      local steps = {}
+    if not _is_user_turn_start(msgs, i) then
+      i = i + 1
+    else
+      -- 1) 先按 run 扫描：统计总步数，并按「途中注入的用户消息」切段。
+      local segs = {}       -- 每段：assistant 消息下标数组
+      local seg = {}
+      local total = 0
       local j = i + 1
-      while j <= n do
+      while j <= n and not _is_user_turn_start(msgs, j) do
         local x = msgs[j]
-        if x.role == "user" and not x.runtime_context and not _is_sub_agent_result(x) then break end
-        if x.role == "assistant" then steps[#steps + 1] = j end
+        if x.role == "assistant" then
+          seg[#seg + 1] = j
+          total = total + 1
+        elseif _is_mid_turn_user(msgs, j) then
+          segs[#segs + 1] = seg
+          seg = {}
+        end
         j = j + 1
       end
-      local total = #steps
-      -- 最终回答始终展开：即使 keep_steps=0，也只折叠 final 之前的步骤。
-      local old_count = math.max(0, total - 1)
-      -- keep_steps 只在「进行中的最后一轮」生效（j > n 表示本轮到消息末尾）。
-      -- 轮次一旦完成，中间调用全部收进过程折叠，不再摊开最近 keep_steps 步。
-      if active and total > 0 and j > n then
-        old_count = math.min(old_count, math.max(0, total - keep_steps))
-      end
-      local old_indices = {}
-      for k = 1, old_count do old_indices[#old_indices + 1] = steps[k] end
-      local stats = old_count > 0 and _collect_step_stats(msgs, old_indices, results) or nil
-      for k, idx in ipairs(steps) do
-        meta[idx] = {
-          index = k,
-          total = total,
-          old = k <= old_count,
-          final = (k == total),
-          first_old = (k == 1 and old_count > 0),
-          stats = (k == 1 and old_count > 0) and stats or nil,
-        }
+      segs[#segs + 1] = seg
+      -- 2) 逐段决定折叠范围：run 末尾的段是「最后一段」，其余段都是被中途插入收尾的中间段。
+      local base = 0 -- 本段之前该 run 已编号的 Step 数
+      for si, steps in ipairs(segs) do
+        local is_last_seg = (si == #segs)
+        local count = #steps
+        local old_count = 0
+        if count > 0 then
+          if is_last_seg then
+            -- 最终回答始终展开：即使 keep_steps=0，也只折叠 final 之前的步骤。
+            old_count = math.max(0, count - 1)
+            -- keep_steps 只在「仍在进行的最后一个 run」生效（j > n 表示本 run 到消息末尾）。
+            -- run 一旦完成，中间调用全部收进过程折叠，不再摊开最近 keep_steps 步。
+            if active and j > n then
+              old_count = math.min(old_count, math.max(0, count - keep_steps))
+            end
+          else
+            -- 被途中插入收尾的段：整段都是中间调用（下一个段的步骤紧跟在同一 run 里）。
+            old_count = count
+          end
+        end
+        local old_indices = {}
+        for k = 1, old_count do old_indices[#old_indices + 1] = steps[k] end
+        local stats = old_count > 0 and _collect_step_stats(msgs, old_indices, results, base + 1) or nil
+        for k, idx in ipairs(steps) do
+          local index = base + k
+          meta[idx] = {
+            index = index,
+            total = total,
+            old = k <= old_count,
+            final = is_last_seg and (k == count),
+            first_old = (k == 1 and old_count > 0),
+            stats = (k == 1 and old_count > 0) and stats or nil,
+          }
+        end
+        base = base + count
       end
       i = j
-    else
-      i = i + 1
     end
   end
   return meta
@@ -1765,30 +1782,12 @@ local function _format_message(lines, marks, message, is_turn_end, opts, show_he
     _append_process_header(lines, marks, step)
     fold_from = #lines
   end
-  -- 用户消息右对齐（AI 消息保持左对齐）：正文整块统一补白（保住代码块/列表内部缩进），
-  -- 角色头补白到同一条右边缘。先构建正文到临时表，据其实际宽度决定补白量——正文超宽
-  -- （长段落/超宽表格）时整体不补白，避免出现「角色头在最右、正文在最左」的割裂视觉。
-  local tw = (message.role == "user") and opts and opts.table_width or nil
-  if tw then
-    local cl, cm = {}, {}
-    _append_reasoning(cl, cm, message, opts, show)
-    _append_content(cl, cm, message, opts)
-    local pad = _right_align(cl, cm, 1, tw)
-    if show_header ~= false then
-      _append_role_header(lines, marks, message)
-      local hdr_pad = pad > 0 and (tw - textmetrics.strwidth(lines[#lines])) or 0
-      if hdr_pad > 0 then
-        lines[#lines] = string.rep(" ", hdr_pad) .. lines[#lines]
-      end
-    end
-    for i = 1, #cl do _push(lines, marks, cl[i], cm[i]) end
-  else
-    if show_header ~= false then
-      _append_role_header(lines, marks, message)
-    end
-    _append_reasoning(lines, marks, message, opts, show)
-    _append_content(lines, marks, message, opts)
+  -- 一律左对齐（用户消息与 AI 消息同为行首起排，不做行首补白）。
+  if show_header ~= false then
+    _append_role_header(lines, marks, message)
   end
+  _append_reasoning(lines, marks, message, opts, show)
+  _append_content(lines, marks, message, opts)
   if is_turn_end then
     _append_turn_sep(lines, marks)
   end
@@ -1884,10 +1883,16 @@ local function _blocks(msgs, opts, prev, show)
   if show == nil then show = _show_for(nil) end
   local streaming = opts and opts.streaming
   local fold_mode = _fold_mode()
-  -- 进行中的轮次（agent 正忙）：只有这一刻才按 process_keep_steps 保留最近几步展开；
-  -- 轮次结束后中间调用全部收进「过程」折叠。
+  -- 「过程」折叠是否按**进行中**处理：只看 agent 是否真的还在处理最后一个 run
+  -- （opts.fold_active，由 chat_view 按 agent 状态给出），不看暂存队列——用户在本轮收尾时
+  -- 发的消息仍挂在 pending 队列里，若据此判为进行中，已结束的轮会一直按 keep_steps 摊开最近几步。
+  -- 缺省回退 streaming（兼容直接调用 render 的旧路径）。
+  -- 不进块签名：fold_active 只影响 Step 元数据（old/first_old），已由 _step_sig 覆盖，
+  -- 否则 streaming 一抖动就会让所有前缀块失效（长会话流式重排的主要开销）。
+  local fold_active = opts and opts.fold_active
+  if fold_active == nil then fold_active = (streaming == true) end
   local pmeta = fold_mode == "process"
-      and _process_meta(msgs, _process_keep_steps(), streaming == true) or nil
+      and _process_meta(msgs, _process_keep_steps(), fold_active == true) or nil
   -- 角色头只在**角色发生切换时**显示（如 👤 用户 → 🤖 AI、🤖 AI → 👤 用户）：
   -- Agent loop 内同一用户轮次会连续产生多条 assistant 消息（工具调用 → 结果 → 再调用…），
   -- 它们之间不再重复刷 `🤖 AI`。process 折叠程度下角色头渲染在「过程」折叠**之外**，
@@ -2055,7 +2060,8 @@ local function _blocks(msgs, opts, prev, show)
       last_role = role
       if role == "assistant" then
         current_proc_step = step
-      elseif role == "user" then
+      elseif role == "user" and _is_user_turn_start(msgs, idx) then
+        -- 只有真实用户轮次才清空：途中注入的用户消息仍属同一 run，后续子 Agent 块照旧跟随本 run 的折叠状态。
         current_proc_step = nil
       end
       local clen, rlen = #(snap.content or ""), #(snap.reasoning or "")

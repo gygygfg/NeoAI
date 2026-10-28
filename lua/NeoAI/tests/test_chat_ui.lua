@@ -667,7 +667,7 @@ tests.suite("chat_ui", function(_, it)
     chat_service.reset()
   end)
 
-  it("角色头只在角色切换时出现，用户消息右对齐 / AI 消息左对齐", function(t)
+  it("角色头只在角色切换时出现，用户与 AI 消息均左对齐", function(t)
     local message_list = require("NeoAI.ui.components.message_list")
     local chat_view = require("NeoAI.ui.window.chat_view")
     local chat_service = require("NeoAI.services.chat_service")
@@ -702,30 +702,26 @@ tests.suite("chat_ui", function(_, it)
     t.eq(2, n_user, "两条用户消息应各有一个角色头（切换点）")
     t.eq(2, n_ai, "同一轮的多个 assistant 消息只应有一个角色头")
 
-    -- 2) 用户消息右对齐、AI 消息左对齐
-    local tw = math.max(20, vim.api.nvim_win_get_width(opened.win_id) - 2)
+    -- 2) 用户消息与 AI 消息一律左对齐（行首不补白）
     local function line_of(needle)
       for _, l in ipairs(lines) do
         if l:find(needle, 1, true) then return l end
       end
       return nil
     end
-    local user_line = assert(line_of("帮我看下这个文件"), "用户消息应渲染")
-    t.eq(tw, vim.fn.strdisplaywidth(user_line), "用户消息应右对齐到窗口可用宽度")
-    t.true_(user_line:match("^%s+") ~= nil, "用户消息左侧应有补白")
-    for _, needle in ipairs({ "我先读一下。", "看完了，没问题。", "不客气" }) do
+    for _, needle in ipairs({ "帮我看下这个文件", "我先读一下。", "看完了，没问题。", "谢谢", "不客气" }) do
       local l = assert(line_of(needle), needle .. " 应渲染")
-      t.eq(needle, l, "AI 消息应左对齐（行首无补白）")
+      t.eq(needle, l, needle .. " 应左对齐（行首无补白）")
     end
-    -- 3) 用户角色头本身也靠右（与用户消息右边缘对齐）
+    -- 3) 用户角色头同样左对齐
     local user_header = assert(line_of("👤 用户"), "应渲染用户角色头")
-    t.eq(tw, vim.fn.strdisplaywidth(user_header), "用户角色头也应右对齐")
+    t.eq("👤 用户", user_header, "用户角色头应左对齐（不做右边缘补白）")
 
     chat_view.reset()
     chat_service.reset()
   end)
 
-  it("用户消息右对齐不影响折叠：补白行不被 expr 折叠误判为折叠块", function(t)
+  it("用户消息左对齐：多段消息行首无补白，且不被 expr 折叠误判为折叠块", function(t)
     local message_list = require("NeoAI.ui.components.message_list")
     local chat_view = require("NeoAI.ui.window.chat_view")
     local chat_service = require("NeoAI.services.chat_service")
@@ -750,8 +746,9 @@ tests.suite("chat_ui", function(_, it)
       local text = vim.api.nvim_buf_get_lines(opened.buf, ln - 1, ln, false)[1] or ""
       if text:find("第一行", 1, true) or text:find("第二段", 1, true)
         or text:find("👤 用户", 1, true) then
-        t.eq(0, vim.fn.foldlevel(ln), "补白后的用户消息行不应被折叠: " .. text)
-        t.eq(-1, vim.fn.foldclosed(ln), "补白后的用户消息行不应在折叠块内: " .. text)
+        t.eq(nil, text:match("^%s+"), "用户消息行与角色头行首不应有补白: " .. text)
+        t.eq(0, vim.fn.foldlevel(ln), "用户消息行不应被折叠: " .. text)
+        t.eq(-1, vim.fn.foldclosed(ln), "用户消息行不应在折叠块内: " .. text)
       end
     end
 

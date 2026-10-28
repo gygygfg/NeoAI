@@ -476,7 +476,10 @@ is only kept for other `approval.mode` values (`prompt`/`strict`).
     **a pending item shows its header line with the rest folded** (the header — tool / risk badge /
     file count / `待审` — stays visible and is the whole-unit approval entry; the secret warning, risk
     reasons, git hint and file list start collapsed, `za`/`zo` expands), avoiding a flood from package
-    installs or git operations with up to thousands of files; the out-of-bounds trace section does not
+    installs or git operations with up to thousands of files; while collapsed the **fold text shows the
+    modified files** (`修改文件: a.lua, b.lua`, with `… 共 N 个` beyond 3) instead of the command that
+    happens to be the fold's first line, so the paths are visible without expanding. The out-of-bounds
+    trace section does not
     fold. **Command-based change sets** (`run_command` / package installs) show the actual command
     `$ <command>` under the header; the file lines below it are exactly the files the command affects,
     highlighted by workspace / user / system level. **For a host operation the header line and the

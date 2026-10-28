@@ -245,6 +245,7 @@ local state = {
   line_to_trace = {}, -- 行号 -> 越界留痕路径（`i` 查看详情，非审批目标）
   line_to_cmd = {}, -- 行号 -> { command = string|nil } 越界命令（`i` 查看该命令涉及的文件）
   fold_levels = {}, -- 行号 -> 折叠级别（仅「已应用」区 > 0）：区标题=1，条目及其文件行=2
+  fold_titles = {}, -- 折叠首行 -> 折叠文本摘要（待审条目：显示被修改的文件而非命令）
   last_cursor = nil, -- { line, col } 关闭时记录，重开时恢复
   --- @type table<string, any>|nil 关闭时光标所在条目（优先恢复）
   last_target = nil,
@@ -297,8 +298,11 @@ end
 local function _fold_text()
   local start = vim.v.foldstart
   local count = vim.v.foldend - start + 1
-  local first = vim.fn.getline(start) or ""
-  return string.format("  ▸ %s  (%d 行)", first, count)
+  -- 折叠文本优先用渲染层登记的摘要：待审条目的折叠首行往往是插在条目里的命令
+  -- （`$ <cmd>`），直接取首行会把命令当成摘要显示；登记后显示被修改的文件。
+  local title = state.fold_titles[start]
+  local text = (type(title) == "string" and title ~= "") and title or (vim.fn.getline(start) or "")
+  return string.format("  ▸ %s  (%d 行)", text, count)
 end
 
 -- ========== 私有函数 ==========
@@ -406,6 +410,30 @@ local function _one_line(s)
   return (tostring(s):gsub("\r\n", "⏎"):gsub("[\r\n]", "⏎"))
 end
 
+--- 折叠摘要：把变更单元涉及的文件压成一行（最多 `limit` 个，超出附「共 N 个」）。
+--- 待审条目收起时，折叠首行往往是插在条目里的命令行；摘要登记后折叠文本显示**被修改的文件**
+--- 而不是命令（用户从收起状态一眼看出改了哪些文件）。
+--- @param files table|nil 文件项数组（{ path } 或字符串）
+--- @param limit number|nil 最多显示的路径数（缺省 3）
+--- @return string|nil 摘要文本；没有可用路径时返回 nil（回退显示折叠首行）
+local function _fold_files_summary(files, limit)
+  limit = tonumber(limit) or 3
+  if limit < 1 then limit = 1 end
+  local paths, total = {}, 0
+  for _, f in ipairs(files or {}) do
+    local p = type(f) == "table" and f.path or f
+    p = _one_line(p)
+    if p ~= "" then
+      total = total + 1
+      if #paths < limit then paths[#paths + 1] = p end
+    end
+  end
+  if #paths == 0 then return nil end
+  local s = "修改文件: " .. table.concat(paths, ", ")
+  if total > #paths then s = s .. string.format(" … 共 %d 个", total) end
+  return s
+end
+
 --- 合并重复风险原因并计数：包安装等会对每个写入路径重复同一原因（如数千个
 --- SYSTEM_PATH_WRITE），展示为 `SYSTEM_PATH_WRITE×2797`（保留首次出现顺序）。
 --- @param list table|nil
@@ -488,7 +516,7 @@ end
 --- @param audit table|nil AI 审计 { pending?, error?, fallback?, notes? = { [路径或命令]=说明 } }
 --- @param saved table|nil 已保存/已撤销（含快照）的变更单元数组（sandbox.list_saved）
 --- @param rejected table|nil 可恢复的已拒绝变更单元数组（sandbox.list_rejected）
---- @return table { lines, marks, line_to_target, line_to_trace, fold_levels }
+--- @return table { lines, marks, line_to_target, line_to_trace, fold_levels, fold_titles }
 function M.build_lines(items, traces, audit, saved, rejected)
   local lines = {}
   local marks = {}
@@ -497,6 +525,8 @@ function M.build_lines(items, traces, audit, saved, rejected)
   -- 折叠级别（稀疏表：仅「已应用」区 > 0）：区标题=1（整区收起），条目头行及其文件行=2
   -- （展开整区后条目仍各自收起）。待审区/留痕区不登记，保持不折叠。
   local fold_levels = {}
+  -- 折叠首行 -> 折叠文本摘要（待审条目收起时显示被修改的文件，而不是条目内的命令）。
+  local fold_titles = {}
   -- 本次渲染复用一次 cwd/home 规范形式，避免逐文件重复 fs.canonical。
   local lvl_ctx = { cwd = _canon_base(_ws_base()), home = _canon_base(vim.fn.expand("~")) }
   lines[#lines + 1] = LEGEND
@@ -768,6 +798,11 @@ function M.build_lines(items, traces, audit, saved, rejected)
     -- 头行保持正常显示（审批入口，保留工具/风险/文件数与高亮），其后的密钥警告/风险原因/
     -- git 提示/文件行统一登记为一级折叠，默认收起、`za`/`zo` 展开——即「第一行显示、其余折叠」。
     -- 包安装/git 操作可达上千文件，折叠避免刷屏；头行已含文件数，审批仍可整单元进行。
+    -- 折叠文本用文件摘要（而不是折叠首行的 `$ 命令`）：收起时也能看出改了哪些文件。
+    if #lines > hln then
+      local summary = _fold_files_summary(files)
+      if summary then fold_titles[hln + 1] = summary end
+    end
     for ln = hln + 1, #lines do fold_levels[ln] = 1 end
     lines[#lines + 1] = ""
     end
@@ -925,7 +960,7 @@ function M.build_lines(items, traces, audit, saved, rejected)
     if type(lines[i]) ~= "string" then lines[i] = _one_line(lines[i]) end
     if lines[i]:find("[\r\n]") then lines[i] = _one_line(lines[i]) end
   end
-  return { lines = lines, marks = marks, line_to_target = line_to_target, line_to_trace = line_to_trace, fold_levels = fold_levels }
+  return { lines = lines, marks = marks, line_to_target = line_to_target, line_to_trace = line_to_trace, fold_levels = fold_levels, fold_titles = fold_titles }
 end
 
 -- 前向声明（定义见下方 diff 预览区）
@@ -3559,8 +3594,9 @@ function M.refresh()
     for ln, v in pairs(src or {}) do out[ln + offset] = v end
     return out
   end
-  -- 折叠级别必须在写 buffer 前更新：写行后 nvim 会立即按 foldexpr 求值。
+  -- 折叠级别/折叠摘要必须在写 buffer 前更新：写行后 nvim 会立即按 foldexpr 求值。
   state.fold_levels = _shift(body.fold_levels)
+  state.fold_titles = _shift(body.fold_titles)
   vim.api.nvim_buf_set_lines(state.buf, 0, -1, false, lines)
   state.line_to_target = _shift(body.line_to_target)
   state.line_to_trace = _shift(body.line_to_trace)
@@ -3634,6 +3670,7 @@ function M.close()
   state.line_to_trace = {}
   state.line_to_cmd = {}
   state.fold_levels = {}
+  state.fold_titles = {}
   -- 作废在途 AI 审计结果；保留已完成结论（diff 预览返回/重开时复用，集合变化时由 refresh 清除）。
   state.audit_seq = state.audit_seq + 1
 end
@@ -3706,6 +3743,7 @@ function M.reset()
   state.audit_sig = nil
   state.audit_seq = state.audit_seq + 1
   state.fold_levels = {}
+  state.fold_titles = {}
   state.page = "files"
   state.line_to_hub = {}
   state.line_to_allowance = {}

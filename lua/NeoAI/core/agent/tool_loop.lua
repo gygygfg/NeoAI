@@ -466,7 +466,8 @@ function M.run(agent, tool_calls, tool_service, opts)
       local guard_cfg = config_store.get("tools.guard.repeat_tool") or {}
       local reminder = guard.check_round(agent, current_calls, guard_cfg)
       if reminder then
-        agent:add_message("user", reminder)
+        -- 与 pending 注入消息一致：这是同一 run 的中途插入，不是新的用户轮次。
+        agent:add_message("user", reminder, { mid_turn = true })
         event_bus.emit(events.TOOL_LOOP_GUARD_REMINDER, { agent_id = agent.id, repeats = agent.guard and agent.guard.repeats })
       end
 

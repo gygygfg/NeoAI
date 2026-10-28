@@ -62,6 +62,129 @@ local function _messages()
 end
 
 tests.suite("chat_fold", function(_, it)
+  --- 构造「AI 跑工具期间用户插入一句话」的消息序列：一个 run 连续 9 步（第 9 步是最终回答），
+  --- 注入消息落在第 3 步的工具结果之后。
+  --- @param marked boolean 是否带 mid_turn 标记（false = 模拟旧数据，走启发式识别）
+  --- @return table
+  local function _mid_turn_messages(marked)
+    local msgs = { { role = "user", content = "question" } }
+    for i = 1, 9 do
+      local final = (i == 9)
+      local tc = nil
+      if not final then
+        tc = { { id = "m" .. i, ["function"] = {
+          name = "git_status", arguments = '{"description":"d' .. i .. '"}',
+        } } }
+      end
+      msgs[#msgs + 1] = {
+        role = "assistant",
+        content = final and "final answer" or "",
+        reasoning = "think " .. i,
+        tool_calls = tc,
+      }
+      if not final then
+        msgs[#msgs + 1] = { role = "tool", tool_call_id = "m" .. i, content = "ok" }
+      end
+      if i == 3 then
+        local injected = { role = "user", content = "中途插入" }
+        if marked then injected.mid_turn = true end
+        msgs[#msgs + 1] = injected
+      end
+    end
+    return msgs
+  end
+
+  --- 统计 buffer 里出现「过程」折叠首行的行号
+  --- @param lines table
+  --- @return number[]
+  local function _proc_lines(lines)
+    local out = {}
+    for i, l in ipairs(lines or {}) do
+      if l:find("🧩 过程", 1, true) then out[#out + 1] = i end
+    end
+    return out
+  end
+
+  local function _case_mid_turn(t, marked)
+    local chat_view = require("NeoAI.ui.window.chat_view")
+    local chat_service = require("NeoAI.services.chat_service")
+    local config_store = require("NeoAI.kernel.config_store")
+    chat_view.reset(); chat_service.reset()
+    config_store.load({ ui = { chat = { fold = "process", process_keep_steps = 3 } } })
+    local opened = chat_view.open()
+    local agent = assert(chat_service.get_current_agent())
+    agent.state = "idle"
+    agent.messages = _mid_turn_messages(marked)
+    chat_view.refresh()
+    vim.api.nvim_set_current_win(opened.win_id)
+
+    local lines = vim.api.nvim_buf_get_lines(opened.buf, 0, -1, false)
+    local procs = _proc_lines(lines)
+    t.eq(2, #procs, "一个 run 被用户插入切段：应有两个过程折叠（各自不能跨过用户消息）")
+    -- Step 编号跨段连续，不因插入而重置成两个 Step 1-N
+    local label1 = vim.fn.foldtextresult(vim.fn.foldclosed(procs[1]))
+    local label2 = vim.fn.foldtextresult(vim.fn.foldclosed(procs[2]))
+    t.true_(label1:find("Step 1-3", 1, true) ~= nil, "第一段应折叠 Step 1-3: " .. label1)
+    t.true_(label2:find("Step 4-8", 1, true) ~= nil, "第二段应接着编号为 Step 4-8: " .. label2)
+    -- 插入前的最后一步（Step 3）只是中间调用：必须收进过程折叠，不能留在折叠外
+    local think3 = assert(_find_line(lines, "think 3"), "think 3 应仍在 buffer 中")
+    t.eq(vim.fn.foldclosed(procs[1]), vim.fn.foldclosed(think3),
+      "途中插入前的最后一步（think 3）应被收进过程折叠")
+    t.eq(vim.fn.foldclosed(procs[1]), vim.fn.foldclosed(assert(_find_line(lines, "git_status · d3"))),
+      "途中插入前的最后一个工具块也应被收进过程折叠")
+    -- 用户自己插入的那句话不能被折叠吞掉
+    local injected = assert(_find_line(lines, "中途插入"), "插入的用户消息应渲染")
+    t.eq(-1, vim.fn.foldclosed(injected), "插入的用户消息不应落在折叠内")
+    -- 最终回答保持展开
+    local final_body = assert(_find_line(lines, "final answer"), "最终回答应展示")
+    t.eq(-1, vim.fn.foldclosed(final_body), "最终回答不应被折叠")
+
+    config_store.load({ ui = { chat = { fold = "reasoning_tools", process_keep_steps = 3 } } })
+    chat_view.reset(); chat_service.reset()
+  end
+
+  it("process：途中注入的用户消息不打断 Step 编号，插入前的步骤全部收进过程折叠", function(t)
+    _case_mid_turn(t, true)
+  end)
+
+  it("process：旧数据（无 mid_turn 标记）紧跟 tool 结果的用户消息仍按途中注入处理", function(t)
+    _case_mid_turn(t, false)
+  end)
+
+  it("process：agent 已空闲时不再套用 keep_steps（暂存队列非空也不算进行中）", function(t)
+    local message_list = require("NeoAI.ui.components.message_list")
+    local chat_view = require("NeoAI.ui.window.chat_view")
+    local chat_service = require("NeoAI.services.chat_service")
+    local config_store = require("NeoAI.kernel.config_store")
+    chat_view.reset(); chat_service.reset()
+    config_store.load({ ui = { chat = { fold = "process", process_keep_steps = 3 } } })
+    local opened = chat_view.open()
+    local agent = assert(chat_service.get_current_agent())
+    agent.state = "idle"
+    local msgs = _messages()
+    agent.messages = msgs
+    chat_view.refresh()
+    vim.api.nvim_set_current_win(opened.win_id)
+
+    -- streaming 仍为真（例如用户收尾时发的消息还挂在暂存队列里），但本轮已经结束：
+    -- fold_active=false → 最近 3 步也必须收进过程折叠。
+    message_list.render(opened.buf, msgs, { streaming = true, fold_active = false })
+    local lines = vim.api.nvim_buf_get_lines(opened.buf, 0, -1, false)
+    local proc = assert(_find_line(lines, "🧩 过程"), "应显示过程折叠首行")
+    local label = vim.fn.foldtextresult(vim.fn.foldclosed(proc))
+    t.true_(label:find("Step 1-5", 1, true) ~= nil, "轮次结束后应全部收起: " .. label)
+
+    -- 本轮仍在进行（fold_active=true）时保持最近 keep_steps 步展开
+    message_list.render(opened.buf, msgs, { streaming = true, fold_active = true })
+    lines = vim.api.nvim_buf_get_lines(opened.buf, 0, -1, false)
+    proc = assert(_find_line(lines, "🧩 过程"), "应显示过程折叠首行")
+    local label2 = vim.fn.foldtextresult(vim.fn.foldclosed(proc))
+    t.true_(label2:find("Step 1-3", 1, true) ~= nil, "进行中只折叠前面 3 步: " .. label2)
+
+    config_store.load({ ui = { chat = { fold = "reasoning_tools", process_keep_steps = 3 } } })
+    chat_view.reset(); chat_service.reset()
+  end)
+
   it("process：轮次完成后中间 Step 全部收进过程折叠，最终 Step 按序显示 Step N", function(t)
     local chat_view = require("NeoAI.ui.window.chat_view")
     local chat_service = require("NeoAI.services.chat_service")

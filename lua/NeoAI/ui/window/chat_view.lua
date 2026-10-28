@@ -299,7 +299,14 @@ local function _render(keep_view)
   -- table_width 随聊天窗口宽度自适应：窄窗把表收紧（更多折行），宽窗放宽表，避免整表超出屏幕。
   local has_pending = chat_service.has_pending_work_for_agent
   local streaming = type(has_pending) == "function" and has_pending(state.agent_id) or false
-  local render_opts = { streaming = streaming }
+  -- 「过程」折叠的进行中判定只看 agent 是否真的还在处理本轮（不看暂存队列）：
+  -- 用户在收尾时发的消息仍挂在 pending 队列里，若据此判为进行中，已结束的轮会一直按
+  -- process_keep_steps 摊开最近几步而不收进过程折叠。
+  local is_busy = chat_service.is_agent_busy
+  local render_opts = {
+    streaming = streaming,
+    fold_active = type(is_busy) == "function" and is_busy(state.agent_id) == true or false,
+  }
   state.last_table_width = _current_table_width()
   if state.last_table_width then
     render_opts.table_width = state.last_table_width
@@ -1005,6 +1012,20 @@ local function _on_agent_end(payload)
     -- 都不应抢焦点/重复进入插入模式。
     if _focused() and _can_auto_focus_input() then _focus_input_insert() end
   end
+end
+
+--- Agent 状态归位（离开 generating/tool_running）：补一次渲染，让「过程」折叠回到已结束轮的
+--- 展开范围（只留最终回答）。
+--- 折叠范围本应只由消息序列 + 「本轮是否还在进行」决定，但负责渲染的事件（MESSAGE_ADDED /
+--- GENERATION_COMPLETED）抵达时状态可能尚未归位（或是先到的流式分片），那时仍按
+--- process_keep_steps 摊开最近几步；若此后没有别的渲染，这几步就一直留在过程折叠外。
+--- 这里在状态真正归位后兜底一次 keep_view 渲染（内容无变化时 _render 直接返回，不碰 buffer/视口）。
+--- @param payload table { agent_id, old, new }
+local function _on_agent_state_changed(payload)
+  if not payload or payload.agent_id ~= state.agent_id then return end
+  local new_state = payload.new
+  if new_state == "generating" or new_state == "tool_running" then return end
+  _schedule_render(true)
 end
 
 --- 提交输入
@@ -1988,6 +2009,8 @@ function M.open(opts)
   state.unsubs[#state.unsubs + 1] = event_bus.on(events.GENERATION_COMPLETED, _on_agent_end)
   state.unsubs[#state.unsubs + 1] = event_bus.on(events.GENERATION_ERROR, _on_agent_end)
   state.unsubs[#state.unsubs + 1] = event_bus.on(events.AGENT_ABORTED, _on_agent_end)
+  -- 状态归位兜底：折叠范围不依赖事件到达顺序（见 _on_agent_state_changed）
+  state.unsubs[#state.unsubs + 1] = event_bus.on(events.AGENT_STATE_CHANGED, _on_agent_state_changed)
   -- 轨迹模式保存随显示模式启停
   state.unsubs[#state.unsubs + 1] = event_bus.on(events.DISPLAY_MODE_CHANGED, _on_display_mode_changed)
   state.unsubs[#state.unsubs + 1] = event_bus.on(events.CONFIG_CHANGED, _on_config_changed)

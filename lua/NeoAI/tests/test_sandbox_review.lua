@@ -358,6 +358,61 @@ tests.suite("sandbox_review", function(_, it)
     services.provide("services.sandbox", saved)
   end)
 
+  it("build_lines 待审条目折叠摘要显示被修改的文件（不显示命令）", function(t)
+    local sr = require("NeoAI.ui.components.sandbox_review")
+    local cwd = vim.fn.getcwd()
+    local data = sr.build_lines({ { change_set_id = "csCmd", tool = "run_command", risk_level = 1,
+      command = "sed -i 's/a/b/' p.lua q.lua",
+      files = { { path = cwd .. "/p.lua" }, { path = cwd .. "/q.lua" } } } }, {}, nil, {})
+    local head
+    for i, l in ipairs(data.lines) do
+      if l:find("csCmd", 1, true) then head = i end
+    end
+    t.not_nil(head, "应有头行")
+    t.true_(data.lines[head + 1]:find("$ sed", 1, true) ~= nil, "条目内仍应展示命令（仅供展开查看）")
+    local title = (data.fold_titles or {})[head + 1]
+    t.not_nil(title, "折叠首行应登记摘要")
+    t.true_(title:find("p.lua", 1, true) ~= nil, "摘要应含被修改的文件 p.lua: " .. title)
+    t.true_(title:find("q.lua", 1, true) ~= nil, "摘要应含被修改的文件 q.lua: " .. title)
+    t.eq(nil, title:find("sed", 1, true), "摘要不应包含命令: " .. title)
+  end)
+
+  it("open 后待审条目折叠文本显示文件而不是命令", function(t)
+    local services = require("NeoAI.kernel.services")
+    local sr = require("NeoAI.ui.components.sandbox_review")
+    sr.reset()
+    local saved = services.use("services.sandbox")
+    local cwd = vim.fn.getcwd()
+    _provide_sandbox({
+      list_reviews = function()
+        return { { change_set_id = "csCmdOpen", tool = "run_command", risk_level = 1,
+          command = "sed -i 's/a/b/' mod.lua",
+          files = { { path = cwd .. "/mod.lua" } } } }
+      end,
+      list_traces = function() return {} end,
+      list_saved = function() return {} end,
+      apply = function() return { ok = true } end,
+      reject = function() end,
+    })
+    sr.open()
+    local buf = assert(sr.get_buf(), "应创建审批 buffer")
+    local win = vim.fn.bufwinid(buf)
+    t.true_(win ~= -1, "审批 buffer 应在窗口中显示")
+    local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+    local head
+    for i, l in ipairs(lines) do
+      if l:find("csCmdOpen", 1, true) then head = i end
+    end
+    t.not_nil(head, "应有头行")
+    local closed = vim.api.nvim_win_call(win, function() return vim.fn.foldclosed(head + 1) end)
+    local text = vim.api.nvim_win_call(win, function() return vim.fn.foldtextresult(closed) end)
+    t.eq(head + 1, closed, "头行之后默认收起")
+    t.true_(text:find("mod.lua", 1, true) ~= nil, "折叠文本应显示被修改的文件: " .. text)
+    t.eq(nil, text:find("sed", 1, true), "折叠文本不应显示命令: " .. text)
+    sr.close()
+    services.provide("services.sandbox", saved)
+  end)
+
   it("build_lines 合并重复风险原因并计数", function(t)
     local sr = require("NeoAI.ui.components.sandbox_review")
     local cwd = vim.fn.getcwd()

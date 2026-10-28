@@ -213,6 +213,9 @@ local function _build_persist_session(agent)
         -- 子 Agent 结果标记（UI 折叠渲染用，不进入模型上下文）：随会话持久化，
         -- 重开会话时仍按折叠块渲染而非用户消息。
         sub_agent = msg.sub_agent,
+        -- 途中注入标记（AI 忙碌期间发送、由工具循环轮末插入的用户消息）：随会话持久化，
+        -- 重开会话后「过程」折叠仍把它当作同一 run 的中途插入（见 message_list._process_meta）。
+        mid_turn = msg.mid_turn,
       })
       synced[#synced + 1] = msg
     end
@@ -395,6 +398,9 @@ end
 --- 与 _flush_pending 不同：_flush_pending 在 agent 空闲（整个工具循环结束）后才发送；
 --- 这里在工具循环中途、本轮工具结果记录后、下次模型调用之前插入，供下一轮模型感知，
 --- 而不是等整个工具循环彻底结束才补上。
+--- 注入的消息打上 `mid_turn = true`：它属于**同一个 AI run** 的中途插入，不是新的用户轮次
+--- （聊天渲染据此不在中途重置 Step 编号、也不把它切断的最后一步当成最终回答）。
+--- 该标记随会话持久化（见 _persist_agent 白名单），重开会话后仍按同一语义渲染。
 --- @param agent table
 local function _inject_pending(agent)
   local q = pending_queue[agent.id]
@@ -404,7 +410,10 @@ local function _inject_pending(agent)
   end
   pending_queue[agent.id] = nil
   for _, item in ipairs(q) do
-    agent:add_message("user", item.content, item.opts and item.opts.message_extra or nil)
+    local extra = item.opts and item.opts.message_extra
+    extra = extra and vim.deepcopy(extra) or {}
+    extra.mid_turn = true
+    agent:add_message("user", item.content, extra)
     event_bus.emit(events.MESSAGE_SENT, { agent_id = agent.id, content = item.content })
     -- 消息已插入对话即视为已发送；resolve 避免 UI await 挂起（UI 主要只关心 reject）。
     -- 若 Agent 中途被销毁，会由 detach_window 走 _flush_pending 的拒绝逻辑，不在此重复。
@@ -732,6 +741,8 @@ end
 
 --- 指定 Agent 是否仍有未完成的工作（正忙，或暂存队列里还有待发消息）。
 --- 多聊天实例：按 agent_id 判定，避免后台实例误用聚焦实例的忙碌/排队状态。
+--- 注意：暂存队列非空**不等于**本轮还在进行——用户在收尾时发的消息仍在队列里等待发送，
+--- 此时本轮已经结束。折叠渲染要用 `is_agent_busy`（只看本轮是否真的在处理）判定「进行中」。
 --- @param agent_id string|nil
 --- @return boolean
 function M.has_pending_work_for_agent(agent_id)
@@ -748,6 +759,18 @@ end
 --- @return boolean
 function M.has_pending_work()
   return M.has_pending_work_for_agent(state.current_agent_id)
+end
+
+--- 指定 Agent 是否**正在处理本轮的生成**（generating / tool_running / 生成槽位占用）。
+--- 与 has_pending_work_for_agent 的区别：不看暂存队列。折叠渲染用它判定「这一轮是否仍在进行」
+--- （进行中才按 process_keep_steps 保留最近几步展开），否则用户收尾时发的那条待发消息
+--- 会让已结束的轮一直被当成进行中，最近 keep_steps 步永远收不进「过程」折叠。
+--- @param agent_id string|nil
+--- @return boolean
+function M.is_agent_busy(agent_id)
+  if not agent_id then return false end
+  local agent = runtime.get(agent_id)
+  return agent ~= nil and _is_busy(agent)
 end
 
 --- 获取指定 Agent 的消息（多实例：按 agent_id 取，避免后台实例读到聚焦实例的内容）。
