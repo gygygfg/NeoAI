@@ -1473,18 +1473,17 @@ local function _apply_settle(ctx, pub)
   return pub
 end
 
---- 发布前的公共步骤：标记 APPLYING、广播开始、捕获原文件快照。
+--- 发布前的公共步骤（同步部分）：标记 APPLYING、广播开始；快照由调用方捕获。
+--- 拆出「标记」与「快照」两段，使异步路径可以把快照（逐文件复制原文件）下沉线程池。
 --- @param ctx table
 --- @return table pub_opts
-local function _apply_publish_begin(ctx)
+local function _apply_publish_mark(ctx)
   local item = ctx.item
   item.apply_state = M.APPLY.APPLYING
   _persist(item)
   _emit(require("NeoAI.kernel.events").SANDBOX_PUBLISH_STARTED, {
     change_set_id = ctx.id, candidate_digest = item.candidate_digest,
   })
-  -- 保存前捕获原文件快照（真实文件当前内容），供撤销保存时交换。
-  ctx.snapshot_entries = _capture_snapshot(ctx.cand)
   return {
     expected_base = item.base_version,
     allow_root = ctx.opts.allow_root == true,
@@ -1493,6 +1492,93 @@ local function _apply_publish_begin(ctx)
     atomic = item.atomic_group == "git",
     partial = item.atomic_group ~= "git",
   }
+end
+
+--- 发布前的公共步骤（同步版）：标记 APPLYING + 在主线程捕获原文件快照。
+--- @param ctx table
+--- @return table pub_opts
+local function _apply_publish_begin(ctx)
+  local pub_opts = _apply_publish_mark(ctx)
+  -- 保存前捕获原文件快照（真实文件当前内容），供撤销保存时交换。
+  ctx.snapshot_entries = _capture_snapshot(ctx.cand)
+  return pub_opts
+end
+
+--- 线程内为单个候选文件捕获「应用前」快照侧：stat + 复制到 blob（或读入内容兜底）。
+--- `fs_copyfile`/`fs_stat`/读盘都在 worker 内完成，主线程只收结构化结果。
+--- @param payload table { path, blob, cap }
+--- @return table
+local function _snapshot_entry_worker(payload)
+  local uv = vim.uv
+  local path, blob, cap = payload.path, payload.blob, payload.cap or 0
+  local st = uv.fs_stat(path)
+  local is_file = st ~= nil and st.type == "file"
+  local too_large = is_file and cap > 0 and (st.size or 0) > cap
+  local copied, content = false, nil
+  if is_file and not too_large then
+    if blob then
+      local ok = uv.fs_copyfile(path, blob)
+      if ok then
+        pcall(uv.fs_chmod, blob, 384) -- 0600
+        copied = true
+      end
+    end
+    if not copied then
+      local f = io.open(path, "rb")
+      if f then
+        content = f:read("*a")
+        f:close()
+      end
+    end
+  end
+  return {
+    exists = st ~= nil,
+    type = st and st.type or nil,
+    mode = st and (st.mode % 4096) or nil,
+    too_large = too_large or false,
+    blob = copied and blob or nil,
+    content = content,
+  }
+end
+
+--- 应用前快照的异步版本：逐文件「stat + 复制到 blob」下沉线程池（分块并发）。
+--- 线程池不可用时回落同步 `_capture_snapshot`，语义一致。
+--- @param cand table 冻结候选（已按选择性应用过滤）
+--- @return Deferred resolve(table 数组)
+local function _capture_snapshot_async(cand)
+  local async = require("NeoAI.utils.async")
+  local work = require("NeoAI.utils.work")
+  local files = cand.files or {}
+  if not work.available() or #files == 0 then
+    return async.resolve(_capture_snapshot(cand))
+  end
+  local cap = _snapshot_cap()
+  local digest = tostring(cand.candidate_digest)
+  local limit = (type(work.parallelism) == "function" and work.parallelism()) or 4
+  return work.batched(files, limit, function(f)
+    local blob = store.blob_path("snap|" .. digest .. "|" .. f.path)
+    return work.run_codec(_snapshot_entry_worker, { path = f.path, blob = blob, cap = cap })
+  end):then_(function(results)
+    local entries = {}
+    for i, f in ipairs(files) do
+      local r = results[i] or {}
+      entries[#entries + 1] = {
+        path = f.path,
+        action = f.action,
+        alt_exists = r.exists == true,
+        alt_type = r.type,
+        alt_mode = r.mode,
+        alt_content = r.content,
+        alt_blob = r.blob,
+        alt_too_large = r.too_large or nil,
+        side = "after", -- 真实盘当前为「保存后」版本；快照侧为「保存前」版本
+      }
+    end
+    return entries
+  end, function()
+    -- 线程池中途失败：回落同步捕获（保证撤销快照不缺失）
+    return _capture_snapshot(cand)
+  end)
 end
 
 --- 应用变更单元（CAS 发布到真实工作区，同步）
@@ -1533,7 +1619,37 @@ function M.apply(id, opts)
   return res
 end
 
---- 应用变更单元（异步）：CAS + 写入在线程池分块执行，主线程不被大候选落盘阻塞。
+--- `M.apply_async` 的主体（候选已预取/命中缓存）
+--- @param id string
+--- @param opts table|nil
+--- @param async table utils.async
+--- @return Deferred
+local function _apply_async_impl(id, opts, async)
+  local ctx, early = _apply_begin(id, opts)
+  if early then return async.resolve(early) end
+  ctx = assert(ctx)
+  local ok_begin, pub_opts = pcall(_apply_publish_mark, ctx)
+  if not ok_begin then return async.resolve(_settle_publish_error(ctx, pub_opts)) end
+  -- 应用前快照：逐文件复制原文件（撤销用）下沉线程池，完成后才发布。
+  return _capture_snapshot_async(ctx.cand):then_(function(entries)
+    ctx.snapshot_entries = entries
+    -- `candidate.publish_async` 对顺序敏感单元（git 原子组/删除）内部回落同步 `M.publish`，
+    -- 可能同步抛异常；此处捕获并转成结构化 FAILED，而不是让异常冒泡把条目卡在 APPLYING。
+    local ok_pub, d = pcall(candidate.publish_async, ctx.cand, pub_opts)
+    if not ok_pub then return _settle_publish_error(ctx, d) end
+    local out = d:then_(function(pub)
+      return _apply_settle(ctx, pub)
+    end)
+    -- 发布异常/被拒时同样释放路径占用，避免路径长期「发布中」而无法重试。
+    out:then_(nil, function() _release_paths(ctx) end)
+    return out
+  end, function(err)
+    return _settle_publish_error(ctx, err)
+  end)
+end
+
+--- 应用变更单元（异步）：候选读取/解码、应用前快照捕获、CAS + 写入均在线程池执行，
+--- 主线程不被大候选读盘/复制/落盘阻塞。
 --- 提权（allow_root / root+run_as 降权）、顺序敏感（git 原子组/删除）或线程池不可用时，
 --- `candidate.publish_async` 内部回落同步发布，语义与 `M.apply` 一致。
 --- @param id string
@@ -1541,21 +1657,19 @@ end
 --- @return Deferred resolve(table { ok, state, reason?, receipt? })
 function M.apply_async(id, opts)
   local async = require("NeoAI.utils.async")
-  local ctx, early = _apply_begin(id, opts)
-  if early then return async.resolve(early) end
-  ctx = assert(ctx)
-  local ok_begin, pub_opts = pcall(_apply_publish_begin, ctx)
-  if not ok_begin then return async.resolve(_settle_publish_error(ctx, pub_opts)) end
-  -- `candidate.publish_async` 对顺序敏感单元（git 原子组/删除）内部回落同步 `M.publish`，
-  -- 可能同步抛异常；此处捕获并转成结构化 FAILED，而不是让异常冒泡把条目卡在 APPLYING。
-  local ok_pub, d = pcall(candidate.publish_async, ctx.cand, pub_opts)
-  if not ok_pub then return async.resolve(_settle_publish_error(ctx, d)) end
-  d = d:then_(function(pub)
-    return _apply_settle(ctx, pub)
-  end)
-  -- 发布异常/被拒时同样释放路径占用，避免路径长期「发布中」而无法重试。
-  d:then_(nil, function() _release_paths(ctx) end)
-  return d
+  -- 候选预取：大候选（数十 MB）的「读盘 + JSON 解码」不再阻塞主线程；命中解码缓存时同步返回。
+  -- 待审项的摘要即内容寻址，故预取结果可直接复用；读取失败时 `_apply_begin` 内的同步路径兜底。
+  local pre = M.get(id)
+  local digest = pre and pre.candidate_digest
+  if digest then
+    local ok_pre, pres = pcall(store.read_candidate_async, digest)
+    if ok_pre and pres then
+      return pres:then_(function()
+        return _apply_async_impl(id, opts, async)
+      end)
+    end
+  end
+  return _apply_async_impl(id, opts, async)
 end
 
 --- 开始一次批量应用会话：会话内 `apply` 把候选删除推迟到 `end_batch` 统一对账。

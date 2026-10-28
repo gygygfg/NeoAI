@@ -1606,8 +1606,10 @@ tests.suite("tools", function(_, it)
     vim.fn.bufload(buf)
     t.true_(vim.deep_equal({ "local foo = 1" }, vim.api.nvim_buf_get_lines(buf, 0, -1, false)))
     -- AI 直写磁盘后，reload_buffers_for 应把窗口 buffer 更新为磁盘内容
+    -- （读盘已下沉线程池：返回 Deferred，测试等待其完成）
     fs.write_file(path, "local bar = 2\n")
-    helpers.reload_buffers_for(path)
+    local d = helpers.reload_buffers_for(path)
+    if d then t.await(d) end
     t.true_(vim.deep_equal({ "local bar = 2" }, vim.api.nvim_buf_get_lines(buf, 0, -1, false)), "打开中的 buffer 应反映磁盘最新内容")
     -- 无关路径不应误伤
     fs.write_file("/tmp/neoai_reload_other.txt", "x\n")

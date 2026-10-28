@@ -289,4 +289,51 @@ tests.suite("http", function(_, it)
     local ok2, obj2 = pcall(json.decode, body2)
     t.true_(ok2, "嵌套非法字节同样被清洗: " .. tostring(obj2))
   end)
+
+  it("结构化大 body 经线程池 UTF-8 校验后逐字节送达（前缀缓存稳定）", function(t)
+    local http = require("NeoAI.utils.http")
+    local json = require("NeoAI.utils.json")
+    local server = require("NeoAI.tests.http_server")
+    local payload = { model = "m", stream = false, messages = {} }
+    local chunk = string.rep("中文与 ASCII mixed。\n", 300)
+    for i = 1, 30 do payload.messages[i] = { role = "user", content = chunk .. i } end
+    t.true_(json.should_encode_async(payload), "应超过异步编码阈值")
+    local expected = json.encode(payload)
+    local received = nil
+    server.with_server(function(client, request)
+      received = request
+      server.respond(client, '{"ok":true}')
+    end, function(base)
+      local resp = t.await(http.request({
+        base_url = base, path = "/chat", method = "POST", body = payload,
+      }))
+      t.eq('{"ok":true}', resp)
+    end)
+    local body = received and received:match("\r\n\r\n(.*)$")
+    t.not_nil(body, "应收到请求体")
+    -- 编码在主线程完成（键顺序确定），必须与同步 encode 逐字节一致
+    t.eq(expected, body, "经线程池校验后的请求体应与同步编码完全一致（键顺序不得随机化）")
+    local decoded = json.decode(body)
+    t.eq(30, #decoded.messages)
+    t.eq(payload.messages[7].content, decoded.messages[7].content)
+  end)
+
+  it("json_request：结构化 body 不再主线程深拷贝/预编码", function(t)
+    local http = require("NeoAI.utils.http")
+    local server = require("NeoAI.tests.http_server")
+    local got = nil
+    server.with_server(function(client, request)
+      got = request
+      server.respond(client, '{"echo":1}')
+    end, function(base)
+      local res = t.await(http.json_request({
+        base_url = base, path = "/echo", method = "POST",
+        body = { hello = "世界" },
+      }))
+      t.eq(1, res and res.echo)
+    end)
+    local body = got and got:match("\r\n\r\n(.*)$")
+    t.not_nil(body, "应收到请求体")
+    t.matches('"hello":"世界"', body, "中文内容应原样送达")
+  end)
 end)

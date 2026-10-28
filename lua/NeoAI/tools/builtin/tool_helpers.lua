@@ -286,22 +286,99 @@ function M.sync_buffer_from_sandbox(bufnr, filepath)
   return ok1 and ok2
 end
 
+--- 线程内读取文件全部字节（阻塞 I/O 下沉线程池）。
+--- 返回 "\1<data>" 成功 / "\0<err>" 失败（`work.run` 只能回传原始类型）。
+--- @param path string
+--- @return string
+local function _read_file_worker(path)
+  local f = io.open(path, "rb")
+  if not f then return "\0open failed" end
+  local data = f:read("*a")
+  f:close()
+  if data == nil then return "\0read failed" end
+  return "\1" .. data
+end
+
+-- 每个 buffer 的磁盘同步代次：连续多次写盘后只应用最后一次读取结果，
+-- 避免较早的读取（迟到的回调）把 buffer 回退到中间版本。
+local sync_gen = {}
+
+--- 把磁盘内容同步进 buffer 的**异步版本**：读盘（`vim.fn.readfile` 两次整读）下沉线程池，
+--- 主线程只做行拆分比较与必要的 `nvim_buf_set_lines`。写类工具改盘后调用（不阻塞主线程）。
+--- 语义与 `sync_buffer_from_disk` 一致：二进制/有未保存改动的 buffer 绝不覆盖。
+--- @param bufnr number
+--- @return Deferred|nil 读取在途时返回 Deferred（测试/需要顺序时可用 await）；跳过时返回 nil
+function M.sync_buffer_from_disk_async(bufnr)
+  if use_autoread then return nil end
+  if type(bufnr) ~= "number" or not vim.api.nvim_buf_is_loaded(bufnr) then return nil end
+  if vim.bo[bufnr].modified then return nil end
+  local filepath = vim.api.nvim_buf_get_name(bufnr)
+  if filepath == "" or vim.fn.filereadable(filepath) ~= 1 then return nil end
+  -- 二进制文件不同步：readfile 会按行拆分并丢失 NUL/非法字节，破坏内容。
+  if _is_binary_file(filepath) then return nil end
+  local work = require("NeoAI.utils.work")
+  if not work.available() then
+    M.sync_buffer_from_disk(bufnr)
+    return nil
+  end
+  sync_gen[bufnr] = (sync_gen[bufnr] or 0) + 1
+  local gen = sync_gen[bufnr]
+  return work.run(_read_file_worker, filepath):then_(function(res)
+    -- 期间发生了更新的同步请求 / buffer 被卸载 / 用户有了未保存改动：直接放弃本次结果
+    if sync_gen[bufnr] ~= gen then return end
+    if not vim.api.nvim_buf_is_valid(bufnr) or not vim.api.nvim_buf_is_loaded(bufnr) then return end
+    if vim.bo[bufnr].modified then return end
+    if type(res) ~= "string" or res:sub(1, 1) ~= "\1" then return end
+    local data = res:sub(2)
+    local has_eol = data == "" or data:sub(-1) == "\n"
+    local body = (has_eol and #data > 0) and data:sub(1, -2) or data
+    local disk_lines = vim.split(body, "\n", { plain = true })
+    if #disk_lines == 0 then disk_lines = { "" } end
+    local mem_lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+    local same = #disk_lines == #mem_lines
+    if same then
+      for i = 1, #disk_lines do
+        if disk_lines[i] ~= mem_lines[i] then same = false break end
+      end
+    end
+    if same then
+      pcall(vim.api.nvim_buf_set_option, bufnr, "eol", has_eol)
+      return
+    end
+    local ok1 = pcall(vim.api.nvim_buf_set_lines, bufnr, 0, -1, false, disk_lines)
+    local ok2 = pcall(vim.api.nvim_buf_set_option, bufnr, "eol", has_eol)
+    pcall(vim.api.nvim_buf_set_option, bufnr, "modified", false)
+    return ok1 and ok2
+  end, function()
+    return false
+  end)
+end
+
 --- AI 工具直写磁盘后，同步所有已加载且指向该文件的 buffer（仅当无未保存改动）。
 --- 解决 edit_file/write_file/append_file/git_restore 改盘后，已打开 buffer 展示
 --- 过期内容（看不见 AI 的修改、按旧行号操作读错位置）的问题。
 --- @param filepath string
+--- @return Deferred|nil 有 buffer 需要同步时返回 Deferred（全部完成后 resolve）
 function M.reload_buffers_for(filepath)
-  if use_autoread then return end -- >=0.13: 由 autoread 自动重载
-  if not filepath or filepath == "" then return end
+  if use_autoread then return nil end -- >=0.13: 由 autoread 自动重载
+  if not filepath or filepath == "" then return nil end
   local abs = vim.fn.fnamemodify(filepath, ":p")
+  local pending = nil
   for _, buf in ipairs(vim.api.nvim_list_bufs()) do
     if vim.api.nvim_buf_is_loaded(buf) then
       local name = vim.api.nvim_buf_get_name(buf)
       if name ~= "" and vim.fn.fnamemodify(name, ":p") == abs then
-        M.sync_buffer_from_disk(buf)
+        -- 读盘/行比较下沉线程池：大文件写盘后不再阻塞主线程（旧实现每次 `readfile` 整读两遍）。
+        local d = M.sync_buffer_from_disk_async(buf)
+        if d then
+          pending = pending or {}
+          pending[#pending + 1] = d
+        end
       end
     end
   end
+  if not pending then return nil end
+  return require("NeoAI.utils.async").all(pending)
 end
 
 --- 持久化后台加载的 buffer（写回磁盘）。

@@ -4288,7 +4288,13 @@ function M.publish(candidate, opts)
         end
       elseif f.link then
         -- 符号链接：以 lstat/readlink 做 CAS（fs_stat 会跟随链接）。
-        if f.action == "create" then
+        -- 幂等：宿主链接**已指向候选目标**（重试/重复审批历史单元，或沙箱重建 venv 后冻结出的
+        -- `create`）→ 视为已满足并跳过；目标不同才是真冲突（绝不静默覆盖外部改动）。
+        -- 必须与普通文件的 `_already_applied` 对齐，否则 venv 的 `bin/python`、`lib64` 等
+        -- 链接会让整个候选永久卡在 CONFLICT。
+        if exists and lstat.type == "link" and vim.uv.fs_readlink(f.path) == f.link then
+          skip_paths[f.path] = "link"
+        elseif f.action == "create" then
           if exists then
             return { ok = false, state = "CONFLICT", reason = "TARGET_ALREADY_EXISTS: " .. f.path }
           end
@@ -4384,7 +4390,12 @@ function M.publish(candidate, opts)
   for _, f in ipairs(_apply_order(ordered_files)) do
     local action, content
     if f.link then
-      action = "symlink"
+      -- 链接已指向候选目标（幂等跳过，见 CAS 的 `skip_paths`）：不再 unlink 重建。
+      if skip_paths[f.path] then
+        action = nil
+      else
+        action = "symlink"
+      end
       content = f.link
     elseif f.action == "create" or f.action == "modify" then
       if skip_paths[f.path] then
@@ -4590,7 +4601,11 @@ local function _publish_worker(payload, sha_src)
       local exists = lstat ~= nil
       local conflict
       if link then
-        if action == "create" then
+        -- 幂等：宿主链接已指向候选目标（重试/重复审批，或沙箱重建 venv 冻结出的 create）
+        -- → 不冲突（写入阶段重建为同一目标，幂等）。
+        if exists and lstat.type == "link" and uv.fs_readlink(path) == link then
+          -- skip
+        elseif action == "create" then
           if exists then conflict = "TARGET_ALREADY_EXISTS: " .. path end
         else
           if not exists then conflict = "TARGET_MISSING: " .. path
@@ -4629,7 +4644,9 @@ local function _publish_worker(payload, sha_src)
     -- ---- 写入 ----
     if phase == "write" then
       local stage, werr
-      if link then
+      if action == nil then
+        -- 幂等跳过（内容/链接目标已是候选结果，见 `materialize` 的 `_skip`）：不写、不重建。
+      elseif link then
         local st = uv.fs_lstat(path)
         if st then
           if st.type == "directory" then
@@ -4753,6 +4770,14 @@ function M.publish_async(candidate, opts)
       base_type = f.base_type, before_hash = f.before_hash, before_sig = f.before_sig,
       base_blob = f.base_blob, after_hash = f.after_hash,
     }
+    -- 符号链接幂等（与同步 `M.publish` 一致）：宿主已指向候选目标 → 两阶段均跳过，
+    -- 不 unlink 重建（避免无谓改写与 CAS→写入之间的竞态）。
+    if f.link then
+      local lst = vim.uv.fs_lstat(f.path)
+      if lst and lst.type == "link" and vim.uv.fs_readlink(f.path) == f.link then
+        spec._skip = true
+      end
+    end
     if (f.action == "create" or f.action == "modify") and not f.link and not f.large
       and not f.blob and spec.content ~= nil then
       local _, unresolved = secret.detokenize(spec.content)

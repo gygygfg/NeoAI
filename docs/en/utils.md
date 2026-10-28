@@ -38,7 +38,17 @@
 
 ## 3. json.lua
 
-- `encode(value)`: Lua value → JSON string.
+- `encode(value)`: Lua value → JSON string (sanitizes invalid UTF-8 with an O(size) pure-Lua scan).
+- `encode_fast(value)`: calls the C `vim.json.encode` directly, skipping the sanitize scan (caller
+  guarantees valid UTF-8).
+- `encode_async(value, opts)`: byte-identical output to `encode`, but moves the `O(context)` invalid
+  UTF-8 scan into the `utils.work` thread pool (ASCII-only output short-circuits via a C-level
+  `string.find`; a sync sanitize fallback only runs when invalid bytes are found). Key ordering is
+  still decided on the main thread, keeping the prompt-cache prefix byte-stable. Below
+  `opts.min_bytes` (default 48 KB) or without the thread pool it is equivalent to sync `encode`.
+- `estimate_bytes(value, limit)`: bounded size estimate (decides whether offloading pays off).
+- `should_encode_async(value, min_bytes)`: whether the offload threshold is reached.
+- `encode_lossless(value)` / `decode_lossless(str)`: lossless binary (base64 sentinel) codec.
 - `decode(json_str)`: JSON → Lua value (raises on failure).
 - `decode_or_nil(json_str)`: safe decoding (returns nil on failure).
 - `decode_line(line)`: decode a single JSONL line.

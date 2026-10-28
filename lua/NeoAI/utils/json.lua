@@ -16,6 +16,9 @@ local strx = require("NeoAI.utils.stringx")
 
 local BYTES_KEY = "__neoai_bytes_b64__"
 
+-- 二进制哨兵键（暴露给工作线程：线程内解码候选时需同一键名识别哨兵表）
+M.BYTES_KEY = BYTES_KEY
+
 local function _b64encode(s)
   if vim.base64 and vim.base64.encode then return vim.base64.encode(s) end
   return require("NeoAI.utils.image").base64_encode(s)
@@ -116,6 +119,123 @@ function M.encode_fast(value)
     if ok then return encoded end
   end
   return M.encode(value)
+end
+
+-- ========== 编码卸载（纯 Lua UTF-8 校验下沉线程池） ==========
+--
+-- 为什么只把「校验」而不是「编码」下沉：LuaJIT 2.1 的字符串哈希按 **Lua state** 随机播种，
+-- 工作线程是独立 state，`vim.json.encode` 在同一张表上的 **键顺序与主线程不同**，且每个
+-- worker state 之间也不同。请求体 JSON 的键顺序若逐轮变化，服务端（DeepSeek/OpenAI）
+-- 的前缀缓存会从第一个变化的键起全部失效——这是不可接受的回归。因此：
+--   * 编码 `/` 键顺序：仍留在主线程（同一 state 内对同构表逐字节稳定）；
+--   * UTF-8 全量深扫（`_sanitize_value`，纯 Lua 逐字节循环，O(上下文)）：下沉线程池校验。
+-- 纯 ASCII 输出必然合法，用 C 级 `string.find` 快速判定即可（无需线程往返）。
+
+--- 线程内校验字符串是否为合法 UTF-8（与 `stringx.sanitize_utf8` 同口径，自包含）。
+--- 返回 "\1" 合法 / "\0" 非法（`work.run` 只能回传原始类型，故用标记串）。
+--- @param s string
+--- @return string
+local function _validate_utf8_worker(s)
+  local i, n = 1, #s
+  while i <= n do
+    local b1 = s:byte(i)
+    if b1 <= 0x7F then
+      i = i + 1
+    else
+      local len, lo, hi = 1, 0, 0
+      if b1 >= 0xC2 and b1 <= 0xDF then
+        len = 2
+      elseif b1 >= 0xE0 and b1 <= 0xEF then
+        len = 3
+        if b1 == 0xE0 then lo = 0xA0 elseif b1 == 0xED then hi = 0x9F end
+      elseif b1 >= 0xF0 and b1 <= 0xF4 then
+        len = 4
+        if b1 == 0xF0 then lo = 0x90 elseif b1 == 0xF4 then hi = 0x8F end
+      else
+        return "\0"
+      end
+      if i + len - 1 > n then return "\0" end
+      local b2 = s:byte(i + 1)
+      if b2 < 0x80 or b2 > 0xBF then return "\0" end
+      if lo > 0 and b2 < lo then return "\0" end
+      if hi > 0 and b2 > hi then return "\0" end
+      for k = 3, len do
+        local b = s:byte(i + k - 1)
+        if b < 0x80 or b > 0xBF then return "\0" end
+      end
+      i = i + len
+    end
+  end
+  return "\1"
+end
+
+--- 估算结构化值的文本规模（字节数上限 `limit`）。
+--- 只做一次有界遍历统计字符串长度，不做任何编码/拷贝，用于决定是否值得卸载到线程池。
+--- @param value any
+--- @param limit number|nil 达到该上限即提前返回（默认无上限）
+--- @return number
+function M.estimate_bytes(value, limit)
+  local cap = tonumber(limit) or math.huge
+  local function walk(v, depth, acc)
+    local t = type(v)
+    if t == "string" then return acc + #v + 3 end
+    if t == "number" or t == "boolean" then return acc + 8 end
+    if t ~= "table" or depth <= 0 then return acc end
+    for k, val in pairs(v) do
+      if acc >= cap then return acc end
+      if type(k) == "string" then acc = acc + #k + 4 end
+      acc = walk(val, depth - 1, acc)
+    end
+    return acc
+  end
+  return walk(value, 8, 0)
+end
+
+-- 异步编码阈值：低于该规模的请求体直接同步编码（避免线程往返与一次调度延迟）。
+M.ENCODE_ASYNC_MIN_BYTES = 48 * 1024
+
+--- 是否值得把该值的编码卸载到线程池
+--- @param value any
+--- @param min_bytes number|nil
+--- @return boolean
+function M.should_encode_async(value, min_bytes)
+  local threshold = tonumber(min_bytes) or M.ENCODE_ASYNC_MIN_BYTES
+  local work = require("NeoAI.utils.work")
+  if not work.available() then return false end
+  return M.estimate_bytes(value, threshold) >= threshold
+end
+
+--- 异步 JSON 编码：与 `M.encode` 输出逐字节一致，但把 O(上下文) 的非法 UTF-8 深扫
+--- 下沉到 `utils/work` 线程池。流程：
+---   1. 主线程 `encode_fast`（C 实现，键顺序确定 → 前缀缓存稳定）；
+---   2. 纯 ASCII 输出必然合法（C 级 `string.find`），直接返回，无线程往返；
+---   3. 含非 ASCII 时把输出的 UTF-8 合法性校验交给 worker；
+---   4. 校验发现非法字节 → 主线程回退 `M.encode`（U+FFFD 清洗，与旧行为一致）。
+--- 低于 `min_bytes` 或线程池不可用时直接同步 `M.encode`（行为完全不变）。
+--- @param value any
+--- @param opts table|nil { min_bytes?: number }
+--- @return Deferred resolve(string) 编码后的 JSON 字符串
+function M.encode_async(value, opts)
+  opts = opts or {}
+  local async = require("NeoAI.utils.async")
+  local work = require("NeoAI.utils.work")
+  local min_bytes = tonumber(opts.min_bytes) or M.ENCODE_ASYNC_MIN_BYTES
+  if not work.available() or M.estimate_bytes(value, min_bytes) < min_bytes then
+    return async.resolve(M.encode(value))
+  end
+  local encoded = M.encode_fast(value)
+  -- 纯 ASCII：一定是合法 UTF-8，等价于 `M.encode` 的结果（无需清洗）
+  if not encoded:find("[\128-\255]") then
+    return async.resolve(encoded)
+  end
+  return work.run(_validate_utf8_worker, encoded):then_(function(valid)
+    if valid == "\1" then return encoded end
+    -- 含非法 UTF-8（二进制工具输出等）：回退清洗编码（罕见路径，保持旧语义）
+    return M.encode(value)
+  end, function()
+    -- 线程池异常：不冒险直接发送可能非法的 JSON，回退同步清洗编码
+    return M.encode(value)
+  end)
 end
 
 --- 编码为 JSON 字符串（含非法 UTF-8 清洗，保证输出可被严格解析器接受）

@@ -636,7 +636,11 @@ is only kept for other `approval.mode` values (`prompt`/`strict`).
         skipped instead of failing with `TARGET_ALREADY_EXISTS` / `BASELINE_CHANGED`; differing
         content is still a conflict (external changes are never silently overwritten). This lets
         "retry a requeued unit", "re-approve a historic unit" and "the same change already landed via
-        another unit" all converge.
+        another unit" all converge. **Symlinks** are compared by link target: when the host entry is
+        already a link to the same target it is skipped idempotently (never unlinked/recreated), and
+        only a different target conflicts — otherwise venv links such as `bin/python`/`lib64` would
+        keep a venv-rebuild candidate stuck on `TARGET_ALREADY_EXISTS` forever (identical behaviour in
+        the synchronous and worker CAS paths).
       - **Apply order must be a strict weak order**: `_apply_order` sorts by
         `(git rank, deletes-first, depth, path)` — deletes by **descending** depth (children before
         parents), writes by plain path order (a parent path is a prefix of its children, so parents

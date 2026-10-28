@@ -76,13 +76,20 @@ end, { a = 1, b = 2 }):then_(function(res) ... end)
 | 长会话流式渲染 | 块描述符按「廉价输入」（消息身份、content/reasoning 长度、推理开关、工具调用与结果身份及状态）复用；未变化块跳过指纹/签名拼接与 build 闭包分配，只重建变化块（`ui/components/message_list.lua`） |
 | 会话树构建 | 分组 / 排序 / 隐藏支标记 / 空会话判定 / `├─└─│` 连接线 / 每行文案整体下沉 `work.run_codec`（模块常量 `TREE_BUILD_SRC` 源码串传入线程内 `load`）；主线程只做快照拷贝、行片段 `concat`、`nvim_buf_set_lines`。回传格式按实测择优：**行文本单字符串 + 元数据字符串数组 + 每行 1 字节 depth**（嵌套小表解码 143ms、平铺数字数组 169ms、字符串 30ms @390 会话/9007 行）。摘要按 `updated_at`+消息数缓存，截断改纯 Lua 字符边界扫描（`vim.fn.strcharpart` 在 2 万条消息下约 1.1s → 70ms）；隐藏支由逐会话回溯祖先链（O(n·depth)）改为单遍向下传播（O(n)）。会话数 < 80 时直接主线程构建（比线程往返更快）。构建同 tick 合并 + 50ms 最小间隔 + 在途合并 + 代次校验（`ui/window/tree_view.lua`） |
 | 会话删除落盘 | 树里 `d`/`D` 先乐观删行（主线程只移行），再防抖 150ms 合并为一次 `session_store.mutate_async`：整文件重写在 `utils.work` 线程内完成（读盘 → `delete`/`trim` → mkstemp + 全量写 + 尺寸校验 + fsync + `.bak` + rename），与追加式持久化共用 per-path 写盘串行链（`core/session/session_store.lua`、`ui/window/tree_view.lua`） |
+| 每轮请求体编码 | 请求体（全部历史消息 + 工具 schema）的非法 UTF-8 深扫（纯 Lua 逐字节、O(上下文)）下沉线程池：主线程只做 C 的 `vim.json.encode`，纯 ASCII 输出直接跳过校验，仅在发现非法字节时回退同步清洗（`utils/json.lua` 的 `encode_async`、`utils/http.lua`）。实测 1.15MB 中文上下文：编码主线程开销 5.7ms → 2.5ms（−55%），且不再产生清洗副本的 GC 压力。**编码本身刻意保留在主线程**：LuaJIT 的字符串哈希按 state 播种，worker 内 `vim.json.encode` 的键顺序随机化会让服务端前缀缓存逐轮失效（`docs/ai_engine.md` 的缓存不变量） |
+| 应用修改：候选读取/解码 | `store.read_candidate_async`：大候选（数十 MB）的读盘 + JSON 解码 + base64 哨兵解包在 `utils.work` 内完成，`vim.mpack` 回传；`apply_async` 先异步预取。候选按内容寻址不可变 → 解码结果进 LRU（`candidate_cache_max_bytes`，默认 16MB），逐文件应用同一变更单元不再重复整份解码。实测 5.6MB 候选：主线程「读盘+解码」10.4ms → ~0.4ms（worker 解码 + mpack 回传），缓存命中为 0（`sandbox/state/store.lua`、`sandbox/review/review.lua`） |
+| 应用修改：应用前快照 | 撤销快照逐文件 `fs_copyfile`（阻塞系统调用）原在主线程串行执行；改为 `work.batched` 分块并发（stat + 复制 + 权限收紧全在 worker，线程池不可用时回落同步），完成后才发布（`sandbox/review/review.lua`） |
+| 写盘后的 buffer 同步 | `reload_buffers_for` 的磁盘读取（旧实现每次 `readfile` 整读两遍）下沉线程池，主线程只做行拆分比较与必要的 `nvim_buf_set_lines`；按 buffer 代次丢弃迟到的旧读取，绝不覆盖未保存改动（`tools/builtin/tool_helpers.lua`） |
 
 ## 3. 使用线程池的模块
 
 | 模块 | 用途 |
 | --- | --- |
 | `utils/fs.lua` | `read_file_async` / `write_file_async` / `append_file_async` / `delete_file_async` / `list_dir_async` / `search_files_async` / `read_file_lines_async`。 |
+| `utils/json.lua` | `encode_async`：大对象编码前的非法 UTF-8 深扫下沉线程池（编码仍在主线程以保键顺序稳定）；`estimate_bytes` / `should_encode_async` 决定是否值得卸载。 |
 | `utils/work.lua` | `run_codec`：`vim.mpack` 编解码结构化输入/输出（主线程与 worker 内均可用）。 |
+| `sandbox/state/store.lua` | `read_candidate_async`：候选读盘 + JSON 解码 + base64 哨兵解包在 worker 内完成，并维护解码结果 LRU；同步写盘/整文件重写走既有 `_encode_and_write` 线程池链。 |
+| `sandbox/review/review.lua` | `apply_async`：候选异步预取 + 应用前快照逐文件复制 `work.batched` 并发（线程池不可用回落同步）。 |
 | `tools/builtin/file_ops.lua` | `read_file` / `edit_file` / `list_files` / `search_files` / `delete_file`（异步变体）。 |
 | `tools/builtin/read_image.lua` | 读二进制文件（`work.run(_read_binary, abs_path)`）。 |
 | `sandbox/execution/candidate.lua` | `capture_overlay_async` / `finish_async`：overlay 递归遍历、文件读取、SHA-256 哈希在线程池内完成，主线程只做状态登记/组装。**未改动的物化文件按 mtime/size 签名（`dsig`）跳过读取与哈希**；`finish_async` 按 `tools.sandbox.work_chunk_files`（默认 128）分块并发投递，使 npm/cargo 等大量文件场景用满多核。 |

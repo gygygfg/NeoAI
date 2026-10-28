@@ -506,6 +506,36 @@ tests.suite("sandbox_session", function(_, it)
     store.reset()
   end)
 
+  it("存储：异步读取候选（线程池）与同步一致，且重复读取命中解码缓存", function(t)
+    local store = require("NeoAI.sandbox.state.store")
+    local root = vim.fn.tempname()
+    vim.fn.mkdir(root, "p")
+    store.init(root)
+    local bin = "bin\x00\xff\xfe tail"
+    local cand = {
+      candidate_digest = "sha256:asyncread", created_at = 1,
+      files = {
+        { path = "/tmp/a.lua", action = "modify", content = "local a = 1\n", after_hash = "sha256:a" },
+        { path = "/tmp/bin", action = "modify", content = bin },
+      },
+    }
+    store.write_candidate_async(cand)
+    t.true_(store.flush(5000), "flush 应完成")
+    -- 线程池异步读取：读盘 + JSON 解码 + base64 哨兵解包全部离开主线程
+    local read = t.await(store.read_candidate_async("sha256:asyncread"))
+    t.not_nil(read, "应读到候选")
+    t.eq(#cand.files, #read.files, "文件数一致")
+    t.eq(cand.files[1].content, read.files[1].content)
+    t.eq(bin, read.files[2].content, "二进制内容应无损往返")
+    -- 再次读取应命中解码缓存（同一 table 实例）
+    t.true_(rawequal(read, t.await(store.read_candidate_async("sha256:asyncread"))), "应命中解码缓存")
+    t.true_(rawequal(read, store.read_candidate("sha256:asyncread")), "同步读取同样命中缓存")
+    -- 候选被删除后缓存必须失效（不能返回已删除的内容）
+    store.discard_candidate("sha256:asyncread")
+    t.nil_(store.read_candidate("sha256:asyncread"), "删除后不应再从缓存读到")
+    store.reset()
+  end)
+
   it("存储：非法 UTF-8 候选经线程校验后无损落盘（二进制不损坏）", function(t)
     local store = require("NeoAI.sandbox.state.store")
     local fs = require("NeoAI.utils.fs")

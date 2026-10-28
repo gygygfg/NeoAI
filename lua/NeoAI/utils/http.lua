@@ -223,11 +223,27 @@ function M.request(opts, callbacks)
     return async.reject({ kind = "aborted", message = callbacks.signal:reason() })
   end
   -- 出网守卫：向非白名单地址发送密钥时弹窗阻止。仅检查一次（重入时跳过）。
+  -- 守卫必须在编码前运行：它需要看结构化 body（而不是已序列化的 JSON 文本）。
   if _guard and not opts._egress_checked then
     local g = _guard(opts, callbacks)
     if g ~= nil then
       return g:then_(function()
         local o = vim.tbl_extend("force", {}, opts)
+        o._egress_checked = true
+        return M.request(o, callbacks)
+      end)
+    end
+  end
+  -- 结构化 body 的非法 UTF-8 深扫下沉线程池：上下文级请求体（全部历史消息 + 工具 schema）
+  -- 的清洗扫描是每轮 O(上下文) 的主线程纯 Lua 开销。编码本身仍留在主线程（键顺序必须确定，
+  -- 见 `utils/json.lua` 的说明），大 body 在 worker 校验完成后重入本函数（此时 body 已是
+  -- 字符串，且守卫已检查过，不会二次弹窗）。小 body / 线程池不可用时行为完全不变。
+  if type(opts.body) == "table" then
+    local json = require("NeoAI.utils.json")
+    if json.should_encode_async(opts.body) then
+      return json.encode_async(opts.body):then_(function(encoded)
+        local o = vim.tbl_extend("force", {}, opts)
+        o.body = encoded
         o._egress_checked = true
         return M.request(o, callbacks)
       end)
@@ -393,11 +409,9 @@ end
 --- @param opts table 同 M.request，另支持 json=true
 --- @return Deferred resolve(解码后的数据或 nil)
 function M.json_request(opts, callbacks)
-  local req_opts = vim.deepcopy(opts)
-  if req_opts.body ~= nil and type(req_opts.body) ~= "string" then
-    local json = require("NeoAI.utils.json")
-    req_opts.body = json.encode(req_opts.body)
-  end
+  -- 浅拷贝外壳：不再 `vim.deepcopy`（大 body 深拷贝是主线程开销），body 保持结构化，
+  -- 由 `M.request` 决定同步编码还是下沉线程池（见其「结构化 body 编码」段）。
+  local req_opts = vim.tbl_extend("force", {}, opts)
   return M.request(req_opts, callbacks):then_(function(body)
     local json = require("NeoAI.utils.json")
     local decoded = json.decode_or_nil(body)

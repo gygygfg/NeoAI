@@ -1340,6 +1340,64 @@ tests.suite("sandbox_ops", function(_, it)
     vim.fn.delete(root, "rf")
   end)
 
+  it("发布：create 符号链接且目标已是指向同一目标 → 幂等跳过（venv bin/python）", function(t)
+    -- 回归：`.venv/bin/python` 是符号链接（uv/python -m venv 生成）。宿主已有同一链接时，
+    -- 重试/重复审批（或沙箱重建 venv 冻结出的 create）必须在链接目标一致时幂等通过，
+    -- 否则候选永久卡在 CONFLICT: TARGET_ALREADY_EXISTS，`.venv` 永远无法结算。
+    local fs = require("NeoAI.utils.fs")
+    local candidate = require("NeoAI.sandbox.execution.candidate")
+    local root = fs.canonical(vim.fn.tempname())
+    local bin = root .. "/.venv/bin"
+    fs.ensure_dir(bin)
+    local target = "/usr/bin/python3.13"
+    vim.uv.fs_symlink(target, bin .. "/python")
+    local ok = candidate.publish({
+      candidate_digest = "sha256:link_create_idem",
+      files = {
+        { path = bin .. "/python", action = "create", link = target },
+      },
+    })
+    t.true_(ok.ok, "链接目标一致时 create 应幂等成功: " .. tostring(ok.reason))
+    t.eq(target, vim.uv.fs_readlink(bin .. "/python"), "链接不应被改写")
+    -- 目标不同 → 仍是真冲突（绝不静默覆盖外部改动）
+    local conflict = candidate.publish({
+      candidate_digest = "sha256:link_create_conflict",
+      files = {
+        { path = bin .. "/python", action = "create", link = "/usr/bin/python3.12" },
+      },
+    })
+    t.false_(conflict.ok, "链接目标不同时 create 应冲突")
+    t.matches("TARGET_ALREADY_EXISTS", tostring(conflict.reason), "应报 TARGET_ALREADY_EXISTS")
+    t.eq(target, vim.uv.fs_readlink(bin .. "/python"), "冲突时不得改写链接")
+    vim.fn.delete(root, "rf")
+  end)
+
+  it("发布（异步）：create 符号链接目标一致同样幂等（工作线程 CAS）", function(t)
+    local fs = require("NeoAI.utils.fs")
+    local candidate = require("NeoAI.sandbox.execution.candidate")
+    local root = fs.canonical(vim.fn.tempname())
+    local bin = root .. "/.venv/bin"
+    fs.ensure_dir(bin)
+    local target = "/usr/bin/python3.13"
+    vim.uv.fs_symlink(target, bin .. "/python")
+    local before = vim.uv.fs_lstat(bin .. "/python")
+    local done, res = false, nil
+    candidate.publish_async({
+      candidate_digest = "sha256:link_create_idem_async",
+      files = {
+        { path = bin .. "/python", action = "create", link = target },
+      },
+    }):then_(function(r) res = r; done = true end,
+      function(e) res = { ok = false, reason = tostring(e) }; done = true end)
+    vim.wait(20000, function() return done end, 10)
+    t.true_(done, "异步发布应完成")
+    t.true_(res and res.ok, "异步发布链接目标一致时应幂等成功: " .. tostring(res and res.reason))
+    t.eq(target, vim.uv.fs_readlink(bin .. "/python"), "链接不应被改写")
+    local after = vim.uv.fs_lstat(bin .. "/python")
+    t.eq(before.ino, after and after.ino, "幂等跳过时不应 unlink 重建（inode 不变）")
+    vim.fn.delete(root, "rf")
+  end)
+
   it("部分应用：失败 rmdir 回队时必须带上其子项删除（否则重试永远 ENOTEMPTY）", function(t)
     local fs = require("NeoAI.utils.fs")
     local sandbox = require("NeoAI.sandbox")

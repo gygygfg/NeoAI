@@ -80,6 +80,9 @@ local write_state = {
 -- 写入失败的最大自动重试次数（之后保留内存缓存并记录错误，等待下次写入自然重试）。
 local MAX_WRITE_RETRY = 3
 
+-- 前向声明：写入新内容时必须失效「候选解码缓存」（缓存实现见下文 `_candidate_cache_drop`）。
+local _candidate_cache_drop
+
 local function _candidates_dir()
   return state.root .. "/candidates"
 end
@@ -296,6 +299,8 @@ end
 --- @param value any
 local function _encode_and_write(path, value)
   local encoded = json.encode_fast(value)
+  -- 新内容写入：同路径的解码缓存立即失效（内容寻址下摘要相同则内容相同，但 raw 回写可能覆盖）。
+  _candidate_cache_drop(path)
   write_state.mem[path] = encoded
   -- 立即登记 pending：flush 需等待「编码校验 + 写入」整条链路，否则会在写入前误判已清空。
   write_state.pending[path] = encoded
@@ -342,14 +347,95 @@ local function _cancel_write(path)
   if write_state.running[path] then write_state.cancelled[path] = true end
 end
 
---- 读取 JSON：优先命中异步写缓存，其次读盘。
+--- 候选解码缓存（LRU，按字节预算）。
+---
+--- 候选是**内容寻址**的（摘要 = manifest 哈希），同一摘要内容永不变，故解码结果可安全复用。
+--- 应用（尤其审批界面「逐文件应用」）每次都会 `read_candidate` 整份候选：数 MB 的 JSON
+--- 读盘 + 解码全在主线程，逐文件应用同一变更单元时会被重复执行 N 次。缓存把重复解码
+--- 降为一次，其余命中内存。
+local candidate_cache = {}        -- path -> 解码后的候选
+local candidate_cache_size = {}   -- path -> 编码字节数（估算占用）
+local candidate_cache_order = {}  -- 最近使用的 path（尾部最新）
+local candidate_cache_total = 0
+
+local CANDIDATE_CACHE_MAX_ITEMS = 8
+
+--- 候选解码缓存字节预算（0 关闭缓存）
+--- @return number
+local function _candidate_cache_budget()
+  local n = tonumber(require("NeoAI.kernel.config_store").get(
+    "tools.sandbox.review.candidate_cache_max_bytes"))
+  if n == nil then return 16 * 1024 * 1024 end
+  return math.max(0, n)
+end
+
+local function _candidate_cache_clear()
+  candidate_cache, candidate_cache_size, candidate_cache_order = {}, {}, {}
+  candidate_cache_total = 0
+end
+
+--- 取缓存命中并刷新 LRU 顺序
 --- @param path string
 --- @return table|nil
+local function _candidate_cache_get(path)
+  local value = candidate_cache[path]
+  if value == nil then return nil end
+  for i = 1, #candidate_cache_order do
+    if candidate_cache_order[i] == path then
+      table.remove(candidate_cache_order, i)
+      break
+    end
+  end
+  candidate_cache_order[#candidate_cache_order + 1] = path
+  return value
+end
+
+--- 失效单条缓存（写入/删除/raw 回写时调用；前向声明见文件头部）
+--- @param path string
+_candidate_cache_drop = function(path)
+  if candidate_cache[path] == nil then return end
+  candidate_cache[path] = nil
+  candidate_cache_total = candidate_cache_total - (candidate_cache_size[path] or 0)
+  candidate_cache_size[path] = nil
+  for i = 1, #candidate_cache_order do
+    if candidate_cache_order[i] == path then
+      table.remove(candidate_cache_order, i)
+      break
+    end
+  end
+end
+
+--- @param path string
+--- @param value table
+--- @param bytes number 编码后的字节数
+local function _candidate_cache_put(path, value, bytes)
+  local budget = _candidate_cache_budget()
+  bytes = tonumber(bytes) or 0
+  -- 单个候选超过预算一半就不缓存：避免一次大候选把整个预算挤满、频繁抖动。
+  if budget <= 0 or bytes > budget / 2 then
+    _candidate_cache_drop(path)
+    return
+  end
+  _candidate_cache_drop(path)
+  candidate_cache[path] = value
+  candidate_cache_size[path] = bytes
+  candidate_cache_total = candidate_cache_total + bytes
+  candidate_cache_order[#candidate_cache_order + 1] = path
+  while (#candidate_cache_order > CANDIDATE_CACHE_MAX_ITEMS
+    or candidate_cache_total > budget) and #candidate_cache_order > 0 do
+    _candidate_cache_drop(candidate_cache_order[1])
+  end
+end
+
+--- 读取 JSON：优先命中异步写缓存，其次读盘。
+--- @param path string
+--- @return table|nil decoded
+--- @return number|nil 原始编码字节数（供调用方做缓存预算记账）
 local function _read_json(path)
   local encoded = write_state.mem[path]
   if encoded == nil then encoded = fs.read_file(path) end
   if not encoded then return nil end
-  return json.decode_lossless(encoded)
+  return json.decode_lossless(encoded), #encoded
 end
 
 --- 列出 dir 下的 JSON 条目：以磁盘为准，但**异步写缓存（最新）覆盖**同路径的旧磁盘内容，
@@ -414,6 +500,7 @@ end
 --- @param root string
 function M.init(root)
   state.root = root
+  _candidate_cache_clear()
   _ensure_dirs()
 end
 
@@ -489,12 +576,79 @@ function M.write_candidate_async(candidate)
   return async.resolve(true)
 end
 
---- 读取候选
+--- 读取候选（带解码缓存：内容寻址 → 同一摘要内容不可变，可安全复用）
 --- @param digest string
 --- @return table|nil
 function M.read_candidate(digest)
   if not state.root then return nil end
-  return _read_json(_candidates_dir() .. "/" .. _safe_name(digest) .. ".json")
+  local path = _candidates_dir() .. "/" .. _safe_name(digest) .. ".json"
+  local cached = _candidate_cache_get(path)
+  if cached then return cached end
+  local value, size = _read_json(path)
+  if value then _candidate_cache_put(path, value, size or 0) end
+  return value
+end
+
+--- 线程内读取并解码候选（读盘 + `vim.json.decode` + base64 哨兵解包全部离开主线程）。
+--- @param payload table { path: string, bytes_key: string }
+--- @return table|nil { cand = table, bytes = number }（不存在/损坏时 nil）
+local function _read_candidate_worker(payload)
+  local path, bytes_key = payload.path, payload.bytes_key
+  local f = io.open(path, "rb")
+  if not f then return nil end
+  local raw = f:read("*a")
+  f:close()
+  if not raw or raw == "" then return nil end
+  local ok, decoded = pcall(vim.json.decode, raw)
+  if not ok or type(decoded) ~= "table" then return nil end
+  -- 与 `json.decode_lossless` 的 `_unpack_binary` 同语义：还原以 base64 哨兵保存的二进制内容。
+  local function unpack_binary(v)
+    if type(v) ~= "table" then return v end
+    if v[bytes_key] == true and type(v.d) == "string" then
+      local okd, dec = pcall(vim.base64.decode, v.d)
+      if okd and type(dec) == "string" then return dec end
+    end
+    local out = nil
+    for k, val in pairs(v) do
+      local nv = unpack_binary(val)
+      if nv ~= val then
+        if not out then
+          out = {}
+          for k2, v2 in pairs(v) do out[k2] = v2 end
+        end
+        out[k] = nv
+      end
+    end
+    return out or v
+  end
+  return { cand = unpack_binary(decoded), bytes = #raw }
+end
+
+--- 异步读取候选：读盘/解码/解包在 `utils.work` 线程池执行，主线程只接收已解码结构
+--- （`vim.mpack` 回传，C 实现）。命中解码缓存或线程池不可用时回落同步 `M.read_candidate`。
+--- @param digest string
+--- @return Deferred resolve(table|nil)
+function M.read_candidate_async(digest)
+  if not state.root then return async.resolve(nil) end
+  local path = _candidates_dir() .. "/" .. _safe_name(digest) .. ".json"
+  local cached = _candidate_cache_get(path)
+  if cached then return async.resolve(cached) end
+  local work = require("NeoAI.utils.work")
+  if not work.available() then
+    return async.resolve(M.read_candidate(digest))
+  end
+  return work.run_codec(_read_candidate_worker, {
+    path = path, bytes_key = require("NeoAI.utils.json").BYTES_KEY,
+  }):then_(function(res)
+    if type(res) ~= "table" or type(res.cand) ~= "table" then
+      -- 走盘失败（写入仍在队列中）时回落同步路径：同步路径会命中 write_state.mem 编码缓存。
+      return M.read_candidate(digest)
+    end
+    _candidate_cache_put(path, res.cand, res.bytes)
+    return res.cand
+  end, function()
+    return M.read_candidate(digest)
+  end)
 end
 
 --- 读取候选原始编码（未解码的 JSON 文本）。用于「拒绝时原样另存」——避免 decode→encode
@@ -524,6 +678,7 @@ function M.write_candidate_raw(digest, raw)
   write_state.cancelled[path] = nil
   write_state.mem[path] = raw
   write_state.pending[path] = raw
+  _candidate_cache_drop(path)
   written_candidates[digest] = true
   _drain(path)
   return true
@@ -545,6 +700,7 @@ function M.discard_candidate(digest)
   if not state.root then return false end
   local path = _candidates_dir() .. "/" .. _safe_name(digest) .. ".json"
   _cancel_write(path)
+  _candidate_cache_drop(path)
   written_candidates[digest] = nil
   return fs.delete_file(path)
 end
@@ -966,6 +1122,7 @@ function M.reset()
   write_state.errors = {}
   write_state.attempts = {}
   _snapshot_cache_clear()
+  _candidate_cache_clear()
   written_candidates = {}
   if state.root then
     -- best-effort cleanup：reset 阶段删除各目录属清理型 pcall，失败不影响 reset 语义（目录可能不存在/正被占用），故不升级为告警。

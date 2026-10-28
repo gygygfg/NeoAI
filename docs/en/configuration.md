@@ -668,6 +668,11 @@ sandbox = {
   --     window are coalesced into one redraw.
   --   content_cache_max: LRU cap for on-demand candidate file content (diff preview); in-memory items
   --     strip content after persisting, so staging many files does not double memory.
+  --   candidate_cache_max_bytes: LRU byte budget for decoded candidates (default 16 MB, 0 disables).
+  --     Candidates are content-addressed and immutable, so a decoded structure can be reused safely;
+  --     applying (especially per-file apply of the same change set) reads the whole candidate each
+  --     time, and the cache turns repeat disk-read + JSON decode into a single hit. Candidates larger
+  --     than the budget are not cached.
   --   terminal_cache_max: cap on terminal (REJECTED/SUPERSEDED/EXPIRED) change sets kept in memory;
   --     excess items are evicted and re-read from disk on demand (no data loss).
   --   rejected_max / rejected_dir: on explicit reject, the candidate content is saved to rejected_dir
@@ -690,7 +695,8 @@ sandbox = {
   --     strictest).
   review = { enabled = true, auto_apply = false, session_auto_approve = false,
              max_display_files = 200, refresh_debounce_ms = 80,
-             content_cache_max = 64, terminal_cache_max = 200, rejected_max = 50,
+             content_cache_max = 64, candidate_cache_max_bytes = 16 * 1024 * 1024,
+             terminal_cache_max = 200, rejected_max = 50,
              rejected_dir = "/tmp/neoai-rejected", cas_mode = "hash",
              merge = true, merge_max_bytes = nil,
              snapshot_cas = "sig",

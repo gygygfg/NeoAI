@@ -191,6 +191,10 @@ approval is allowed by default and a notify is sent.
 > Blocking file I/O (reading large files / recursive search / writing to disk) runs in a thread pool via `utils.work`,
 > without occupying the main thread.
 >
+> Post-write buffer sync (`tool_helpers.reload_buffers_for`) also moves the disk read into the pool: the main thread only
+> splits/compares lines and calls `nvim_buf_set_lines` when needed, discarding stale reads by per-buffer epoch so unsaved
+> edits are never overwritten.
+>
 > **Concurrent edits to the same file are serialized via a file lock**: `tool_loop` fires tool calls in parallel, and
 > the replace branch is "read → modify → write"; concurrent edits to the same file would all read the stale content
 > and the last writer would clobber the others (lost update). So writes (overwrite/append) and the whole

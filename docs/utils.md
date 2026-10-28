@@ -38,7 +38,15 @@
 
 ## 3. json.lua
 
-- `encode(value)`：Lua 值 → JSON 字符串。
+- `encode(value)`：Lua 值 → JSON 字符串（含非法 UTF-8 清洗，O(表体积) 纯 Lua 深扫）。
+- `encode_fast(value)`：直接用 C 实现 `vim.json.encode`，跳过清洗深扫（调用方保证合法 UTF-8）。
+- `encode_async(value, opts)`：与 `encode` 输出**逐字节一致**，但把 `O(上下文)` 的非法 UTF-8
+  深扫下沉 `utils.work` 线程池（纯 ASCII 输出用 C 级 `string.find` 直接跳过；发现非法字节才回退
+  同步清洗）。键顺序仍在主线程确定，保证前缀缓存逐字节稳定。低于 `opts.min_bytes`
+  （默认 48KB）或线程池不可用时等价于同步 `encode`。
+- `estimate_bytes(value, limit)`：有界估算结构文本体积（决定是否值得卸载）。
+- `should_encode_async(value, min_bytes)`：是否达到卸载阈值。
+- `encode_lossless(value)` / `decode_lossless(str)`：二进制无损（base64 哨兵）编解码。
 - `decode(json_str)`：JSON → Lua 值（失败抛错）。
 - `decode_or_nil(json_str)`：安全解码（失败返回 nil）。
 - `decode_line(line)`：JSONL 单行解码。

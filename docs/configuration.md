@@ -595,6 +595,9 @@ sandbox = {
   --   refresh_debounce_ms：审批窗刷新防抖（ms），同一窗口内多个沙箱事件合并为一次重绘。
   --   content_cache_max：按需读取的候选文件内容 LRU 上限（diff 预览用）；内存条目落盘后
   --     剥离 content，避免暂存大量文件时内存翻倍。
+  --   candidate_cache_max_bytes：候选「解码结果」LRU 字节预算（默认 16MB，0 关闭）。候选按内容
+  --     寻址不可变，同一摘要的解码结构可安全复用；应用（尤其逐文件应用同一变更单元）每次都要
+  --     读取整份候选，缓存把重复的「读盘 + JSON 解码」降为一次。超过预算的候选不缓存。
   --   terminal_cache_max：内存保留的终态（REJECTED/SUPERSEDED/EXPIRED）变更单元上限，
   --     超限淘汰、按需从磁盘回读（数据不丢）。
   --   rejected_max / rejected_dir：显式拒绝时把候选内容另存到 rejected_dir（默认
@@ -610,7 +613,8 @@ sandbox = {
   --   snapshot_cas：撤销保存的快照 CAS "sig"（默认，签名，省 CPU）|"hash"（内容哈希，最严）。
   review = { enabled = true, auto_apply = false, session_auto_approve = false,
              max_display_files = 200, refresh_debounce_ms = 80,
-             content_cache_max = 64, terminal_cache_max = 200, rejected_max = 50,
+             content_cache_max = 64, candidate_cache_max_bytes = 16 * 1024 * 1024,
+             terminal_cache_max = 200, rejected_max = 50,
              rejected_dir = "/tmp/neoai-rejected", cas_mode = "hash",
              merge = true, merge_max_bytes = nil,
              snapshot_cas = "sig",
