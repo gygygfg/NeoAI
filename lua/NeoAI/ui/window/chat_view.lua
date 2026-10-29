@@ -18,6 +18,7 @@ local display_modes = require("NeoAI.ui.components.display_modes")
 local services = require("NeoAI.kernel.services")
 local event_bus = require("NeoAI.kernel.event_bus")
 local events = require("NeoAI.kernel.events")
+local fs = require("NeoAI.utils.fs")
 
 -- 聊天服务经服务定位器动态解析：支持运行期替换/禁用，不做默认模块回退。
 local chat_service = setmetatable({}, {
@@ -67,6 +68,86 @@ end
 --- @return boolean
 local function _is_current(id)
   return id ~= nil and _current_id == id
+end
+
+-- ========== 发送前相对路径绝对化 ==========
+-- 输入框的 nvim-cmp path 补全常产出相对路径；直接发给模型时，模型在不同 cwd 下解析
+-- 容易出现歧义（工具已找不到文件）。发送前把「真实存在的相对路径」换成绝对路径，
+-- 不存在的相对路径一律原样保留（保持用户原文语义）。
+-- 基准目录取 vim.fn.getcwd()（与 nvim-cmp path 补全的相对基准一致）。
+
+--- token 首尾可能包裹的字符（引号/反引号/括号/中英文逗号分号等标点）。
+--- 不包含 `.`（避免破坏 `./x`、`../x` 与 `..`）。
+local _PATH_WRAPPERS = {
+  '"', "'", "`", "(", ")", "[", "]", "{", "}", "<", ">", ",", ";", ":",
+  "“", "”", "‘", "’", "（", "）", "【", "】", "《", "》", "，", "。", "；", "：", "！", "？", "、",
+}
+
+--- 剥除字符串某一端的包裹字符（可叠加，如 `("a")`）。
+--- @param s string
+--- @param from_start boolean true=前端，false=末端
+--- @return string
+local function _strip_edge(s, from_start)
+  local changed = true
+  while changed and #s > 0 do
+    changed = false
+    for _, w in ipairs(_PATH_WRAPPERS) do
+      local wl = #w
+      if #s >= wl then
+        local piece = from_start and s:sub(1, wl) or s:sub(#s - wl + 1)
+        if piece == w then
+          s = from_start and s:sub(wl + 1) or s:sub(1, #s - wl)
+          changed = true
+          break
+        end
+      end
+    end
+  end
+  return s
+end
+
+--- 剥除 token 两端的包裹字符。
+--- @param token string
+--- @return string
+local function _strip_wrappers(token)
+  return _strip_edge(_strip_edge(token, true), false)
+end
+
+--- 判断 token 内部是否像相对路径（绝对路径 / ~ / $VAR / URL 一律不处理）。
+--- @param core string
+--- @return boolean
+local function _looks_relative(core)
+  if core == "" then return false end
+  local first = core:sub(1, 1)
+  if first == "/" or first == "~" or first == "$" then return false end
+  if core:find("://", 1, true) then return false end
+  return core:find("/", 1, true) ~= nil
+end
+
+--- 把文本中「真实存在的相对路径」token 换成绝对路径（按编辑器 cwd 解析）。
+--- 仅用于发送给模型的内容，不改写输入框可见文本；未命中的 token 原样保留。
+--- @param content string
+--- @return string
+local function _absolutize_existing_paths(content)
+  if type(content) ~= "string" or content == "" then return content end
+  -- 快速前置判断：不含 `/` 的文本不可能含相对路径 token，直接返回，避免逐 token 走 vim.fn。
+  if not content:find("/", 1, true) then return content end
+  local cwd = vim.fn.getcwd()
+  if type(cwd) ~= "string" or cwd == "" then return content end
+  return (content:gsub("%S+", function(token)
+    local core = _strip_wrappers(token)
+    if not _looks_relative(core) then return token end
+    local abs = vim.fn.fnamemodify(fs.join(cwd, core), ":p")
+    if type(abs) ~= "string" or abs == "" then return token end
+    if vim.fn.filereadable(abs) == 1 or vim.fn.isdirectory(abs) == 1 then
+      -- `:p` 对目录会追加尾部 `/`，去掉以保持整洁（根目录除外）。
+      if #abs > 1 then abs = abs:gsub("/+$", "") end
+      if abs == "" then return token end
+      -- 命中：整个 token（含包裹的引号等）替换为绝对路径。
+      return abs
+    end
+    return token
+  end))
 end
 
 --- 构造一个独立聊天实例（闭包工厂）。返回实例 API 表。
@@ -1031,6 +1112,8 @@ end
 --- 提交输入
 --- @param content string
 local function _on_submit(content)
+  -- 发送前把真实存在的相对路径换成绝对路径（消除模型侧 cwd 歧义）；仅影响发给模型的内容。
+  content = _absolutize_existing_paths(content)
   input_box.on_submitted()
   -- 发送后切回主窗口并进入普通模式：生成期间可随时滚动查看流式输出
   _focus_main_normal()

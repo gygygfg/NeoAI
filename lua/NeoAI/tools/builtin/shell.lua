@@ -366,9 +366,12 @@ local function _run_interactive(command, opts)
   end)
 end
 
---- 会话级 shell 状态持久化包装。
---- 每个 run_command 是独立进程/独立 shell，export/cd 默认不保留；通过在命令前后
---- 载入/保存「cwd + 导出变量」到会话状态文件，使同一 agent 循环内状态跨命令保留。
+--- 会话级 shell 状态持久化包装（仅导出变量）。
+--- 每个 run_command 是独立进程/独立 shell，export 默认不保留；通过在命令前后
+--- 载入/保存「导出变量」到会话状态文件，使同一 agent 循环内 export 跨命令保留。
+--- 注意：cwd **不再**跨命令继承——每条命令的初始 PWD 恒为会话绑定工作目录
+--- （ctx.sandbox_cwd，即仓库/.git 根），因此命令内的 `cd` 只对本次命令有效；
+--- 需要跨步骤在同一目录操作时，请在同一条命令内用 `cd <dir> && ...` 完成。
 --- @param command string
 --- @param state_dir string 沙箱内会话状态目录（已 bind 到宿主会话目录）
 --- @return string
@@ -376,10 +379,8 @@ local function _wrap_session_command(command, state_dir)
   return table.concat({
     "_sd='" .. state_dir .. "'",
     'if [ -f "$_sd/env" ]; then . "$_sd/env"; fi',
-    'if [ -f "$_sd/cwd" ]; then cd "$(cat "$_sd/cwd")" 2>/dev/null || true; fi',
     command,
     "_rc=$?",
-    'pwd > "$_sd/cwd" 2>/dev/null',
     'export -p > "$_sd/env" 2>/dev/null',
     "exit $_rc",
   }, "\n")
@@ -446,6 +447,7 @@ local shell_tools = {}
 local RUN_COMMAND_DESC_BASE =
   "执行 Shell 命令（前台，单次调用内完成）。同 opencode bash（command, timeout_ms；默认 30000ms，-1 不限时）。"
   .. "长任务（安装/编译/下载）请在同一次调用内显式传较大 timeout_ms（如 600000），不要靠重试规避超时。"
+  .. "初始工作目录恒为会话工作目录（仓库根）：命令内的 cd 只对本次命令有效，需跨步骤在同一目录操作时请写 `cd <dir> && ...`；export 的环境变量则跨命令保留。"
   .. "`&`/nohup/setsid 后台进程跨轮次存活（命令结束不回收进程树），输出请重定向到文件。"
 
 -- 交互式（PTY）：标明可交互。
@@ -453,6 +455,7 @@ local RUN_COMMAND_DESC_INTERACTIVE =
   "执行 Shell 命令（交互式 PTY，可自动应答等待输入）。同 opencode bash（command, timeout_ms；默认 30000ms，-1 不限时）。"
   .. "命令一旦等待输入，系统按 description 自动应答（输入/按键/结束），也可用 terminal_send_text/terminal_send_keys/terminal_kill 精确控制。"
   .. "description 请写清目标与预期（如“安装依赖，提示是否继续选 y”）。多轮交互请传足够大 timeout_ms（如 120000~600000）。"
+  .. "初始工作目录恒为会话工作目录（仓库根）：命令内的 cd 只对本次命令有效，需跨步骤在同一目录操作时请写 `cd <dir> && ...`；export 的环境变量则跨命令保留。"
   .. "后台进程（&/nohup/setsid）跨轮次存活（命令结束不回收进程树），输出请重定向到文件。"
 
 shell_tools.run_command = helpers.define_tool(
