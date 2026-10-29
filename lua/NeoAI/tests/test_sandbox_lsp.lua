@@ -409,6 +409,10 @@ tests.suite("sandbox_lsp", function(_, it)
       vim.api.nvim_buf_set_name(bufnr, real)
       vim.bo[bufnr].filetype = "python"
       local ogc, os, ocl = vim.lsp.get_configs, vim.lsp.start, vim.lsp.get_clients
+      -- 显式模拟「沙箱不可用」：有 bwrap 的宿主上 wrap_cmd 会返回沙箱前缀，
+      -- 否则本用例名不副实（会走克隆而非 plain 回退）。
+      local owc = lsp.wrap_cmd
+      lsp.wrap_cmd = function() return nil end
       local captured
       ---@diagnostic disable-next-line: duplicate-set-field
       vim.lsp.get_configs = function()
@@ -420,6 +424,7 @@ tests.suite("sandbox_lsp", function(_, it)
       vim.lsp.get_clients = function() return {} end
       local started, reason = lsp.start_missing(bufnr)
       vim.lsp.get_configs, vim.lsp.start, vim.lsp.get_clients = ogc, os, ocl
+      lsp.wrap_cmd = owc
       t.true_(started, "应按编辑器配置启动缺失 server")
       t.nil_(reason, "成功时不应返回原因")
       t.not_nil(captured, "应调用 vim.lsp.start")
@@ -472,6 +477,9 @@ tests.suite("sandbox_lsp", function(_, it)
       vim.api.nvim_buf_set_name(bufnr, real)
       vim.bo[bufnr].filetype = "python"
       local ogc, os, oc = vim.lsp.get_clients, vim.lsp.start, vim.lsp.get_configs
+      -- 显式模拟「沙箱不可用」（见上一个用例）：否则有 bwrap 时会走克隆路径。
+      local owc = lsp.wrap_cmd
+      lsp.wrap_cmd = function() return nil end
       local started = 0
       ---@diagnostic disable-next-line: duplicate-set-field
       vim.lsp.get_clients = function() return {} end
@@ -483,6 +491,7 @@ tests.suite("sandbox_lsp", function(_, it)
       vim.lsp.start = function() started = started + 1; return 9501 end
       local ok, reason = lsp.start_missing(bufnr)
       vim.lsp.get_clients, vim.lsp.start, vim.lsp.get_configs = ogc, os, oc
+      lsp.wrap_cmd = owc
       t.false_(ok, "有暂存改动且沙箱不可用时应拒绝回退")
       t.eq("staged_no_sandbox", reason and reason.code, "应返回 staged_no_sandbox 原因")
       t.eq(0, started, "不应启动 plain 客户端（保持视图一致 R3）")

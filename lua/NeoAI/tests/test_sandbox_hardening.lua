@@ -395,7 +395,7 @@ tests.suite("sandbox_hardening", function(_, it)
     local pid = vim.fn.jobstart({ "sh", "-c",
       "echo $$ > " .. handle.path .. "/cgroup.procs; "
         .. "python3 - <<'PY' 2>/dev/null || true\n"
-        .. "import os\ntry:\n os.mknod('/tmp/neoai_backstop_dev', 0o600 | 0o020000, os.makedev(8, 0))\nexcept Exception:\n pass\nPY" }, {})
+        .. "import os\ntry:\n os.mknod('/tmp/neoai_backstop_dev', 0o600 | 0o020000, os.makedev(8, 0))\nexcept Exception:\n pass\nPY" })
     local deadline = vim.uv.hrtime() + 4000 * 1e6
     while vim.uv.hrtime() < deadline and not killed do vim.wait(50) end
     pcall(vim.fn.jobstop, pid)

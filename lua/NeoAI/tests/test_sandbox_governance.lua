@@ -220,7 +220,7 @@ tests.suite("sandbox_governance", function(_, it)
       vim.fn.mkdir(dir, "p")
       local sock = dir .. "/docker.sock"
       local f = assert(io.open(sock, "w")); f:close()
-      with_config({ tools = { sandbox = { docker = { mode = "controlled", socket = sock } } } }, function()
+      with_config({ tools = { sandbox = { container = { enabled = true }, docker = { mode = "controlled", socket = sock } } } }, function()
         container._set_podman_available(false)
         local c = assert(container.facade("docker ps"))
         t.eq("unsupported", c.mode, "弃用的 controlled socket 不再放行")
