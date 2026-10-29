@@ -138,7 +138,10 @@ tests.suite("sandbox_session", function(_, it)
     local runtime = require("NeoAI.sandbox.execution.runtime")
     local conceal = require("NeoAI.sandbox.observe.conceal")
     if runtime.backend() ~= "bwrap" then return end
-    local prefix = assert(runtime.process_prefix({ cwd = "/tmp", session_dir = "/tmp/neoai_sess" }))
+    -- 会话状态目录由调用方（wrapper）创建后再传入；此处同样先建目录。
+    local session_dir = vim.fn.tempname()
+    require("NeoAI.utils.fs").ensure_dir(session_dir)
+    local prefix = assert(runtime.process_prefix({ cwd = "/tmp", session_dir = session_dir }))
     t.not_nil(prefix, "应能构造前缀")
     local joined = table.concat(prefix, " ")
     t.true_(joined:find("--as-pid-1", 1, true) ~= nil, "应使用 --as-pid-1 隐藏 bwrap 进程")

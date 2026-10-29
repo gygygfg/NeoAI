@@ -43,6 +43,8 @@ local state = {
   degrade = nil, -- 最近一次防御层降级信息 { layer, mode, reason, fallback }
   degrade_notified = {}, -- 会话内 notify 去重（key -> true）
   degrade_audited = {}, -- 证据/事件去重（key -> hrtime(ms)，抑制同一命令的重复评估）
+  mount_skip_notified = {}, -- 挂载剔除 notify 去重（key -> true）
+  mount_skip_audited = {}, -- 挂载剔除证据/事件去重（key -> hrtime(ms)）
 }
 
 -- 默认遮蔽的宿主敏感路径（安全默认，可经 tools.sandbox.mask_paths 覆盖）：
@@ -1614,6 +1616,165 @@ local function _mask_paths_canonical()
   return canon
 end
 
+-- ========== 挂载目的路径规范化与单点失败隔离 ==========
+--
+-- bwrap 在 init 阶段**创建挂载点**：目的路径的父目录若是符号链接（Ubuntu 的
+-- `/var/run -> /run`），旧版 bubblewrap 创建挂载点会报
+-- `Can't create file ...: No such file or directory` / `Can't mkdir ...: ...`；而**任意一条**
+-- 挂载失败都会让整个 bwrap init 失败——所有外部命令（run_command / git / 工具子进程）
+-- 一起挂掉，进程内工具（read_file / list_files）不走 bwrap 所以看起来正常。
+--
+-- 因此在返回前缀前统一做一次「挂载收尾」：
+--   1. 目的路径按父目录真实化（`/var/run/docker.sock` → `/run/docker.sock`）；
+--   2. 源已不存在的绑定直接剔除（等价于该可选挂载未生效，且 bwrap 本就会失败）；
+--   3. 同一选项 + 同一目的路径的重复挂载只保留最后一条（后者覆盖前者，视图等价）；
+--   4. 安全关键挂载（整机 root overlay 的 upper/work）缺失一律硬失败，绝不剔除。
+-- 剔除项写 evidence + `SANDBOX_MOUNT_SKIPPED` 事件 + 告警（会话内去重），绝不静默。
+
+-- bwrap 挂载类选项的实参元数据：n = 实参个数；dest/src 为相对下标（1-based）。
+local MOUNT_OPTS = {
+  ["--bind"] = { n = 2, dest = 2, src = 1 },
+  ["--ro-bind"] = { n = 2, dest = 2, src = 1 },
+  ["--dev-bind"] = { n = 2, dest = 2, src = 1 },
+  ["--bind-try"] = { n = 2, dest = 2, src = 1 },
+  ["--ro-bind-try"] = { n = 2, dest = 2, src = 1 },
+  ["--dev-bind-try"] = { n = 2, dest = 2, src = 1 },
+  ["--file"] = { n = 2, dest = 2, src = 1 },
+  ["--tmpfs"] = { n = 1, dest = 1 },
+  ["--dev"] = { n = 1, dest = 1, keep = true },
+  ["--proc"] = { n = 1, dest = 1, keep = true },
+  ["--mqueue"] = { n = 1, dest = 1, keep = true },
+  ["--dir"] = { n = 1, dest = 1, keep = true },
+  ["--remount-ro"] = { n = 1, dest = 1, keep = true },
+  ["--symlink"] = { n = 2, dest = 2, keep = true },
+  ["--bind-data"] = { n = 2, dest = 2, keep = true },
+  ["--ro-bind-data"] = { n = 2, dest = 2, keep = true },
+  ["--overlay"] = { n = 3, dest = 3, overlay = true },
+  ["--overlay-src"] = { n = 1, keep = true },
+}
+
+--- 把挂载目的路径折算为「父目录真实、末段保留」的形式。
+---
+--- 只解析**父目录**的符号链接，绝不解析末段：
+---   * `/var/run/docker.sock` → `/run/docker.sock`（`/var/run -> /run`，父目录是符号链接，
+---     旧版 bwrap 无法在其下创建挂载点）；
+---   * `/bin` 保持不变（末段本身是 `usr/bin` 的符号链接；若折算成 `/usr/bin`，bwrap 会在
+---     `/usr/bin` 建挂载点而命名空间里根本没有 `/bin` 这个符号链接，`/bin/sh` 直接 ENOENT）。
+--- @param p string
+--- @return string
+local function _mount_dst(p)
+  if type(p) ~= "string" or p == "" or p == "/" then return p end
+  p = p:gsub("/+$", "")
+  local dir, base = p:match("^(.*)/([^/]+)$")
+  if not dir or dir == "" or base == nil then return p end
+  local ok, rd = pcall(vim.fn.resolve, dir)
+  if ok and type(rd) == "string" and rd ~= "" and rd ~= dir then
+    rd = rd:gsub("/+$", "")
+    return (rd == "" and "/" or rd) .. "/" .. base
+  end
+  return p
+end
+
+--- 扫描 argv 中的挂载选项分组（`--` 之后是载荷命令，停止扫描）。
+--- @param argv table
+--- @return table groups { { s=起始下标, n=长度, opt=选项名, dest_idx=目的下标|nil, src_idx=源下标|nil, keep=boolean, overlay=boolean } }
+local function _mount_groups(argv)
+  local groups = {}
+  local i, n = 1, #argv
+  while i <= n do
+    local opt = argv[i]
+    if opt == "--" then break end
+    local spec = MOUNT_OPTS[opt]
+    if spec then
+      groups[#groups + 1] = {
+        s = i, n = 1 + spec.n, opt = opt,
+        dest_idx = spec.dest and (i + spec.dest) or nil,
+        src_idx = spec.src and (i + spec.src) or nil,
+        keep = spec.keep == true,
+        overlay = spec.overlay == true,
+      }
+      i = i + 1 + spec.n
+    else
+      i = i + 1
+    end
+  end
+  return groups
+end
+
+--- 按剔除表重建 argv。
+--- @param argv table
+--- @param drop table 起始下标 -> 长度
+--- @return table
+local function _drop_groups(argv, drop)
+  local out = {}
+  local i = 1
+  while i <= #argv do
+    local n = drop[i]
+    if n then
+      i = i + n
+    else
+      out[#out + 1] = argv[i]
+      i = i + 1
+    end
+  end
+  return out
+end
+
+--- 挂载收尾：规范化目的路径、剔除源缺失的绑定、重复挂载去重、校验安全关键挂载。
+--- @param argv table bwrap argv（尚未拼接载荷命令）
+--- @return table|nil argv
+--- @return table|nil skips { { path=..., opt=..., reason="source_missing" }, ... }
+--- @return string|nil err
+local function _finalize_mounts(argv)
+  local groups = _mount_groups(argv)
+  local drop, skips, seen = {}, {}, {}
+  for _, g in ipairs(groups) do
+    local src = g.src_idx and argv[g.src_idx] or nil
+    local dest = g.dest_idx and argv[g.dest_idx] or nil
+    if g.overlay then
+      local upper, work = argv[g.s + 1], argv[g.s + 2]
+      -- 安全关键挂载：缺失即无法保证「写入进暂存」，绝不能剔除后继续（会变成直写/视图丢失）。
+      if not (upper and vim.uv.fs_stat(upper)) or not (work and vim.uv.fs_stat(work)) then
+        return nil, nil, "SANDBOX_MOUNT_FAILED: overlay upper/work 缺失（"
+          .. tostring(upper) .. " / " .. tostring(work) .. "）"
+      end
+    end
+    -- 源缺失：bwrap 会 `Can't find source path` 让整条命令 init 失败；该挂载本就不可能生效。
+    -- 注意 `/dev/null` 是遮蔽源，恒存在；仍显式排除以避免 stat 语义差异。
+    if g.src_idx and type(src) == "string" and src ~= "/dev/null" and not vim.uv.fs_stat(src) then
+      drop[g.s] = g.n
+      skips[#skips + 1] = { path = src, opt = g.opt, reason = "source_missing" }
+    else
+      if type(dest) == "string" and dest ~= "" and dest ~= "/" then
+        dest = _mount_dst(dest)
+        argv[g.dest_idx] = dest
+      end
+      -- 去重：同一选项 + 同一目的路径的重复挂载，后者覆盖前者，剔除前一条（视图等价）。
+      -- `--dir`/`--dev`/`--proc` 等保留项不参与（它们可能是在为后续挂载创建挂载点）。
+      if not g.keep and type(dest) == "string" and dest ~= "" then
+        local key = g.opt .. "\0" .. dest
+        local prev = seen[key]
+        if prev and prev.s ~= g.s then drop[prev.s] = prev.n end
+        seen[key] = g
+      end
+    end
+  end
+  if next(drop) then argv = _drop_groups(argv, drop) end
+  return argv, skips
+end
+
+--- bwrap 挂载失败文案 → 失败条目（兼容各版本措辞）。
+local MOUNT_FAIL_PATTERNS = {
+  { kind = "dest", pat = "^bwrap:%s*Can't create file at (.-):%s" },
+  { kind = "dest", pat = "^bwrap:%s*Can't create file (.-):%s" },
+  { kind = "dest", pat = "^bwrap:%s*Can't mkdir parents for (.-):%s" },
+  { kind = "dest", pat = "^bwrap:%s*Can't mkdir (.-):%s" },
+  { kind = "dest", pat = "^bwrap:%s*Can't make symlink at (.-):%s" },
+  { kind = "dest", pat = "^bwrap:%s*Can't bind mount .- on (.-):%s" },
+  { kind = "src", pat = "^bwrap:%s*Can't find source path (.-):%s" },
+  { kind = "src", pat = "^bwrap:%s*Can't stat (.-):%s" },
+}
+
 --- 载荷是否持有 CAP_DAC_OVERRIDE（可无视 DAC 遍历任意目录）
 --- 同时计入全局 `cap_add` 与档位 `priv.cap_add`（T0/T1 基线现含该能力）。
 --- @param priv table|nil 档位隔离参数
@@ -2176,6 +2337,75 @@ end
 --- @return string|nil mask_entry
 function M.mask_entry(path, cwd)
   return _mask_entry(path, cwd)
+end
+
+--- 把挂载目的路径折算为真实路径（父目录符号链接展开，末段保留）。供测试与诊断。
+--- @param path string
+--- @return string
+function M.mount_dst(path)
+  return _mount_dst(path)
+end
+
+--- 挂载收尾（内部）：规范化目的路径、剔除源缺失的绑定、重复挂载去重、校验安全关键挂载。
+--- 暴露给测试复现 argv 生成；调用方通常无需直接使用（`process_prefix` 已自动调用）。
+--- @param argv table
+--- @return table|nil argv
+--- @return table|nil skips
+--- @return string|nil err
+function M._finalize_mounts(argv)
+  return _finalize_mounts(argv)
+end
+
+--- bwrap 挂载失败文案 → 失败条目。兼容 `Can't create file (at) ...`、
+--- `Can't mkdir (parents for) ...`、`Can't bind mount <src> on <dst>`、`Can't find source path ...`。
+--- @param stderr string|nil
+--- @return table|nil { kind="dest"|"src", path=string, message=string }
+function M.mount_failure_info(stderr)
+  if type(stderr) ~= "string" or stderr == "" then return nil end
+  for line in stderr:gmatch("[^\r\n]+") do
+    for _, p in ipairs(MOUNT_FAIL_PATTERNS) do
+      local path = line:match(p.pat)
+      if path and path ~= "" then
+        return { kind = p.kind, path = path, message = line }
+      end
+    end
+  end
+  return nil
+end
+
+--- 从 bwrap argv 中剔除与失败条目相关的挂载（供 init 失败自愈重试）。
+--- 安全护栏：`kind="dest"` 且目标在宿主上**仍然存在**时返回 nil——此时剔除会解除遮蔽或
+--- 改变可见视图（泄露），必须按硬失败处理，绝不静默放宽。
+--- @param argv table 原始前缀
+--- @param info table { kind="dest"|"src", path=string }
+--- @return table|nil pruned
+--- @return table|nil removed { { path=..., opt=..., kind=... }, ... }
+function M.prune_mount(argv, info)
+  if type(argv) ~= "table" or type(info) ~= "table" or type(info.path) ~= "string" then return nil end
+  local kind = info.kind == "src" and "src" or "dest"
+  if kind == "dest" and vim.uv.fs_stat(info.path) ~= nil then
+    -- 目标仍存在：剔除会暴露本该被遮蔽/覆盖的内容。拒绝自愈。
+    return nil
+  end
+  local target = _mount_dst(info.path)
+  local groups = _mount_groups(argv)
+  local drop, removed = {}, {}
+  for _, g in ipairs(groups) do
+    local hit
+    if kind == "src" then
+      local s = g.src_idx and argv[g.src_idx]
+      hit = type(s) == "string" and _mount_dst(s) == target
+    else
+      local d = g.dest_idx and argv[g.dest_idx]
+      hit = type(d) == "string" and _mount_dst(d) == target
+    end
+    if hit then
+      drop[g.s] = g.n
+      removed[#removed + 1] = { path = info.path, opt = g.opt, kind = kind }
+    end
+  end
+  if #removed == 0 then return nil end
+  return _drop_groups(argv, drop), removed
 end
 
 --- 系统目录（stdpath）值；缺失/空串返回 nil。
@@ -3180,6 +3410,15 @@ function M.process_prefix(opts)
         table.insert(argv, "--ambient-caps"); table.insert(argv, amb)
       end
     end
+    -- 挂载收尾：目的路径真实化（父目录符号链接）、源缺失的绑定剔除、重复挂载去重、
+    -- 安全关键挂载（root overlay upper/work）校验。任意一条挂载失败都会让 bwrap init 失败，
+    -- 进而拖垮**所有**外部命令，因此必须在返回前缀前收敛。
+    local finalized, skips, ferr = _finalize_mounts(argv)
+    if not finalized then return nil, ferr end
+    argv = finalized
+    if skips and #skips > 0 then
+      pcall(function() M.note_mount_skip(skips, { stage = "finalize", tool = opts.tool }) end)
+    end
     if filter then
       return _wrap_close_fds(_prepend_affinity(argv), "exec 3<'" .. filter .. "'"), nil, opts.cwd
     end
@@ -3289,6 +3528,66 @@ end
 --- @return table|nil
 function M.last_degrade()
   return state.degrade
+end
+
+--- 记录一次挂载剔除（绝不静默）：写证据 + 发事件 + 会话内去重告警。
+--- 剔除只会发生在「该挂载本就不可能生效」的场景（源已不存在 / 目标已不存在），
+--- 因此不改变可见与遮蔽面的最终结果；但必须留痕，避免用户误以为沙箱完整。
+--- @param entries table { { path=..., opt=..., reason=..., kind=... }, ... }
+--- @param info table|nil { stage="finalize"|"init_retry", tool?, command? }
+function M.note_mount_skip(entries, info)
+  if type(entries) ~= "table" or #entries == 0 then return end
+  info = info or {}
+  local paths = {}
+  for _, e in ipairs(entries) do
+    if type(e) == "table" and type(e.path) == "string" and e.path ~= "" then paths[#paths + 1] = e.path end
+  end
+  if #paths == 0 then return end
+  local key = table.concat(paths, "\0")
+  local now = vim.uv.hrtime() / 1e6
+  local last = state.mount_skip_audited[key]
+  if not last or (now - last) > 1500 then
+    state.mount_skip_audited[key] = now
+    pcall(function()
+      require("NeoAI.sandbox.review.evidence").add("sandbox_mount_skip", {
+        paths = paths, entries = entries, stage = info.stage,
+        tool = info.tool, command = info.command,
+      }, { source = "observed", tool = info.tool })
+    end)
+    pcall(function()
+      require("NeoAI.kernel.event_bus").emit(
+        require("NeoAI.kernel.events").SANDBOX_MOUNT_SKIPPED, {
+          paths = paths, stage = info.stage, tool = info.tool,
+        })
+    end)
+  end
+  if not state.mount_skip_notified[key] then
+    state.mount_skip_notified[key] = true
+    pcall(vim.notify,
+      "[NeoAI] 沙箱已跳过不可用的挂载点（不阻断命令）：" .. table.concat(paths, ", "),
+      vim.log.levels.WARN)
+  end
+end
+
+--- 记录一次不可自愈的挂载失败（绝不静默）：目标仍存在，剔除会解除遮蔽/改变视图，
+--- 因此按硬失败处理并留痕。
+--- @param fail table { kind="dest"|"src", path=string, message=string }
+--- @param info table|nil { stage?, tool?, command? }
+function M.note_mount_failure(fail, info)
+  if type(fail) ~= "table" or type(fail.path) ~= "string" then return end
+  info = info or {}
+  pcall(function()
+    require("NeoAI.sandbox.review.evidence").add("sandbox_mount_failed", {
+      path = fail.path, kind = fail.kind, message = fail.message, stage = info.stage,
+      tool = info.tool, command = info.command,
+    }, { source = "observed", tool = info.tool })
+  end)
+  pcall(function()
+    require("NeoAI.kernel.event_bus").emit(
+      require("NeoAI.kernel.events").SANDBOX_MOUNT_FAILED, {
+        path = fail.path, kind = fail.kind, stage = info.stage, tool = info.tool,
+      })
+  end)
 end
 
 --- 当前 seccomp 基线的施加方式（诊断用）。

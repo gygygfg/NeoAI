@@ -130,6 +130,9 @@ local function _run_command(command, opts)
   local stderr_chunks = {}
   local done = false
   local job
+  -- 挂载自愈：bwrap init 因单条挂载失败（如目标父目录符号链接、TOCTOU 消失）而整体失败时，
+  -- 剔除该挂载重试一次（仅在目标已不存在、剔除不改变安全面时；见 runtime.prune_mount）。
+  local retried = opts._mount_retried == true
   local cfg_rc = require("NeoAI.kernel.config_store").get("tools.run_command") or {}
   local timeout_ms = opts.timeout_ms or 30000
   -- 墙钟安全网：max_wall_ms>0 时约束所有命令（含 timeout_ms=-1 的「不限」），避免永久运行。
@@ -253,6 +256,35 @@ local function _run_command(command, opts)
     end,
     on_exit = function(_, code)
       local out, errout = snapshot()
+      -- 挂载自愈：init 失败时剔除坏挂载重试一次（绝不静默：写 evidence + 事件 + 告警）。
+      if not retried and code ~= 0 and opts.prefix then
+        local ok_rt, rt = pcall(require, "NeoAI.sandbox.execution.runtime")
+        if ok_rt and rt and type(rt.mount_failure_info) == "function" then
+          local fail = rt.mount_failure_info(errout)
+          local pruned, removed = nil, nil
+          if fail then pruned, removed = rt.prune_mount(opts.prefix, fail) end
+          if pruned then
+            retried = true
+            done = true
+            unsub()
+            pcall(function()
+              rt.note_mount_skip(removed, { stage = "init_retry", tool = "run_command" })
+            end)
+            local opts2 = vim.tbl_extend("force", {}, opts)
+            opts2.prefix = pruned
+            opts2._mount_retried = true
+            opts2._egress_checked = true
+            _run_command(command, opts2):then_(function(v) d:resolve(v) end, function(e) d:reject(e) end)
+            return
+          end
+          -- 目标仍存在（剔除会解除遮蔽）或无可剔除项：按硬失败处理并留痕。
+          if fail then
+            pcall(function()
+              rt.note_mount_failure(fail, { stage = "init", tool = "run_command" })
+            end)
+          end
+        end
+      end
       local oom, oom_level = false, nil
       -- 137（SIGKILL）与裸 -1（无超时/取消标记、进程树被终止后无法回传退出码）都做 OOM 归因。
       if cgroup_path and (code == 137 or code == -1) then

@@ -2233,6 +2233,49 @@ commands (SSRF, e.g. host admin panels, internal ports, cloud metadata):
 - **Mutually exclusive with the isolated-netns gateway (`network.gateway`)**: when the gateway is
   enabled it provides the proxy and this interception steps aside.
 
+### 6.2 Mount-point normalization and single-failure isolation
+
+bwrap **creates mount points** during init, and any single failing mount aborts the whole bwrap
+init — taking down **every external process** (`run_command`, `git fetch`, tool subprocesses, LSP).
+In-process tools (`read_file` / `list_files` / `git_status`) do not go through bwrap, so they keep
+working, which makes the failure look bizarre. Typical triggers:
+
+- The host makes `/var/run` a symlink to `/run` (Ubuntu/Debian) and the default mask list contains
+  both `/run/docker.sock` and `/var/run/docker.sock`; older bubblewrap cannot create a mount point
+  whose parent is a symlink and reports
+  `Can't create file at /var/run/docker.sock: No such file or directory`
+  (version dependent: 0.9/0.11 fail, 0.12 follows symlinks).
+- A mask/expose target disappears between `fs_stat` and bwrap startup (TOCTOU, e.g. the docker
+  daemon restarting and reclaiming its socket).
+
+Handling (`sandbox/execution/runtime.lua`):
+
+1. **Real dest paths**: before returning the prefix, `_finalize_mounts()` resolves each mount
+   destination's **parent** to its real path (`/var/run/...` → `/run/...`) while keeping the last
+   component (symlink semantics unchanged). Mask paths get the same treatment in `_mask_real()`.
+2. **Drop missing sources**: a `--bind/--ro-bind/--dev-bind` whose source no longer exists is
+   dropped (it could never take effect, while bwrap would abort the whole command with
+   `Can't find source path`).
+3. **Dedupe**: identical option + identical dest keeps the last entry only (later mounts shadow
+   earlier ones, so the view is equivalent); `--dir`/`--dev`/`--proc` keep-entries are exempt
+   (they may be creating a mount point for a later mount).
+4. **Security-critical mounts are never dropped**: a missing root-overlay upper/work is a hard
+   failure (`SANDBOX_MOUNT_FAILED`) — never a silent fallback to direct writes or a lost staging
+   view.
+5. **Init-failure self-heal**: on bwrap init failure, `run_command` and tool subprocesses
+   (`sandbox.execution.exec`) parse the error (all wordings: `Can't create file (at) ...`,
+   `Can't mkdir (parents for) ...`, `Can't bind mount <src> on <dst>`, `Can't find source path ...`)
+   and retry **once** without that mount **only when the failing target no longer exists on the
+   host** (so dropping it cannot change the mask/exposure surface); otherwise it stays a hard
+   failure.
+6. **Never silent**: every drop writes evidence (`sandbox_mount_skip`), emits
+   `SANDBOX_MOUNT_SKIPPED`, and warns once per session; non-healable failures write
+   `sandbox_mount_failed` + `SANDBOX_MOUNT_FAILED`.
+
+> This only stops one bad mount from taking down every command; it never weakens a boundary.
+> Drops that would unmask or expose something are rejected by the guard, and a missing
+> security-critical overlay still fails hard.
+
 ## 7. Configuration
 
 ```lua
@@ -2318,6 +2361,11 @@ results produce `DENY` (`POLICY_EVALUATION_FAILED`). Aggregation is `DENY > NEED
 `SANDBOX_PUBLISH_STARTED` / `SANDBOX_COMMITTED` / `SANDBOX_DISCARDED` / `SANDBOX_CONFLICT`,
 plus async review `SANDBOX_REVIEW_ENQUEUED` / `SANDBOX_REVIEW_APPROVED` /
 `SANDBOX_REVIEW_REJECTED` / `SANDBOX_APPLIED`, see [EVENTS.md](EVENTS.md).
+
+Mount finalization and self-heal (§6.2): `SANDBOX_MOUNT_SKIPPED` (source gone, or init failure
+healed by dropping that mount and retrying; payload = `{paths, stage, tool}`) and
+`SANDBOX_MOUNT_FAILED` (not healable, treated as a hard failure;
+payload = `{path, kind, stage, tool}`).
 
 ## 9. Tests
 

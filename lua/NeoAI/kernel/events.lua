@@ -214,6 +214,12 @@ M.SANDBOX_DEGRADED = "sandbox:degraded"
 -- 行为违规：eBPF 行为兜底（第 2 层）观测到危险 syscall 命中并已 cgroup.kill 整树终止。
 -- payload={syscall=..., pid=..., attempt=...}
 M.SANDBOX_BEHAVIOR_VIOLATION = "sandbox:behavior_violation"
+-- 挂载点剔除：bwrap init 前发现源已不存在（或 init 失败后自愈重试）而跳过该挂载。
+-- 安全关键挂载不被剔除；payload={paths={...}, stage="finalize"|"init_retry", tool=...}
+M.SANDBOX_MOUNT_SKIPPED = "sandbox:mount_skipped"
+-- 挂载点失败：init 失败且不可安全自愈（目标仍存在，剔除会解除遮蔽/暴露），按硬失败处理。
+-- payload={path=..., kind="dest"|"src", stage="init", tool=...}
+M.SANDBOX_MOUNT_FAILED = "sandbox:mount_failed"
 
 -- ========== 交互式终端（run_command PTY） ==========
 -- run_command 以 PTY 运行命令时，轮询 /proc 检测到“阻塞读终端 = 等待输入”触发 waiting_input；

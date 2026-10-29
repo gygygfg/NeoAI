@@ -38,7 +38,9 @@ end
 
 --- 启动一个（可能已带沙箱前缀的）子进程，缓冲输出，返回 Deferred。
 --- @param argv table 完整 argv（已含前缀）
---- @param opts table { cwd?, env?, timeout_ms?, signal? }
+--- @param opts table { cwd?, env?, timeout_ms?, signal?, rebuild? }
+---   rebuild：bwrap init 失败时的自愈回调 `function(fail) -> argv|nil, removed`，
+---   用于剔除单条坏挂载后重试一次（不改变安全面，见 runtime.prune_mount）。
 --- @return Deferred
 local function _spawn(argv, opts)
   opts = opts or {}
@@ -46,6 +48,7 @@ local function _spawn(argv, opts)
   local stdout_chunks, stderr_chunks = {}, {}
   local done = false
   local job
+  local retried = opts._mount_retried == true
   -- 取消订阅句柄：settle 时统一反注册，避免 agent.signal（长生命周期）上监听器无界增长。
   local unsub = function() end
   local function settle(res)
@@ -70,21 +73,46 @@ local function _spawn(argv, opts)
       settle({ code = -1, stdout = table.concat(stdout_chunks, "\n"), stderr = table.concat(stderr_chunks, "\n"), timed_out = true })
     end, timeout_ms)
   end
-  job = vim.fn.jobstart(argv, {
-    cwd = opts.cwd,
-    env = require("NeoAI.utils.env").for_jobstart(opts.env or require("NeoAI.sandbox.secret.secret").sanitized_env()),
-    stdout_buffered = false,
-    stderr_buffered = false,
-    on_stdout = function(_, data)
-      if data and #data > 0 then stdout_chunks[#stdout_chunks + 1] = table.concat(data, "\n") end
-    end,
-    on_stderr = function(_, data)
-      if data and #data > 0 then stderr_chunks[#stderr_chunks + 1] = table.concat(data, "\n") end
-    end,
-    on_exit = function(_, code)
-      settle({ code = code, stdout = table.concat(stdout_chunks, "\n"), stderr = table.concat(stderr_chunks, "\n") })
-    end,
-  })
+  local function start(args)
+    return vim.fn.jobstart(args, {
+      cwd = opts.cwd,
+      env = require("NeoAI.utils.env").for_jobstart(opts.env or require("NeoAI.sandbox.secret.secret").sanitized_env()),
+      stdout_buffered = false,
+      stderr_buffered = false,
+      on_stdout = function(_, data)
+        if data and #data > 0 then stdout_chunks[#stdout_chunks + 1] = table.concat(data, "\n") end
+      end,
+      on_stderr = function(_, data)
+        if data and #data > 0 then stderr_chunks[#stderr_chunks + 1] = table.concat(data, "\n") end
+      end,
+      on_exit = function(_, code)
+        -- 挂载自愈：init 失败时剔除坏挂载重试一次（绝不静默）。
+        if not retried and code ~= 0 and opts.rebuild then
+          local ok_rt, rt = pcall(require, "NeoAI.sandbox.execution.runtime")
+          if ok_rt and rt and type(rt.mount_failure_info) == "function" then
+            local fail = rt.mount_failure_info(table.concat(stderr_chunks, "\n"))
+            if fail then
+              local rebuilt, removed = opts.rebuild(fail)
+              if rebuilt then
+                retried = true
+                pcall(function()
+                  rt.note_mount_skip(removed, { stage = "init_retry", tool = opts.name })
+                end)
+                stdout_chunks, stderr_chunks = {}, {}
+                if start(rebuilt) > 0 then return end
+              else
+                pcall(function()
+                  rt.note_mount_failure(fail, { stage = "init", tool = opts.name })
+                end)
+              end
+            end
+          end
+        end
+        settle({ code = code, stdout = table.concat(stdout_chunks, "\n"), stderr = table.concat(stderr_chunks, "\n") })
+      end,
+    })
+  end
+  job = start(argv)
   if job <= 0 then
     done = true
     unsub()
@@ -165,18 +193,31 @@ function M.run(argv, opts)
     -- token→真实密钥的还原仅限沙箱内部进程：argv 中的 NEOKEY_ 还原后执行；
     -- 日志/证据用的 args.command 仍保留 token。
     local secret = require("NeoAI.sandbox.secret.secret")
-    local full = {}
-    for _, v in ipairs(ictx.sandbox_prefix or {}) do full[#full + 1] = v end
-    for _, v in ipairs(argv) do
-      full[#full + 1] = (type(v) == "string") and (secret.detokenize(v)) or v
+    local base = ictx.sandbox_prefix or {}
+    local function build(prefix)
+      local full = {}
+      for _, v in ipairs(prefix) do full[#full + 1] = v end
+      for _, v in ipairs(argv) do
+        full[#full + 1] = (type(v) == "string") and (secret.detokenize(v)) or v
+      end
+      return full
     end
     local function spawn()
-      return _spawn(full, {
+      return _spawn(build(base), {
+        name = tool.name,
         cwd = ictx.sandbox_cwd or opts.cwd,
         env = ictx.sandbox_env,
         timeout_ms = opts.timeout_ms,
         signal = opts.signal,
         kill = ictx.sandbox_kill,
+        -- 挂载自愈：init 失败时剔除坏挂载重试一次（安全护栏见 runtime.prune_mount）。
+        rebuild = function(fail)
+          local ok_rt, rt = pcall(require, "NeoAI.sandbox.execution.runtime")
+          if not (ok_rt and rt and type(rt.prune_mount) == "function") then return nil end
+          local pruned, removed = rt.prune_mount(base, fail)
+          if not pruned then return nil end
+          return build(pruned), removed
+        end,
       })
     end
     -- 出网守卫：命令/env 含密钥且指向非白名单地址时弹窗阻止（白名单不警告）。

@@ -1837,6 +1837,39 @@ seccomp（含设备节点屏障）**——沙箱内进程看到的是一份「�
 
 - **与独立 netns 网关（`network.gateway`）互斥**：后者启用时由网关提供代理，本拦截自动让位。
 
+### 6.2 挂载点规范化与单点失败隔离
+
+bwrap 在 init 阶段**创建挂载点**，任意一条挂载失败都会让整个 bwrap 进程初始化失败，进而
+**所有外部进程**（`run_command`、`git fetch`、工具子进程、LSP）一起失败；而进程内工具
+（`read_file` / `list_files` / `git_status`）不走 bwrap，看起来一切正常。典型触发：
+
+- 宿主把 `/var/run` 做成指向 `/run` 的符号链接（Ubuntu/Debian），默认遮蔽表同时列
+  `/run/docker.sock` 与 `/var/run/docker.sock`；旧版 bubblewrap 对「父目录是符号链接」的
+  挂载点创建会报 `Can't create file at /var/run/docker.sock: No such file or directory`
+  （实测与 bubblewrap 版本相关：0.9/0.11 会失败，0.12 已能跟随符号链接）。
+- 遮蔽/暴露目标在 `fs_stat` 与 bwrap 启动之间消失（TOCTOU，如 docker 守护进程重启回收 socket）。
+
+处理（`sandbox/execution/runtime.lua`）：
+
+1. **目的路径真实化**：`_finalize_mounts()` 在返回前缀前把每条挂载的目的路径按**父目录**
+   折算为真实路径（`/var/run/...` → `/run/...`），末段保留（不改变符号链接本身的语义）。
+   遮蔽路径在配置层由 `_mask_real()` 做同一折算并去重。
+2. **源缺失剔除**：`--bind/--ro-bind/--dev-bind` 的源在宿主已不存在时直接剔除该挂载
+   （它本就不可能生效，而 bwrap 会因 `Can't find source path` 让整条命令失败）。
+3. **重复挂载去重**：同选项 + 同目的路径只保留最后一条（后者覆盖前者，视图等价）；
+   `--dir`/`--dev`/`--proc` 等保留项不参与（它们可能在为后续挂载创建挂载点）。
+4. **安全关键挂载不剔除**：整机根 overlay 的 upper/work 缺失一律硬失败
+   （`SANDBOX_MOUNT_FAILED`），绝不退化为直写或丢失暂存视图。
+5. **init 失败自愈**：`run_command` 与工具子进程（`sandbox.execution.exec`）在 bwrap init
+   失败时解析错误文案（兼容 `Can't create file (at) ...`、`Can't mkdir (parents for) ...`、
+   `Can't bind mount <src> on <dst>`、`Can't find source path ...`），**仅在失败目标在宿主上
+   已不存在**（剔除不改变遮蔽/可见面）时剔除该挂载并重试一次；否则按硬失败处理。
+6. **绝不静默**：每次剔除写 evidence（`sandbox_mount_skip`）、发 `SANDBOX_MOUNT_SKIPPED`
+   事件、会话内去重告警；不可自愈的失败写 `sandbox_mount_failed` + `SANDBOX_MOUNT_FAILED`。
+
+> 该机制只保证「一条坏挂载不再拖垮所有命令」，不放松任何安全边界：会解除遮蔽/暴露的剔除
+> 一律被护栏拒绝，安全关键 overlay 缺失仍然硬失败。
+
 ## 7. 配置
 
 ```lua
@@ -1923,6 +1956,10 @@ require("NeoAI").setup({
 `SANDBOX_PUBLISH_STARTED` / `SANDBOX_COMMITTED` / `SANDBOX_DISCARDED` /
 `SANDBOX_CONFLICT`，以及异步审批 `SANDBOX_REVIEW_ENQUEUED` / `SANDBOX_REVIEW_APPROVED` /
 `SANDBOX_REVIEW_REJECTED` / `SANDBOX_APPLIED`，详见 [EVENTS.md](EVENTS.md)。
+
+挂载收尾与自愈（§6.2）：`SANDBOX_MOUNT_SKIPPED`（源已不存在/init 失败后剔除该挂载并重试，
+payload = `{paths, stage, tool}`）、`SANDBOX_MOUNT_FAILED`（不可自愈，按硬失败处理，
+payload = `{path, kind, stage, tool}`）。
 
 ## 9. 测试
 
