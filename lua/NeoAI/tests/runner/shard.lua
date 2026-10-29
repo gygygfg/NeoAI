@@ -52,9 +52,15 @@ end
 --- @return string[] load_errors
 function M.parse_manifest(output)
   local suites = {}
-  -- 仅在同一行内解析可选 module 字段（`[^\n]*` 不跨行），避免误吞下一条 SUITE 行。
-  for name, cases, rest in (output or ""):gmatch("SUITE (%S+) (%d+)([^\n]*)") do
+  -- 归一化：headless 的 `print` 在超宽行（80 列边界）可能不落换行，使下一条 `SUITE` 粘在
+  -- 上一条 module 尾部（实测 `...promptSUITE sandbox_ops 58 ...`）。先把这种粘连拆回独立行，
+  -- 否则下一个套件会整条丢失（其名字被吞进上一条的 module）。
+  local out = (output or ""):gsub("(%S)SUITE (%S+ %d+)", "%1\nSUITE %2")
+  -- 仅在同一行内解析可选 module 字段（`[^\n]*` 不跨行）。
+  for name, cases, rest in out:gmatch("SUITE (%S+) (%d+)([^\n]*)") do
     local mod = rest:match("^%s*(%S+)")
+    -- module 名只含字母/数字/下划线/点；异常内容（残留粘连/折行）一律丢弃，退回「加载全部」。
+    if mod and not mod:match("^[%w_%.]+$") then mod = nil end
     suites[#suites + 1] = { name = name, cases = tonumber(cases) or 0, module = mod }
   end
   local load_errors = {}

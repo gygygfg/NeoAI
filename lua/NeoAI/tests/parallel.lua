@@ -53,8 +53,11 @@ function M._discover(opts)
     'require("NeoAI").setup({ log = { level = "ERROR" }, session = { auto_save = false } })',
     'local suites, errs = require("NeoAI.tests").list_suites()',
     "for _, s in ipairs(suites) do",
-    '  print(("SUITE %s %d %s"):format(s.name, s.cases, s.module or ""))',
+    -- 显式换行 + flush：headless 的 `print` 在超宽行（80 列边界）可能不落换行，导致下一条
+    -- `SUITE` 粘到上一条 module 尾部（如 `...promptSUITE ...`），worker 按错误 module 加载失败。
+    '  io.stdout:write(("SUITE %s %d %s\\n"):format(s.name, s.cases, s.module or ""))',
     "end",
+    "io.stdout:flush()",
     "for _, e in ipairs(errs or {}) do",
     '  io.stdout:write("LOADFAIL:: " .. tostring(e) .. "\\n")',
     "end",

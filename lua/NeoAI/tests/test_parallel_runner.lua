@@ -21,6 +21,23 @@ tests.suite("parallel_runner", function(_, it, before_each)
     return table.concat(lines, "\n") .. "\n"
   end
 
+  it("清单解析：超宽行吞换行时不得把下一条 SUITE 粘进 module", function(t)
+    local shard = require("NeoAI.tests.runner.shard")
+    local out = table.concat({
+      "SUITE alpha 3 NeoAI.tests.test_alpha",
+      -- 模拟 print 在 80 列边界未落换行：下一条 SUITE 粘在上一条 module 尾部。
+      "SUITE beta 5 NeoAI.tests.test_betaSUITE gamma 1 NeoAI.tests.test_gamma",
+      "",
+    }, "\n")
+    local suites = shard.parse_manifest(out)
+    t.eq(3, #suites, "应解析出 3 个套件")
+    t.eq("NeoAI.tests.test_alpha", suites[1].module)
+    t.eq("NeoAI.tests.test_beta", suites[2].module, "粘连的 SUITE 应拆分为独立记录")
+    t.eq(5, suites[2].cases)
+    t.eq("gamma", suites[3].name, "被粘连的套件不得丢失")
+    t.eq("NeoAI.tests.test_gamma", suites[3].module)
+  end)
+
   it("分片：LPT 贪心把最重套件独立成档", function(t)
     local suites = {
       { name = "a", cases = 10 }, { name = "b", cases = 1 },
