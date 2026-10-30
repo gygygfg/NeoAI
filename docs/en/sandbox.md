@@ -2241,18 +2241,26 @@ In-process tools (`read_file` / `list_files` / `git_status`) do not go through b
 working, which makes the failure look bizarre. Typical triggers:
 
 - The host makes `/var/run` a symlink to `/run` (Ubuntu/Debian) and the default mask list contains
-  both `/run/docker.sock` and `/var/run/docker.sock`; older bubblewrap cannot create a mount point
-  whose parent is a symlink and reports
-  `Can't create file at /var/run/docker.sock: No such file or directory`
-  (version dependent: 0.9/0.11 fail, 0.12 follows symlinks).
+  both `/run/docker.sock` and `/var/run/docker.sock`; bubblewrap 0.9/0.11 cannot create a mount
+  point whose parent is a symlink and reports
+  `Can't create file at /var/run/docker.sock: No such file or directory`.
+- bubblewrap **0.12+** additionally refuses to mount onto a symlink:
+  `bwrap: Can't mount on symlink destination /etc/resolv.conf`. On systemd-resolved hosts
+  `/etc/resolv.conf` is exactly such a symlink (`-> /run/systemd/resolve/stub-resolv.conf`), so
+  **every** external command fails — on new ARM64 distros just as on x86 (CPU-arch independent).
 - A mask/expose target disappears between `fs_stat` and bwrap startup (TOCTOU, e.g. the docker
   daemon restarting and reclaiming its socket).
 
 Handling (`sandbox/execution/runtime.lua`):
 
 1. **Real dest paths**: before returning the prefix, `_finalize_mounts()` resolves each mount
-   destination's **parent** to its real path (`/var/run/...` → `/run/...`) while keeping the last
-   component (symlink semantics unchanged). Mask paths get the same treatment in `_mask_real()`.
+   destination to its real path:
+   - by default only the **parent** is resolved (`/var/run/...` → `/run/...`) and the last
+     component is preserved (resolving it would break `/bin` in selective-mount namespaces where
+     the `/bin -> usr/bin` symlink does not exist, causing `/bin/sh` ENOENT);
+   - when the namespace root **is** the host root (`read_all` overlay / read-only root) the last
+     component is resolved too (`resolve_leaf`), satisfying bubblewrap 0.12+'s symlink rule.
+   Mask paths get the same treatment in `_mask_real()`.
 2. **Drop missing sources**: a `--bind/--ro-bind/--dev-bind` whose source no longer exists is
    dropped (it could never take effect, while bwrap would abort the whole command with
    `Can't find source path`).
@@ -2262,19 +2270,42 @@ Handling (`sandbox/execution/runtime.lua`):
 4. **Security-critical mounts are never dropped**: a missing root-overlay upper/work is a hard
    failure (`SANDBOX_MOUNT_FAILED`) — never a silent fallback to direct writes or a lost staging
    view.
-5. **Init-failure self-heal**: on bwrap init failure, `run_command` and tool subprocesses
+5. **resolv.conf re-mount after masking**: the resolved target of `/etc/resolv.conf` may live under
+   `/run/systemd`, which is masked later; it is therefore mounted **again after** masking (dedupe
+   keeps the last one), otherwise DNS breaks inside the sandbox.
+6. **Init-failure self-heal**: on bwrap init failure, `run_command` and tool subprocesses
    (`sandbox.execution.exec`) parse the error (all wordings: `Can't create file (at) ...`,
-   `Can't mkdir (parents for) ...`, `Can't bind mount <src> on <dst>`, `Can't find source path ...`)
-   and retry **once** without that mount **only when the failing target no longer exists on the
-   host** (so dropping it cannot change the mask/exposure surface); otherwise it stays a hard
-   failure.
-6. **Never silent**: every drop writes evidence (`sandbox_mount_skip`), emits
+   `Can't mkdir (parents for) ...`, `Can't bind mount <src> on <dst>`, `Can't find source path ...`,
+   `Can't mount on symlink destination ...`): a symlink dest is rewritten to its real path and
+   retried once; other mounts are retried **once** without them **only when the failing target no
+   longer exists on the host** (so dropping it cannot change the mask/exposure surface); otherwise
+   it stays a hard failure.
+7. **Never silent**: every repair/drop writes evidence (`sandbox_mount_skip`), emits
    `SANDBOX_MOUNT_SKIPPED`, and warns once per session; non-healable failures write
    `sandbox_mount_failed` + `SANDBOX_MOUNT_FAILED`.
 
 > This only stops one bad mount from taking down every command; it never weakens a boundary.
 > Drops that would unmask or expose something are rejected by the guard, and a missing
 > security-critical overlay still fails hard.
+
+### 6.3 Full capability without Docker / Podman (incl. ARM64)
+- **Isolation backend is independent of container runtimes**: `bwrap` (preferred) or
+  `unshare` + unprivileged userns covers every sandbox capability (overlay staging, masks,
+  seccomp, cgroups, network gate, approvals). `docker`/`podman` **never** participate as an
+  isolation backend; they are only used by the optional container facade when the AI itself calls
+  container commands (daemonless `podman` can share the sandbox namespace; if absent, such calls
+  are rejected with the authentic "docker daemon not running" error and nothing else is affected).
+- **Minimal dependencies**: `bubblewrap` (overlay needs **>= 0.11.0** for `--overlay-src`;
+  0.9/0.10 fall back to bind + seeded view) + `util-linux` (`unshare`/`setpriv`, seccomp needs
+  >= 2.32); `strace`/`bpftrace` are observation-only (auto-fallback, never required for isolation).
+- **ARM64**: the seccomp baseline picks the per-arch syscall table (`aarch64` uses asm-generic
+  numbers); capability probes and mounts are arch-independent. If
+  `unshare --user --map-root-user true` fails: Ubuntu 24.04+ restricts unprivileged userns via
+  AppArmor — `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`; Debian/Arch —
+  `sudo sysctl -w kernel.unprivileged_userns_clone=1`.
+- **Diagnostics**: `:NeoAISandboxCaps` prints `bwrap_version`, `overlay=ready|unavailable(...)`,
+  `seccomp_mode` and `backstop`; `:NeoAIDoctor` names the missing dependency and how to install or
+  enable it.
 
 ## 7. Configuration
 

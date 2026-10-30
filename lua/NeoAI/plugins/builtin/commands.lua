@@ -272,7 +272,7 @@ function M.start()
     if not sandbox then return end
     local caps = sandbox.probe()
     local parts = {}
-    for _, k in ipairs({ "bwrap", "unshare", "userns", "cgroup2", "overlayfs", "seccomp", "cgroup", "seccomp_filter" }) do
+    for _, k in ipairs({ "bwrap", "bwrap_version", "unshare", "userns", "cgroup2", "overlayfs", "seccomp", "cgroup", "seccomp_filter" }) do
       parts[#parts + 1] = k .. "=" .. tostring(caps[k])
     end
     -- 权限档位与容器门面（只走 podman；宿主 docker daemon 永不连接）

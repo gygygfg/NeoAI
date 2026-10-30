@@ -124,6 +124,7 @@ function M.collect()
           backend = (ok_backend and type(backend) == "string") and backend or nil,
           bwrap = caps.bwrap, unshare = caps.unshare, userns = caps.userns,
           overlayfs = caps.overlayfs, seccomp = caps.seccomp, cgroup2 = caps.cgroup2,
+          bwrap_version = caps.bwrap_version,
           setpriv = vim.fn.executable("setpriv") == 1,
           docker = vim.fn.executable("docker") == 1,
           podman = vim.fn.executable("podman") == 1,

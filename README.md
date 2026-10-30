@@ -53,7 +53,7 @@
 | --- | --- | --- | --- |
 | `git_*` 工具、工作树管理 | `git` | `git` | git 相关工具不注册 |
 | `web_fetch` 网页渲染 | `node` + `npm` | `nodejs` / `npm` | 该工具默认关闭；开启时首次自动安装（Android/Termux 不支持，工具会直接不注册） |
-| **沙箱隔离（推荐）** | `bwrap` | `bubblewrap` | 沙箱禁用 → **退回审批模式**（命令经事前审批后直接在宿主执行，写入直接落盘、不冻结待审候选）。bwrap 是唯一支持 overlay 暂存层、档位挂载/capability 与 `/proc/sys` 遮蔽的后端 |
+| **沙箱隔离（推荐）** | `bwrap` **≥ 0.11**（overlay 需 `--overlay-src`） | `bubblewrap` | 沙箱禁用 → **退回审批模式**（命令经事前审批后直接在宿主执行，写入直接落盘、不冻结待审候选）。bwrap 是唯一支持 overlay 暂存层、档位挂载/capability 与 `/proc/sys` 遮蔽的后端；**不需要 Docker/Podman** |
 | **沙箱隔离（兜底）** | `unshare` + 非特权 user namespace | `util-linux` | `bwrap` 缺失时用它兜底；但内核若禁止非特权 userns（`/proc/sys/kernel/unprivileged_userns_clone=0`、SELinux 拦截 `clone(CLONE_NEWUSER)`），该后端同样不可用 → 退回审批模式 |
 | seccomp 基线（unshare 后端） | `setpriv --seccomp-filter` | `util-linux` **≥ 2.32** | seccomp 无法施加 → 按三层模型降级：启用 eBPF 行为兜底，或落到「仅强告警 + 审计」 |
 | 沙箱行为观测（eBPF 兜底） | `bpftrace` + **root** + 内核 BTF + tracefs | `bpftrace` | 观测回退到 `strace` / `procfs` / 命令解析启发式（越界访问与密钥告警可能漏判） |
@@ -81,6 +81,14 @@ sudo apk add bubblewrap util-linux strace git curl
 # Android / Termux（注意：见下方平台限制）
 pkg install bubblewrap util-linux strace git curl
 ```
+
+> **不需要 Docker / Podman**：以上依赖即覆盖全部沙箱能力（隔离、overlay 暂存、seccomp、
+> 资源限额、网络门禁、审批）。`podman` 仅用于可选的「容器门面」（AI 主动执行容器命令时），
+> 未安装不影响任何其他功能。ARM64 与 x86_64 依赖相同（seccomp 基线按架构自动选择 syscall 表）。
+> overlay 需要 `bwrap --version >= 0.11.0`；老发行版（如 Ubuntu 24.04 的 0.9.0）请升级/自行构建。
+> 若 `unshare --user --map-root-user true` 失败：Ubuntu 24.04+ 执行
+> `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`，Debian/Arch 执行
+> `sudo sysctl -w kernel.unprivileged_userns_clone=1`。
 
 ### 平台限制：Android / Termux
 

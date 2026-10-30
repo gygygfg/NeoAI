@@ -1401,6 +1401,16 @@ local function _overlay_works(flags)
   return ok
 end
 
+--- bwrap 版本号字符串（如 "0.12.0"）；不可得返回 nil。用于诊断（overlay 需 >= 0.11、
+--- 0.12+ 拒绝符号链接目的路径——已由挂载收尾处理）。
+--- @return string|nil
+local function _bwrap_version()
+  if not _executable("bwrap") then return nil end
+  local ok, out = pcall(function() return vim.fn.system({ "bwrap", "--version" }) end)
+  if not ok or type(out) ~= "string" then return nil end
+  return out:match("(%d+%.%d+%.%d+)") or out:match("(%d+%.%d+)")
+end
+
 --- 探测内核/工具能力（含 bwrap/overlay 功能实测）
 --- @return table
 local function _probe()
@@ -1438,6 +1448,7 @@ local function _probe()
   end
   caps.bwrap = flags ~= nil
   caps.bwrap_flags = flags
+  caps.bwrap_version = _bwrap_version()
   -- overlayfs：在选定隔离模式下真实挂载实测
   if caps.bwrap then
     caps.overlayfs = _overlay_works(assert(flags))
@@ -1653,18 +1664,28 @@ local MOUNT_OPTS = {
   ["--overlay-src"] = { n = 1, keep = true },
 }
 
---- 把挂载目的路径折算为「父目录真实、末段保留」的形式。
+--- 把挂载目的路径折算为真实路径。
 ---
---- 只解析**父目录**的符号链接，绝不解析末段：
+--- 默认只解析**父目录**的符号链接，绝不解析末段：
 ---   * `/var/run/docker.sock` → `/run/docker.sock`（`/var/run -> /run`，父目录是符号链接，
 ---     旧版 bwrap 无法在其下创建挂载点）；
 ---   * `/bin` 保持不变（末段本身是 `usr/bin` 的符号链接；若折算成 `/usr/bin`，bwrap 会在
 ---     `/usr/bin` 建挂载点而命名空间里根本没有 `/bin` 这个符号链接，`/bin/sh` 直接 ENOENT）。
+---
+--- `resolve_leaf=true`（仅当**命名空间根就是宿主根**：read_all 的整机 overlay/只读根）时
+--- 额外解析末段：bubblewrap >= 0.12 拒绝挂载到符号链接目的路径
+--- （`bwrap: Can't mount on symlink destination /etc/resolv.conf`），此时命名空间里存在与宿主
+--- 一致的符号链接链，折算到真实路径语义等价。
 --- @param p string
+--- @param resolve_leaf boolean|nil
 --- @return string
-local function _mount_dst(p)
+local function _mount_dst(p, resolve_leaf)
   if type(p) ~= "string" or p == "" or p == "/" then return p end
   p = p:gsub("/+$", "")
+  if resolve_leaf then
+    local ok, r = pcall(vim.fn.resolve, p)
+    if ok and type(r) == "string" and r ~= "" and r ~= p then return (r:gsub("/+$", "")) end
+  end
   local dir, base = p:match("^(.*)/([^/]+)$")
   if not dir or dir == "" or base == nil then return p end
   local ok, rd = pcall(vim.fn.resolve, dir)
@@ -1722,10 +1743,13 @@ end
 
 --- 挂载收尾：规范化目的路径、剔除源缺失的绑定、重复挂载去重、校验安全关键挂载。
 --- @param argv table bwrap argv（尚未拼接载荷命令）
+--- @param opts table|nil { resolve_leaf = boolean }（命名空间根即宿主根时为 true）
 --- @return table|nil argv
 --- @return table|nil skips { { path=..., opt=..., reason="source_missing" }, ... }
 --- @return string|nil err
-local function _finalize_mounts(argv)
+local function _finalize_mounts(argv, opts)
+  opts = opts or {}
+  local resolve_leaf = opts.resolve_leaf == true
   local groups = _mount_groups(argv)
   local drop, skips, seen = {}, {}, {}
   for _, g in ipairs(groups) do
@@ -1746,7 +1770,7 @@ local function _finalize_mounts(argv)
       skips[#skips + 1] = { path = src, opt = g.opt, reason = "source_missing" }
     else
       if type(dest) == "string" and dest ~= "" and dest ~= "/" then
-        dest = _mount_dst(dest)
+        dest = _mount_dst(dest, resolve_leaf)
         argv[g.dest_idx] = dest
       end
       -- 去重：同一选项 + 同一目的路径的重复挂载，后者覆盖前者，剔除前一条（视图等价）。
@@ -1763,8 +1787,39 @@ local function _finalize_mounts(argv)
   return argv, skips
 end
 
+--- 是否符号链接（lstat，不跟随）。
+--- @param p string
+--- @return boolean
+local function _is_symlink(p)
+  local ok, st = pcall(vim.uv.fs_lstat, p)
+  return ok and st ~= nil and st.type == "link"
+end
+
+--- 遮蔽之后补挂 `/etc/resolv.conf` 的**真实路径**（仅整机根视图）。
+---
+--- bubblewrap >= 0.12 拒绝挂载到符号链接目的路径；systemd-resolved 主机上
+--- `/etc/resolv.conf -> /run/systemd/resolve/stub-resolv.conf`，而 `/run/systemd` 稍后会被
+--- 整体遮蔽（tmpfs）——早先按真实路径挂上的 resolv.conf 会被遮掉，沙箱内 DNS 失效。
+--- 故在遮蔽之后再挂一次；`_finalize_mounts` 按「同选项 + 同目的保留最后一条」去重，前一条被移除。
+--- @param argv table
+local function _append_resolv_late(argv)
+  local host = "/etc/resolv.conf"
+  if not _is_symlink(host) then return end
+  local rmode = config_store.get("tools.sandbox.resolv_conf") or "sanitize"
+  if rmode == "hide" then return end
+  local src = rmode == "passthrough" and host or _sanitized_resolv_conf()
+  if not src then return end
+  local dst = _mount_dst(host, true)
+  if dst == host then return end
+  argv[#argv + 1] = "--ro-bind"
+  argv[#argv + 1] = src
+  argv[#argv + 1] = dst
+end
+
 --- bwrap 挂载失败文案 → 失败条目（兼容各版本措辞）。
 local MOUNT_FAIL_PATTERNS = {
+  -- bubblewrap >= 0.12：拒绝把挂载点放在符号链接上（该行没有 `: errno` 后缀）。
+  { kind = "symlink", pat = "^bwrap:%s*Can't mount on symlink destination (.+)$" },
   { kind = "dest", pat = "^bwrap:%s*Can't create file at (.-):%s" },
   { kind = "dest", pat = "^bwrap:%s*Can't create file (.-):%s" },
   { kind = "dest", pat = "^bwrap:%s*Can't mkdir parents for (.-):%s" },
@@ -2339,21 +2394,24 @@ function M.mask_entry(path, cwd)
   return _mask_entry(path, cwd)
 end
 
---- 把挂载目的路径折算为真实路径（父目录符号链接展开，末段保留）。供测试与诊断。
+--- 把挂载目的路径折算为真实路径。默认仅展开父目录符号链接；`resolve_leaf=true`
+--- （命名空间根即宿主根时）额外展开末段（bwrap >= 0.12 拒绝挂载到符号链接目的路径）。
 --- @param path string
+--- @param resolve_leaf boolean|nil
 --- @return string
-function M.mount_dst(path)
-  return _mount_dst(path)
+function M.mount_dst(path, resolve_leaf)
+  return _mount_dst(path, resolve_leaf == true)
 end
 
 --- 挂载收尾（内部）：规范化目的路径、剔除源缺失的绑定、重复挂载去重、校验安全关键挂载。
 --- 暴露给测试复现 argv 生成；调用方通常无需直接使用（`process_prefix` 已自动调用）。
 --- @param argv table
+--- @param opts table|nil { resolve_leaf = boolean }
 --- @return table|nil argv
 --- @return table|nil skips
 --- @return string|nil err
-function M._finalize_mounts(argv)
-  return _finalize_mounts(argv)
+function M._finalize_mounts(argv, opts)
+  return _finalize_mounts(argv, opts)
 end
 
 --- bwrap 挂载失败文案 → 失败条目。兼容 `Can't create file (at) ...`、
@@ -2406,6 +2464,34 @@ function M.prune_mount(argv, info)
   end
   if #removed == 0 then return nil end
   return _drop_groups(argv, drop), removed
+end
+
+--- 自愈一次 bwrap init 失败：符号链接目的路径 → 改写到真实路径；其它 → 剔除该挂载。
+--- 与 `prune_mount` 相同的安全护栏：目标仍存在时绝不剔除（会解除遮蔽）。
+--- @param argv table 原始前缀
+--- @param info table { kind="dest"|"src"|"symlink", path=string }
+--- @return table|nil healed
+--- @return table|nil actions { { path=..., opt=..., kind=..., resolved?=... }, ... }
+function M.heal_mount(argv, info)
+  if type(argv) ~= "table" or type(info) ~= "table" or type(info.path) ~= "string" then return nil end
+  if info.kind ~= "symlink" then return M.prune_mount(argv, info) end
+  local raw = (info.path:gsub("/+$", ""))
+  local target = _mount_dst(raw, true)
+  if target == raw then return nil end
+  local groups = _mount_groups(argv)
+  local actions = {}
+  for _, g in ipairs(groups) do
+    local d = g.dest_idx and argv[g.dest_idx]
+    if type(d) == "string" then
+      local dd = _mount_dst(d, false)
+      if dd == raw or dd == target then
+        argv[g.dest_idx] = target
+        actions[#actions + 1] = { path = info.path, opt = g.opt, kind = "symlink", resolved = target }
+      end
+    end
+  end
+  if #actions == 0 then return nil end
+  return argv, actions
 end
 
 --- 系统目录（stdpath）值；缺失/空串返回 nil。
@@ -3188,6 +3274,11 @@ function M.process_prefix(opts)
         table.insert(argv, "--bind"); table.insert(argv, "/dev/null"); table.insert(argv, mp.path)
       end
     end
+    -- 整机根视图下命名空间与宿主共享同一套符号链接：bwrap >= 0.12 拒绝挂载到符号链接目的
+    -- 路径，故挂载收尾需展开末段；且 /etc/resolv.conf（systemd-resolved 下为符号链接）的真实
+    -- 路径可能落在稍后被遮蔽的 /run/systemd 内，须在遮蔽之后补挂一次。
+    local resolve_leaf = _read_all()
+    if resolve_leaf then _append_resolv_late(argv) end
     -- systemd 外观：建立 sd_booted 标记（/run/systemd/system）并把 PID1 伪装为 systemd
     -- （comm/cmdline/stat/status），使沙箱内无法通过 PID1 或 /run/systemd 识别出「非 systemd
     -- 环境」。仅在 PID 命名空间隔离（--as-pid-1，PID1 为载荷）时生效；no_pid_ns 时 PID1 是宿主
@@ -3413,7 +3504,7 @@ function M.process_prefix(opts)
     -- 挂载收尾：目的路径真实化（父目录符号链接）、源缺失的绑定剔除、重复挂载去重、
     -- 安全关键挂载（root overlay upper/work）校验。任意一条挂载失败都会让 bwrap init 失败，
     -- 进而拖垮**所有**外部命令，因此必须在返回前缀前收敛。
-    local finalized, skips, ferr = _finalize_mounts(argv)
+    local finalized, skips, ferr = _finalize_mounts(argv, { resolve_leaf = resolve_leaf })
     if not finalized then return nil, ferr end
     argv = finalized
     if skips and #skips > 0 then
@@ -3564,7 +3655,7 @@ function M.note_mount_skip(entries, info)
   if not state.mount_skip_notified[key] then
     state.mount_skip_notified[key] = true
     pcall(vim.notify,
-      "[NeoAI] 沙箱已跳过不可用的挂载点（不阻断命令）：" .. table.concat(paths, ", "),
+      "[NeoAI] 沙箱已自动修复或跳过不可用的挂载点（不阻断命令）：" .. table.concat(paths, ", "),
       vim.log.levels.WARN)
   end
 end

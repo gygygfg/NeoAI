@@ -23,10 +23,14 @@ tests.suite("sandbox_mounts", function(_, it)
       "父目录为符号链接时应折算为真实路径（末段保留）")
     t.eq(dir .. "/real/file", runtime.mount_dst(dir .. "/link/file/"),
       "尾斜杠应被规范化")
-    -- 末段本身是符号链接时**不得**解析：`/bin -> usr/bin`，折算成 `/usr/bin` 会让命名空间里
+    -- 末段本身是符号链接时**不得**默认解析：`/bin -> usr/bin`，折算成 `/usr/bin` 会让命名空间里
     -- 没有 `/bin` 这个符号链接（bwrap 在 `/usr/bin` 建挂载点），`/bin/sh` 直接 ENOENT。
     t.eq("/bin", runtime.mount_dst("/bin"), "末段符号链接应保留")
     t.eq("/lib64", runtime.mount_dst("/lib64"), "末段符号链接应保留")
+    -- 整机根视图（resolve_leaf=true）下命名空间镜像宿主符号链接；bwrap >= 0.12 拒绝挂载到
+    -- 符号链接目的路径，故末段必须折算。
+    t.eq("/usr/bin", runtime.mount_dst("/bin", true), "整机根视图应展开末段符号链接")
+    t.eq(dir .. "/real/file", runtime.mount_dst(dir .. "/link/file", true))
     vim.fn.delete(dir, "rf")
   end)
 
@@ -90,6 +94,7 @@ tests.suite("sandbox_mounts", function(_, it)
       { "bwrap: Can't mkdir /var/run/podman: No such file or directory", "dest", "/var/run/podman" },
       { "bwrap: Can't mkdir parents for /x/y: Read-only file system", "dest", "/x/y" },
       { "bwrap: Can't make symlink at /x/l: File exists", "dest", "/x/l" },
+      { "bwrap: Can't mount on symlink destination /etc/resolv.conf", "symlink", "/etc/resolv.conf" },
       { "bwrap: Can't bind mount /nope on /tmp/x: No such file or directory", "dest", "/tmp/x" },
       { "bwrap: Can't find source path /nope: No such file or directory", "src", "/nope" },
     }
@@ -154,5 +159,102 @@ tests.suite("sandbox_mounts", function(_, it)
     local out = vim.fn.system(cmd)
     t.eq(0, vim.v.shell_error, "前缀应能正常 init 并执行，实际输出: " .. tostring(out))
     t.matches("MOUNT_OK", tostring(out))
+  end)
+
+  it("bwrap >= 0.12：符号链接目的路径经收尾折算后可正常 init", function(t)
+    if runtime.backend() ~= "bwrap" then return end
+    local dir = vim.fn.tempname()
+    vim.fn.mkdir(dir, "p")
+    local target = dir .. "/target"
+    local f = assert(io.open(target, "w"))
+    f:write("x\n")
+    f:close()
+    local link = dir .. "/link"
+    vim.fn.system({ "ln", "-sfn", target, link })
+    local argv = {
+      "bwrap", "--dev-bind", "/", "/", "--ro-bind", "/etc/hostname", link,
+      "/bin/sh", "-c", "echo SYMLINK_OK",
+    }
+    local out, _, err = runtime._finalize_mounts(argv, { resolve_leaf = true })
+    t.not_nil(out, "收尾不应失败: " .. tostring(err))
+    local joined = table.concat(out, " ")
+    t.true_(joined:find(link, 1, true) == nil, "符号链接目的路径应被折算为真实路径")
+    t.true_(joined:find(target, 1, true) ~= nil, "应挂载到真实路径")
+    local run = vim.fn.system(out)
+    t.eq(0, vim.v.shell_error, "折算后前缀应能 init，实际输出: " .. tostring(run))
+    t.matches("SYMLINK_OK", tostring(run))
+    vim.fn.delete(dir, "rf")
+  end)
+
+  it("自愈：符号链接目的路径错误 → 改写为真实路径（不剔除）", function(t)
+    local dir = vim.fn.tempname()
+    vim.fn.mkdir(dir, "p")
+    local target = dir .. "/target"
+    local f = assert(io.open(target, "w"))
+    f:write("x\n")
+    f:close()
+    local link = dir .. "/link"
+    vim.fn.system({ "ln", "-sfn", target, link })
+    local argv = {
+      "bwrap", "--dev-bind", "/", "/", "--ro-bind", "/etc/hostname", link,
+      "/bin/sh", "-c", "true",
+    }
+    local healed, actions = runtime.heal_mount(argv, { kind = "symlink", path = link })
+    t.not_nil(healed, "应修复符号链接目的路径")
+    t.eq(1, #actions, "应记录 1 条修复")
+    t.eq(target, actions[1].resolved)
+    local joined = table.concat(healed, " ")
+    t.true_(joined:find(link, 1, true) == nil, "不应再出现符号链接目的路径")
+    t.true_(joined:find(target, 1, true) ~= nil, "应改写为真实路径")
+    vim.fn.delete(dir, "rf")
+  end)
+
+  it("resolv.conf 为符号链接：真实路径挂载位于 /run/systemd 遮蔽之后", function(t)
+    if runtime.backend() ~= "bwrap" then return end
+    local lst = vim.uv.fs_lstat("/etc/resolv.conf")
+    if not (lst and lst.type == "link") then return end
+    local prefix = assert(runtime.process_prefix({ cwd = "/tmp" }))
+    local idx_mask, idx_bind = nil, nil
+    for i, v in ipairs(prefix) do
+      if v == "--tmpfs" and prefix[i + 1] == "/run/systemd" then idx_mask = i end
+      if v == "--ro-bind" and type(prefix[i + 2]) == "string"
+        and prefix[i + 2] ~= "/etc/resolv.conf" and prefix[i + 2]:find("resolv", 1, true)
+      then
+        idx_bind = i
+      end
+    end
+    t.not_nil(idx_bind, "应在真实路径补挂 resolv.conf（避免符号链接目的路径）")
+    if idx_mask then
+      t.true_(idx_bind > idx_mask, "补挂必须在 /run/systemd 遮蔽之后，否则会被遮掉")
+    end
+  end)
+
+  it("遮蔽后补挂：符号链接目标落在被遮蔽目录内仍可见（resolv.conf 场景）", function(t)
+    if runtime.backend() ~= "bwrap" then return end
+    local dir = vim.fn.tempname()
+    vim.fn.mkdir(dir .. "/etc", "p")
+    vim.fn.mkdir(dir .. "/run/systemd", "p")
+    local sym = dir .. "/etc/resolv.conf"
+    local target = dir .. "/run/systemd/resolv.conf"
+    vim.fn.system({ "ln", "-sfn", target, sym })
+    local src = dir .. "/sanitized"
+    local f = assert(io.open(src, "w"))
+    f:write("nameserver 127.0.0.1\n")
+    f:close()
+    -- 模拟 systemd-resolved：/etc/resolv.conf -> /run/systemd/resolv.conf，而 /run/systemd
+    -- 稍后被整体遮蔽。早挂（符号链接路径折算到真实路径）会被遮蔽；必须在遮蔽之后再挂一次。
+    local argv = {
+      "bwrap", "--dev-bind", "/", "/",
+      "--ro-bind", src, sym,
+      "--tmpfs", dir .. "/run/systemd",
+      "--ro-bind", src, target,
+      "/bin/sh", "-c", "cat " .. sym,
+    }
+    local out, _, err = runtime._finalize_mounts(argv, { resolve_leaf = true })
+    t.not_nil(out, "收尾不应失败: " .. tostring(err))
+    local res = vim.fn.system(out)
+    t.eq(0, vim.v.shell_error, "应能 init 并读取: " .. tostring(res))
+    t.matches("nameserver 127.0.0.1", tostring(res), "遮蔽后补挂应生效，实际: " .. tostring(res))
+    vim.fn.delete(dir, "rf")
   end)
 end)

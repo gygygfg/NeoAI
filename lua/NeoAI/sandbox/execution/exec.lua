@@ -210,11 +210,11 @@ function M.run(argv, opts)
         timeout_ms = opts.timeout_ms,
         signal = opts.signal,
         kill = ictx.sandbox_kill,
-        -- 挂载自愈：init 失败时剔除坏挂载重试一次（安全护栏见 runtime.prune_mount）。
+        -- 挂载自愈：init 失败时修复/剔除坏挂载重试一次（安全护栏见 runtime.prune_mount）。
         rebuild = function(fail)
           local ok_rt, rt = pcall(require, "NeoAI.sandbox.execution.runtime")
-          if not (ok_rt and rt and type(rt.prune_mount) == "function") then return nil end
-          local pruned, removed = rt.prune_mount(base, fail)
+          if not (ok_rt and rt and type(rt.heal_mount) == "function") then return nil end
+          local pruned, removed = rt.heal_mount(base, fail)
           if not pruned then return nil end
           return build(pruned), removed
         end,

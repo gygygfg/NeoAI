@@ -134,6 +134,20 @@ tests.suite("sandbox_deps", function(_, it)
     end)
   end)
 
+  it("后端报告：overlay 不可用且 bwrap 版本过旧 → 指明升级 0.11+，无需 docker/podman", function(t)
+    with_env("linux", "apt", function()
+      local r = deps.backend_report({
+        backend = "bwrap", bwrap = true, unshare = true, userns = true,
+        overlayfs = false, seccomp = true, cgroup2 = true, bwrap_version = "0.9.0",
+      })
+      t.eq("ok", r.status)
+      local text = table.concat(r.lines, "\n")
+      t.matches("0%.9%.0", text, "应显示 bwrap 版本")
+      t.matches("0%.11", text, "应提示 overlay 需要 bubblewrap >= 0.11.0")
+      t.matches("Docker", text, "应说明无需 Docker/Podman")
+    end)
+  end)
+
   it("降级话术：未知层附上 layer/reason 便于对账，不丢信息", function(t)
     local text = deps.degrade_text("mystery_layer", "mode_x", "some_reason", "some_fallback")
     t.matches("mystery_layer", text)

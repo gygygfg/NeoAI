@@ -157,6 +157,7 @@ end
 --- @param opts table|nil {
 ---   backend: "bwrap"|"unshare"|nil（隔离后端；nil = 无后端）
 ---   bwrap/unshare/userns/overlayfs/seccomp/cgroup2: boolean（能力实测结果）
+---   bwrap_version: string|nil（bwrap --version，诊断 overlay 版本要求）
 ---   setpriv: boolean|nil（unshare 后端能否经 setpriv 施加 seccomp；nil 视为未知/可用）
 ---   docker/podman: boolean|nil（容器运行时存在性，仅用于说明「不参与隔离后端」）
 --- }
@@ -170,14 +171,17 @@ function M.backend_report(opts)
   if backend == "bwrap" then
     add("隔离后端：bwrap（bubblewrap 包）可用——唯一支持 overlay 暂存层、档位挂载/capability"
       .. "与 /proc/sys 遮蔽的后端")
+    if opts.bwrap_version then
+      add("bubblewrap 版本：" .. tostring(opts.bwrap_version))
+    end
     if opts.overlayfs then
       add("overlay 可写层：可用（工具写入冻结为待审候选）")
     else
       add("overlay 可写层：不可用（降级为 bind + 播种；写入仍冻结为待审候选）")
-      -- 版本约束（实测）：--overlay-src 自 0.11.0 引入；而 0.12.0 起为修 CVE 拒绝向
-      -- 符号链接目标挂载，Ubuntu 的 /etc/resolv.conf 是符号链接，会直接 init 失败。
-      add("bubblewrap 需 >= 0.11.0 才有 --overlay-src；0.12.0+ 因拒绝符号链接目标挂载"
-        .. "（/etc/resolv.conf）而不兼容，当前有效区间为 0.11.x")
+      -- --overlay-src 自 bubblewrap 0.11.0 引入；更老版本（如 Ubuntu 24.04 的 0.9.0）
+      -- 没有该选项，overlay 无替代方案，只能升级 bwrap（不涉及 docker/podman）。
+      add("overlay 需要 bubblewrap >= 0.11.0（提供 --overlay-src；0.9/0.10 没有该选项）。"
+        .. "升级方式见发行版包或从源码构建；Docker/Podman 不参与隔离后端，无需安装")
     end
     if opts.seccomp == false then
       add("seccomp 基线：内核不支持（缺 /proc/sys/kernel/seccomp/actions_avail），"
@@ -219,6 +223,10 @@ function M.backend_report(opts)
       add("unshare 已安装，但非特权 user namespace 被内核拒绝"
         .. "（`unshare --user --map-root-user true` 失败）：unshare 兜底后端不可用。"
         .. "需内核开启（/proc/sys/kernel/unprivileged_userns_clone=1）或改用 root + bwrap")
+      add("Ubuntu 24.04+ 默认由 AppArmor 限制非特权 userns：可设 "
+        .. "`sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`"
+        .. "（或为 bwrap/nvim 配置 AppArmor profile）；"
+        .. "Debian/Arch 可设 `sudo sysctl -w kernel.unprivileged_userns_clone=1`")
     elseif not opts.unshare then
       add("缺少 unshare（util-linux 包）：unshare 兜底后端不可用。" .. M.install_hint("unshare"))
     end

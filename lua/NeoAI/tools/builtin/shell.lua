@@ -262,7 +262,7 @@ local function _run_command(command, opts)
         if ok_rt and rt and type(rt.mount_failure_info) == "function" then
           local fail = rt.mount_failure_info(errout)
           local pruned, removed = nil, nil
-          if fail then pruned, removed = rt.prune_mount(opts.prefix, fail) end
+          if fail then pruned, removed = rt.heal_mount(opts.prefix, fail) end
           if pruned then
             retried = true
             done = true

@@ -1844,15 +1844,21 @@ bwrap 在 init 阶段**创建挂载点**，任意一条挂载失败都会让整�
 （`read_file` / `list_files` / `git_status`）不走 bwrap，看起来一切正常。典型触发：
 
 - 宿主把 `/var/run` 做成指向 `/run` 的符号链接（Ubuntu/Debian），默认遮蔽表同时列
-  `/run/docker.sock` 与 `/var/run/docker.sock`；旧版 bubblewrap 对「父目录是符号链接」的
-  挂载点创建会报 `Can't create file at /var/run/docker.sock: No such file or directory`
-  （实测与 bubblewrap 版本相关：0.9/0.11 会失败，0.12 已能跟随符号链接）。
+  `/run/docker.sock` 与 `/var/run/docker.sock`；bubblewrap 0.9/0.11 对「父目录是符号链接」的
+  挂载点创建会报 `Can't create file at /var/run/docker.sock: No such file or directory`。
+- bubblewrap **0.12+** 进一步拒绝把挂载点放在符号链接上：
+  `bwrap: Can't mount on symlink destination /etc/resolv.conf`。systemd-resolved 主机上
+  `/etc/resolv.conf` 正是指向 `/run/systemd/resolve/stub-resolv.conf` 的符号链接，命中即**所有**
+  外部命令 init 失败（ARM64 新版发行版同样如此，与 CPU 架构无关）。
 - 遮蔽/暴露目标在 `fs_stat` 与 bwrap 启动之间消失（TOCTOU，如 docker 守护进程重启回收 socket）。
 
 处理（`sandbox/execution/runtime.lua`）：
 
-1. **目的路径真实化**：`_finalize_mounts()` 在返回前缀前把每条挂载的目的路径按**父目录**
-   折算为真实路径（`/var/run/...` → `/run/...`），末段保留（不改变符号链接本身的语义）。
+1. **目的路径真实化**：`_finalize_mounts()` 在返回前缀前把每条挂载的目的路径折算为真实路径：
+   - 默认按**父目录**折算（`/var/run/...` → `/run/...`），末段保留（否则 `/bin` 这类末段符号
+     链接在选择性挂载的命名空间里不存在，`/bin/sh` 会 ENOENT）；
+   - 当命名空间根就是宿主根（`read_all` 的整机 overlay / 只读根）时额外展开**末段**
+     （`resolve_leaf`），满足 bubblewrap 0.12+ 对符号链接目的路径的限制。
    遮蔽路径在配置层由 `_mask_real()` 做同一折算并去重。
 2. **源缺失剔除**：`--bind/--ro-bind/--dev-bind` 的源在宿主已不存在时直接剔除该挂载
    （它本就不可能生效，而 bwrap 会因 `Can't find source path` 让整条命令失败）。
@@ -1860,15 +1866,37 @@ bwrap 在 init 阶段**创建挂载点**，任意一条挂载失败都会让整�
    `--dir`/`--dev`/`--proc` 等保留项不参与（它们可能在为后续挂载创建挂载点）。
 4. **安全关键挂载不剔除**：整机根 overlay 的 upper/work 缺失一律硬失败
    （`SANDBOX_MOUNT_FAILED`），绝不退化为直写或丢失暂存视图。
-5. **init 失败自愈**：`run_command` 与工具子进程（`sandbox.execution.exec`）在 bwrap init
+5. **resolv.conf 遮蔽后补挂**：`/etc/resolv.conf` 折算后的真实路径可能落在稍后被整体遮蔽的
+   `/run/systemd` 内；因此在遮蔽之后**再挂一次**真实路径（去重保留最后一条），否则沙箱内 DNS
+   失效。
+6. **init 失败自愈**：`run_command` 与工具子进程（`sandbox.execution.exec`）在 bwrap init
    失败时解析错误文案（兼容 `Can't create file (at) ...`、`Can't mkdir (parents for) ...`、
-   `Can't bind mount <src> on <dst>`、`Can't find source path ...`），**仅在失败目标在宿主上
-   已不存在**（剔除不改变遮蔽/可见面）时剔除该挂载并重试一次；否则按硬失败处理。
-6. **绝不静默**：每次剔除写 evidence（`sandbox_mount_skip`）、发 `SANDBOX_MOUNT_SKIPPED`
+   `Can't bind mount <src> on <dst>`、`Can't find source path ...`、
+   `Can't mount on symlink destination ...`）：符号链接目的路径改写为真实路径后重试一次；
+   其它**仅在失败目标在宿主上已不存在**（剔除不改变遮蔽/可见面）时剔除该挂载并重试一次；
+   否则按硬失败处理。
+7. **绝不静默**：每次修复/剔除写 evidence（`sandbox_mount_skip`）、发 `SANDBOX_MOUNT_SKIPPED`
    事件、会话内去重告警；不可自愈的失败写 `sandbox_mount_failed` + `SANDBOX_MOUNT_FAILED`。
 
 > 该机制只保证「一条坏挂载不再拖垮所有命令」，不放松任何安全边界：会解除遮蔽/暴露的剔除
 > 一律被护栏拒绝，安全关键 overlay 缺失仍然硬失败。
+
+### 6.3 无 Docker / Podman 的完整能力（含 ARM64）
+- **隔离后端与容器运行时无关**：`bwrap`（优先）或 `unshare` + 非特权 userns 即可覆盖全部
+  沙箱能力（overlay 暂存、遮蔽、seccomp、cgroup、网络门禁、审批）。`docker`/`podman`
+  **不参与**隔离后端，装了也不会被使用；只在「AI 主动调用容器命令」的可选容器门面里，
+  无守护进程的 `podman` 才能让容器与沙箱同 namespace（未装则伪装为真机
+  「docker daemon 未运行」错误，不影响其他能力）。
+- **最小依赖**：`bubblewrap`（overlay 需 **>= 0.11.0** 的 `--overlay-src`；0.9/0.10 只能退化为
+  bind + 播种视图）+ `util-linux`（`unshare`/`setpriv`，seccomp 补装需 >= 2.32）；
+  `strace`/`bpftrace` 仅供观测（缺失自动回退，不影响隔离）。
+- **ARM64**：seccomp 基线按架构选择 syscall 表（`aarch64` 使用 asm-generic 编号），其余
+  能力探测/挂载均为架构无关。若 `unshare --user --map-root-user true` 失败：
+  Ubuntu 24.04+ 由 AppArmor 限制非特权 userns，可 `sudo sysctl -w
+  kernel.apparmor_restrict_unprivileged_userns=0`；Debian/Arch 可
+  `sudo sysctl -w kernel.unprivileged_userns_clone=1`。
+- **诊断**：`:NeoAISandboxCaps` 输出 `bwrap_version`、`overlay=ready|unavailable(...)`、
+  `seccomp_mode`、`backstop`；`:NeoAIDoctor` 给出缺哪个依赖及安装/启用方式。
 
 ## 7. 配置
 

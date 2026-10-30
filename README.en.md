@@ -53,7 +53,7 @@
 | --- | --- | --- | --- |
 | `git_*` tools, worktrees | `git` | `git` | git tools are not registered |
 | `web_fetch` rendering | `node` + `npm` | `nodejs` / `npm` | Off by default, auto-installed on first use (unsupported on Android/Termux — the tool is simply not registered) |
-| **Sandbox isolation (preferred)** | `bwrap` | `bubblewrap` | Sandbox disabled → **falls back to approval mode** (commands run on the host after blocking pre-approval; writes land on disk directly, no staged candidates). bwrap is the only backend supporting the overlay staging layer, tier mounts/capabilities and `/proc/sys` masking |
+| **Sandbox isolation (preferred)** | `bwrap` **>= 0.11** (overlay needs `--overlay-src`) | `bubblewrap` | Sandbox disabled → **falls back to approval mode** (commands run on the host after blocking pre-approval; writes land on disk directly, no staged candidates). bwrap is the only backend supporting the overlay staging layer, tier mounts/capabilities and `/proc/sys` masking; **Docker/Podman are not required** |
 | **Sandbox isolation (fallback)** | `unshare` + unprivileged user namespaces | `util-linux` | Used when `bwrap` is absent; if the kernel forbids unprivileged userns (`/proc/sys/kernel/unprivileged_userns_clone=0`, SELinux rejecting `clone(CLONE_NEWUSER)`) this backend is unusable too → approval mode |
 | seccomp baseline (unshare backend) | `setpriv --seccomp-filter` | `util-linux` **>= 2.32** | seccomp cannot be applied → three-layer model: eBPF behavior backstop, or "warn + audit only" |
 | Sandbox behavior observation (eBPF backstop) | `bpftrace` + **root** + kernel BTF + tracefs | `bpftrace` | Observation falls back to `strace` / `procfs` / command-parsing heuristics (out-of-bounds and secret warnings may be missed) |
@@ -81,6 +81,16 @@ sudo apk add bubblewrap util-linux strace git curl
 # Android / Termux (see the platform limitation below)
 pkg install bubblewrap util-linux strace git curl
 ```
+
+> **Docker / Podman are not required**: the dependencies above cover every sandbox capability
+> (isolation, overlay staging, seccomp, resource limits, network gate, approvals). `podman` is only
+> used by the optional container facade (when the AI itself runs container commands); without it
+> nothing else is affected. ARM64 needs the same packages as x86_64 (the seccomp baseline selects
+> the per-arch syscall table automatically). Overlay requires `bwrap --version >= 0.11.0`; on older
+> distros (e.g. Ubuntu 24.04 ships 0.9.0) upgrade or build it yourself. If
+> `unshare --user --map-root-user true` fails: on Ubuntu 24.04+ run
+> `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`; on Debian/Arch run
+> `sudo sysctl -w kernel.unprivileged_userns_clone=1`.
 
 ### Platform limitation: Android / Termux
 
