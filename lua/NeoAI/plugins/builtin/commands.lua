@@ -390,19 +390,44 @@ function M.start()
       for i = 2, #parts do files[#files + 1] = parts[i] end
       apply_opts.files = files
     end
-    local res = sandbox.apply(id, apply_opts)
-    if res.ok then
-      vim.notify("[NeoAI] 已应用: " .. id, vim.log.levels.INFO)
-    else
-      vim.notify(("[NeoAI] 应用失败(%s): %s"):format(tostring(res.state), tostring(res.reason)), vim.log.levels.ERROR)
+    local function report(res)
+      if res and res.ok then
+        vim.notify("[NeoAI] 已应用: " .. id, vim.log.levels.INFO)
+      else
+        vim.notify(("[NeoAI] 应用失败(%s): %s"):format(tostring(res and res.state), tostring(res and res.reason)),
+          vim.log.levels.ERROR)
+      end
     end
+    if sandbox.apply_async then
+      local p = sandbox.apply_async(id, apply_opts)
+      if p and type(p.then_) == "function" then
+        p:then_(report, function(e)
+          report({ ok = false, state = "FAILED", reason = tostring(e and (e.message or e) or e) })
+        end)
+        return
+      end
+    end
+    report(sandbox.apply(id, apply_opts))
   end, { nargs = "*", desc = "批准并应用沙箱变更单元（可指定文件子集：:NeoAISandboxApply <id> [file...]）" })
 
   _cmd("NeoAISandboxApplyAll", function()
     local sandbox = _svc("services.sandbox")
     if not sandbox then return end
-    local res = sandbox.apply_all({ only_approved = false })
-    vim.notify(("[NeoAI] 批量应用完成：成功 %d，失败 %d"):format(res.applied, res.failed), vim.log.levels.INFO)
+    local function report(res)
+      vim.notify(("[NeoAI] 批量应用完成：成功 %d，失败 %d"):format(res.applied, res.failed),
+        vim.log.levels.INFO)
+    end
+    if sandbox.apply_all_async then
+      local p = sandbox.apply_all_async({ only_approved = false })
+      if p and type(p.then_) == "function" then
+        p:then_(report, function(e)
+          vim.notify("[NeoAI] 批量应用失败: " .. tostring(e and (e.message or e) or e),
+            vim.log.levels.ERROR)
+        end)
+        return
+      end
+    end
+    report(sandbox.apply_all({ only_approved = false }))
   end, { desc = "应用全部待审沙箱变更单元" })
 
   _cmd("NeoAISandboxGrant", function(opts)

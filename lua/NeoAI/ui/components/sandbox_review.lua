@@ -181,6 +181,7 @@ local LEVEL_HL = {
   pending1 = "NeoAISandboxReviewPending1",
   pending2 = "NeoAISandboxReviewPending2",
   pending3 = "NeoAISandboxReviewPending3",
+  busy = "NeoAISandboxReviewBusy",
   secret = "NeoAISandboxReviewSecret",
   risk0 = "NeoAISandboxReviewRisk0",
   risk1 = "NeoAISandboxReviewRisk1",
@@ -261,12 +262,14 @@ local state = {
   unsubs = {}, -- 窗口打开期间的沙箱事件订阅取消函数（关闭时清理）
   refresh_pending = false, -- 已排队一次自动刷新（同一 tick 内的事件合并）
   unwait = nil, -- services.wait 取消句柄（hub UI 延迟注册）
+  local_busy = {}, -- change_set_id -> true：点击后立即标记，等 worker 结果/事件清除
 }
 
 -- 广播自动刷新订阅的沙箱事件：待审/已应用/越界留痕/主机操作任一变化都会重绘审批窗。
 local WATCH_EVENTS = {
   events.SANDBOX_REVIEW_ENQUEUED, events.SANDBOX_REVIEW_APPROVED,
   events.SANDBOX_REVIEW_REJECTED, events.SANDBOX_REVIEW_SUPERSEDED,
+  events.SANDBOX_REVIEW_HYDRATED,
   events.SANDBOX_APPLIED, events.SANDBOX_COMMITTED,
   events.SANDBOX_DISCARDED, events.SANDBOX_REVERTED,
   events.SANDBOX_OUTSIDE_ACCESS,
@@ -274,6 +277,11 @@ local WATCH_EVENTS = {
   events.SANDBOX_HOST_OP_ENQUEUED, events.SANDBOX_HOST_OP_APPLIED,
   events.SANDBOX_HOST_OP_REJECTED,
   events.SANDBOX_APPROVAL_CHANGED,
+  -- 发布开始（应用进入 APPLYING）与后台任务进度：条目「执行中」高亮随事件更新。
+  events.SANDBOX_PUBLISH_STARTED,
+  events.SANDBOX_JOB_STARTED,
+  events.SANDBOX_JOB_UPDATED,
+  events.SANDBOX_JOB_FINISHED,
   -- 统一运行时请求广播（网络请求 / 危险命令访问 / 敏感文件读取，page 区分）：新条目到达即刷新。
   events.SANDBOX_CONSENT_REQUESTED,
 }
@@ -318,6 +326,8 @@ local function _ensure_hl()
   vim.api.nvim_set_hl(0, LEVEL_HL.pending1, { default = true, fg = "#e5c07b", bold = true })
   vim.api.nvim_set_hl(0, LEVEL_HL.pending2, { default = true, fg = "#d19a66", bold = true })
   vim.api.nvim_set_hl(0, LEVEL_HL.pending3, { default = true, fg = "#ff5555", bold = true, underline = true })
+  -- 执行中（捕获/冻结/应用/预览）：与待审区分，强调「可等待，不要重复操作」。
+  vim.api.nvim_set_hl(0, LEVEL_HL.busy, { default = true, fg = "#61afef", bold = true, italic = true })
   vim.api.nvim_set_hl(0, LEVEL_HL.secret, { default = true, fg = "#e06c75", bold = true, underline = true })
   vim.api.nvim_set_hl(0, LEVEL_HL.risk0, { default = true, fg = "#7f8c8d", bold = true })
   vim.api.nvim_set_hl(0, LEVEL_HL.risk1, { default = true, fg = "#e5c07b", bold = true })
@@ -516,8 +526,9 @@ end
 --- @param audit table|nil AI 审计 { pending?, error?, fallback?, notes? = { [路径或命令]=说明 } }
 --- @param saved table|nil 已保存/已撤销（含快照）的变更单元数组（sandbox.list_saved）
 --- @param rejected table|nil 可恢复的已拒绝变更单元数组（sandbox.list_rejected）
+--- @param jobs table|nil change_set_id -> 活跃后台任务（sandbox.job_for / 内部 jobs 映射）
 --- @return table { lines, marks, line_to_target, line_to_trace, fold_levels, fold_titles }
-function M.build_lines(items, traces, audit, saved, rejected)
+function M.build_lines(items, traces, audit, saved, rejected, jobs)
   local lines = {}
   local marks = {}
   local line_to_target = {}
@@ -648,6 +659,8 @@ function M.build_lines(items, traces, audit, saved, rejected)
     lines[#lines + 1] = ""
   end
   for _, item in ipairs(items or {}) do
+    local job = jobs and jobs[item.change_set_id]
+    local busy = item.apply_state == "APPLYING" or (type(job) == "table" and job.state == "running")
     local tier = item.privilege_tier or 0
     local badge = tier > 0 and string.format(" [T%d]", tier) or ""
     local risk_badge = ""
@@ -659,8 +672,10 @@ function M.build_lines(items, traces, audit, saved, rejected)
       local cmd = _one_line((item.write_set and item.write_set[1]) or "?")
       local base = _one_line(string.format("[%s] %s%s%s（主机操作）  ", item.change_set_id, item.tool or "?", badge, risk_badge))
       local hln = #lines + 1
-      lines[#lines + 1] = base .. "待审"
-      marks[#marks + 1] = { line = hln, start_col = #base, end_col = #base + #"待审", level = _pending_hl(item) }
+      local status = busy and "执行中…" or "待审"
+      lines[#lines + 1] = base .. status
+      marks[#marks + 1] = { line = hln, start_col = #base, end_col = #base + #status,
+        level = busy and LEVEL_HL.busy or _pending_hl(item) }
       if risk_badge ~= "" then
         local rb = base:find("%[L%d%]", 1)
         if rb then marks[#marks + 1] = { line = hln, start_col = rb - 1, end_col = rb + 2, level = _risk_hl(item.risk_level) } end
@@ -714,9 +729,11 @@ function M.build_lines(items, traces, audit, saved, rejected)
       or string.format("（%s%d 个文件）", pkg, #files)
     local base = _one_line(string.format("[%s] %s%s%s%s  ", item.change_set_id, item.tool or "?", badge, risk_badge, group_desc))
     local hln = #lines + 1
-    lines[#lines + 1] = base .. "待审"
-    -- 「待审」标签按安全等级着色（L0 灰 / L1 黄 / L2 橙 / L3 红）
-    marks[#marks + 1] = { line = hln, start_col = #base, end_col = #base + #"待审", level = _pending_hl(item) }
+    local status = busy and "执行中…" or "待审"
+    lines[#lines + 1] = base .. status
+    -- 「待审」标签按安全等级着色（L0 灰 / L1 黄 / L2 橙 / L3 红）；执行中统一用 busy 色。
+    marks[#marks + 1] = { line = hln, start_col = #base, end_col = #base + #status,
+      level = busy and LEVEL_HL.busy or _pending_hl(item) }
     -- 头行 = 整单元审批入口：<CR> 一次应用该变更单元的全部文件
     -- （包安装按安装命令合并，整包一次审批，无需逐文件确认）。
     line_to_target[hln] = { change_set_id = item.change_set_id, whole = true }
@@ -1105,7 +1122,13 @@ end
 --- @param ok_msg function(result):string
 --- @param fail_msg function(result):string
 local function _apply_target(target, ok_msg, fail_msg)
+  local target_id = target and target.change_set_id and tostring(target.change_set_id) or nil
+  if target_id then
+    state.local_busy[target_id] = true
+    M.refresh()
+  end
   local function report(res)
+    if target_id then state.local_busy[target_id] = nil end
     if res and res.ok then
       vim.notify(ok_msg(res), vim.log.levels.INFO)
     elseif res and res.state == "PARTIAL" then
@@ -1123,6 +1146,11 @@ local function _apply_target(target, ok_msg, fail_msg)
     if res and (res.ok or res.state == "PARTIAL") then M.fold_all() end
   end
   local res = _do_apply_async(target)
+  if res == nil then
+    if target_id then state.local_busy[target_id] = nil end
+    M.refresh()
+    return
+  end
   if _is_deferred(res) then
     res:then_(function(r)
       if r and not r.ok and r.state == "NEEDS_ROOT" then
@@ -2927,8 +2955,17 @@ local function _gather_ctx()
   local anomalies = _safe(function()
     return sandbox.audit_list({ min_level = 2, limit = 200 })
   end, {}) or {}
+  -- 活跃后台任务：change_set_id -> job；本地乐观标记（点击后、worker 事件到达前）也并入。
+  local jobs = {}
+  for _, job in ipairs(_safe(function() return sandbox.jobs and sandbox.jobs() end, {}) or {}) do
+    if job.change_set_id then jobs[tostring(job.change_set_id)] = job end
+    for _, id in ipairs(job.item_ids or {}) do jobs[tostring(id)] = job end
+  end
+  for id in pairs(state.local_busy or {}) do
+    if not jobs[tostring(id)] then jobs[tostring(id)] = { state = "running", kind = "local" } end
+  end
   return { items = items, hostops = hostops, traces = traces, ephemeral = ephemeral,
-    saved = saved, rejected = rejected, anomalies = anomalies }
+    saved = saved, rejected = rejected, anomalies = anomalies, jobs = jobs }
 end
 
 --- 各页展示计数
@@ -3439,6 +3476,9 @@ function M.open()
     M.refresh()
     return
   end
+  -- 审批窗口打开期间 pin 住后台 worker：避免用户正在查看时 worker 因空闲回收，
+  -- 下次操作还要等待重新启动。关闭窗口时 unpin。
+  pcall(function() require("NeoAI.utils.remote_work").pin("review_window") end)
   -- 无待审/审批/留痕事项时同样打开窗口（展示空界面并订阅事件，新事项到达时自动刷新），
   -- 不再提前返回、也不再弹「无事项」提示。
   local ctx = _gather_ctx()
@@ -3578,7 +3618,7 @@ function M.refresh()
     body = _build_blocking_page(state.page, ctx)
   else
     -- 「待修改」页：越界留痕/异常移入「越界/异常」页，故此处 traces 传 nil。
-    body = M.build_lines(ctx.items, nil, state.audit, ctx.saved, ctx.rejected)
+    body = M.build_lines(ctx.items, nil, state.audit, ctx.saved, ctx.rejected, ctx.jobs)
   end
   local lines = {}
   for _, l in ipairs(header_lines) do lines[#lines + 1] = l end
@@ -3643,6 +3683,7 @@ end
 --- 关闭界面
 function M.close()
   _unwatch()
+  pcall(function() require("NeoAI.utils.remote_work").unpin("review_window") end)
   _close_dirs_editor()
   _close_devices_editor()
   _close_tools_approval_editor()
@@ -3671,6 +3712,7 @@ function M.close()
   state.line_to_cmd = {}
   state.fold_levels = {}
   state.fold_titles = {}
+  state.local_busy = {}
   -- 作废在途 AI 审计结果；保留已完成结论（diff 预览返回/重开时复用，集合变化时由 refresh 清除）。
   state.audit_seq = state.audit_seq + 1
 end

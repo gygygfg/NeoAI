@@ -2220,4 +2220,26 @@ tests.suite("sandbox_review", function(_, it)
     services.provide("services.sandbox", saved)
     config_store.load({})
   end)
+
+  it("build_lines：执行中的条目显示「执行中…」并使用 busy 高亮", function(t)
+    local sr = require("NeoAI.ui.components.sandbox_review")
+    local cwd = vim.fn.getcwd()
+    local data = sr.build_lines({
+      {
+        change_set_id = "cs_busy",
+        tool = "edit_file",
+        apply_state = "APPLYING",
+        files = { { path = cwd .. "/busy.txt", action = "modify" } },
+      },
+    }, nil, nil, nil, nil, {
+      cs_busy = { state = "running", kind = "apply" },
+    })
+    local found
+    for _, m in ipairs(data.marks) do
+      local text = data.lines[m.line]:sub(m.start_col + 1, m.end_col)
+      if text == "执行中…" then found = m end
+    end
+    t.not_nil(found, "应有「执行中…」标签")
+    t.eq("NeoAISandboxReviewBusy", found.level, "应使用 busy 高亮")
+  end)
 end)

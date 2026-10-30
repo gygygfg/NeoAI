@@ -292,6 +292,10 @@ vim.api.nvim_create_autocmd("User", {
 | `SANDBOX_RECOVERY_REQUIRED` | `sandbox:recovery_required` | 需人工恢复 | `{ command_id }` |
 | `SANDBOX_OUTCOME_UNKNOWN` | `sandbox:outcome_unknown` | 结果不明需对账 | `{ operation_id }` |
 | `SANDBOX_REVIEW_ENQUEUED` | `sandbox:review_enqueued` | 候选进入异步待审队列 | `{ change_set_id, candidate_digest, write_set, tool }` |
+| `SANDBOX_REVIEW_HYDRATED` | `sandbox:review_hydrated` | 异步水合完成（主线程可重绘） | `{ count, error? }` |
+| `SANDBOX_JOB_STARTED` | `sandbox:job_started` | 后台任务开始（捕获/冻结/应用/预览） | `{ id, kind, label, change_set_id?, attempt_id?, total? }` |
+| `SANDBOX_JOB_UPDATED` | `sandbox:job_updated` | 后台任务阶段/进度更新 | `{ id, kind, stage, done?, total?, message? }` |
+| `SANDBOX_JOB_FINISHED` | `sandbox:job_finished` | 后台任务完成/失败 | `{ id, kind, state, error?, change_set_id?, attempt_id? }` |
 | `SANDBOX_REVIEW_APPROVED` | `sandbox:review_approved` | 变更单元被批准（未应用） | `{ change_set_id }` |
 | `SANDBOX_REVIEW_REJECTED` | `sandbox:review_rejected` | 变更单元被拒绝 | `{ change_set_id, reason }` |
 | `SANDBOX_APPLIED` | `sandbox:applied` | 变更单元已 CAS 应用到真实工作区 | `{ change_set_id, operation_id }` |

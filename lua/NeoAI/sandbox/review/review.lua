@@ -7,6 +7,7 @@
 ---   review_state: PENDING | APPROVED | REJECTED | EXPIRED | SUPERSEDED
 ---   apply_state : NOT_REQUESTED | APPLYING | APPLIED | CONFLICT | FAILED | RECONCILING
 
+local async = require("NeoAI.utils.async")
 local store = require("NeoAI.sandbox.state.store")
 local candidate = require("NeoAI.sandbox.execution.candidate")
 local logger = require("NeoAI.kernel.logger")
@@ -45,6 +46,8 @@ local state = {
   seq = 0,
   session_auto = nil, -- 会话级自动审批覆盖（nil = 用配置默认，默认关闭）
   loaded = false, -- 是否已从磁盘水合过历史变更单元
+  loading = nil, -- 异步水合中的 Deferred（生产启动预热）
+  load_gen = 0, -- 水合代次：reset 后丢弃迟到结果
   -- 待审摘要缓存：待审堆积到数千时，状态栏每次重绘都全量扫描会随轮次线性变慢；
   -- 任何变更单元写操作（_persist）都会失效缓存，下次读取时重算一次。
   pending_cache = nil,
@@ -63,7 +66,50 @@ local state = {
   -- 正在发布中的路径 → change_set_id。同一路径的并发发布必须串行化，否则两次发布都以
   -- 同一基线通过 CAS 后互相覆盖，静默丢一个（「已允许的修改被回滚」）。
   applying_paths = {},
+  -- 路径 → change_set_id 集合；supersede_by_paths 只检查命中路径的条目，避免每轮
+  -- 「全部 pending × 全部 files」的 O(n²) 扫描。终态条目允许保留索引（查询时会过滤）。
+  path_index = {},
+  -- package_key → change_set_id 集合；包安装合并只查同键成员。
+  package_index = {},
 }
+
+local function _unindex_item(item)
+  if type(item) ~= "table" or not item.change_set_id then return end
+  local id = item.change_set_id
+  for _, f in ipairs(item.files or {}) do
+    if type(f) == "table" and type(f.path) == "string" then
+      local set = state.path_index[f.path]
+      if set then
+        set[id] = nil
+        if next(set) == nil then state.path_index[f.path] = nil end
+      end
+    end
+  end
+  if type(item.package_key) == "string" and item.package_key ~= "" then
+    local set = state.package_index[item.package_key]
+    if set then
+      set[id] = nil
+      if next(set) == nil then state.package_index[item.package_key] = nil end
+    end
+  end
+end
+
+local function _index_item(item)
+  if type(item) ~= "table" or not item.change_set_id then return end
+  local id = item.change_set_id
+  for _, f in ipairs(item.files or {}) do
+    if type(f) == "table" and type(f.path) == "string" then
+      local set = state.path_index[f.path]
+      if not set then set = {}; state.path_index[f.path] = set end
+      set[id] = true
+    end
+  end
+  if type(item.package_key) == "string" and item.package_key ~= "" then
+    local set = state.package_index[item.package_key]
+    if not set then set = {}; state.package_index[item.package_key] = set end
+    set[id] = true
+  end
+end
 
 -- ========== 候选内容按需读取（内存 item 已剥离 content） ==========
 
@@ -113,24 +159,36 @@ local _mark_rejected
 --- 待审堆积到数百/上千时，`supersede_by_paths`（每次工具调用）与状态栏
 --- `pending_summary`（每次重绘多次）会退化为 O(n²) 磁盘扫描，占满主线程。
 --- 内存态由 review 自身写入维护，进程内即权威来源，无需反复读盘。
-local function _ensure_loaded()
-  if state.loaded then return end
-  state.loaded = true
-  local ok, persisted = pcall(store.list_reviews)
-  if not ok or type(persisted) ~= "table" then return end
-  for _, item in ipairs(persisted) do
+--- 合并一批从磁盘水合出的条目（同步/异步水合共用）。
+--- @param persisted table
+local function _merge_persisted(persisted)
+  for _, item in ipairs(persisted or {}) do
     local id = item and item.change_set_id
     if id and not state.items[id] then
-      -- 部分取代增量：被更新候选覆盖的路径单独持久化（避免重编码整单元）；水合时并回。
-      local removed = store.read_review_removed and store.read_review_removed(id)
-      if removed and type(removed.paths) == "table" then item.superseded_paths = removed.paths end
+      -- 部分取代增量：仅在确实发生过部分取代时读增量文件（避免每个条目一次同步读盘）。
+      if item.partial_superseded_by and store.read_review_removed then
+        local removed = store.read_review_removed(id)
+        if removed and type(removed.paths) == "table" then item.superseded_paths = removed.paths end
+      end
       state.items[id] = item
-      -- 播种「可恢复的已拒绝」FIFO（按 rejected_at 升序），使跨会话的 rejected_max 约束生效。
+      _index_item(item)
       if item.review_state == M.REVIEW.REJECTED and item.rejected_copy == true then
         _mark_rejected(id)
       end
     end
   end
+  state.pending_cache = nil
+  state.pending_items = nil
+end
+
+local function _ensure_loaded()
+  if state.loaded then return end
+  -- 生产启动已异步预热：加载中不要同步扫盘；先返回当前内存快照，水合完成事件触发重绘。
+  if state.loading then return end
+  state.loaded = true
+  local ok, persisted = pcall(store.list_reviews)
+  if not ok or type(persisted) ~= "table" then return end
+  _merge_persisted(persisted)
   -- 磁盘水合顺序不定，按 rejected_at 升序重排可恢复 FIFO，保证跨会话按「最旧优先」回收。
   if #state.rejected_order > 1 then
     table.sort(state.rejected_order, function(a, b)
@@ -140,6 +198,58 @@ local function _ensure_loaded()
   end
   state.pending_cache = nil
   state.pending_items = nil
+end
+
+--- 异步预热待审队列（生产启动调用）：扫描/读盘/解码在线程/worker，主线程只合并索引。
+--- 加载期间同步 `list/get` 返回当前内存快照，不触发二次扫盘；完成后广播事件触发 UI 刷新。
+--- @return Deferred resolve(boolean)
+function M.preload_async()
+  if state.loaded then return async.resolve(true) end
+  if state.loading then return state.loading end
+  state.load_gen = state.load_gen + 1
+  local gen = state.load_gen
+  local d = async.Deferred.new()
+  state.loading = d
+  local function done(ok, err)
+    if state.load_gen ~= gen then
+      pcall(function() d:resolve(false) end)
+      return
+    end
+    state.loaded = true
+    state.loading = nil
+    state.pending_cache = nil
+    state.pending_items = nil
+    if not ok then
+      logger.warn("[sandbox] 异步水合失败，保留内存快照: %s", tostring(err))
+    end
+    pcall(function() d:resolve(ok == true) end)
+    _emit(require("NeoAI.kernel.events").SANDBOX_REVIEW_HYDRATED, { count = vim.tbl_count(state.items) })
+  end
+  local ok_call, p = pcall(store.list_reviews_async)
+  if not ok_call or not p or type(p.then_) ~= "function" then
+    state.loaded = true
+    state.loading = nil
+    return async.resolve(false)
+  end
+  p:then_(function(items)
+    if state.load_gen ~= gen then
+      done(false, "stale")
+      return
+    end
+    _merge_persisted(items)
+    done(true)
+  end, function(err)
+    if state.load_gen ~= gen then
+      done(false, "stale")
+      return
+    end
+    -- 异步失败：不要永久停留在 loading；下一次同步调用可回退扫盘。
+    state.loading = nil
+    state.load_gen = state.load_gen + 1
+    pcall(function() d:reject(err) end)
+    _emit(require("NeoAI.kernel.events").SANDBOX_REVIEW_HYDRATED, { count = vim.tbl_count(state.items), error = true })
+  end)
+  return d
 end
 
 --- 待审项缓存（按 created_at 升序）。`supersede_by_paths`/包合并每次工具调用都要遍历待审项，
@@ -223,6 +333,7 @@ local function _maybe_evict_rejected()
     if item then
       item.rejected_copy = nil
       -- 直接移出内存：副本已删，不再可恢复/展示，内存占用随之下界。
+      _unindex_item(item)
       state.items[id] = nil
     end
   end
@@ -258,7 +369,10 @@ local function _maybe_evict()
     local id = table.remove(state.terminal_order, 1)
     state.terminal_set[id] = nil
     local item = state.items[id]
-    if item and _dead_terminal(item) then state.items[id] = nil end
+    if item and _dead_terminal(item) then
+      _unindex_item(item)
+      state.items[id] = nil
+    end
   end
 end
 
@@ -641,12 +755,26 @@ local function _merge_package_item(item, cand)
   local key = item.package_key
   if type(key) ~= "string" or key == "" then return item end
   local members = {}
-  for _, it in ipairs(_pending_items()) do
-    if it.change_set_id ~= item.change_set_id and it.package_key == key then
-      members[#members + 1] = it
+  local ids = state.package_index[key]
+  if ids and next(ids) ~= nil then
+    for id in pairs(ids) do
+      local it = state.items[id]
+      if it and it.change_set_id ~= item.change_set_id and it.package_key == key
+        and it.review_state == M.REVIEW.PENDING then
+        members[#members + 1] = it
+      end
+    end
+  else
+    for _, it in ipairs(_pending_items()) do
+      if it.change_set_id ~= item.change_set_id and it.package_key == key then
+        members[#members + 1] = it
+      end
     end
   end
   if #members == 0 then return item end
+  table.sort(members, function(a, b)
+    return (a.created_at or 0) < (b.created_at or 0)
+  end)
   local base = members[1]
   -- 部分取代增量：成员中被更新候选覆盖的路径不再并入（除非新候选本身重新写入该路径）。
   local skip = {}
@@ -680,10 +808,9 @@ local function _merge_package_item(item, cand)
     candidate_digest = digest, files = files, created_at = os.time(),
     effect = base.effect or cand.effect, command_id = cand.command_id,
   }
-  store.write_candidate_async(newcand)
-  -- 合并后要丢弃各成员候选：先确保新候选落盘，避免异步写未完成时旧候选被删而新候选尚不存在
-  -- （应用时 CANDIDATE_NOT_FOUND）。有界等待（写入已在异步链上，不阻塞 Agent）。
-  logger.try("store_flush", store.flush, 30000)
+  local written = store.write_candidate_async(newcand)
+  -- 合并后要丢弃各成员候选：等新候选**真正落盘**后再删旧候选，避免异步写未完成时旧候选
+  -- 已删除而新候选尚不存在（应用时 CANDIDATE_NOT_FOUND）。等待走 Deferred，不阻塞主线程。
   local to_discard = {}
   -- 其余同键成员并入 base：标记取代并丢弃各自候选。
   for i = 2, #members do
@@ -718,6 +845,7 @@ local function _merge_package_item(item, cand)
   base.secret_warning = item.secret_warning or base.secret_warning
   base.updated_at = os.time()
   state.items[base.change_set_id] = base
+  _index_item(base)
   _persist(base)
   if old_base_digest ~= digest then to_discard[old_base_digest] = true end
   -- 新条目已并入 base：标记取代并丢弃其候选。
@@ -728,7 +856,19 @@ local function _merge_package_item(item, cand)
   if item.candidate_digest ~= digest then to_discard[item.candidate_digest] = true end
   _persist(item)
   logger.try("delete_review_removed", store.delete_review_removed, item.change_set_id)
-  _discard_candidates(to_discard)
+  if written then
+    written:then_(function(ok)
+      if ok == false then
+        logger.warn("[sandbox] 合并候选落盘失败，保留旧候选: %s", tostring(digest))
+        return
+      end
+      _discard_candidates(to_discard)
+    end, function(err)
+      logger.warn("[sandbox] 合并候选落盘异常，保留旧候选: %s", tostring(err and (err.message or err) or err))
+    end)
+  else
+    _discard_candidates(to_discard)
+  end
   _emit(require("NeoAI.kernel.events").SANDBOX_REVIEW_SUPERSEDED, {
     change_set_id = item.change_set_id, superseded_by = base.change_set_id,
   })
@@ -811,6 +951,7 @@ function M.enqueue(cand, meta)
     end
   end
   state.items[id] = item
+  _index_item(item)
   -- 先做包合并（可能需要候选内容），再落盘并剥离内存内容：`_persist` 会剥离 `item.files`，
   -- 而它与 `cand.files` 是同一引用，先剥离会让合并后的候选丢失新文件内容。
   local merged = _merge_package_item(item, cand)
@@ -1133,6 +1274,7 @@ function M.restore(id)
   item.rejected_copy = nil
   item.apply_state = M.APPLY.NOT_REQUESTED
   state.items[id] = item
+  _index_item(item)
   -- 清理副本与 FIFO 登记（恢复后不再属于「已拒绝」）。
   logger.try("delete_rejected_copy", store.delete_rejected_copy, id, digest)
   _unmark_rejected(id)
@@ -1247,8 +1389,8 @@ local function _apply_begin(id, opts)
   end
   local cand = store.read_candidate(item.candidate_digest)
   if not cand then
-    -- 大候选的落盘是异步的（线程池）：可能仍在写队列。先冲刷再读，避免误报丢失。
-    logger.try("store_flush", store.flush, 2000)
+    -- 大候选的落盘是异步的：`apply_async` 的预取已通过 `when_written` 等待；同步 `apply`
+    -- 命中 `write_state.mem` 编码缓存。此处不再 `vim.wait` 轮询，避免主线程最多 2s 卡顿。
     cand = store.read_candidate(item.candidate_digest)
   end
   if not cand and store.was_written and store.was_written(item.candidate_digest) then
@@ -1657,6 +1799,19 @@ end
 --- @return Deferred resolve(table { ok, state, reason?, receipt? })
 function M.apply_async(id, opts)
   local async = require("NeoAI.utils.async")
+  local jobs = require("NeoAI.sandbox.execution.jobs")
+  local job = jobs.begin({
+    kind = "apply", change_set_id = id, label = "应用中",
+    total = tonumber(opts and opts.files and #opts.files) or nil,
+  })
+  local function finish(r)
+    jobs.finish(job, not (r and r.ok == false), r and r.reason or nil)
+    return r
+  end
+  local function failed(e)
+    jobs.finish(job, false, tostring(type(e) == "table" and (e.message or e.kind) or e))
+    return e
+  end
   -- 候选预取：大候选（数十 MB）的「读盘 + JSON 解码」不再阻塞主线程；命中解码缓存时同步返回。
   -- 待审项的摘要即内容寻址，故预取结果可直接复用；读取失败时 `_apply_begin` 内的同步路径兜底。
   local pre = M.get(id)
@@ -1664,12 +1819,18 @@ function M.apply_async(id, opts)
   if digest then
     local ok_pre, pres = pcall(store.read_candidate_async, digest)
     if ok_pre and pres then
-      return pres:then_(function()
+      local out = pres:then_(function()
         return _apply_async_impl(id, opts, async)
       end)
+      return out:then_(finish, failed)
     end
   end
-  return _apply_async_impl(id, opts, async)
+  local ok, out = pcall(_apply_async_impl, id, opts, async)
+  if not ok then
+    failed(out)
+    return async.reject({ kind = "sandbox", message = "应用异常: " .. tostring(out) })
+  end
+  return out:then_(finish, failed)
 end
 
 --- 开始一次批量应用会话：会话内 `apply` 把候选删除推迟到 `end_batch` 统一对账。
@@ -1707,6 +1868,45 @@ function M.apply_all(opts)
   end
   _discard_candidates(deferred)
   return result
+end
+
+--- 异步批量应用（命令/诊断入口）：逐项 apply_async，每项之间让出主循环；候选删除用
+--- 批量会话一次性对账。返回 Deferred resolve({ applied, failed })。
+--- @param opts table|nil { only_approved? }
+--- @return Deferred
+function M.apply_all_async(opts)
+  opts = opts or {}
+  local async = require("NeoAI.utils.async")
+  local items
+  if opts.only_approved then
+    items = M.list({ review_state = M.REVIEW.APPROVED })
+  else
+    items = _pending_items()
+  end
+  local result = { applied = 0, failed = 0 }
+  local batch = M.begin_batch()
+  local d = async.Deferred.new()
+  local i = 0
+  local function step()
+    i = i + 1
+    local item = items[i]
+    if not item then
+      M.end_batch(batch)
+      d:resolve(result)
+      return
+    end
+    local p = M.apply_async(item.change_set_id, { auto_approve = true, batch = batch })
+    p:then_(function(res)
+      if res and res.ok then result.applied = result.applied + 1
+      else result.failed = result.failed + 1 end
+      vim.defer_fn(step, 0)
+    end, function()
+      result.failed = result.failed + 1
+      vim.defer_fn(step, 0)
+    end)
+  end
+  vim.defer_fn(step, 0)
+  return d
 end
 
 --- 某变更单元是否因三方合并冲突而待审（apply_state=CONFLICT 且记录了冲突文件）。
@@ -1819,8 +2019,24 @@ function M.supersede_by_paths(paths, except_id)
   if not next(set) then return 0 end
   local n = 0
   local to_discard = {}
-  for _, item in ipairs(_pending_items()) do
-    if item.change_set_id ~= except_id and type(item.files) == "table" and #item.files > 0 then
+  -- 只取命中路径的条目：path_index 把「全部 pending × 全部 files」降为「本轮路径的并集」。
+  local candidate_ids = {}
+  for p in pairs(set) do
+    local ids = state.path_index[p]
+    if ids then for id in pairs(ids) do candidate_ids[id] = true end end
+  end
+  local candidates = {}
+  if next(candidate_ids) ~= nil then
+    for id in pairs(candidate_ids) do
+      local item = state.items[id]
+      if item then candidates[#candidates + 1] = item end
+    end
+  else
+    candidates = _pending_items()
+  end
+  for _, item in ipairs(candidates) do
+    if item.review_state == M.REVIEW.PENDING
+      and item.change_set_id ~= except_id and type(item.files) == "table" and #item.files > 0 then
       local sup = type(item.superseded_paths) == "table" and item.superseded_paths or nil
       local overlap = 0
       for _, f in ipairs(item.files) do
@@ -2083,6 +2299,8 @@ function M.reset()
   state.seq = 0
   state.session_auto = nil
   state.loaded = false
+  state.loading = nil
+  state.load_gen = state.load_gen + 1
   state.pending_cache = nil
   state.pending_items = nil
   state.ref_scans = 0
@@ -2091,6 +2309,8 @@ function M.reset()
   state.rejected_order = {}
   state.rejected_set = {}
   state.applying_paths = {}
+  state.path_index = {}
+  state.package_index = {}
   _clear_content_cache()
 end
 

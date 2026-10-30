@@ -832,6 +832,26 @@ UI 见 `ui/components/device_consent`，与网络同意/工具审批同款浮窗
     在已经 exec 之后判、判完再杀。
   - 因此 exec 守卫是**纵深防御**，不替代 seccomp 强制层；用户不应因它存在而降低审批严格度。
 
+### 后台 worker（单进程、按任务并行）
+
+主进程只保留 UI/事件循环；纯 Lua 的读盘、哈希、密钥 token 化、候选 JSON 编解码、快照/候选
+写入、目录遍历等任务经 **Unix socket + msgpack 帧** 提交给一个后台 worker：
+
+- worker 由主进程用 `posix_spawn` 启动（`utils/posix_spawn`，避免 fork 复制大页表），入口为
+  `nvim --headless --clean -u NONE -l .../worker_main.lua`；
+- **不按任务多开**：每个主 nvim 最多一个 worker 进程；任务通过 `utils/work` 的远程后端提交，
+  worker 内用 libuv 线程池并行执行（`tools.worker.max_concurrency`，默认 4）；
+- **按需启动/回收**：首次沙箱/重计算任务才启动；`idle_ttl_ms` 无任务后退出；审批窗打开
+  期间 `pin` 住；worker 崩溃仅在有排队/在途任务时退避重启；
+- 落盘等待改为 Deferred（`store.when_written` / `store.flush_async`），主线程不再
+  `vim.wait` 轮询候选/待审写入；
+- 会话轮换优先 `rename` 整个暂存目录（O(1)），避免逐文件复制大文件/符号链接；
+- `sandbox_review` 从 worker/内存缓存读取活跃任务，条目显示「执行中…」并使用
+  `NeoAISandboxReviewBusy` 高亮；`SANDBOX_JOB_*` 事件驱动刷新。
+
+严格主进程零任务时可将 `tools.worker.enabled=false` 仅用于测试/诊断；默认开启。
+worker 不可用时错误显式上报，不静默把重任务拿回主线程。
+
 ### 暂存机制
 
 - **显式路径工具**（`edit_file` / `create_directory` / `ensure_dir` / `delete_file`）：

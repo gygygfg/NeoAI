@@ -80,6 +80,7 @@ end, { a = 1, b = 2 }):then_(function(res) ... end)
 | 应用修改：候选读取/解码 | `store.read_candidate_async`：大候选（数十 MB）的读盘 + JSON 解码 + base64 哨兵解包在 `utils.work` 内完成，`vim.mpack` 回传；`apply_async` 先异步预取。候选按内容寻址不可变 → 解码结果进 LRU（`candidate_cache_max_bytes`，默认 16MB），逐文件应用同一变更单元不再重复整份解码。实测 5.6MB 候选：主线程「读盘+解码」10.4ms → ~0.4ms（worker 解码 + mpack 回传），缓存命中为 0（`sandbox/state/store.lua`、`sandbox/review/review.lua`） |
 | 应用修改：应用前快照 | 撤销快照逐文件 `fs_copyfile`（阻塞系统调用）原在主线程串行执行；改为 `work.batched` 分块并发（stat + 复制 + 权限收紧全在 worker，线程池不可用时回落同步），完成后才发布（`sandbox/review/review.lua`） |
 | 写盘后的 buffer 同步 | `reload_buffers_for` 的磁盘读取（旧实现每次 `readfile` 整读两遍）下沉线程池，主线程只做行拆分比较与必要的 `nvim_buf_set_lines`；按 buffer 代次丢弃迟到的旧读取，绝不覆盖未保存改动（`tools/builtin/tool_helpers.lua`） |
+| 后台 worker 进程 | `utils/work` 的纯 Lua 任务经 `utils/remote_work` 提交给单个 `posix_spawn` worker（headless nvim，Unix socket + msgpack）；worker 内 libuv 线程池按任务并行。主进程只保留事件循环/UI；按需启动、空闲/重任务后回收，不按任务多开 nvim（`utils/posix_spawn.lua`、`utils/remote_work.lua`、`kernel/worker_server.lua`） |
 
 ## 3. 使用线程池的模块
 

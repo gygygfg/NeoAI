@@ -268,6 +268,25 @@ approval = {
 > hot-add/remove this list (plus masked dirs `sandbox.mask_dirs` and the `sandbox.mask_dirs_enabled` toggle) —
 > **session-only, not persisted to disk**.
 
+**worker (background task process)**:
+
+```lua
+worker = {
+  enabled = true,                  -- Main process only handles UI; pure-Lua tasks go to one worker
+  mode = "on_demand",              -- on_demand | always | off
+  offload = "all",                 -- all | large
+  min_bytes = 0,
+  max_concurrency = 4,             -- Parallel slots inside the worker (UV_THREADPOOL_SIZE)
+  idle_ttl_ms = 60000,
+  startup_timeout_ms = 5000,
+  request_timeout_ms = 120000,
+  max_restarts = 3,
+  restart_backoff_ms = { 200, 1000, 3000 },
+  max_pending = 64,
+  log_max_bytes = 1024 * 1024,
+},
+```
+
 **sandbox (tool execution sandbox)**:
 
 ```lua

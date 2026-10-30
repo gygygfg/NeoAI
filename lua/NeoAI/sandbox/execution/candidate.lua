@@ -544,8 +544,45 @@ function M.rotate_session()
   local old = state.workspace
   state.session_seq = state.session_seq + 1
   state.session_id = string.format("s%d_%d", os.time(), state.session_seq)
-  fs.ensure_dir(_workspace_dir())
+  local new_dir = _workspace_dir()
   state.process_dir_cache = nil
+  -- 快路径：同一 `sessions/` 父目录下直接 rename 整个暂存目录（O(1)，不复制大文件/
+  -- 符号链接/目录）。只重写 `state.workspace` 中的 staged 前缀，主线程无逐文件 I/O。
+  -- 任一条目不在旧目录下（历史布局/外部遗留）则走下面的逐文件迁移，保持兼容。
+  local can_rename = old_dir ~= nil and old_dir ~= new_dir
+  local prefix = old_dir and (old_dir .. "/") or nil
+  if can_rename then
+    for _, entry in pairs(old) do
+      if type(entry.staged) == "string" and entry.staged:sub(1, #prefix) ~= prefix then
+        can_rename = false
+        break
+      end
+    end
+  end
+  if can_rename and vim.uv.fs_rename(old_dir, new_dir) then
+    local migrated = {}
+    local migrated_rev = {}
+    for real, entry in pairs(old) do
+      if type(entry.staged) == "string" then
+        entry.staged = new_dir .. "/" .. entry.staged:sub(#prefix + 1)
+      end
+      entry.version = _bump_version()
+      migrated[real] = entry
+      if entry.staged then migrated_rev[entry.staged] = real end
+    end
+    state.workspace = migrated
+    state.staged_to_real = migrated_rev
+    state.materialized = {}
+    state.seeded = {}
+    if old_proc then
+      local rt = require("NeoAI.sandbox.execution.runtime")
+      pcall(rt.fuse_release_under, old_proc)
+      _defer_cleanup(old_proc)
+    end
+    _flush_pending_cleanup()
+    return state.session_id
+  end
+  fs.ensure_dir(new_dir)
   local migrated = {}
   local migrated_rev = {}
   local jobs = {}
@@ -1952,6 +1989,127 @@ local function _capture_base_blobs(files)
   end
 end
 
+--- 工作线程：读取真实基线（超限/不可读返回空串）。
+local function _read_base_worker(payload)
+  local cap = tonumber(payload.cap) or 0
+  local f = io.open(payload.path, "rb")
+  if not f then return "" end
+  local size = f:seek("end") or 0
+  if cap > 0 and size > cap then f:close(); return "" end
+  f:seek("set", 0)
+  local raw = f:read("*a") or ""
+  f:close()
+  return raw
+end
+
+--- 工作线程：原子写入 merge base blob。
+local function _write_base_blob_worker(path, content)
+  local uv = vim.uv
+  local tmp = path .. ".tmp." .. tostring(uv.hrtime())
+  local f = io.open(tmp, "wb")
+  if not f then return "\0open failed" end
+  local okw = f:write(content or "")
+  f:close()
+  if not okw then pcall(uv.fs_unlink, tmp); return "\0write failed" end
+  pcall(uv.fs_chmod, tmp, 384)
+  local ok = uv.fs_rename(tmp, path)
+  if not ok then pcall(uv.fs_unlink, tmp); return "\0rename failed" end
+  return "\1"
+end
+
+--- 异步捕获 merge base：读盘/密钥 token 化/blob 写盘全部离开主线程。
+--- @param files table
+--- @return Deferred
+local function _capture_base_blobs_async(files)
+  local async = require("NeoAI.utils.async")
+  if not _merge_enabled() then return async.resolve() end
+  local work = require("NeoAI.utils.work")
+  if not work.available() then
+    _capture_base_blobs(files)
+    return async.resolve()
+  end
+  local eligible = {}
+  for _, f in ipairs(files) do
+    if f.action == "modify" and f.base_exists and f.base_type == "file"
+      and not f.large and not f.blob and not f.before_sig and f.before_hash then
+      eligible[#eligible + 1] = f
+    end
+  end
+  if #eligible == 0 then return async.resolve() end
+  local cap = _merge_max_bytes()
+  local secret = require("NeoAI.sandbox.secret.secret")
+  local store = require("NeoAI.sandbox.state.store")
+  return work.batched(eligible, work.parallelism(), function(f)
+    return work.run_codec(_read_base_worker, { path = f.path, cap = cap })
+  end):then_(function(raws)
+    local active, texts, flags, text_idx = {}, {}, {}, {}
+    for i, f in ipairs(eligible) do
+      local raw = raws[i]
+      if type(raw) == "string" and raw ~= "" and (cap <= 0 or #raw <= cap) and _is_text_content(raw) then
+        local entry = { file = f, raw = raw, tokenize = _tokenize_ok(secret, f.path) }
+        active[#active + 1] = entry
+        if entry.tokenize then
+          texts[#texts + 1] = raw
+          flags[#flags + 1] = secret.is_secret_path(f.path)
+          text_idx[#texts] = #active
+        end
+      end
+    end
+    if #active == 0 then return end
+    if #texts == 0 then
+      local jobs = {}
+      for _, entry in ipairs(active) do
+        local f = entry.file
+        local key = "mergebase:" .. tostring(f.path) .. ":" .. tostring(f.before_hash)
+        local path = store.blob_path(key)
+        if path and store.blobs_dir() then
+          jobs[#jobs + 1] = { file = f, path = path, content = entry.raw }
+        end
+      end
+      if #jobs == 0 then return end
+      return work.batched(jobs, work.parallelism(), function(j)
+        return work.run(_write_base_blob_worker, j.path, j.content):then_(function()
+          return j.path
+        end)
+      end):then_(function(results)
+        for i, j in ipairs(jobs) do
+          if type(results[i]) == "string" and results[i] ~= "" then j.file.base_blob = results[i] end
+        end
+      end)
+    end
+    return secret.tokenize_many_async(texts, { entropy_flags = flags }):then_(function(tokenized)
+      local tok_of = {}
+      for i, idx in ipairs(text_idx) do tok_of[idx] = tokenized and tokenized[i] or texts[i] end
+      local jobs = {}
+      for i, entry in ipairs(active) do
+        local f = entry.file
+        local tok = tok_of[i] or entry.raw
+        local key = "mergebase:" .. tostring(f.path) .. ":" .. tostring(f.before_hash)
+        local path = store.blob_path(key)
+        if path and store.blobs_dir() then
+          jobs[#jobs + 1] = { file = f, path = path, content = tok }
+        end
+      end
+      if #jobs == 0 then return end
+      return work.batched(jobs, work.parallelism(), function(j)
+        return work.run(_write_base_blob_worker, j.path, j.content):then_(function()
+          return j.path
+        end)
+      end):then_(function(results)
+        for i, j in ipairs(jobs) do
+          if type(results[i]) == "string" and results[i] ~= "" then j.file.base_blob = results[i] end
+        end
+      end)
+    end, function(err)
+      require("NeoAI.kernel.logger").warn("[sandbox] merge base token 化失败: %s",
+        tostring(err and (err.message or err) or err))
+    end)
+  end, function(err)
+    require("NeoAI.kernel.logger").warn("[sandbox] merge base 读取失败: %s",
+      tostring(err and (err.message or err) or err))
+  end)
+end
+
 --- 登记 overlay upper 中一条路径为候选条目（相对 real_root）
 --- @param attempt table
 --- @param real_root string
@@ -3290,7 +3448,7 @@ end
 ---   nil 时在主线程 fs_stat/读取（同步路径）。
 --- @param classify table|nil 工作线程预分类结果：path -> { masked, git_class, level }（包候选专用）
 --- @return table candidate
-function M.finish(attempt_id, prefetch, classify)
+function M.finish(attempt_id, prefetch, classify, skip_base_blobs)
   local attempt = state.attempts[attempt_id]
   if not attempt then
     ---@diagnostic disable-next-line: return-type-mismatch
@@ -3485,7 +3643,8 @@ function M.finish(attempt_id, prefetch, classify)
         dropped.masked or 0, dropped.volatile or 0, dropped.git or 0, dropped.self or 0) or "-")
   end
   -- 三方合并基线捕获（发布时间检测到外部改动时使用），须在过滤后避免为被剔除文件做无用读取。
-  _capture_base_blobs(files)
+  -- 异步冻结路径由调用方在 worker 线程完成（skip_base_blobs=true），不在这里阻塞主线程。
+  if not skip_base_blobs then _capture_base_blobs(files) end
   local manifest = {}
   for _, f in ipairs(files) do
     manifest[#manifest + 1] = { path = f.path, action = f.action, after_hash = f.after_hash }
@@ -3661,7 +3820,11 @@ function M.finish_async(attempt_id, opts)
           }
         end
       end
-      return M.finish(attempt_id, prefetch, classify)
+      local cand = M.finish(attempt_id, prefetch, classify, true)
+      if not cand then return cand end
+      return _capture_base_blobs_async(cand.files):then_(function()
+        return cand
+      end)
     end)
   end
   if not opts.classify then return run_finish(nil) end

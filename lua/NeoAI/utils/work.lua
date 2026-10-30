@@ -45,42 +45,10 @@ end
 
 -- ========== 私有常量 ==========
 
--- 工作线程内统一执行器：接收 string.dump 出来的函数字节码，load 后 pcall 运行。
--- 返回值用前缀区分成功/失败（线程回调只能拿原始类型，无法安全传异常对象）。
-local WORKER_RUNNER = table.concat({
-  [[local code = ...]],
-  [[local nargs = select("#", ...) - 1]],
-  [[local args = {}]],
-  [[for i = 1, nargs do args[i] = (select(i + 1, ...)) end]],
-  [[local fn = assert(load(code, "=worker", "b"))]],
-  [[local unpackx = table.unpack or unpack]],
-  [[local ok, res = pcall(fn, unpackx(args, 1, nargs))]],
-  [[if ok then]],
-  [[  if res == nil then return "\1" end]],
-  [[  if type(res) ~= "string" then return "\1" .. tostring(res) end]],
-  [[  return "\1" .. res]],
-  [[end]],
-  [[return "\0" .. tostring(res)]],
-}, "\n")
-
--- 结构化编解码工作线程执行器：入参/出参经 `vim.mpack` 编解码（worker 内同样可用），
--- 使线程函数可接收/返回任意可 msgpack 化的数据（table / 二进制 string）。
--- 参数约定：queue(code, payload, ...extras)。
-local WORKER_CODEC_RUNNER = table.concat({
-  [[local code, payload = ...]],
-  [[if not (vim and vim.mpack) then return "\0worker 线程缺少 vim.mpack" end]],
-  [[local nextra = select("#", ...) - 2]],
-  [[local extras = {}]],
-  [[for i = 1, nextra do extras[i] = (select(i + 2, ...)) end]],
-  [[local fn = assert(load(code, "=worker_codec", "b"))]],
-  [[local data = vim.mpack.decode(payload)]],
-  [[local unpackx = table.unpack or unpack]],
-  [[local ok, res = pcall(fn, data, unpackx(extras, 1, nextra))]],
-  [[if not ok then return "\0" .. tostring(res) end]],
-  [[local ok2, enc = pcall(vim.mpack.encode, res)]],
-  [[if not ok2 then return "\0" .. tostring(enc) end]],
-  [[return "\1" .. enc]],
-}, "\n")
+-- 工作线程内统一执行器（主进程线程池与后台 worker 进程共用源码）
+local RUNNERS = require("NeoAI.utils.worker_runner")
+local WORKER_RUNNER = RUNNERS.RUNNER
+local WORKER_CODEC_RUNNER = RUNNERS.CODEC_RUNNER
 
 -- ========== 私有状态 ==========
 
@@ -102,6 +70,92 @@ local function _dump(fn)
   if not ok then return nil, tostring(code) end
   dump_cache[fn] = code
   return code
+end
+
+--- 主进程线程池执行（本地回退 / 自检 / 测试）。
+local function _local_run_code(code, ...)
+  local d = async.Deferred.new()
+  local ctx_ok, ctx = pcall(vim.uv.new_work, WORKER_RUNNER, function(out)
+    if out and out:sub(1, 1) == "\1" then
+      d:resolve(out:sub(2))
+    else
+      d:reject({ kind = "work", message = (out and out:sub(2)) or "工作线程异常退出" })
+    end
+  end)
+  if not ctx_ok then
+    return async.reject({ kind = "work", message = "创建工作线程失败: " .. tostring(ctx) })
+  end
+  local queued, qerr = ctx:queue(code, ...)
+  if not queued then
+    return async.reject({ kind = "work", message = "工作线程入队失败: " .. tostring(qerr) })
+  end
+  return d
+end
+
+local function _local_run_codec_code(code, payload, ...)
+  local d = async.Deferred.new()
+  local ctx_ok, ctx = pcall(vim.uv.new_work, WORKER_CODEC_RUNNER, function(out)
+    if out and out:sub(1, 1) == "\1" then
+      local ok, decoded = pcall(vim.mpack.decode, out:sub(2))
+      if ok then
+        if decoded == vim.NIL then decoded = nil end
+        d:resolve(decoded)
+      else
+        d:reject({ kind = "work", message = "工作线程返回解码失败: " .. tostring(decoded) })
+      end
+    else
+      d:reject({ kind = "work", message = (out and out:sub(2)) or "工作线程异常退出" })
+    end
+  end)
+  if not ctx_ok then
+    return async.reject({ kind = "work", message = "创建工作线程失败: " .. tostring(ctx) })
+  end
+  local queued, qerr = ctx:queue(code, payload, ...)
+  if not queued then
+    return async.reject({ kind = "work", message = "工作线程入队失败: " .. tostring(qerr) })
+  end
+  return d
+end
+
+--- 远程 worker（主进程只做 UI；工作函数在独立进程内并行执行）。
+--- 延迟 require，避免 utils/work ←→ utils/remote_work 的加载环。
+--- @return table|nil
+local function _remote()
+  local ok, r = pcall(require, "NeoAI.utils.remote_work")
+  if ok and type(r) == "table" then return r end
+  return nil
+end
+
+--- 估算原始参数规模（用于 large 模式阈值）。
+local function _raw_size(code, ...)
+  local n = #code
+  for i = 1, select("#", ...) do
+    local v = select(i, ...)
+    local t = type(v)
+    if t == "string" then n = n + #v
+    elseif t == "number" or t == "boolean" then n = n + 8
+    end
+  end
+  return n
+end
+
+--- 判断参数中是否有 nil 空洞（table 无法无歧义 mpack 编码）。
+local function _has_nil(...)
+  local n = select("#", ...)
+  for i = 1, n do
+    if select(i, ...) == nil then return true end
+  end
+  return false
+end
+
+--- 是否全部为可安全跨进程的原始类型（table/cdata/function 不进入原始参数）。
+local function _all_primitive(...)
+  local n = select("#", ...)
+  for i = 1, n do
+    local t = type(select(i, ...))
+    if t ~= "string" and t ~= "number" and t ~= "boolean" then return false end
+  end
+  return true
 end
 
 -- ========== 公开 API ==========
@@ -193,9 +247,16 @@ end
 --- @return boolean 是否完成同步校验（异步退化时返回 true）
 function M.selfcheck(opts)
   opts = opts or {}
-  local d = M.run_codec(function(data)
+  -- 自检必须走本地线程池：远程 worker 的启动/握手由 remote_work 自己校验，不能在
+  -- setup 阶段同步等待它（否则会把首次启动延迟转嫁到用户初始化）。
+  local code, derr = _dump(function(data)
     return { mpack = (type(vim) == "table" and type(vim.mpack) == "table"), v = data.v }
-  end, { v = 1 })
+  end)
+  if not code then
+    error("[NeoAI.work] 自检函数序列化失败: " .. tostring(derr), 2)
+  end
+  local payload = vim.mpack.encode({ v = 1 })
+  local d = _local_run_codec_code(code, payload)
   local done, ok, err = false, nil, nil
   d:then_(function(r)
     ok = (type(r) == "table" and r.mpack == true and r.v == 1)
@@ -250,22 +311,15 @@ function M.run(fn, ...)
     return async.reject({ kind = "work", message = "工作函数序列化失败: " .. tostring(derr) })
   end
 
-  local d = async.Deferred.new()
-  local ctx_ok, ctx = pcall(vim.uv.new_work, WORKER_RUNNER, function(out)
-    if out and out:sub(1, 1) == "\1" then
-      d:resolve(out:sub(2))
-    else
-      d:reject({ kind = "work", message = (out and out:sub(2)) or "工作线程异常退出" })
-    end
-  end)
-  if not ctx_ok then
-    return async.reject({ kind = "work", message = "创建工作线程失败: " .. tostring(ctx) })
+  local remote = _remote()
+  local bytes = _raw_size(code, ...)
+  if remote and _all_primitive(...) and remote.should_offload(bytes) then
+    local args = {}
+    local n = select("#", ...)
+    for i = 1, n do args[i] = select(i, ...) end
+    return remote.run(code, args, { kind = "run", bytes = bytes })
   end
-  local queued, qerr = ctx:queue(code, ...)
-  if not queued then
-    return async.reject({ kind = "work", message = "工作线程入队失败: " .. tostring(qerr) })
-  end
-  return d
+  return _local_run_code(code, ...)
 end
 
 --- 在线程池中执行「结构化输入 → 结构化输出」的纯 Lua 计算。
@@ -294,29 +348,15 @@ function M.run_codec(fn, input, ...)
     return async.reject({ kind = "work", message = "输入 msgpack 编码失败: " .. tostring(payload) })
   end
 
-  local d = async.Deferred.new()
-  local ctx_ok, ctx = pcall(vim.uv.new_work, WORKER_CODEC_RUNNER, function(out)
-    if out and out:sub(1, 1) == "\1" then
-      local ok, decoded = pcall(vim.mpack.decode, out:sub(2))
-      if ok then
-        -- mpack 把 null 解为 vim.NIL；顶层归一为 nil，与旧 JSON 行为一致。
-        if decoded == vim.NIL then decoded = nil end
-        d:resolve(decoded)
-      else
-        d:reject({ kind = "work", message = "工作线程返回解码失败: " .. tostring(decoded) })
-      end
-    else
-      d:reject({ kind = "work", message = (out and out:sub(2)) or "工作线程异常退出" })
-    end
-  end)
-  if not ctx_ok then
-    return async.reject({ kind = "work", message = "创建工作线程失败: " .. tostring(ctx) })
+  local remote = _remote()
+  local bytes = _raw_size(code, payload, ...)
+  if remote and _all_primitive(...) and remote.should_offload(bytes) then
+    local extras = {}
+    local n = select("#", ...)
+    for i = 1, n do extras[i] = select(i, ...) end
+    return remote.run_codec(code, payload, extras, { kind = "run_codec", bytes = bytes })
   end
-  local queued, qerr = ctx:queue(code, payload, ...)
-  if not queued then
-    return async.reject({ kind = "work", message = "工作线程入队失败: " .. tostring(qerr) })
-  end
-  return d
+  return _local_run_codec_code(code, payload, ...)
 end
 
 --- 重置（测试用）

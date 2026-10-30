@@ -385,6 +385,24 @@ local DEFAULT_CONFIG = {
     enabled = true,
     builtin = true,
     external = {},
+    -- 后台 worker（单进程、按任务并行）
+    -- 主进程只保留 UI 与事件循环；纯 Lua 的读盘/哈希/token/JSON/候选处理等任务经
+    -- Unix socket + msgpack 提交给一个后台 worker（headless nvim，posix_spawn 启动）。
+    -- worker 内用 libuv 线程池并行执行；按需启动、空闲/重任务后回收，不会按任务多开进程。
+    worker = {
+      enabled = true,             -- false = 全部回到主进程线程池（测试/诊断）
+      mode = "on_demand",         -- on_demand | always | off
+      offload = "all",            -- all = 所有 utils.work 任务；large = 仅超过 min_bytes
+      min_bytes = 0,              -- offload="large" 时的阈值
+      max_concurrency = 4,        -- worker 内并行槽（UV_THREADPOOL_SIZE）
+      idle_ttl_ms = 60000,        -- 无任务/无 pin 后回收延迟
+      startup_timeout_ms = 5000,
+      request_timeout_ms = 120000,
+      max_restarts = 3,
+      restart_backoff_ms = { 200, 1000, 3000 },
+      max_pending = 64,
+      log_max_bytes = 1024 * 1024,
+    },
     -- 工具输出「AI 上下文限流」：工具回传给模型的文本超过 max_chars 时，只回传
     -- 「头 head_chars + 截断标记 + 尾 tail_chars」，并把完整输出自动写入沙箱私有 /tmp
     -- 下的临时文件（提示中给出路径，可用 read_file 的 start_line/end_line 分段回读）。

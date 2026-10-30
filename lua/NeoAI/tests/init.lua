@@ -6,6 +6,10 @@
 
 local M = {}
 
+-- 测试默认不启动后台 worker（避免每个套件额外拉起 headless nvim）；需要验证 worker 的
+-- 套件显式设置 `NEOAI_TEST_WORKER=1` 并通过 remote_work.reset() 管理生命周期。
+vim.g.neoai_test = true
+
 -- ========== 测试注册表 ==========
 
 local state = {

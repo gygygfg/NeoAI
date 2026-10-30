@@ -74,6 +74,8 @@ local write_state = {
   cancelled = {}, -- path -> true（写入期间被删除，完成后清理）
   errors = {},    -- path -> 最近一次写入失败原因（诊断）
   attempts = {},  -- path -> 已重试次数
+  waiters = {},   -- path -> { Deferred }：等待该路径真正落盘
+  flush_waiters = {}, -- { Deferred }：等待所有在途写入清空
   gen = 0,        -- 代次：reset 后使在途完成回调失效
 }
 
@@ -200,6 +202,80 @@ end
 --- 忽略返回值，写入失败（ENOSPC/EACCES/mkstemp 失败等）被当作成功：内存缓存被清除、调用方
 --- 收到 resolve(true)，随后读取回退磁盘却读不到内容（表现为「文件写了却读不到」）。失败时
 --- 保留内存缓存（「刚写入即可读回」仍成立）、记录错误并有限重试。
+--- 该路径是否仍有未落盘的写入。
+--- @param path string
+--- @return boolean
+local function _path_busy(path)
+  return write_state.pending[path] ~= nil or write_state.running[path] ~= nil
+end
+
+--- 解析某路径的写入等待者。
+local function _resolve_path_waiters(path, ok)
+  local list = write_state.waiters[path]
+  if not list then return end
+  write_state.waiters[path] = nil
+  for _, d in ipairs(list) do pcall(function() d:resolve(ok) end) end
+end
+
+--- 所有写入是否已清空；清空时解析 flush_async 等待者。
+local function _resolve_flush_waiters()
+  for _ in pairs(write_state.pending) do return end
+  for _ in pairs(write_state.running) do return end
+  local list = write_state.flush_waiters
+  write_state.flush_waiters = {}
+  for _, d in ipairs(list) do pcall(function() d:resolve(true) end) end
+end
+
+--- 等待指定路径真正落盘（success=true / 最终失败=false），不阻塞主线程。
+--- @param path string
+--- @return Deferred
+function M.when_written(path)
+  local d = async.Deferred.new()
+  if not _path_busy(path) then
+    d:resolve(true)
+    return d
+  end
+  write_state.waiters[path] = write_state.waiters[path] or {}
+  write_state.waiters[path][#write_state.waiters[path] + 1] = d
+  return d
+end
+
+--- 等待所有在途写入清空（异步，超时 resolve(false)）。
+--- @param timeout_ms number|nil
+--- @return Deferred
+function M.flush_async(timeout_ms)
+  local d = async.Deferred.new()
+  local busy = false
+  for _ in pairs(write_state.pending) do busy = true; break end
+  if not busy then
+    for _ in pairs(write_state.running) do busy = true; break end
+  end
+  if not busy then
+    d:resolve(true)
+    return d
+  end
+  write_state.flush_waiters[#write_state.flush_waiters + 1] = d
+  local timeout = tonumber(timeout_ms)
+  if timeout and timeout > 0 then
+    local timer = vim.uv.new_timer()
+    timer:start(timeout, 0, function()
+      vim.schedule(function()
+        pcall(function() timer:stop() end)
+        pcall(function() timer:close() end)
+        -- 从等待列表移除（若已解析则不存在），并 resolve(false) 表示超时。
+        for i = #write_state.flush_waiters, 1, -1 do
+          if write_state.flush_waiters[i] == d then
+            table.remove(write_state.flush_waiters, i)
+            pcall(function() d:resolve(false) end)
+            break
+          end
+        end
+      end)
+    end)
+  end
+  return d
+end
+
 --- @param path string
 local function _drain(path)
   if write_state.running[path] then return end
@@ -243,6 +319,11 @@ local function _drain(path)
       write_state.errors[path] = nil
       write_state.attempts[path] = nil
     end
+    if not _path_busy(path) then
+      local final_fail = failed and ((write_state.attempts[path] or 0) > MAX_WRITE_RETRY)
+      _resolve_path_waiters(path, not final_fail)
+    end
+    _resolve_flush_waiters()
   end
   local work = require("NeoAI.utils.work")
   if not work.available() then
@@ -573,7 +654,7 @@ function M.write_candidate_async(candidate)
   local path = _candidates_dir() .. "/" .. _safe_name(candidate.candidate_digest) .. ".json"
   _encode_and_write(path, candidate)
   written_candidates[candidate.candidate_digest] = true
-  return async.resolve(true)
+  return M.when_written(path)
 end
 
 --- 读取候选（带解码缓存：内容寻址 → 同一摘要内容不可变，可安全复用）
@@ -633,6 +714,12 @@ function M.read_candidate_async(digest)
   local path = _candidates_dir() .. "/" .. _safe_name(digest) .. ".json"
   local cached = _candidate_cache_get(path)
   if cached then return async.resolve(cached) end
+  -- 写入仍在队列/线程池：等待真正落盘后再读，避免大候选异步写导致的 CANDIDATE_NOT_FOUND。
+  if _path_busy(path) then
+    return M.when_written(path):then_(function()
+      return M.read_candidate_async(digest)
+    end)
+  end
   local work = require("NeoAI.utils.work")
   if not work.available() then
     return async.resolve(M.read_candidate(digest))
@@ -775,7 +862,7 @@ function M.write_review_async(item)
   if not _ensure_dirs() then return async.resolve(false) end
   local path = _reviews_dir() .. "/" .. _safe_name(item.change_set_id) .. ".json"
   _encode_and_write(path, _persistable(item))
-  return async.resolve(true)
+  return M.when_written(path)
 end
 
 --- 读取变更单元
@@ -793,6 +880,79 @@ function M.list_reviews()
   local out = _list_json_dir(_reviews_dir())
   table.sort(out, function(a, b) return (a.created_at or 0) < (b.created_at or 0) end)
   return out
+end
+
+--- 线程内扫描并解码 reviews 目录（无 nvim 主状态依赖）。
+local function _list_reviews_worker(payload)
+  local dir, bytes_key = payload.dir, payload.bytes_key
+  local function unpack_binary(v)
+    if type(v) ~= "table" then return v end
+    if v[bytes_key] == true and type(v.d) == "string" then
+      local okd, dec = pcall(vim.base64.decode, v.d)
+      if okd and type(dec) == "string" then return dec end
+    end
+    local out = nil
+    for k, val in pairs(v) do
+      local nv = unpack_binary(val)
+      if nv ~= val then
+        if not out then out = {}; for k2, v2 in pairs(v) do out[k2] = v2 end end
+        out[k] = nv
+      end
+    end
+    return out or v
+  end
+  local out = {}
+  local handle = vim.uv.fs_scandir(dir)
+  if not handle then return out end
+  while true do
+    local name = vim.uv.fs_scandir_next(handle)
+    if not name then break end
+    if name:sub(-5) == ".json" then
+      local f = io.open(dir .. "/" .. name, "rb")
+      if f then
+        local raw = f:read("*a")
+        f:close()
+        if raw and raw ~= "" then
+          local ok, decoded = pcall(vim.json.decode, raw)
+          if ok and type(decoded) == "table" then out[#out + 1] = unpack_binary(decoded) end
+        end
+      end
+    end
+  end
+  return out
+end
+
+--- 异步列出全部变更单元：扫描/读盘/解码在 worker 内完成；主线程只合并内存中尚未落盘的
+--- 最新写入（write-behind 缓存）并按 created_at 排序。
+--- @return Deferred resolve(table[])
+function M.list_reviews_async()
+  if not state.root then return async.resolve({}) end
+  local work = require("NeoAI.utils.work")
+  if not work.available() then return async.resolve(M.list_reviews()) end
+  local dir = _reviews_dir()
+  return work.run_codec(_list_reviews_worker, {
+    dir = dir, bytes_key = require("NeoAI.utils.json").BYTES_KEY,
+  }):then_(function(items)
+    local by_id, out = {}, {}
+    for _, item in ipairs(items or {}) do
+      if type(item) == "table" and item.change_set_id then by_id[item.change_set_id] = item end
+    end
+    -- 尚未落盘的最新内容优先（与 `_list_json_dir` 语义一致）。
+    for path, encoded in pairs(write_state.mem) do
+      if path:sub(1, #dir + 1) == dir .. "/" then
+        local decoded = json.decode_lossless(encoded)
+        if type(decoded) == "table" and decoded.change_set_id then
+          by_id[decoded.change_set_id] = decoded
+        end
+      end
+    end
+    for _, item in pairs(by_id) do out[#out + 1] = item end
+    table.sort(out, function(a, b) return (a.created_at or 0) < (b.created_at or 0) end)
+    return out
+  end, function()
+    -- worker/解码失败：回退同步路径（正确性优先；调用方仍在异步链上）。
+    return M.list_reviews()
+  end)
 end
 
 --- 删除变更单元
@@ -1024,7 +1184,9 @@ function M.write_snapshot_async(record)
   _snapshot_cache_invalidate(record.snapshot_id)
   _encode_and_write(path, record)
   _encode_and_write(mpath, _snapshot_meta(record))
-  return async.resolve(true)
+  return async.all({ M.when_written(path), M.when_written(mpath) }):then_(function()
+    return true
+  end)
 end
 
 --- 读取应用快照元数据（不含 `alt_content`）：优先读元数据文件，缺失时回退完整快照并剥离。

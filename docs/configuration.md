@@ -257,6 +257,25 @@ approval = {
 > 亦可在 `:NeoAISandboxReview`「资源访问」页按 `E` 打开目录编辑器热增删本列表（及遮蔽目录
 > `sandbox.mask_dirs`、切换 `sandbox.mask_dirs_enabled`）——**仅当前会话生效，不写盘**。
 
+**worker（后台任务进程）**：
+
+```lua
+worker = {
+  enabled = true,                  -- 主进程只做 UI；纯 Lua 任务交给后台 worker
+  mode = "on_demand",              -- on_demand | always | off
+  offload = "all",                 -- all | large
+  min_bytes = 0,                   -- offload="large" 阈值
+  max_concurrency = 4,             -- worker 内并行槽（UV_THREADPOOL_SIZE）
+  idle_ttl_ms = 60000,             -- 无任务/无 pin 后回收
+  startup_timeout_ms = 5000,
+  request_timeout_ms = 120000,
+  max_restarts = 3,
+  restart_backoff_ms = { 200, 1000, 3000 },
+  max_pending = 64,
+  log_max_bytes = 1024 * 1024,
+},
+```
+
 **sandbox（工具执行沙箱）**：
 
 ```lua

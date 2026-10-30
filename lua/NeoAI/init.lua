@@ -34,6 +34,11 @@ local function _register_shutdown_hooks()
   kernel.lifecycle.on_shutdown(function()
     require("NeoAI.kernel.plugins").stop_all()
   end)
+  -- 逆序执行：本钩子比 stop_all 后注册 → 先停后台 worker，避免它继续向正在销毁的客户端
+  -- 回写结果。worker 是纯任务进程，与插件/服务生命周期无关。
+  kernel.lifecycle.on_shutdown(function()
+    pcall(function() require("NeoAI.utils.remote_work").stop(1000) end)
+  end)
   kernel.lifecycle.on_shutdown(function()
     local chat = services.use("services.chat_service")
     if chat and chat.persist_active_sessions then

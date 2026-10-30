@@ -105,6 +105,62 @@ local function _rehydrate_pending()
   end
 end
 
+--- 只保留未被部分取代的候选文件（物化用）。
+local function _filter_superseded(cand, item)
+  local sup = item.superseded_paths
+  if type(sup) ~= "table" or not next(sup) then return cand end
+  local filtered = {}
+  for _, f in ipairs(cand.files or {}) do
+    if not sup[f.path] then filtered[#filtered + 1] = f end
+  end
+  local copy = {}
+  for k, v in pairs(cand) do copy[k] = v end
+  copy.files = filtered
+  return copy
+end
+
+--- 异步重新物化待审候选：候选读盘/解码在线程/worker，合并写盘用 merge_candidate_async；
+--- 每完成一项让出主循环，避免大量待审项在启动后集中冻结界面。
+local function _rehydrate_pending_async()
+  local ok, items = pcall(review.list)
+  if not ok or type(items) ~= "table" then return end
+  local i = 0
+  local function step()
+    i = i + 1
+    local item = items[i]
+    if not item then return end
+    local st, ap = item.review_state, item.apply_state
+    local keep = st == review.REVIEW.PENDING
+      or (st == review.REVIEW.APPROVED and ap == review.APPLY.NOT_REQUESTED)
+    if not keep or not item.candidate_digest then
+      vim.defer_fn(step, 0)
+      return
+    end
+    local ok_read, d = pcall(store.read_candidate_async, item.candidate_digest)
+    if not ok_read or not d or type(d.then_) ~= "function" then
+      vim.defer_fn(step, 0)
+      return
+    end
+    d:then_(function(cand)
+      if not cand then vim.defer_fn(step, 0); return end
+      cand = _filter_superseded(cand, item)
+      local ok_m, md = pcall(candidate.merge_candidate_async, cand)
+      if not ok_m or not md or type(md.then_) ~= "function" then
+        vim.defer_fn(step, 0)
+        return
+      end
+      md:then_(function()
+        vim.defer_fn(step, 0)
+      end, function()
+        vim.defer_fn(step, 0)
+      end)
+    end, function()
+      vim.defer_fn(step, 0)
+    end)
+  end
+  step()
+end
+
 -- ========== 公开 API ==========
 
 --- 初始化：准备本进程隔离的存储，并水合本进程的待审队列。
@@ -118,7 +174,16 @@ function M.init()
   cache.init(root)
   candidate.ensure_dirs(root)
   state.initialized = true
-  _rehydrate_pending()
+  if vim.g.neoai_test then
+    -- 测试要求确定性/同步水合；生产走异步预热 + 分帧物化。
+    _rehydrate_pending()
+  else
+    review.preload_async():then_(function()
+      vim.schedule(function() pcall(_rehydrate_pending_async) end)
+    end, function()
+      vim.schedule(function() pcall(_rehydrate_pending_async) end)
+    end)
+  end
   -- 启动探测内核级观测后端（eBPF/strace/procfs）：不可用或发生回退时 notify（异步，不阻塞启动）。
   vim.schedule(function()
     pcall(function() require("NeoAI.sandbox.observe.observer").notify_backend() end)
@@ -372,6 +437,25 @@ function M.list_reviews(filter)
   return review.list(filter)
 end
 
+--- 活跃后台任务（捕获/冻结/合并/应用/预览）；供审批窗口显示「执行中」。
+--- @return table[]
+function M.jobs()
+  return require("NeoAI.sandbox.execution.jobs").list()
+end
+
+--- 某变更单元当前的后台任务。
+--- @param id string
+--- @return table|nil
+function M.job_for(id)
+  return require("NeoAI.sandbox.execution.jobs").for_item(id)
+end
+
+--- 后台任务是否活跃。
+--- @return boolean
+function M.jobs_active()
+  return require("NeoAI.sandbox.execution.jobs").any()
+end
+
 --- 按需读取某变更单元中单个文件的候选内容（审批 diff 预览用）。
 --- 内存条目落盘后已剥离 content（避免暂存大量文件时内存翻倍），此处按候选摘要惰性读取。
 --- @param id string change_set_id
@@ -560,6 +644,13 @@ end
 --- @return table
 function M.apply_all(opts)
   return review.apply_all(opts)
+end
+
+--- 异步批量应用（逐项让出主循环；返回 Deferred resolve({ applied, failed })）。
+--- @param opts table|nil
+--- @return Deferred
+function M.apply_all_async(opts)
+  return review.apply_all_async(opts)
 end
 
 --- 开始批量应用会话：会话内 apply(id, { batch = ctx }) 把候选删除推迟到 end_batch
@@ -1091,6 +1182,7 @@ function M.reset()
   -- 回收保活的后台命令资源域（先于 `cgroup.reset()`，以便在句柄状态被清空前 kill + 删除）。
   pcall(function() require("NeoAI.sandbox.execution.wrapper").release_persistent_backgrounds() end)
   candidate.reset()
+  require("NeoAI.sandbox.execution.jobs").reset()
   control.reset()
   store.reset()
   runtime.reset()

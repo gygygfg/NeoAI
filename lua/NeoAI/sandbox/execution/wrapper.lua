@@ -1058,15 +1058,23 @@ local function _persist_and_settle(cand, attempt, ctx, cfg, spec, result, proces
     -- 之后写候选 JSON 只含元数据（体积/编解码开销大减）；发布按文件复制/解密。
     return candidate.blobify_async(cand)
   end):then_(function()
-    store.write_candidate_async(cand)
-    -- 确保候选**落盘**后再入待审：`write_candidate_async` 只把写入排入线程池，进程在写入完成
-    -- 前退出/热重载或写入失败都会使待审项指向一个不存在的候选，用户应用时报
-    -- `CANDIDATE_NOT_FOUND`。此处有界等待落盘（大候选约百 ms～数百 ms，且在主线程异步链上，
-    -- 不阻塞 Agent 拿到命令结果），保证入队即已持久化。
-    logger.try("store_flush", store.flush, 30000)
-    _profile("persist", (vim.uv.hrtime() - _t_persist) / 1e6,
-      "files=" .. tostring(#(cand.files or {})))
-    return _settle_candidate(cand, attempt, ctx, cfg, spec, result, process_info, pre)
+    -- 确保候选**落盘**后再入待审：等待 write_candidate_async 的真实完成回调，而不是在
+    -- 主线程 `vim.wait` 轮询。写入失败也继续入队（内存缓存仍可读回），但记录诊断。
+    local written = store.write_candidate_async(cand)
+    return written:then_(function(ok)
+      if ok == false then
+        logger.warn("[sandbox] 候选落盘失败，仍以内存缓存入待审: %s",
+          tostring(cand.candidate_digest))
+      end
+      _profile("persist", (vim.uv.hrtime() - _t_persist) / 1e6,
+        "files=" .. tostring(#(cand.files or {})))
+      return _settle_candidate(cand, attempt, ctx, cfg, spec, result, process_info, pre)
+    end, function(err)
+      logger.warn("[sandbox] 候选落盘异常: %s", tostring(err and (err.message or err) or err))
+      _profile("persist", (vim.uv.hrtime() - _t_persist) / 1e6,
+        "files=" .. tostring(#(cand.files or {})))
+      return _settle_candidate(cand, attempt, ctx, cfg, spec, result, process_info, pre)
+    end)
   end)
 end
 
@@ -2674,10 +2682,11 @@ local function _gate_inner(tool, args, ctx, call_original)
     local d = async.Deferred.new()
     -- 带外观测句柄（ebpf/procfs）已在 staging 前启动；进程退出后停止并冲刷事件。
     local function _stop_observe()
-      -- 写日志：capture 前确保在途/排队的解析 job 全部派发完成（否则写集不完整 → 不可信）。
+      -- 写日志：**不在主线程同步 drain**（旧实现最多阻塞 1s/命令）。未确认排空时把
+      -- `_journal_drained=false`，capture 自动回退全量遍历（现已在线程/worker 内执行），
+      -- 正确性不变，主线程不再被观测器冲刷阻塞。
       if observe_handle and observe_handle.drain then
-        local ok, drained = pcall(observe_handle.drain, 1000)
-        ctx._journal_drained = (ok and drained == true)
+        ctx._journal_drained = false
       end
       if observe_handle then pcall(observe_handle.stop) end
       observe_handle = nil
@@ -2915,6 +2924,10 @@ local function _gate_inner(tool, args, ctx, call_original)
           tostring(ctx._journal_drained), tostring(ctx._observed_relative), nw, nd,
           journal_hint and "hint(incremental)" or "full")
       end
+      local _job = require("NeoAI.sandbox.execution.jobs").begin({
+        kind = "stage", attempt_id = attempt.attempt_id,
+        label = "暂存/冻结",
+      })
       local chain = _serialize_capture(function()
         local captures = {}
         local pkg_opts = { package = attempt.package == true, since = attempt.started_at }
@@ -2953,6 +2966,13 @@ local function _gate_inner(tool, args, ctx, call_original)
             command_id = attempt.command_id,
           } }
         end)
+      end)
+      -- 后台任务状态：只用于 UI「执行中」高亮，不改变结算语义。
+      chain:then_(function(settled)
+        require("NeoAI.sandbox.execution.jobs").finish(
+          _job, not (settled and settled.ok == false), settled and settled.err and settled.err.message or nil)
+      end, function(e)
+        require("NeoAI.sandbox.execution.jobs").finish(_job, false, tostring(e and (e.message or e) or e))
       end)
       if (cfg.postprocess or "async") == "sync" then
         -- 同步模式（测试/确定性）：等待捕获→冻结→合并→落盘→结算完成后再返回结果。

@@ -146,7 +146,12 @@ M.SANDBOX_REVIEW_ENQUEUED = "sandbox:review_enqueued"
 M.SANDBOX_REVIEW_APPROVED = "sandbox:review_approved"
 M.SANDBOX_REVIEW_REJECTED = "sandbox:review_rejected"
 M.SANDBOX_REVIEW_SUPERSEDED = "sandbox:review_superseded"
+M.SANDBOX_REVIEW_HYDRATED = "sandbox:review_hydrated"
 M.SANDBOX_APPLIED = "sandbox:applied"
+-- 后台任务（worker 捕获/冻结/合并/落盘/应用/预览）状态：审批窗口据此高亮「执行中」条目。
+M.SANDBOX_JOB_STARTED = "sandbox:job_started"
+M.SANDBOX_JOB_UPDATED = "sandbox:job_updated"
+M.SANDBOX_JOB_FINISHED = "sandbox:job_finished"
 -- 撤销保存：把真实文件回滚到应用前内容，并把变更单元移回待审（payload.requeued=true）。
 -- 历史遗留的「已撤销」记录 `u` 重做保存时也会发此事件（apply_state APPLIED ↔ REVERTED）。
 M.SANDBOX_REVERTED = "sandbox:reverted"
