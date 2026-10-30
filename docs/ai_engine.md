@@ -121,6 +121,10 @@ _runtime._run_generation(agent, opts)
 - **推理内容（reasoning_content）不随历史回传**：避免每次请求重复发送整段思维链、
   使 DeepSeek 前缀缓存从该 assistant 消息起字节不一致而失效。内部 `message.reasoning`
   仍保留用于渲染。
+- **运行时上下文快照**（`core/session/runtime_context.lua`）：todo/计划模式/常驻技能等易变
+  状态以追加快照注入历史，内容变化才追加新快照，旧快照不改写。支持 messages 中途 system 的
+  端点（DeepSeek 两种协议）使用 `role="system"` 提升优先级；其余端点回退 `user`。两种角色
+  都保持严格追加扩展，不改写系统提示前缀。
 
 ## 4. 工具调用循环（tool_loop.lua）
 

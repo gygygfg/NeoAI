@@ -12,6 +12,7 @@ tests.suite("model_capabilities", function(_, it)
         providers = {
           deepseek = { api_type = "openai", base_url = "http://x", api_key = "k" },
           anthropic = { api_type = "anthropic", base_url = "http://a", api_key = "k" },
+          ds_anthropic = { api_type = "anthropic", base_url = "http://d", api_key = "k" },
           google = { api_type = "google", base_url = "http://g", api_key = "k" },
         },
       },
@@ -36,6 +37,15 @@ tests.suite("model_capabilities", function(_, it)
     t.eq(1048576, g.context_window)
     t.eq("gemini", g.cache_kind)
     t.eq(2048, g.min_cacheable)
+  end)
+
+  it("DeepSeek Anthropic 兼容端点：anthropic usage + 自动缓存（无显式断点）", function(t)
+    load()
+    local caps = require("NeoAI.core.model.capabilities")
+    local d = caps.resolve("deepseek-flash", "ds_anthropic")
+    t.eq("anthropic", d.cache_kind)
+    t.false_(d.explicit_cache)
+    t.nil_(d.max_breakpoints)
   end)
 
   it("未知模型回退协议族默认 / 兜底", function(t)

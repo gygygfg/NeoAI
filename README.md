@@ -10,7 +10,7 @@
 
 - **多 AI 提供商支持** — 内置 DeepSeek、OpenAI、Anthropic、Google Gemini、Groq、Together AI、OpenRouter、SiliconFlow、月之暗面、智谱、百度、阿里云、阶跃星辰等 13+ 家 AI 服务商
   - (钞能力有限，只测试了DeepSeek)
-- **按模型自动选择** — 请求参数格式与缓存命中计算方案随模型自动适配：协议族编解码（OpenAI/Anthropic/Gemini 消息·工具·图像）+ 厂商方言（`max_tokens`/`max_completion_tokens`、`reasoning_effort`/`thinking`/`enable_thinking` 等）+ 模型能力表（上下文窗口/输出上限/缓存机制）+ 显式缓存（Anthropic 断点 / OpenAI explicit / Gemini `cachedContents`，失败自动降级为隐式），未知模型安全回退（见 [docs/model_policy.md](docs/model_policy.md)）
+- **按模型自动选择** — 请求参数格式与缓存命中计算方案随模型自动适配：协议族编解码（OpenAI/Anthropic/Gemini 消息·工具·图像）+ 厂商方言（`max_tokens`/`max_completion_tokens`、`reasoning_effort`/`thinking`/`enable_thinking` 等）+ 模型能力表（上下文窗口/输出上限/缓存机制）+ 显式缓存（Anthropic 断点 / OpenAI explicit / Gemini `cachedContents`，失败自动降级为隐式）+ 推理强度（`ai.reasoning_effort` low/high/max，辅助调用默认关思考）+ 历史 system 快照（DeepSeek 上运行态使用 system 角色，保持追加式前缀），未知模型安全回退（见 [docs/model_policy.md](docs/model_policy.md)）
 - **场景化模型配置** — 按场景（聊天、编程、思考、工具执行、子 Agent、窗口命名）分配不同的 AI 模型和参数
 - **流式响应** — 实时流式显示 AI 生成内容，支持推理过程（reasoning）展示
 - **树形会话管理** — 基于分支树管理多个对话会话，支持分支创建、切换、删除
@@ -275,6 +275,8 @@ require("NeoAI").setup({
     truncation = { enabled = true, max_continues = 3 },
 
     reasoning_enabled = true,            -- 启用深度思考模式
+    -- reasoning_effort = "high",        -- low / high / max（DeepSeek；nil=提供商默认）
+    aux_reasoning = false,               -- 辅助调用（压缩/计划提取/沙箱审计）是否保留思考
     system_prompt = "你是一个AI编程助手，帮助用户解决编程问题。",
     timeout_ms = 60000,                  -- 请求超时
     max_retries = 3,                     -- 请求重试次数

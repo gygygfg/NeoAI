@@ -4,9 +4,11 @@
 --- - 系统提示（identity/persona）必须逐字节稳定，才能复用 DeepSeek 前缀缓存；
 ---   任何易变运行态（当前任务清单 todo、计划模式等）不能放进系统提示，否则改动会让
 ---   从那个位置起的整段历史缓存失效（命中率骤降）。
---- - 因此把易变运行态渲染成一条 user 角色「运行时上下文快照」消息追加进历史：
+--- - 因此把易变运行态渲染成一条「运行时上下文快照」消息追加进历史：
 ---   快照只在内容变化时才追加新的（newer supersedes older），旧快照永不改写 → 请求保持
 ---   严格追加扩展（append-extension），系统提示稳定，只有变化的快照尾部短暂失效。
+--- - 支持 messages 中途 system 的端点（如 DeepSeek）使用 system 角色，让运行态具备
+---   系统级优先级；其余端点回退 user 角色（旧行为）。角色只影响单条消息，追加语义不变。
 
 local M = {}
 
@@ -16,6 +18,31 @@ local SNAPSHOT_PREFIX = "当前运行上下文。此快照取代更早的运行�
 local CLEARED_TEXT = "当前运行上下文：无。更早的运行上下文快照不再适用。"
 
 -- ========== 私有函数 ==========
+
+--- 解析当前 Agent 的方言，判断快照能否使用 system 角色。
+--- 先用 user 角色是保守基线；只有端点明确支持 messages 中途 system（如 DeepSeek）
+--- 才提升为 system。这样运行态具备系统级优先级，同时保持严格追加扩展（缓存稳定）。
+--- @param agent table
+--- @return string "system" | "user"
+local function _snapshot_role(agent)
+  local ok, profiles = pcall(require, "NeoAI.core.model.profiles")
+  if not ok or not profiles.resolve then return "user" end
+  local config_store = require("NeoAI.kernel.config_store")
+  local ac = (agent and agent.config) or {}
+  local provider_name = ac.provider or config_store.get("ai.default_provider")
+  local provider = provider_name and config_store.get("ai.providers." .. provider_name) or {}
+  local model = (agent and agent.model) or ac.model
+  if (not model or model == "auto") and provider_name then
+    local ok2, registry = pcall(require, "NeoAI.core.model.registry")
+    if ok2 and registry.resolve_default then
+      local ok3, resolved = pcall(registry.resolve_default, provider_name)
+      if ok3 then model = resolved end
+    end
+  end
+  local ok4, dialect = pcall(profiles.resolve, provider_name, provider, model)
+  if ok4 and dialect and dialect.system_in_history == true then return "system" end
+  return "user"
+end
 
 --- 渲染当前运行上下文（todos + 计划模式 + 已装载技能），空则返回 ""
 --- @param agent table
@@ -97,7 +124,7 @@ function M.ensure(agent)
   if text ~= "" then
     if last and last.content == text then return nil end
     local msg = {
-      role = "user",
+      role = _snapshot_role(agent),
       content = text,
       ts = os.time(),
       runtime_context = true,
@@ -108,7 +135,7 @@ function M.ensure(agent)
   -- 无运行态：若历史里已有旧快照，追加一条清除标记（沿用 supersede 语义）
   if last then
     local msg = {
-      role = "user",
+      role = _snapshot_role(agent),
       content = CLEARED_TEXT,
       ts = os.time(),
       runtime_context = true,

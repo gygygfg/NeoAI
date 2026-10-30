@@ -54,13 +54,33 @@ provider_name + provider + model
 | Dimension | OpenAI/DeepSeek | OpenAI o series | Anthropic | Gemini |
 | --- | --- | --- | --- | --- |
 | Output limit field | `max_tokens` | `max_completion_tokens` | `max_tokens` (required) | `generationConfig.maxOutputTokens` |
-| Reasoning switch | — | `reasoning_effort` | `thinking:{type:"enabled",budget_tokens}` (temperature must be 1) | `generationConfig.thinkingConfig` |
+| Reasoning switch | `thinking:{type:"enabled"/"disabled"}` (DeepSeek); other OpenAI-compatible vendors use their dialect | `reasoning_effort` | `thinking:{type:"enabled",budget_tokens}` or `output_config:{effort}` (temperature must be 1) | `generationConfig.thinkingConfig` |
 | Reasoning stream | `reasoning_content` / `reasoning` | Same | `thinking`/`thinking_delta` blocks (with signature) | part `thought:true` |
 | Auth | `Authorization: Bearer` | Same | `x-api-key` + `anthropic-version` | URL `?key=` |
 | usage | `prompt_tokens` (including hits) | Same | `input_tokens` / `output_tokens` (input excludes hits) | `usageMetadata.*TokenCount` |
 
 Third-party OpenAI-compatible dialects: SiliconFlow/Alibaba Cloud `enable_thinking`, Zhipu
 `thinking:{type}`, OpenRouter `reasoning:{enabled,exclude}`, Groq `reasoning_format`.
+
+**DeepSeek reasoning controls**: on the OpenAI protocol, send `reasoning_effort`
+(`low`/`high`/`max`, default `high`) with `thinking:{type:"enabled"|"disabled"}`; the
+Anthropic-compatible endpoint uses `output_config:{effort}` (`budget_tokens` is ignored).
+`ai.reasoning_effort` applies to every request, while `ai.aux_reasoning=false` makes
+compaction/extraction/sandbox-audit auxiliary calls explicitly disable thinking. Measured:
+`medium` is mapped to `high` server-side; NeoAI normalizes DeepSeek effort to
+`low`/`high`/`max` in the dialect layer. The Anthropic-compatible endpoint still uses
+automatic prefix caching (`cache_read_input_tokens`, resolved as the Anthropic cache kind)
+but ignores `cache_control`, so NeoAI sends no explicit breakpoints by default; force them
+with `model_policy.overrides.<provider>.explicit=true` if needed.
+
+**In-history system messages (`system_in_history`)**: supported endpoints (both DeepSeek
+protocols in our tests) accept `role:"system"` anywhere in `messages`, and the latest one is
+the effective system prompt. NeoAI uses this to raise runtime-context snapshots to the
+`system` role (other endpoints fall back to `user`) while keeping strict append-extension.
+For the Anthropic protocol, later system messages are preserved only when the dialect sets
+`system_in_history=true`; otherwise they are merged into the top-level `system`. Native
+Anthropic defaults to off (older Claude models reject it); opt in explicitly with
+`ai.model_policy.dialects.anthropic = { system_in_history = true }`.
 
 ## 4. Model Numeric Metadata: Prefer Live Retrieval
 
@@ -155,7 +175,7 @@ ai = {
   priority; otherwise it is derived from the model capability table, and unknown models fall back
   to 64000 (so the default value does not mask real windows such as Gemini 1M / Claude 200k).
 
-**`reasoning_kind` values**: `none` / `effort` / `budget` / `enable_thinking` / `thinking_object` / `openrouter_object` / `thinking_config`.
+**`reasoning_kind` values**: `none` / `effort` / `budget` / `output_config_effort` / `enable_thinking` / `thinking_object` / `openrouter_object` / `thinking_config`.
 
 **Degradation guarantee**: when explicit cache injection or remote cache object creation fails, it
 **silently degrades to implicit caching** and never blocks the request; after compaction, explicit

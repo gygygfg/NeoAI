@@ -122,6 +122,10 @@ emitting `TOOL_CALL_DETECTED`) and emits `TOOL_ARG_COMPLETED`.
 - **Reasoning content (reasoning_content) is not sent back with the history**: this avoids resending the whole chain of thought on every request,
   which would make DeepSeek's prefix cache byte-inconsistent from that assistant message onward and thus invalidate it. The internal `message.reasoning`
   is still kept for rendering.
+- **Runtime-context snapshots** (`core/session/runtime_context.lua`): volatile state such as todos, plan mode, and persisted skills is injected into
+  history as append-only snapshots; a new snapshot is appended only when the content changes, and old snapshots are never rewritten. Endpoints that
+  accept mid-history system messages (both DeepSeek protocols) use `role="system"` for higher priority; other endpoints fall back to `user`. Both
+  roles keep strict append-extension and never rewrite the system-prompt prefix.
 
 ## 4. Tool Call Loop (tool_loop.lua)
 

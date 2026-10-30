@@ -24,6 +24,8 @@ local PROTOCOLS = {
     stream_usage = true, -- OpenAI 兼容需 stream_options.include_usage 才回传 usage
     cache_directive = "none",
     max_tokens_required = false, -- 未传则不发送（由厂商默认决定）
+    system_in_history = false, -- 是否允许 messages 中途追加 role=system（按模型/厂商开启）
+    thinking_toggle = false, -- 是否支持 thinking:{type=enabled|disabled} 显式开关
   },
   anthropic = {
     protocol = "anthropic",
@@ -34,6 +36,8 @@ local PROTOCOLS = {
     stream_usage = false,
     cache_directive = "anthropic_auto",
     max_tokens_required = true, -- Anthropic 的 max_tokens 为必填，未传时用能力表兼底
+    system_in_history = false, -- 老 Claude 模型不支持中途 system；按模型显式开启
+    thinking_toggle = false,
   },
   google = {
     protocol = "google",
@@ -44,6 +48,8 @@ local PROTOCOLS = {
     stream_usage = false,
     cache_directive = "none",
     max_tokens_required = false,
+    system_in_history = false,
+    thinking_toggle = false,
   },
 }
 
@@ -58,7 +64,18 @@ local PROFILES = {
     reasoning_kind = "effort",
     default_effort = "medium",
   },
-  deepseek = { protocol = "openai", reasoning_kind = "none" },
+  -- DeepSeek：OpenAI 协议下用 reasoning_effort + thinking 显式开关（实测低/高/最大三档；
+  -- 未传时默认 high 且思考开启）。system_in_history：实测 messages 中途 system 可用。
+  deepseek = {
+    protocol = "openai", reasoning_kind = "effort", default_effort = "high",
+    effort_map = "deepseek", thinking_toggle = true, system_in_history = true,
+  },
+  -- DeepSeek 的 Anthropic 兼容端点：推理用 output_config.effort（budget_tokens 会被忽略）。
+  -- 仅在 provider.api_type="anthropic" 时命中；模型 id 仍走 deepseek 前缀。
+  deepseek_messages = {
+    protocol = "anthropic", reasoning_kind = "output_config_effort", default_effort = "high",
+    effort_map = "deepseek", thinking_toggle = true, system_in_history = true,
+  },
   groq = { protocol = "openai", reasoning_kind = "none" },
   together = { protocol = "openai", reasoning_kind = "none" },
   openrouter = { protocol = "openai", reasoning_kind = "openrouter_object" },
@@ -82,6 +99,7 @@ local MODEL_PROFILES = {
   { pat = "claude", profile = "anthropic" },
   { pat = "gemini", profile = "google" },
   { pat = "deepseek", profile = "deepseek" },
+  { pat = "deepseek", profile = "deepseek_messages" },
 }
 
 -- ========== 私有函数 ==========
@@ -170,6 +188,27 @@ function M.resolve(provider_name, provider, model)
 
   dialect.name = dialect.profile or provider_name or protocol
   return dialect
+end
+
+--- DeepSeek effort 归一化：官方只稳定支持 low / high / max 三档；
+--- 其余常见档位按官方映射收敛（minimal→low、medium/xhigh→high、ultra→max）。
+local DEEPSEEK_EFFORT_MAP = {
+  minimal = "low", low = "low",
+  medium = "high", high = "high", xhigh = "high",
+  max = "max", ultra = "max",
+}
+
+--- 归一化推理强度（按方言）
+--- @param dialect table|nil
+--- @param effort string|nil 用户配置/调用方传入
+--- @return string|nil 归一化后的 effort（nil 表示交由厂商默认）
+function M.normalize_effort(dialect, effort)
+  local value = type(effort) == "string" and effort:lower() or nil
+  if dialect and dialect.effort_map == "deepseek" then
+    if value then value = DEEPSEEK_EFFORT_MAP[value] end
+    return value or dialect.default_effort or "high"
+  end
+  return value or (dialect and dialect.default_effort)
 end
 
 --- 是否需要 thinking（推理）参数

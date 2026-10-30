@@ -204,10 +204,11 @@ function M.build(session, opts)
   -- 请求视图：应用会话持久化的压缩覆盖层（渲染仍用原始 session.messages）
   local comp = session.metadata and session.metadata.compaction
   local source = _apply_overlay(session.messages, comp)
-  -- 截断历史（保留最近的 max_history 条非 system）
+  -- 截断历史（保留最近的 max_history 条非 system；运行态/系统更新快照例外——
+  -- 它们以 system 角色追加在历史里，必须保留，否则会丢失运行态）
   local non_system = {}
   for _, m in ipairs(source) do
-    if m.role ~= "system" then
+    if m.role ~= "system" or m.runtime_context or m.system_update then
       non_system[#non_system + 1] = m
     end
   end

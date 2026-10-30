@@ -294,6 +294,8 @@ function openai.build_body(opts)
     local kind = d.reasoning_kind or "none"
     if kind == "effort" then
       body.reasoning_effort = opts.reasoning_effort or d.default_effort or "medium"
+      -- DeepSeek 支持显式 thinking 开关；未传时服务端默认开启，这里显式声明避免歧义。
+      if d.thinking_toggle then body.thinking = { type = "enabled" } end
     elseif kind == "enable_thinking" then
       body.enable_thinking = true
     elseif kind == "thinking_object" then
@@ -301,6 +303,10 @@ function openai.build_body(opts)
     elseif kind == "openrouter_object" then
       body.reasoning = { enabled = true, exclude = false }
     end
+  elseif d.thinking_toggle then
+    -- 辅助调用/用户关闭推理：DeepSeek 需要显式 disabled 才会真正停止思考
+    -- （省略参数时服务端仍默认开启）。
+    body.thinking = { type = "disabled" }
   end
 
   if opts.stream and d.stream_usage ~= false then
@@ -403,10 +409,18 @@ end
 function anthropic.encode_messages(messages, dialect)
   local system_chunks = {}
   local out = {}
+  -- system_in_history：首个 system 作为顶层完整提示，后续 system 原样保留在 messages 中
+  -- （模型把最新的 system 当作当前有效系统提示）。这样追加式改提示不会重写顶层前缀，
+  -- 已有的前缀缓存仍然命中；不支持的模型/端点保持旧的「全部合并到顶层」行为。
+  local in_history = dialect and dialect.system_in_history == true
   for _, m in ipairs(messages or {}) do
     if m.role == "system" then
       if type(m.content) == "string" and m.content ~= "" then
-        system_chunks[#system_chunks + 1] = m.content
+        if in_history and #system_chunks > 0 and #out > 0 then
+          out[#out + 1] = { role = "system", content = { { type = "text", text = m.content } } }
+        else
+          system_chunks[#system_chunks + 1] = m.content
+        end
       end
     elseif m.role == "tool" then
       out[#out + 1] = {
@@ -495,6 +509,14 @@ function anthropic.build_body(opts)
     -- Anthropic 扩展思考：开启后 temperature 必须为 1（或省略）
     body.thinking = { type = "enabled", budget_tokens = opts.reasoning_budget or 2048 }
     body.temperature = 1
+  elseif opts.reasoning_enabled and d.reasoning_kind == "output_config_effort" then
+    -- DeepSeek 的 Anthropic 兼容端点：budget_tokens 会被忽略，用 output_config.effort
+    -- （low/high/max）控制思考强度；开启思考时同样要求 temperature=1。
+    body.output_config = { effort = opts.reasoning_effort or d.default_effort or "high" }
+    body.temperature = 1
+  elseif not opts.reasoning_enabled and d.thinking_toggle then
+    body.thinking = { type = "disabled" }
+    if opts.temperature and d.temperature_supported ~= false then body.temperature = opts.temperature end
   elseif opts.temperature and d.temperature_supported ~= false then
     body.temperature = opts.temperature
   end

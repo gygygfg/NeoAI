@@ -135,6 +135,8 @@ function M.generate(item, target, on_done)
       max_tokens = cfg.max_tokens or 256,
       max_retries = 0,
       timeout_ms = cfg.timeout_ms or 15000,
+      -- 短文案警示：默认关思考，降低审批路径的尾延迟。
+      reasoning_enabled = config_store.get("ai.aux_reasoning") == true,
     })
   end)
   if not ok or not d or type(d.then_) ~= "function" then

@@ -244,6 +244,9 @@ local function _summarize(agent, shadow, cfg)
     tools = tool_defs,
     signal = agent.signal,
     max_tokens = cfg.compact_max_tokens or 8192,
+    -- 辅助调用默认关思考（ai.aux_reasoning=false）：摘要/提取类任务不需要长思维链，
+    -- 关掉可显著降延迟与 token；需要时可用配置恢复。
+    reasoning_enabled = config_store.get("ai.aux_reasoning") == true,
   })
 end
 

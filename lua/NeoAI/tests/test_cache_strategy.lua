@@ -258,8 +258,9 @@ tests.suite("cache_strategy", function(_, it)
     local last = captured.messages[#captured.messages]
     t.eq("user", last.role)
     t.true_(last.content:find("compaction engine", 1, true) ~= nil)
-    -- 摘要请求带上工具定义
+    -- 摘要请求带上工具定义；辅助调用默认关思考（ai.aux_reasoning=false）
     t.not_nil(captured.opts.tools)
+    t.eq(false, captured.opts.reasoning_enabled)
     -- 覆盖层：原始消息不被改动（渲染仍原始），请求视图首条为检查点、末轮保留
     t.eq(4, #agent.messages, "原始消息不应被改动")
     t.not_nil(agent.compaction, "应写入压缩覆盖层")

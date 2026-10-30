@@ -37,6 +37,17 @@ tests.suite("protocol_adapter", function(_, it)
     t.eq("enabled", b3.thinking.type)
   end)
 
+  it("OpenAI：DeepSeek 风格 effort + thinking 显式开关", function(t)
+    local a = adapter.get("openai")
+    local d = { reasoning_kind = "effort", default_effort = "high", thinking_toggle = true }
+    local on = a.build_body({ model = "deepseek-flash", messages = {}, reasoning_enabled = true, reasoning_effort = "max", dialect = d })
+    t.eq("max", on.reasoning_effort)
+    t.eq("enabled", on.thinking.type)
+    local off = a.build_body({ model = "deepseek-flash", messages = {}, reasoning_enabled = false, dialect = d })
+    t.nil_(off.reasoning_effort)
+    t.eq("disabled", off.thinking.type)
+  end)
+
   it("OpenAI：流式自动加 stream_options.include_usage", function(t)
     local a = adapter.get("openai")
     local b = a.build_body({ model = "m", messages = {}, stream = true, dialect = { stream_usage = true } })
@@ -103,6 +114,41 @@ tests.suite("protocol_adapter", function(_, it)
     local b = a.build_body({ model = "claude", messages = {}, reasoning_enabled = true, temperature = 0.3, dialect = { reasoning_kind = "budget" } })
     t.eq(1, b.temperature)
     t.eq("enabled", b.thinking.type)
+  end)
+
+  it("Anthropic：output_config.effort（DeepSeek 兼容端点）与 disabled", function(t)
+    local a = adapter.get("anthropic")
+    local d = { reasoning_kind = "output_config_effort", default_effort = "high", thinking_toggle = true }
+    local on = a.build_body({ model = "deepseek-flash", messages = {}, reasoning_enabled = true, reasoning_effort = "low", temperature = 0.3, dialect = d })
+    t.eq("low", on.output_config.effort)
+    t.eq(1, on.temperature)
+    t.nil_(on.thinking)
+    local off = a.build_body({ model = "deepseek-flash", messages = {}, reasoning_enabled = false, temperature = 0.3, dialect = d })
+    t.eq("disabled", off.thinking.type)
+    t.eq(0.3, off.temperature)
+    t.nil_(off.output_config)
+  end)
+
+  it("Anthropic：system_in_history 保留后续 system 消息", function(t)
+    local a = adapter.get("anthropic")
+    local msgs = {
+      { role = "system", content = "SYS-1" },
+      { role = "user", content = "q1" },
+      { role = "system", content = "SYS-2" },
+      { role = "assistant", content = "a1" },
+      { role = "user", content = "q2" },
+    }
+    local legacy = a.encode_messages(msgs, {})
+    t.eq("SYS-1\n\nSYS-2", legacy.system)
+    t.eq(3, #legacy.messages)
+
+    local enc = a.encode_messages(msgs, { system_in_history = true })
+    t.eq("SYS-1", enc.system)
+    t.eq("user", enc.messages[1].role)
+    t.eq("system", enc.messages[2].role)
+    t.eq("SYS-2", enc.messages[2].content[1].text)
+    t.eq("assistant", enc.messages[3].role)
+    t.eq("user", enc.messages[4].role)
   end)
 
   it("Gemini：contents + systemInstruction + functionDeclarations + inlineData", function(t)

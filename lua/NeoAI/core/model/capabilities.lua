@@ -135,6 +135,15 @@ function M.resolve(model, provider_name, provider)
     end
   end
 
+  -- DeepSeek 的 Anthropic 兼容端点：自动前缀缓存 + Anthropic usage 字段
+  -- （cache_read_input_tokens）；cache_control 会被服务端忽略，因此默认不打显式断点。
+  -- 用户仍可通过 overrides 显式改回 explicit=true。
+  if api_type == "anthropic" and id:find("deepseek", 1, true) then
+    caps.cache_kind = "anthropic"
+    caps.explicit = false
+    caps.max_breakpoints = nil
+  end
+
   -- 数值能力按优先级覆盖：内置/协议默认 → 实时 → 用户覆盖
   local enabled = config_store.get("ai.model_policy.enabled") ~= false
   local base_src = matched and "builtin" or "api_default"

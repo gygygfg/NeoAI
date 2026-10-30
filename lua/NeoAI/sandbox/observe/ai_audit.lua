@@ -359,6 +359,8 @@ local function _invoke(items, user_messages, opts, on_done)
       max_tokens = cfg.max_tokens or 1024,
       max_retries = 0,
       timeout_ms = cfg.timeout_ms or 30000,
+      -- 审计判定是短分类任务：默认关思考，降低沙箱审批/审计路径延迟。
+      reasoning_enabled = config_store.get("ai.aux_reasoning") == true,
     })
   end)
   if not ok or not d or type(d.then_) ~= "function" then

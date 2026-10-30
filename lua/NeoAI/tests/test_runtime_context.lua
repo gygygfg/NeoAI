@@ -1,7 +1,8 @@
 --- 运行时上下文快照测试
 --- @module 'NeoAI.tests.test_runtime_context'
 --- 对齐 deepseek-harness：易变运行态（todos/计划模式）不以系统提示段注入（否则系统提示
---- 变化会让整段前缀缓存失效），而是以 user 角色「运行时上下文快照」消息追加进历史；
+--- 变化会让整段前缀缓存失效），而是以「运行时上下文快照」消息追加进历史；
+--- 支持 messages 中途 system 的模型用 system 角色，其余回退 user；
 --- 仅在内容变化时追加（newer supersedes older），系统提示保持逐字节稳定。
 
 local tests = require("NeoAI.tests")
@@ -11,7 +12,7 @@ tests.suite("runtime_context", function(_, it)
     return {
       id = id or "agent-1",
       session_id = "s-1",
-      config = {},
+      config = { provider = "deepseek", model = "deepseek-flash" },
       messages = {},
       plan_mode = false,
       plan = nil,
@@ -34,13 +35,25 @@ tests.suite("runtime_context", function(_, it)
     local snap = assert(rc.ensure(agent))
     t.not_nil(snap)
     t.eq(1, #agent.messages)
-    t.eq("user", snap.role)
+    t.eq("system", snap.role, "DeepSeek 支持历史 system，快照应使用 system 角色")
     t.true_(snap.runtime_context)
     t.true_(snap.content:find("当前运行上下文", 1, true) ~= nil)
     t.true_(snap.content:find("任务A", 1, true) ~= nil)
     -- 内容未变：再次 ensure 不应追加
     t.nil_(rc.ensure(agent))
     t.eq(1, #agent.messages)
+    todo.reset()
+  end)
+
+  it("不支持历史 system 的模型回退 user 角色", function(t)
+    local rc = require("NeoAI.core.session.runtime_context")
+    local todo = require("NeoAI.tools.builtin.todo")
+    todo.reset()
+    todo.seed("s-1", { { content = "任务A", status = "pending" } })
+    local agent = fresh_agent()
+    agent.config = { provider = "openai", model = "gpt-4o" }
+    local snap = assert(rc.ensure(agent))
+    t.eq("user", snap.role)
     todo.reset()
   end)
 
@@ -79,7 +92,7 @@ tests.suite("runtime_context", function(_, it)
     local sys = prefix.build_system_prompt(agent)
     t.nil_(sys:find("当前任务清单", 1, true), "系统提示不应含待办")
     t.true_(sys:find("persona", 1, true) ~= nil, "系统提示仍含 persona")
-    -- 待办以 user 快照注入历史
+    -- 待办以快照注入历史（DeepSeek 用 system 角色）
     t.eq(1, #agent.messages)
     t.true_(agent.messages[1].content:find("任务A", 1, true) ~= nil)
     todo.reset()
@@ -99,6 +112,21 @@ tests.suite("runtime_context", function(_, it)
     t.not_nil(snap2)
     t.nil_(snap2.content:find("计划模式", 1, true))
     pm.cleanup(agent)
+  end)
+
+  it("context_builder 保留 system 角色运行态快照", function(t)
+    local cb = require("NeoAI.core.session.context_builder")
+    local session = {
+      messages = {
+        { role = "user", content = "hi" },
+        { role = "system", content = "SNAP", runtime_context = true },
+      },
+    }
+    local out = cb.build(session, { include_system = false, max_history = 10 })
+    t.eq(2, #out)
+    t.eq("user", out[1].role)
+    t.eq("system", out[2].role)
+    t.eq("SNAP", out[2].content)
   end)
 
   it("persist_loaded：已装载技能走历史快照，系统提示保持稳定", function(t)

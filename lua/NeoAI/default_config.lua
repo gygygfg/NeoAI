@@ -128,6 +128,14 @@ local DEFAULT_CONFIG = {
       nudge = "请从中断处继续输出，不要重复已输出的内容。",
     },
     reasoning_enabled = true,
+    -- 推理强度：默认 nil（由提供商默认决定；DeepSeek 为 high）。
+    -- DeepSeek 稳定支持 low / high / max 三档，其余档位按官方映射收敛
+    -- （minimal→low、medium/xhigh→high、ultra→max）。可被 provider.reasoning_effort
+    -- 或单次请求的 opts.reasoning_effort 覆盖。
+    -- reasoning_effort = "high",
+    -- 辅助调用（压缩摘要、计划提取、沙箱 AI 审计/L3 警示）是否保留思考。
+    -- 默认关闭：省延迟与 token；DeepSeek 会显式下发 thinking:{type="disabled"}。
+    aux_reasoning = false,
     system_prompt = "你是一个AI编程助手，帮助用户解决编程问题。",
     timeout_ms = 60000,
     max_retries = 3,

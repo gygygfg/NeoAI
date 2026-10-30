@@ -262,6 +262,9 @@ function M.apply_async(spec)
   local kind = caps.cache_kind
   if not _enabled(kind) then return async.resolve(false) end
   if kind == "anthropic" then
+    -- DeepSeek 的 Anthropic 兼容端点等只支持自动缓存、忽略 cache_control：
+    -- 仍按 anthropic 解析 usage，但不下发显式断点。
+    if caps.explicit_cache == false then return async.resolve(false) end
     _apply_anthropic(spec.body, caps)
     return async.resolve(true)
   elseif kind == "openai" then

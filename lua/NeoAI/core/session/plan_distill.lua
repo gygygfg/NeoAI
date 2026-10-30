@@ -475,6 +475,9 @@ local function _send_extract(agent, messages, cfg, on_chunk)
     -- 提取输出上限：nil（默认）＝不下发 max_tokens，由厂商默认最大输出决定，避免推理型模型
     -- 在固定小上限处被 finish_reason=length 截断、关键字段缺失后触发整轮重试（见 default_config）。
     max_tokens = cfg.extract_max_tokens,
+    -- 计划提取是结构化抽取，不需要长思维链；默认关思考还能规避 deepseek-flash
+    -- 大段 CoT 撞上输出上限导致关键字段缺失、整轮重试的问题。
+    reasoning_enabled = config_store.get("ai.aux_reasoning") == true,
   }, on_chunk):then_(function(resp)
     return resp and resp.content
   end)

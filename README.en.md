@@ -10,7 +10,7 @@
 
 - **Multi-provider AI support** — ships with 13+ AI providers, including DeepSeek, OpenAI, Anthropic, Google Gemini, Groq, Together AI, OpenRouter, SiliconFlow, Moonshot, Zhipu, Baidu, Alibaba Cloud, and StepFun
   - (Limited budget — only DeepSeek has been tested)
-- **Automatic per-model adaptation** — request parameter formats and cache-hit accounting adapt to the model automatically: protocol-family codecs (OpenAI/Anthropic/Gemini messages · tools · images) + vendor dialects (`max_tokens`/`max_completion_tokens`, `reasoning_effort`/`thinking`/`enable_thinking`, etc.) + a model capability table (context window / output limit / cache mechanism) + explicit caching (Anthropic breakpoints / OpenAI explicit / Gemini `cachedContents`, falling back to implicit on failure), with a safe fallback for unknown models (see [docs/en/model_policy.md](docs/en/model_policy.md))
+- **Automatic per-model adaptation** — request parameter formats and cache-hit accounting adapt to the model automatically: protocol-family codecs (OpenAI/Anthropic/Gemini messages · tools · images) + vendor dialects (`max_tokens`/`max_completion_tokens`, `reasoning_effort`/`thinking`/`enable_thinking`, etc.) + a model capability table (context window / output limit / cache mechanism) + explicit caching (Anthropic breakpoints / OpenAI explicit / Gemini `cachedContents`, falling back to implicit on failure) + reasoning effort (`ai.reasoning_effort` low/high/max, with auxiliary calls defaulting to thinking off) + in-history system snapshots (runtime state uses the system role on DeepSeek while keeping append-only prefixes), with a safe fallback for unknown models (see [docs/en/model_policy.md](docs/en/model_policy.md))
 - **Scenario-based model configuration** — assign a different AI model and parameters to each scenario (chat, coding, thinking, tool execution, sub-Agent, window naming)
 - **Streaming responses** — display AI output in real time as a stream, including reasoning traces
 - **Tree-based session management** — manage multiple chat sessions as a branch tree, with branch creation, switching, and deletion
@@ -284,6 +284,8 @@ require("NeoAI").setup({
     truncation = { enabled = true, max_continues = 3 },
 
     reasoning_enabled = true,            -- enable deep reasoning mode
+    -- reasoning_effort = "high",        -- low / high / max (DeepSeek; nil = provider default)
+    aux_reasoning = false,               -- keep thinking for auxiliary calls (compaction/extraction/sandbox audit)?
     system_prompt = "You are an AI coding assistant that helps users solve programming problems.",
     timeout_ms = 60000,                  -- request timeout
     max_retries = 3,                     -- number of request retries

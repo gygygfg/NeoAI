@@ -20,13 +20,43 @@ tests.suite("model_profiles", function(_, it)
     t.false_(d.temperature_supported)
   end)
 
-  it("DeepSeek：openai 协议 + max_tokens", function(t)
+  it("DeepSeek：openai 协议 + max_tokens + effort/thinking 方言", function(t)
     load({ deepseek = { api_type = "openai", base_url = "http://x", api_key = "k" } })
     local profiles = require("NeoAI.core.model.profiles")
     local d = profiles.resolve("deepseek", { api_type = "openai" }, "deepseek-v4-flash")
     t.eq("openai", d.protocol)
     t.eq("max_tokens", d.max_tokens_field)
-    t.eq("none", d.reasoning_kind)
+    t.eq("effort", d.reasoning_kind)
+    t.eq("high", d.default_effort)
+    t.true_(d.thinking_toggle)
+    t.true_(d.system_in_history)
+  end)
+
+  it("DeepSeek Anthropic 兼容端点：output_config.effort + 历史 system", function(t)
+    local profiles = require("NeoAI.core.model.profiles")
+    local provider = { api_type = "anthropic", base_url = "http://x", api_key = "k" }
+    local d = profiles.resolve("ds-anthropic", provider, "deepseek-flash")
+    t.eq("anthropic", d.protocol)
+    t.eq("output_config_effort", d.reasoning_kind)
+    t.true_(d.thinking_toggle)
+    t.true_(d.system_in_history)
+    -- 原生 Anthropic 默认仍走 budget，且不默认开启历史 system
+    local a = profiles.resolve("anthropic", { api_type = "anthropic" }, "claude-x")
+    t.eq("budget", a.reasoning_kind)
+    t.false_(a.system_in_history)
+  end)
+
+  it("DeepSeek effort 归一化：仅保留 low/high/max", function(t)
+    local profiles = require("NeoAI.core.model.profiles")
+    local d = {
+      effort_map = "deepseek", default_effort = "high",
+    }
+    t.eq("low", profiles.normalize_effort(d, "minimal"))
+    t.eq("high", profiles.normalize_effort(d, "medium"))
+    t.eq("high", profiles.normalize_effort(d, "xhigh"))
+    t.eq("max", profiles.normalize_effort(d, "ultra"))
+    t.eq("high", profiles.normalize_effort(d, nil))
+    t.eq("low", profiles.normalize_effort({}, "low"))
   end)
 
   it("Anthropic / Gemini 协议默认", function(t)

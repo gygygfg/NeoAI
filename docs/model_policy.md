@@ -48,13 +48,28 @@ provider_name + provider + model
 | 维度 | OpenAI/DeepSeek | OpenAI o 系列 | Anthropic | Gemini |
 | --- | --- | --- | --- | --- |
 | 输出上限字段 | `max_tokens` | `max_completion_tokens` | `max_tokens`（必填） | `generationConfig.maxOutputTokens` |
-| 推理开关 | — | `reasoning_effort` | `thinking:{type:"enabled",budget_tokens}`（temperature 必须=1） | `generationConfig.thinkingConfig` |
+| 推理开关 | `thinking:{type:"enabled"/"disabled"}`（DeepSeek）；其余 OpenAI 兼容见方言 | `reasoning_effort` | `thinking:{type:"enabled",budget_tokens}` 或 `output_config:{effort}`（temperature 必须=1） | `generationConfig.thinkingConfig` |
 | 推理流出 | `reasoning_content` / `reasoning` | 同 | `thinking`/`thinking_delta` 块（带 signature） | part `thought:true` |
 | 鉴权 | `Authorization: Bearer` | 同 | `x-api-key` + `anthropic-version` | URL `?key=` |
 | usage | `prompt_tokens`（含命中） | 同 | `input_tokens` / `output_tokens`（输入不含命中） | `usageMetadata.*TokenCount` |
 
 第三方 OpenAI 兼容方言：SiliconFlow/阿里云 `enable_thinking`、智谱 `thinking:{type}`、
 OpenRouter `reasoning:{enabled,exclude}`、Groq `reasoning_format`。
+
+**DeepSeek 推理控制**：OpenAI 协议用 `reasoning_effort`（`low`/`high`/`max`，默认 `high`）
+配合 `thinking:{type:"enabled"|"disabled"}`；Anthropic 兼容端点用 `output_config:{effort}`
+（`budget_tokens` 会被忽略）。`ai.reasoning_effort` 对所有请求生效，`ai.aux_reasoning=false`
+让压缩/计划提取/沙箱审计等辅助调用显式关思考。实测 `medium` 会被服务端映射到 `high`，
+NeoAI 在 DeepSeek 方言层先归一化为 `low`/`high`/`max`。Anthropic 兼容端点仍使用自动前缀缓存
+（`cache_read_input_tokens`，能力表按 anthropic 解析），但忽略 `cache_control`，因此默认不下发
+显式断点；需要时可用 `model_policy.overrides.<provider>.explicit=true` 强制。
+
+**历史 system 消息（`system_in_history`）**：支持的端点（实测 DeepSeek 两种协议）允许在
+`messages` 中途放 `role:"system"`，模型把最新一条当作当前有效系统提示。NeoAI 用它把
+运行时上下文快照提升为 `system` 角色（其余端点回退 `user`），保持严格追加扩展；Anthropic
+协议只在方言 `system_in_history=true` 时保留历史 system，否则仍合并到顶层 `system`。
+原生 Anthropic 默认关闭（老 Claude 模型不支持），可显式覆盖：
+`ai.model_policy.dialects.anthropic = { system_in_history = true }`。
 
 ## 4. 模型数值元数据：实时获取优先
 
@@ -131,7 +146,7 @@ ai = {
 - 上下文窗口：`ai.context_cache.context_window` **显式非默认值**优先，否则按模型能力表推导，
   未知模型回退 64000（因此默认值不会屏蔽 Gemini 1M / Claude 200k 等真实窗口）。
 
-**`reasoning_kind` 取值**：`none` / `effort` / `budget` / `enable_thinking` / `thinking_object` / `openrouter_object` / `thinking_config`。
+**`reasoning_kind` 取值**：`none` / `effort` / `budget` / `output_config_effort` / `enable_thinking` / `thinking_object` / `openrouter_object` / `thinking_config`。
 
 **降级保证**：显式缓存注入或远端缓存对象创建失败时**静默降级为隐式缓存**，绝不阻断请求；
 压缩后对显式缓存 `invalidate`（Gemini 删除并待下次重建），会话销毁时 `dispose` 清理。

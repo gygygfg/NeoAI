@@ -39,6 +39,8 @@ See `lua/NeoAI/default_config.lua` for the full configuration. The main sections
 | `modes` | `{chat, plan, auto}` | Per mode → `{provider, model, temperature, stream}` (optional `max_tokens`); applied when entering that mode. If `max_tokens` is not configured, nothing is sent |
 | `truncation` | `{enabled=true, max_continues=3}` | Auto-continues when output is truncated with no tool call (the prompt is not stored), and writes a visible notice once the limit is exceeded |
 | `reasoning_enabled` | `true` | Enables deep thinking (reasoning_content) |
+| `reasoning_effort` | `nil` | Reasoning effort: `low` / `high` / `max`. `nil` = provider default (DeepSeek: `high`); other DeepSeek levels are mapped per the official table (`minimal→low`, `medium/xhigh→high`, `ultra→max`). Can be overridden by `providers.<name>.reasoning_effort` or a single request |
+| `aux_reasoning` | `false` | Whether auxiliary calls (compaction summary, plan extraction, sandbox AI audit/L3 warning) keep thinking; off by default to reduce latency and tokens (DeepSeek sends `thinking:{type="disabled"}` explicitly) |
 | `system_prompt` | Default Chinese prompt | persona section |
 | `timeout_ms` | `60000` | Request timeout |
 | `max_retries` | `3` | Number of request retries |

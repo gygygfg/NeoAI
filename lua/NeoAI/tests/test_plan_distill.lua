@@ -487,6 +487,7 @@ lua/b.lua</Files>
       t.await(p._send_extract(agent, { { role = "user", content = "x" } }, {}))
       t.eq(4096, captured[1].max_tokens, "显式 extract_max_tokens 应下发")
       t.nil_(captured[2].max_tokens, "默认 extract_max_tokens=nil 时不下发 max_tokens（避免截断）")
+      t.eq(false, captured[1].reasoning_enabled, "计划提取默认关思考")
     end)
     request.send_stream = orig
     if not ok then error(err, 0) end

@@ -40,6 +40,8 @@
 | `modes` | `{chat, plan, auto}` | 按模式 → `{provider, model, temperature, stream}`（可选 `max_tokens`）；进入该模式时应用。`max_tokens` 缺省不配置即不发送 |
 | `truncation` | `{enabled=true, max_continues=3}` | 输出被截断且无工具调用时自动续写（提示不落库），超限写可见提示 |
 | `reasoning_enabled` | `true` | 启用深度思考（reasoning_content） |
+| `reasoning_effort` | `nil` | 推理强度：`low` / `high` / `max`。`nil` = 提供商默认（DeepSeek 为 `high`）；DeepSeek 其余档位按官方映射收敛（`minimal→low`、`medium/xhigh→high`、`ultra→max`）。可被 `providers.<name>.reasoning_effort` 或单次请求覆盖 |
+| `aux_reasoning` | `false` | 辅助调用（压缩摘要、计划提取、沙箱 AI 审计/L3 警示）是否保留思考；默认关闭以降低延迟与 token（DeepSeek 显式下发 `thinking:{type="disabled"}`） |
 | `system_prompt` | 默认中文提示 | persona 段 |
 | `timeout_ms` | `60000` | 请求超时 |
 | `max_retries` | `3` | 请求重试次数 |

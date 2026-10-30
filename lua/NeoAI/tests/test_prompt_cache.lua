@@ -20,6 +20,7 @@ tests.suite("prompt_cache", function(_, it)
         default_provider = "anthropic",
         providers = {
           anthropic = { api_type = "anthropic", base_url = "http://a", api_key = "ka" },
+          ds_anthropic = { api_type = "anthropic", base_url = "http://d", api_key = "kd" },
           google = { api_type = "google", base_url = "http://g", api_key = "kg" },
           openai = { api_type = "openai", base_url = "http://o", api_key = "ko" },
         },
@@ -42,6 +43,21 @@ tests.suite("prompt_cache", function(_, it)
     t.not_nil(body.system[1].cache_control)
     t.nil_(body.tools[1].cache_control)
     t.not_nil(body.tools[2].cache_control)
+  end)
+
+  it("DeepSeek Anthropic：不下发 cache_control（自动缓存）", function(t)
+    load()
+    local capabilities = require("NeoAI.core.model.capabilities")
+    local cache = require("NeoAI.core.model.prompt_cache")
+    cache.reset()
+    local caps = capabilities.resolve("deepseek-flash", "ds_anthropic")
+    local body = { model = "deepseek-flash", system = "SYS", tools = { { name = "a" } } }
+    local done, ok = false, nil
+    cache.apply_async({ body = body, caps = caps, provider_name = "ds_anthropic", model = "deepseek-flash", system = "SYS", tools = body.tools }):then_(function(r) ok = r done = true end)
+    t.true_(wait_until(function() return done end))
+    t.false_(ok)
+    t.eq("SYS", body.system, "不应把 system 升级为带 cache_control 的块")
+    t.nil_(body.tools[1].cache_control)
   end)
 
   it("Anthropic：历史消息滚动断点用满预算", function(t)

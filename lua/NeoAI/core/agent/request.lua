@@ -103,6 +103,11 @@ local function _build_request(messages, opts)
   if reasoning_enabled == nil then
     reasoning_enabled = config_store.get("ai.reasoning_enabled")
   end
+  -- 推理强度：调用方 → provider 配置 → 全局配置；再按方言归一化（DeepSeek 只有 low/high/max）。
+  local reasoning_effort = opts.reasoning_effort
+    or provider.reasoning_effort
+    or config_store.get("ai.reasoning_effort")
+  reasoning_effort = profiles.normalize_effort(dialect, reasoning_effort)
 
   -- 协议编码：内部规范 → 各协议 wire 形态（Anthropic system/blocks、Gemini contents 等）
   local encoded = a.encode_messages(messages, dialect)
@@ -137,7 +142,7 @@ local function _build_request(messages, opts)
     max_tokens = max_tokens,
     reasoning_enabled = reasoning_enabled,
     reasoning_budget = opts.reasoning_budget or caps.reasoning_budget,
-    reasoning_effort = opts.reasoning_effort,
+    reasoning_effort = reasoning_effort,
     tools = tools,
     dialect = dialect,
   })
