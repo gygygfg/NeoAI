@@ -154,6 +154,14 @@ function M.new_attempt(tool_name, args, ctx, spec)
     command = (type(args) == "table" and type(args.command) == "string" and args.command ~= "")
       and args.command or nil,
   }
+  -- 审批悬浮窗「调用参数」：只保留脱敏、限长的摘要（大文本内容不重复保存）。
+  pcall(function()
+    local ap = require("NeoAI.sandbox.review.args_preview")
+    local cfg = require("NeoAI.kernel.config_store")
+    attempt.args_preview = ap.build(args, {
+      max_chars = tonumber(cfg.get("tools.sandbox.review.args_max_chars")) or 2000,
+    })
+  end)
   state.attempts[command_id] = attempt
   return attempt
 end

@@ -222,7 +222,7 @@ tests.suite("sandbox_ai_audit", function(_, it)
     ai.reset()
   end)
 
-  it("build_lines 在文件行下方渲染暗灰审计说明", function(t)
+  it("build_lines 在安全审查区渲染 AI 审计说明", function(t)
     local sr = require("NeoAI.ui.components.sandbox_review")
     local cwd = vim.fn.getcwd()
     local path = cwd .. "/a.lua"
@@ -232,17 +232,21 @@ tests.suite("sandbox_ai_audit", function(_, it)
     -- 生成中：顶部暗灰状态行
     local pending = sr.build_lines(items, nil, { pending = true })
     t.matches("AI 审计生成中", table.concat(pending.lines, "\n"))
-    -- 完成后：说明在文件行正下方，且为 note 高亮
+    -- 完成后：说明在「安全审查」区（第 1 层展开后仍折叠），且为 note 高亮
     local done = sr.build_lines(items, nil, { notes = { [path] = "工作区文件，低风险，可应用" } })
-    local file_ln
+    local file_ln, note_ln
     for ln, target in pairs(done.line_to_target) do
       if target.path == path then file_ln = ln end
     end
+    for i, l in ipairs(done.lines) do
+      if l:find("工作区文件，低风险，可应用", 1, true) then note_ln = i end
+    end
     t.not_nil(file_ln, "应有文件行")
-    t.matches("工作区文件，低风险，可应用", done.lines[file_ln + 1], "说明应在文件行下方")
+    t.not_nil(note_ln, "安全审查区应有审计说明")
+    t.true_(note_ln > file_ln, "审计说明应在安全审查区（文件行之后）")
     local has_note
     for _, m in ipairs(done.marks) do
-      if m.level == "note" and m.line == file_ln + 1 then has_note = true end
+      if m.level == "note" and m.line == note_ln then has_note = true end
     end
     t.true_(has_note, "说明应有 note 高亮")
     -- 失败：状态行
@@ -293,7 +297,7 @@ tests.suite("sandbox_ai_audit", function(_, it)
     local items = {
       { change_set_id = "cs1", tool = "edit_file", files = { { path = cwd .. "/sub/a.lua", action = "modify" } } },
     }
-    -- 模型只回 "a.lua"（省略前缀）：应命中该文件行下方的说明。
+    -- 模型只回 "a.lua"（省略前缀）：应命中该条目的安全审查说明。
     local data = sr.build_lines(items, nil, { notes = { ["a.lua"] = "安全：可应用" } })
     local text = table.concat(data.lines, "\n")
     t.matches("安全：可应用", text, "后缀匹配应命中")

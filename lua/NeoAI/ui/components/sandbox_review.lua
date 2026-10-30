@@ -6,9 +6,14 @@
 --- 「工作区」= 当前工作区根（会话绑定工作目录优先，见 `core/session/workspace_root.resolve`），
 ---   而不是编辑器 cwd：在工程子目录里启动 nvim 时，父目录内的工程文件仍算工作区内。
 ---   风险徽标配色：L0 灰 / L1·L2 黄 / L3 红（仅 L3 用红色危险高亮）。
---- 审批单位为单个文件：<CR> 仅应用光标所在文件 / d 仅拒绝该文件（其余文件保留待审）。
---- 「已应用」区默认整体折叠（区标题一级 / 条目头行二级，za/zo 逐级展开），
---- 刷新后重新收起；任何应用成功后**整个审批窗全部折叠**（fold_all），待审区与越界留痕区不折叠。
+--- 条目为**两层嵌套折叠**（待审/已应用/已拒绝统一）：
+---   第 1 层 = 条目头（工具 · N 个文件 · 风险/状态）；展开后直接显示修改文件列表，
+---   第 2 层 = 「调用参数」「安全审查」两个默认收起的二级分区。
+---   收起时风险等级无法高亮，折叠文本用彩色圆点 ⚪L0/🟡L1/🟠L2/🔴L3。
+--- <CR>：已收起的折叠起点只展开；展开后光标在文件行才应用（整包/git 组应用到整组）；
+---   d 拒绝整单元或单文件（其余保留待审）；光标所在文件/整包文件行淡蓝底高亮。
+--- 「已应用」「已拒绝」区标题仍为一级折叠；刷新按稳定键恢复用户展开的条目/分区；
+---   任何应用成功后**整个审批窗全部折叠**（fold_all）。
 --- 沙箱广播事件驱动自动刷新（窗口打开期间订阅，关闭时退订）；q 关闭。
 --- 经 kernel.services.use 获取 sandbox 服务，缺失时降级提示。
 
@@ -189,6 +194,7 @@ local LEVEL_HL = {
   risk3 = "NeoAISandboxReviewRisk3",
   ai = "NeoAISandboxReviewAi",
   note = "NeoAISandboxReviewNote",
+  section = "NeoAISandboxReviewSection",
   tab_active = "NeoAISandboxReviewTabActive",
   tab_inactive = "NeoAISandboxReviewTabInactive",
   verdict_safe = "NeoAISandboxReviewVerdictSafe",
@@ -214,7 +220,7 @@ local LEGEND_SEGMENTS = {
   { "L3严重", "risk3" },
   { "  " },
   { "⚠密钥操作", "secret" },
-  { "   |   <CR> 头行=整包应用 / 文件行=应用该文件   A 一键同意全部工作区修改   d 拒绝该文件   i 预览修改diff/越界详情   u 撤销/重做保存·恢复已拒绝   a AI审计   q 关闭" },
+  { "   |   <CR> 折叠处=展开 / 文件行=应用   za/zo 折叠   A 一键同意全部工作区修改   d 拒绝   i 预览 diff/详情   u 撤销/重做保存·恢复已拒绝   a AI审计   q 关闭" },
 }
 
 local LEGEND, LEGEND_MARKS = (function()
@@ -245,8 +251,14 @@ local state = {
   line_to_history = {}, -- 行号 -> 网络请求页历史条目 key（超时自动拒绝 → `S` 重新允许）
   line_to_trace = {}, -- 行号 -> 越界留痕路径（`i` 查看详情，非审批目标）
   line_to_cmd = {}, -- 行号 -> { command = string|nil } 越界命令（`i` 查看该命令涉及的文件）
-  fold_levels = {}, -- 行号 -> 折叠级别（仅「已应用」区 > 0）：区标题=1，条目及其文件行=2
-  fold_titles = {}, -- 折叠首行 -> 折叠文本摘要（待审条目：显示被修改的文件而非命令）
+  line_to_file = {}, -- 行号 -> { change_set_id, path?, whole?, saved?, rejected? }（光标目标行高亮）
+  fold_levels = {}, -- 行号 -> 折叠级别：待审条目/二级分区、已应用区区标题/条目/二级分区
+  fold_titles = {}, -- 折叠首行 -> 完整折叠显示文本（含缩进/风险圆点/▸）
+  fold_keys = {}, -- 行号 -> 稳定折叠键（刷新后恢复展开状态）
+  fold_keys_rev = {}, -- 稳定折叠键 -> 行号
+  open_folds = {}, -- 稳定折叠键 -> true（用户展开过的折叠）
+  target_ns = nil, -- 光标所在文件/整包高亮命名空间
+  target_aucmd = nil, -- CursorMoved 自动高亮句柄
   last_cursor = nil, -- { line, col } 关闭时记录，重开时恢复
   --- @type table<string, any>|nil 关闭时光标所在条目（优先恢复）
   last_target = nil,
@@ -295,9 +307,32 @@ local function _risk_label(level)
   return RISK_LABEL[tonumber(level) or 0] or "低危"
 end
 
+-- 风险等级的彩色圆点：折叠文本/收起状态无法使用高亮，用 emoji 表达等级。
+-- L0 低危=⚪ / L1 中危=🟡 / L2 高危=🟠 / L3 严重=🔴。
+local RISK_DOT = { [0] = "⚪", [1] = "🟡", [2] = "🟠", [3] = "🔴" }
+--- 风险等级圆点（无等级信息返回 nil）
+--- @param level number|nil
+--- @return string|nil
+local function _risk_dot(level)
+  local lv = tonumber(level)
+  if lv == nil then return nil end
+  lv = math.max(0, math.min(3, math.floor(lv)))
+  return RISK_DOT[lv]
+end
+
+--- AI 审计说明的单条结论：不安全 / 安全 / 未知
+--- @param note string|nil
+--- @return string "unsafe"|"safe"|"unknown"
+local function _note_verdict(note)
+  if type(note) ~= "string" then return "unknown" end
+  if note:match("^%s*不安全") then return "unsafe" end
+  if note:match("^%s*安全") then return "safe" end
+  return "unknown"
+end
+
 -- ========== 折叠回调（预览窗） ==========
--- 「已应用」区默认整体收起（区标题一级），展开后每条仍各自收起（条目头行二级）；
--- 待审区/留痕区不登记级别（=0）故不折叠。实例化为模块级全局函数而非
+-- 「已应用」区默认整体收起（区标题一级），展开后每条仍各自收起（条目二级 / 分区三级）；
+-- 待审条目自身为一级折叠、调用参数/安全审查为二级。实例化为模块级全局函数而非
 -- v:lua.require'...'：后者在带 UI 会话里求值可能失败（参见 chat_view 注释）。
 local function _fold_expr()
   return tostring(state.fold_levels[vim.v.lnum] or 0)
@@ -306,11 +341,11 @@ end
 local function _fold_text()
   local start = vim.v.foldstart
   local count = vim.v.foldend - start + 1
-  -- 折叠文本优先用渲染层登记的摘要：待审条目的折叠首行往往是插在条目里的命令
-  -- （`$ <cmd>`），直接取首行会把命令当成摘要显示；登记后显示被修改的文件。
+  -- 折叠文本优先用渲染层登记的完整显示文本（含缩进/风险圆点/▸），
+  -- 这样两级折叠的缩进与层级一致；未登记时回退折叠首行。
   local title = state.fold_titles[start]
-  local text = (type(title) == "string" and title ~= "") and title or (vim.fn.getline(start) or "")
-  return string.format("  ▸ %s  (%d 行)", text, count)
+  local text = (type(title) == "string" and title ~= "") and title or ("  ▸ " .. (vim.fn.getline(start) or ""))
+  return string.format("%s  (%d 行)", text, count)
 end
 
 -- ========== 私有函数 ==========
@@ -336,6 +371,10 @@ local function _ensure_hl()
   vim.api.nvim_set_hl(0, LEVEL_HL.risk3, { default = true, fg = "#ff5555", bold = true, underline = true })
   vim.api.nvim_set_hl(0, LEVEL_HL.ai, { default = true, fg = "#56b6c2", bold = true })
   vim.api.nvim_set_hl(0, LEVEL_HL.note, { default = true, fg = "#7f8c8d" })
+  -- 光标所在文件行 / 整包全部文件行：淡蓝底，表示 <CR> 将作用的文件范围。
+  vim.api.nvim_set_hl(0, "NeoAISandboxReviewTarget", { default = true, bg = "#264f78", bold = true })
+  -- 二级分区标题（调用参数 / 安全审查）
+  vim.api.nvim_set_hl(0, "NeoAISandboxReviewSection", { default = true, fg = "#61afef", bold = true })
   -- 页标签高亮采用 Mason 风格（存在 mason.nvim 高亮组时链接复用其块状配色）。
   local mason_hl = require("NeoAI.ui.mason_hl")
   mason_hl.def(LEVEL_HL.tab_active, "MasonHighlightBlockBold", { bold = true, reverse = true })
@@ -527,17 +566,21 @@ end
 --- @param saved table|nil 已保存/已撤销（含快照）的变更单元数组（sandbox.list_saved）
 --- @param rejected table|nil 可恢复的已拒绝变更单元数组（sandbox.list_rejected）
 --- @param jobs table|nil change_set_id -> 活跃后台任务（sandbox.job_for / 内部 jobs 映射）
---- @return table { lines, marks, line_to_target, line_to_trace, fold_levels, fold_titles }
+--- @return table { lines, marks, line_to_target, line_to_trace, line_to_file, fold_levels, fold_titles, fold_keys }
 function M.build_lines(items, traces, audit, saved, rejected, jobs)
   local lines = {}
   local marks = {}
   local line_to_target = {}
   local line_to_trace = {} -- 行号 -> 越界留痕路径（`i` 查看详情；非审批目标）
-  -- 折叠级别（稀疏表：仅「已应用」区 > 0）：区标题=1（整区收起），条目头行及其文件行=2
-  -- （展开整区后条目仍各自收起）。待审区/留痕区不登记，保持不折叠。
+  local line_to_file = {} -- 行号 -> { change_set_id, path?, whole?, saved?, rejected? }（目标高亮）
+  -- 折叠级别（稀疏表）：
+  --   待审条目 = 一级（条目头 → 条目尾），二级分区（调用参数/安全审查）= 二级；
+  --   已应用/已拒绝区标题 = 一级，条目 = 二级，条目内分区 = 三级。
   local fold_levels = {}
-  -- 折叠首行 -> 折叠文本摘要（待审条目收起时显示被修改的文件，而不是条目内的命令）。
+  -- 折叠首行 -> 完整折叠显示文本（缩进 + 风险圆点 + ▸）。
   local fold_titles = {}
+  -- 折叠首行 -> 稳定键（刷新后恢复用户展开状态）。
+  local fold_keys = {}
   -- 本次渲染复用一次 cwd/home 规范形式，避免逐文件重复 fs.canonical。
   local lvl_ctx = { cwd = _canon_base(_ws_base()), home = _canon_base(vim.fn.expand("~")) }
   lines[#lines + 1] = LEGEND
@@ -545,7 +588,7 @@ function M.build_lines(items, traces, audit, saved, rejected, jobs)
     marks[#marks + 1] = { line = #lines, start_col = m.start_col, end_col = m.end_col, level = m.level }
   end
   lines[#lines + 1] = ""
-  -- AI 审计状态（生成中 / 结论 / 失败 / 兜底说明）：结论先说安全/不安全；正式说明在各自文件行下方。
+  -- AI 审计状态（生成中 / 结论 / 失败 / 兜底说明）：结论先说安全/不安全；逐条说明在各条目的安全审查区。
   if audit and (audit.pending or audit.notes
       or (audit.error and audit.error ~= "") or (audit.fallback and audit.fallback ~= "")) then
     local status, level = nil, "note"
@@ -619,25 +662,7 @@ function M.build_lines(items, traces, audit, saved, rejected, jobs)
     end
     return nil
   end
-  --- 在当前位置追加一条暗灰审计说明。AI 审计已完成但该条目缺说明时，标注「请人工确认」，
-  --- 确保**每条都要审**：不漏任何文件 / 主机命令。
-  local function _append_note(key)
-    local note = _note_for(key)
-    local missing = false
-    if not note or note == "" then
-      if audit and audit.notes then
-        note = "（AI 未给出说明，请人工确认）"
-        missing = true
-      else
-        return
-      end
-    end
-    local text = "    " .. _one_line(note)
-    local ln = #lines + 1
-    lines[#lines + 1] = text
-    marks[#marks + 1] = { line = ln, start_col = 4, end_col = 4 + #note, level = missing and "verdict_unsafe" or "note" }
-  end
-  -- 每单元最多渲染的文件行数（0 = 不限）：包安装/git 操作可达数千文件，逐行渲染（字符串 +
+  --- 每单元最多渲染的文件行数（0 = 不限）：包安装/git 操作可达数千文件，逐行渲染（字符串 +
   -- 高亮 + 行→目标映射）在开窗/每次刷新时都很慢；超限折叠为一行汇总。
   local max_files = tonumber(require("NeoAI.kernel.config_store").get(
     "tools.sandbox.review.max_display_files"))
@@ -652,6 +677,363 @@ function M.build_lines(items, traces, audit, saved, rejected, jobs)
     line_to_target[ln] = target
     return ln
   end
+  -- 安全审查区逐条 AI 说明展示上限（不安全优先；超出截断）。
+  local max_notes = tonumber(require("NeoAI.kernel.config_store").get(
+    "tools.sandbox.review.max_display_notes"))
+  if max_notes == nil then max_notes = 50 end
+  local audit_enabled = require("NeoAI.kernel.config_store").get(
+    "tools.sandbox.review.ai_audit.enabled") ~= false
+  local entry_indent = "      "
+  local row_indent = "        "
+  local section_value_indent = "          "
+
+  --- 文件行的 AI 结论摘要图标（详细说明在安全审查区）。
+  --- @param region string
+  --- @param path string
+  --- @return string
+  local function _file_icon(region, path)
+    if region ~= "pending" or not (audit and audit.notes) then return "" end
+    local v = _note_verdict(_note_for(path))
+    if v == "unsafe" then return "  ⚠" end
+    if v == "safe" then return "  ✅" end
+    return "  ❔"
+  end
+
+  --- 构建「调用参数」区内容（不含标题）。
+  --- @param item table
+  --- @return table specs
+  --- @return number count
+  local function _args_specs(item)
+    local specs, count = {}, 0
+    local ap = item.args_preview
+    if type(ap) == "table" then
+      for _, f in ipairs(ap.fields or {}) do
+        specs[#specs + 1] = { text = tostring(f.key) .. "  " .. _one_line(f.value) }
+      end
+      for _, o in ipairs(ap.omitted or {}) do
+        local what = o.table and "<表，已省略>" or ("<" .. tostring(o.bytes or 0) .. " 字节，已省略>")
+        specs[#specs + 1] = { text = tostring(o.key) .. "  " .. what }
+      end
+      count = #specs
+      if ap.truncated then specs[#specs + 1] = { text = "… 参数过长，已截断" } end
+    end
+    if count == 0 and type(item.command) == "string" and item.command ~= "" then
+      specs[#specs + 1] = { text = "command  " .. _one_line(item.command) }
+      count = 1
+    end
+    -- 主机操作（旧记录无 args_preview）：命令即调用参数。
+    if count == 0 and item.kind == "host_op" then
+      local cmd = (item.write_set and item.write_set[1]) or ""
+      if cmd ~= "" then
+        specs[#specs + 1] = { text = "command  " .. _one_line(cmd) }
+        count = 1
+      end
+    end
+    if count == 0 then specs[#specs + 1] = { text = "（未记录调用参数）" } end
+    local merged = tonumber(item.args_merged) or 1
+    if merged > 1 then specs[#specs + 1] = { text = ("已合并 %d 次调用"):format(merged) } end
+    return specs, count
+  end
+
+  --- 构建「安全审查」区内容（不含标题）与结论摘要。
+  --- @param item table
+  --- @param files table
+  --- @param region string
+  --- @return table { specs, summary, unsafe, safe }
+  local function _security_specs(item, files, region)
+    local specs = {}
+    local unsafe, safe, unknown = false, false, 0
+    local notes = {}
+    if region == "pending" and audit and audit.notes then
+      if item.kind == "host_op" then
+        local cmd = (item.write_set and item.write_set[1]) or ""
+        local note = _note_for(cmd)
+        notes[1] = { key = cmd, note = note, verdict = _note_verdict(note) }
+      else
+        for _, f in ipairs(files) do
+          local note = _note_for(f.path)
+          notes[#notes + 1] = { key = f.path, note = note, verdict = _note_verdict(note) }
+        end
+      end
+      for _, n in ipairs(notes) do
+        if n.verdict == "unsafe" then unsafe = true
+        elseif n.verdict == "safe" then safe = true
+        else unknown = unknown + 1 end
+      end
+    end
+    local conclusion, clevel
+    if unsafe then
+      conclusion, clevel = "⚠ 不安全 — 存在不安全变更，请逐条确认", "verdict_unsafe"
+    elseif #notes > 0 and safe and unknown == 0 then
+      conclusion, clevel = "✅ 安全 — 未发现不安全变更", "verdict_safe"
+    elseif #notes > 0 then
+      conclusion, clevel = "❔ 待人工确认 — 部分项 AI 未给出说明", "note"
+    elseif audit and audit.pending then
+      conclusion, clevel = "⏳ AI 审计生成中…", "ai"
+    elseif region ~= "pending" then
+      conclusion, clevel = "历史条目 — 仅展示冻结时的风险信息", "note"
+    elseif audit_enabled then
+      conclusion, clevel = "❔ 未审计 — 按 a 发起 AI 审计", "note"
+    else
+      conclusion, clevel = "AI 审计已禁用", "note"
+    end
+    specs[#specs + 1] = { text = "结论   " .. conclusion, level = clevel }
+    local lv = tonumber(item.risk_level)
+    if lv ~= nil then
+      local dot = _risk_dot(lv) or ""
+      specs[#specs + 1] = { text = ("等级   L%d %s %s"):format(lv, _risk_label(lv), dot), level = _risk_hl(lv) }
+    end
+    if type(item.risk_reasons) == "table" and #item.risk_reasons > 0 then
+      specs[#specs + 1] = { text = "原因   " .. table.concat(_merge_reasons(item.risk_reasons), ", "), level = _risk_hl(lv or 0) }
+    end
+    if (tonumber(item.privilege_tier) or 0) > 0 then
+      specs[#specs + 1] = { text = ("档位   T%d"):format(tonumber(item.privilege_tier)), level = "section" }
+    end
+    local sw = item.secret_warning
+    if type(sw) == "table" and (tonumber(sw.count) or 0) > 0 then
+      local detail = "内容含加密 token，应用时还原"
+      if #(sw.tokens or {}) == 0 and #(sw.names or {}) > 0 then
+        detail = "涉及密钥环境变量：" .. _one_line(table.concat(sw.names, ", "))
+      end
+      specs[#specs + 1] = { text = ("密钥   ⚠ 密钥操作×%d（%s）"):format(sw.count, detail), level = "secret" }
+    end
+    if item.derived_opaque then
+      specs[#specs + 1] = { text = "密钥   ⚠ 不透明派生密钥流（命令/脚本可能加密变换，无法逐字还原）", level = "secret" }
+    end
+    if item.merge_conflict then
+      specs[#specs + 1] = { text = "冲突   ⚠ 合并冲突（外部改动，未写入真实文件）— R 交给 AI 重做", level = "secret" }
+    end
+    if type(item.dropped) == "table" and #item.dropped > 0 then
+      specs[#specs + 1] = { text = ("丢弃   ℹ 将跳过 %d 个遮蔽/缓存文件（不写入宿主）"):format(#item.dropped), level = "note" }
+    end
+    if item.package_sensitive then
+      specs[#specs + 1] = { text = "包安装 ⚠ 涉及软件源/密钥，请重点确认", level = "secret" }
+    end
+    if item.fail_reason and item.fail_reason ~= "" then
+      specs[#specs + 1] = { text = "上次失败 " .. _one_line(item.fail_reason), level = "note" }
+    end
+    if item.kind == "host_op" then
+      specs[#specs + 1] = { text = "主机   T2 主机操作，批准后在主机 replay", level = "note" }
+    end
+    -- AI 逐条说明：不安全 → 未说明 → 安全；超限截断。
+    local order = { unsafe = 1, unknown = 2, safe = 3 }
+    table.sort(notes, function(a, b)
+      local oa, ob = order[a.verdict] or 9, order[b.verdict] or 9
+      if oa ~= ob then return oa < ob end
+      return tostring(a.key) < tostring(b.key)
+    end)
+    local shown = 0
+    for _, n in ipairs(notes) do
+      if max_notes > 0 and shown >= max_notes then break end
+      shown = shown + 1
+      local icon = n.verdict == "unsafe" and "⚠" or (n.verdict == "safe" and "✅" or "❔")
+      local text = n.note
+      if not text or text == "" then text = "（AI 未给出说明，请人工确认）" end
+      specs[#specs + 1] = {
+        text = string.format("%s %s  %s", icon, _one_line(n.key), _one_line(text)),
+        level = n.verdict == "unsafe" and "verdict_unsafe" or "note",
+      }
+    end
+    if max_notes > 0 and #notes > max_notes then
+      specs[#specs + 1] = { text = ("… 其余 %d 条说明已截断"):format(#notes - max_notes), level = "note" }
+    end
+    if region == "pending" and audit then
+      if audit.pending then
+        specs[#specs + 1] = { text = "AI 审计   ⏳ 生成中…", level = "ai" }
+      elseif audit.error and audit.error ~= "" then
+        specs[#specs + 1] = { text = "AI 审计   ✖ 失败：" .. _one_line(audit.error), level = "note" }
+      elseif audit.fallback and audit.fallback ~= "" then
+        specs[#specs + 1] = { text = "AI 审计   " .. _one_line(audit.fallback), level = "note" }
+      elseif audit.notes then
+        specs[#specs + 1] = { text = "AI 审计   ✔ 已完成", level = "note" }
+      end
+    end
+    local summary_bits = {}
+    if region ~= "pending" then summary_bits[#summary_bits + 1] = "历史"
+    elseif unsafe then summary_bits[#summary_bits + 1] = "⚠ 不安全"
+    elseif #notes > 0 and safe and unknown == 0 then summary_bits[#summary_bits + 1] = "✅ 安全"
+    else summary_bits[#summary_bits + 1] = "❔ 待确认" end
+    if lv ~= nil then summary_bits[#summary_bits + 1] = string.format("%sL%d", _risk_dot(lv) or "", lv) end
+    if type(item.risk_reasons) == "table" and #item.risk_reasons > 0 then
+      summary_bits[#summary_bits + 1] = ("%d 个原因"):format(#item.risk_reasons)
+    end
+    return { specs = specs, summary = table.concat(summary_bits, " · "), unsafe = unsafe, safe = safe }
+  end
+
+  --- 渲染一个条目（两级折叠：条目 = base，调用参数/安全审查 = base+1）。
+  --- 文件列表在第 1 层展开后直接可见；调用参数与安全审查保持折叠。
+  --- @param item table
+  --- @param opts table {
+  ---   region: "pending"|"saved"|"rejected",
+  ---   base: number, files: table, status: string,
+  ---   whole_target: table, key_prefix: string,
+  ---   saved?: boolean, rejected?: boolean,
+  --- }
+  --- @return number 条目头行
+  local function _render_entry(item, opts)
+    opts = opts or {}
+    local region = opts.region or "pending"
+    local base = tonumber(opts.base) or 1
+    local files = opts.files or {}
+    local host = item.kind == "host_op"
+    local git_op = item.atomic_group == "git"
+    local pkg = item.package == true or item.package_key ~= nil
+    local whole_files = git_op or pkg
+    local key_prefix = opts.key_prefix or (region .. ":" .. tostring(item.change_set_id))
+    local lv = tonumber(item.risk_level)
+    local dot = _risk_dot(lv)
+    local tier = tonumber(item.privilege_tier) or 0
+    local status = opts.status or "待审"
+
+    local desc
+    if host then
+      desc = ("主机操作 · %d 条命令"):format(#(item.write_set or {}))
+    else
+      local pkg_desc = ""
+      if item.package then
+        local mgr, names = item.package_manager, item.package_names
+        if mgr and type(names) == "table" and #names > 0 then
+          pkg_desc = ("包安装 %s: %s，"):format(mgr, _one_line(table.concat(names, ", ")))
+        elseif mgr then
+          pkg_desc = ("包安装 %s，"):format(mgr)
+        else
+          pkg_desc = "包安装，"
+        end
+        if item.package_sensitive then pkg_desc = pkg_desc .. "⚠ 涉及软件源/密钥，" end
+      end
+      desc = ("%s%d 个文件"):format(pkg_desc, #files)
+      if git_op then desc = "git 操作 · " .. desc .. " · 原子整组" end
+      if pkg and not item.package then desc = "整包 · " .. desc end
+    end
+    local meta_bits = {}
+    if tier > 0 then meta_bits[#meta_bits + 1] = "T" .. tier end
+    if lv ~= nil then meta_bits[#meta_bits + 1] = ("[L%d]%s"):format(lv, _risk_label(lv)) end
+    local head_body = ("[%s] %s · %s%s"):format(
+      tostring(item.change_set_id), _one_line(item.tool or "?"), desc,
+      #meta_bits > 0 and (" · " .. table.concat(meta_bits, " · ")) or "")
+    local head_prefix = "  ▾ " .. head_body .. "  "
+    local head = head_prefix .. status
+    local hln = #lines + 1
+    lines[hln] = head
+    marks[#marks + 1] = {
+      line = hln, start_col = #head - #status, end_col = #head,
+      level = opts.status_level or _pending_hl(item),
+    }
+    if lv ~= nil then
+      local badge = ("[L%d]"):format(lv)
+      local pos = head:find(badge, 1, true)
+      if pos then
+        marks[#marks + 1] = { line = hln, start_col = pos - 1, end_col = pos - 1 + #badge, level = _risk_hl(lv) }
+      end
+    end
+    line_to_target[hln] = opts.whole_target
+    fold_levels[hln] = base
+    fold_keys[hln] = key_prefix .. ":entry"
+    -- 收起时无法使用高亮：折叠文本用彩色圆点表达风险等级。
+    local fold_body = head_body
+    if dot and lv ~= nil then
+      fold_body = fold_body:gsub("%[L%d%]", dot .. "L" .. tostring(lv), 1)
+    end
+    fold_titles[hln] = "  ▸ " .. fold_body .. "  " .. status
+
+    -- 一级内容：合并冲突提示 / 修改文件列表（展开条目立即可见）。
+    if item.merge_conflict then
+      local text = entry_indent .. "⚠ 合并冲突（外部改动，未写入真实文件）— 按 R 交给 AI 基于最新内容重做"
+      lines[#lines + 1] = text
+      marks[#marks + 1] = { line = #lines, start_col = 0, end_col = #text, level = "system" }
+      fold_levels[#lines] = base
+    end
+    if not host then
+      local title = ("%s修改文件（%d）"):format(entry_indent, #files)
+      lines[#lines + 1] = title
+      marks[#marks + 1] = { line = #lines, start_col = 0, end_col = #title, level = "section" }
+      fold_levels[#lines] = base
+      local shown = 0
+      for _, f in ipairs(files) do
+        if max_files > 0 and shown >= max_files then break end
+        shown = shown + 1
+        local path = _one_line(f.path or tostring(f))
+        local suffix = f.action and ("  [" .. _one_line(f.action) .. "]") or ""
+        local icon = _file_icon(region, path)
+        local text = row_indent .. path .. suffix .. icon
+        local ln = #lines + 1
+        lines[ln] = text
+        fold_levels[ln] = base
+        marks[#marks + 1] = { line = ln, start_col = #row_indent, end_col = #row_indent + #path, level = M.level_of(path, lvl_ctx) }
+        local target
+        if whole_files then
+          target = vim.deepcopy(opts.whole_target)
+          -- 整包条目：文件行仍带 path（diff 预览可定位；应用仍为整包），
+          -- git 原子组保持无 path（其内部文件不做 diff 预览）。
+          if pkg then target.path = path end
+        else
+          target = vim.deepcopy(opts.whole_target)
+          target.path = path
+          target.whole = nil
+        end
+        line_to_target[ln] = target
+        line_to_file[ln] = {
+          change_set_id = item.change_set_id,
+          path = path,
+          whole = whole_files,
+          saved = opts.saved,
+          rejected = opts.rejected,
+        }
+      end
+      if max_files > 0 and #files > shown then
+        local rln = _append_rest(#files - shown, opts.whole_target, row_indent)
+        fold_levels[rln] = base
+      end
+      if git_op then
+        local hint = entry_indent .. "⚙ 一次 git 操作：整组通过/丢弃（原子，不可逐文件）"
+        local gln = #lines + 1
+        lines[gln] = hint
+        marks[#marks + 1] = { line = gln, start_col = 0, end_col = #hint, level = "system" }
+        line_to_target[gln] = opts.whole_target
+        fold_levels[gln] = base
+      end
+    end
+
+    -- 二级分区：调用参数 + 安全审查（默认收起）。
+    local args_specs, args_count = _args_specs(item)
+    local args_title = ("调用参数 · %s · %d 项"):format(_one_line(item.tool or "?"), args_count)
+    local args_ln = #lines + 1
+    lines[args_ln] = entry_indent .. "▾ " .. args_title
+    marks[#marks + 1] = { line = args_ln, start_col = 0, end_col = #lines[args_ln], level = "section" }
+    fold_levels[args_ln] = base + 1
+    fold_keys[args_ln] = key_prefix .. ":args"
+    fold_titles[args_ln] = entry_indent .. "▸ " .. args_title
+    for _, sp in ipairs(args_specs) do
+      local text = section_value_indent .. sp.text
+      lines[#lines + 1] = text
+      marks[#marks + 1] = { line = #lines, start_col = 0, end_col = #text, level = sp.level or "note" }
+      fold_levels[#lines] = base + 1
+    end
+    -- 两个二级分区之间放一条一级空行：否则连续的二级行会被 Vim 合并成同一个折叠，
+    -- 导致「调用参数」和「安全审查」只有一个折叠起点（安全审查标题被藏进上一个折叠里）。
+    lines[#lines + 1] = ""
+    fold_levels[#lines] = base
+    local sec = _security_specs(item, files, region)
+    local sec_title = "安全审查 · " .. sec.summary
+    local sec_ln = #lines + 1
+    lines[sec_ln] = entry_indent .. "▾ " .. sec_title
+    marks[#marks + 1] = { line = sec_ln, start_col = 0, end_col = #lines[sec_ln], level = "section" }
+    fold_levels[sec_ln] = base + 1
+    fold_keys[sec_ln] = key_prefix .. ":security"
+    fold_titles[sec_ln] = entry_indent .. "▸ " .. sec_title
+    for _, sp in ipairs(sec.specs) do
+      local text = section_value_indent .. sp.text
+      lines[#lines + 1] = text
+      marks[#marks + 1] = { line = #lines, start_col = 0, end_col = #text, level = sp.level or "note" }
+      fold_levels[#lines] = base + 1
+    end
+    -- 条目尾空行：待审区不登记（结束本条目折叠，避免相邻条目合并）；
+    -- 已应用/已拒绝区计入区标题的一级折叠（opts.tail_level=1），保证整区连续收起。
+    lines[#lines + 1] = ""
+    local tail_level = tonumber(opts.tail_level)
+    if tail_level and tail_level > 0 then fold_levels[#lines] = tail_level end
+    return hln
+  end
   -- 审批分区：未应用（待审）在前，已应用（含快照，可撤销）在后，边界醒目。
   if items and #items > 0 then
     local head = ("── 未应用（待审 %d 个变更单元）──"):format(#items)
@@ -661,35 +1043,6 @@ function M.build_lines(items, traces, audit, saved, rejected, jobs)
   for _, item in ipairs(items or {}) do
     local job = jobs and jobs[item.change_set_id]
     local busy = item.apply_state == "APPLYING" or (type(job) == "table" and job.state == "running")
-    local tier = item.privilege_tier or 0
-    local badge = tier > 0 and string.format(" [T%d]", tier) or ""
-    local risk_badge = ""
-    if item.risk_level ~= nil then
-      risk_badge = string.format(" [%s]%s", _risk_badge(item.risk_level), _risk_label(item.risk_level))
-    end
-    -- 主机操作提案（T2）：展示命令，整条审批；审批后主机 replay。
-    if item.kind == "host_op" then
-      local cmd = _one_line((item.write_set and item.write_set[1]) or "?")
-      local base = _one_line(string.format("[%s] %s%s%s（主机操作）  ", item.change_set_id, item.tool or "?", badge, risk_badge))
-      local hln = #lines + 1
-      local status = busy and "执行中…" or "待审"
-      lines[#lines + 1] = base .. status
-      marks[#marks + 1] = { line = hln, start_col = #base, end_col = #base + #status,
-        level = busy and LEVEL_HL.busy or _pending_hl(item) }
-      if risk_badge ~= "" then
-        local rb = base:find("%[L%d%]", 1)
-        if rb then marks[#marks + 1] = { line = hln, start_col = rb - 1, end_col = rb + 2, level = _risk_hl(item.risk_level) } end
-      end
-      -- 头行同样作为整条审批入口（<CR> 应用 / d 拒绝 / i 预览命令），与命令行的目标一致。
-      line_to_target[hln] = { change_set_id = item.change_set_id, host_op = true }
-      local text = "  $ " .. cmd
-      local ln = #lines + 1
-      lines[#lines + 1] = text
-      marks[#marks + 1] = { line = ln, start_col = 2, end_col = 2 + #cmd, level = "system" }
-      line_to_target[ln] = { change_set_id = item.change_set_id, host_op = true }
-      _append_note(cmd)
-      lines[#lines + 1] = ""
-    else
     -- files 缺失（旧持久化记录）时回退 write_set
     local files = item.files
     if not files or #files == 0 then
@@ -706,123 +1059,17 @@ function M.build_lines(items, traces, audit, saved, rejected, jobs)
       end
       files = kept
     end
-    -- 包安装：标注管理器与包名（按安装命令合并为一个审批单元）。
-    local pkg = ""
-    if item.package then
-      local mgr = item.package_manager
-      local names = item.package_names
-      if mgr and type(names) == "table" and #names > 0 then
-        pkg = string.format("包安装 %s: %s，", mgr, _one_line(table.concat(names, ", ")))
-      elseif mgr then
-        pkg = string.format("包安装 %s，", mgr)
-      else
-        pkg = "包安装，"
-      end
-      if item.package_sensitive then
-        pkg = pkg .. "⚠ 涉及软件源/密钥，"
-      end
-    end
-    -- git 操作：一次涉及多个文件（工作区 + `.git` 对象/指针），必须整组通过/丢弃（原子）。
-    local git_op = item.atomic_group == "git"
-    local group_desc = git_op
-      and string.format("（git 操作 · %d 个文件 · 原子整组）", #files)
-      or string.format("（%s%d 个文件）", pkg, #files)
-    local base = _one_line(string.format("[%s] %s%s%s%s  ", item.change_set_id, item.tool or "?", badge, risk_badge, group_desc))
-    local hln = #lines + 1
-    local status = busy and "执行中…" or "待审"
-    lines[#lines + 1] = base .. status
-    -- 「待审」标签按安全等级着色（L0 灰 / L1 黄 / L2 橙 / L3 红）；执行中统一用 busy 色。
-    marks[#marks + 1] = { line = hln, start_col = #base, end_col = #base + #status,
-      level = busy and LEVEL_HL.busy or _pending_hl(item) }
-    -- 头行 = 整单元审批入口：<CR> 一次应用该变更单元的全部文件
-    -- （包安装按安装命令合并，整包一次审批，无需逐文件确认）。
-    line_to_target[hln] = { change_set_id = item.change_set_id, whole = true }
-    -- 安全级徽标按级别着色
-    if risk_badge ~= "" then
-      local rb = base:find("%[L%d%]", 1)
-      if rb then marks[#marks + 1] = { line = hln, start_col = rb - 1, end_col = rb + 2, level = _risk_hl(item.risk_level) } end
-    end
-    -- 三方合并冲突标记：应用时检测到外部改动且无法自动合并，未写入真实文件。
-    if item.merge_conflict then
-      local cp = "  ⚠ 合并冲突（外部改动，未写入真实文件）——按 R 交给 AI 基于最新内容重做"
-      lines[#lines + 1] = cp
-      marks[#marks + 1] = { line = #lines, start_col = 0, end_col = #cp, level = "system" }
-    end
-    -- 命令型变更单元（run_command / 包安装等）：展示实际命令，便于用户了解具体操作；
-    -- 其后的文件行即该命令影响的文件，按工作区/用户/系统级别高亮。
-    if type(item.command) == "string" and item.command ~= "" then
-      local cmd_text = _one_line(item.command)
-      local cmd_line = "  $ " .. cmd_text
-      local cln = #lines + 1
-      lines[#lines + 1] = cmd_line
-      marks[#marks + 1] = { line = cln, start_col = 4, end_col = 4 + #cmd_text, level = "system" }
-    end
-    -- 密钥防护警告：该变更涉及被加密映射的密钥（token）或敏感环境变量名，红色醒目提示。
-    if item.secret_warning and (item.secret_warning.count or 0) > 0 then
-      local sw = item.secret_warning
-      local detail = "内容含加密 token，应用时还原"
-      local ntok = (sw.tokens and #sw.tokens or 0)
-      local nname = (sw.names and #sw.names or 0)
-      if ntok == 0 and nname > 0 then
-        detail = "涉及密钥环境变量：" .. _one_line(table.concat(sw.names, ", "))
-      end
-      local warn = string.format("  ⚠ 密钥操作×%d（%s）", sw.count, detail)
-      lines[#lines + 1] = warn
-      marks[#marks + 1] = { line = #lines, start_col = 0, end_col = #warn, level = "secret" }
-    end
-    -- 不透明派生：命令/脚本可能加密/变换了密钥，输出无法逐字还原；应用前需人工确认。
-    if item.derived_opaque then
-      local warn = "  ⚠ 不透明派生密钥流（命令/脚本可能加密变换，无法逐字还原）——请人工确认后再应用"
-      lines[#lines + 1] = warn
-      marks[#marks + 1] = { line = #lines, start_col = 0, end_col = #warn, level = "secret" }
-    end
-    -- 安全分级原因（非空时展示，便于理解为何需要审批）
-    if item.risk_reasons and #item.risk_reasons > 0 then
-      local reason = "  风险: " .. table.concat(_merge_reasons(item.risk_reasons), ", ")
-      lines[#lines + 1] = reason
-      marks[#marks + 1] = { line = #lines, start_col = 0, end_col = #reason, level = _risk_hl(item.risk_level) }
-    end
-    -- 头行 = 整单元审批；普通条目下方文件行为单文件审批（可选择性只应用某个文件）。
-    -- git 原子组：整组通过/丢弃，文件行同样映射到整组（不可逐文件）。
-    if git_op then
-      local hint = "  ⚙ 一次 git 操作：整组通过/丢弃（原子，不可逐文件）"
-      local gln = #lines + 1
-      lines[#lines + 1] = hint
-      marks[#marks + 1] = { line = gln, start_col = 0, end_col = #hint, level = "system" }
-      line_to_target[gln] = { change_set_id = item.change_set_id, whole = true }
-    end
-
-    local shown = 0
-    for _, f in ipairs(files) do
-      if max_files > 0 and shown >= max_files then break end
-      shown = shown + 1
-      local path = _one_line(f.path or tostring(f))
-      local suffix = f.action and ("  [" .. _one_line(f.action) .. "]") or ""
-      local text = "  " .. path .. suffix
-      local ln = #lines + 1
-      lines[#lines + 1] = text
-      marks[#marks + 1] = { line = ln, start_col = 2, end_col = 2 + #path, level = M.level_of(path, lvl_ctx) }
-      if git_op then
-        line_to_target[ln] = { change_set_id = item.change_set_id, whole = true }
-      else
-        line_to_target[ln] = { change_set_id = item.change_set_id, path = path }
-      end
-      _append_note(path)
-    end
-    if max_files > 0 and #files > shown then
-      _append_rest(#files - shown, { change_set_id = item.change_set_id, whole = true })
-    end
-    -- 头行保持正常显示（审批入口，保留工具/风险/文件数与高亮），其后的密钥警告/风险原因/
-    -- git 提示/文件行统一登记为一级折叠，默认收起、`za`/`zo` 展开——即「第一行显示、其余折叠」。
-    -- 包安装/git 操作可达上千文件，折叠避免刷屏；头行已含文件数，审批仍可整单元进行。
-    -- 折叠文本用文件摘要（而不是折叠首行的 `$ 命令`）：收起时也能看出改了哪些文件。
-    if #lines > hln then
-      local summary = _fold_files_summary(files)
-      if summary then fold_titles[hln + 1] = summary end
-    end
-    for ln = hln + 1, #lines do fold_levels[ln] = 1 end
-    lines[#lines + 1] = ""
-    end
+    _render_entry(item, {
+      region = "pending",
+      base = 1,
+      files = files,
+      status = busy and "执行中…" or "待审",
+      status_level = busy and LEVEL_HL.busy or _pending_hl(item),
+      whole_target = item.kind == "host_op"
+        and { change_set_id = item.change_set_id, host_op = true }
+        or { change_set_id = item.change_set_id, whole = true },
+      key_prefix = "pending:" .. tostring(item.change_set_id),
+    })
   end
   -- 已保存（含原文件快照）：展示已发布到真实工作区的变更，`u` 撤销保存（回滚真实文件并回到待审）。
   -- 历史遗留的「已撤销」记录仍展示，`u` 可重做保存。
@@ -842,56 +1089,29 @@ function M.build_lines(items, traces, audit, saved, rejected, jobs)
     end
     local title_ln = #lines + 1
     lines[#lines + 1] = "── " .. title .. "──（默认折叠，za/zo 展开）"
-    -- 区标题 = 一级折叠（默认整体收起）
     fold_levels[title_ln] = 1
+    fold_keys[title_ln] = "saved:region"
     for _, item in ipairs(saved) do
       local reverted = item.apply_state == "REVERTED"
-      local label = reverted and "已撤销" or "已保存"
       local files = item.saved_files
       if not files or #files == 0 then
         files = item.files or {}
       end
       if #files == 0 then
+        files = {}
         for _, p in ipairs(item.write_set or {}) do files[#files + 1] = { path = p } end
       end
-      local git_op = item.atomic_group == "git"
-      local group_desc = git_op
-        and string.format("（git 操作 · %d 个文件 · 原子整组）", #files)
-        or string.format("（%d 个文件）", #files)
-      local base = _one_line(string.format("[%s] %s%s  ", item.change_set_id, item.tool or "?", group_desc))
-      local hln = #lines + 1
-      lines[#lines + 1] = base .. label
-      -- 条目头行 = 二级折叠（展开整区后仍各自收起）
-      fold_levels[hln] = 2
-      marks[#marks + 1] = { line = hln, start_col = #base, end_col = #base + #label,
-        level = reverted and "pending0" or "workspace" }
-      line_to_target[hln] = { change_set_id = item.change_set_id, saved = true, whole = true }
-      local shown = 0
-      for _, f in ipairs(files) do
-        if max_files > 0 and shown >= max_files then break end
-        shown = shown + 1
-        local path = _one_line(f.path or tostring(f))
-        local suffix = f.action and ("  [" .. _one_line(f.action) .. "]") or ""
-        local text = "  " .. path .. suffix
-        local ln = #lines + 1
-        lines[#lines + 1] = text
-        -- 文件行并入所属条目的二级折叠
-        fold_levels[ln] = 2
-        marks[#marks + 1] = { line = ln, start_col = 2, end_col = 2 + #path, level = M.level_of(path, lvl_ctx) }
-        -- git 原子组：整组撤销/重做，文件行同样映射到整组。
-        line_to_target[ln] = git_op
-          and { change_set_id = item.change_set_id, saved = true, whole = true }
-          or { change_set_id = item.change_set_id, path = path, saved = true }
-      end
-      if max_files > 0 and #files > shown then
-        local rln = _append_rest(#files - shown,
-          { change_set_id = item.change_set_id, saved = true, whole = true })
-        fold_levels[rln] = 2
-      end
-      -- 条目尾空行计入一级，保证区折叠连续闭合到末条（空行自身不可见）
-      local blk = #lines + 1
-      lines[#lines + 1] = ""
-      fold_levels[blk] = 1
+      _render_entry(item, {
+        region = "saved",
+        base = 2,
+        files = files,
+        status = reverted and "已撤销" or "已保存",
+        status_level = reverted and "pending0" or "workspace",
+        whole_target = { change_set_id = item.change_set_id, saved = true, whole = true },
+        key_prefix = "saved:" .. tostring(item.change_set_id),
+        saved = true,
+        tail_level = 1,
+      })
     end
   end
   -- 已拒绝（可恢复）：显式拒绝（`d`）时候选内容另存 /tmp 副本，条目在此仍可见，
@@ -900,47 +1120,25 @@ function M.build_lines(items, traces, audit, saved, rejected, jobs)
     local title_ln = #lines + 1
     lines[#lines + 1] = ("── 已拒绝（%d 个变更单元，u 恢复为待审）──（默认折叠，za/zo 展开）"):format(#rejected)
     fold_levels[title_ln] = 1
+    fold_keys[title_ln] = "rejected:region"
     for _, item in ipairs(rejected) do
       local files = item.files
       if not files or #files == 0 then
         files = {}
         for _, p in ipairs(item.write_set or {}) do files[#files + 1] = { path = p } end
       end
-      local git_op = item.atomic_group == "git"
-      local group_desc = git_op
-        and string.format("（git 操作 · %d 个文件 · 原子整组）", #files)
-        or string.format("（%d 个文件）", #files)
-      local reason = item.reject_reason and (" · " .. _one_line(item.reject_reason)) or ""
-      local base = _one_line(string.format("[%s] %s%s%s  ",
-        item.change_set_id, item.tool or "?", group_desc, reason))
-      local hln = #lines + 1
-      lines[#lines + 1] = base .. "已拒绝"
-      fold_levels[hln] = 2
-      marks[#marks + 1] = { line = hln, start_col = #base, end_col = #base + #"已拒绝", level = "system" }
-      line_to_target[hln] = { change_set_id = item.change_set_id, rejected = true, whole = true }
-      local shown = 0
-      for _, f in ipairs(files) do
-        if max_files > 0 and shown >= max_files then break end
-        shown = shown + 1
-        local path = _one_line(f.path or tostring(f))
-        local suffix = f.action and ("  [" .. _one_line(f.action) .. "]") or ""
-        local text = "  " .. path .. suffix
-        local ln = #lines + 1
-        lines[#lines + 1] = text
-        fold_levels[ln] = 2
-        marks[#marks + 1] = { line = ln, start_col = 2, end_col = 2 + #path, level = M.level_of(path, lvl_ctx) }
-        line_to_target[ln] = git_op
-          and { change_set_id = item.change_set_id, rejected = true, whole = true }
-          or { change_set_id = item.change_set_id, path = path, rejected = true }
-      end
-      if max_files > 0 and #files > shown then
-        local rln = _append_rest(#files - shown,
-          { change_set_id = item.change_set_id, rejected = true, whole = true })
-        fold_levels[rln] = 2
-      end
-      local blk = #lines + 1
-      lines[#lines + 1] = ""
-      fold_levels[blk] = 1
+      local reason = item.reject_reason and ("（" .. _one_line(item.reject_reason) .. "）") or ""
+      _render_entry(item, {
+        region = "rejected",
+        base = 2,
+        files = files,
+        status = "已拒绝" .. reason,
+        status_level = "system",
+        whole_target = { change_set_id = item.change_set_id, rejected = true, whole = true },
+        key_prefix = "rejected:" .. tostring(item.change_set_id),
+        rejected = true,
+        tail_level = 1,
+      })
     end
   end
   -- 越界访问留痕（read_all 下访问 cwd 之外用户工作目录；仅记录，非阻塞）。
@@ -977,7 +1175,16 @@ function M.build_lines(items, traces, audit, saved, rejected, jobs)
     if type(lines[i]) ~= "string" then lines[i] = _one_line(lines[i]) end
     if lines[i]:find("[\r\n]") then lines[i] = _one_line(lines[i]) end
   end
-  return { lines = lines, marks = marks, line_to_target = line_to_target, line_to_trace = line_to_trace, fold_levels = fold_levels, fold_titles = fold_titles }
+  return {
+    lines = lines,
+    marks = marks,
+    line_to_target = line_to_target,
+    line_to_trace = line_to_trace,
+    line_to_file = line_to_file,
+    fold_levels = fold_levels,
+    fold_titles = fold_titles,
+    fold_keys = fold_keys,
+  }
 end
 
 -- 前向声明（定义见下方 diff 预览区）
@@ -3463,6 +3670,81 @@ function M.setup()
   end)
 end
 
+-- ========== 折叠状态保持 / 目标行高亮 ==========
+
+--- 记录当前窗口里已展开的条目/分区（刷新后恢复；应用成功的 fold_all 会清空）。
+local function _capture_open_folds()
+  if not (state.win_id and vim.api.nvim_win_is_valid(state.win_id)) then return end
+  local total = vim.api.nvim_buf_line_count(state.buf or 0)
+  state.open_folds = state.open_folds or {}
+  for ln, key in pairs(state.fold_keys or {}) do
+    if ln >= 1 and ln <= total then
+      local closed = vim.api.nvim_win_call(state.win_id, function()
+        return vim.fn.foldclosed(ln)
+      end)
+      if closed == -1 then
+        state.open_folds[key] = true
+      else
+        state.open_folds[key] = nil
+      end
+    end
+  end
+end
+
+--- 重绘后按稳定键恢复用户展开的条目/分区（先展开条目，再展开内部分区）。
+local function _restore_open_folds()
+  if not (state.win_id and vim.api.nvim_win_is_valid(state.win_id)) then return end
+  if not next(state.open_folds or {}) then return end
+  local list = {}
+  for key in pairs(state.open_folds) do
+    local ln = state.fold_keys_rev and state.fold_keys_rev[key]
+    if ln then list[#list + 1] = { ln = ln, key = key } end
+  end
+  if #list == 0 then return end
+  table.sort(list, function(a, b) return a.ln < b.ln end)
+  local saved
+  pcall(function() saved = vim.api.nvim_win_get_cursor(state.win_id) end)
+  for _, item in ipairs(list) do
+    pcall(vim.api.nvim_win_set_cursor, state.win_id, { item.ln, 0 })
+    pcall(vim.api.nvim_win_call, state.win_id, function() vim.cmd("normal! zo") end)
+  end
+  if saved then
+    pcall(vim.api.nvim_win_set_cursor, state.win_id, { saved[1], saved[2] })
+  end
+end
+
+--- 光标在文件行时高亮 <CR> 将作用的文件范围：
+---   普通条目 = 当前文件行；整包 / git 原子组 = 该单元全部文件行。
+local function _update_target_highlight()
+  if not (state.buf and vim.api.nvim_buf_is_valid(state.buf)) then return end
+  local ns = state.target_ns
+  if not ns then return end
+  vim.api.nvim_buf_clear_namespace(state.buf, ns, 0, -1)
+  if not (state.win_id and vim.api.nvim_win_is_valid(state.win_id)) then return end
+  local ok, pos = pcall(vim.api.nvim_win_get_cursor, state.win_id)
+  if not ok then return end
+  local rec = state.line_to_file and state.line_to_file[pos[1]]
+  if not rec or not rec.change_set_id then return end
+  local rows = {}
+  if rec.whole then
+    for ln, r in pairs(state.line_to_file) do
+      if r.change_set_id == rec.change_set_id then rows[#rows + 1] = ln end
+    end
+    table.sort(rows)
+  else
+    rows[1] = pos[1]
+  end
+  for _, ln in ipairs(rows) do
+    local text = (vim.api.nvim_buf_get_lines(state.buf, ln - 1, ln, false)[1]) or ""
+    pcall(vim.api.nvim_buf_set_extmark, state.buf, ns, ln - 1, 0, {
+      end_col = #text,
+      hl_group = "NeoAISandboxReviewTarget",
+      hl_eol = false,
+      priority = 220,
+    })
+  end
+end
+
 -- ========== 公开 API ==========
 
 --- 打开待审审批界面
@@ -3535,6 +3817,27 @@ function M.open()
   vim.wo[state.win_id].foldtext = "v:lua.NeoAISandboxReviewFoldText()"
   vim.wo[state.win_id].foldlevel = 0
   vim.wo[state.win_id].foldminlines = 0
+  -- 显示折叠列（▸/▾），让两层嵌套折叠看得见。
+  vim.wo[state.win_id].foldcolumn = "1"
+
+  -- 光标所在文件/整包的高亮命名空间 + 跟随光标刷新。
+  state.target_ns = vim.api.nvim_create_namespace("NeoAISandboxReviewTarget")
+  if state.target_aucmd then pcall(vim.api.nvim_del_autocmd, state.target_aucmd) end
+  state.target_aucmd = vim.api.nvim_create_autocmd({ "CursorMoved", "CursorMovedI" }, {
+    buffer = state.buf,
+    callback = function() _update_target_highlight() end,
+  })
+
+  --- 光标是否位于**已收起的折叠起点**（条目头 / 二级分区）。
+  --- 只判断 foldclosed(ln) == ln：光标在折叠内部（非首行）时仍按普通目标处理，
+  --- 便于测试/程序化定位到隐藏文件行；正常交互下光标会落在折叠首行。
+  --- @return number 行号
+  --- @return boolean 是否已收起
+  local function _fold_start_state()
+    local ln = vim.api.nvim_win_get_cursor(0)[1]
+    local ok, closed = pcall(vim.fn.foldclosed, ln)
+    return ln, (ok and closed == ln)
+  end
 
   vim.keymap.set("n", "q", function() M.close() end, { buffer = state.buf })
   vim.keymap.set("n", "<Esc>", function() M.close() end, { buffer = state.buf })
@@ -3544,10 +3847,20 @@ function M.open()
   vim.keymap.set("n", "<Left>", function() _switch_page(-1) end, { buffer = state.buf })
   vim.keymap.set("n", "<Right>", function() _switch_page(1) end, { buffer = state.buf })
   -- <CR>/d：阻塞类页面用于允许/拒绝该审批条目；「待修改」页用于应用/拒绝文件。
+  -- 折叠中的行（收起条目 / 收起的调用参数·安全审查）按 <CR> 只展开，不应用：
+  -- 防止条目收起成一行后回车误把整单元应用掉。
   vim.keymap.set("n", "<CR>", function()
     if _is_blocking_page(state.page) then return _blocking_decide("allow_once") end
+    local ln, closed = _fold_start_state()
+    if closed then
+      pcall(vim.cmd, "normal! zo")
+      return
+    end
+    -- 已展开的「调用参数 / 安全审查」标题行：回车不做任何事（不误报“请移到条目行”）。
+    local key = state.fold_keys[ln]
+    if key and key:sub(-6) ~= ":entry" then return end
     _apply_current()
-  end, { buffer = state.buf })
+  end, { buffer = state.buf, desc = "NeoAI 展开折叠/应用" })
   vim.keymap.set("n", "S", function()
     if _is_blocking_page(state.page) then return _blocking_decide("allow_session") end
   end, { buffer = state.buf, desc = "NeoAI 本次会话允许该审批" })
@@ -3635,8 +3948,13 @@ function M.refresh()
     return out
   end
   -- 折叠级别/折叠摘要必须在写 buffer 前更新：写行后 nvim 会立即按 foldexpr 求值。
+  -- 先记录用户当前展开的条目/分区，重绘后按稳定键恢复（避免事件刷新把正在看的条目收起）。
+  _capture_open_folds()
   state.fold_levels = _shift(body.fold_levels)
   state.fold_titles = _shift(body.fold_titles)
+  state.fold_keys = _shift(body.fold_keys)
+  state.fold_keys_rev = {}
+  for ln, key in pairs(state.fold_keys) do state.fold_keys_rev[key] = ln end
   vim.api.nvim_buf_set_lines(state.buf, 0, -1, false, lines)
   state.line_to_target = _shift(body.line_to_target)
   state.line_to_trace = _shift(body.line_to_trace)
@@ -3644,6 +3962,7 @@ function M.refresh()
   state.line_to_hub = _shift(body.line_to_hub)
   state.line_to_allowance = _shift(body.line_to_allowance)
   state.line_to_history = _shift(body.line_to_history)
+  state.line_to_file = _shift(body.line_to_file)
   vim.api.nvim_buf_clear_namespace(state.buf, state.ns, 0, -1)
   for _, m in ipairs(marks) do
     if LEVEL_HL[m.level] then
@@ -3678,6 +3997,9 @@ function M.refresh()
       restore, (state.last_cursor and state.last_cursor.col) or 0,
     })
   end
+  -- 恢复用户此前展开的条目/分区，再刷新光标所在文件的高亮。
+  _restore_open_folds()
+  _update_target_highlight()
 end
 
 --- 关闭界面
@@ -3701,17 +4023,26 @@ function M.close()
     pcall(vim.api.nvim_win_close, state.win_id, true)
   end
   geometry.untrack(state.win_id)
+  if state.target_aucmd then
+    pcall(vim.api.nvim_del_autocmd, state.target_aucmd)
+    state.target_aucmd = nil
+  end
   state.win_id = nil
   state.buf = nil
   state.ns = nil
+  state.target_ns = nil
   state.line_to_target = {}
   state.line_to_hub = {}
   state.line_to_allowance = {}
   state.line_to_history = {}
   state.line_to_trace = {}
   state.line_to_cmd = {}
+  state.line_to_file = {}
   state.fold_levels = {}
   state.fold_titles = {}
+  state.fold_keys = {}
+  state.fold_keys_rev = {}
+  state.open_folds = {}
   state.local_busy = {}
   -- 作废在途 AI 审计结果；保留已完成结论（diff 预览返回/重开时复用，集合变化时由 refresh 清除）。
   state.audit_seq = state.audit_seq + 1
@@ -3735,6 +4066,7 @@ end
 --- 用户仍可随时 za/zo 再展开。
 function M.fold_all()
   if not (state.win_id and vim.api.nvim_win_is_valid(state.win_id)) then return end
+  state.open_folds = {}
   vim.wo[state.win_id].foldlevel = 0
   pcall(vim.api.nvim_win_call, state.win_id, function()
     pcall(vim.cmd, "silent! normal! zM")

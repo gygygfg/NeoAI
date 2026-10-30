@@ -269,12 +269,15 @@ tests.suite("sandbox_review", function(_, it)
     t.eq(2, fl[h2], "第二条目头行应为二级折叠")
     t.eq(2, fl[h1 + 1], "文件行应并入二级折叠")
     t.eq(2, fl[h1 + 2], "第二个文件行应并入二级折叠")
+    local has_section = false
     for _, lv in pairs(fl) do
-      t.true_(lv == 1 or lv == 2, "仅已应用区登记折叠级别（1/2）")
+      t.true_(lv == 1 or lv == 2 or lv == 3, "已应用区折叠级别只允许 1/2/3")
+      if lv == 3 then has_section = true end
     end
+    t.true_(has_section, "条目内「调用参数 / 安全审查」应为三级折叠")
   end)
 
-  it("build_lines 待审普通条目「头行显示、其余折叠」", function(t)
+  it("build_lines 待审条目两级折叠：条目一级 / 参数与审查二级", function(t)
     local sr = require("NeoAI.ui.components.sandbox_review")
     local cwd = vim.fn.getcwd()
     local data = sr.build_lines({ { change_set_id = "csP", tool = "edit_file", risk_level = 1,
@@ -288,14 +291,27 @@ tests.suite("sandbox_review", function(_, it)
     end
     t.not_nil(head, "应有头行")
     t.not_nil(last, "应有文件行")
-    t.eq(nil, fl[head], "头行不折叠（保持正常显示与高亮）")
+    t.eq(1, fl[head], "条目头行应为一层折叠起点")
     for ln = head + 1, last do
-      t.eq(1, fl[ln], "头行之后的风险原因/文件行都应登记一级折叠")
+      t.true_(fl[ln] == 1 or fl[ln] == 2, "条目内各行应有折叠级别（1/2）")
     end
-    t.eq(nil, fl[last + 1], "条目尾空行不应登记折叠级别（避免相邻条目合并）")
+    -- 「调用参数」「安全审查」二级折叠
+    local args_ln, sec_ln
+    for i, l in ipairs(data.lines) do
+      if l:find("调用参数", 1, true) then args_ln = i end
+      if l:find("安全审查", 1, true) then sec_ln = i end
+    end
+    t.eq(2, fl[args_ln], "调用参数应为二级折叠")
+    t.eq(2, fl[sec_ln], "安全审查应为二级折叠")
+    local tail
+    for i = #data.lines, head + 1, -1 do
+      if data.lines[i] == "" then tail = i; break end
+    end
+    t.not_nil(tail, "条目后应有空行")
+    t.eq(nil, fl[tail], "条目尾空行不应登记折叠级别（避免相邻条目合并）")
   end)
 
-  it("build_lines 待审 git 原子组登记整组折叠级别", function(t)
+  it("build_lines 待审 git 原子组登记整组两级折叠", function(t)
     local sr = require("NeoAI.ui.components.sandbox_review")
     local cwd = vim.fn.getcwd()
     local data = sr.build_lines({ { change_set_id = "csGF", tool = "git_add", atomic_group = "git",
@@ -312,11 +328,16 @@ tests.suite("sandbox_review", function(_, it)
     end
     t.not_nil(head, "应有 git 组头行")
     t.not_nil(last, "应有 git 组文件行")
-    t.eq(nil, fl[head], "头行不折叠（保持正常显示与高亮）")
+    t.eq(1, fl[head], "git 组头行应为一层折叠起点")
     for ln = head + 1, last do
-      t.eq(1, fl[ln], "头行之后的提示/风险/文件行都应登记一级折叠")
+      t.true_(fl[ln] == 1 or fl[ln] == 2, "git 组内提示/文件行应有折叠级别（1/2）")
     end
-    t.eq(nil, fl[last + 1], "组尾空行不应登记折叠级别（避免相邻组合并）")
+    local tail
+    for i = #data.lines, head + 1, -1 do
+      if data.lines[i] == "" then tail = i; break end
+    end
+    t.not_nil(tail, "组后应有空行")
+    t.eq(nil, fl[tail], "组尾空行不应登记折叠级别（避免相邻组合并）")
   end)
 
   it("open 后待审 git 原子组默认收起且可展开", function(t)
@@ -349,11 +370,12 @@ tests.suite("sandbox_review", function(_, it)
     local function closed(ln)
       return vim.api.nvim_win_call(win, function() return vim.fn.foldclosed(ln) end)
     end
-    t.eq(-1, closed(head), "git 组头行应保持显示（不折叠）")
-    t.eq(head + 1, closed(head + 1), "头行之后（提示/文件）默认应处于折叠状态")
-    vim.api.nvim_win_set_cursor(win, { head + 1, 0 })
+    t.eq(head, closed(head), "git 组头行（收起条目）应为折叠起点")
+    t.eq(head, closed(head + 1), "头行之后（文件列表）默认应处于折叠中")
+    vim.api.nvim_win_set_cursor(win, { head, 0 })
     vim.api.nvim_win_call(win, function() vim.cmd("normal! zo") end)
-    t.eq(-1, closed(head + 1), "zo 后 git 组其余行应展开")
+    t.eq(-1, closed(head), "zo 后条目应展开")
+    t.eq(-1, closed(head + 1), "展开条目后文件列表应可见")
     sr.close()
     services.provide("services.sandbox", saved)
   end)
@@ -369,11 +391,11 @@ tests.suite("sandbox_review", function(_, it)
       if l:find("csCmd", 1, true) then head = i end
     end
     t.not_nil(head, "应有头行")
-    t.true_(data.lines[head + 1]:find("$ sed", 1, true) ~= nil, "条目内仍应展示命令（仅供展开查看）")
-    local title = (data.fold_titles or {})[head + 1]
-    t.not_nil(title, "折叠首行应登记摘要")
-    t.true_(title:find("p.lua", 1, true) ~= nil, "摘要应含被修改的文件 p.lua: " .. title)
-    t.true_(title:find("q.lua", 1, true) ~= nil, "摘要应含被修改的文件 q.lua: " .. title)
+    local all = table.concat(data.lines, "\n")
+    t.true_(all:find("sed -i", 1, true) ~= nil, "条目内仍应展示命令（调用参数区，仅供展开查看）")
+    local title = (data.fold_titles or {})[head]
+    t.not_nil(title, "条目头行应登记折叠摘要")
+    t.true_(title:find("2 个文件", 1, true) ~= nil, "摘要应含修改文件数: " .. title)
     t.eq(nil, title:find("sed", 1, true), "摘要不应包含命令: " .. title)
   end)
 
@@ -404,11 +426,212 @@ tests.suite("sandbox_review", function(_, it)
       if l:find("csCmdOpen", 1, true) then head = i end
     end
     t.not_nil(head, "应有头行")
-    local closed = vim.api.nvim_win_call(win, function() return vim.fn.foldclosed(head + 1) end)
+    local closed = vim.api.nvim_win_call(win, function() return vim.fn.foldclosed(head) end)
     local text = vim.api.nvim_win_call(win, function() return vim.fn.foldtextresult(closed) end)
-    t.eq(head + 1, closed, "头行之后默认收起")
-    t.true_(text:find("mod.lua", 1, true) ~= nil, "折叠文本应显示被修改的文件: " .. text)
+    t.eq(head, closed, "条目头行默认收起")
+    t.true_(text:find("1 个文件", 1, true) ~= nil, "折叠文本应显示修改文件数: " .. text)
     t.eq(nil, text:find("sed", 1, true), "折叠文本不应显示命令: " .. text)
+    sr.close()
+    services.provide("services.sandbox", saved)
+  end)
+
+  it("build_lines 渲染调用参数区：大文本省略、保留关键参数", function(t)
+    local sr = require("NeoAI.ui.components.sandbox_review")
+    local cwd = vim.fn.getcwd()
+    local data = sr.build_lines({ {
+      change_set_id = "csArgs", tool = "write_file", risk_level = 1,
+      args_preview = {
+        fields = { { key = "path", value = "a.lua" }, { key = "mode", value = "overwrite" } },
+        omitted = { { key = "content", bytes = 2048 } },
+        truncated = false,
+      },
+      files = { { path = cwd .. "/a.lua", action = "modify" } },
+    } }, {}, nil, {})
+    local text = table.concat(data.lines, "\n")
+    t.matches("调用参数 · write_file · 3 项", text)
+    t.matches("path  a.lua", text)
+    t.matches("content  <2048 字节，已省略>", text)
+    t.eq(nil, text:find(string.rep("x", 100), 1, true), "不应渲染大文本内容")
+  end)
+
+  it("args_preview 对大文本省略并做密钥脱敏", function(t)
+    local ap = require("NeoAI.sandbox.review.args_preview")
+    local p = assert(ap.build({
+      path = "a.lua",
+      content = string.rep("x", 4096),
+      token = "ghp_abcdefghijklmnopqrst",
+      timeout_ms = 120000,
+    }))
+    local by_key = {}
+    for _, f in ipairs(p.fields or {}) do by_key[f.key] = f.value end
+    for _, o in ipairs(p.omitted or {}) do by_key[o.key] = o.bytes end
+    t.eq("a.lua", by_key.path)
+    t.eq(4096, by_key.content)
+    t.eq("120000", by_key.timeout_ms)
+    t.matches("%[REDACTED", by_key.token, "token 不应明文展示")
+  end)
+
+  it("收起条目按 <CR> 只展开，不应用；展开后 <CR> 才应用", function(t)
+    local services = require("NeoAI.kernel.services")
+    local sr = require("NeoAI.ui.components.sandbox_review")
+    sr.reset()
+    local saved = services.use("services.sandbox")
+    local cwd = vim.fn.getcwd()
+    local applied = 0
+    _provide_sandbox({
+      list_reviews = function()
+        return { { change_set_id = "csCR", tool = "edit_file", risk_level = 1,
+          files = { { path = cwd .. "/cr.lua", action = "modify" } } } }
+      end,
+      list_traces = function() return {} end,
+      list_saved = function() return {} end,
+      apply = function() applied = applied + 1; return { ok = true } end,
+      reject = function() end,
+    })
+    sr.open()
+    local buf = assert(sr.get_buf())
+    local win = vim.fn.bufwinid(buf)
+    local head
+    for i, l in ipairs(vim.api.nvim_buf_get_lines(buf, 0, -1, false)) do
+      if l:find("csCR", 1, true) then head = i end
+    end
+    t.not_nil(head, "应有条目头行")
+    vim.api.nvim_win_set_cursor(win, { head, 0 })
+    local cr
+    for _, m in ipairs(vim.api.nvim_buf_get_keymap(buf, "n")) do
+      if m.lhs == "<CR>" then cr = m.callback end
+    end
+    t.not_nil(cr, "应有 <CR> 键位")
+    cr()
+    t.eq(0, applied, "收起条目按 <CR> 不应应用")
+    t.eq(-1, vim.api.nvim_win_call(win, function() return vim.fn.foldclosed(head) end),
+      "收起条目按 <CR> 应展开")
+    cr()
+    t.eq(1, applied, "展开后条目头行按 <CR> 应应用整单元")
+    sr.close()
+    services.provide("services.sandbox", saved)
+  end)
+
+  it("光标文件行高亮：普通条目单文件，整包高亮全部文件", function(t)
+    local services = require("NeoAI.kernel.services")
+    local sr = require("NeoAI.ui.components.sandbox_review")
+    local function _marks()
+      local ns = vim.api.nvim_get_namespaces()["NeoAISandboxReviewTarget"]
+      if not ns then return {} end
+      return vim.api.nvim_buf_get_extmarks(sr.get_buf(), ns, 0, -1, {})
+    end
+    local function _open_with(item)
+      sr.reset()
+      local saved = services.use("services.sandbox")
+      _provide_sandbox({
+        list_reviews = function() return { item } end,
+        list_traces = function() return {} end,
+        list_saved = function() return {} end,
+        apply = function() return { ok = true } end,
+        reject = function() end,
+      })
+      sr.open()
+      local buf = assert(sr.get_buf())
+      local win = vim.fn.bufwinid(buf)
+      vim.wo[win].foldlevel = 99
+      local file_line
+      for ln, tgt in pairs(sr.get_line_map()) do
+        if tgt.path then file_line = ln end
+      end
+      t.not_nil(file_line, "应有文件行")
+      vim.api.nvim_win_set_cursor(win, { file_line, 0 })
+      vim.api.nvim_exec_autocmds("CursorMoved", { buffer = buf })
+      local n = #_marks()
+      sr.close()
+      services.provide("services.sandbox", saved)
+      return n
+    end
+    local cwd = vim.fn.getcwd()
+    t.eq(1, _open_with({ change_set_id = "csHi1", tool = "edit_file",
+      files = { { path = cwd .. "/1.lua" }, { path = cwd .. "/2.lua" } } }),
+      "普通条目只高亮当前文件行")
+    t.eq(2, _open_with({ change_set_id = "csHi2", tool = "run_command", package = true,
+      files = { { path = cwd .. "/p1.lua" }, { path = cwd .. "/p2.lua" } } }),
+      "整包条目应高亮全部文件行")
+  end)
+
+  it("open 后两个二级分区是独立折叠（不会合并成一个）", function(t)
+    local services = require("NeoAI.kernel.services")
+    local sr = require("NeoAI.ui.components.sandbox_review")
+    sr.reset()
+    local saved = services.use("services.sandbox")
+    local cwd = vim.fn.getcwd()
+    _provide_sandbox({
+      list_reviews = function()
+        return { { change_set_id = "csTwo", tool = "write_file", risk_level = 1,
+          files = { { path = cwd .. "/two.lua" } } } }
+      end,
+      list_traces = function() return {} end,
+      list_saved = function() return {} end,
+      apply = function() return { ok = true } end,
+      reject = function() end,
+    })
+    sr.open()
+    local buf = assert(sr.get_buf())
+    local win = vim.fn.bufwinid(buf)
+    local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+    local head, args_ln, sec_ln
+    for i, l in ipairs(lines) do
+      if l:find("csTwo", 1, true) then head = i end
+      if l:find("▾ 调用参数", 1, true) then args_ln = i end
+      if l:find("▾ 安全审查", 1, true) then sec_ln = i end
+    end
+    t.not_nil(head, "应有条目头")
+    t.not_nil(args_ln, "应有调用参数区")
+    t.not_nil(sec_ln, "应有安全审查区")
+    local function closed(ln)
+      return vim.api.nvim_win_call(win, function() return vim.fn.foldclosed(ln) end)
+    end
+    vim.api.nvim_win_set_cursor(win, { head, 0 })
+    vim.api.nvim_win_call(win, function() vim.cmd("normal! zo") end)
+    t.eq(args_ln, closed(args_ln), "调用参数应独立收起")
+    t.eq(sec_ln, closed(sec_ln), "安全审查应独立收起")
+    vim.api.nvim_win_set_cursor(win, { args_ln, 0 })
+    vim.api.nvim_win_call(win, function() vim.cmd("normal! zo") end)
+    t.eq(-1, closed(args_ln), "调用参数应可单独展开")
+    t.eq(sec_ln, closed(sec_ln), "展开调用参数不应展开安全审查")
+    sr.close()
+    services.provide("services.sandbox", saved)
+  end)
+
+  it("刷新后保持用户展开的条目折叠状态", function(t)
+    local services = require("NeoAI.kernel.services")
+    local sr = require("NeoAI.ui.components.sandbox_review")
+    sr.reset()
+    local saved = services.use("services.sandbox")
+    local cwd = vim.fn.getcwd()
+    _provide_sandbox({
+      list_reviews = function()
+        return { { change_set_id = "csKeep", tool = "write_file", risk_level = 1,
+          files = { { path = cwd .. "/keep.lua" } } } }
+      end,
+      list_traces = function() return {} end,
+      list_saved = function() return {} end,
+      apply = function() return { ok = true } end,
+      reject = function() end,
+    })
+    sr.open()
+    local buf = assert(sr.get_buf())
+    local win = vim.fn.bufwinid(buf)
+    local function head_line()
+      for i, l in ipairs(vim.api.nvim_buf_get_lines(buf, 0, -1, false)) do
+        if l:find("csKeep", 1, true) then return i end
+      end
+    end
+    local h1 = head_line()
+    t.not_nil(h1, "应有条目头")
+    vim.api.nvim_win_set_cursor(win, { h1, 0 })
+    vim.api.nvim_win_call(win, function() vim.cmd("normal! zo") end)
+    sr.refresh()
+    local h2 = head_line()
+    t.not_nil(h2, "刷新后仍应有条目头")
+    t.eq(-1, vim.api.nvim_win_call(win, function() return vim.fn.foldclosed(h2) end),
+      "刷新后应保持用户展开的条目")
     sr.close()
     services.provide("services.sandbox", saved)
   end)
@@ -973,8 +1196,11 @@ tests.suite("sandbox_review", function(_, it)
     local ws, sys
     for _, m in ipairs(data.marks) do
       local ln = data.lines[m.line]
-      if ln and ln:find("src/a.lua", 1, true) then ws = m.level end
-      if ln and ln:find("/etc/hosts", 1, true) then sys = m.level end
+      -- 只看文件行（恰好 8 空格缩进）；调用参数区里的 command 行（10 空格）也含路径，需排除。
+      if ln and ln:sub(1, 8) == "        " and ln:sub(9, 9) ~= " " then
+        if ln:find("src/a.lua", 1, true) then ws = m.level end
+        if ln:find("/etc/hosts", 1, true) then sys = m.level end
+      end
     end
     t.eq("workspace", ws, "工作区文件应 workspace 高亮")
     t.eq("system", sys, "系统文件应 system 高亮")

@@ -287,6 +287,7 @@ sandbox = {
   mode = "dry_run",                -- dry_run（默认，仅冻结候选）| commit（授权后立即 CAS 发布）
   postprocess = "async",           -- 进程命令后处理模式：async（默认）= 命令进程退出后立即返回结果给主循环，overlay 捕获/候选冻结/暂存合并/落盘/结算在后台完成（FIFO 槽位保持到后台完成，保证下一命令看到一致暂存；后续读写工具会等待在途后处理）；sync = 等待后处理完成后再返回（确定性，测试默认）
   attach_await_ms = 3000,          -- 物化前等待「上一条命令在途后处理」完成的最长时间（ms）：async 模式下若不等，下一条命令会用旧暂存覆盖 overlay 中上一轮的产物（内容回退）；0 = 不等待（旧行为）；超时仍继续执行并写证据（绝不永久阻塞命令）
+  classify_min_files = 256,        -- 冻结时把遮蔽/.git/风险级别分类下沉到 worker 的文件数阈值；普通 run_command 改动大时避免主线程逐文件 vim.fn.resolve
   shutdown_timeout_ms = 3000,      -- 退出/关闭（`:qall`、插件热重载）时等待后台后处理与暂存迁移完成的最长时间（ms）；超时即放弃等待，避免卡住退出；0 = 不等待（可能丢失最后一笔未完成的冻结/待审入队）
   backend = "auto",                -- auto | bwrap | unshare
   -- 无任何可用隔离后端（无 bwrap、unshare/userns 被内核拒绝，如 Android/Termux 拦 clone(CLONE_NEWUSER)）时：
@@ -606,10 +607,15 @@ sandbox = {
   --   若冻结时剔除了遮蔽/易变缓存文件会在警告区提示「将跳过 N 个」。
   -- ai_audit：待审界面按 `a`（可配置 key）把用户消息 + 分级的待审变更结构化文本交给模型，
   --           **逐条**（每个文件/主机命令）生成 ≤50 字、以「安全/不安全」开头的暗灰补充说明
-  --           （显示在文件行下方，高危变更优先且不得省略；模型漏答的条目标注「请人工确认」，
-  --           顶部先给出整体安全/不安全结论，不进入聊天界面）。auto=true 时打开待审界面自动
-  --           发起审计（默认关闭；集合变化时自动重审）。全局并发上限 max_concurrent（默认 10，
-  --           在途请求超出即排队 FIFO），避免 auto 频繁触发时请求风暴。
+  --           （归入每个条目的「安全审查」二级折叠区，高危变更优先且不得省略；模型漏答的条目
+  --           标注「请人工确认」，顶部先给出整体安全/不安全结论，不进入聊天界面）。auto=true
+  --           时打开待审界面自动发起审计（默认关闭；集合变化时自动重审）。全局并发上限
+  --           max_concurrent（默认 10，在途请求超出即排队 FIFO），避免 auto 频繁触发时请求风暴。
+  -- 审批窗条目渲染（两层嵌套折叠）：
+  --   args_max_chars：条目「调用参数」区的参数摘要总长度上限（字符，默认 2000）。工具参数中的
+  --     content/old_string/new_string 等大文本只记录字节数；展示值经密钥破坏性脱敏后落盘。
+  --   max_display_notes：「安全审查」区逐条 AI 说明的展示上限（默认 50，0=不限）；不安全项优先，
+  --     超出截断为「其余 N 条说明已截断」。
   -- 大量文件优化：
   --   max_display_files：审批窗每个变更单元最多渲染的文件行数（0=不限），超限折叠为一行
   --     「其余 M 个文件」汇总（映射整单元审批）；避免包安装/git 操作数千文件时开窗/刷新慢。
@@ -633,7 +639,8 @@ sandbox = {
   --     merge=false 回退原「基线变了即整体拒绝」。merge_max_bytes=null 沿用 max_file_bytes。
   --   snapshot_cas：撤销保存的快照 CAS "sig"（默认，签名，省 CPU）|"hash"（内容哈希，最严）。
   review = { enabled = true, auto_apply = false, session_auto_approve = false,
-             max_display_files = 200, refresh_debounce_ms = 80,
+             max_display_files = 200, args_max_chars = 2000, max_display_notes = 50,
+             refresh_debounce_ms = 80,
              content_cache_max = 64, candidate_cache_max_bytes = 16 * 1024 * 1024,
              terminal_cache_max = 200, rejected_max = 50,
              rejected_dir = "/tmp/neoai-rejected", cas_mode = "hash",

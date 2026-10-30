@@ -836,6 +836,9 @@ local function _merge_package_item(item, cand)
   logger.try("delete_review_removed", store.delete_review_removed, base.change_set_id)
   base.package_names = _union(base.package_names, item.package_names)
   base.command = item.command or base.command
+  -- 同安装命令合并：保留最新一次调用的参数摘要，并累加合并次数供界面标注。
+  base.args_preview = item.args_preview or base.args_preview
+  base.args_merged = (tonumber(base.args_merged) or 1) + 1
   base.package_manager = item.package_manager or base.package_manager
   if (tonumber(item.risk_level) or 0) > (tonumber(base.risk_level) or 0) then
     base.risk_level = item.risk_level
@@ -930,6 +933,10 @@ function M.enqueue(cand, meta)
     package_sensitive = meta.package_sensitive,
     -- 冻结时剔除的不可发布文件（遮蔽/易变缓存），供审批界面提示。
     dropped = meta.dropped,
+    -- 工具调用参数摘要（脱敏/限长）：审批界面「调用参数」区。
+    args_preview = meta.args_preview,
+    -- 同一安装命令合并的次数：审批界面「调用参数」区标注「已合并 N 次调用」。
+    args_merged = meta.args_merged,
     -- 上次失败原因（部分应用回队时携带）：新待审单元直接展示，避免「同因再失败」无从排查。
     fail_reason = meta.fail_reason,
     review_state = M.REVIEW.PENDING,
@@ -981,6 +988,8 @@ function M.enqueue_host_op(rec)
     attempt_id = rec.attempt_id,
     write_set = { rec.command },
     files = {},
+    -- 主机操作无工具参数：命令即「调用参数」。
+    args_preview = { fields = { { key = "command", value = tostring(rec.command or "") } }, omitted = {}, truncated = false },
     privilege_tier = rec.tier,
     effect = "process",
     -- 主机操作提案属 L3（critical）：供审批界面红色高危标注与 AI 审计正确分级。

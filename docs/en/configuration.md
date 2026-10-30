@@ -299,6 +299,7 @@ sandbox = {
   mode = "dry_run",                -- dry_run (default, only freezes candidates) | commit (CAS publish after authorization)
   postprocess = "async",           -- Process-command post-processing mode: async (default) = return the result to the main loop as soon as the process exits, while overlay capture/candidate freeze/staging merge/persist/settle run in the background (the FIFO slot is held until the background chain finishes so the next command sees consistent staging; subsequent read/write tools wait for in-flight post-processing); sync = wait for post-processing before returning (deterministic; tests inject this)
   attach_await_ms = 3000,          -- Max time (ms) to wait for the previous command's in-flight post-processing before materializing staging into the new overlay: without the wait the next command overwrites last round's overlay products with stale staging (content rollback); 0 = no wait (legacy); on timeout execution continues and evidence is recorded (never blocks a command forever)
+  classify_min_files = 256,        -- Freeze-time threshold for moving mask/.git/risk classification into the worker (avoids per-file vim.fn.resolve on the main thread for large non-package commands)
   shutdown_timeout_ms = 3000,      -- Max time (ms) to wait for background post-processing and staging migration on exit/close (`:qall`, plugin hot reload); the wait is abandoned on timeout so quitting never hangs; 0 = don't wait (the last unfinished freeze/pending enqueue may be lost)
   backend = "auto",                -- auto | bwrap | unshare
   -- When NO isolation backend is available (no bwrap, unshare/userns rejected by kernel, e.g. Android/Termux
@@ -674,13 +675,19 @@ sandbox = {
   --   files are reported in the warning block as "N will be skipped".
   -- ai_audit: press `a` (configurable key) in the review UI to hand the user messages + structured
   --           text of risk-graded pending changes to the model, which returns a ≤50-char note for
-  --           **every** item (file / host command) starting with a safe/unsafe verdict (rendered
-  --           under the line; high-risk changes come first and are never omitted; items the model
-  --           misses are marked "needs manual confirmation"; the top shows an overall verdict; never
-  --           posted to chat). auto=true runs the audit automatically when the review UI opens
-  --           (default off; re-audits when the pending set changes). Global concurrency cap
-  --           max_concurrent (default 10; excess in-flight requests queue FIFO) avoids a request
-  --           storm when auto fires frequently.
+  --           **every** item (file / host command) starting with a safe/unsafe verdict (rendered in
+  --           the per-entry nested "Security review" section; high-risk changes come first and are
+  --           never omitted; items the model misses are marked "needs manual confirmation"; the top
+  --           shows an overall verdict; never posted to chat). auto=true runs the audit automatically
+  --           when the review UI opens (default off; re-audits when the pending set changes). Global
+  --           concurrency cap max_concurrent (default 10; excess in-flight requests queue FIFO)
+  --           avoids a request storm when auto fires frequently.
+  -- Review entry rendering (two-level nested folds):
+  --   args_max_chars: max chars for the per-entry "Call arguments" summary (default 2000). Large text
+  --     args (content/old_string/new_string) are stored as byte counts only; displayed values are
+  --     destructively secret-redacted before persisting.
+  --   max_display_notes: max per-file AI notes shown in the "Security review" section (default 50,
+  --     0 = unlimited); unsafe notes first, the rest collapse into a truncation line.
   -- Many-file optimizations:
   --   max_display_files: max file rows rendered per change set in the review UI (0 = unlimited);
   --     beyond it they collapse into one "N more files" summary row (mapped to whole-unit approval),
@@ -715,7 +722,8 @@ sandbox = {
   --   snapshot_cas: undo-snapshot CAS "sig" (default, signatures, less CPU) | "hash" (content hash,
   --     strictest).
   review = { enabled = true, auto_apply = false, session_auto_approve = false,
-             max_display_files = 200, refresh_debounce_ms = 80,
+             max_display_files = 200, args_max_chars = 2000, max_display_notes = 50,
+             refresh_debounce_ms = 80,
              content_cache_max = 64, candidate_cache_max_bytes = 16 * 1024 * 1024,
              terminal_cache_max = 200, rejected_max = 50,
              rejected_dir = "/tmp/neoai-rejected", cas_mode = "hash",

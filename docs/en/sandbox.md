@@ -435,9 +435,18 @@ is only kept for other `approval.mode` values (`prompt`/`strict`).
     already dedupes by category at the source). Risk badges are colored **L0 gray / L1·L2 yellow /
     L3 red** — only L3 uses the red danger highlight. Items are **sectioned into "unapplied" and
     "applied"**: pending (unapplied) changes come first, already-published (snapshotted, revertible)
-    changes after. **The header line approves the whole change set**
-    (`<CR>` applies every file in it), while a **file line approves a single file**
-    (`<CR>` applies only the file under the cursor); `A` **approves every workspace change in one
+    changes after. **Every entry uses two-level nested folds** (pending / applied / rejected alike):
+    level 1 is the entry line (`[cs] tool · N files · [risk] status`); expanding it shows the modified
+    file list immediately while two level-2 sections stay collapsed — **call arguments** (redacted,
+    length-capped; large text args shown as byte counts) and **security review** (verdict, risk
+    level/reasons, privilege tier, secret/merge/dropped/package warnings, per-file AI notes). Collapsed
+    risk levels use colored emoji dots (`⚪L0/🟡L1/🟠L2/🔴L3`) because fold text cannot be highlighted.
+    The cursor-file target row is highlighted; whole-package / git-atomic entries highlight **all** of
+    their file rows. Pressing `<CR>` on a **collapsed fold start** (entry / call-arguments / security
+    review) only expands it, never applies; after expanding, `<CR>` on a file row applies that file
+    (whole package / git group for those units), while L2/L3 still go through the diff confirm.
+    **The header line approves the whole change set** once the entry is expanded
+    (`<CR>` applies every file in it); `A` **approves every workspace change in one
     key** (applies workspace-scoped pending files at file granularity; files outside the workspace and
     host-operation proposals stay pending for individual review, and root-requiring items prompt for
     per-item escalation). Batch application **yields to the main loop between items** (each change set
@@ -554,8 +563,10 @@ is only kept for other `approval.mode` values (`prompt`/`strict`).
       (`privilege.package_info`) and **merged into a single approval unit by the install-command
       key `package_key` (`<manager>:<packages>`)** — multiple candidates from the same install
       command (indexes, metadata, package files) appear as one entry in the review queue and are
-      approved as one unit (`<CR>` applies all files) without per-file confirmation; `files` still
-      allows applying only a subset. Detection skips wrappers such as `sudo`/`doas`/`env`/
+      approved as one unit (`<CR>` applies all files) without per-file confirmation; in the review
+      window any file row of a package entry means the whole package (and highlights every file row),
+      while the programmatic `sandbox.apply(id, { files = {...} })` still supports selective subsets.
+      Detection skips wrappers such as `sudo`/`doas`/`env`/
       `bash -c`/`for …; do …` so a package install is not missed and escalated to L3.
     - **Writable roots and capabilities for package installs**: package install commands
       (any segment matching a package manager, `req.package`) automatically add the
@@ -784,14 +795,15 @@ is only kept for other `approval.mode` values (`prompt`/`strict`).
       privilege tier, risk level and reasons, secret/package/command info, per-file diffs) and asks
       the model for **one ≤50-character Chinese risk note per file (or host-op command)**. Each
       note **leads with a safe/unsafe verdict** — it must start with `安全` or `不安全`, followed by
-      the main reason. Notes are rendered as **dark-gray supplementary lines directly under the
-      corresponding file line** (the model outputs `<path or command> => <安全|不安全>：<note>` per
-      line; `parse_notes` parses and truncates to 50 chars, with a whole-output fallback when the
-      format is not followed); the window top first renders an **overall verdict**
+      the main reason. Notes are rendered inside each entry's **nested "security review" section**
+      (the model outputs `<path or command> => <安全|不安全>：<note>` per line; `parse_notes` parses and
+      truncates to 50 chars, with a whole-output fallback when the format is not followed); the window
+      top first renders an **overall verdict**
       (`ai_audit.verdict`: any note judged unsafe → red `不安全`, otherwise green `安全`). Pending
       changes are **fed to the model highest-risk first**, and high-risk (L2/L3) changes are never
       omitted, so their notes survive total-length/output truncation. **Every item is audited**: an
-      item the model misses is marked with a red "（AI 未给出说明，请人工确认）" under its line. A short
+      item the model misses is marked with a red "（AI 未给出说明，请人工确认）" in its security
+      review section. A short
       dark-gray status line at the top shows generating/failure. The audit **never posts to the chat UI and never
       applies or rejects** any change; the user remains in control via the review UI. The review
       window has soft wrapping on by default (`wrap`/`linebreak`). Diffs / user messages / total text

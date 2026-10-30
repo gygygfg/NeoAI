@@ -687,7 +687,27 @@ local state = {
   -- 与「在本机继续执行」不同性质，不随本集合放行。
   allowed = {}, -- secret -> true
   allowed_notified = {}, -- secret -> true（提示只打一次）
+  path_cache = {}, -- path -> secret?/sensitive?：静态路径规则结果，跨命令复用
+  path_cache_n = 0,
 }
+
+local PATH_CACHE_MAX = 50000
+
+--- 路径静态规则缓存（规则为编译期常量，不随配置变化；配置校验在 reset 清空）。
+local function _cached_path(fn, path, bucket)
+  if type(path) ~= "string" or path == "" then return false end
+  local key = bucket .. "\0" .. path
+  local v = state.path_cache[key]
+  if v ~= nil then return v end
+  v = fn(path) == true
+  state.path_cache_n = state.path_cache_n + 1
+  if state.path_cache_n > PATH_CACHE_MAX then
+    state.path_cache = {}
+    state.path_cache_n = 1
+  end
+  state.path_cache[key] = v
+  return v
+end
 
 -- ========== 私有函数 ==========
 
@@ -2265,12 +2285,24 @@ local NON_CREDENTIAL_PATH_PATS = {
 --- @param path string
 --- @return boolean
 local function is_public_cert_bundle(path)
+  local key = "pc\0" .. path
+  local v = state.path_cache[key]
+  if v ~= nil then return v end
   local base = path:match("[^/]+$") or path
-  if PUBLIC_CERT_BASENAMES[base:lower()] then return true end
-  for _, pat in ipairs(PUBLIC_CERT_DIR_PATS) do
-    if path:find(pat) then return true end
+  local res = PUBLIC_CERT_BASENAMES[base:lower()] == true
+  if not res then
+    for _, pat in ipairs(PUBLIC_CERT_DIR_PATS) do
+      if path:find(pat) then res = true; break end
+    end
   end
-  return false
+  state.path_cache[key] = res
+  state.path_cache_n = state.path_cache_n + 1
+  if state.path_cache_n > PATH_CACHE_MAX then
+    state.path_cache = {}
+    state.path_cache_n = 1
+    state.path_cache[key] = res
+  end
+  return res
 end
 
 --- 路径是否位于第三方包缓存/vendored 源码树（非用户凭据）。
@@ -2289,16 +2321,31 @@ end
 --- @return boolean
 is_non_credential_path = function(path)
   if type(path) ~= "string" or path == "" then return false end
+  local key = "nc\0" .. path
+  local cached = state.path_cache[key]
+  if cached ~= nil then return cached end
   local lower = path:lower()
   local base = lower:match("[^/]+$") or lower
-  if NON_CREDENTIAL_BASENAMES[base] then return true end
-  for _, pat in ipairs(NON_CREDENTIAL_BASENAME_PATS) do
-    if lower:match(pat) then return true end
+  local res = NON_CREDENTIAL_BASENAMES[base] == true
+  if not res then
+    for _, pat in ipairs(NON_CREDENTIAL_BASENAME_PATS) do
+      if lower:match(pat) then res = true; break end
+    end
   end
-  for _, pat in ipairs(NON_CREDENTIAL_PATH_PATS) do
-    if path:find(pat) then return true end
+  if not res then
+    for _, pat in ipairs(NON_CREDENTIAL_PATH_PATS) do
+      if path:find(pat) then res = true; break end
+    end
   end
-  return is_non_credential_dir(path)
+  if not res then res = is_non_credential_dir(path) end
+  state.path_cache[key] = res
+  state.path_cache_n = state.path_cache_n + 1
+  if state.path_cache_n > PATH_CACHE_MAX then
+    state.path_cache = {}
+    state.path_cache_n = 1
+    state.path_cache[key] = res
+  end
+  return res
 end
 
 --- 路径是否为非凭据文件（公开：供候选冻结 / 密钥告警判定跳过非凭据文件）。
@@ -2311,13 +2358,17 @@ end
 --- 路径是否疑似密钥文件（宽口径：用于决定是否做高熵扫描）
 --- @param path string|nil
 --- @return boolean
-function M.is_secret_path(path)
-  if type(path) ~= "string" or path == "" then return false end
+local function _is_secret_path_impl(path)
   if is_public_cert_bundle(path) or is_non_credential_path(path) then return false end
   for _, pat in ipairs(SECRET_PATH_PATS) do
     if path:find(pat) then return true end
   end
   return false
+end
+
+function M.is_secret_path(path)
+  if type(path) ~= "string" or path == "" then return false end
+  return _cached_path(_is_secret_path_impl, path, "sp")
 end
 
 -- 真正的凭据/密钥文件（严口径）：供 UI「获取密钥」告警。刻意排除常见误报——
@@ -2337,13 +2388,17 @@ local SENSITIVE_PATH_PATS = {
 --- 路径是否为真正的凭据/密钥文件（严口径，供 UI 告警）。
 --- @param path string|nil
 --- @return boolean
-function M.is_sensitive_path(path)
-  if type(path) ~= "string" or path == "" then return false end
+local function _is_sensitive_path_impl(path)
   if is_public_cert_bundle(path) or is_non_credential_path(path) then return false end
   for _, pat in ipairs(SENSITIVE_PATH_PATS) do
     if path:find(pat) then return true end
   end
   return false
+end
+
+function M.is_sensitive_path(path)
+  if type(path) ~= "string" or path == "" then return false end
+  return _cached_path(_is_sensitive_path_impl, path, "sn")
 end
 
 --- 记录一次 token / 密钥环境变量名操作留痕（并写证据）
@@ -2567,6 +2622,8 @@ function M.reset()
   state.traces = {}
   state.allowed = {}
   state.allowed_notified = {}
+  state.path_cache = {}
+  state.path_cache_n = 0
 end
 
 return M

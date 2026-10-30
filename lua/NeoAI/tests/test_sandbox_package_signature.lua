@@ -218,4 +218,49 @@ tests.suite("sandbox_package_signature", function(_, it)
     local detail = observe.from_candidate({ files = files }, {}, { sample = 20 })
     t.eq(10, #detail, "未超阈值应逐条产出")
   end)
+
+  it("普通命令大候选：冻结分类在 worker，主线程不逐文件 resolve", function(t)
+    local fs = require("NeoAI.utils.fs")
+    local sandbox = require("NeoAI.sandbox")
+    local candidate = require("NeoAI.sandbox.execution.candidate")
+    local control = require("NeoAI.sandbox.execution.control")
+    local store = require("NeoAI.sandbox.state.store")
+    local runtime = require("NeoAI.sandbox.execution.runtime")
+    with_config({ tools = { sandbox = {
+      workspace_root = vim.fn.tempname() .. "/sb",
+      classify_min_files = 1,
+    } } }, function()
+      sandbox.reset()
+      local dir = fs.canonical(vim.fn.tempname())
+      fs.ensure_dir(dir)
+      local base = vim.fn.tempname()
+      local upper = base .. "/upper"
+      fs.ensure_dir(upper)
+      for i = 1, 300 do
+        fs.write_file(upper .. "/f" .. i .. ".txt", "content-" .. i .. "\n")
+      end
+      local a = control.new_attempt("run_command", {}, {}, { effect = "process" })
+      candidate.begin(a, assert(store.root()))
+      local _, err = await(candidate.capture_overlay_async(a.attempt_id, dir, upper, nil))
+      t.eq(nil, err, "非包捕获应完成")
+      -- 主线程分类一旦被调用即失败：证明大候选走了 worker 预分类。
+      local saved_masked = runtime.is_masked_path
+      local saved_git = runtime.git_path_class
+      runtime.is_masked_path = function() error("main-thread is_masked_path") end
+      runtime.git_path_class = function() error("main-thread git_path_class") end
+      local ok, cand = pcall(function()
+        return assert(await(candidate.finish_async(a.attempt_id), 30000))
+      end)
+      runtime.is_masked_path = saved_masked
+      runtime.git_path_class = saved_git
+      t.true_(ok, "冻结应成功: " .. tostring(cand))
+      t.eq(300, #(cand.files or {}), "300 个文件都应进入候选")
+      for _, f in ipairs(cand.files or {}) do
+        t.eq(false, f.git_class, "普通文件应缓存 false 哨兵，避免二次分类")
+      end
+      candidate.cleanup(a.attempt_id)
+      vim.fn.delete(dir, "rf")
+      vim.fn.delete(base, "rf")
+    end)
+  end)
 end)

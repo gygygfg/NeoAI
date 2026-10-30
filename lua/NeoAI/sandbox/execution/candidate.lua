@@ -3379,10 +3379,24 @@ local function _is_git_write_tool(attempt)
   return type(name) == "string" and GIT_WRITE_TOOLS[name] == true
 end
 
+--- 读取已缓存的 `.git` 分类；`false` 是「已判定为普通文件」的哨兵，避免重复
+--- `runtime.git_path_class`（其内部可能做路径解析）。未分类（nil）才计算一次并缓存。
+--- @param f table
+--- @return string|nil
+local function _file_git_class(f)
+  local gc = f.git_class
+  if gc == nil then
+    gc = require("NeoAI.sandbox.execution.runtime").git_path_class(f.path)
+    f.git_class = gc or false
+  end
+  if gc == false then return nil end
+  return gc
+end
+
 --- 剔除命中「有效遮蔽」与「易变包索引/缓存」的文件。
 --- @param files table
 --- @param attempt table|nil 控制层 attempt（含 effective_unmask / package）
---- @param classify table|nil 工作线程预分类结果：path -> { masked, git_class, level }（包候选专用）
+--- @param classify table|nil 工作线程预分类结果：path -> { masked, git_class, level }（大候选/包候选）
 --- @return table files 过滤后的文件
 --- @return table dropped { masked=number, volatile=number, git=number, self=number, *_paths=table }
 local function _filter_unpublishable(files, attempt, classify)
@@ -3428,7 +3442,8 @@ local function _filter_unpublishable(files, attempt, classify)
       dropped.self = dropped.self + 1
       if #dropped.self_paths < 20 then dropped.self_paths[#dropped.self_paths + 1] = f.path end
     else
-      f.git_class = gc -- nil 表示普通文件；object/pointer 供原子排序与发布语义
+      -- false = 已分类且为普通文件（哨兵）；object/pointer 供原子排序与发布语义。
+      f.git_class = gc or false
       out[#out + 1] = f
     end
   end
@@ -3446,7 +3461,7 @@ end
 --- @param attempt_id string
 --- @param prefetch table|nil 工作线程预取结果：staged 路径 -> { exists, type, size, content }；
 ---   nil 时在主线程 fs_stat/读取（同步路径）。
---- @param classify table|nil 工作线程预分类结果：path -> { masked, git_class, level }（包候选专用）
+--- @param classify table|nil 工作线程预分类结果：path -> { masked, git_class, level }（大候选/包候选）
 --- @return table candidate
 function M.finish(attempt_id, prefetch, classify, skip_base_blobs)
   local attempt = state.attempts[attempt_id]
@@ -3827,7 +3842,14 @@ function M.finish_async(attempt_id, opts)
       end)
     end)
   end
-  if not opts.classify then return run_finish(nil) end
+  -- 非 package 命令也必须在文件量较大时把「遮蔽/git/级别」分类下沉到 worker：
+  -- 主线程逐文件 `vim.fn.resolve`（is_masked_path）是普通 run_command（git/make/repo）冻结时
+  -- 的最大 CPU 热点。小候选保留主线程回退，避免线程往返开销。
+  local classify_min = tonumber(require("NeoAI.kernel.config_store").get(
+    "tools.sandbox.classify_min_files"))
+  if classify_min == nil then classify_min = 256 end
+  local need_classify = opts.classify == true or #entries >= classify_min
+  if not need_classify then return run_finish(nil) end
   -- 分类（遮蔽/git/级别）在工作线程用原生 realpath 完成，主线程只消费结果。
   local paths = {}
   for i, entry in ipairs(entries) do paths[i] = entry.real end
@@ -3846,6 +3868,10 @@ function M.finish_async(attempt_id, opts)
       end
     end
     return run_finish(map)
+  end, function(err)
+    require("NeoAI.kernel.logger").warn("[sandbox] worker 分类失败，回退主线程分类: %s",
+      tostring(err and (err.message or err) or err))
+    return run_finish(nil)
   end)
 end
 
@@ -3869,7 +3895,7 @@ local function _apply_order(files)
   -- 原子顺序：git 对象库（不可变/可累加）→ 普通文件 → git 指针（index/refs/HEAD）。
   -- 对象先于指针，保证任何被写入的索引/refs 所引用的对象都已存在（绝不悬空）。
   local function rank(f)
-    local gc = f.git_class or runtime.git_path_class(f.path)
+    local gc = _file_git_class(f)
     if gc == "object" then return 0 end
     if gc == "pointer" then return 2 end
     return 1
@@ -3971,7 +3997,7 @@ end
 local function _atomic_group(files)
   local runtime = require("NeoAI.sandbox.execution.runtime")
   for _, f in ipairs(files or {}) do
-    local gc = f.git_class or runtime.git_path_class(f.path)
+    local gc = _file_git_class(f)
     if gc == "object" or gc == "pointer" then return true end
   end
   return false
@@ -4042,20 +4068,15 @@ _journal_definitely_no_git = function(root, hint)
     for _, g in ipairs(gds) do if under(p, g) then return true end end
     return false
   end
+  -- 只在本轮写日志**确实命中 .git**，或存在活动 index.lock 时才强制全量遍历。
+  -- 旧实现只要 objects/refs/logs/index 等在 120s 内新鲜就全量——正常 git/make 构建几乎
+  -- 每次都命中，导致 O(仓库) 全量遍历。写日志漏事件由 capture 的 upper 覆盖率扫描兜底
+  -- （发现未覆盖且 mtime 在命令窗口内的条目即回退全量），不会静默漏捕获。
   for p in pairs(hint.writes or {}) do if hits_git(p) then return false end end
   for p in pairs(hint.deletes or {}) do if hits_git(p) then return false end end
   for _, g in ipairs(gds) do
     local lst = vim.uv.fs_lstat(g .. "/index.lock")
     if lst and lst.mtime and (now - lst.mtime.sec) <= _GIT_FRESH_S then return false end
-    for _, sub in ipairs({ "objects", "refs", "logs" }) do
-      local dst = vim.uv.fs_stat(g .. "/" .. sub)
-      if dst and dst.mtime and (now - dst.mtime.sec) <= _GIT_FRESH_S then return false end
-    end
-    for _, fn in ipairs({ "HEAD", "ORIG_HEAD", "packed-refs", "MERGE_HEAD",
-      "CHERRY_PICK_HEAD", "REVERT_HEAD", "FETCH_HEAD", "index" }) do
-      local st = vim.uv.fs_stat(g .. "/" .. fn)
-      if st and st.mtime and (now - st.mtime.sec) <= _GIT_FRESH_S then return false end
-    end
   end
   return true
 end
@@ -4186,7 +4207,7 @@ local function _git_publish_gate(candidate)
   local dir, provided, cand_content = nil, {}, {}
   local ref_targets, gate_needed, cand_has_pack = {}, false, false
   for _, f in ipairs(files) do
-    local gc = f.git_class or runtime.git_path_class(f.path)
+    local gc = _file_git_class(f)
     if gc == "object" or gc == "pointer" then
       local gd, rel = rel_git(f.path)
       if gd and not dir then dir = gd end
@@ -4411,7 +4432,7 @@ function M.publish(candidate, opts)
   end
 
   for _, f in ipairs(candidate.files or {}) do
-    local gc = f.git_class or runtime.git_path_class(f.path)
+    local gc = _file_git_class(f)
     if gc ~= "object" and not under_recreated(f.path) then
       local lstat = vim.uv.fs_lstat(f.path)
       local stat = vim.uv.fs_stat(f.path)
@@ -4584,7 +4605,7 @@ function M.publish(candidate, opts)
     elseif f.action == "rmdir" then
       action = "rmdir"
     end
-    local gc = f.git_class or runtime.git_path_class(f.path)
+    local gc = _file_git_class(f)
     -- git 对象库内容寻址：目标已存在即内容相同（幂等），跳过写入。
     if action == "write" and gc == "object" and vim.uv.fs_stat(f.path) then
       action = nil
@@ -4648,7 +4669,7 @@ end
 local function _order_insensitive(files)
   local runtime = require("NeoAI.sandbox.execution.runtime")
   for _, f in ipairs(files) do
-    local gc = f.git_class or runtime.git_path_class(f.path)
+    local gc = _file_git_class(f)
     if gc == "object" or gc == "pointer" then return false end
     if f.action == "delete" or f.action == "rmdir" then return false end
   end
@@ -4923,13 +4944,12 @@ function M.publish_async(candidate, opts)
   end
   -- 出沙箱解密预检（主线程，仅内嵌内容；blob 内容在写入阶段按块读取并解密预检）。
   local secret = require("NeoAI.sandbox.secret.secret")
-  local runtime = require("NeoAI.sandbox.execution.runtime")
   local specs = {}
   for i, f in ipairs(files) do
     local spec = {
       path = f.path, action = f.action, mode = f.mode, link = f.link,
       blob = f.blob, large = f.large, content = (not f.blob) and f.content or nil,
-      git_class = f.git_class or runtime.git_path_class(f.path),
+      git_class = _file_git_class(f),
       base_type = f.base_type, before_hash = f.before_hash, before_sig = f.before_sig,
       base_blob = f.base_blob, after_hash = f.after_hash,
     }

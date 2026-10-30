@@ -673,6 +673,8 @@ local function _enqueue_review(cand, attempt, cfg, env, meta)
     package_sensitive = meta and meta.package_sensitive or nil,
     -- 冻结时剔除的不可发布文件（遮蔽/易变缓存）：供审批界面提示「部分文件将被跳过」。
     dropped = cand and cand.dropped or nil,
+    -- 审批界面「调用参数」区：执行尝试里已生成好的脱敏、限长摘要。
+    args_preview = attempt and attempt.args_preview or nil,
   })
 end
 
