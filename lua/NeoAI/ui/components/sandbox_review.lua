@@ -459,6 +459,15 @@ local function _one_line(s)
   return (tostring(s):gsub("\r\n", "⏎"):gsub("[\r\n]", "⏎"))
 end
 
+--- 审批视图的动作标签：删除是「搬出」（整棵 rename 到同盘 `.neoai-retired/`，内容不销毁）。
+--- @param action string|nil
+--- @return string
+local function _action_label(action)
+  if action == "retire" then return "删除·已搬出" end
+  if action == "rmdir" then return "删除目录" end
+  return tostring(action or "modify")
+end
+
 --- 折叠摘要：把变更单元涉及的文件压成一行（最多 `limit` 个，超出附「共 N 个」）。
 --- 待审条目收起时，折叠首行往往是插在条目里的命令行；摘要登记后折叠文本显示**被修改的文件**
 --- 而不是命令（用户从收起状态一眼看出改了哪些文件）。
@@ -966,7 +975,7 @@ function M.build_lines(items, traces, audit, saved, rejected, jobs)
         if max_files > 0 and shown >= max_files then break end
         shown = shown + 1
         local path = _one_line(f.path or tostring(f))
-        local suffix = f.action and ("  [" .. _one_line(f.action) .. "]") or ""
+        local suffix = f.action and ("  [" .. _one_line(_action_label(f.action)) .. "]") or ""
         local icon = _file_icon(region, path)
         local text = row_indent .. path .. suffix .. icon
         local ln = #lines + 1
@@ -1114,11 +1123,18 @@ function M.build_lines(items, traces, audit, saved, rejected, jobs)
         files = {}
         for _, p in ipairs(item.write_set or {}) do files[#files + 1] = { path = p } end
       end
+      -- 删除类（retire）撤销 = 整棵搬回：在状态后提示，避免用户以为内容已丢失。
+      local has_retire = false
+      for _, f in ipairs(files) do
+        if type(f) == "table" and f.action == "retire" then has_retire = true break end
+      end
+      local status_text = reverted and "已撤销" or "已保存"
+      if has_retire then status_text = status_text .. "·删除可整棵搬回" end
       _render_entry(item, {
         region = "saved",
         base = 2,
         files = files,
-        status = reverted and "已撤销" or "已保存",
+        status = status_text,
         status_level = reverted and "pending0" or "workspace",
         whole_target = { change_set_id = item.change_set_id, saved = true, whole = true },
         key_prefix = "saved:" .. tostring(item.change_set_id),
@@ -2005,10 +2021,11 @@ local function _preview_data(target, item)
   end
   local f = _find_file(item, target.path)
   local action = f and f.action or "modify"
+  local is_del = (action == "delete" or action == "rmdir" or action == "retire")
   local before = (action == "create" or action == "mkdir") and "" or _read_file(target.path)
-  local after = (action == "delete" or action == "rmdir") and "" or ((f and f.content) or "")
+  local after = is_del and "" or ((f and f.content) or "")
   -- 内存 item 落盘后 content 已剥离：按候选摘要按需读取（小型 LRU）。
-  if (action ~= "delete" and action ~= "rmdir") and after == "" and not (f and f.content) then
+  if not is_del and after == "" and not (f and f.content) then
     local sb = _sb()
     local lazy = sb and sb.content_for(item.change_set_id, target.path)
     if lazy then after = lazy end
@@ -2019,7 +2036,7 @@ local function _preview_data(target, item)
     local restored = sb and sb.detokenize(after)
     if restored ~= nil then after = restored end
   end)
-  return string.format("%s · %s · %s", action, _risk_label(level), target.path), before, after
+  return string.format("%s · %s · %s", _action_label(action), _risk_label(level), target.path), before, after
 end
 
 --- 打开 diff 预览窗口（可选二次确认模式）

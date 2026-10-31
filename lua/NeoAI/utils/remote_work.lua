@@ -593,7 +593,7 @@ end
 
 _send_request = function(req, d, kind, bytes)
   if state.stopped then
-    return pcall(function() d:reject({ kind = "worker", message = "worker 已停止" }) end)
+    return pcall(function() d:reject({ kind = "worker", not_started = true, message = "worker 已停止" }) end)
   end
   if not state.connected then
     state.queue[#state.queue + 1] = { req = req, d = d, kind = kind, bytes = bytes }
@@ -628,7 +628,7 @@ _submit = function(req, opts)
   local d = async.Deferred.new()
   local cfg = _cfg()
   if #state.queue >= (tonumber(cfg.max_pending) or 64) and not state.connected then
-    return async.reject({ kind = "worker", message = "worker 队列已满" })
+    return async.reject({ kind = "worker", not_started = true, message = "worker 队列已满" })
   end
   _send_request(req, d, opts, opts.bytes)
   return d

@@ -475,9 +475,11 @@ local function _capture_snapshot(cand)
   for _, f in ipairs(cand.files or {}) do
     local st = vim.uv.fs_stat(f.path)
     local is_file = st ~= nil and st.type == "file"
-    local too_large = is_file and cap > 0 and (st.size or 0) > cap
+    -- 删除 = 搬出（retire）：撤销靠 rename 整棵搬回，无需复制原内容（目录也无从逐文件复制）。
+    local is_retire = (f.action == "retire")
+    local too_large = is_file and not is_retire and cap > 0 and (st.size or 0) > cap
     local alt_blob, alt_content
-    if is_file and not too_large then
+    if is_file and not is_retire and not too_large then
       alt_blob = store.copy_to_blob(f.path,
         "snap|" .. tostring(cand.candidate_digest) .. "|" .. f.path)
       if not alt_blob then alt_content = _read_file(f.path) end
@@ -503,7 +505,8 @@ end
 --- @param item table 变更单元
 --- @param entries table _capture_snapshot 结果
 --- @param operation_id string|nil
-local function _store_snapshot(item, entries, operation_id)
+--- @param retired table|nil 本次搬出记录 { { path, retired }, ... }（撤销时 rename 搬回）
+local function _store_snapshot(item, entries, operation_id, retired)
   local cap = _snapshot_cap()
   local cas = _snapshot_cas_mode()
   -- 应用后应写盘的内容哈希（命中候选 `after_hash` 的 sha256 形式，或明文内容）：
@@ -521,7 +524,14 @@ local function _store_snapshot(item, entries, operation_id)
       end
     end
   end
+  local retired_of = {}
+  for _, r in ipairs(retired or {}) do
+    if type(r) == "table" and type(r.path) == "string" and type(r.retired) == "string" then
+      retired_of[r.path] = r.retired
+    end
+  end
   for _, e in ipairs(entries) do
+    if retired_of[e.path] then e.retired = retired_of[e.path] end
     local st = vim.uv.fs_stat(e.path)
     e.disk_exists = st ~= nil
     e.disk_type = st and st.type or nil
@@ -582,6 +592,9 @@ local function _requeue_after_undo(item, rec)
       end
     end
     entry.action = action
+    -- 删除 = 搬出：撤销（整棵搬回）后目录签名必然变化，重试只校验「仍是目录」。
+    -- 若保留旧 before_sig，重试删除会永久卡在 BASELINE_CHANGED。
+    if action == "retire" then entry.before_sig = nil end
     if entry.link == nil and (action == "create" or action == "modify") then
       if e.alt_content ~= nil then
         entry.content = e.alt_content
@@ -727,7 +740,12 @@ function M.undo(id, opts)
     end
 
     local res
-    if not wrote_exists then
+    if e.retired then
+      -- 删除 = 搬出：撤销 = 整棵搬回（rename，O(1)，内容完整；不复制、不遍历）。
+      res = writer.apply("unretire", e.path, e.retired, {
+        allow_root = opts.allow_root == true, prefer_sudo = opts.prefer_sudo == true,
+      })
+    elseif not wrote_exists then
       -- 快照侧不存在：删除当前盘上的文件/目录（两侧都不存在时无需操作）。
       if not cur_exists then
         res = { ok = true, state = "WRITTEN" }
@@ -759,6 +777,8 @@ function M.undo(id, opts)
     -- 交换两侧：当前盘内容（写入前已复制到 blob）成为新的快照侧；disk_* 为刚写回的版本。
     e.alt_exists, e.alt_type, e.alt_mode = cur_exists, cur_type, cur_mode
     e.alt_content, e.alt_blob, e.alt_too_large = nil, new_blob, nil
+    -- 搬回后该路径已回到原位置：清除搬出记录（再次删除会重新搬出并登记）。
+    if e.retired then e.retired = nil end
     e.side = (e.side == "after") and "before" or "after"
     e.disk_exists = wrote_exists
     e.disk_type = wrote_type
@@ -1538,12 +1558,22 @@ local function _apply_begin(id, opts)
     copy.candidate_digest = cand.candidate_digest .. ":subset" .. tostring(#filtered)
     cand = copy
   end
-  -- 同一路径的并发发布串行化：若该路径正被另一变更单元发布，拒绝本次（否则两次发布都以
-  -- 同一基线通过 CAS 后互相覆盖，静默丢一个）。用户待其完成后可重试。
+  -- 同一路径（或祖先/后代）的并发发布串行化：若该路径正被另一变更单元发布，拒绝本次
+  -- （否则两次发布都以同一基线通过 CAS 后互相覆盖，静默丢一个）。删除只记节点，故必须把
+  -- 「祖先目录」与「其下路径」视为重叠——否则搬出 D 与写入 D/x 可能交错。用户待其完成后可重试。
   local busy = nil
   for _, f in ipairs(cand.files or {}) do
-    local owner = state.applying_paths[f.path]
-    if owner and owner ~= id then busy = f.path break end
+    if not busy then
+      for busy_path, owner in pairs(state.applying_paths) do
+        if owner ~= id
+          and (f.path == busy_path
+            or f.path:sub(1, #busy_path + 1) == busy_path .. "/"
+            or busy_path:sub(1, #f.path + 1) == f.path .. "/") then
+          busy = busy_path
+          break
+        end
+      end
+    end
   end
   if busy then
     _restore_pending()
@@ -1598,11 +1628,14 @@ local function _apply_settle(ctx, pub)
       for _, f in ipairs(ctx.remaining) do seen[f.path] = true end
       local extra = {}
       for _, f in ipairs(ctx.remaining) do
-        if f.action == "rmdir" then
+        if f.action == "rmdir" or (f.action == "retire" and f.recursive) then
           local pre = f.path .. "/"
+          local is_node = (f.action == "retire")
           for _, g in ipairs(ctx.cand.files or {}) do
-            if (g.action == "delete" or g.action == "rmdir")
-              and g.path:sub(1, #pre) == pre and not seen[g.path] then
+            -- 失败的节点删除：rmdir 需带上子项删除（否则永远 RMDIR_NOT_EMPTY）；
+            -- retire 还需带上其后代写入（祖先搬出失败时它们被跳过，必须一起重试）。
+            local take = is_node or (g.action == "delete" or g.action == "rmdir")
+            if take and g.path:sub(1, #pre) == pre and not seen[g.path] then
               seen[g.path] = true
               extra[#extra + 1] = g
             end
@@ -1631,7 +1664,7 @@ local function _apply_settle(ctx, pub)
     else
       _discard_candidate(item.candidate_digest)
     end
-    _store_snapshot(item, ctx.snapshot_entries, pub.receipt and pub.receipt.operation_id)
+    _store_snapshot(item, ctx.snapshot_entries, pub.receipt and pub.receipt.operation_id, pub.retired)
     _persist(item)
     logger.try("delete_review_removed", store.delete_review_removed, item.change_set_id)
     -- 仅应用了部分文件：其余文件（未选中 + 写入失败）保留待审，供用户逐个确认/重试。
@@ -1697,6 +1730,8 @@ local function _apply_publish_mark(ctx)
     expected_base = item.base_version,
     allow_root = ctx.opts.allow_root == true,
     prefer_sudo = ctx.opts.prefer_sudo == true,
+    -- 删除搬出（retire）按变更单元分目录存放，便于撤销与生命周期回收。
+    change_set_id = ctx.id,
     -- git 原子组（索引↔对象库↔refs）必须整组应用；其余单元允许部分写入（失败文件回队）。
     atomic = item.atomic_group == "git",
     partial = item.atomic_group ~= "git",
@@ -1766,7 +1801,8 @@ local function _capture_snapshot_async(cand)
   local digest = tostring(cand.candidate_digest)
   local limit = (type(work.parallelism) == "function" and work.parallelism()) or 4
   return work.batched(files, limit, function(f)
-    local blob = store.blob_path("snap|" .. digest .. "|" .. f.path)
+    -- 删除 = 搬出：撤销靠 rename 搬回，无需复制原内容（目录也无从逐文件复制）。
+    local blob = (f.action == "retire") and nil or store.blob_path("snap|" .. digest .. "|" .. f.path)
     return work.run_codec(_snapshot_entry_worker, { path = f.path, blob = blob, cap = cap })
   end):then_(function(results)
     local entries = {}
@@ -2081,11 +2117,24 @@ end
 --- 例外：`atomic_group="git"` 的对象/指针必须整组保留，不可拆分。
 --- @param paths table 路径数组
 --- @param except_id string|nil 不取代的 change_set_id（通常是刚入队的新项）
+--- @param roots table|nil 整棵删除的节点路径（覆盖其下所有路径）
 --- @return number superseded 受影响的变更单元数量
-function M.supersede_by_paths(paths, except_id)
+function M.supersede_by_paths(paths, except_id, roots)
   local set = {}
   for _, p in ipairs(paths or {}) do set[p] = true end
-  if not next(set) then return 0 end
+  local root_list = {}
+  for _, r in ipairs(roots or {}) do
+    if type(r) == "string" and r ~= "" then root_list[#root_list + 1] = r end
+  end
+  if not next(set) and #root_list == 0 then return 0 end
+  --- 路径是否被本次取代覆盖（精确命中或被「整棵删除」的节点覆盖）。
+  local function covered(p)
+    if set[p] then return true end
+    for _, r in ipairs(root_list) do
+      if p:sub(1, #r + 1) == r .. "/" then return true end
+    end
+    return false
+  end
   local n = 0
   local to_discard = {}
   -- 只取命中路径的条目：path_index 把「全部 pending × 全部 files」降为「本轮路径的并集」。
@@ -2093,6 +2142,15 @@ function M.supersede_by_paths(paths, except_id)
   for p in pairs(set) do
     local ids = state.path_index[p]
     if ids then for id in pairs(ids) do candidate_ids[id] = true end end
+  end
+  -- 祖先节点（整棵删除）覆盖其下所有路径：按前缀补齐候选单元。
+  for _, r in ipairs(root_list) do
+    local pre = r .. "/"
+    for p, ids in pairs(state.path_index) do
+      if p:sub(1, #pre) == pre then
+        for id in pairs(ids) do candidate_ids[id] = true end
+      end
+    end
   end
   local candidates = {}
   if next(candidate_ids) ~= nil then
@@ -2109,7 +2167,7 @@ function M.supersede_by_paths(paths, except_id)
       local sup = type(item.superseded_paths) == "table" and item.superseded_paths or nil
       local overlap = 0
       for _, f in ipairs(item.files) do
-        if set[f.path] and not (sup and sup[f.path]) then overlap = overlap + 1 end
+        if covered(f.path) and not (sup and sup[f.path]) then overlap = overlap + 1 end
       end
       if overlap > 0 then
         local eff = #item.files - _superseded_count(item)

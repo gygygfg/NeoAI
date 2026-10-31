@@ -322,6 +322,7 @@ vim.api.nvim_create_autocmd("User", {
 4. **错误隔离**：回调抛异常会被 event_bus 捕获并记日志，不会中断其它订阅者（但最好自己 `pcall`）。
 5. **payload 为浅表**：`emit` 的 payload 经 `nvim_exec_autocmds` 深拷贝，**不要依赖对象元表/方法**。
    需要传原对象（如计时器、Agent 实例）时，应直接以闭包/模块级引用传递，而非塞进事件 payload。
+   payload 中若夹带 **userdata**（如 `vim.uv` 句柄）会导致转换失败（`Invalid 'data': Cannot convert userdata`）；event_bus 会退化为投递「剔除函数/线程/userdata 的副本」，订阅者仍能收到事件，但这些值会丢失。
 
 ## 5. 订阅事件示例
 

@@ -30,6 +30,19 @@ local trace_log = require("NeoAI.sandbox.execution.trace_log")
 local _rewrite_value, _enc_root, _is_sudo_bin, _split_shell, _cand_paths, _package_manager_of, _limits_key =
   wrapper_util.rewrite_value, wrapper_util.enc_root, wrapper_util.is_sudo_bin, wrapper_util.split_shell, wrapper_util.cand_paths, wrapper_util.package_manager_of, wrapper_util.limits_key
 
+--- 候选里「整棵删除」的节点路径（`retire` + recursive）：用于把取代判定扩展到其子树。
+--- @param cand table
+--- @return table
+local function _retire_roots(cand)
+  local out = {}
+  for _, f in ipairs((cand or {}).files or {}) do
+    if f.action == "retire" and f.recursive and type(f.path) == "string" then
+      out[#out + 1] = f.path
+    end
+  end
+  return out
+end
+
 local M = {}
 
 --- 选择有效的沙箱工作目录：会话/上下文 cwd 失效（空串或目录已不存在）时回退到有效目录。
@@ -991,7 +1004,7 @@ local function _settle_candidate(cand, attempt, ctx, cfg, spec, result, process_
       store.write_receipt(pub.receipt)
       if covering then grant.consume(covering.grant_id, #(cand.files or {})) end
       -- 直接发布后，同路径的旧待审项已被覆盖，标记 SUPERSEDED 避免重复版本
-      require("NeoAI.sandbox.review.review").supersede_by_paths(_cand_paths(cand), nil)
+      require("NeoAI.sandbox.review.review").supersede_by_paths(_cand_paths(cand), nil, _retire_roots(cand))
       return { ok = true, value = result }
     end
     control.transition(attempt, "CONFLICT")
@@ -1023,7 +1036,7 @@ local function _settle_candidate(cand, attempt, ctx, cfg, spec, result, process_
   })
   if item then
     -- 同一文件被再次编辑：新候选取代同路径的旧待审项（队列只保留最新版本）
-    require("NeoAI.sandbox.review.review").supersede_by_paths(_cand_paths(cand), item.change_set_id)
+    require("NeoAI.sandbox.review.review").supersede_by_paths(_cand_paths(cand), item.change_set_id, _retire_roots(cand))
   end
   _lap("settle.enqueue")
   control.transition(attempt, "AWAITING_PUBLICATION_AUTH")

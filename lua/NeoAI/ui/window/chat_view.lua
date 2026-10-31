@@ -1242,6 +1242,68 @@ local function _build_chat_actions()
   }
 end
 
+-- ========== 输入窗口识别 / 去重 ==========
+-- 输入窗口用**窗口级变量**打标：即便句柄（state.input_win_id）因关窗失败/事件竞态丢失，
+-- 也能凭标记重新认领本实例的输入窗口，而不是再 :split 一个（回归：右侧上下两个输入框）。
+-- 注意：`:split` 不复制窗口变量（实测），故用户/插件从输入窗口分出的窗口不会被误认领。
+local INPUT_WIN_MARK = "neoai_input_win"
+
+--- 给窗口打输入框标记。
+--- @param win number|nil
+local function _mark_input_win(win)
+  if win and vim.api.nvim_win_is_valid(win) then
+    pcall(function() vim.w[win][INPUT_WIN_MARK] = true end)
+  end
+end
+
+--- 窗口是否为本实例创建的输入窗口（仅看标记，不看当前显示的 buffer）。
+--- @param win number|nil
+--- @return boolean
+local function _is_input_win(win)
+  if not win or not vim.api.nvim_win_is_valid(win) then return false end
+  local ok, v = pcall(function() return vim.w[win][INPUT_WIN_MARK] end)
+  return ok and v == true
+end
+
+--- 全部「本实例创建且仍显示输入 buffer」的输入窗口。
+--- @return number[]
+local function _live_input_wins()
+  local out = {}
+  local ib = input_box.get_buf()
+  if not (ib and vim.api.nvim_buf_is_valid(ib)) then return out end
+  for _, w in ipairs(vim.api.nvim_list_wins()) do
+    if _is_input_win(w) and vim.api.nvim_win_get_buf(w) == ib then
+      out[#out + 1] = w
+    end
+  end
+  return out
+end
+
+--- 认领一个已有输入窗口：优先当前登记项，其次聊天主窗口所在标签页，最后任意一个。
+--- @return number|nil
+local function _pick_input_win()
+  local wins = _live_input_wins()
+  if #wins == 0 then return nil end
+  for _, w in ipairs(wins) do
+    if w == state.input_win_id then return w end
+  end
+  if state.win_id and vim.api.nvim_win_is_valid(state.win_id) then
+    local tab = vim.api.nvim_win_get_tabpage(state.win_id)
+    for _, w in ipairs(wins) do
+      if vim.api.nvim_win_get_tabpage(w) == tab then return w end
+    end
+  end
+  return wins[1]
+end
+
+--- 关闭除 keep 以外多出来的输入窗口（同一输入 buffer 只保留一个窗口）。
+--- @param keep number|nil 保留的窗口（nil = 全部关闭）
+local function _dedupe_input_wins(keep)
+  for _, w in ipairs(_live_input_wins()) do
+    if w ~= keep then pcall(vim.api.nvim_win_close, w, true) end
+  end
+end
+
 --- 在主窗口下方创建输入 split 窗口（不 touch input_box 的状态，仅建窗口+接管 buffer）
 --- @return number win_id
 local function _create_input_window()
@@ -1251,6 +1313,7 @@ local function _create_input_window()
     vim.cmd("belowright split")
     win = vim.api.nvim_get_current_win()
   end)
+  _mark_input_win(win)
   vim.api.nvim_win_set_height(win, _input_idle_height())
   vim.wo[win].winfixheight = true
   vim.wo[win].wrap = false
@@ -1293,7 +1356,11 @@ local function _create_input_area(fresh)
     window_manager.register_aux(input_box.get_buf())
   end
   input_box.attach_window(win)
+  _mark_input_win(win)
   state.input_win_id = win
+  -- 兜底去重：若历史遗留/竞态还留着别的输入窗口（同一输入 buffer），只保留刚建的这个，
+  -- 避免出现「右侧上下两个输入框」。
+  _dedupe_input_wins(win)
   return win
 end
 
@@ -1406,14 +1473,59 @@ local function _is_any_neoai_window(win)
   return vim.bo[buf] and vim.bo[buf].filetype:sub(1, 5) == "neoai"
 end
 
---- 收起绑定的输入框（聊天窗口进入后台 / 主窗口被切到别的 buffer）
+-- 收起失败（窗关闭过程中 / textlock 等）时的重试守卫
+local _collapse_retry_pending = false
+local _collapse_retry_left = 0
+local COLLAPSE_RETRY_MAX = 50
+
+--- 关窗失败后下一拍重试（有句柄在，就不会再建第二个输入框）。
+--- 若期间用户已回到聊天界面，则保留输入框并撤销收起状态，绝不在下一拍把它关掉。
+local function _schedule_collapse_retry()
+  if _collapse_retry_pending or _collapse_retry_left >= COLLAPSE_RETRY_MAX then return end
+  _collapse_retry_pending = true
+  _collapse_retry_left = _collapse_retry_left + 1
+  vim.schedule(function()
+    _collapse_retry_pending = false
+    local w = state.input_win_id
+    if not (w and vim.api.nvim_win_is_valid(w)) then
+      state.input_win_id = nil
+      return
+    end
+    if _is_chat_affiliated(vim.api.nvim_get_current_win()) then
+      state.collapsed = false
+      _collapse_retry_left = 0
+      return
+    end
+    if pcall(vim.api.nvim_win_close, w, true) or not vim.api.nvim_win_is_valid(w) then
+      state.input_win_id = nil
+      _collapse_retry_left = 0
+      return
+    end
+    _schedule_collapse_retry()
+  end)
+end
+
+--- 收起绑定的输入框（聊天窗口进入后台 / 主窗口被切到别的 buffer）。
+--- 关键：只有**确认窗口已关闭**才清空 state.input_win_id。历史上无条件置 nil，一旦关窗失败
+--- （在另一窗口关闭过程中的 WinEnter 里，Neovim 抛 E1312 拒绝改动布局；或 textlock），
+--- 窗口仍在但句柄已丢，下次回到聊天界面时 _restore_aux 会误判「没有输入框」再 :split 一个
+--- —— 表现为右侧上下两个输入框（打开/关闭 nvim-tree 等改动窗口布局的操作时尤易触发）。
 local function _collapse_aux()
   if state.collapsed then return end
   state.collapsed = true
-  if state.input_win_id and vim.api.nvim_win_is_valid(state.input_win_id) then
-    pcall(vim.api.nvim_win_close, state.input_win_id, true)
+  _collapse_retry_left = 0
+  local win = state.input_win_id
+  if not (win and vim.api.nvim_win_is_valid(win)) then
+    state.input_win_id = nil
+    return
   end
-  state.input_win_id = nil
+  local ok = pcall(vim.api.nvim_win_close, win, true)
+  if ok or not vim.api.nvim_win_is_valid(win) then
+    state.input_win_id = nil
+    return
+  end
+  -- 关闭失败：保留句柄，下一拍重试；期间句柄仍有效，_restore_aux 不会再建第二个。
+  _schedule_collapse_retry()
 end
 
 --- 确保输入区存在（回到聊天界面时）。输入 buffer 内容保留（bufhidden=hide）。
@@ -1427,8 +1539,26 @@ local _restore_pending = false
 local _input_creating = false
 local function _restore_aux()
   if not state.win_id or not vim.api.nvim_win_is_valid(state.win_id) then return end
+  _collapse_retry_left = 0
   if state.input_win_id and vim.api.nvim_win_is_valid(state.input_win_id) then
     state.collapsed = false
+    -- 句柄有效且确实在显示输入 buffer：顺手清掉可能残留的多余输入窗口（同 buffer 只留一个）。
+    local ib = input_box.get_buf()
+    if ib and vim.api.nvim_buf_is_valid(ib)
+        and vim.api.nvim_win_get_buf(state.input_win_id) == ib then
+      _dedupe_input_wins(state.input_win_id)
+    end
+    return
+  end
+  -- 句柄丢失但输入窗口仍在（收起时关窗失败、事件竞态等）：认领已有窗口，绝不再 :split 一个。
+  local existing = _pick_input_win()
+  if existing then
+    state.input_win_id = existing
+    state.collapsed = false
+    pcall(input_box.attach_window, existing)
+    _mark_input_win(existing)
+    _dedupe_input_wins(existing)
+    pcall(vim.api.nvim_win_set_height, existing, _input_idle_height())
     return
   end
   -- 输入窗口缺失/失效：重建。重入守卫：创建输入窗口时 :split 会同步触发 WinEnter，
@@ -2151,6 +2281,8 @@ function M.close()
   if state.input_win_id and vim.api.nvim_win_is_valid(state.input_win_id) then
     pcall(vim.api.nvim_win_close, state.input_win_id, true)
   end
+  -- 兜底：清掉任何残留显示输入 buffer 的输入窗口，避免关闭后留下空窗口或多出来的输入框。
+  _dedupe_input_wins(nil)
   if state.win_id and vim.api.nvim_win_is_valid(state.win_id) then
     chat_service.detach_window(state.win_id)
     window_manager.close(state.win_id)
@@ -2548,6 +2680,7 @@ end
 for _, name in ipairs({
   "refresh", "flush", "_sync_follow", "show_status", "cycle_display", "set_display",
   "reload_display", "_recompute_folds", "_mark_folds_dirty", "_is_folds_dirty", "is_following",
+  "_input_win_id",
 }) do
   ChatView[name] = function(...)
     local cur = _current_inst()

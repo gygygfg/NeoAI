@@ -2,6 +2,13 @@ local tests = require("NeoAI.tests")
 local async = require("NeoAI.utils.async")
 
 tests.suite("async_finally", function(_, it)
+  it("error_text 把 worker 拒绝表渲染成可读消息", function(t)
+    t.eq("worker 队列已满", async.error_text({ kind = "worker", message = "worker 队列已满" }))
+    t.eq("disk full", async.error_text("disk full"))
+    t.true_(async.error_text({ kind = "work" }):find("kind", 1, true) ~= nil,
+      "无 message 的表应退化为 inspect 文本")
+  end)
+
   it("finally 保留成功值和原始拒绝对象", function(t)
     local calls = 0
     local value = {}

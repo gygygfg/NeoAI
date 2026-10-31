@@ -122,6 +122,26 @@ tests.suite("session_store_recovery", function(_, it)
     end)
   end)
 
+  it("worker 未能启动追加任务时退化为同步写入，不丢消息", function(t)
+    with_store(function(path)
+      local async = require("NeoAI.utils.async")
+      local s = store.create({ id = "fallback" })
+      session.add_message(s, { role = "user", content = "kept" })
+      local original = fs.append_file_async
+      ---@diagnostic disable-next-line: duplicate-set-field
+      fs.append_file_async = function()
+        return async.reject({ kind = "worker", not_started = true, message = "worker 队列已满" })
+      end
+      local called, res = pcall(function() return t.await(store.persist_async(s)) end)
+      fs.append_file_async = original
+      t.true_(called, "队列满时应退化为同步追加而不是报错: " .. tostring(res))
+      t.eq(true, res, "退化为同步追加后应返回成功")
+      store.reset(); store.init()
+      t.eq("kept", store.get("fallback").messages[1].content)
+      t.eq(2, #fs.read_jsonl(path))
+    end)
+  end)
+
   it("聊天保存失败不标记已同步，重试后历史无丢失或重复", function(t)
     with_store(function()
       local chat = require("NeoAI.services.chat_service")

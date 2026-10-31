@@ -256,7 +256,9 @@ local function _do_persist_agent(agent)
     _commit_persist(stored, session, synced)
     return true
   end, function(err)
-    vim.notify("[NeoAI] 会话保存失败，消息仍保留在内存中: " .. tostring(err), vim.log.levels.ERROR)
+    local msg = async.error_text(err)
+    vim.notify("[NeoAI] 会话保存失败，消息仍保留在内存中: " .. msg, vim.log.levels.ERROR)
+    require("NeoAI.kernel.logger").error("[chat_service] 会话保存失败: %s", msg)
     return async.reject(err)
   end)
 end
@@ -270,7 +272,7 @@ local function _persist_agent_sync(agent)
   if not session then return true end
   local ok, err = session_store.persist(session)
   if not ok then
-    vim.notify("[NeoAI] 会话保存失败，消息仍保留在内存中: " .. tostring(err), vim.log.levels.ERROR)
+    vim.notify("[NeoAI] 会话保存失败，消息仍保留在内存中: " .. async.error_text(err), vim.log.levels.ERROR)
     return false, err
   end
   _commit_persist(stored, session, synced)

@@ -83,11 +83,11 @@ local function _local_run_code(code, ...)
     end
   end)
   if not ctx_ok then
-    return async.reject({ kind = "work", message = "创建工作线程失败: " .. tostring(ctx) })
+    return async.reject({ kind = "work", not_started = true, message = "创建工作线程失败: " .. tostring(ctx) })
   end
   local queued, qerr = ctx:queue(code, ...)
   if not queued then
-    return async.reject({ kind = "work", message = "工作线程入队失败: " .. tostring(qerr) })
+    return async.reject({ kind = "work", not_started = true, message = "工作线程入队失败: " .. tostring(qerr) })
   end
   return d
 end
@@ -108,11 +108,11 @@ local function _local_run_codec_code(code, payload, ...)
     end
   end)
   if not ctx_ok then
-    return async.reject({ kind = "work", message = "创建工作线程失败: " .. tostring(ctx) })
+    return async.reject({ kind = "work", not_started = true, message = "创建工作线程失败: " .. tostring(ctx) })
   end
   local queued, qerr = ctx:queue(code, payload, ...)
   if not queued then
-    return async.reject({ kind = "work", message = "工作线程入队失败: " .. tostring(qerr) })
+    return async.reject({ kind = "work", not_started = true, message = "工作线程入队失败: " .. tostring(qerr) })
   end
   return d
 end
@@ -300,15 +300,15 @@ end
 --- @return Deferred resolve(string), reject({ kind="work", message })
 function M.run(fn, ...)
   if not has_new_work then
-    return async.reject({ kind = "work", message = "工作线程不可用（需要 Neovim 0.10+ 的 vim.uv.new_work）" })
+    return async.reject({ kind = "work", not_started = true, message = "工作线程不可用（需要 Neovim 0.10+ 的 vim.uv.new_work）" })
   end
   if type(fn) ~= "function" then
-    return async.reject({ kind = "work", message = "work.run 需要函数参数" })
+    return async.reject({ kind = "work", not_started = true, message = "work.run 需要函数参数" })
   end
 
   local code, derr = _dump(fn)
   if not code then
-    return async.reject({ kind = "work", message = "工作函数序列化失败: " .. tostring(derr) })
+    return async.reject({ kind = "work", not_started = true, message = "工作函数序列化失败: " .. tostring(derr) })
   end
 
   local remote = _remote()
@@ -334,18 +334,18 @@ end
 --- @return Deferred resolve(解码后的结果), reject({ kind="work", message })
 function M.run_codec(fn, input, ...)
   if not has_new_work then
-    return async.reject({ kind = "work", message = "工作线程不可用（需要 Neovim 0.10+ 的 vim.uv.new_work）" })
+    return async.reject({ kind = "work", not_started = true, message = "工作线程不可用（需要 Neovim 0.10+ 的 vim.uv.new_work）" })
   end
   if type(fn) ~= "function" then
-    return async.reject({ kind = "work", message = "work.run_codec 需要函数参数" })
+    return async.reject({ kind = "work", not_started = true, message = "work.run_codec 需要函数参数" })
   end
   local code, derr = _dump(fn)
   if not code then
-    return async.reject({ kind = "work", message = "工作函数序列化失败: " .. tostring(derr) })
+    return async.reject({ kind = "work", not_started = true, message = "工作函数序列化失败: " .. tostring(derr) })
   end
   local ok_enc, payload = pcall(vim.mpack.encode, input == nil and {} or input)
   if not ok_enc then
-    return async.reject({ kind = "work", message = "输入 msgpack 编码失败: " .. tostring(payload) })
+    return async.reject({ kind = "work", not_started = true, message = "输入 msgpack 编码失败: " .. tostring(payload) })
   end
 
   local remote = _remote()

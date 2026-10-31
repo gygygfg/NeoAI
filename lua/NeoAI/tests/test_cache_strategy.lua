@@ -110,8 +110,7 @@ tests.suite("cache_strategy", function(_, it)
     t.eq(1, a.cache.identity_changes)
   end)
 
-  it("缓存用量解析（prompt_cache_hit_tokens / cached_tokens）", function(t)
-    local prefix = require("NeoAI.core.agent.prefix")
+  it("缓存用量解析（prompt_cache_hit_tokens / cached_tokens）", function(t)    local prefix = require("NeoAI.core.agent.prefix")
     local cu1 = assert(prefix.parse_cache_usage({ prompt_tokens = 300, prompt_cache_hit_tokens = 256 }))
     t.eq(256, cu1.cache_read)
     t.eq(44, cu1.cache_miss)
@@ -270,5 +269,69 @@ tests.suite("cache_strategy", function(_, it)
     t.eq(2, #view, "请求视图 = 检查点 + 最后一轮")
     t.true_(view[1].checkpoint)
     t.eq(short, view[2].content, "最后一轮应保留在请求视图尾部")
+  end)
+
+  it("运行态快照默认 user 角色（中途 system 会破坏 DeepSeek 前缀缓存）", function(t)
+    local config_store = require("NeoAI.kernel.config_store")
+    local rc = require("NeoAI.core.session.runtime_context")
+    local agent = {
+      id = "snap_role_agent",
+      model = "deepseek-chat",
+      config = { provider = "deepseek" },
+      messages = {},
+      _loaded_skills = { demo = "步骤 1" },
+    }
+    config_store.load({
+      ai = {
+        default_provider = "deepseek",
+        providers = { deepseek = { api_type = "openai", base_url = "http://127.0.0.1:1" } },
+        system_in_history = false,
+      },
+      skills = { persist_loaded = true },
+    })
+    local msg = rc.ensure(agent)
+    t.not_nil(msg, "应追加运行态快照")
+    t.eq("user", msg.role, "默认必须以 user 角色追加（严格尾部追加，缓存友好）")
+
+    -- 显式开启 + 方言允许时才提升为 system（端点确认原位渲染 system 才可开启）
+    local agent2 = vim.deepcopy(agent)
+    agent2.id = "snap_role_agent2"
+    agent2.messages = {}
+    config_store.load({
+      ai = {
+        default_provider = "deepseek",
+        providers = { deepseek = { api_type = "openai", base_url = "http://127.0.0.1:1" } },
+        system_in_history = true,
+        model_policy = { dialects = { deepseek = { system_in_history = true } } },
+      },
+      skills = { persist_loaded = true },
+    })
+    local msg2 = rc.ensure(agent2)
+    t.not_nil(msg2, "应追加运行态快照")
+    t.eq("system", msg2.role, "显式开启且方言允许时才用 system")
+  end)
+
+  it("请求形状诊断：尾部追加不告警，历史改写计数并定位首个分歧", function(t)
+    local prefix = require("NeoAI.core.agent.prefix")
+    prefix.reset_shape_diag()
+    local agent = { id = "shape_agent", cache = {} }
+    prefix.note_request_shape(agent, {
+      { role = "system", content = "S" },
+      { role = "user", content = "a" },
+    })
+    prefix.note_request_shape(agent, {
+      { role = "system", content = "S" },
+      { role = "user", content = "a" },
+      { role = "assistant", content = "b" },
+    })
+    t.eq(nil, agent.cache.non_append_requests, "纯尾部追加不应计数")
+    prefix.note_request_shape(agent, {
+      { role = "system", content = "S" },
+      { role = "user", content = "CHANGED" },
+      { role = "assistant", content = "b" },
+    })
+    t.eq(1, agent.cache.non_append_requests, "历史中段改写应计数")
+    t.eq(2, agent.cache.last_non_append_at, "应定位首个分歧消息（1-based）")
+    prefix.reset_shape_diag()
   end)
 end)

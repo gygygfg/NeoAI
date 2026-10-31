@@ -309,15 +309,15 @@ function M.focus()
   -- 先把输入 buffer 绑回输入窗口，再进入插入模式；否则 feedkeys("A") 会在
   -- 当前显示的 buffer（可能是用户编辑的文件）末尾追加并进入插入模式，
   -- 之后的输入都会写进错误的 buffer。
+  -- 本设计的输入窗口**禁止** winfixbuf：外部/历史遗留的锁定状态一律清掉（不自愈会在
+  -- 之后 :e/:bnext 时抛 E1513，或让 :split 出的窗口继承错误语义）。
+  if vim.fn.exists("&winfixbuf") == 1 then
+    pcall(function() vim.wo[state.win_id].winfixbuf = false end)
+  end
   if state.buf and vim.api.nvim_buf_is_valid(state.buf) then
     local shown = vim.api.nvim_win_get_buf(state.win_id)
     if shown ~= state.buf then
-      -- 防御：若外部（插件/旧配置）给输入窗口开了 winfixbuf，set_buf 会抛 E1513，
-      -- 先临时关掉再绑定，确保焦点/输入落在正确的 buffer 上。
-      local fix = vim.fn.exists("&winfixbuf") == 1
-      if fix then pcall(function() vim.wo[state.win_id].winfixbuf = false end) end
       pcall(vim.api.nvim_win_set_buf, state.win_id, state.buf)
-      if fix then pcall(function() vim.wo[state.win_id].winfixbuf = true end) end
     end
   end
   vim.api.nvim_set_current_win(state.win_id)

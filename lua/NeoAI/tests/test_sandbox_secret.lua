@@ -1234,10 +1234,16 @@ tests.suite("sandbox_secret", function(_, it)
           if f.path == dir .. "/victim.txt" then found = f end
         end
         t.not_nil(found, "候选应包含被删除路径（whiteout 捕获）")
-        t.eq("delete", found.action)
+        t.eq("retire", found.action, "删除=搬出：候选为节点搬出")
         local res = sandbox.apply(items[1].change_set_id, { auto_approve = true })
         t.true_(res.ok, tostring(res.reason))
-        t.false_(fs.exists(dir .. "/victim.txt"), "应用后真实文件应被删除")
+        t.false_(fs.exists(dir .. "/victim.txt"), "应用后原路径应消失")
+        -- 内容不销毁：整棵在搬出层，撤销可搬回
+        local moved = assert(res.retired and res.retired[1], "应记录搬出路径")
+        t.eq("KEEP\n", fs.read_file(moved.retired), "搬出层应完整保留内容")
+        local u = sandbox.undo(items[1].change_set_id)
+        t.true_(u and u.ok, "撤销应成功: " .. tostring(u and u.reason))
+        t.eq("KEEP\n", fs.read_file(dir .. "/victim.txt"), "撤销应整棵搬回")
         done = true
       end, function(e)
         t.true_(false, "不应失败: " .. tostring(e and e.message or e))

@@ -66,7 +66,16 @@ end
 local function _to_api_message(message)
   local content = message.content or ""
   local has_tool_calls = message.tool_calls and #message.tool_calls > 0
-  local out = { role = message.role }
+  -- 运行态快照历史遗留的 system 角色统一降级为 user（只改出站副本，不动内存原消息）：
+  -- DeepSeek 官方 chat template 会把**最后一条** system 提到最前，历史快照会整体替换顶层
+  -- 系统提示，且每次快照变化都改写请求开头 → 前缀缓存全量失效。仅显式开启
+  -- `ai.system_in_history`（端点确认按原位渲染 system）时保留 system。
+  local role = message.role
+  if role == "system" and message.runtime_context
+    and config_store.get("ai.system_in_history") ~= true then
+    role = "user"
+  end
+  local out = { role = role }
   -- 仅当 assistant 消息带 tool_calls 且 content 为空时省略 content 字段；
   -- 有实际内容的 assistant 消息、普通消息、tool 消息保持原样输出。
   if content ~= "" or message.role ~= "assistant" or not has_tool_calls then

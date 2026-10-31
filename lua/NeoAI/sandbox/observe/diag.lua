@@ -13,6 +13,7 @@ M.POINTS = {
   "freeze", -- 候选冻结失败
   "publish", -- CAS 发布失败
   "store", -- 持久化写入失败
+  "retire", -- 删除搬出失败（验证部分应用回队）
 }
 
 local fstate = {

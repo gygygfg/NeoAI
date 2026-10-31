@@ -485,6 +485,16 @@ function M.add_usage(agent, usage)
     agent.usage.cache_ratio = agent.usage.prompt_total > 0
       and (agent.usage.prompt_cache_total / agent.usage.prompt_total)
       or 0
+    -- 诊断：逐请求记录缓存命中分布（DEBUG 级）。命中率异常时可直接看到「本次输入 / 命中 /
+    -- 新增」与累计占比，配合 `[prefix] 请求历史非追加` 定位是「历史被改写」还是「新增内容大」。
+    pcall(function()
+      require("NeoAI.kernel.logger").debug(
+        "[usage] prompt=%d hit=%d miss=%d (%d%%) cumulative=%d%% requests=%d",
+        prompt_all, cache_read, cu.cache_miss or 0,
+        prompt_all > 0 and math.floor(cache_read / prompt_all * 100 + 0.5) or 0,
+        math.floor((agent.usage.cache_ratio or 0) * 100 + 0.5),
+        agent.usage.requests or 0)
+    end)
   end
   return agent
 end

@@ -11,6 +11,7 @@ local trace_log = require("NeoAI.sandbox.execution.trace_log")
 local _perm, _sha, _stat_sig, _read, _candidate_content, _is_text_content =
   candidate_util.perm, candidate_util.sha, candidate_util.stat_sig,
   candidate_util.read, candidate_util.candidate_content, candidate_util.is_text_content
+local _dir_sig = candidate_util.dir_sig
 
 local M = {}
 
@@ -102,6 +103,14 @@ local function _abs_literal_leaf(path)
   local dir = fs.canonical(vim.fn.fnamemodify(path, ":h"))
   if dir == "" or dir == "/" then return "/" .. base end
   return dir .. "/" .. base
+end
+
+--- 删除类动作：`delete`/`rmdir`（历史逐文件语义）与 `retire`（节点搬出）都表示
+--- 该路径从工作区视图中消失。发布端对 `retire` 做一次 rename（不销毁内容）。
+--- @param action string|nil
+--- @return boolean
+local function _is_delete_action(action)
+  return action == "delete" or action == "rmdir" or action == "retire"
 end
 
 -- 暂存路径键缓存：`_workspace_path` 在合并/轮换/暂存时对每个真实路径调用，
@@ -779,6 +788,22 @@ function M.stage_delete(attempt_id, real_path)
   return entry
 end
 
+--- 查找「已登记删除」的祖先节点。删除只记节点（`retire`）：沙箱视图按节点遮蔽整棵子树，
+--- 不逐后代登记，因此读取/列举/搜索都必须沿祖先链判定。
+--- @param real string 绝对路径
+--- @return table|nil entry 祖先的 state.workspace 条目
+--- @return string|nil ancestor 祖先绝对路径
+local function _deleted_ancestor(real)
+  local p = real
+  while true do
+    local d = p:match("^(.*)/[^/]*$")
+    if type(d) ~= "string" or d == "" then return nil end
+    local e = state.workspace[d]
+    if e and e.deleted then return e, d end
+    p = d
+  end
+end
+
 --- 沙箱暂存副本（供只读工具读取 AI 尚未发布的修改）。
 --- 目录不映射（目录暂存只含新建内容，映射会丢失真实文件）。
 --- @param real_path string
@@ -786,8 +811,6 @@ end
 function M.read_path(real_path)
   _await_rotation()
   local real = _abs(real_path)
-  local stat = vim.uv.fs_stat(real)
-  if stat and stat.type == "directory" then return nil end
   local ws = state.workspace[real]
   if ws then
     -- 目录暂存（create_directory / run_command 新建目录）不映射：映射到暂存目录会把
@@ -796,6 +819,14 @@ function M.read_path(real_path)
     if sstat and sstat.type == "directory" then return nil end
     return ws.staged
   end
+  -- 被整棵搬出（删除只记节点）的子树：返回暂存命名空间里**不存在**的路径，使只读工具
+  -- 与「删除该文件」得到同一结论（绝不回落到仍存在的真实文件）。
+  local anc, adir = _deleted_ancestor(real)
+  if anc and type(anc.staged) == "string" and anc.staged ~= "" then
+    return anc.staged .. real:sub(#adir + 1)
+  end
+  local stat = vim.uv.fs_stat(real)
+  if stat and stat.type == "directory" then return nil end
   return nil
 end
 
@@ -876,9 +907,12 @@ end
 function M.view_is_dir(real_path)
   _await_rotation()
   local real = _abs(real_path)
+  local ws = state.workspace[real]
+  -- 删除只记节点：节点本身与其下所有后代在沙箱视图里都不再是目录。
+  if ws and ws.deleted then return false end
+  if not ws and _deleted_ancestor(real) then return false end
   local st = vim.uv.fs_stat(real)
   if st and st.type == "directory" then return true end
-  local ws = state.workspace[real]
   -- 用 lstat：暂存副本是符号链接时（venv `lib64 -> lib`），目标是否为目录不改变
   -- 「该路径本身是链接而非目录」的事实，否则会误拒对该路径的写入。
   local lst = ws and not ws.deleted and ws.staged and vim.uv.fs_lstat(ws.staged) or nil
@@ -1040,8 +1074,10 @@ function M.seed_view(src, dst, opts)
       local crel = rel == "" and name or (rel .. "/" .. name)
       local cabs = abs .. "/" .. name
       -- 已暂存删除的路径不播种（避免把命令删除的文件复活；删除由物化阶段保持）。
+      -- 删除只记节点：祖先节点被删除时整棵子树都不播种（不枚举、只做前缀判定）。
       local wse = state.workspace[src_norm .. "/" .. crel]
-      if (not _skip(cabs)) and not (wse and wse.deleted) then
+      local seeded_out = (wse and wse.deleted) or (_deleted_ancestor(src_norm .. "/" .. crel) ~= nil)
+      if (not _skip(cabs)) and not seeded_out then
         local cdest = _dest(crel)
         if typ == "directory" then
           local existed = vim.fn.isdirectory(cdest) == 1
@@ -1478,7 +1514,7 @@ function M.merge_candidate(cand, opts)
           version = _bump_version(),
         }
       end
-    elseif f.action == "delete" or f.action == "rmdir" then
+    elseif _is_delete_action(f.action) then
       pcall(vim.fn.delete, staged, "rf")
       state.workspace[f.path] = { staged = staged, base_hash = f.before_hash, deleted = true, version = _bump_version() }
     elseif f.action == "mkdir" then
@@ -2280,34 +2316,6 @@ function M.capture_overlay(attempt_id, real_root, upper_root)
   local cap = _max_file_bytes()
   local runtime = require("NeoAI.sandbox.execution.runtime")
   local session_name = require("NeoAI.sandbox.observe.conceal").session_basename()
-  --- 已展开的真实路径（避免多级 whiteout 重复登记同一后代）。
-  local expanded = {}
-  --- 递归登记被删目录的下层基线后代（目录→rmdir、文件/链接→delete）：overlay 可能只留目录本身
-  --- 的 whiteout，不逐子项留 whiteout，导致候选只有 rmdir 而真实目录非空（rmdir ENOTEMPTY 失败）。
-  --- @param real_dir string 基线（真实）目录绝对路径
-  --- @param rel_dir string 相对捕获根路径
-  local function capture_deleted_tree(real_dir, rel_dir)
-    local handle = vim.uv.fs_scandir(real_dir)
-    if not handle then return end
-    while true do
-      local name = vim.uv.fs_scandir_next(handle)
-      if not name then break end
-      if name ~= ".wh..wh..opq" and name ~= session_name then
-        local child_rel = rel_dir == "" and name or (rel_dir .. "/" .. name)
-        local real = real_root .. "/" .. child_rel
-        if not runtime.is_self_runtime_path(real) and not expanded[real] then
-          expanded[real] = true
-          local lst = vim.uv.fs_lstat(real)
-          if lst and lst.type == "directory" then
-            capture_deleted_tree(real, child_rel)
-            _capture_entry(attempt, real_root, upper_root .. "/" .. child_rel, child_rel, nil, cap)
-          else
-            _capture_entry(attempt, real_root, upper_root .. "/" .. child_rel, child_rel, nil, cap)
-          end
-        end
-      end
-    end
-  end
   local function walk(dir, rel)
     local handle = vim.uv.fs_scandir(dir)
     if not handle then return end
@@ -2324,13 +2332,9 @@ function M.capture_overlay(attempt_id, real_root, upper_root)
         -- 应用时基线必变（BASELINE_CHANGED），会否决**整个**变更单元。
         if not runtime.is_self_runtime_path(real_root .. "/" .. child_rel) then
           if whiteout then
-            -- 目录 whiteout：补出基线目录的下层后代（否则 rmdir 会命中非空目录失败）。
-            local real = real_root .. "/" .. child_rel
-            local base = vim.uv.fs_stat(real)
-            if base and base.type == "directory" and not expanded[real] then
-              expanded[real] = true
-              capture_deleted_tree(real, child_rel)
-            end
+            -- 目录/文件 whiteout：只登记节点本身。删除在发布时是一次 rename 搬出（见
+            -- `sandbox/execution/retired.lua`），绝不遍历目录树展开后代（避免 8012 文件单元与
+            -- 非空 rmdir 失败）；沙箱视图也只在该节点留一个 whiteout。
             _capture_entry(attempt, real_root, dir .. "/" .. name, child_rel, nil, cap)
           elseif t == "directory" then
             walk(dir .. "/" .. name, child_rel)
@@ -2623,51 +2627,17 @@ local function _capture_worker(payload)
     end
   end
 
-  --- 已展开的真实路径（避免多级 whiteout 重复登记同一后代）。
-  local whiteout_expanded = {}
-  --- 处理 whiteout（命令删除 lower 中的文件/目录）。前向声明以支持与目录展开互递归。
-  local handle_whiteout
-  --- 递归登记被删目录的下层基线后代（目录→rmdir、文件/链接→delete）。
-  --- overlayfs 对「非空 lower 目录的删除」可能只在上层留下**目录本身**的 whiteout，而**不逐子项**
-  --- 留 whiteout。若只据此发布，便会产生「候选只有一条 rmdir、真实目录却非空」的变更单元：
-  --- 应用时 rmdir 命中非空目录（ENOTEMPTY）失败，且审批界面误显示为「空目录」。此处按基线真实
-  --- 目录（仍然存在）补出全部后代 whiteout，使既有「子先于父」发布排序可正确先删子项再 rmdir。
-  --- @param real_dir string 基线（真实）目录绝对路径
-  --- @param rel_dir string 相对捕获根路径
-  local function emit_tree_whiteout(real_dir, rel_dir)
-    local handle = vim.uv.fs_scandir(real_dir)
-    if not handle then return end
-    while true do
-      local name, _ = vim.uv.fs_scandir_next(handle)
-      if not name then break end
-      if name ~= ".wh..wh..opq" and name ~= session_basename then
-        local child_rel = rel_dir == "" and name or (rel_dir .. "/" .. name)
-        local real = real_root .. "/" .. child_rel
-        if not is_self(real) and not whiteout_expanded[real] then
-          whiteout_expanded[real] = true
-          local lst = vim.uv.fs_lstat(real)
-          local dest = upper_root .. "/" .. child_rel
-          if lst and lst.type == "directory" then
-            emit_tree_whiteout(real, child_rel)
-            handle_whiteout(child_rel, real, dest)
-          else
-            handle_whiteout(child_rel, real, dest)
-          end
-        end
-      end
-    end
-  end
-  handle_whiteout = function(child_rel, real, dest)
+  --- 处理 whiteout（命令删除 lower 中的文件/目录）。只登记节点本身：删除在发布时是一次
+  --- `rename` 搬出（见 `sandbox/execution/retired.lua`），绝不在此遍历/展开后代。
+  --- @param child_rel string
+  --- @param real string
+  --- @param dest string
+  local function handle_whiteout(child_rel, real, dest)
     local exp = expected[real]
     if exp and exp.deleted then return end -- 期望即删除态且未被命令重建：未改动，跳过
     local sstat = vim.uv.fs_stat(dest)
     if ws_skip(real, dest, sstat) then return end
     local stat = vim.uv.fs_stat(real)
-    -- 被删的是目录：先补出全部后代（基线真实目录仍在），再登记目录本身。
-    if stat and stat.type == "directory" and not whiteout_expanded[real] then
-      whiteout_expanded[real] = true
-      emit_tree_whiteout(real, child_rel)
-    end
     -- whiteout 删除的是基线文件，base_hash 需与真实内容一致（CAS 冲突检测依赖）。
     enc(child_rel); enc(dest); enc("whiteout")
     enc(stat and "1" or "0"); enc(stat and stat.type or ""); enc("")
@@ -3430,8 +3400,9 @@ local function _filter_unpublishable(files, attempt, classify)
       gc = runtime.git_path_class(f.path)
       masked = runtime.is_masked_path(f.path, unmask) or false
     end
-    local is_obj_del = gc == "object" and (f.action == "delete" or f.action == "rmdir")
-    if gc == "transient" or gc == "other" or is_obj_del then
+    local is_obj_del = gc == "object" and _is_delete_action(f.action)
+    local is_node_retire = (f.action == "retire")
+    if gc == "transient" or gc == "other" or is_obj_del or (is_node_retire and gc ~= nil) then
       -- `.git` 瞬态（*.lock/gc.log）、配置类（config/hooks/info）与对象删除（gc/prune 的
       -- 剪枝）不纳入候选：对象删除绝不应用（保留多余对象无害，删除被引用的对象才会悬空）。
       dropped.git = dropped.git + 1
@@ -3467,6 +3438,84 @@ local function _filter_unpublishable(files, attempt, classify)
     end)
   end
   return out, dropped
+end
+
+--- `.git` 内部的整目录删除不能「搬出」：git 的对象/指针必须按原子组逐文件应用（删除需要
+--- 子先于父 / 对象→指针的顺序），且 `.git` 子树很小。冻结阶段按基线真实目录展开为
+--- `delete`/`rmdir`（只有 `.git` 子树会走这条路径，工作区目录仍是单节点搬出）。
+--- @param files table
+--- @return table
+local function _expand_git_retire(files)
+  local runtime = require("NeoAI.sandbox.execution.runtime")
+  local any = false
+  for _, f in ipairs(files) do
+    if f.action == "retire" and f.recursive and runtime.is_git_internal(f.path) then
+      any = true
+      break
+    end
+  end
+  if not any then return files end
+  local out = {}
+  for _, f in ipairs(files) do
+    if f.action == "retire" and f.recursive and runtime.is_git_internal(f.path) then
+      local function walk(p)
+        local h = vim.uv.fs_scandir(p)
+        if not h then return end
+        while true do
+          local name = vim.uv.fs_scandir_next(h)
+          if not name then break end
+          local c = p .. "/" .. name
+          local lst = vim.uv.fs_lstat(c)
+          if lst and lst.type == "directory" then
+            walk(c)
+            out[#out + 1] = { path = c, action = "rmdir", base_exists = true, base_type = "directory" }
+          else
+            out[#out + 1] = { path = c, action = "delete", base_exists = true,
+              base_type = (lst and lst.type) or "file" }
+          end
+        end
+      end
+      walk(f.path)
+      out[#out + 1] = { path = f.path, action = "rmdir", base_exists = true, base_type = "directory" }
+    else
+      out[#out + 1] = f
+    end
+  end
+  return out
+end
+
+--- 折叠「节点删除」：递归删除目录时，写日志/overlay 仍可能逐路径登记后代删除条目；
+--- 祖先已是 `retire` 节点时，后代删除条目全部丢弃（审批视图只保留一条节点）。
+--- 注意：后代**写入**（重建该目录）必须保留——发布顺序保证先搬出旧树、再按候选视图写入。
+--- @param files table
+--- @return table
+local function _collapse_node_deletes(files)
+  local nodes = {}
+  local any = false
+  for _, f in ipairs(files) do
+    if f.action == "retire" and f.recursive then
+      nodes[f.path] = true
+      any = true
+    end
+  end
+  if not any then return files end
+  local function covered(p)
+    local d = p:match("^(.*)/[^/]*$")
+    while type(d) == "string" and d ~= "" and d ~= "/" do
+      if nodes[d] then return true end
+      d = d:match("^(.*)/[^/]*$")
+    end
+    return false
+  end
+  local out = {}
+  for _, f in ipairs(files) do
+    if _is_delete_action(f.action) and not nodes[f.path] and covered(f.path) then
+      -- 被祖先节点覆盖：丢弃（删除只记节点）
+    else
+      out[#out + 1] = f
+    end
+  end
+  return out
 end
 
 --- 冻结：生成候选（不修改真实工作区）
@@ -3531,12 +3580,13 @@ function M.finish(attempt_id, prefetch, classify, skip_base_blobs)
           action = "modify"
         end
       else
-        if entry.base_exists then action = "delete" end
+        -- 删除 = 搬出（retire）：整棵节点一次 rename 到同盘搬出层，不销毁内容。
+        if entry.base_exists then action = "retire" end
       end
       if action then
         local ws = state.workspace[real]
-        if ws then ws.deleted = (action == "delete" or action == "rmdir") end
-        if action ~= "delete" and not blob then
+        if ws then ws.deleted = _is_delete_action(action) end
+        if action ~= "retire" and not blob then
           pcall(function()
             require("NeoAI.kernel.logger").warn(
               "[sandbox] 大文件 blob 复制失败，跳过候选：%s", real)
@@ -3553,8 +3603,7 @@ function M.finish(attempt_id, prefetch, classify, skip_base_blobs)
             mode = (action == "create" or action == "modify") and entry.mode or nil,
             blob = (action == "create" or action == "modify") and blob or nil,
             large = true,
-          }
-        end
+          }        end
       end
     elseif cap > 0 and staged_stat and staged_stat.type == "file" and (staged_stat.size or 0) > cap then
       -- 未标记 large 但超限（旧 mapping / 兜底）：不纳入候选（避免读入内存 / 嵌入候选 JSON）。
@@ -3563,12 +3612,25 @@ function M.finish(attempt_id, prefetch, classify, skip_base_blobs)
           "[sandbox] 跳过超大候选文件（%d 字节 > 上限 %d）：%s", staged_stat.size, cap, real)
       end)
     else
-      local action, after_hash, content, blob
+      local action, after_hash, content, blob, recursive, dir_sig
       if entry.base_type == "directory" then
         if staged_stat and staged_stat.type == "directory" then
           if not entry.base_exists then action = "mkdir" end
-        else
-          if entry.base_exists then action = "rmdir" end
+        elseif entry.base_exists then
+          -- 目录被删除（overlay whiteout：char/block 设备、`.wh.` 命名或暂存侧缺失）→ 节点搬出。
+          -- 其它类型（文件/链接）意味着「目录被替换」，保留旧 rmdir 语义（历史行为）。
+          local staged_base = type(entry.staged) == "string" and (entry.staged:match("[^/]+$") or "") or ""
+          local is_whiteout = (staged_stat == nil)
+            or (staged_stat.type == "char" or staged_stat.type == "block")
+            or staged_base:sub(1, 4) == ".wh."
+          if is_whiteout then
+            action = "retire"
+            recursive = true
+            local bst = vim.uv.fs_lstat(real)
+            dir_sig = bst and _dir_sig(bst) or nil
+          else
+            action = "rmdir"
+          end
         end
       else
         if staged_stat and staged_stat.type == "file" then
@@ -3594,17 +3656,23 @@ function M.finish(attempt_id, prefetch, classify, skip_base_blobs)
             end
           end
         else
-          if entry.base_exists then action = "delete" end
+          -- 文件被删除：同样是搬出（不销毁内容）。
+          if entry.base_exists then action = "retire" end
         end
       end
       if action then
-        -- 同步工作区暂存状态：删除态标记，使后续 read/list/search 一致地看不到该文件。
+        -- 同步工作区暂存状态：删除态标记，使后续 read/list/search 一致地看不到该文件/子树。
         local ws = state.workspace[real]
-        if ws then
-          ws.deleted = (action == "delete" or action == "rmdir")
+        if _is_delete_action(action) then
+          -- 节点删除：即使此前从未暂存，也要登记删除态（沙箱视图按节点遮蔽整棵子树）。
+          ws = ws or { staged = _workspace_path(real), version = _bump_version() }
+          ws.deleted = true
+          ws.base_hash = ws.base_hash or entry.base_hash
+          state.workspace[real] = ws
+        elseif ws then
           -- 文件工具直接写暂存副本时 real_hash 仍是编辑前基线；冻结时按最终视图内容更新，
           -- 使后续 ws_skip 能用真实内容哈希判断「命令是否改动」。
-          if action ~= "delete" and action ~= "rmdir" and content ~= nil then
+          if content ~= nil then
             local secret = require("NeoAI.sandbox.secret.secret")
             local detok, unresolved = secret.detokenize(content)
             if (unresolved or 0) == 0 then
@@ -3616,13 +3684,15 @@ function M.finish(attempt_id, prefetch, classify, skip_base_blobs)
         files[#files + 1] = {
           path = real,
           action = action,
+          recursive = recursive or nil,
           before_hash = entry.base_hash,
           -- 超大文件（> tools.sandbox.max_file_bytes）在 `_base_hash_worker` 中**按设计不读内容**
           -- → base_hash 为 nil。删除类候选的 CAS 需要基线，故退化为 stat 签名
           -- （publish 的 delete 分支支持 `before_sig`）；否则该删除会永久卡在
           -- `CONFLICT: BASELINE_CHANGED`（实测：删除 10.5MB 的 wheels/*.whl 必然失败）。
-          before_sig = entry.base_sig or ((action == "delete" and entry.base_type == "file"
-            and not entry.base_hash) and _stat_sig(vim.uv.fs_stat(real)) or nil),
+          before_sig = entry.base_sig or dir_sig or ((_is_delete_action(action)
+            and entry.base_type == "file" and not entry.base_hash)
+            and _stat_sig(vim.uv.fs_stat(real)) or nil),
           after_hash = after_hash,
           base_exists = entry.base_exists,
           base_type = entry.base_type,
@@ -3659,6 +3729,10 @@ function M.finish(attempt_id, prefetch, classify, skip_base_blobs)
     end
   end
   table.sort(files, function(a, b) return a.path < b.path end)
+  -- `.git` 内部整目录删除按原子组逐文件展开（git 语义），工作区目录仍只记节点。
+  files = _expand_git_retire(files)
+  -- 删除只记节点：祖先已是 `retire` 节点时丢弃后代删除条目（审批视图一条、发布一次 rename）。
+  files = _collapse_node_deletes(files)
   -- 剔除运行时遮蔽（发布硬拒绝）与易变包缓存（CAS 冲突）文件，避免整单元失败。
   local dropped
   local _n_before = #files
@@ -3887,14 +3961,8 @@ function M.finish_async(attempt_id, opts)
   end)
 end
 
---- 发布应用顺序：删除/rmdir 先于写入，且同组内「子路径先于父路径」（删除）/
---- 「父路径先于子路径」（写入）。否则 `rm -rf <dir>` 产生的候选会先对非空父目录 rmdir，
---- 导致整个变更单元 WRITE_FAILED。
----
---- 实现必须用**严格弱序**（按深度排序），不能写成「成对祖先比较 + 字典序兜底」：
---- 后者不是传递关系（父子规则与字典序可构成环），`table.sort` 在非传递比较器下结果未定义。
---- 实测（8012 文件的包安装单元）会出现 `rmdir` 排在子项删除**之前**——共 489 处——
---- 于是 rmdir 命中非空目录，报 `WRITE_FAILED: ... RMDIR_NOT_EMPTY`。
+--- 发布应用顺序：节点搬出（retire）最先，其次删除/rmdir（子先于父），最后写入（父先于子）。
+--- `retire` 是一次 rename（与深度无关），必须在写入之前：同一目录重建时先搬出旧树再按视图写入。
 --- @param files table
 --- @return table 排序后的副本
 local function _apply_order(files)
@@ -3904,9 +3972,10 @@ local function _apply_order(files)
   local function is_del(f) return f.action == "delete" or f.action == "rmdir" end
   --- 路径深度（`/a/b/c` → 3）；同深度再按字典序，保证比较器传递。
   local function depth(p) return select(2, p:gsub("/", "")) end
-  -- 原子顺序：git 对象库（不可变/可累加）→ 普通文件 → git 指针（index/refs/HEAD）。
+  -- 原子顺序：节点搬出 → git 对象库（不可变/可累加）→ 普通文件 → git 指针（index/refs/HEAD）。
   -- 对象先于指针，保证任何被写入的索引/refs 所引用的对象都已存在（绝不悬空）。
   local function rank(f)
+    if f.action == "retire" then return -1 end
     local gc = _file_git_class(f)
     if gc == "object" then return 0 end
     if gc == "pointer" then return 2 end
@@ -4337,6 +4406,18 @@ local function _publish_validate(candidate)
     if masked then
       return { ok = false, state = "FAILED", reason = "SANDBOX_MASKED_TARGET: " .. tostring(masked) }
     end
+    -- 删除搬出（retire）的硬闸门：搬出层/根/家目录不可搬；`.git` 内部与含 `.git`
+    -- 目录的仓库根不可整棵搬出（工作树 `.git` 是文件 → 允许，保住 `git worktree remove`）。
+    -- 该判定先于「自身运行时」：搬出层本身要给出明确的 SANDBOX_RETIRED_TARGET 原因。
+    if f.action == "retire" then
+      local retired = require("NeoAI.sandbox.execution.retired")
+      if retired.is_retired_path(resolved) then
+        return { ok = false, state = "FAILED", reason = "SANDBOX_RETIRED_TARGET: " .. tostring(resolved) }
+      end
+      if resolved == "/" or resolved == (vim.uv.os_homedir() or "") then
+        return { ok = false, state = "FAILED", reason = "SANDBOX_RETIRE_UNSAFE_ROOT: " .. tostring(resolved) }
+      end
+    end
     -- NeoAI 自身运行时/状态（日志/会话/缓存/沙箱 store）：绝不发布（否则应用时基线必变）。
     if runtime.is_self_runtime_path(resolved) then
       return { ok = false, state = "FAILED", reason = "SANDBOX_SELF_TARGET: " .. tostring(resolved) }
@@ -4345,6 +4426,27 @@ local function _publish_validate(candidate)
     local gc = runtime.git_path_class(resolved)
     if gc == "transient" or gc == "other" then
       return { ok = false, state = "FAILED", reason = "SANDBOX_GIT_INTERNAL: " .. tostring(resolved) }
+    end
+    if f.action == "retire" then
+      if gc ~= nil then
+        return { ok = false, state = "FAILED", reason = "SANDBOX_GIT_INTERNAL: " .. tostring(resolved) }
+      end
+      if f.recursive then
+        local gd = vim.uv.fs_lstat(resolved .. "/.git")
+        if gd and gd.type == "directory" then
+          return { ok = false, state = "FAILED", reason = "SANDBOX_GIT_INTERNAL: " .. tostring(resolved .. "/.git") }
+        end
+        -- 整棵搬出的目录若包含 NeoAI 自身运行时/沙箱 store：搬走会把本进程的候选/待审/日志
+        -- 一起移走（写回时又重建），状态直接损坏。逐文件删除时代码靠 self 过滤跳过这些子树，
+        -- 节点搬出没有这个粒度，故在此硬拒绝。
+        for _, root in ipairs(runtime.self_runtime_roots()) do
+          local r = tostring(root):gsub("/+$", "")
+          if r ~= "" and r:sub(1, #resolved + 1) == resolved .. "/" then
+            return { ok = false, state = "FAILED",
+              reason = "SANDBOX_RETIRE_SELF_ANCESTOR: " .. tostring(resolved) }
+          end
+        end
+      end
     end
   end
   return nil
@@ -4417,6 +4519,18 @@ function M.publish(candidate, opts)
     end
     return false
   end
+  -- 整棵搬出（retire）的目录：其下写入属于「重建该目录」语义（旧树随搬出离开），
+  -- 故 CAS 只校验节点自身，不对其后代做「目标不存在/基线未变」判定。
+  local retired_roots = {}
+  for _, f in ipairs(candidate.files or {}) do
+    if f.action == "retire" and f.recursive then retired_roots[#retired_roots + 1] = f.path end
+  end
+  local function under_retired(p)
+    for _, dir in ipairs(retired_roots) do
+      if p:sub(1, #dir + 1) == dir .. "/" then return true end
+    end
+    return false
+  end
   --- 目标已存在时，其内容是否**已经是候选结果**（幂等判定：该改动此前已落盘）。
   --- 仅用于 `create`/`mkdir` 的冲突路径，不改变正常写入语义。
   --- @param f table 候选文件条目
@@ -4445,7 +4559,7 @@ function M.publish(candidate, opts)
 
   for _, f in ipairs(candidate.files or {}) do
     local gc = _file_git_class(f)
-    if gc ~= "object" and not under_recreated(f.path) then
+    if gc ~= "object" and not under_recreated(f.path) and not under_retired(f.path) then
       local lstat = vim.uv.fs_lstat(f.path)
       local stat = vim.uv.fs_stat(f.path)
       local exists = lstat ~= nil
@@ -4512,8 +4626,19 @@ function M.publish(candidate, opts)
             return { ok = false, state = "CONFLICT", reason = "TARGET_ALREADY_EXISTS: " .. f.path }
           end
         end
+      elseif f.action == "retire" and f.recursive then
+        -- 目录节点搬出：只校验「仍是目录 + 基线签名未变」，绝不遍历目录树。
+        -- 目录 mtime/size 变化说明有外部新增/删除（例如另一单元刚在 D 下写了文件）→ 冲突，
+        -- 避免把别人的改动一起搬走。
+        if not exists then
+          skip_paths[f.path] = "retired"
+        elseif lstat.type ~= "directory" then
+          return { ok = false, state = "CONFLICT", reason = "BASELINE_CHANGED: " .. f.path }
+        elseif f.before_sig and _dir_sig(lstat) ~= f.before_sig then
+          return { ok = false, state = "CONFLICT", reason = "BASELINE_CHANGED: " .. f.path }
+        end
       else
-        local is_del = (f.action == "delete" or f.action == "rmdir")
+        local is_del = _is_delete_action(f.action)
         if not exists then
           -- 删除幂等：目标已被外部删除时视为「已满足」，不视为冲突（与 writer 的删除语义一致）。
           -- 否则一个删除候选在目标消失后会被永久卡在 CAS 冲突里无法结算。
@@ -4578,9 +4703,13 @@ function M.publish(candidate, opts)
   -- 非原子单元允许部分写入：单个文件写入失败不再让整包失败，成功文件照常落盘，
   -- 失败文件由上层回队重试（见 review._apply_settle 的 PARTIAL 分支）。
   local writer = require("NeoAI.sandbox.execution.writer")
+  local retired_mod = require("NeoAI.sandbox.execution.retired")
   local atomic = opts.atomic == true or _atomic_group(candidate.files or {})
   local allow_partial = not atomic and opts.partial ~= false
   local applied, failed = {}, {}
+  local retired_map = {}
+  local failed_retire_roots = {}
+  local change_set = opts.change_set_id
   -- 目录重建：CAS 已通过 → 清掉宿主旧残留（保留候选视图内的路径），随后按顺序写入。
   _prune_recreated(recreated_dirs, recreate_keep)
   for _, f in ipairs(_apply_order(ordered_files)) do
@@ -4616,11 +4745,22 @@ function M.publish(candidate, opts)
       action = "delete"
     elseif f.action == "rmdir" then
       action = "rmdir"
+    elseif f.action == "retire" then
+      action = skip_paths[f.path] and nil or "retire"
     end
     local gc = _file_git_class(f)
     -- git 对象库内容寻址：目标已存在即内容相同（幂等），跳过写入。
     if action == "write" and gc == "object" and vim.uv.fs_stat(f.path) then
       action = nil
+    end
+    -- 祖先目录搬出失败：其下写入绝不能落到仍存在的旧树（与重试单元一起处理）。
+    local blocked_root
+    for _, root in ipairs(failed_retire_roots) do
+      if f.path:sub(1, #root + 1) == root .. "/" then
+        blocked_root = root
+        action = nil
+        break
+      end
     end
     if action then
       local res
@@ -4636,6 +4776,7 @@ function M.publish(candidate, opts)
           allow_root = opts.allow_root == true,
           prefer_sudo = opts.prefer_sudo == true,
           mode = f.mode,
+          change_set_id = change_set,
         })
       end
       if res.state == writer.STATE.NEEDS_ROOT then
@@ -4646,13 +4787,28 @@ function M.publish(candidate, opts)
         local reason = "WRITE_FAILED: " .. f.path .. " " .. tostring(res.err)
         if allow_partial then
           failed[#failed + 1] = { path = f.path, reason = reason }
+          if action == "retire" and f.recursive then
+            failed_retire_roots[#failed_retire_roots + 1] = f.path
+          end
         else
           return { ok = false, state = "FAILED", reason = reason, applied = applied, failed = failed }
         end
       else
+        if action == "retire" and type(res.retired) == "string" then
+          retired_mod.record(change_set, f.path, res.retired)
+          retired_map[#retired_map + 1] = { path = f.path, retired = res.retired }
+        end
         applied[#applied + 1] = f.path
       end
+    elseif blocked_root then
+      -- 祖先搬出失败：本条留待回队重试（随祖先节点一起重新应用）。
+      failed[#failed + 1] = { path = f.path, reason = "SKIPPED_AFTER_FAILED_RETIRE: " .. blocked_root }
     else
+      if f.action == "retire" then
+        -- 幂等跳过（目标已不在）：若此前已搬出，回执带上搬出路径供撤销。
+        local known = retired_mod.lookup(change_set, f.path)
+        if known then retired_map[#retired_map + 1] = { path = f.path, retired = known } end
+      end
       applied[#applied + 1] = f.path
     end
   end
@@ -4669,13 +4825,15 @@ function M.publish(candidate, opts)
     file_count = #applied,
   }
   if #failed > 0 then
-    return _partial_result(applied, failed, receipt)
+    local partial = _partial_result(applied, failed, receipt)
+    partial.retired = retired_map
+    return partial
   end
-  return { ok = true, state = "COMMITTED", receipt = receipt, applied = applied }
+  return { ok = true, state = "COMMITTED", receipt = receipt, applied = applied, retired = retired_map }
 end
 
 --- 候选是否与顺序无关（无删除、无 git 对象/指针）：其写入可并行而无需保序。
---- 删除/rmdir 需「子先于父」，git 对象须先于指针，故这些情况必须顺序发布。
+--- 删除/rmdir 需「子先于父」，搬出节点必须最先执行，git 对象须先于指针，故这些情况必须顺序发布。
 --- @param files table
 --- @return boolean
 local function _order_insensitive(files)
@@ -4683,7 +4841,7 @@ local function _order_insensitive(files)
   for _, f in ipairs(files) do
     local gc = _file_git_class(f)
     if gc == "object" or gc == "pointer" then return false end
-    if f.action == "delete" or f.action == "rmdir" then return false end
+    if _is_delete_action(f.action) then return false end
   end
   return true
 end

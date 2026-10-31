@@ -230,6 +230,50 @@ function M.verify_cache_identity(agent, messages, tool_defs)
   return id
 end
 
+-- 最近一次请求的「消息形状」（agent_id + 每条 role/长度/tool_calls 数）。
+-- 用于检测**非追加**请求（压缩/裁剪/快照改写使历史中段变化）——这类变化会让前缀缓存从第一个
+-- 分歧处失效，是多轮命中率骤降的典型原因。按形状比较，零额外编码开销。
+local _last_shape = nil
+
+--- 清空请求形状诊断（测试用）
+function M.reset_shape_diag()
+  _last_shape = nil
+end
+
+--- 记录并诊断请求是否严格「尾部追加」。
+--- @param agent table|nil
+--- @param messages table 请求消息（内部规范）
+function M.note_request_shape(agent, messages)
+  local sigs = {}
+  for i, m in ipairs(messages or {}) do
+    local c = m.content
+    local len = type(c) == "string" and #c or (type(c) == "table" and #c or 0)
+    sigs[i] = tostring(m.role) .. ":" .. tostring(len) .. ":" .. tostring(m.tool_calls and #m.tool_calls or 0)
+  end
+  local agent_id = (agent and agent.id) or ""
+  local prev = _last_shape
+  if prev and prev.agent_id == agent_id then
+    local n = math.min(#prev.sigs, #sigs)
+    local first
+    for i = 1, n do
+      if prev.sigs[i] ~= sigs[i] then first = i break end
+    end
+    -- 只有「旧消息被改写/截断」才告警；纯尾部追加（first 落在新消息之后）是正常形态。
+    if first and first < #sigs then
+      logger.debug(
+        "[prefix] 请求历史非追加：第 %d 条起变化（role=%s，上一请求 %d 条，本次 %d 条）——前缀缓存将从该处失效",
+        first, tostring(messages[first] and messages[first].role), #prev.sigs, #sigs)
+      if agent then
+        local cache = agent.cache or {}
+        cache.non_append_requests = (cache.non_append_requests or 0) + 1
+        cache.last_non_append_at = first
+        agent.cache = cache
+      end
+    end
+  end
+  _last_shape = { agent_id = agent_id, sigs = sigs }
+end
+
 -- ========== 缓存用量解析 ==========
 
 --- 从 provider usage 解析缓存命中/未命中 token

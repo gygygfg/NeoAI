@@ -149,6 +149,7 @@ function M.send_stream(agent, opts, on_chunk)
         tool_defs = require("NeoAI.core.agent.tool_loop")._tool_definitions(agent)
       end
       prefix.verify_cache_identity(agent, messages, tool_defs)
+      prefix.note_request_shape(agent, messages)
 
       return request.send_stream(messages, {
         agent_config = opts.agent_config or agent.config,

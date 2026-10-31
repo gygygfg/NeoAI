@@ -568,7 +568,7 @@ function M.create(opts)
   state.sessions[s.id] = s
   local ok, err = M.persist(s)
   if not ok then
-    vim.notify("[NeoAI] 新会话暂未保存: " .. tostring(err), vim.log.levels.ERROR)
+    vim.notify("[NeoAI] 新会话暂未保存: " .. async.error_text(err), vim.log.levels.ERROR)
   end
   event_bus.emit(events.SESSION_CREATED, { session = s })
   return s, err
@@ -660,6 +660,19 @@ function M.persist_async(session)
     return fs.append_file_async(path, line):then_(function()
       return _finish_persist(path, line, log, session)
     end, function(e)
+      -- 线程池/后台 worker 未能启动该任务（队列已满、已停止等）：追加尚未发生，
+      -- 退化为**同步追加**。会话消息比一次主线程小写入更重要——资源压力下（如同时
+      -- 生成大量图像附件、worker 队列打满）不能直接把消息留在内存里丢掉。
+      if type(e) == "table" and e.not_started then
+        local ok, serr = fs.append_file(path, line)
+        if ok then
+          return _finish_persist(path, line, log, session)
+        end
+        require("NeoAI.kernel.logger").error("[session_store] 追加失败 %s: %s",
+          path, tostring(serr))
+        return async.reject(serr)
+      end
+      -- 可能已部分写入：标记脏日志，下次持久化先 repair，再重试。
       log.dirty = true
       return async.reject(e)
     end)

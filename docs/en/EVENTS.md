@@ -299,7 +299,7 @@ All event constants are defined in `NeoAI.kernel.events`. They are listed below 
 2. **Clean up promptly**: `event_bus.on(...)` returns an unsubscribe function; call it when a window closes or an agent is disposed to prevent leaks.
 3. **Avoid blocking**: event callbacks run in the autocmd context, so do not perform time-consuming I/O; defer expensive work with `vim.schedule`.
 4. **Isolate errors**: exceptions thrown by a callback are caught by event_bus and logged without interrupting other subscribers (but it is still best to `pcall` yourself).
-5. **Payload is shallow**: the payload passed to `emit` is deep-copied by `nvim_exec_autocmds`, so **do not rely on object metatables/methods**.
+5. **Payload is shallow**: the payload passed to `emit` is deep-copied by `nvim_exec_autocmds`, so **do not rely on object metatables/methods**. Payloads carrying **userdata** (e.g. `vim.uv` handles) cannot be converted (`Invalid 'data': Cannot convert userdata`); `event_bus` then delivers a sanitized copy with functions/threads/userdata removed, so subscribers still receive the event but lose those values.
    When you need to pass the original object (such as a timer or an Agent instance), pass it directly via a closure or a module-level reference instead of stuffing it into the event payload.
 
 ## 5. Event Subscription Examples

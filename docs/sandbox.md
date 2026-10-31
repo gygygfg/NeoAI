@@ -371,34 +371,39 @@ token（`NEOKEY_…`）或格式保真假密钥时**拒绝写盘**（`SECRET_TOK
     **符号链接**按「链接目标一致」判定：宿主已是指向同一目标的链接时同样幂等跳过（不再 unlink
     重建），目标不同才是冲突。否则 venv 的 `bin/python`、`lib64` 这类链接会让重建 venv 的候选
     永久卡在 `TARGET_ALREADY_EXISTS`（同步与工作线程 CAS 两条路径一致）。
-  - **应用顺序必须是严格弱序**：`_apply_order` 以「(git rank, 删除优先, 深度, 路径)」排序——
-    删除按深度**降序**（子先于父）、写入按路径字典序（父路径是子路径前缀，天然父先于子）。
-    不能用「成对祖先比较 + 字典序兜底」：该比较器不传递，`table.sort` 结果未定义，实测
-    （8012 文件单元）有 489 处子项删除被排在父 `rmdir` 之后 → `RMDIR_NOT_EMPTY`。
-  - **失败 rmdir 回队带上子项删除**：部分应用时，失败的回队单元会把该目录在原候选里的子项删除
-    一并回队（已应用的子项在重试时按删除幂等跳过），否则重试单元只剩一条 `rmdir`，命中非空目录后
-    永久 `RMDIR_NOT_EMPTY`。
+  - **应用顺序（历史逐文件删除）**：`_apply_order` 以「(git rank, 删除优先, 深度, 路径)」排序
+    ——删除按深度**降序**（子先于父）、写入按路径字典序。新的删除 `retire` 不参与该排序：
+    它在最前以一次 `rename` 完成（见下条）。比较器必须传递，否则 `table.sort` 结果未定义。
+  - **删除 = 搬出（`retire`，同盘 `rename`，绝不遍历目录树）**：删除不再展开为「每个后代一条」
+    再逐条删除，而是把被删节点（文件或**整棵目录**）一次 `rename` 到同盘的隐藏目录
+    `<parent>/.neoai-retired/<change_set_id>/<name>`（`sandbox/execution/retired.lua`）：
+    - 捕获只登记**节点**（删一个 `.prof/.../Cache_Data` 只产生 1 条候选），不 `scandir` 展开后代；
+      写日志/overlay 仍可能逐路径报到后代删除条目，冻结时折叠进祖先节点。
+    - 发布是一次原子 `rename`（同父目录 ⇒ 同盘），没有「子先于父」顺序依赖，也不会出现
+      `RMDIR_NOT_EMPTY`；宿主机原路径消失、内容完整保留。
+    - 撤销（`u`）= **整棵搬回**（反向 `rename`）：O(1)、不受快照大小上限约束、内容/权限/软链
+      完整恢复。删除类候选因此**不做快照复制**。
+    - 同一单元里既搬出 `D` 又写入 `D/**`（重建 venv 等）：先搬出旧树，再按候选视图写入，
+      天然等价于 overlay 的「不透明目录」（不再需要发布前清理残留）。
+    - 目录基线用 `dirsig:<mtime>:<ino>` 做 CAS：目录项被外部增删（mtime/ino 变化）→
+      `BASELINE_CHANGED`，避免把别人的改动一起搬走；目标已消失时按删除幂等跳过。
+    - 搬出层自带内容为 `*` 的 `.gitignore` 与 `.neoai-owner` 标记：对 `git status` 完全不可见，
+      同名用户目录不会被误用；该目录绝不捕获为候选、绝不出现在列举/搜索/git 视图中。
+    - **`.git` 例外**：`.git` 内部的目录删除仍按原子组**逐文件**展开（对象→指针顺序、
+      对象删除不纳入候选），`git worktree remove` 的工作树目录（`.git` 是**文件**）按普通节点
+      搬出；仓库根（含 `.git` **目录**）、`/`、家目录、搬出层自身一律拒绝搬出。
+    - **回收**：变更单元离开待审/已应用列表、`sandbox.reset` 时回收其搬出内容；另由
+      `tools.sandbox.retired.ttl_days`（默认 7 天）兜底回收（回收后该条不再可撤销）。
   - **超大文件的删除基线**：内容超过 `tools.sandbox.max_file_bytes`（默认 8MB）的文件不做内容
     哈希（避免读数百 MB），但**删除**候选仍需基线做 CAS——此类删除改用 stat 签名
     （`sig:mtime.nsec:size`，`before_sig`）。历史候选若连基线都没有（旧版本冻结），删除本身幂等
-    可恢复，故放行而不是永久卡在 `BASELINE_CHANGED`（实测：删除 10.5MB 的 `wheels/*.whl`
-    曾必然失败）。
-  - **递归删除目录的捕获补全**：`rm -rf <dir>` 在 overlay 中可能只在父目录留下**目录本身**的
-    whiteout，而不逐子项留 whiteout。若据此只生成一条 `rmdir`，则候选与真实盘不一致：审批界面
-    看似「空目录」，应用时 `rmdir` 却命中非空目录（`ENOTEMPTY`）失败。捕获阶段（同步
-    `capture_overlay` 与工作线程 `_capture_worker`）现会**按基线真实目录补出全部后代的
-    whiteout**（目录→`rmdir`、文件/链接→`delete`），再由既有「子先于父」发布排序先删子项、
-    再删除父目录；界面也会完整列出被删子项（超过 `max_display_files` 时折叠，见上）。
-  - **非空目录 rmdir 明确报因**：`writer` 对非空目录 rmdir 直接返回 `RMDIR_NOT_EMPTY: <path>`
-    （区别于权限/其他失败），不再静默为笼统失败。
-  - **目录重建归一化（rmdir + 同目录写入）**：同一候选里既有 `rmdir D` 又有 `D` 下的写入时
-    （典型：包安装重建 venv，或跨命令合并后的包候选单元——`rmdir` 来自删除侧、`create` 来自
-    重建侧），rmdir 在两种顺序下都不成立：先删则宿主仍有旧内容（`ENOTEMPTY`），后删则候选刚写
-    的子项让它非空；此外 `create`/`modify` 的 CAS 也会与重建语义冲突
-    （`TARGET_ALREADY_EXISTS`/`BASELINE_CHANGED`）。发布端（`candidate.publish`）按 overlay 的
-    **不透明目录**语义归一化：CAS 预检放行这些路径 → 清理宿主 `D` 下**不在候选视图**的旧残留 →
-    丢弃该 `rmdir` → 按正常顺序写入（目录由写入自然建出）。此类单元一律走同步发布（异步路径的
-    CAS 与写入在线程池内合并完成，无法插入清理）。
+    可恢复，故放行而不是永久卡在 `BASELINE_CHANGED`。
+  - **非空目录 rmdir 明确报因（历史逐文件删除）**：`writer` 对非空目录 rmdir 直接返回
+    `RMDIR_NOT_EMPTY: <path>`（区别于权限/其他失败）；新的 `retire` 不存在该失败模式。
+  - **目录重建归一化（历史 rmdir + 同目录写入）**：同一候选里既有 `rmdir D` 又有 `D` 下的写入
+    （升级前冻结的旧候选）仍按 overlay 的**不透明目录**语义：CAS 预检放行 → 清掉宿主 `D` 下
+    不在候选视图的旧残留 → 丢弃该 `rmdir` → 按正常顺序写入。新候选用「先搬出旧树、再写入」，
+    无需清理遍历。
   - **部分应用的失败原因可见**：`PARTIAL` 结果的 `reason` 携带**首条**失败原因，并逐条
     （上限 5 条）写入日志；回队的新待审单元携带 `fail_reason`，避免「同因再失败」无从排查。
   - **非原子整包部分应用**：非原子变更单元（不含 `atomic_group="git"` 的对象/指针）在写入阶段
@@ -440,11 +445,12 @@ token（`NEOKEY_…`）或格式保真假密钥时**拒绝写盘**（`SECRET_TOK
     默认用 mtime/size 签名（`tools.sandbox.review.snapshot_cas="sig"`，省去应用后逐文件读取+哈希的
     CPU；`"hash"` 恢复最强一致性）；**签名失配时回退比较内容哈希**（候选 `after_hash` 已知时），
     仅 mtime/inode 变化（`touch`、包重写 `.pyc`）不再误判 `TARGET_CHANGED`。
+    **删除类（`retire`）例外**：撤销靠「整棵搬回」`rename`，不复制内容、不受快照上限约束。
   - **快照上限与「不可撤销」标记**：撤销快照的单文件上限独立于候选内容上限，取
     `tools.sandbox.review.snapshot_max_bytes`（默认 64MB；`<=0` 回退 `max_file_bytes`）。超过上限的
     原文件不保存内容 → 该变更单元**不可撤销**：审批界面「已应用」行事前标
     `⚠ 不可撤销：<file> <size> 超过快照上限`，按 `u` 返回 `SNAPSHOT_TOO_LARGE`（WARN + 去重，不再
-    逐次刷 ERROR），提示调大该项后重新应用。适用于 pip/apt 安装的数十 MB `.so` 等大文件回滚。
+    逐次刷 ERROR），提示调大该项后重新应用。**删除类不受此限**（搬出层原样保留整棵内容）。
   - **终态项有界淘汰**：`tools.sandbox.review.terminal_cache_max`（默认 200）限制内存中保留的
     已拒绝/已被取代（REJECTED/SUPERSEDED/EXPIRED）变更单元；超限项从内存移除，`get`/`list`
     按需从磁盘回读（数据不丢）。APPLIED/REVERTED 保留（撤销列表依赖）。
@@ -527,6 +533,8 @@ token（`NEOKEY_…`）或格式保真假密钥时**拒绝写盘**（`SECRET_TOK
         「未应用（待审）」区**——用快照中已应用侧内容重建候选、清空快照，可重新审批/应用。
         回滚前做 CAS 校验：真实文件若已被外部改动（哈希不符）则拒绝并报 `CONFLICT`，绝不覆盖
         用户改动。快照随每进程实例隔离存储（`store` 的 `snapshots/`），随实例目录回收。
+        **删除类（`retire`）例外**：撤销是把搬出层的整棵节点 `rename` 回原位（O(1)、内容
+        完整、不受快照上限约束），界面显示「删除·已搬出」，重试时只校验「仍是目录」。
       - **显示已拒绝 / 恢复为待审**：显式拒绝（`d`）时把候选内容另存为 `/tmp` 副本，
         审批界面底部「已拒绝（u 恢复为待审）」区展示被拒条目（含拒绝原因）；在条目行按 `u`
         从副本**重建候选并回到待审**（可重新审批/应用），主机操作则恢复提案。该区默认折叠、
@@ -923,7 +931,8 @@ worker 不可用时错误显式上报，不静默把重任务拿回主线程。
       可累加）、`pointer`（index/HEAD/refs/logs/packed-refs/**worktrees** 等）、
       `transient`（`*.lock`/`gc.log`）、`other`（config/hooks/info）。`transient`/`other` 与
       **对象删除**（gc/prune 剪枝）不纳入候选。工作树的 `.git` **文件**按普通路径处理（物理位于
-      工作树目录内，须随父目录 `rmdir` 一起删除，避免 `RMDIR_NOT_EMPTY`）。
+      工作树目录内，随父目录一起搬出，见「删除 = 搬出」）。`.git` 内部的目录删除**不搬出**：
+      冻结阶段按基线展开为逐文件 `delete`/`rmdir`（保持对象→指针的原子顺序）。
     - 应用顺序固定为 **对象 → 普通文件 → 指针**（`_apply_order`）：任何被写入的索引/refs 所引用
       的对象都已存在，绝不悬空；对象库已存在时按内容寻址幂等跳过，不做 CAS。因此 `git_add` /
       `git_commit` / `git_stash` / `git_restore` / `git_worktree` / `git_fetch` / `git_pull` 的

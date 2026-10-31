@@ -136,6 +136,28 @@ tests.suite("kernel", function(_, it, before_each)
     end)
   end)
 
+  it("event_bus：载荷含 userdata 时退化为可转换副本，订阅者仍能收到事件", function(t)
+    local event_bus = require("NeoAI.kernel.event_bus")
+    local timer = vim.uv.new_timer()
+    local received
+    local unsub = event_bus.on("test:ud_payload", function(data) received = data end)
+    -- 模拟真实配置载荷：可能夹带 uv 句柄等 userdata，直接投递会报
+    -- Invalid 'data': Cannot convert userdata，事件完全丢失。
+    event_bus.emit("test:ud_payload", {
+      name = "cfg",
+      handle = timer,
+      keep = { nested = 3 },
+    })
+    return async.sleep(50):then_(function()
+      pcall(function() timer:stop(); timer:close() end)
+      t.not_nil(received, "含 userdata 的载荷也应投递到订阅者")
+      t.eq("cfg", received.name)
+      t.eq(3, received.keep and received.keep.nested)
+      t.nil_(received.handle, "不可转换的 userdata 应被剔除")
+      unsub()
+    end)
+  end)
+
   it("logger 分级输出", function(t)
     local logger = require("NeoAI.kernel.logger")
     logger.init({ level = "ERROR", path = nil })

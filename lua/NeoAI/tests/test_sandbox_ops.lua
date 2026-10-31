@@ -996,7 +996,7 @@ tests.suite("sandbox_ops", function(_, it)
     vim.fn.delete(root, "rf")
   end)
 
-  it("捕获：目录 whiteout 自动补出下层子项删除（非空 rmdir 不再失败）", function(t)
+  it("捕获：目录 whiteout 只登记节点（删除=搬出，不遍历目录树）", function(t)
     local fs = require("NeoAI.utils.fs")
     local sandbox = require("NeoAI.sandbox")
     local candidate = require("NeoAI.sandbox.execution.candidate")
@@ -1011,28 +1011,38 @@ tests.suite("sandbox_ops", function(_, it)
       fs.ensure_dir(upper)
       fs.write_file(dir .. "/sub/a.txt", "a\n")
       fs.write_file(dir .. "/sub/b.txt", "b\n")
-      -- 用 `.wh.sub` 命名白洞模拟「目录被删除，但 overlay 只在父目录留下目录本身的 whiteout，
-      -- 未逐子项留 whiteout」——这正是 `rm -rf <dir>` 的真实捕获形态。
+      -- 用 `.wh.sub` 命名白洞模拟「目录被删除，但 overlay 只在父目录留下目录本身的 whiteout」。
       fs.write_file(upper .. "/.wh.sub", "")
       local attempt = control.new_attempt("run_command", { command = "rm -rf sub" }, {}, { effect = "process" })
       candidate.begin(attempt, assert(store.root()))
       candidate.capture_overlay(attempt.attempt_id, dir, upper)
       local cand = candidate.finish(attempt.attempt_id)
-      local actions = {}
-      for _, f in ipairs(cand and cand.files or {}) do actions[f.path] = f.action end
-      t.eq("rmdir", actions[dir .. "/sub"], "应含目录 rmdir")
-      t.eq("delete", actions[dir .. "/sub/a.txt"], "应补出子文件 a 删除")
-      t.eq("delete", actions[dir .. "/sub/b.txt"], "应补出子文件 b 删除")
-      -- 修复前候选只有 rmdir，发布时命中非空目录失败；现应「先删子项再 rmdir」成功。
-      local pub = candidate.publish(cand, {})
-      t.true_(pub.ok, "递归目录删除应成功: " .. tostring(pub.reason))
-      t.false_(fs.exists(dir .. "/sub"), "目录树应被删除")
+      local actions, count = {}, 0
+      for _, f in ipairs(cand and cand.files or {}) do
+        actions[f.path] = f.action
+        count = count + 1
+      end
+      t.eq(1, count, "删除只记一条节点（不得展开为每个后代一条）")
+      t.eq("retire", actions[dir .. "/sub"], "应含目录节点搬出")
+      t.eq(nil, actions[dir .. "/sub/a.txt"], "不得展开子文件条目")
+      t.eq(nil, actions[dir .. "/sub/b.txt"], "不得展开子文件条目")
+      -- 发布 = 一次 rename：宿主机原路径消失，内容完整保留在搬出层。
+      local pub = candidate.publish(cand, { change_set_id = "cs_node" })
+      t.true_(pub.ok, "目录节点搬出应成功: " .. tostring(pub.reason))
+      t.false_(fs.exists(dir .. "/sub"), "原路径应消失")
+      local moved = assert(pub.retired and pub.retired[1], "应记录搬出路径")
+      t.eq("b\n", fs.read_file(moved.retired .. "/b.txt"), "搬出层应完整保留子树内容")
+      -- 撤销 = 整棵搬回（内容不丢）。
+      local writer = require("NeoAI.sandbox.execution.writer")
+      local back = writer.apply("unretire", dir .. "/sub", moved.retired, {})
+      t.true_(back.ok, "撤销应整棵搬回: " .. tostring(back.err))
+      t.eq("a\n", fs.read_file(dir .. "/sub/a.txt"), "搬回后内容应完整")
       candidate.cleanup(attempt.attempt_id)
       vim.fn.delete(base, "rf")
     end)
   end)
 
-  it("捕获(异步/工作线程)：目录 whiteout 自动补出下层子项删除", function(t)
+  it("捕获(异步/工作线程)：目录 whiteout 只登记节点", function(t)
     local fs = require("NeoAI.utils.fs")
     local sandbox = require("NeoAI.sandbox")
     local candidate = require("NeoAI.sandbox.execution.candidate")
@@ -1058,11 +1068,14 @@ tests.suite("sandbox_ops", function(_, it)
       end)
       t.true_(vim.wait(20000, function() return done end), "异步捕获应完成")
       local cand = candidate.finish(attempt.attempt_id)
-      local actions = {}
-      for _, f in ipairs(cand and cand.files or {}) do actions[f.path] = f.action end
-      t.eq("rmdir", actions[dir .. "/sub"], "应含目录 rmdir")
-      t.eq("delete", actions[dir .. "/sub/a.txt"], "应补出子文件 a 删除")
-      t.eq("delete", actions[dir .. "/sub/b.txt"], "应补出子文件 b 删除")
+      local actions, count = {}, 0
+      for _, f in ipairs(cand and cand.files or {}) do
+        actions[f.path] = f.action
+        count = count + 1
+      end
+      t.eq(1, count, "删除只记一条节点")
+      t.eq("retire", actions[dir .. "/sub"], "应含目录节点搬出")
+      t.eq(nil, actions[dir .. "/sub/a.txt"], "不得展开子文件条目")
       candidate.cleanup(attempt.attempt_id)
       vim.fn.delete(base, "rf")
     end)
@@ -1537,11 +1550,17 @@ tests.suite("sandbox_ops", function(_, it)
         if f.path == big then entry = f end
       end
       t.not_nil(entry, "应登记该删除")
-      t.eq("delete", entry.action, "动作应为 delete")
+      t.eq("retire", entry.action, "动作应为 retire（删除=整棵搬出）")
       t.not_nil(entry.before_sig, "超大文件删除必须带 stat 签名基线（否则 CAS 永远失败）")
-      local pub = candidate.publish(cand)
+      local pub = candidate.publish(cand, { change_set_id = "cs_big_whl" })
       t.true_(pub.ok, "该删除候选应可发布: " .. tostring(pub.reason))
-      t.eq(nil, io.open(big), "真实文件应被删除")
+      t.eq(nil, io.open(big), "真实文件应被搬出（原路径消失）")
+      local moved = assert(pub.retired and pub.retired[1], "应记录搬出路径")
+      t.eq(9 * 1024 * 1024, (vim.uv.fs_stat(moved.retired) or {}).size, "搬出层应完整保留内容")
+      local writer = require("NeoAI.sandbox.execution.writer")
+      local back = writer.apply("unretire", big, moved.retired, {})
+      t.true_(back.ok, "撤销应整棵搬回: " .. tostring(back.err))
+      t.eq(9 * 1024 * 1024, (vim.uv.fs_stat(big) or {}).size, "搬回后内容应完整")
       candidate.cleanup(a.attempt_id)
       vim.fn.delete(dir, "rf")
       vim.fn.delete(base, "rf")

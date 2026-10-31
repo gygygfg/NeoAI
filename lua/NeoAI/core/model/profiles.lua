@@ -65,16 +65,19 @@ local PROFILES = {
     default_effort = "medium",
   },
   -- DeepSeek：OpenAI 协议下用 reasoning_effort + thinking 显式开关（实测低/高/最大三档；
-  -- 未传时默认 high 且思考开启）。system_in_history：实测 messages 中途 system 可用。
+  -- 未传时默认 high 且思考开启）。system_in_history 默认关闭：官方 chat template 会把
+  -- **最后一条** system 提到最前（并丢弃历史中的 system 位置），导致顶层系统提示被运行态
+  -- 快照替换、且每次快照变化都改写请求开头 → 前缀缓存全量失效。确需时用
+  -- `ai.system_in_history=true` + 自定义 dialects 覆盖开启。
   deepseek = {
     protocol = "openai", reasoning_kind = "effort", default_effort = "high",
-    effort_map = "deepseek", thinking_toggle = true, system_in_history = true,
+    effort_map = "deepseek", thinking_toggle = true, system_in_history = false,
   },
   -- DeepSeek 的 Anthropic 兼容端点：推理用 output_config.effort（budget_tokens 会被忽略）。
   -- 仅在 provider.api_type="anthropic" 时命中；模型 id 仍走 deepseek 前缀。
   deepseek_messages = {
     protocol = "anthropic", reasoning_kind = "output_config_effort", default_effort = "high",
-    effort_map = "deepseek", thinking_toggle = true, system_in_history = true,
+    effort_map = "deepseek", thinking_toggle = true, system_in_history = false,
   },
   groq = { protocol = "openai", reasoning_kind = "none" },
   together = { protocol = "openai", reasoning_kind = "none" },

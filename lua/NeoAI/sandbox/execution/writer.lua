@@ -254,14 +254,186 @@ local function _sudo_copy(src, path, mode)
   return false, tostring(out)
 end
 
+--- 删除搬出（retire）的 shell 片段（在目标父目录内创建搬出层后 `mv -T`）。
+--- `$1`=原路径 `$2`=搬出目标 `$3`=搬出容器。`rename` 同目录 → 同盘、原子、无遍历。
+--- @return string
+local function _retire_snippet()
+  return 'if mkdir -p -- "$2" "$3" 2>/dev/null; then '
+    .. 'chmod 700 -- "$3" 2>/dev/null || true; '
+    .. '[ -e "$3/.neoai-owner" ] || printf "NeoAI retired layer\\n" > "$3/.neoai-owner"; '
+    .. '[ -e "$3/.gitignore" ] || printf "*\\n" > "$3/.gitignore"; '
+    .. '[ -e "$2" ] && exit 3; '
+    .. 'mv -T -- "$1" "$2"; '
+    .. 'else exit 1; fi'
+end
+
+--- 撤销搬出（unretire）的 shell 片段（整棵搬回原路径）。
+--- `$1`=原路径 `$2`=搬出路径。
+--- @return string
+local function _unretire_snippet()
+  return '[ -e "$1" ] && exit 3; '
+    .. 'mkdir -p -- "$(dirname -- "$1")" && mv -T -- "$2" "$1"'
+end
+
+--- 搬出/搬回的失败原因归一：挂载点（EBUSY）、跨盘（EXDEV）给出稳定前缀，便于诊断与提示。
+--- @param err any
+--- @return string
+local function _move_error(err)
+  local s = tostring(err or "")
+  if s:find("EBUSY", 1, true) then return "MOVE_EBUSY: " .. s end
+  if s:find("EXDEV", 1, true) then return "MOVE_EXDEV: " .. s end
+  return s
+end
+
+--- 删除 = 搬出：把节点 rename 到同盘搬出层（绝不销毁内容）。
+--- @param path string
+--- @param opts table
+--- @return table { ok, state, writer?, escalated?, retired?, reason?, err? }
+local function _retire(path, opts)
+  local retired = require("NeoAI.sandbox.execution.retired")
+  local runtime = require("NeoAI.sandbox.execution.runtime")
+  if require("NeoAI.sandbox.observe.fault").hit("retire") then
+    return { ok = false, state = M.STATE.FAILED, err = "INJECTED_RETIRE_FAILURE" }
+  end
+  local plan, perr = retired.plan(path, opts.change_set_id)
+  if not plan then return { ok = false, state = M.STATE.FAILED, err = perr } end
+  local allow_root = opts.allow_root == true
+  local cur = vim.uv.getuid()
+
+  local function _root_move()
+    local dest, err = retired.move(path, plan)
+    if dest then
+      return { ok = true, state = M.STATE.WRITTEN, writer = (cur ~= 0) and "nonroot" or "root",
+        escalated = cur ~= 0, retired = dest }
+    end
+    return { ok = false, state = M.STATE.FAILED, err = _move_error(err) }
+  end
+
+  local function _sudo_move()
+    local argv = { "sudo", "sh", "-c", _retire_snippet(), "sh", path, plan.dest, plan.container }
+    local out = vim.fn.system(argv)
+    if vim.v.shell_error == 0 then
+      return { ok = true, state = M.STATE.WRITTEN, writer = "sudo", escalated = true, retired = plan.dest }
+    end
+    return { ok = false, state = M.STATE.FAILED, writer = "sudo", escalated = true, err = tostring(out) }
+  end
+
+  -- NeoAI 自身非 root：当前身份即载荷身份，直接 rename；权限不足 → NEEDS_ROOT / sudo。
+  if cur ~= 0 then
+    local dest, err = retired.move(path, plan)
+    if dest then return { ok = true, state = M.STATE.WRITTEN, writer = "nonroot", retired = dest } end
+    if not _perm_error(err) then return { ok = false, state = M.STATE.FAILED, err = tostring(err) } end
+    if not allow_root then
+      return { ok = false, state = M.STATE.NEEDS_ROOT,
+        reason = "WRITE_REQUIRES_ROOT: " .. tostring(path), err = tostring(err) }
+    end
+    return _sudo_move()
+  end
+
+  local uid, gid = runtime.payload_ids()
+  local nonroot = uid ~= nil and uid > 0
+  if not nonroot then return _root_move() end
+
+  if vim.fn.executable("setpriv") ~= 1 then
+    return { ok = false, state = M.STATE.FAILED, err = "SETPRIV_UNAVAILABLE" }
+  end
+  local argv = {
+    "setpriv", "--reuid", tostring(uid), "--regid", tostring(gid), "--clear-groups",
+    "sh", "-c", _retire_snippet(), "sh", path, plan.dest, plan.container,
+  }
+  local out = vim.fn.system(argv)
+  if vim.v.shell_error == 0 then
+    return { ok = true, state = M.STATE.WRITTEN, writer = "nonroot", retired = plan.dest }
+  end
+  if not _perm_error(out) then return { ok = false, state = M.STATE.FAILED, err = tostring(out) } end
+  if not allow_root then
+    return { ok = false, state = M.STATE.NEEDS_ROOT,
+      reason = "WRITE_REQUIRES_ROOT: " .. tostring(path), err = tostring(out) }
+  end
+  if opts.prefer_sudo then return _sudo_move() end
+  return _root_move()
+end
+
+--- 撤销 = 整棵搬回：把搬出层里的节点 rename 回原路径（不复制内容、不遍历）。
+--- @param original string 原路径
+--- @param retired_path string 搬出路径
+--- @param opts table
+--- @return table { ok, state, writer?, escalated?, reason?, err? }
+local function _unretire(original, retired_path, opts)
+  local retired = require("NeoAI.sandbox.execution.retired")
+  local runtime = require("NeoAI.sandbox.execution.runtime")
+  if type(retired_path) ~= "string" or retired_path == "" then
+    return { ok = false, state = M.STATE.FAILED, err = "RETIRED_GONE" }
+  end
+  local allow_root = opts.allow_root == true
+  local cur = vim.uv.getuid()
+
+  local function _root_restore()
+    local ok, err = retired.restore(retired_path, original)
+    if ok then
+      return { ok = true, state = M.STATE.WRITTEN, writer = (cur ~= 0) and "nonroot" or "root",
+        escalated = cur ~= 0 }
+    end
+    return { ok = false, state = M.STATE.FAILED, err = _move_error(err) }
+  end
+
+  local function _sudo_restore()
+    local argv = { "sudo", "sh", "-c", _unretire_snippet(), "sh", original, retired_path }
+    local out = vim.fn.system(argv)
+    if vim.v.shell_error == 0 then
+      retired.forget_retired(retired_path)
+      return { ok = true, state = M.STATE.WRITTEN, writer = "sudo", escalated = true }
+    end
+    return { ok = false, state = M.STATE.FAILED, writer = "sudo", escalated = true, err = tostring(out) }
+  end
+
+  if cur ~= 0 then
+    local ok, err = retired.restore(retired_path, original)
+    if ok then return { ok = true, state = M.STATE.WRITTEN, writer = "nonroot" } end
+    if not _perm_error(err) then return { ok = false, state = M.STATE.FAILED, err = tostring(err) } end
+    if not allow_root then
+      return { ok = false, state = M.STATE.NEEDS_ROOT,
+        reason = "WRITE_REQUIRES_ROOT: " .. tostring(original), err = tostring(err) }
+    end
+    return _sudo_restore()
+  end
+
+  local uid, gid = runtime.payload_ids()
+  local nonroot = uid ~= nil and uid > 0
+  if not nonroot then return _root_restore() end
+
+  if vim.fn.executable("setpriv") ~= 1 then
+    return { ok = false, state = M.STATE.FAILED, err = "SETPRIV_UNAVAILABLE" }
+  end
+  local argv = {
+    "setpriv", "--reuid", tostring(uid), "--regid", tostring(gid), "--clear-groups",
+    "sh", "-c", _unretire_snippet(), "sh", original, retired_path,
+  }
+  local out = vim.fn.system(argv)
+  if vim.v.shell_error == 0 then
+    retired.forget_retired(retired_path)
+    return { ok = true, state = M.STATE.WRITTEN, writer = "nonroot" }
+  end
+  if not _perm_error(out) then return { ok = false, state = M.STATE.FAILED, err = tostring(out) } end
+  if not allow_root then
+    return { ok = false, state = M.STATE.NEEDS_ROOT,
+      reason = "WRITE_REQUIRES_ROOT: " .. tostring(original), err = tostring(out) }
+  end
+  if opts.prefer_sudo then return _sudo_restore() end
+  return _root_restore()
+end
+
 --- 统一落盘入口：先非 root，权限不足 → NEEDS_ROOT（或已批准时以 root/sudo 写入）。
---- @param action string "write"|"delete"|"mkdir"|"rmdir"
+--- @param action string "write"|"delete"|"mkdir"|"rmdir"|"symlink"|"retire"|"unretire"
 --- @param path string
 --- @param content string|nil
---- @param opts table|nil { allow_root?: boolean, prefer_sudo?: boolean, mode?: number }
---- @return table { ok, state, writer?, escalated?, reason?, err? }
+--- @param opts table|nil { allow_root?: boolean, prefer_sudo?: boolean, mode?: number,
+---   change_set_id?: string }
+--- @return table { ok, state, writer?, escalated?, reason?, err?, retired? }
 function M.apply(action, path, content, opts)
   opts = opts or {}
+  if action == "retire" then return _retire(path, opts) end
+  if action == "unretire" then return _unretire(path, content, opts) end
   local runtime = require("NeoAI.sandbox.execution.runtime")
   local uid, gid = runtime.payload_ids()
   local cur = vim.uv.getuid()

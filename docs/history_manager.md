@@ -45,7 +45,7 @@
 - `_session_path()`：`session.save_path / session.file`（默认 `~/.cache/NeoAI/sessions.jsonl`）。
 - **init**：逐行读取并修复 JSONL（`fs.repair_jsonl`），仅反序列化每个会话的最新快照。
 - **persist(session)** / **update(session)**：追加单个会话快照，返回 `true` 或 `false, err`；达到日志冗余阈值时合并。
-- **persist_async(session)**：同上但写盘在 `utils.work` 线程池；与整文件重写共用**同一条 per-path 写盘串行链**（`state.write_chains`），保证「追加」与「重写」不交错（否则重写会基于旧快照提交、覆盖刚追加的行）。若同步 `persist` 期间有整文件重写在途，追加完成后会**补写一次**同一快照（幂等，仅一次）。
+- **persist_async(session)**：同上但写盘在 `utils.work` 线程池；与整文件重写共用**同一条 per-path 写盘串行链**（`state.write_chains`），保证「追加」与「重写」不交错（否则重写会基于旧快照提交、覆盖刚追加的行）。若同步 `persist` 期间有整文件重写在途，追加完成后会**补写一次**同一快照（幂等，仅一次）。线程池/后台 worker **未能启动**该追加任务时（队列已满、worker 已停止等，拒绝值带 `not_started=true`），自动退化为**主线程同步追加**（会话消息优先于一次小写入的开销，避免资源压力下把消息留在内存里丢掉）；可能已部分写入的失败仍标记脏日志，下次持久化先 `repair_jsonl` 再重试。
 - **save_all()**：写入同目录临时文件、fsync、备份旧文件到 `.bak`，再 rename 替换正式文件；失败返回 `false, err`，正式文件不被截断。
 - **delete(session_id, opts?)**：删除目标及直接子会话（`opts.recursive` 删除完整分支）。**若被删集合中含子 Agent 会话（`metadata.tags` 含 `sub_agent`），连同其整支后代一并删除**（`opts.include_sub_agents = false` 可关闭），避免留下挂在已删主会话下的孤儿会话。更深后代重挂到最近存活祖先，无祖先则提升为根，并更新子树的 `root_id`。返回的 id 列表**目标在前**、其余升序。保存成功后才提交内存变更和删除事件；失败返回 `{}, err`。
 - **mutate_async(ops)**：批量变更（`{op="delete", id, recursive?, include_sub_agents?}` / `{op="trim", id, first, last, ts?}`）。先在**主线程内存真值**上模拟出最终态（`_simulate_mutations`），再把整文件重写交给 `utils.work` 线程（读盘 → 应用变更 → 原子重写：mkstemp + 全量写 + 尺寸校验 + fsync + `.bak` + rename）。落盘成功后才应用内存变更并发 `SESSION_SAVED`/`SESSION_DELETED`；失败不改内存、不发事件（拒绝值 `{kind="session_write", message}`）。工作线程不可用时用同一份最终态在主线程同步原子重写。`utils.work` 线程只读写日志，绝不用盘上内容覆盖内存（内存可能比磁盘新）。会话树的多选删除/轮次裁剪都走此入口。

@@ -432,6 +432,20 @@ the instance and its focus autocmds reacting to global events (which shows up as
 restored). A re-entrancy guard `_input_creating` prevents the nested `WinEnter` fired synchronously by `:split` from
 creating a second input box.
 
+**Collapse clears its handle only after the window is confirmed closed.** Closing a window from a `WinEnter` that fires
+while another window is closing is rejected by Neovim with `E1312`, and a `:split` in that state fails with `E242`;
+unconditionally dropping `state.input_win_id` on a failed close made the next restore believe no input box existed and
+`:split` a second one — two input boxes stacked below the chat (easily triggered by window-layout-changing operations such
+as opening/closing nvim-tree). A failed collapse now keeps the handle and retries on the next main-loop tick (bounded;
+it stops and keeps the input box if the user returned to the chat meanwhile). When the handle is lost but a window still
+shows the input buffer, `_restore_aux` **adopts** that window (marked with the window variable `w:neoai_input_win`, which
+`:split` does not copy, so user/plugin splits are never mistaken for it) and closes any extra copies, keeping exactly one
+window per input buffer.
+
+`input_box.focus()` only *clears* `'winfixbuf'` before rebinding the input buffer; it never turns it back on (a previous
+"temporarily disable then restore" left the option permanently enabled on the input window, so later `:e`/`:bnext` still
+raised `E1513`).
+
 ### 4.8 LSP Isolation for UI Buffers (ui/lsp_guard)
 
 NeoAI's chat/input/floating windows are pure UI text; if an LSP client (native LSP / GitHub Copilot) attaches to
@@ -468,6 +482,14 @@ collapsed, i.e. its window is closed but the buffer survives), safely closes the
 the user must explicitly `:NeoAIChat` (new session); restored `NeoAI Input N` leftovers are no longer spared by a
 blanket "live chat exists ⇒ exempt every input buffer" rule (which would otherwise occupy names — unique input naming
 relies on this).
+
+**Write-side repair (`SessionWritePost`)**: when a `buftype=nofile` input buffer is displayed in multiple windows,
+`:mksession` writes one `enew` + `file NeoAI\ Input` line per window; restoring the second line hits
+`E95: Buffer with this name already exists` and **aborts the whole session restore** (`:restart` shows a `UIEnter`
+autocmd error and the UI is only half restored). `ui/session_cleanup.dedupe_session_input_windows()` rewrites those
+duplicate `file NeoAI\ Input` lines to unused unique names (`NeoAI Input <n>`) right after the session file is written,
+so restoring succeeds; the shells are then removed by the orphan cleanup above. The input box is a singleton in normal
+operation (see §4.7); this also covers stale duplicates from older versions and user `:vsp` splits of the input window.
 
 It also defines the `_G.NeoAIFoldExpr` fallback stub (returns 0) so a restored window's
 `foldexpr=v:lua.NeoAIFoldExpr()` does not error on the first repaint (overwritten by `chat_view.open`).

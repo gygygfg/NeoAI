@@ -25,6 +25,38 @@ local function _normalize(event)
   return "NeoAI:" .. event
 end
 
+--- 深度上限：防御异常/自引用结构（正常载荷远小于此）。
+local SANITIZE_MAX_DEPTH = 20
+
+--- 生成「可转换为 Vimscript 值」的载荷副本：去掉函数/线程/userdata 与不可作键的值。
+--- `nvim_exec_autocmds` 的 data 必须能转成 Vimscript 值；载荷里夹带 uv 句柄等 userdata
+--- （实测报 `Invalid 'data': Cannot convert userdata`）时事件完全投递不到订阅者。
+--- 仅在直接投递失败时作为兜底调用。
+--- @param value any
+--- @param seen table|nil 环检测
+--- @param depth number|nil
+--- @return any|nil 清理后的值（不可转换时为 nil）
+local function _sanitize(value, seen, depth)
+  local t = type(value)
+  if t == "function" or t == "thread" or t == "userdata" or t == "cdata" then return nil end
+  if t ~= "table" then return value end
+  depth = depth or 0
+  if depth >= SANITIZE_MAX_DEPTH then return nil end
+  seen = seen or {}
+  if seen[value] then return nil end
+  seen[value] = true
+  local out = {}
+  for k, v in pairs(value) do
+    local kt = type(k)
+    if kt == "string" or kt == "number" or kt == "boolean" then
+      local sv = _sanitize(v, seen, depth + 1)
+      if sv ~= nil then out[k] = sv end
+    end
+  end
+  seen[value] = nil
+  return out
+end
+
 -- ========== 公开 API ==========
 
 --- 触发事件
@@ -43,8 +75,16 @@ function M.emit(event, payload)
     data = payload,
   })
   if not ok then
-    local logger = require("NeoAI.kernel.logger")
-    logger.warn("[event_bus] 触发事件失败 %s: %s", pattern, tostring(err))
+    -- 载荷含函数/userdata（如 `tools.external` 的工具定义带 run 函数）时无法转成 Vimscript 值：
+    -- 先尝试投递「去掉不可转换值」的副本，保证订阅者仍能收到事件；仍失败才告警。
+    local ok2, err2 = pcall(vim.api.nvim_exec_autocmds, "User", {
+      pattern = pattern,
+      data = _sanitize(payload),
+    })
+    if not ok2 then
+      local logger = require("NeoAI.kernel.logger")
+      logger.warn("[event_bus] 触发事件失败 %s: %s", pattern, tostring(err2 or err))
+    end
   end
 end
 

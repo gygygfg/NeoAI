@@ -202,6 +202,11 @@ local DEFAULT_CONFIG = {
     },
     context_cache = {
       enabled = true, -- 启用前缀缓存身份一致性 + 自动上下文压缩
+      -- 运行态快照（todo/计划模式/常驻技能）是否以 role=system 追加进历史。
+      -- 默认 false：DeepSeek 官方 chat template 会取「最后一条 system」放到最前，会把顶层
+      -- 系统提示整体替换，并让每次快照变化都改写请求开头 → 多轮前缀缓存命中率骤降。
+      -- 仅当端点确认支持 messages 中途 system 且模板按原位渲染时才开启。
+      system_in_history = false,
       context_window = 64000, -- 模型上下文窗口（token 估算）
       threshold_ratio = 0.8, -- 达到该比例触发压缩
       warn_ratio = 0.85, -- 达到该比例状态栏变色并提示（接近上限）
@@ -1497,6 +1502,13 @@ local DEFAULT_CONFIG = {
       retention = {
         candidate_days = 7, -- 未应用候选保留期（天）
         max_pending = 20, -- 每任务最多待审候选数
+      },
+      -- 删除 = 搬出：被删节点（文件/整棵目录）以一次 rename 移到同盘的 `<parent>/.neoai-retired/`，
+      -- 撤销时整棵搬回（内容从不销毁）。搬出内容按「生命周期 + TTL」回收：
+      -- 变更单元离开待审/已应用列表、实例重置时清理；超过 ttl_days 的搬出内容也会被回收
+      -- （回收后该条不再可撤销）。
+      retired = {
+        ttl_days = 7,
       },
       policy = {
         version = "1", -- 策略版本（用于审计回放；规则变更时应递增）

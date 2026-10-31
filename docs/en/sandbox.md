@@ -527,7 +527,9 @@ is only kept for other `approval.mode` values (`prompt`/`strict`).
       be reviewed and applied again. A CAS check runs before the rollback: if the real file was changed
       externally (hash mismatch) the operation is refused with `CONFLICT`, never overwriting user edits.
       Snapshots live in the per-process instance store (`snapshots/`) and are reclaimed with the
-      instance dir.
+      instance dir. **Deletes (`retire`) are the exception**: undo `rename`s the whole retired node
+      back (O(1), content intact, not subject to the snapshot cap); the UI labels it "删除·已搬出"
+      and a retry only checks that the target is still a directory.
     - **Show rejected / restore to pending**: on an explicit reject (`d`) the candidate content is saved
       as a `/tmp` copy; the review window's "已拒绝（u 恢复为待审）" (rejected) section lists rejected
       entries (with the reject reason); pressing `u` on an item **rebuilds the candidate from the copy
@@ -655,44 +657,55 @@ is only kept for other `approval.mode` values (`prompt`/`strict`).
         only a different target conflicts — otherwise venv links such as `bin/python`/`lib64` would
         keep a venv-rebuild candidate stuck on `TARGET_ALREADY_EXISTS` forever (identical behaviour in
         the synchronous and worker CAS paths).
-      - **Apply order must be a strict weak order**: `_apply_order` sorts by
+      - **Apply order (legacy per-file deletes)**: `_apply_order` sorts by
         `(git rank, deletes-first, depth, path)` — deletes by **descending** depth (children before
-        parents), writes by plain path order (a parent path is a prefix of its children, so parents
-        come first naturally). Never use "pairwise ancestor checks + lexicographic fallback": that
-        comparator is not transitive and `table.sort` is undefined for it — measured on an 8012-file
-        unit, **489** child deletes were scheduled after their parent `rmdir` → `RMDIR_NOT_EMPTY`.
-      - **Requeued failed rmdir carries its child deletes**: on partial apply, the requeued unit
-        re-includes the deletes of that directory's children from the original candidate (already
-        applied children are skipped idempotently on retry); otherwise the requeued unit holds a lone
-        `rmdir` that hits a non-empty directory and fails with `RMDIR_NOT_EMPTY` forever.
+        parents), writes by plain path order. The new `retire` deletion does **not** participate: it
+        runs first as a single `rename` (see below). The comparator must stay transitive
+        (`table.sort` is undefined otherwise).
+      - **Deletion = moving aside (`retire`, same-device `rename`, never walks the tree)**: a deletion
+        is no longer expanded into "one entry per descendant" and applied item by item. The deleted
+        node (a file or **a whole directory**) is moved with a single `rename` into the hidden
+        same-device directory `<parent>/.neoai-retired/<change_set_id>/<name>`
+        (`sandbox/execution/retired.lua`):
+        - Capture registers only the **node** (deleting `.prof/.../Cache_Data` yields exactly one
+          entry) and never `scandir`s descendants; write-log/overlay entries that still report
+          per-child deletes are folded into the ancestor node at freeze time.
+        - Publish is one atomic `rename` (same parent ⇒ same filesystem): no "children-before-parent"
+          ordering, no `RMDIR_NOT_EMPTY`; the host path disappears while the content is preserved.
+        - Undo (`u`) = **move the whole tree back** (reverse `rename`): O(1), not subject to the
+          snapshot size limit, content/mode/symlinks fully restored. Delete candidates therefore
+          **copy no snapshot content**.
+        - A unit that both retires `D` and writes under `D/**` (venv rebuild) first moves the old tree
+          aside, then writes the candidate view — exactly overlay's "opaque directory" semantics
+          (no pre-publish prune pass needed).
+        - The directory baseline is `dirsig:<mtime>:<ino>` for CAS: if entries were added/removed
+          externally (mtime/ino change) → `BASELINE_CHANGED`, so somebody else's change is never
+          swept away; a vanished target is skipped idempotently.
+        - The retired layer carries a `*` `.gitignore` and a `.neoai-owner` marker: invisible to
+          `git status`, and a pre-existing user directory with the same name is never reused. It is
+          never captured as a candidate and never shown by listing/search/git views.
+        - **`.git` exception**: directory deletions *inside* `.git` are still expanded into per-file
+          `delete`/`rmdir` entries (atomic object→pointer order; object deletions stay out of
+          candidates). A `git worktree remove` worktree (`.git` is a **file**) is retired as a normal
+          node; a repository root (containing a `.git` **directory**), `/`, the home directory and the
+          retired layer itself are always refused.
+        - **Reclaim**: a unit's retired content is reclaimed when it leaves the pending/applied lists or
+          on `sandbox.reset`; `tools.sandbox.retired.ttl_days` (default 7 days) is the fallback sweep
+          (after which that entry is no longer undoable).
       - **Baseline for very large deletions**: files above `tools.sandbox.max_file_bytes` (8MB) are
         deliberately not content-hashed (that would read hundreds of MB), but a **delete** candidate
         still needs a baseline for CAS — such deletions use the stat signature
         (`sig:mtime.nsec:size`, `before_sig`). Legacy candidates with no baseline at all (frozen by an
         older version) are **allowed** rather than stuck forever on `BASELINE_CHANGED`, since a delete
-        is idempotent and recoverable (measured: deleting a 10.5MB `wheels/*.whl` used to always fail).
-
-      - **Recursive directory deletion capture completion**: `rm -rf <dir>` may leave only a whiteout
-        for the **directory itself** in the overlay upper, with no per-child whiteouts. Producing a
-        single `rmdir` from that makes the change unit disagree with the real disk: the review UI looks
-        like an "empty directory" while `rmdir` fails on a non-empty directory (`ENOTEMPTY`). Capture
-        (both sync `capture_overlay` and the worker `_capture_worker`) now **synthesizes whiteouts for
-        all descendants from the base tree** (directory→`rmdir`, file/link→`delete`), and the existing
-        "children-before-parent" publish ordering removes children first, then the parent; the UI also
-        lists the deleted children (folded beyond `max_display_files`, see above).
-      - **Explicit reason for non-empty rmdir**: `writer` returns `RMDIR_NOT_EMPTY: <path>` for a
-        non-empty directory (distinct from permission/other failures) instead of a generic failure.
-      - **Directory-recreate normalization (`rmdir` + writes under it)**: when a unit contains both
-        `rmdir D` and writes under `D` (typical: a package install rebuilding its venv, or a package
-        unit merged across commands — the `rmdir` comes from the delete side, the `create` from the
-        rebuild side), the rmdir cannot hold in either order: delete-first still leaves the old host
-        content (`ENOTEMPTY`), delete-last hits the children the unit just wrote; the `create`/`modify`
-        CAS also conflicts with the rebuild semantics (`TARGET_ALREADY_EXISTS`/`BASELINE_CHANGED`).
-        Publish (`candidate.publish`) therefore normalizes it with overlay **opaque-directory**
-        semantics: exempt those paths from the CAS precheck → prune host entries under `D` that are
-        **not** in the candidate view → drop the rmdir → write normally (the directory is recreated by
-        the writes). Such units always publish synchronously (the async path merges CAS and writes
-        inside the worker, leaving no place for the prune).
+        is idempotent and recoverable.
+      - **Explicit reason for non-empty rmdir (legacy per-file deletes)**: `writer` returns
+        `RMDIR_NOT_EMPTY: <path>` for a non-empty directory (distinct from permission/other failures);
+        the new `retire` has no such failure mode.
+      - **Directory-recreate normalization (legacy `rmdir` + writes under it)**: when a unit frozen by
+        an older version contains both `rmdir D` and writes under `D`, publish keeps the overlay
+        **opaque-directory** semantics: exempt those paths from the CAS precheck → prune host entries
+        under `D` that are **not** in the candidate view → drop the rmdir → write normally. New
+        candidates instead "retire the old tree, then write" and need no prune traversal.
       - **Visible partial-apply failures**: the `PARTIAL` result's `reason` carries the **first**
         failure reason, all reasons (up to 5) are logged, and the requeued pending unit carries
         `fail_reason`, so repeated same-cause failures are diagnosable.
@@ -753,13 +766,15 @@ is only kept for other `approval.mode` values (`prompt`/`strict`).
         mismatch the content hash is compared as a fallback** (when the candidate `after_hash` is
         known), so mtime/inode-only churn (`touch`, a package rewriting `.pyc`) no longer reports
         `TARGET_CHANGED`.
+        **Deletes (`retire`) are the exception**: undo is a whole-tree "move back" `rename` — no
+        content copy and no snapshot-cap limit.
       - **Snapshot cap and "cannot undo" marking**: the per-file undo-snapshot cap is independent of
         the candidate content cap: `tools.sandbox.review.snapshot_max_bytes` (default 64MB; `<=0`
         falls back to `max_file_bytes`). Files above the cap keep no original content → the change set
         **cannot be undone**: the review UI marks the "Applied" row up front with
         `⚠ cannot undo: <file> <size> exceeds the snapshot cap`, and `u` returns
         `SNAPSHOT_TOO_LARGE` (WARN, deduplicated — no per-press ERROR spam) suggesting you raise the
-        cap and re-apply. This covers rolling back tens-of-MB `.so` files installed by pip/apt.
+        cap and re-apply. **Deletes are exempt** (the retired layer keeps the whole tree verbatim).
       - **Bounded terminal eviction**: `tools.sandbox.review.terminal_cache_max` (default 200) caps the
         rejected/superseded (REJECTED/SUPERSEDED/EXPIRED) change sets kept in memory; excess items are
         dropped from memory and `get`/`list` fall back to disk on demand (no data loss).
@@ -1064,8 +1079,10 @@ network-consent / tool-approval ones, subject to focus gating):
       content-addressed, immutable, additive), `pointer` (index/HEAD/refs/logs/packed-refs/**worktrees**, …),
       `transient` (`*.lock`/`gc.log`) and `other` (config/hooks/info). `transient`/`other` and
       **object deletions** (gc/prune pruning) are never candidates. A worktree's own `.git` **file** is
-      treated as a normal path (it physically lives in the worktree directory and must be deleted
-      together with the parent `rmdir`, avoiding `RMDIR_NOT_EMPTY`).
+      treated as a normal path (it physically lives in the worktree directory and is retired together
+      with its parent, see "Deletion = moving aside"). Directory deletions *inside* `.git` are
+      **not** retired: freeze expands them into per-file `delete`/`rmdir` entries (preserving the
+      objects→pointers atomic order).
     - Application order is fixed to **objects → normal files → pointers** (`_apply_order`): any index/ref
       written references objects that already exist, so nothing dangles; objects already present are
       skipped idempotently by content address (no CAS). Hence the `.git` changes of `git_add` /

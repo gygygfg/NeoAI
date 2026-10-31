@@ -603,6 +603,128 @@ tests.suite("chat_ui", function(_, it)
     chat_service.reset()
   end)
 
+  it("输入框收起时关窗失败（E1312）不丢句柄：恢复后仍只有一个输入框", function(t)
+    local chat_view = require("NeoAI.ui.window.chat_view")
+    local chat_service = require("NeoAI.services.chat_service")
+    local input_box = require("NeoAI.ui.components.input_box")
+    chat_view.reset()
+    chat_service.reset()
+
+    local opened = chat_view.open()
+    local main = opened.win_id
+    local input_win = input_box.get_win()
+    t.true_(vim.api.nvim_win_is_valid(input_win), "打开后应有输入窗口")
+
+    -- 同一标签页内再放一个普通文件窗口（用于把焦点移出聊天界面）
+    vim.api.nvim_set_current_win(main)
+    vim.cmd("vsplit")
+    local side = vim.api.nvim_get_current_win()
+    local side_buf = vim.api.nvim_create_buf(false, true)
+    vim.bo[side_buf].filetype = "lua"
+    vim.api.nvim_win_set_buf(side, side_buf)
+    vim.api.nvim_set_current_win(main)
+    t.true_(vim.api.nvim_win_is_valid(input_win), "回到聊天主窗口后输入框应存在")
+
+    -- 模拟「在另一窗口关闭过程中的 WinEnter 里关窗」：Neovim 抛 E1312 拒绝改动布局。
+    -- 旧实现无条件把句柄置空 → 回到聊天时又 :split 一个，表现为右侧上下两个输入框。
+    local orig_close = vim.api.nvim_win_close
+    vim.api.nvim_win_close = function(win, force)
+      if win == input_win then
+        error("E1312: Not allowed to change the window layout in this autocmd", 0)
+      end
+      return orig_close(win, force)
+    end
+    local ok = pcall(vim.api.nvim_set_current_win, side) -- WinEnter：离开聊天 → 收起输入框
+    vim.api.nvim_win_close = orig_close
+    t.true_(ok, "收起失败不应把错误抛给用户")
+    t.true_(vim.api.nvim_win_is_valid(input_win), "关窗失败时输入窗口应保留")
+
+    -- 回到聊天主窗口：不得再新建第二个输入框
+    vim.api.nvim_set_current_win(main)
+    vim.wait(200)
+    local n = 0
+    for _, w in ipairs(vim.api.nvim_list_wins()) do
+      if vim.api.nvim_win_get_buf(w) == input_box.get_buf() then n = n + 1 end
+    end
+    t.eq(1, n, "不应出现两个输入框")
+    t.eq(input_win, chat_view._input_win_id(), "恢复后应复用原输入窗口")
+
+    pcall(vim.api.nvim_buf_delete, side_buf, { force = true })
+    chat_view.reset()
+    chat_service.reset()
+  end)
+
+  it("输入窗口句柄丢失时认领已有输入窗口，不再新建第二个", function(t)
+    local chat_view = require("NeoAI.ui.window.chat_view")
+    local chat_service = require("NeoAI.services.chat_service")
+    local input_box = require("NeoAI.ui.components.input_box")
+    chat_view.reset()
+    chat_service.reset()
+
+    local opened = chat_view.open()
+    local main = opened.win_id
+    local input_buf = input_box.get_buf()
+    local primary = input_box.get_win()
+    t.true_(vim.api.nvim_win_is_valid(primary), "打开后应有输入窗口")
+
+    -- 模拟「句柄丢失但输入窗口仍在」：另建一个带本实例标记、显示输入 buffer 的窗口，
+    -- 再正常关掉原输入窗口（WinClosed 会把句柄置空）。
+    vim.api.nvim_set_current_win(main)
+    vim.cmd("vsplit")
+    local spare = vim.api.nvim_get_current_win()
+    vim.api.nvim_win_set_buf(spare, input_buf)
+    vim.w[spare].neoai_input_win = true
+    vim.api.nvim_win_close(primary, true)
+    t.false_(vim.api.nvim_win_is_valid(primary), "原输入窗口应已关闭")
+
+    -- 回到聊天主窗口：应认领 spare，而不是再 :split 一个。
+    vim.api.nvim_set_current_win(main)
+    vim.wait(100)
+    local n = 0
+    for _, w in ipairs(vim.api.nvim_list_wins()) do
+      if vim.api.nvim_win_get_buf(w) == input_buf then n = n + 1 end
+    end
+    t.eq(1, n, "不应新增第二个输入框窗口")
+    t.eq(spare, chat_view._input_win_id(), "应认领已有输入窗口")
+
+    chat_view.reset()
+    chat_service.reset()
+  end)
+
+  it("输入窗口重绑不再打开 winfixbuf（避免 E1513 与错误语义）", function(t)
+    if vim.fn.exists("&winfixbuf") ~= 1 then return end
+    local chat_view = require("NeoAI.ui.window.chat_view")
+    local chat_service = require("NeoAI.services.chat_service")
+    local input_box = require("NeoAI.ui.components.input_box")
+    chat_view.reset()
+    chat_service.reset()
+
+    local opened = chat_view.open()
+    local main = opened.win_id
+    local iwin = input_box.get_win()
+    local ibuf = input_box.get_buf()
+    t.true_(vim.api.nvim_win_is_valid(iwin), "打开后应有输入窗口")
+
+    -- 输入窗口暂时显示别的 buffer（当前窗口为主窗口 → 不触发重定向），focus 时重绑；
+    -- 旧实现会在这里把 winfixbuf 设成 true 并永久留在该窗口上。
+    local tmp = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_set_current_win(main)
+    vim.api.nvim_win_set_buf(iwin, tmp)
+    t.eq(tmp, vim.api.nvim_win_get_buf(iwin), "测试前置：输入窗口应显示临时 buffer")
+    input_box.focus()
+    t.eq(ibuf, vim.api.nvim_win_get_buf(iwin), "focus 应把输入 buffer 绑回输入窗口")
+    t.false_(vim.wo[iwin].winfixbuf, "重绑后不得打开 winfixbuf")
+
+    -- 外部/历史遗留的锁定状态也应被清掉（设计上输入窗口不使用 winfixbuf）
+    vim.wo[iwin].winfixbuf = true
+    input_box.focus()
+    t.false_(vim.wo[iwin].winfixbuf, "focus 应清掉遗留的 winfixbuf")
+
+    pcall(vim.api.nvim_buf_delete, tmp, { force = true })
+    chat_view.reset()
+    chat_service.reset()
+  end)
+
   it("输入框多行缩进内容不被误折叠为思考过程", function(t)
     local chat_view = require("NeoAI.ui.window.chat_view")
     local chat_service = require("NeoAI.services.chat_service")
@@ -3364,13 +3486,15 @@ tests.suite("chat_ui", function(_, it)
     local session_cleanup = require("NeoAI.ui.session_cleanup")
     session_cleanup.install()
     local autocmds = vim.api.nvim_get_autocmds({ group = "NeoAISessionCleanup" })
-    local has_slp, has_enter = false, false
+    local has_slp, has_enter, has_swp = false, false, false
     for _, a in ipairs(autocmds) do
       if a.event == "SessionLoadPost" then has_slp = true end
       if a.event == "VimEnter" then has_enter = true end
+      if a.event == "SessionWritePost" then has_swp = true end
     end
     t.true_(has_slp, "应注册 SessionLoadPost")
     t.true_(has_enter, "应注册 VimEnter")
+    t.true_(has_swp, "应注册 SessionWritePost（会话写入后修复重复输入窗口）")
     t.eq("function", type(_G.NeoAIFoldExpr), "应提供 foldexpr 兜底桩")
 
     -- 触发 SessionLoadPost：孤儿应被清除
@@ -3380,6 +3504,64 @@ tests.suite("chat_ui", function(_, it)
     vim.api.nvim_exec_autocmds("SessionLoadPost", {})
     t.true_(vim.wait(500, function() return not vim.api.nvim_buf_is_valid(orphan) end),
       "SessionLoadPost 后孤儿应被清理")
+  end)
+
+  it("会话文件里重复的 NeoAI Input 窗口被改名，恢复时不再 E95", function(t)
+    local session_cleanup = require("NeoAI.ui.session_cleanup")
+    local path = vim.fn.tempname() .. "_dup_input.vim"
+    local lines = {
+      "let SessionLoad = 1",
+      "argglobal",
+      "enew",
+      "file NeoAI\\ Input",
+      "balt NeoAI\\ Chat",
+      "wincmd w",
+      "argglobal",
+      "enew",
+      "file NeoAI\\ Input",
+      "balt NeoAI\\ Chat",
+      "wincmd w",
+      "argglobal",
+      "enew",
+      "file NeoAI\\ Chat",
+    }
+    vim.fn.writefile(lines, path)
+    t.true_(session_cleanup.dedupe_session_input_windows(path), "应改写含重复输入窗口的会话")
+    local out = vim.fn.readfile(path)
+    t.eq("file NeoAI\\ Input", out[4], "第一个输入窗口保持原名")
+    t.eq("file NeoAI\\ Input\\ 2", out[9], "重复的输入窗口应改用唯一名")
+    t.eq("file NeoAI\\ Chat", out[14], "聊天窗口不受影响")
+    t.false_(session_cleanup.dedupe_session_input_windows(path), "无重复时应为 no-op（幂等）")
+    pcall(vim.fn.delete, path)
+  end)
+
+  it("mksession 写入时修复重复输入窗口：会话文件不含两个同名 file", function(t)
+    local chat_view = require("NeoAI.ui.window.chat_view")
+    local chat_service = require("NeoAI.services.chat_service")
+    local input_box = require("NeoAI.ui.components.input_box")
+    local session_cleanup = require("NeoAI.ui.session_cleanup")
+    chat_view.reset()
+    chat_service.reset()
+
+    local opened = chat_view.open()
+    -- 造一个额外窗口显示同一输入 buffer（模拟旧版本残留/用户 :vsp 输入窗口）
+    vim.api.nvim_set_current_win(opened.win_id)
+    vim.cmd("vsplit")
+    local spare = vim.api.nvim_get_current_win()
+    vim.api.nvim_win_set_buf(spare, input_box.get_buf())
+
+    session_cleanup.install()
+    local path = vim.fn.tempname() .. "_sess.vim"
+    vim.cmd("mksession! " .. vim.fn.fnameescape(path))
+    local dup = 0
+    for _, line in ipairs(vim.fn.readfile(path)) do
+      if line == "file NeoAI\\ Input" then dup = dup + 1 end
+    end
+    t.eq(1, dup, "会话文件里只应有一个 `file NeoAI Input`（重复窗口已改名）")
+    pcall(vim.fn.delete, path)
+
+    chat_view.reset()
+    chat_service.reset()
   end)
 
   it("输入框内 :terminal 不报 E1513，改为新标签页打开（回归 N1 泛化）", function(t)

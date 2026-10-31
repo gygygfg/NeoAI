@@ -207,6 +207,20 @@ function M.reject(err)
   return d
 end
 
+--- 把 reject 的错误值渲染成可读文本。
+--- 线程池/后台 worker 的 reject 值是 `{ kind = "work"|"worker", message = ... }` 表，
+--- 直接 `tostring` 只会得到 `table: 0x...`（用户看到「保存失败: table: 0x…」无从判断）。
+--- @param err any
+--- @return string
+function M.error_text(err)
+  if type(err) == "table" then
+    if type(err.message) == "string" and err.message ~= "" then return err.message end
+    local ok, s = pcall(vim.inspect, err)
+    if ok and type(s) == "string" then return (s:gsub("%s+$", "")) end
+  end
+  return tostring(err)
+end
+
 --- 延迟指定毫秒后 resolve
 --- @param ms number
 --- @param value any

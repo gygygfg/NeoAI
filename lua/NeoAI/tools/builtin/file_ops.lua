@@ -378,6 +378,17 @@ local function _override_is_dir(o)
   return st ~= nil and st.type == "directory"
 end
 
+--- 搬出层（`.neoai-retired`）对 AI 不可见：列举/搜索结果一律过滤。
+--- @param p string|nil
+--- @return boolean
+local function _is_retired_path(p)
+  if type(p) ~= "string" or p == "" then return false end
+  for seg in p:gmatch("[^/]+") do
+    if seg == ".neoai-retired" or seg:match("^%.neoai%-retired%-%d+$") then return true end
+  end
+  return false
+end
+
 --- 沙箱视图中该目录下是否存在内容（真实目录可能尚不存在）。
 --- 用于 list_files：run_command/create_directory 可在沙箱里新建整棵目录树，
 --- 而真实磁盘尚无该目录；只按真实 fs.is_dir 判断会把沙箱视图判为“目录不存在”。
@@ -385,7 +396,12 @@ end
 --- @return boolean
 local function _sandbox_dir_present(dir)
   local absdir = _abs_norm(dir)
-  for _, o in ipairs(_sandbox_overrides()) do
+  local overrides = _sandbox_overrides()
+  -- 删除只记节点：祖先节点被删除时，其下一切都不在沙箱视图里（不枚举、只做前缀判定）。
+  for _, o in ipairs(overrides) do
+    if o.deleted and absdir:sub(1, #o.real + 1) == o.real .. "/" then return false end
+  end
+  for _, o in ipairs(overrides) do
     if not o.deleted then
       local abs = o.real
       if abs == absdir or abs:sub(1, #absdir + 1) == absdir .. "/" then
@@ -401,10 +417,16 @@ end
 --- @return boolean|nil
 local function _sandbox_path_exists(path)
   local abs = _abs_norm(path)
-  for _, o in ipairs(_sandbox_overrides()) do
-    if o.real == abs then
-      return not o.deleted
-    end
+  local overrides = _sandbox_overrides()
+  -- 精确条目优先（被删目录下重新创建的文件应对 AI 可见）。
+  for _, o in ipairs(overrides) do
+    if o.real == abs then return not o.deleted end
+  end
+  -- 删除只记节点：祖先被删除 ⇒ 该路径在沙箱视图里不存在。
+  for _, o in ipairs(overrides) do
+    if o.deleted and abs:sub(1, #o.real + 1) == o.real .. "/" then return false end
+  end
+  for _, o in ipairs(overrides) do
     if not o.deleted and o.real:sub(1, #abs + 1) == abs .. "/" then
       return true
     end
@@ -434,11 +456,13 @@ local function _merge_list(base_text, dir, recursive, max)
         local is_dir = line:sub(-1) == "/"
         local raw = is_dir and line:sub(1, -2) or line
         local abs = _abs_norm(raw)
-        local drop = false
-        for del in pairs(removed) do
-          if abs == del or abs:sub(1, #del + 1) == del .. "/" then
-            drop = true
-            break
+        local drop = _is_retired_path(abs)
+        if not drop then
+          for del in pairs(removed) do
+            if abs == del or abs:sub(1, #del + 1) == del .. "/" then
+              drop = true
+              break
+            end
           end
         end
         if not drop then
@@ -522,6 +546,7 @@ local function _merge_search(base_text, dir, query, include, max)
   end
   local function is_overridden(p)
     local ap = _abs_norm(p)
+    if _is_retired_path(ap) then return true end
     if overridden[ap] ~= nil then
       return true
     end

@@ -35,6 +35,17 @@ local function _read(path)
   return content
 end
 
+--- 目录基线签名（`dirsig:<mtime.sec>:<mtime.nsec>:<ino>`）：删除 = 搬出只记节点，
+--- 不遍历目录树；发布前用它判定「目录项是否被外部增删」（mtime/ino 变化 → CAS 冲突）。
+--- 与文件签名分开：目录不读内容，也不与暂存侧签名混用。
+--- @param st table|nil vim.uv.fs_stat 结果
+--- @return string|nil
+local function _dir_sig(st)
+  if not (st and st.type == "directory" and st.mtime) then return nil end
+  return string.format("dirsig:%s:%s:%s",
+    tostring(st.mtime.sec), tostring(st.mtime.nsec), tostring(st.ino or 0))
+end
+
 --- 读取候选条目的发布内容（供发布解密预检与写入）：
 --- 非大文件 blob 从 blob 读取（token 化内容，需 detokenize）；大文件 blob 返回 nil（按文件复制）。
 --- @param f table
@@ -59,6 +70,7 @@ return {
   perm = _perm,
   sha = _sha,
   stat_sig = _stat_sig,
+  dir_sig = _dir_sig,
   read = _read,
   candidate_content = _candidate_content,
   is_text_content = _is_text_content,

@@ -2555,6 +2555,19 @@ local function _self_runtime_matcher()
   return fn
 end
 
+--- 路径是否位于「删除搬出层」（`<parent>/.neoai-retired[-N]`）本身或其中。
+--- 该目录由 `sandbox/execution/retired.lua` 管理：绝不捕获为候选、绝不作为发布目标，
+--- 只读工具/列举/搜索也不显示（否则「已删除」的内容会从搬出层重新可见）。
+--- @param path string|nil
+--- @return boolean
+function M.is_retired_path(path)
+  if type(path) ~= "string" or path == "" then return false end
+  for seg in path:gmatch("[^/]+") do
+    if seg == ".neoai-retired" or seg:match("^%.neoai%-retired%-%d+$") then return true end
+  end
+  return false
+end
+
 --- 路径是否属于 NeoAI 自身运行时/状态（日志、会话、缓存、沙箱 store 等），或插件在工作区内
 --- 生成的产物文件（如测试运行器耗时缓存 `.neoai_test_timings.json`）。
 --- 这些路径绝不纳入沙箱候选：整机根 overlay 会捕获会话期间写入它们的内容，而日志/会话/测试
@@ -2563,6 +2576,8 @@ end
 --- @return boolean
 function M.is_self_runtime_path(path)
   if type(path) ~= "string" or path == "" then return false end
+  -- 搬出层同样绝不捕获/发布（它保存着「已删除」的内容）。
+  if M.is_retired_path(path) then return true end
   return _self_runtime_matcher()(path)
 end
 

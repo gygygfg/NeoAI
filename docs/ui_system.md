@@ -375,6 +375,17 @@ level 2 嵌套折叠。因此展开「过程」折叠后，内部思考/工具�
 仍响应全局事件空转（表现为卡顿、输入框无法恢复）。创建时用重入守卫 `_input_creating` 防止 `:split`
 同步触发的嵌套 `WinEnter` 建出第二个输入框。
 
+**收起只在确认窗口已关闭后才清空句柄**。在「另一窗口正在关闭」期间触发的 `WinEnter` 里关窗会被 Neovim
+以 `E1312` 拒绝（同一时机 `:split` 报 `E242`）；旧实现关窗失败也照样把 `state.input_win_id` 置空，导致
+下次回到聊天时误判「没有输入框」再 `:split` 一个——表现为聊天窗口下方**上下两个输入框**（打开/关闭
+nvim-tree 等改动窗口布局的操作时尤易触发）。现在关窗失败会保留句柄并在主循环下一拍重试（有次数上限；
+期间用户回到聊天则保留输入框、撤销收起状态）。若句柄确实丢失但窗口仍在显示输入 buffer，`_restore_aux`
+会凭窗口变量 `w:neoai_input_win` **认领**该窗口（`:split` 不复制窗口变量，故用户/插件分出的窗口不会被
+误认领），并关闭多余副本，保证同一输入 buffer 只有一个输入窗口。
+
+`input_box.focus()` 重绑输入 buffer 前只**清除** `'winfixbuf'`、不再重新打开（旧的「临时关闭再恢复」会把
+该选项永久留在输入窗口上，之后 `:e`/`:bnext` 仍会报 `E1513`）。
+
 ### 4.8 界面 buffer 的 LSP 隔离（ui/lsp_guard）
 
 NeoAI 的聊天/输入框/悬浮窗等都是纯 UI 文本，若 LSP 客户端（native LSP / GitHub Copilot）
@@ -411,6 +422,14 @@ NeoAI 的聊天/输入框/悬浮窗等都是纯 UI 文本，若 LSP 客户端（
 `nvim_buf_delete(force)`，全程 `pcall`、幂等、不触碰非 NeoAI buffer。
 效果：重启后聊天界面完全关闭，用户需显式 `:NeoAIChat` 重开（新会话）；恢复残留的
 `NeoAI Input N` 不会被「有实时聊天即整体豁免」放过而占名（多实例下输入 buffer 名唯一化依赖于此）。
+
+**写入前修复（`SessionWritePost`）**：`buftype=nofile` 的输入 buffer 被多个窗口显示时，`:mksession`
+会为每个窗口各写一行 `enew` + `file NeoAI\ Input`；恢复时第二行起会撞 `E95: Buffer with this name
+already exists`，并**中断整个会话恢复**（`:restart` 表现为 `UIEnter` 自动命令报错、界面只恢复一半）。
+`ui/session_cleanup.dedupe_session_input_windows()` 在会话文件写好后，把重复的 `file NeoAI\ Input`
+行改成未占用的唯一名（`NeoAI Input <n>`），使恢复不再报错；这些「壳」随后由上面的孤儿清理统一删除。
+输入框正常情况下是单例（见 §4.7），此机制同时兜住「旧版本残留」与「用户从输入窗口 `:vsp`」等
+多窗口场景。
 
 同时定义 `_G.NeoAIFoldExpr` 兜底桩（返回 0），避免恢复出的窗口 `foldexpr=v:lua.NeoAIFoldExpr()`
 在重绘首帧报错（`chat_view.open` 会用真实实现覆盖）。

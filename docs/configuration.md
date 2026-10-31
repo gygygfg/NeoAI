@@ -111,6 +111,11 @@ Groq 等的 `context_window`）；拿不到才回退内置表。数值优先级�
 ```lua
 context_cache = {
   enabled = true,
+  -- 运行态快照（todo/计划模式/常驻技能）是否以 role=system 追加进历史。默认 false：
+  -- DeepSeek 官方 chat template 会取「最后一条 system」放到最前，历史中的 system 快照会把
+  -- 顶层系统提示整体替换，并且每次快照变化都改写请求开头 → 多轮前缀缓存命中率骤降。
+  -- 仅当端点确认支持 messages 中途 system 且按原位渲染时才开启。
+  system_in_history = false,
   context_window = 64000,       -- 上下文窗口兜底值：用户显式非默认值优先，否则按模型能力表推导
   threshold_ratio = 0.8,        -- 达到该比例触发后台异步压缩（不阻塞、不弹窗；显式缓存模型自动取更保守值）
   retain_ratio = 0.16,          -- 保留的最近历史比例（单轮长循环回退/溢出恢复用；常规压缩折叠第一轮至倒数第二轮）
@@ -696,6 +701,7 @@ sandbox = {
   lsp_overlay = { enabled = true, idle_timeout_ms = 600000 }, -- AI 专用沙箱 LSP：AI 的 lsp_* 工具克隆的 server 读暂存内容（默认开，仅 bwrap+overlay；不可用时回退编辑器客户端）。克隆体在最后一次调用后保活 idle_timeout_ms（默认 10 分钟）再自动关闭，期间后续诊断/查询无需等待 server 重启；设 0/负数则永不空闲回收
   secrets = { enabled = true, min_length = 20, max_length = 200, min_entropy = 3.5, min_distinct = 8, exclude_pure_hex = true, exclude_uuid = true, entropy_skip_urls = true, entropy_requires_context = true, entropy_secret_paths_only = true, generated_scan_max_bytes = 2097152, generated_scan_max_files = 200, tokenize_env = true, binary_fake = true, disclose_fakes = false, flow_tracking = true, alert = { enabled = true, timeout_ms = 0 }, trusted_services = {}, auto_trust_providers = true, extra_rules = {}, allowlist = {} }, -- 密钥/敏感信息防护：熵检测 + 具名规则（私钥块/AKIA/ghp_/sk-/JWT/Bearer…）+ **格式保真假密钥**（同长度/同字符类/熵不低于原始；进程内映射表不落盘）；env 名含 KEY/TOKEN/SECRET/PASSWORD/CREDENTIAL 的值无视熵强制假化；裸熵串须含 -/_ 且非代码标识符（snake_case 函数/常量名）或处于敏感名上下文；exclude_uuid=true 排除 UUID（请求 ID/webhook 路径段等标识符），entropy_skip_urls=true 让通用熵扫描跳过 URL/域名/IP 片段（网址与 IP 是地址不是凭据，误判会导致后续提到该地址的命令被硬拦截；具名规则/敏感名赋值/已知环境变量密钥仍作用于 URL 内部）；非敏感名且值含 / 的环境变量只按具名规则处理（不破坏 PATH/LD_LIBRARY_PATH 等）；entropy_secret_paths_only=true 时全文熵扫描仅对疑似密钥文件执行。**假密钥**出现在工具参数/AI 上下文时警告用户（不阻断）；**真实密钥**出现时立即停止 Agent 并弹窗，用户确认后才继续（headless 无 UI 时失败关闭）。binary_fake=true 时敏感二进制密钥文件（.p12/.pfx/keystore/raw key）被读取/暂存时用同长度随机字节假化（base64 标记传输，落盘/执行时精确还原）。flow_tracking=true 时记录假密钥来源与所有流经点（工具/命令/环境变量/落盘），命令/脚本加密等不可逆变换产生的派生文件标记「不透明派生」并在发布前强制人工确认。trusted_services 为出网白名单（精确主机/`*.suffix`/IP/CIDR）：向白名单发送密钥不弹窗也不警告；auto_trust_providers=true 时已配置的模型供应商 base_url 主机自动信任；disclose_fakes=true 时向 AI 披露「这是假密钥」（默认不披露以保持格式保真）；**AI 自己生成的值**（首次出现在模型输出/工具参数、不是环境或工具结果取到的）自动放行：不假化、不登记为真密钥、后续出现也不弹窗（同一值若之后由环境/工具登记则恢复保护）
   retention = { candidate_days = 7, max_pending = 20 },
+  retired = { ttl_days = 7 }, -- 删除=搬出：被删节点移到同盘 `<parent>/.neoai-retired/`，撤销时整棵搬回；该单元离开待审/已应用列表或 reset 时回收，另有本 TTL 兜底（天；<=0 按 7 天）
   policy = {
     version = "1",                 -- 策略版本（用于审计回放；规则变更时递增）
     deny_tools = {},               -- 硬拒绝工具名（用户确认亦不可覆盖）

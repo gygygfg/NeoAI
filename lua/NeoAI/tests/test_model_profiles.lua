@@ -29,17 +29,18 @@ tests.suite("model_profiles", function(_, it)
     t.eq("effort", d.reasoning_kind)
     t.eq("high", d.default_effort)
     t.true_(d.thinking_toggle)
-    t.true_(d.system_in_history)
+    -- 历史 system 默认关闭（DeepSeek 模板会把最后一条 system 提到最前，破坏系统提示与前缀缓存）
+    t.false_(d.system_in_history)
   end)
 
-  it("DeepSeek Anthropic 兼容端点：output_config.effort + 历史 system", function(t)
+  it("DeepSeek Anthropic 兼容端点：output_config.effort + 历史 system 默认关闭", function(t)
     local profiles = require("NeoAI.core.model.profiles")
     local provider = { api_type = "anthropic", base_url = "http://x", api_key = "k" }
     local d = profiles.resolve("ds-anthropic", provider, "deepseek-flash")
     t.eq("anthropic", d.protocol)
     t.eq("output_config_effort", d.reasoning_kind)
     t.true_(d.thinking_toggle)
-    t.true_(d.system_in_history)
+    t.false_(d.system_in_history)
     -- 原生 Anthropic 默认仍走 budget，且不默认开启历史 system
     local a = profiles.resolve("anthropic", { api_type = "anthropic" }, "claude-x")
     t.eq("budget", a.reasoning_kind)

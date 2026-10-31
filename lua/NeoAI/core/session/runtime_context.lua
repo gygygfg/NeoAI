@@ -7,8 +7,9 @@
 --- - 因此把易变运行态渲染成一条「运行时上下文快照」消息追加进历史：
 ---   快照只在内容变化时才追加新的（newer supersedes older），旧快照永不改写 → 请求保持
 ---   严格追加扩展（append-extension），系统提示稳定，只有变化的快照尾部短暂失效。
---- - 支持 messages 中途 system 的端点（如 DeepSeek）使用 system 角色，让运行态具备
----   系统级优先级；其余端点回退 user 角色（旧行为）。角色只影响单条消息，追加语义不变。
+--- - 端点明确支持 messages 中途 system（如部分代理）时才可经 `ai.system_in_history=true` 开启
+---   system 角色；默认 user —— DeepSeek 官方模板会把最后一条 system 提到最前，从而替换顶层
+---   系统提示并使前缀缓存全量失效。角色只影响单条消息，追加语义不变。
 
 local M = {}
 
@@ -19,15 +20,18 @@ local CLEARED_TEXT = "当前运行上下文：无。更早的运行上下文快�
 
 -- ========== 私有函数 ==========
 
---- 解析当前 Agent 的方言，判断快照能否使用 system 角色。
---- 先用 user 角色是保守基线；只有端点明确支持 messages 中途 system（如 DeepSeek）
---- 才提升为 system。这样运行态具备系统级优先级，同时保持严格追加扩展（缓存稳定）。
+--- 解析当前 Agent 的方言，判断快照能否使用 system 角色（默认 user，需显式开启）。
 --- @param agent table
 --- @return string "system" | "user"
 local function _snapshot_role(agent)
+  -- 默认 user，且必须显式开启 `ai.system_in_history=true`：DeepSeek 官方 chat template 会把
+  -- 所有 system 消息收敛为「**最后一条** system 的内容放在最前」，历史中的 system 快照会整体
+  -- 替换顶层系统提示，且每次快照变化都改写请求开头 → 前缀缓存全量失效（多轮命中率骤降）。
+  -- user 角色是严格追加扩展：旧消息逐字节不变，快照只在尾部生效，缓存友好。
+  local config_store = require("NeoAI.kernel.config_store")
+  if config_store.get("ai.system_in_history") ~= true then return "user" end
   local ok, profiles = pcall(require, "NeoAI.core.model.profiles")
   if not ok or not profiles.resolve then return "user" end
-  local config_store = require("NeoAI.kernel.config_store")
   local ac = (agent and agent.config) or {}
   local provider_name = ac.provider or config_store.get("ai.default_provider")
   local provider = provider_name and config_store.get("ai.providers." .. provider_name) or {}

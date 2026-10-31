@@ -21,7 +21,7 @@ local review = require("NeoAI.sandbox.review.review")
 local grant = require("NeoAI.sandbox.review.grant")
 local impact = require("NeoAI.sandbox.observe.impact")
 local evidence = require("NeoAI.sandbox.review.evidence")
-local envelope = require("NeoAI.sandbox.observe.envelope")
+local retired_layer = require("NeoAI.sandbox.execution.retired")local envelope = require("NeoAI.sandbox.observe.envelope")
 local network = require("NeoAI.sandbox.net.network")
 local broker = require("NeoAI.sandbox.net.broker")
 local replay = require("NeoAI.sandbox.review.replay")
@@ -798,7 +798,14 @@ function M.prune()
     end
   end
   local removed_evidence = evidence.prune(days)
-  return { removed_reviews = removed_reviews, removed_candidates = removed_candidates, removed_evidence = removed_evidence }
+  -- 删除 = 搬出：按「生命周期 + TTL」回收搬出内容。仍在列表里的变更单元保留（可撤销），
+  -- 已离开列表的立即回收；超过 `tools.sandbox.retired.ttl_days` 的兜底回收（随后不可撤销）。
+  local keep = {}
+  for _, item in ipairs(review.list()) do keep[item.change_set_id] = true end
+  local ttl_days = tonumber(config_store.get("tools.sandbox.retired.ttl_days"))
+  local removed_retired = retired_layer.gc({ keep = keep, ttl_days = ttl_days })
+  return { removed_reviews = removed_reviews, removed_candidates = removed_candidates,
+    removed_evidence = removed_evidence, removed_retired = removed_retired }
 end
 
 --- 运行指标
@@ -1170,10 +1177,9 @@ M.trace = trace
 
 --- 重置（测试用）
 function M.reset()
-  -- 确保 store 根已知：前序代码可能已调用 store.reset() 将 root 置空；此时直接
-  -- store.reset() 会因 root 为 nil 而 no-op，无法删除磁盘上的残留候选/待审，造成
-  -- 跨 reset/跨套件污染。先按当前实例根初始化，使其可被清理。
-  if not store.root() then store.init(_root()) end
+  -- 按**当前配置**落位 store 根：用例内可能临时改写 `tools.sandbox.workspace_root`（with_config），
+  -- 若沿用旧根，reset 清空的是旧目录，而后续代码落到新根 → 新根里的陈旧候选/待审会被读到。
+  store.init(_root())
   -- 等待后台后处理完成，避免 reset 时仍有在途捕获/冻结/结算写入旧实例目录造成污染。
   pcall(function() require("NeoAI.sandbox.execution.wrapper").await_postprocess(60000) end)
   -- 停止 systemd 门面 IPC 桥（测试隔离：避免跨套件残留定时器/监听）。
@@ -1189,6 +1195,8 @@ function M.reset()
   candidate.reset()
   require("NeoAI.sandbox.execution.jobs").reset()
   control.reset()
+  -- 重置前先回收搬出层内容（登记表在 store 内，store.reset 会删掉它 → 之后无法再追踪）。
+  pcall(retired_layer.purge_all)
   store.reset()
   runtime.reset()
   policy.reset()
