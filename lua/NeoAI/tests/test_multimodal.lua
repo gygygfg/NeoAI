@@ -189,6 +189,70 @@ tests.suite("multimodal", function(_, it, before_each)
     t.eq(1, img_count, "仅保留 1 张图像（其余 offload 为文本）")
   end)
 
+  it("materialize：默认不限制单请求图像数（read_image 连续看图不被丢弃）", function(t)
+    local att = require("NeoAI.core.attachment.attachment")
+    local content = require("NeoAI.core.model.content")
+    local json = require("NeoAI.utils.json")
+    local ok = false
+    local ref
+    att.save_image({ data = PNG, mediaType = "image/png", name = "t.png" }):then_(function(r) ref = r ok = true end)
+    t.true_(wait_until(function() return ok end), "save")
+
+    -- 默认策略：maxImagesPerRequest = 0（不限），12 张图全部保留。
+    local policy = att.request_policy()
+    t.eq(0, tonumber(policy.maxImagesPerRequest) or 0, "默认不限单请求图像数")
+    local msgs = { { role = "user", content = "see" } }
+    for i = 1, 12 do
+      msgs[#msgs + 1] = { role = "tool", tool_call_id = "c" .. i, content = json.encode({ image = ref }) }
+      msgs[#msgs + 1] = { role = "assistant", content = "" }
+    end
+    local ok2, wire
+    content.materialize(msgs, { vision = true }):then_(function(w) wire = w ok2 = true end)
+    t.true_(wait_until(function() return ok2 end), "materialize")
+    local img_count = 0
+    for _, m in ipairs(wire) do
+      if type(m.content) == "table" then
+        for _, p in ipairs(m.content) do
+          if p.type == "image" then img_count = img_count + 1 end
+        end
+      end
+    end
+    t.eq(12, img_count, "12 张全部保留（不再按条数丢最旧）")
+
+    -- 显式数量上限仍生效（向后兼容）；provider 硬上限 maxRequestImages 同样生效。
+    ok2 = false
+    content.materialize(msgs, { vision = true, policy = {
+      maxPixels = 640000, maxBytes = 1024 * 1024,
+      maxImagesPerRequest = 3, maxRequestBytes = 40 * 1024 * 1024, maxRequestImages = 600,
+    } }):then_(function(w) wire = w ok2 = true end)
+    t.true_(wait_until(function() return ok2 end), "materialize(explicit cap)")
+    local limited = 0
+    for _, m in ipairs(wire) do
+      if type(m.content) == "table" then
+        for _, p in ipairs(m.content) do
+          if p.type == "image" then limited = limited + 1 end
+        end
+      end
+    end
+    t.eq(3, limited, "显式 maxImagesPerRequest 仍生效")
+
+    ok2 = false
+    content.materialize(msgs, { vision = true, policy = {
+      maxPixels = 640000, maxBytes = 1024 * 1024,
+      maxImagesPerRequest = 0, maxRequestBytes = 40 * 1024 * 1024, maxRequestImages = 4,
+    } }):then_(function(w) wire = w ok2 = true end)
+    t.true_(wait_until(function() return ok2 end), "materialize(hard cap)")
+    local hard = 0
+    for _, m in ipairs(wire) do
+      if type(m.content) == "table" then
+        for _, p in ipairs(m.content) do
+          if p.type == "image" then hard = hard + 1 end
+        end
+      end
+    end
+    t.eq(4, hard, "provider 硬上限 maxRequestImages 生效（0=不限时仍兜底）")
+  end)
+
   it("materialize：工具结果图像不打断 tool_calls→tool 连续性", function(t)
     local att = require("NeoAI.core.attachment.attachment")
     local content = require("NeoAI.core.model.content")

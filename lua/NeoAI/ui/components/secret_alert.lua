@@ -59,12 +59,19 @@ local function _on_win_closed(rec)
   if decide then decide("stop") end
 end
 
+--- 压成单行：`nvim_buf_set_lines` 不接受含换行的元素（命令/密钥值可能自带换行）。
+--- @param s any
+--- @return string
+local function _one_line(s)
+  return (tostring(s == nil and "" or s):gsub("[\r\n]+", " "))
+end
+
 --- 截断长文本用于弹窗展示（保留足够辨识信息）
 --- @param s any
 --- @param n number|nil
 --- @return string
 local function _short(s, n)
-  s = tostring(s or "")
+  s = _one_line(s)
   n = n or 120
   if #s > n then return s:sub(1, n) .. "…（共 " .. #s .. " 字符）" end
   return s
@@ -80,7 +87,7 @@ local function _text(ctx)
   if ctx.kind == "egress" then
     lines[#lines + 1] = "⚠ 检测到向非白名单地址发送密钥"
     lines[#lines + 1] = ""
-    lines[#lines + 1] = "目标: " .. tostring(ctx.dest or "?")
+    lines[#lines + 1] = "目标: " .. _one_line(ctx.dest or "?")
     if ctx.command then lines[#lines + 1] = "来源命令: " .. _short(ctx.command, 200) end
     if ctx.secret or ctx.secret_preview then
       lines[#lines + 1] = "密钥: " .. _short(ctx.secret or ctx.secret_preview)
@@ -90,14 +97,14 @@ local function _text(ctx)
     lines[#lines + 1] = ""
     if ctx.command then lines[#lines + 1] = "来源: " .. _short(ctx.command, 200) end
     lines[#lines + 1] = "密钥: " .. _short(ctx.secret or ctx.secret_preview or "?")
-    if has_fake then lines[#lines + 1] = "将替换为假密钥: " .. tostring(ctx.fake) end
+    if has_fake then lines[#lines + 1] = "将替换为假密钥: " .. _one_line(ctx.fake) end
   else
     lines[#lines + 1] = "⚠ 工具调用中出现真实密钥（沙箱可能已被突破）"
     lines[#lines + 1] = ""
-    lines[#lines + 1] = "来源工具: " .. tostring(ctx.tool or "?")
+    lines[#lines + 1] = "来源工具: " .. _one_line(ctx.tool or "?")
     if ctx.command then lines[#lines + 1] = "来源命令: " .. _short(ctx.command, 200) end
     lines[#lines + 1] = "密钥: " .. _short(ctx.secret or ctx.secret_preview or "?")
-    if has_fake then lines[#lines + 1] = "将替换为假密钥: " .. tostring(ctx.fake) end
+    if has_fake then lines[#lines + 1] = "将替换为假密钥: " .. _one_line(ctx.fake) end
   end
   lines[#lines + 1] = ""
   if has_fake then

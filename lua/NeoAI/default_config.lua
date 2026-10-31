@@ -165,17 +165,17 @@ local DEFAULT_CONFIG = {
       media_types = { "image/png", "image/jpeg", "image/webp", "image/gif" },
       limits = {
         maxImageBytes = 20 * 1024 * 1024, -- 单图字节上限
-        maxImagesPerMessage = 16, -- 每条消息图像数上限
-        maxMessageImageBytes = 40 * 1024 * 1024, -- 每条消息图像累计字节
         maxImagePixels = 50000000, -- 解码后像素上限（无缩略工具时强拒）
         maxImageDimension = 8000, -- 长边上限
       },
       request_image = {
         maxPixels = 640000, -- 单请求图像像素预算（有 ImageMagick 时缩略到该预算）
         maxBytes = 1024 * 1024, -- 单请求图像编码字节上限
-        maxImagesPerRequest = 8, -- 单请求最多保留图像数（超出丢最旧）
+        -- 单请求保留图像数上限：0 = 不限（read_image 连续看图不再被静默丢弃）。
+        -- 仍受 maxRequestImages（provider 硬上限）与 maxRequestBytes（字节预算）约束。
+        maxImagesPerRequest = 0,
         maxRequestBytes = 20 * 1024 * 1024, -- 单请求图像累计字节上限（超出丢最旧）
-        maxRequestImages = 600, -- 与 provider 上限对齐的深层兜底
+        maxRequestImages = 600, -- provider 侧硬上限（最终兜底）
       },
     },
     -- 按模型自动选择策略：能力表（上下文窗口/缓存机制/输出上限）+ 厂商方言（请求参数名/
@@ -1226,7 +1226,13 @@ local DEFAULT_CONFIG = {
         merge_max_bytes = nil,
         -- 撤销保存的快照 CAS 模式："sig"（默认，用真实文件 mtime/size 签名，省去应用后逐文件
         -- 读取+哈希的 CPU 开销）| "hash"（逐文件内容哈希，最强一致性）。
+        -- 注：签名失配时会回退比较内容哈希（已知时），故仅 mtime/inode 变化（touch、包重新
+        -- 写入 `.pyc`）不再误判 `TARGET_CHANGED`。
         snapshot_cas = "sig",
+        -- 撤销保存的原文件快照单文件上限（字节；0 = 沿用 `max_file_bytes`）。
+        -- 超过上限的文件不保存原内容 → 该变更单元**不可撤销**（审批窗会标「不可撤销」）。
+        -- 与 `max_file_bytes`（候选内容读取上限）解耦：pip/apt 安装的 20~40MB `.so` 也需要可回滚。
+        snapshot_max_bytes = 64 * 1024 * 1024,
         -- L3（critical）操作二次确认：首次 <CR> 时由 AI 生成后果警告并自动打开 diff，
         -- 需在 diff 内再次确认才真正应用；AI 不可用时回退规则警告，不阻断。
         -- `package_confirm=true` 时，L2 的包安装/敏感安装（apt-key、gpg --import、改软件源等）
@@ -1370,6 +1376,9 @@ local DEFAULT_CONFIG = {
           "~/.cache/pip", "~/.cache/uv", "~/.npm/_cacache", "~/.cache/yarn",
           "~/.cargo/registry/cache", "~/.cache/go-build",
         },
+        -- Python 字节码缓存（`__pycache__/**`、`*.pyc`）：包安装/导入时被随时重建，
+        -- 冻结进待审只会带来 CAS 冲突与无意义的撤销项。默认跳过（不影响包本体与 `.dist-info`）。
+        skip_bytecode_cache = true,
       },
       -- 容器门面：默认**关闭**（`enabled = false`）——不做任何容器运行时封装：AI 调用的
       -- docker / podman / docker-compose 命令按原文执行，不改写运行时、不注入命名空间共享

@@ -435,8 +435,10 @@ network-consent (net_consent) popups (see the "Focus-aware interactive popups" s
 
 ### 🖼 Images (read_image.lua)
 
-`read_image`: reads PNG/JPEG/WebP/GIF, persists it into attachment storage, and returns a reference. See
-[configuration.md](configuration.md) (multimodal).
+`read_image`: reads PNG/JPEG/WebP/GIF, persists it into attachment storage, and returns a reference. The
+per-request image **count is unlimited by default** (consecutive calls never drop the oldest image); only
+`ai.attachments.request_image.maxRequestImages` (provider hard limit) and the byte budget
+`maxRequestBytes` bound it. See [configuration.md](configuration.md) (multimodal).
 
 ### 🌐 Web fetch (web_fetch.lua, disabled by default)
 

@@ -60,9 +60,11 @@ attachments = {
   assume_vision = true,          -- assume unknown models can read images (soft gate); false restores the old conservative behavior
   vision_model_heuristics = { "vision", "-vl", "4o", "gemini" }, -- detect vision models by id substring
   media_types = { "image/png", "image/jpeg", "image/webp", "image/gif" },
-  limits = { maxImageBytes=20MB, maxImagesPerMessage=16, maxMessageImageBytes=40MB,
-             maxImagePixels=50M, maxImageDimension=8000 },
-  request_image = { maxPixels=640000, maxBytes=1MB, maxImagesPerRequest=8,
+  limits = { maxImageBytes=20MB, maxImagePixels=50M, maxImageDimension=8000 },
+  -- maxImagesPerRequest=0: no per-request image-count cap (consecutive read_image calls are not
+  --   truncated oldest-first); still bounded by maxRequestImages (provider hard limit) and
+  --   maxRequestBytes (byte budget).
+  request_image = { maxPixels=640000, maxBytes=1MB, maxImagesPerRequest=0,
                     maxRequestBytes=20MB, maxRequestImages=600 },
 }
 ```
@@ -720,7 +722,11 @@ sandbox = {
   --     back to the old "reject the whole unit if the baseline changed". merge_max_bytes=null uses
   --     max_file_bytes.
   --   snapshot_cas: undo-snapshot CAS "sig" (default, signatures, less CPU) | "hash" (content hash,
-  --     strictest).
+  --     strictest). On a signature mismatch the content hash (when known) is compared as a fallback:
+  --     mtime/inode-only churn (touch, package rewriting `.pyc`) no longer reports TARGET_CHANGED.
+  --   snapshot_max_bytes: per-file cap for the pre-apply undo snapshot (default 64MB; <=0 falls back
+  --     to max_file_bytes). Files above the cap keep no original content → that change unit cannot
+  --     be undone (the review UI marks it and tells you to raise this value).
   review = { enabled = true, auto_apply = false, session_auto_approve = false,
              max_display_files = 200, args_max_chars = 2000, max_display_notes = 50,
              refresh_debounce_ms = 80,
@@ -728,7 +734,7 @@ sandbox = {
              terminal_cache_max = 200, rejected_max = 50,
              rejected_dir = "/tmp/neoai-rejected", cas_mode = "hash",
              merge = true, merge_max_bytes = nil,
-             snapshot_cas = "sig",
+             snapshot_cas = "sig", snapshot_max_bytes = 64 * 1024 * 1024,
              l3_warning = { enabled = true, package_confirm = true, max_tokens = 256, timeout_ms = 15000 },
              ai_audit = { enabled = true, auto = false, key = "a", max_concurrent = 10,
                           max_diff_chars = 8000, max_user_chars = 4000, max_total_chars = 60000,
@@ -773,12 +779,13 @@ sandbox = {
     managers = { "apt", "apt-get", "pip", "pip3", "uv", "conda", "npm", "npx", "pnpm", "yarn", "go", "cargo", "gem", "composer" }, -- package-manager names (command recognition); path signatures via privilege.package_path_manager; sensitive-install detection via privilege.package_sensitive
     roots = { "/usr", "/var", "/etc", "~/.cache", "~/.npm", "~/.nvm", "~/.cargo", "~/.rustup", "~/go", "~/.local" }, -- package-install writable roots (overlay staging). /etc lets dpkg postinst write /etc/ld.so.cache etc.; sensitive entries stay masked by mask_paths
     volatile_paths = { "/var/lib/apt/lists", "/var/cache/apt", "/var/cache/dnf", "/var/cache/yum", "/var/cache/pacman/pkg", "/var/cache/apk", "~/.cache/pip", "~/.cache/uv", "~/.npm/_cacache", "~/.cache/yarn", "~/.cargo/registry/cache", "~/.cache/go-build" }, -- volatile package indexes/caches: skipped when freezing a candidate (not queued, not published) so an apt-update baseline change cannot fail the whole install with BASELINE_CHANGED; the install is unaffected (dpkg/status, package files still apply); {} disables. Do not add state files like /var/lib/dpkg/status
+    skip_bytecode_cache = true, -- skip Python bytecode caches (`__pycache__/**`, `*.pyc`): regenerated on every install/import, freezing them only causes CAS conflicts and pointless undo entries; .py sources and .dist-info still queue normally
     cap_add = { "CAP_DAC_OVERRIDE", "CAP_CHOWN", "CAP_SETUID", "CAP_SETGID", "CAP_FOWNER" },
     unmask = { "/etc/passwd", "/etc/group", "/etc/shadow", "/etc/shadow-", "/etc/gshadow", "/etc/gshadow-" }, -- unmask the account DB during package installs: dpkg postinst adduser/useradd/su subprocesses need it; writes still go to overlay staging and require approval to publish
     apt_sandbox_user = "root", -- apt family: injects APT::Sandbox::User (default "root" disables apt's own `_apt` privilege drop, avoiding setgroups EPERM in nested userns/restricted containers that makes apt update/install fail); "_apt" or empty keeps apt defaults
   },
   lsp_overlay = { enabled = true, idle_timeout_ms = 600000 }, -- AI-only sandboxed LSP: servers cloned by the AI lsp_* tools read staged content (on by default, bwrap+overlay only; falls back to editor clients when unavailable). Clones are kept warm for idle_timeout_ms (default 10 min) after the last call, then auto-stopped, so later diagnostics/queries need not wait for a restart; 0/negative disables idle reaping
-  secrets = { enabled = true, min_length = 20, max_length = 200, min_entropy = 3.5, min_distinct = 8, exclude_pure_hex = true, entropy_requires_context = true, entropy_secret_paths_only = true, generated_scan_max_bytes = 2097152, generated_scan_max_files = 200, tokenize_env = true, binary_fake = true, disclose_fakes = false, flow_tracking = true, alert = { enabled = true, timeout_ms = 0 }, trusted_services = {}, auto_trust_providers = true, extra_rules = {}, allowlist = {} }, -- Secret/sensitive guard: entropy + named rules (private-key blocks/AKIA/ghp_/sk-/JWT/Bearer…) + **format-preserving fake keys** (same length / character classes / entropy >= original; in-process map never persisted); env values whose names contain KEY/TOKEN/SECRET/PASSWORD/CREDENTIAL are force-faked; bare entropy runs require a -/_ separator and must not be a code identifier or a sensitive-name context; non-sensitive-named env values containing / are handled by named rules only (never breaking PATH/LD_LIBRARY_PATH); with entropy_secret_paths_only=true the full-text entropy scan runs only on suspected secret files. A **fake key** in tool args/AI context warns the user (non-blocking); a **real key** immediately stops the Agent and pops a confirm dialog, continuing only after user confirmation (fail-closed when headless/no UI). binary_fake=true fakes sensitive binary key files (.p12/.pfx/keystore/raw key) on read/stage with same-length random bytes (base64 marker transport; restored exactly on write/exec). flow_tracking=true records each fake key's origin and every flow sink (tool/command/env/disk); files derived through irreversible command/script transforms are marked "opaque-derived" and force manual confirmation before publish. trusted_services is the egress whitelist (exact host / `*.suffix` / IP / CIDR): sending a key to a whitelisted host never warns or pops; auto_trust_providers=true auto-trusts configured model-provider base_url hosts; disclose_fakes=true tells the AI these are fake (off by default to preserve format fidelity)
+  secrets = { enabled = true, min_length = 20, max_length = 200, min_entropy = 3.5, min_distinct = 8, exclude_pure_hex = true, entropy_requires_context = true, entropy_secret_paths_only = true, generated_scan_max_bytes = 2097152, generated_scan_max_files = 200, tokenize_env = true, binary_fake = true, disclose_fakes = false, flow_tracking = true, alert = { enabled = true, timeout_ms = 0 }, trusted_services = {}, auto_trust_providers = true, extra_rules = {}, allowlist = {} }, -- Secret/sensitive guard: entropy + named rules (private-key blocks/AKIA/ghp_/sk-/JWT/Bearer…) + **format-preserving fake keys** (same length / character classes / entropy >= original; in-process map never persisted); env values whose names contain KEY/TOKEN/SECRET/PASSWORD/CREDENTIAL are force-faked; bare entropy runs require a -/_ separator and must not be a code identifier or a sensitive-name context; non-sensitive-named env values containing / are handled by named rules only (never breaking PATH/LD_LIBRARY_PATH); with entropy_secret_paths_only=true the full-text entropy scan runs only on suspected secret files. A **fake key** in tool args/AI context warns the user (non-blocking); a **real key** immediately stops the Agent and pops a confirm dialog, continuing only after user confirmation (fail-closed when headless/no UI). binary_fake=true fakes sensitive binary key files (.p12/.pfx/keystore/raw key) on read/stage with same-length random bytes (base64 marker transport; restored exactly on write/exec). flow_tracking=true records each fake key's origin and every flow sink (tool/command/env/disk); files derived through irreversible command/script transforms are marked "opaque-derived" and force manual confirmation before publish. trusted_services is the egress whitelist (exact host / `*.suffix` / IP / CIDR): sending a key to a whitelisted host never warns or pops; auto_trust_providers=true auto-trusts configured model-provider base_url hosts; disclose_fakes=true tells the AI these are fake (off by default to preserve format fidelity); values generated by the AI itself (first seen in model output/tool arguments, not obtained from env or tool results) are auto-allowed: not faked, not registered as real secrets, and never alerted — if the same value is later registered from env/tool output, protection resumes
   retention = { candidate_days = 7, max_pending = 20 },
   policy = {
     version = "1",                 -- policy version (for audit replay; bump when rules change)

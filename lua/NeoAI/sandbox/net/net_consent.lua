@@ -89,6 +89,16 @@ local function _target_key(host, port, owner)
   return _key(tostring(host or "?"), port, svc)
 end
 
+--- 通知审批悬浮窗「网络请求」页重绘（允许/撤销/历史变化）。
+--- 记账与重绘必须解耦于调用方时序：会话允许在决策内同步写入后立即广播，
+--- 否则窗口刷新可能早于记账而显示为空。
+local function _emit_network_changed()
+  pcall(function()
+    require("NeoAI.kernel.event_bus").emit(
+      require("NeoAI.kernel.events").SANDBOX_APPROVAL_CHANGED, { page = "network" })
+  end)
+end
+
 --- 追加一条已结束的网络访问决策历史（新→旧；受 HISTORY_MAX 约束）。
 --- @param rec table { host, port, local_?, proto?, comm?, decision, at_ms }
 local function _push_history(rec)
@@ -472,6 +482,8 @@ function M.allow_session(host, port, owner)
   end
   -- 登记/刷新结构化条目，供审批悬浮窗「本会话已允许」区展示与撤销。
   _remember_allowance(host, port, owner)
+  -- 立即广播：窗口「本会话已允许」区无需等下一次无关事件才出现该条目。
+  _emit_network_changed()
 end
 
 --- 列出「本会话已允许」条目（供审批悬浮窗展示/撤销）。按批准先后顺序。
@@ -526,10 +538,7 @@ function M.revoke_allowance(key)
     host = rec.host, port = rec.port, svc = rec.svc, comm = rec.comm,
     decision = "revoked", at_ms = os.time() * 1000,
   })
-  pcall(function()
-    require("NeoAI.kernel.event_bus").emit(
-      require("NeoAI.kernel.events").SANDBOX_APPROVAL_CHANGED, { page = "network" })
-  end)
+  _emit_network_changed()
   return true
 end
 
@@ -664,6 +673,13 @@ function M.request(ctx)
     done = true
     if decision ~= "allow_once" and decision ~= "allow_session" and decision ~= "deny" then
       decision = "deny"
+    end
+    -- 会话允许必须**在本次决策内同步记账**：窗口重绘由 hub 结算事件触发，若等调用方
+    -- （host_proxy 的 Deferred 回调，经 vim.schedule 延迟）再调 `allow_session`，重绘会
+    -- 早于记账，「本会话已允许」区为空（用户看到「允许了但窗口里没有条目」）。
+    -- host_proxy 决策后的调用保留（幂等）以防其它调用方。
+    if decision == "allow_session" then
+      M.allow_session(ctx.host, ctx.port, owner)
     end
     -- 记录已结束决策历史（单次允许 / 拒绝）；allow_session 由「本会话已允许」区承载，不入历史。
     -- `reason` 标明自动兜底原因（"timeout" = 弹窗无响应自动拒绝），供审批悬浮窗区分并支持补救。

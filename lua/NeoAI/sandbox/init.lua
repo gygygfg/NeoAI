@@ -628,11 +628,16 @@ function M.list_saved()
       -- 用元数据（剥离原文件内容）而非完整快照：避免每次开窗/刷新把每个已保存项的
       -- 原始内容全量解码进内存。
       local snap = store.read_snapshot_meta(item.snapshot_id)
-      local files = {}
+      local files, too_large = {}, {}
       for _, e in ipairs((snap and snap.files) or {}) do
         files[#files + 1] = { path = e.path, action = e.action, side = e.side }
+        -- 原文件超过快照上限：没有保存原内容 → 该条目不可撤销（事前标记，避免按 u 才报错）。
+        if e.alt_too_large then
+          too_large[#too_large + 1] = { path = e.path, size = tonumber(e.alt_size) }
+        end
       end
       item.saved_files = files
+      item.undo_block = (#too_large > 0) and { reason = "SNAPSHOT_TOO_LARGE", files = too_large } or nil
       out[#out + 1] = item
     end
   end

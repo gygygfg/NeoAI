@@ -429,7 +429,7 @@ local function _handle_scan_result(scan, tool, tool_name, args, ctx)
       end
       local spec_allowed = require("NeoAI.sandbox.execution.tool_spec").get(tool_name, tool and tool.category)
       if spec_allowed and spec_allowed.effect == "fs_write" then
-        secret.tokenize_args(args, { entropy = _entropy_enabled(tool_name, args, ctx) })
+        secret.tokenize_args(args, { entropy = _entropy_enabled(tool_name, args, ctx), origin = "ai" })
       end
       return true
     end
@@ -463,7 +463,7 @@ local function _handle_scan_result(scan, tool, tool_name, args, ctx)
     -- 替换为假密钥：弹窗展示的 fake 与实际替换使用的一致。
     local fake = secret.fake_for and secret.fake_for(scan.secret) or nil
     local function replace_with_fake()
-      secret.tokenize_args(args, { entropy = _entropy_enabled(tool_name, args, ctx) })
+      secret.tokenize_args(args, { entropy = _entropy_enabled(tool_name, args, ctx), origin = "ai" })
       pcall(function()
         require("NeoAI.sandbox.secret.secret_flow").record("arg", { tool = tool_name, fake = fake, command = source })
       end)
@@ -506,7 +506,7 @@ local function _handle_scan_result(scan, tool, tool_name, args, ctx)
       end)
       local spec = require("NeoAI.sandbox.execution.tool_spec").get(tool_name, tool and tool.category)
       if spec and spec.effect == "fs_write" then
-        secret.tokenize_args(args, { entropy = _entropy_enabled(tool_name, args, ctx) })
+        secret.tokenize_args(args, { entropy = _entropy_enabled(tool_name, args, ctx), origin = "ai" })
       end
       return true
     end)
@@ -540,7 +540,7 @@ local function _handle_scan_result(scan, tool, tool_name, args, ctx)
   end
   local spec = require("NeoAI.sandbox.execution.tool_spec").get(tool_name, tool and tool.category)
   if spec and spec.effect == "fs_write" then
-    secret.tokenize_args(args, { entropy = _entropy_enabled(tool_name, args, ctx) })
+    secret.tokenize_args(args, { entropy = _entropy_enabled(tool_name, args, ctx), origin = "ai" })
   end
   return true
 end
@@ -549,7 +549,9 @@ end
 --- - 命中映射表中已知的**原始密钥**（未加密真实值）→ 硬拦截并终止整个 Agent（明确通知用户）；
 --- - 命中 token（加密后的 key）或**敏感环境变量名** → 记录留痕并提级审批
 ---   （`ctx.secret_operation`），由待审悬浮窗展示 `⚠ 密钥操作`，**不终止**；
---- - fs_write 类工具的内容参数做 token 化，使写入只落 token，commit 时再还原。
+--- - fs_write 类工具的内容参数做 token 化，使写入只落 token，commit 时再还原；
+---   **AI 自己生成的**值（首次出现在参数里的高熵串）不登记为真密钥、不假化、不弹窗
+---   （`tokenize_args(..., { origin="ai" })`），只有环境/工具结果取到的真密钥才保护；
 --- 另：AI 可见上下文中的原始密钥由 `core/agent/recovery` 在请求前守卫并终止（沙箱上下文
 --- 被突破）。
 --- 返回值：

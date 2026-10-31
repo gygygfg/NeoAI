@@ -378,8 +378,9 @@ label 字符串；自由输入覆盖为纯文本。**仅 NORMAL 模式按 `<Esc>
 
 ### 🖼 图像（read_image.lua）
 
-`read_image`：读取 PNG/JPEG/WebP/GIF，持久化进附件存储，返回引用。详见
-[configuration.md](configuration.md)（多模态）。
+`read_image`：读取 PNG/JPEG/WebP/GIF，持久化进附件存储，返回引用。单请求图像**条数默认不限**
+（连续看图不会被丢最旧），仅受 `ai.attachments.request_image.maxRequestImages`（provider 硬上限）
+与字节预算 `maxRequestBytes` 约束。详见 [configuration.md](configuration.md)（多模态）。
 
 ### 🌐 网页抓取（web_fetch.lua，默认不启用）
 

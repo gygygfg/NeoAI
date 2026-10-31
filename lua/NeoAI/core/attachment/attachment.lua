@@ -26,8 +26,6 @@ local _downscale_tool = nil -- 已探测的 ImageMagick 可执行名（nil = 无
 
 local DEFAULT_LIMITS = {
   maxImageBytes = 20 * 1024 * 1024, -- 单图字节上限（原始）
-  maxImagesPerMessage = 16,
-  maxMessageImageBytes = 40 * 1024 * 1024,
   maxImagePixels = 50000000, -- 解码后像素上限（未缩略时粗估强拒）
   maxImageDimension = 8000, -- 长边上限
 }
@@ -35,9 +33,11 @@ local DEFAULT_LIMITS = {
 local DEFAULT_REQUEST_POLICY = {
   maxPixels = 640000, -- 单请求图像总像素预算
   maxBytes = 1024 * 1024, -- 单请求图像编码字节上限（超过且无法缩略则 offload）
-  maxImagesPerRequest = 8, -- 单请求最多保留图像数（超出丢最旧）
+  -- 单请求保留图像数上限：0 = 不限（仅受 maxRequestImages / 字节预算约束）。
+  -- 会话里连续 read_image 看图不应因条数被静默丢弃。
+  maxImagesPerRequest = 0,
   maxRequestBytes = 20 * 1024 * 1024, -- 单个请求的全部图像累计（超出丢最旧）
-  maxRequestImages = 600, -- 与 provider 上限对齐的深层兜底
+  maxRequestImages = 600, -- provider 侧硬上限（最终兜底）
 }
 
 -- ========== 私有函数 ==========

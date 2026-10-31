@@ -551,16 +551,15 @@ ai = {
     media_types = { "image/png", "image/jpeg", "image/webp", "image/gif" },
     limits = {
       max_image_bytes = 20 * 1024 * 1024,
-      max_images_per_message = 16,
-      max_message_image_bytes = 40 * 1024 * 1024,
       max_image_pixels = 50000000,
       max_image_dimension = 8000,
     },
     request_image = {
       max_pixels = 640000, -- per-request image pixel budget
       max_bytes = 1024 * 1024, -- per-request upper bound on encoded image bytes
-      max_images_per_request = 8, -- maximum images retained per request (the oldest are dropped beyond this)
+      max_images_per_request = 0, -- per-request image count: 0 = unlimited (consecutive read_image calls keep every image)
       max_request_bytes = 20 * 1024 * 1024,
+      max_request_images = 600, -- provider hard limit (final backstop)
     },
   },
 }
@@ -568,7 +567,8 @@ ai = {
 
 > Image data is stored content-addressed under `attachments.path`, and session messages keep only immutable
 > references, which are resolved into `image_url` (data URLs) only when a request is sent and then injected
-> within the model route's pixel/byte budget, with the **oldest** overflow images replaced by text placeholders.
+> within the model route's pixel/byte budget; **only** when the byte budget is exhausted are the **oldest**
+> images replaced by text placeholders (the count is unlimited by default).
 > When a model does not support images, NeoAI degrades gracefully without blocking the call.
 ### lualine statusline integration
 

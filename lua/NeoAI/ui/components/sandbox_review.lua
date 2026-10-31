@@ -936,6 +936,19 @@ function M.build_lines(items, traces, audit, saved, rejected, jobs)
     end
     fold_titles[hln] = "  ▸ " .. fold_body .. "  " .. status
 
+    -- 已应用区：原文件超过快照上限 → 条目不可撤销，事前提示（避免按 u 才报错）。
+    if region == "saved" and type(item.undo_block) == "table" then
+      local blk = (item.undo_block.files and item.undo_block.files[1]) or {}
+      local name = blk.path and (tostring(blk.path):gsub(".*/", "")) or "?"
+      local size = blk.size and string.format("%.1f MB", blk.size / 1048576) or "大小未知"
+      local more = (type(item.undo_block.files) == "table" and #item.undo_block.files > 1)
+        and (" 等 " .. tostring(#item.undo_block.files) .. " 个文件") or ""
+      local text = entry_indent .. ("⚠ 不可撤销：%s %s%s 超过快照上限（tools.sandbox.review.snapshot_max_bytes）"):format(
+        _one_line(name), size, more)
+      lines[#lines + 1] = text
+      marks[#marks + 1] = { line = #lines, start_col = 0, end_col = #text, level = "system" }
+      fold_levels[#lines] = base
+    end
     -- 一级内容：合并冲突提示 / 修改文件列表（展开条目立即可见）。
     if item.merge_conflict then
       local text = entry_indent .. "⚠ 合并冲突（外部改动，未写入真实文件）— 按 R 交给 AI 基于最新内容重做"
@@ -1628,6 +1641,23 @@ local function _resolve_conflict_current()
   end
 end
 
+--- 撤销失败提示去重：同一变更单元 + 同一原因短时间内只提示一次（连按 u 不刷屏）。
+local undo_notice_at = {}
+local function _notify_undo_failure(id, res)
+  local state_name = tostring(res and res.state)
+  local key = tostring(id) .. "|" .. state_name
+  local now = vim.uv.now()
+  if undo_notice_at[key] and (now - undo_notice_at[key]) < 10000 then return end
+  undo_notice_at[key] = now
+  if state_name == "SNAPSHOT_TOO_LARGE" then
+    -- 不可撤销不是「错误」而是快照策略：用 WARN + 可操作提示，不刷 ERROR。
+    vim.notify(("[NeoAI] 该变更单元不可撤销：%s"):format(tostring(res and res.reason)), vim.log.levels.WARN)
+  else
+    vim.notify(("[NeoAI] 撤销/重做失败(%s): %s"):format(state_name, tostring(res and res.reason)),
+      vim.log.levels.ERROR)
+  end
+end
+
 --- 撤销保存光标所在条目：把真实文件回滚到保存前，并把该变更单元移回待审队列。
 --- 冲突（真实文件被外部改动）时拒绝。
 local function _undo_current()
@@ -1670,8 +1700,7 @@ local function _undo_current()
     elseif res and res.state == "NEEDS_ROOT" then
       vim.notify("[NeoAI] 撤销保存需要 root 权限：" .. tostring(res.reason), vim.log.levels.WARN)
     else
-      vim.notify(("[NeoAI] 撤销/重做失败(%s): %s"):format(tostring(res and res.state), tostring(res and res.reason)),
-        vim.log.levels.ERROR)
+      _notify_undo_failure(target.change_set_id, res)
     end
     M.refresh()
   end
@@ -3533,22 +3562,6 @@ end
 --- 资源访问页便捷键：把光标所在条目命中的遮蔽路径加入工作目录列表。
 local function _add_masked_to_workspace()
   local ln = vim.api.nvim_win_get_cursor(0)[1]
-  -- 网络请求页历史行：仅「超时自动拒绝」（用户未应答）支持 `S` 重新允许（本次会话）——
-  -- 补救「用户离开时连接被超时兜底拒绝，回来后无需重跑命令」。
-  local hkey = state.line_to_history and state.line_to_history[ln]
-  if hkey then
-    if value == "allow_session" then
-      if _net_allow_history(hkey) then
-        vim.notify("[NeoAI] 已重新允许该目标（本次会话），后续访问不再询问", vim.log.levels.INFO)
-        _schedule_refresh()
-      else
-        vim.notify("[NeoAI] 该历史行不可重新允许（非超时自动拒绝或已补救）", vim.log.levels.WARN)
-      end
-    else
-      vim.notify("[NeoAI] 该历史行仅支持 S 重新允许（本次会话）", vim.log.levels.INFO)
-    end
-    return
-  end
   local id = state.line_to_hub and state.line_to_hub[ln]
   local entry = id and _hub_get(id)
   local masked = entry and entry.meta and entry.meta.masked

@@ -81,10 +81,17 @@ function M.await(d)
   return out
 end
 
+--- 重置登记状态（测试/热重载）：清空活跃计时器与嵌套等待深度。
+--- 跨套件残留的 `_wait_depth>0`（上一个套件留下了未结算的 `await()`）会让新计时器被
+--- 误暂停，表现为「elapsed 明显小于实际等待」的时序抖动。
+function M.reset()
+  _active = {}
+  _wait_depth = 0
+end
+
 --- 创建可暂停计时器
 --- @return table
-function M.create()
-  local t = {
+function M.create()  local t = {
     running = false,   -- 当前是否在累计
     settled = false,   -- 是否已结束（stop / 超时）
     active = 0,        -- 累计活跃毫秒（剔除暂停期间）

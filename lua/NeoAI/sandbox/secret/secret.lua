@@ -308,7 +308,11 @@ end
 --- `key_separator = "."`、`CONFIGFILE_KEY = 'pyproject.toml'` 会被误登记为原始密钥，
 --- 污染映射表并让后续 `find_real_secret` 子串匹配误拦截命令。
 --- 环境变量名引用（如 `api_key=DASHSCOPE_API_KEY`）同样不是凭据值，须排除。
---- 认定：长度 >= 4，含数字；或长度 >= 8 且含大写 / Base64 特殊字符。
+--- 认定（从严，避免把普通标识符当密钥——`data-key="statusColor"` 曾被误登记并让后续
+--- 提到 `statusColor` 的普通命令被当成密钥泄漏）：
+---   * 含数字；或
+---   * 长度 >= 8 且含 Base64/URL-safe 特殊字符（+/=:）；
+---   * 纯字母：长度 >= 16、大小写混合且熵 >= 4.2（随机口令），**不**按「含大写」放行。
 --- @param value any
 --- @return boolean
 local function looks_like_assigned_secret(value)
@@ -319,8 +323,10 @@ local function looks_like_assigned_secret(value)
   -- 否则 `key = "<F5>"` 会被按名脱敏成 `<V1>`，使工具回传与磁盘字节不一致（幽灵改动错觉）。
   if value:match("^<[%w%-_]+>$") then return false end
   if value:find("%d") then return true end
-  if #value >= 8 and value:find("%u") then return true end
   if #value >= 8 and value:find("[%+/=:]") then return true end
+  if #value >= 16 and value:find("%u") and value:find("%l") and entropy(value) >= 4.2 then
+    return true
+  end
   return false
 end
 
@@ -563,18 +569,22 @@ local function apply_secret_names(text, token_for, known)
     if looks_like_url_or_host(value) then return nil end
     return token_for(value, "env_name:" .. name)
   end
-  text = text:gsub("([%a_][%w_]*)(%s*=%s*)(" .. NAME_VALUE_CHARS .. ")([%(]?)", function(name, sep, value, paren)
+  text = text:gsub("([^%w_]?)([%a_][%w_]*)(%s*=%s*)(" .. NAME_VALUE_CHARS .. ")([%(]?)", function(pre, name, sep, value, paren)
+    -- 复合名（`data-key=…` / `obj.key=…`）不是敏感变量赋值：前缀是 `-`/`.` 时跳过，
+    -- 否则 `data-key="statusColor"` 这类属性选择器会把普通标识符登记成「原始密钥」。
+    if pre == "-" or pre == "." then return nil end
     if paren == "(" then return nil end
     local token = make(name, value)
     if not token then return nil end
-    return name .. sep .. token
+    return pre .. name .. sep .. token
   end)
   -- 带引号赋值（含 JSON `"name": "value"`）：名字/值两侧引号可省略或配对，用反向引用一次
   -- 匹配所有形态。此前对单/双引号各跑两条 gsub（共 4 次全文扫描），大文件时是主要耗时。
-  text = text:gsub("([\"']?)([%a_][%w_]*)%1(%s*[=:]%s*)([\"'])(.-)%4", function(q1, name, sep, q2, value)
+  text = text:gsub("([^%w_]?)([\"']?)([%a_][%w_]*)%2(%s*[=:]%s*)([\"'])(.-)%5", function(pre, q1, name, sep, q2, value)
+    if pre == "-" or pre == "." then return nil end
     local token = make(name, value)
     if not token then return nil end
-    return q1 .. name .. q1 .. sep .. q2 .. token .. q2
+    return pre .. q1 .. name .. q1 .. sep .. q2 .. token .. q2
   end)
   return text
 end
@@ -677,6 +687,9 @@ local state = {
   by_blob = {}, -- binary fake(bytes) -> real(bytes)
   stale_fakes = {}, -- 热重载后残留的 fake（映射缺失 → 不可还原，fail-closed）
   env_secrets = {}, -- 来自环境变量的密钥值（软信号：只 token 化/告警，不终止 Agent）
+  -- 模型自己生成的值（首次出现在 AI 输出/工具参数里，**不是**通过工具从环境/磁盘取到的）：
+  -- 不登记进 `by_secret`（不假化），后续在上下文/参数中再次出现也不触发密钥弹窗。
+  ai_generated = {},
   seq = 0,
   salt = nil,
   traces = {}, -- 留痕：{ event, tool, path, tokens, at }
@@ -747,6 +760,8 @@ end
 local function _register_token(secret, token, rule_name)
   if state.by_secret[secret] then return end
   state.by_secret[secret] = token
+  -- 一旦由环境/工具结果登记为真密钥，就不再按「AI 生成」豁免（保守优先）。
+  state.ai_generated[secret] = nil
   state.by_token[token] = secret
   state.fake_set[token] = true
   state.traces[#state.traces + 1] = { event = "detected", token = token, rule = rule_name, at = os.time() }
@@ -857,6 +872,15 @@ end
 function M.is_allowed(secret)
   if type(secret) ~= "string" or secret == "" then return false end
   return state.allowed[secret] == true
+end
+
+--- 该值是否被判定为「模型自己生成」（首次出现在 AI 输出/工具参数里，不是从环境或磁盘
+--- 通过工具取到的）。这类值不假化、不登记为真密钥，后续出现也不弹窗。
+--- @param value string|nil
+--- @return boolean
+function M.is_ai_generated(value)
+  if type(value) ~= "string" or value == "" then return false end
+  return state.ai_generated[value] == true
 end
 
 --- 本会话放行集合（测试/审计用；返回副本）。
@@ -985,7 +1009,9 @@ function M.detect_named(text)
   return out
 end
 --- @param text string
---- @param opts table|nil { entropy?: boolean, plain_secrets?: string[] } entropy=false 时跳过残余高熵扫描
+--- @param opts table|nil { entropy?: boolean, plain_secrets?: string[], origin?: "ai"|nil }
+---   entropy=false 时跳过残余高熵扫描；`origin="ai"` 表示输出方是**模型自己**（工具参数）：
+---   其中首次出现的候选值登记为「AI 生成」，原样保留（不假化、不当作真密钥）。
 --- @return string tokenized
 --- @return table tokens 本次用到的 token 数组
 function M.tokenize(text, opts)
@@ -1012,6 +1038,18 @@ function M.tokenize(text, opts)
     fakes = scan_opts.fakes
   end
   local out = _scan.process(text, cfg, function(secret, rule_name)
+    -- AI 自己生成的值（工具参数里的首次出现）：登记为「AI 生成」，原样保留。
+    -- 只有**已知**真密钥（`by_secret`，来自环境变量/工具结果）才继续走假化/拦截。
+    if not state.by_secret[secret] and not state.fake_set[secret] then
+      if scan_opts.origin == "ai" then
+        if not state.ai_generated[secret] then
+          state.ai_generated[secret] = true
+          state.traces[#state.traces + 1] = { event = "ai_generated", at = os.time() }
+        end
+        return secret
+      end
+      if state.ai_generated[secret] then return secret end
+    end
     local token = _token_for(secret, rule_name)
     used[#used + 1] = token
     -- 保持 fakes 列表实时更新：本轮新生成的假密钥也要参与「子串排除」，否则其被分隔符
@@ -1834,7 +1872,7 @@ function M.find_real_secret(text, opts)
   if type(text) ~= "string" or text == "" then return nil end
   local skip_env = opts and opts.skip_env
   for secret in pairs(state.by_secret) do
-    if #secret >= 8 and not _is_env_name_secret(secret)
+    if #secret >= 8 and not state.ai_generated[secret] and not _is_env_name_secret(secret)
       -- 地址形态（URL / 域名 / IP）不是凭据：即便历史遗留登记过（旧版本把网址误当密钥），
       -- 也不硬拦截后续提到它的命令。
       and not (_scan.looks_like_url_or_host and _scan.looks_like_url_or_host(secret))
@@ -2015,9 +2053,11 @@ function M.scan_all_async(value)
   end)
 end
 
---- 对工具参数做 token 化（深度遍历字符串；由执行器按 fs_write 规格调用）
+--- 对工具参数做 token 化（深度遍历字符串；由执行器按 fs_write 规格调用）。
+--- `opts.origin="ai"`：参数由模型自己撰写——首次出现的高熵值是「AI 生成」而非端上泄漏，
+--- 原样保留（不假化、不登记为真密钥）；只有已登记的真密钥（环境变量/工具结果）仍被假化。
 --- @param args table
---- @param opts table|nil { entropy?: boolean }
+--- @param opts table|nil { entropy?: boolean, origin?: "ai" }
 --- @return table tokens 用到的 token 数组
 function M.tokenize_args(args, opts)
   local used = {}
@@ -2617,6 +2657,7 @@ function M.reset()
   state.by_blob_real = {}
   state.stale_fakes = {}
   state.env_secrets = {}
+  state.ai_generated = {}
   state.seq = 0
   state.salt = nil
   state.traces = {}

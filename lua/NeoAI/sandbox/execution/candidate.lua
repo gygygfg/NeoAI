@@ -3306,12 +3306,18 @@ end
 -- 包管理器易变索引/缓存（CAS 基线冲突）都不应阻塞其余文件的正常应用。
 
 --- 易变包索引/缓存匹配器（配置 `tools.sandbox.packages.volatile_paths`，支持 `~` 与 glob）。
+--- 另按 `packages.skip_bytecode_cache`（默认开）跳过 Python 字节码缓存（`__pycache__`、`*.pyc`）：
+--- 这些文件由解释器随时重建，冻结进待审只会产生 CAS 冲突与无意义的撤销项。
 --- 结果按配置引用缓存；配置变更时自动重建。
 --- @return function(path) -> boolean
 local function _volatile_matcher()
   local cfg = require("NeoAI.kernel.config_store").get("tools.sandbox.packages") or {}
   local list = cfg.volatile_paths
-  if state.volatile_cache and state.volatile_cache.cfg == list then return state.volatile_cache.fn end
+  local skip_pyc = cfg.skip_bytecode_cache ~= false
+  if state.volatile_cache and state.volatile_cache.cfg == list
+    and state.volatile_cache.skip_pyc == skip_pyc then
+    return state.volatile_cache.fn
+  end
   local roots = {}
   if type(list) == "table" then
     for _, p in ipairs(list) do
@@ -3334,12 +3340,18 @@ local function _volatile_matcher()
     end
   end
   local function under(p, r) return p == r or p:sub(1, #r + 1) == r .. "/" end
+  local function is_bytecode(p)
+    if not skip_pyc then return false end
+    if p:sub(-4) == ".pyc" then return true end
+    return p:find("/__pycache__/", 1, true) ~= nil
+  end
   local fn = function(path)
     if type(path) ~= "string" or path == "" then return false end
+    if is_bytecode(path) then return true end
     for _, r in ipairs(roots) do if under(path, r) then return true end end
     return false
   end
-  state.volatile_cache = { cfg = list, fn = fn }
+  state.volatile_cache = { cfg = list, skip_pyc = skip_pyc, fn = fn }
   return fn
 end
 

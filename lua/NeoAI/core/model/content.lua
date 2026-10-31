@@ -107,14 +107,30 @@ local function _collect_refs(messages)
   return refs
 end
 
---- 计算请求内图像数量/字节预算 offload：超限的最旧图像替换为文本占位
+--- 解析数量上限：`nil`/`0`/负数 = 不限；其余取整。
+--- @param v any
+--- @return number|nil
+local function _count_limit(v)
+  local n = tonumber(v)
+  if n == nil or n <= 0 then return nil end
+  return math.floor(n)
+end
+
+--- 计算请求内图像数量/字节预算 offload：超限的最旧图像替换为文本占位。
+--- 数量配额默认**不限**（`maxImagesPerRequest = 0`）：会话里看图（read_image）不应因条数
+--- 被静默丢弃；仅保留 provider 侧的硬上限 `maxRequestImages` 与字节预算兜底。
 --- @param wire table 已构建的 wire 消息
 --- @param policy table
+--- @return number omitted 被替换为文本占位的图像数
 local function _apply_budget(wire, policy)
-  local max_count = policy.maxImagesPerRequest
-  local max_bytes = policy.maxRequestBytes
+  local max_count = _count_limit(policy.maxImagesPerRequest)
+  local hard_count = _count_limit(policy.maxRequestImages)
+  if hard_count and (not max_count or hard_count < max_count) then max_count = hard_count end
+  local max_bytes = tonumber(policy.maxRequestBytes)
+  if max_bytes and max_bytes <= 0 then max_bytes = nil end
   local count = 0
   local total_bytes = 0
+  local omitted = 0
   for _, m in ipairs(wire) do
     if type(m.content) == "table" then
       for i, part in ipairs(m.content) do
@@ -124,6 +140,7 @@ local function _apply_budget(wire, policy)
           local over_bytes = max_bytes and (total_bytes + b) > max_bytes
           if over_count or over_bytes then
             m.content[i] = { type = "text", text = OFFLOADED_IMAGE_TEXT }
+            omitted = omitted + 1
           else
             count = count + 1
             total_bytes = total_bytes + b
@@ -131,6 +148,27 @@ local function _apply_budget(wire, policy)
         end
       end
     end
+  end
+  return omitted
+end
+
+--- 图像因字节/条数预算被 offload 时的提示（同一进程内限流，避免长会话刷屏）。
+--- 静默丢弃会让模型误以为「工具没生效」：至少要留一条可追溯提示。
+--- @param omitted number
+local _offload_notice_at = 0
+local function _notice_offload(omitted)
+  if omitted <= 0 then return end
+  local now = vim.uv.now()
+  if now - _offload_notice_at < 60000 then return end
+  _offload_notice_at = now
+  local msg = ("[NeoAI] 本轮请求图像预算不足，已省略 %d 张较早的图像（可用 :NeoAI 配置调大 "
+    .. "ai.attachments.request_image.maxRequestBytes）"):format(omitted)
+  pcall(function()
+    require("NeoAI.kernel.logger").warn("[multimodal] %s", msg)
+  end)
+  local ok_ui, uis = pcall(vim.api.nvim_list_uis)
+  if ok_ui and type(uis) == "table" and #uis > 0 then
+    vim.schedule(function() pcall(vim.notify, msg, vim.log.levels.WARN) end)
   end
 end
 
@@ -213,7 +251,8 @@ local function _build_wire(messages, infos, policy)
     end
   end
   flush()
-  _apply_budget(wire, policy or {})
+  local omitted = _apply_budget(wire, policy or {})
+  if omitted and omitted > 0 then _notice_offload(omitted) end
   -- 清理内部字节字段（避免泄漏进 wire JSON）
   for _, m in ipairs(wire) do
     if type(m.content) == "table" then

@@ -488,6 +488,8 @@ local function _capture_snapshot(cand)
       alt_exists = st ~= nil,
       alt_type = st and st.type or nil,
       alt_mode = st and (st.mode % 4096) or nil,
+      -- 原文件大小：供审批界面展示「不可撤销：NN MB > 快照上限」。
+      alt_size = is_file and st.size and st.size or nil,
       alt_content = alt_content,
       alt_blob = alt_blob,
       alt_too_large = too_large or nil,
@@ -504,6 +506,21 @@ end
 local function _store_snapshot(item, entries, operation_id)
   local cap = _snapshot_cap()
   local cas = _snapshot_cas_mode()
+  -- 应用后应写盘的内容哈希（命中候选 `after_hash` 的 sha256 形式，或明文内容）：
+  -- 供撤销 CAS 在 stat 签名变化时回退比较内容（mtime/inode 被外部 touch、包生成的
+  -- `.pyc` 被重新写入等「内容其实没变」的场景不应判成冲突）。均为候选侧已就绪的信息，
+  -- 不额外读盘。
+  local expect_hash = {}
+  for _, f in ipairs(item.files or {}) do
+    if type(f) == "table" and type(f.path) == "string" then
+      local h = f.after_hash
+      if type(h) == "string" and h:sub(1, 7) == "sha256:" then
+        expect_hash[f.path] = h
+      elseif type(f.content) == "string" then
+        expect_hash[f.path] = _sha(f.content)
+      end
+    end
+  end
   for _, e in ipairs(entries) do
     local st = vim.uv.fs_stat(e.path)
     e.disk_exists = st ~= nil
@@ -511,9 +528,11 @@ local function _store_snapshot(item, entries, operation_id)
     if st and st.type == "file" then
       -- 默认用 stat 签名做撤销 CAS（不整读文件，避免应用后逐文件读取+哈希的 CPU 开销）；
       -- 大文件同样用签名。可用 `snapshot_cas="hash"` 恢复逐文件哈希。
+      -- 签名模式下额外记录「期望内容哈希」（已知则零成本），使签名失配时能区分
+      -- 「内容真的变了」与「只是 mtime 变了」。
       if cas == "sig" or (cap > 0 and (st.size or 0) > cap) then
         e.disk_sig = _stat_sig(st)
-        e.disk_hash = nil
+        e.disk_hash = expect_hash[e.path]
       else
         e.disk_hash = _sha(_read_file(e.path) or "")
         e.disk_sig = nil
@@ -625,8 +644,36 @@ function M.undo(id, opts)
   if not rec then
     return { ok = false, state = "FAILED", reason = "SNAPSHOT_NOT_FOUND: " .. tostring(id) }
   end
+  -- 快照不可用（原文件超过快照上限）优先于 CAS 报出：这类条目**天生不可撤销**，
+  -- 报 TARGET_CHANGED 会误导（真实原因是没有保存原文件内容），且逐文件刷屏。
+  local too_large = nil
+  for _, e in ipairs(rec.files or {}) do
+    if e.alt_too_large then
+      too_large = too_large or { path = e.path, size = tonumber(e.alt_size) }
+    end
+  end
+  if too_large then
+    return {
+      ok = false, state = "SNAPSHOT_TOO_LARGE",
+      reason = string.format("%s（%s，超过快照上限 %d MB；可调大 tools.sandbox.review.snapshot_max_bytes 后重新应用）",
+        tostring(too_large.path),
+        too_large.size and string.format("%.1f MB", too_large.size / 1048576) or "大小未知",
+        math.floor(_snapshot_cap() / 1048576)),
+    }
+  end
+  -- 期望的「上次写入内容」哈希（候选侧信息；旧快照无 disk_hash 时也能回退比较内容）。
+  local expect_hash = {}
+  for _, f in ipairs(item.files or {}) do
+    if type(f) == "table" and type(f.path) == "string" then
+      local h = f.after_hash
+      if type(h) == "string" and h:sub(1, 7) == "sha256:" then expect_hash[f.path] = h end
+    end
+  end
   -- 冲突预检：真实文件须仍是上次写入的版本（否则拒绝，避免覆盖外部改动）。
+  -- stat 签名失配时回退比较内容哈希：mtime/inode 被外部工具刷新、包生成的 `.pyc`/`.so`
+  -- 被重新写入（内容未变）不应判成冲突——否则「手动按 u 一直失败」。
   if not opts.force then
+    local cap = _snapshot_cap()
     for _, e in ipairs(rec.files or {}) do
       local st = vim.uv.fs_stat(e.path)
       local exists = st ~= nil
@@ -635,24 +682,35 @@ function M.undo(id, opts)
         if (st.type == "file") ~= (e.disk_type == "file") then
           ok = false
         elseif st.type == "file" then
-          if e.disk_sig then
-            ok = (_stat_sig(st) == e.disk_sig)
+          local sig_ok = e.disk_sig and (_stat_sig(st) == e.disk_sig)
+          if sig_ok then
+            ok = true
           else
-            ok = (_sha(_read_file(e.path) or "") == e.disk_hash)
+            -- 内容比较：仅在文件不大于快照上限时读取（避免为 GB 级文件做全量读取）。
+            local size = st.size or 0
+            local readable = (cap <= 0) or (size <= cap)
+            local expect = e.disk_hash or expect_hash[e.path]
+            if readable and expect then
+              local cur = _read_file(e.path)
+              ok = (cur ~= nil and _sha(cur) == expect)
+              if ok then e.disk_sig = _stat_sig(st) end -- 内容一致：刷新签名，后续撤销不再误判
+            else
+              ok = false
+            end
           end
         end
       end
       if not ok then
-        return { ok = false, state = "CONFLICT", reason = "TARGET_CHANGED: " .. tostring(e.path) }
+        return {
+          ok = false, state = "CONFLICT",
+          reason = "TARGET_CHANGED: " .. tostring(e.path) .. "（应用后真实文件又被改动，无法安全回滚）",
+        }
       end
     end
   end
   local writer = require("NeoAI.sandbox.execution.writer")
   local cas = _snapshot_cas_mode()
   for _, e in ipairs(rec.files or {}) do
-    if e.alt_too_large then
-      return { ok = false, state = "FAILED", reason = "SNAPSHOT_TOO_LARGE: " .. tostring(e.path) }
-    end
     -- 交换前记录当前（保存侧）版本，交换后成为新的快照侧。
     local st = vim.uv.fs_stat(e.path)
     local cur_exists = st ~= nil
@@ -1686,6 +1744,7 @@ local function _snapshot_entry_worker(payload)
     exists = st ~= nil,
     type = st and st.type or nil,
     mode = st and (st.mode % 4096) or nil,
+    size = st and st.size and st.size or nil,
     too_large = too_large or false,
     blob = copied and blob or nil,
     content = content,
@@ -1719,6 +1778,7 @@ local function _capture_snapshot_async(cand)
         alt_exists = r.exists == true,
         alt_type = r.type,
         alt_mode = r.mode,
+        alt_size = r.size,
         alt_content = r.content,
         alt_blob = r.blob,
         alt_too_large = r.too_large or nil,

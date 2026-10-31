@@ -222,6 +222,43 @@ tests.suite("net_consent", function(_, it)
     nc.reset()
   end)
 
+  it("弹窗选择会话允许：决策内同步记账并广播（窗口立即可见，不依赖调用方）", function(t)
+    local nc = require("NeoAI.sandbox.net.net_consent")
+    local hub = require("NeoAI.sandbox.review.approval_hub")
+    local bus = require("NeoAI.kernel.event_bus")
+    local events = require("NeoAI.kernel.events")
+    nc.reset()
+    hub.reset()
+    hub.set_ui({ refresh = function() end })
+    local changes = 0
+    local seen_at_event = nil
+    local un = bus.on(events.SANDBOX_APPROVAL_CHANGED, function(p)
+      if p and p.page == "network" then
+        changes = changes + 1
+        -- 关键回归：窗口刷新由该事件触发，事件到达时「本会话已允许」必须已经可见。
+        seen_at_event = #nc.list_allowances()
+      end
+    end)
+    nc.set_ui({ show = function(_, decide) decide("allow_session") end })
+    local owner = { comm = "postgres", pid = 4242, exe = "/usr/bin/postgres" }
+    local decision
+    nc.request({ host = "127.0.0.1", port = 5432, local_ = true, owner = owner, owner_resolved = true })
+      :then_(function(v) decision = v end)
+    t.true_(vim.wait(1000, function() return decision ~= nil end), "请求应 resolve")
+    -- 决策内已记账：无需调用方（host_proxy 的延迟回调）再调 allow_session。
+    local allow = nc.list_allowances()
+    t.eq(1, #allow, "会话允许应立即出现在「本会话已允许」")
+    t.matches("127%.0%.0%.1:5432", allow[1].key, "key 应含目标")
+    t.true_(nc.is_session_allowed("127.0.0.1", 5432, owner), "应记住会话允许")
+    t.true_(changes >= 1, "应广播 SANDBOX_APPROVAL_CHANGED(page=network) 触发窗口重绘")
+    t.eq(1, seen_at_event, "广播时「本会话已允许」应已含该条目（重绘不会读到空列表）")
+    un()
+    nc.set_ui(nil)
+    nc.reset()
+    hub.set_ui(nil)
+    hub.reset()
+  end)
+
   it("决策历史与本会话允许可撤销", function(t)
     local nc = require("NeoAI.sandbox.net.net_consent")
     nc.reset()

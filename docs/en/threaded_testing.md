@@ -104,7 +104,7 @@ falls back to the old serial channel.
 | MCP | `mcp_client`, `mcp_transport`, `mcp_bridge`, `mcp_cache` |
 | Skills / Herder | `skills`, `herder`, `herder_install` |
 | Sandbox (incl. grants / replay / observation / network consent) | `sandbox_ai_audit`, `sandbox_background`, `sandbox_boundary_consistency`, `sandbox_boundary_escape`, `sandbox_boundary_net`, `sandbox_conflict_ai`, `sandbox_core`, `sandbox_governance`, `sandbox_hardening`, `sandbox_instance`, `sandbox_loss_audit`, `sandbox_lost_update`, `sandbox_lsp`, `sandbox_maintscript`, `sandbox_merge`, `sandbox_mountview`, `sandbox_namespace`, `sandbox_ops`, `sandbox_overlay_invalidate`, `sandbox_package_signature`, `sandbox_privdrop`, `sandbox_privilege`, `sandbox_publish_async`, `sandbox_review`, `sandbox_script_scan`, `sandbox_secret`, `sandbox_service`, `sandbox_session`, `sandbox_shims`, `sandbox_staging`, `sandbox_symlink`, `sandbox_systemd`, `sandbox_systemd_user`, `sandbox_view`, `grant`, `replay`, `observer`, `review_cache`, `net_consent`, `gateway` |
-| Secret guard | `secret_async`, `secret_fake`, `secret_highlight` |
+| Secret guard | `secret_async`, `secret_fake`, `secret_highlight`, `secret_provenance` |
 | Test framework / infrastructure | `test_runner`, `parallel_runner`, `integration`, `http`, `async`, `timer`, `work_codec` |
 
 ## 4. Running headless

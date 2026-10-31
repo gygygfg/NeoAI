@@ -498,6 +498,22 @@ function M.run_all(...)
         pcall(function()
           require("NeoAI.kernel.config_store").load({})
           require("NeoAI.kernel.plugins").start_all()
+          -- 计时器登记（`_active`/`_wait_depth`）是模块级全局态：上一个套件若留下未结算的
+          -- `timer.await`，会把后续套件的计时器误暂停，造成时序用例抖动。
+          require("NeoAI.utils.timer").reset()
+        end)
+        -- 服务注册兜底：个别套件为构造「无服务」场景会 `services.revoke(...)` 且不恢复
+        -- （如 signal_unsub 撤销 services.sandbox、chat_ui 撤销 services.chat_service）。
+        -- 插件宿主对已启动插件的 start_all 是幂等的，不会重新 provide，导致同分片后续套件
+        -- 全部报「服务未初始化」。这里按 catalog 把缺失的插件服务重新登记回来。
+        pcall(function()
+          local services = require("NeoAI.kernel.services")
+          for _, spec in ipairs(require("NeoAI.plugins.catalog").build_specs()) do
+            if spec.service and not services.has(spec.service) then
+              local ok, mod = pcall(require, spec.module)
+              if ok and mod then services.provide(spec.service, mod) end
+            end
+          end
         end)
         pcall(function() require("NeoAI.tools").reload_tools() end)
       end

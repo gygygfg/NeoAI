@@ -55,10 +55,14 @@ local function _read_file(path)
   return c
 end
 
---- 快照单文件内容上限（与候选同源配置，避免删除大文件时读入/落盘巨量内容）
+--- 快照单文件内容上限（撤销保存需要保存原文件内容；超过则不落盘 → 该条目不可撤销）。
+--- 优先读独立配置 `tools.sandbox.review.snapshot_max_bytes`（<=0 / 未配置时回退
+--- `max_file_bytes`，兼容旧行为）。独立配置默认可覆盖到 64MB，使 pip 安装的 .so 等大文件可撤销。
 --- @return number
 local function _snapshot_cap()
-  local n = tonumber(require("NeoAI.kernel.config_store").get("tools.sandbox.max_file_bytes"))
+  local cfg = require("NeoAI.kernel.config_store")
+  local n = tonumber(cfg.get("tools.sandbox.review.snapshot_max_bytes"))
+  if n == nil or n <= 0 then n = tonumber(cfg.get("tools.sandbox.max_file_bytes")) end
   if n == nil then return 8 * 1024 * 1024 end
   return n
 end

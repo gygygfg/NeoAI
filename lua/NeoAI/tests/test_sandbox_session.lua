@@ -893,6 +893,113 @@ tests.suite("sandbox_session", function(_, it)
     end)
   end)
 
+  it("撤销保存：原文件超过 max_file_bytes 仍可撤销（snapshot_max_bytes 独立上限）", function(t)
+    local fs = require("NeoAI.utils.fs")
+    local sandbox = require("NeoAI.sandbox")
+    local base = string.rep("A", 64 * 1024) .. "\n"
+    with_config({
+      tools = { approval = { mode = "auto_allow" }, sandbox = {
+        mode = "dry_run",
+        max_file_bytes = 1024, -- 候选内容上限（与撤销快照解耦）
+        review = { enabled = true, snapshot_max_bytes = 1024 * 1024 },
+      } },
+    }, function()
+      sandbox.reset()
+      local p = vim.fn.tempname() .. "_undo_big.txt"
+      fs.write_file(p, base)
+      local done = false
+      require("NeoAI.tools").execute("edit_file", {
+        file_path = p, mode = "write", content = "next\n", description = "t",
+      }, {}):then_(function()
+        local items = sandbox.list_reviews({ review_state = "PENDING" })
+        t.eq(1, #items, "应有 1 个待审单元")
+        local id = items[1].change_set_id
+        local res = sandbox.apply(id, { auto_approve = true })
+        t.true_(res.ok, tostring(res.reason))
+        local saved = sandbox.list_saved()
+        t.eq(1, #saved, "应有 1 个已保存项")
+        t.eq(nil, saved[1].undo_block, "64KB 原文件在独立快照上限内，应可撤销")
+        local u = sandbox.undo(id)
+        t.true_(u.ok, "撤销应成功: " .. tostring(u.reason))
+        t.eq(#base, #fs.read_file(p), "撤销后应恢复原文件大小")
+        t.eq(base, fs.read_file(p), "撤销后应恢复原内容")
+        done = true
+      end, function(e) t.true_(false, tostring(e and e.message or e)); done = true end)
+      t.true_(vim.wait(8000, function() return done end), "应完成")
+      fs.delete_file(p)
+    end)
+  end)
+
+  it("撤销保存：快照超限时返回 SNAPSHOT_TOO_LARGE（不误报 TARGET_CHANGED，且事前标记 undo_block）", function(t)
+    local fs = require("NeoAI.utils.fs")
+    local sandbox = require("NeoAI.sandbox")
+    with_config({
+      tools = { approval = { mode = "auto_allow" }, sandbox = {
+        mode = "dry_run",
+        max_file_bytes = 64 * 1024,
+        review = { enabled = true, snapshot_max_bytes = 1024 },
+      } },
+    }, function()
+      sandbox.reset()
+      local p = vim.fn.tempname() .. "_undo_toolarge.txt"
+      local base = string.rep("B", 8 * 1024) .. "\n"
+      fs.write_file(p, base)
+      local done = false
+      require("NeoAI.tools").execute("edit_file", {
+        file_path = p, mode = "write", content = "next\n", description = "t",
+      }, {}):then_(function()
+        local id = sandbox.list_reviews({ review_state = "PENDING" })[1].change_set_id
+        t.true_(sandbox.apply(id, { auto_approve = true }).ok, "应用应成功")
+        local saved = sandbox.list_saved()
+        t.eq(1, #saved)
+        t.not_nil(saved[1].undo_block, "应在条目上事前标记不可撤销")
+        t.eq("SNAPSHOT_TOO_LARGE", saved[1].undo_block.reason)
+        t.matches("_undo_toolarge", tostring(saved[1].undo_block.files[1].path), "应标明超限文件")
+        -- 触碰真实文件（mtime 变化）：真实原因是快照超限，不应报 TARGET_CHANGED。
+        pcall(vim.uv.fs_utime, p, nil, os.time() + 10)
+        local u = sandbox.undo(id)
+        t.false_(u.ok, "不可撤销条目撤销应失败")
+        t.eq("SNAPSHOT_TOO_LARGE", u.state, "应报 SNAPSHOT_TOO_LARGE，而不是 TARGET_CHANGED")
+        t.matches("snapshot_max_bytes", tostring(u.reason), "应给出可操作的配置提示")
+        t.eq("next", (tostring(fs.read_file(p)):gsub("%s+$", "")), "失败时不应改动真实文件")
+        done = true
+      end, function(e) t.true_(false, tostring(e and e.message or e)); done = true end)
+      t.true_(vim.wait(8000, function() return done end), "应完成")
+      fs.delete_file(p)
+    end)
+  end)
+
+  it("撤销保存：仅 mtime 变化（内容未变）不误判 TARGET_CHANGED", function(t)
+    local fs = require("NeoAI.utils.fs")
+    local sandbox = require("NeoAI.sandbox")
+    with_config({
+      tools = { approval = { mode = "auto_allow" }, sandbox = {
+        mode = "dry_run", review = { enabled = true },
+      } },
+    }, function()
+      sandbox.reset()
+      local p = vim.fn.tempname() .. "_undo_touch.txt"
+      fs.write_file(p, "base\n")
+      local done = false
+      require("NeoAI.tools").execute("edit_file", {
+        file_path = p, mode = "write", content = "next\n", description = "t",
+      }, {}):then_(function()
+        local id = sandbox.list_reviews({ review_state = "PENDING" })[1].change_set_id
+        t.true_(sandbox.apply(id, { auto_approve = true }).ok, "应用应成功")
+        local st = vim.uv.fs_stat(p)
+        t.not_nil(st, "文件应存在")
+        -- 只改 mtime，内容保持与「上次写入」一致（模拟 .pyc 重建 / 外部 touch）。
+        pcall(vim.uv.fs_utime, p, nil, (st.mtime.sec or os.time()) + 10)
+        local u = sandbox.undo(id)
+        t.true_(u.ok, "内容未变时不应判冲突: " .. tostring(u.reason))
+        t.eq("base", (tostring(fs.read_file(p)):gsub("%s+$", "")), "撤销后应恢复原内容")
+        done = true
+      end, function(e) t.true_(false, tostring(e and e.message or e)); done = true end)
+      t.true_(vim.wait(8000, function() return done end), "应完成")
+      fs.delete_file(p)
+    end)
+  end)
+
   it("临时根（ephemeral_roots）：/tmp 写入不产生待审候选、不落真实盘、读取一致", function(t)
     local fs = require("NeoAI.utils.fs")
     local sandbox = require("NeoAI.sandbox")

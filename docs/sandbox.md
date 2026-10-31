@@ -438,7 +438,13 @@ token（`NEOKEY_…`）或格式保真假密钥时**拒绝写盘**（`SECRET_TOK
   - **应用与撤销按文件复制、快照磁盘化**：应用前把真实文件**复制到 blob**（`_capture_snapshot`）
     作为撤销快照，撤销时按文件复制回写——不再把原文件内容嵌入快照 JSON 或常驻内存；撤销 CAS
     默认用 mtime/size 签名（`tools.sandbox.review.snapshot_cas="sig"`，省去应用后逐文件读取+哈希的
-    CPU；`"hash"` 恢复最强一致性）。
+    CPU；`"hash"` 恢复最强一致性）；**签名失配时回退比较内容哈希**（候选 `after_hash` 已知时），
+    仅 mtime/inode 变化（`touch`、包重写 `.pyc`）不再误判 `TARGET_CHANGED`。
+  - **快照上限与「不可撤销」标记**：撤销快照的单文件上限独立于候选内容上限，取
+    `tools.sandbox.review.snapshot_max_bytes`（默认 64MB；`<=0` 回退 `max_file_bytes`）。超过上限的
+    原文件不保存内容 → 该变更单元**不可撤销**：审批界面「已应用」行事前标
+    `⚠ 不可撤销：<file> <size> 超过快照上限`，按 `u` 返回 `SNAPSHOT_TOO_LARGE`（WARN + 去重，不再
+    逐次刷 ERROR），提示调大该项后重新应用。适用于 pip/apt 安装的数十 MB `.so` 等大文件回滚。
   - **终态项有界淘汰**：`tools.sandbox.review.terminal_cache_max`（默认 200）限制内存中保留的
     已拒绝/已被取代（REJECTED/SUPERSEDED/EXPIRED）变更单元；超限项从内存移除，`get`/`list`
     按需从磁盘回读（数据不丢）。APPLIED/REVERTED 保留（撤销列表依赖）。
@@ -638,7 +644,9 @@ token（`NEOKEY_…`）或格式保真假密钥时**拒绝写盘**（`SECRET_TOK
     - **网络请求页**：除**待批准**（阻塞）外追加两段——**「本会话已允许（可撤销）」**列出本会话内
       以「本次会话允许」放行的目标（按「端口 + 服务进程」颗粒度），光标落在该行按 `d` **撤销**
       （撤销后该目标下次访问重新询问，并追加一条「已撤销」历史）；**「历史」**展示已结束决策
-      （单次允许 / 拒绝 / 已撤销），含服务身份与时间。该页两处**去重**：
+      （单次允许 / 拒绝 / 已撤销），含服务身份与时间。**会话允许在决策内同步记账并广播**
+      `sandbox:approval_changed{page="network"}`：不必等调用方（`host_proxy` 的延迟回调）补记，
+      窗口重绘时「本会话已允许」区一定已含该条目（避免「允许了但窗口里没有条目」）。该页两处**去重**：
       - **待批准去重**：同一目标（`host:port@<服务进程>`）的并发/重复请求在审批中心**合并为一条**
         （条目附「×N 个请求」，`approval_hub` 的 `dedupe_key`），一次决策让所有挂起连接一起生效——
         避免同一目标刷出多行要逐个点，也避免「弹窗被后一个请求替换后前一个无人决策、一直挂到超时」；
@@ -702,6 +710,8 @@ token（`NEOKEY_…`）或格式保真假密钥时**拒绝写盘**（`SECRET_TOK
      `/var/cache/apt` 等），仅对包安装候选生效。这些文件由包管理器随时重新生成，应用时基线
      往往已变化，会触发 `CONFLICT/BASELINE_CHANGED`；剔除不影响安装效果
      （`/var/lib/dpkg/status`、包文件等仍应用），宿主可自行 `apt update` 重建索引。
+     另按 `packages.skip_bytecode_cache`（默认开）跳过 Python 字节码缓存（`__pycache__/**`、
+     `*.pyc`）：解释器随时重建，`.py` 源码与 `.dist-info` 仍正常入队。
   3. **NeoAI 自身运行时/状态路径**——`<stdpath cache>/NeoAI`、`<stdpath state>/NeoAI`、
      `<stdpath data>/NeoAI`，以及可配置的 `log.path`、`tools.sandbox.workspace_root`（涵盖日志、
      会话、缓存、沙箱 store 等）。这些位于用户工作区之外且由插件**持续写入**（日志实时增长），
@@ -2565,6 +2575,15 @@ UI 未注册但为**交互式 Neovim** 时，回退到内建 `confirm` **暂停�
   （`pyproject.toml`）、路径/URL（`/root/...`）不作为凭据登记——否则源码里的
   `'password': 'bar'`、`key_separator = "."`、`CONFIGFILE_KEY = 'pyproject.toml'` 会被误登记为
   「原始密钥」，污染映射表并让后续含该片段的命令/上下文被 `find_real_secret` 子串匹配误拦截。
+  **纯字母值须「长 + 大小写混合 + 熵 ≥ 4.2」（≥16 字符）**才认定，普通驼峰标识符
+  （`statusColor`、`fontFamily`）不再被当作密钥。
+  **复合名不参与按名脱敏**：赋值名前置 `-`/`.` 时跳过（`data-key="statusColor"`、`obj.key=…`、
+  `el.dataset.key=…`），避免把 HTML/JS 属性选择器里的普通值登记成「原始密钥」。
+- **AI 自己生成的值自动放行**：模型输出/工具参数里的高熵串，若**首次**出现在 AI 撰写的参数中
+  （`tokenize_args(..., { origin="ai" })`）且不是已知真密钥，则登记为 `ai_generated`，
+  **原样保留**（不假化、不进入 `by_secret`）。之后它再次出现在上下文/参数里也不触发
+  `SANDBOX_SECRET_BLOCKED` / 告警弹窗——它不是从环境或磁盘取到的凭据。反之，环境变量与
+  工具结果里的真密钥仍正常登记保护；同一值一旦由环境/工具登记，AI 生成豁免即失效（保守优先）。
 - `allowlist` 可再加 Lua pattern 排除。参数见
   [configuration.md](configuration.md) 的 `tools.sandbox.secrets`。
 

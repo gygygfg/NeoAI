@@ -550,24 +550,23 @@ ai = {
     media_types = { "image/png", "image/jpeg", "image/webp", "image/gif" },
     limits = {
       max_image_bytes = 20 * 1024 * 1024,
-      max_images_per_message = 16,
-      max_message_image_bytes = 40 * 1024 * 1024,
       max_image_pixels = 50000000,
       max_image_dimension = 8000,
     },
     request_image = {
       max_pixels = 640000, -- 单请求图像像素预算
       max_bytes = 1024 * 1024, -- 单请求图像编码字节上限
-      max_images_per_request = 8, -- 单请求最多保留图像（超出丢最旧）
+      max_images_per_request = 0, -- 单请求图像条数：0 = 不限（连续 read_image 看图不再丢最旧）
       max_request_bytes = 20 * 1024 * 1024,
+      max_request_images = 600, -- provider 侧硬上限（最终兜底）
     },
   },
 }
 ```
 
 > 图像内容寻址存储于 `attachments.path`，会话消息只保存不可变引用；发送请求时才解析为
-> `image_url`（data URL）按模型 route 的像素/字节预算注入，超限的**最旧**图像被替换为
-> 文本占位。模型不支持图像时自动降级，不阻塞调用。
+> `image_url`（data URL）按模型 route 的像素/字节预算注入，**仅当字节预算不足时**才把**最旧**图像
+> 替换为文本占位（条数默认不限）。模型不支持图像时自动降级，不阻塞调用。
 
 ### lualine 状态栏集成
 

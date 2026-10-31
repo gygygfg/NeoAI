@@ -61,9 +61,10 @@ attachments = {
   assume_vision = true,          -- 未知模型默认放行（软门禁）；false 回退旧的保守行为
   vision_model_heuristics = { "vision", "-vl", "4o", "gemini" }, -- 按 id 子串识别视觉模型
   media_types = { "image/png", "image/jpeg", "image/webp", "image/gif" },
-  limits = { maxImageBytes=20MB, maxImagesPerMessage=16, maxMessageImageBytes=40MB,
-             maxImagePixels=50M, maxImageDimension=8000 },
-  request_image = { maxPixels=640000, maxBytes=1MB, maxImagesPerRequest=8,
+  limits = { maxImageBytes=20MB, maxImagePixels=50M, maxImageDimension=8000 },
+  -- maxImagesPerRequest=0：单请求图像条数**不限**（会话中连续 read_image 看图不会被丢最旧）；
+  --   仍受 maxRequestImages（provider 硬上限）与 maxRequestBytes（字节预算）兜底。
+  request_image = { maxPixels=640000, maxBytes=1MB, maxImagesPerRequest=0,
                     maxRequestBytes=20MB, maxRequestImages=600 },
 }
 ```
@@ -638,6 +639,10 @@ sandbox = {
   --     最新内容重做）。仅普通文本 modify 文件生效；二进制/大文件/软链/目录创建删除仍走 CAS。
   --     merge=false 回退原「基线变了即整体拒绝」。merge_max_bytes=null 沿用 max_file_bytes。
   --   snapshot_cas：撤销保存的快照 CAS "sig"（默认，签名，省 CPU）|"hash"（内容哈希，最严）。
+  --     签名失配时会回退比较内容哈希（已知时）：仅 mtime/inode 变化（touch、包重写 .pyc）
+  --     不再误判 TARGET_CHANGED。
+  --   snapshot_max_bytes：撤销保存的原文件快照单文件上限（默认 64MB；<=0 沿用 max_file_bytes）。
+  --     超限文件不保存原内容 → 该变更单元不可撤销（审批窗标「不可撤销」并提示调大本项）。
   review = { enabled = true, auto_apply = false, session_auto_approve = false,
              max_display_files = 200, args_max_chars = 2000, max_display_notes = 50,
              refresh_debounce_ms = 80,
@@ -645,7 +650,7 @@ sandbox = {
              terminal_cache_max = 200, rejected_max = 50,
              rejected_dir = "/tmp/neoai-rejected", cas_mode = "hash",
              merge = true, merge_max_bytes = nil,
-             snapshot_cas = "sig",
+             snapshot_cas = "sig", snapshot_max_bytes = 64 * 1024 * 1024,
              l3_warning = { enabled = true, package_confirm = true, max_tokens = 256, timeout_ms = 15000 },
              ai_audit = { enabled = true, auto = false, key = "a", max_concurrent = 10,
                           max_diff_chars = 8000, max_user_chars = 4000, max_total_chars = 60000,
@@ -683,12 +688,13 @@ sandbox = {
     managers = { "apt", "apt-get", "pip", "pip3", "uv", "conda", "npm", "npx", "pnpm", "yarn", "go", "cargo", "gem", "composer" }, -- 包管理器名单（命令识别）；改动路径特征见 privilege.package_path_manager；敏感安装判定见 privilege.package_sensitive
     roots = { "/usr", "/var", "/etc", "~/.cache", "~/.npm", "~/.nvm", "~/.cargo", "~/.rustup", "~/go", "~/.local" }, -- 包安装可写根（overlay 暂存）。/etc 供 dpkg postinst 写 /etc/ld.so.cache 等；敏感条目仍由 mask_paths 遮蔽
     volatile_paths = { "/var/lib/apt/lists", "/var/cache/apt", "/var/cache/dnf", "/var/cache/yum", "/var/cache/pacman/pkg", "/var/cache/apk", "~/.cache/pip", "~/.cache/uv", "~/.npm/_cacache", "~/.cache/yarn", "~/.cargo/registry/cache", "~/.cache/go-build" }, -- 易变包索引/缓存：冻结候选时跳过（不待审、不发布），避免 apt update 后基线变化触发 BASELINE_CHANGED 使整个安装失败；不影响安装效果（dpkg/status、包文件仍应用）；{} 关闭。勿放 /var/lib/dpkg/status 等状态文件
+    skip_bytecode_cache = true, -- 跳过 Python 字节码缓存（`__pycache__/**`、`*.pyc`）：包安装/导入时随时重建，冻结进待审只会带来 CAS 冲突与无意义撤销项；.py 源码与 .dist-info 仍正常入队
     cap_add = { "CAP_DAC_OVERRIDE", "CAP_CHOWN", "CAP_SETUID", "CAP_SETGID", "CAP_FOWNER" },
     unmask = { "/etc/passwd", "/etc/group", "/etc/shadow", "/etc/shadow-", "/etc/gshadow", "/etc/gshadow-" }, -- 包安装期间解除账户库遮蔽：dpkg postinst 的 adduser/useradd/su 子进程需读写账户库；写入仍进 overlay 暂存、需审批发布
     apt_sandbox_user = "root", -- apt 系列：注入 APT::Sandbox::User（默认 "root" 关闭 apt 自身的 `_apt` 降权，避免嵌套 userns/受限容器中 setgroups EPERM 使 apt update/install 失败）；"_apt" 或空串保留 apt 默认行为
   },
   lsp_overlay = { enabled = true, idle_timeout_ms = 600000 }, -- AI 专用沙箱 LSP：AI 的 lsp_* 工具克隆的 server 读暂存内容（默认开，仅 bwrap+overlay；不可用时回退编辑器客户端）。克隆体在最后一次调用后保活 idle_timeout_ms（默认 10 分钟）再自动关闭，期间后续诊断/查询无需等待 server 重启；设 0/负数则永不空闲回收
-  secrets = { enabled = true, min_length = 20, max_length = 200, min_entropy = 3.5, min_distinct = 8, exclude_pure_hex = true, exclude_uuid = true, entropy_skip_urls = true, entropy_requires_context = true, entropy_secret_paths_only = true, generated_scan_max_bytes = 2097152, generated_scan_max_files = 200, tokenize_env = true, binary_fake = true, disclose_fakes = false, flow_tracking = true, alert = { enabled = true, timeout_ms = 0 }, trusted_services = {}, auto_trust_providers = true, extra_rules = {}, allowlist = {} }, -- 密钥/敏感信息防护：熵检测 + 具名规则（私钥块/AKIA/ghp_/sk-/JWT/Bearer…）+ **格式保真假密钥**（同长度/同字符类/熵不低于原始；进程内映射表不落盘）；env 名含 KEY/TOKEN/SECRET/PASSWORD/CREDENTIAL 的值无视熵强制假化；裸熵串须含 -/_ 且非代码标识符（snake_case 函数/常量名）或处于敏感名上下文；exclude_uuid=true 排除 UUID（请求 ID/webhook 路径段等标识符），entropy_skip_urls=true 让通用熵扫描跳过 URL/域名/IP 片段（网址与 IP 是地址不是凭据，误判会导致后续提到该地址的命令被硬拦截；具名规则/敏感名赋值/已知环境变量密钥仍作用于 URL 内部）；非敏感名且值含 / 的环境变量只按具名规则处理（不破坏 PATH/LD_LIBRARY_PATH 等）；entropy_secret_paths_only=true 时全文熵扫描仅对疑似密钥文件执行。**假密钥**出现在工具参数/AI 上下文时警告用户（不阻断）；**真实密钥**出现时立即停止 Agent 并弹窗，用户确认后才继续（headless 无 UI 时失败关闭）。binary_fake=true 时敏感二进制密钥文件（.p12/.pfx/keystore/raw key）被读取/暂存时用同长度随机字节假化（base64 标记传输，落盘/执行时精确还原）。flow_tracking=true 时记录假密钥来源与所有流经点（工具/命令/环境变量/落盘），命令/脚本加密等不可逆变换产生的派生文件标记「不透明派生」并在发布前强制人工确认。trusted_services 为出网白名单（精确主机/`*.suffix`/IP/CIDR）：向白名单发送密钥不弹窗也不警告；auto_trust_providers=true 时已配置的模型供应商 base_url 主机自动信任；disclose_fakes=true 时向 AI 披露「这是假密钥」（默认不披露以保持格式保真）
+  secrets = { enabled = true, min_length = 20, max_length = 200, min_entropy = 3.5, min_distinct = 8, exclude_pure_hex = true, exclude_uuid = true, entropy_skip_urls = true, entropy_requires_context = true, entropy_secret_paths_only = true, generated_scan_max_bytes = 2097152, generated_scan_max_files = 200, tokenize_env = true, binary_fake = true, disclose_fakes = false, flow_tracking = true, alert = { enabled = true, timeout_ms = 0 }, trusted_services = {}, auto_trust_providers = true, extra_rules = {}, allowlist = {} }, -- 密钥/敏感信息防护：熵检测 + 具名规则（私钥块/AKIA/ghp_/sk-/JWT/Bearer…）+ **格式保真假密钥**（同长度/同字符类/熵不低于原始；进程内映射表不落盘）；env 名含 KEY/TOKEN/SECRET/PASSWORD/CREDENTIAL 的值无视熵强制假化；裸熵串须含 -/_ 且非代码标识符（snake_case 函数/常量名）或处于敏感名上下文；exclude_uuid=true 排除 UUID（请求 ID/webhook 路径段等标识符），entropy_skip_urls=true 让通用熵扫描跳过 URL/域名/IP 片段（网址与 IP 是地址不是凭据，误判会导致后续提到该地址的命令被硬拦截；具名规则/敏感名赋值/已知环境变量密钥仍作用于 URL 内部）；非敏感名且值含 / 的环境变量只按具名规则处理（不破坏 PATH/LD_LIBRARY_PATH 等）；entropy_secret_paths_only=true 时全文熵扫描仅对疑似密钥文件执行。**假密钥**出现在工具参数/AI 上下文时警告用户（不阻断）；**真实密钥**出现时立即停止 Agent 并弹窗，用户确认后才继续（headless 无 UI 时失败关闭）。binary_fake=true 时敏感二进制密钥文件（.p12/.pfx/keystore/raw key）被读取/暂存时用同长度随机字节假化（base64 标记传输，落盘/执行时精确还原）。flow_tracking=true 时记录假密钥来源与所有流经点（工具/命令/环境变量/落盘），命令/脚本加密等不可逆变换产生的派生文件标记「不透明派生」并在发布前强制人工确认。trusted_services 为出网白名单（精确主机/`*.suffix`/IP/CIDR）：向白名单发送密钥不弹窗也不警告；auto_trust_providers=true 时已配置的模型供应商 base_url 主机自动信任；disclose_fakes=true 时向 AI 披露「这是假密钥」（默认不披露以保持格式保真）；**AI 自己生成的值**（首次出现在模型输出/工具参数、不是环境或工具结果取到的）自动放行：不假化、不登记为真密钥、后续出现也不弹窗（同一值若之后由环境/工具登记则恢复保护）
   retention = { candidate_days = 7, max_pending = 20 },
   policy = {
     version = "1",                 -- 策略版本（用于审计回放；规则变更时递增）

@@ -822,6 +822,12 @@ tests.suite("sandbox_secret", function(_, it)
     fs.ensure_dir(volatile_dir)
     local volatile_file = volatile_dir .. "/Packages"
     local normal = dir .. "/normal.txt"
+    -- Python 字节码缓存：包安装/导入时随时重建，冻结时应跳过（默认开启）。
+    local pyc_dir = dir .. "/pkg/__pycache__"
+    fs.ensure_dir(pyc_dir)
+    local pyc_file = pyc_dir .. "/mod.cpython-313.pyc"
+    local loose_pyc = dir .. "/pkg/legacy.pyc"
+    local module_py = dir .. "/pkg/mod.py"
     with_config({
       tools = { sandbox = {
         workspace_root = vim.fn.tempname() .. "/sb",
@@ -842,16 +848,22 @@ tests.suite("sandbox_secret", function(_, it)
       stage(unmasked, "allowed\n")
       stage(volatile_file, "index\n")
       stage(normal, "ok\n")
+      stage(pyc_file, "pyc\n")
+      stage(loose_pyc, "pyc\n")
+      stage(module_py, "print(1)\n")
       local cand = candidate.finish(a.attempt_id)
       local paths = {}
       for _, f in ipairs(cand.files) do paths[f.path] = true end
       t.nil_(paths[masked], "遮蔽文件应被剔除")
       t.nil_(paths[volatile_file], "易变包缓存应被剔除")
+      t.nil_(paths[pyc_file], "__pycache__ 内的 .pyc 应被剔除")
+      t.nil_(paths[loose_pyc], "散落的 .pyc 应被剔除")
+      t.not_nil(paths[module_py], "同一目录下的 .py 源码应保留")
       t.not_nil(paths[normal], "普通文件应保留")
       t.not_nil(paths[unmasked], "被 unmask 放行的遮蔽文件应保留")
       t.not_nil(cand.dropped, "应记录剔除信息")
       t.eq(1, cand.dropped.masked, "应记录剔除的遮蔽文件数")
-      t.eq(1, cand.dropped.volatile, "应记录剔除的易变缓存数")
+      t.eq(3, cand.dropped.volatile, "应记录剔除的易变/字节码缓存数")
       candidate.cleanup(a.attempt_id)
     end)
     vim.fn.delete(dir, "rf")
