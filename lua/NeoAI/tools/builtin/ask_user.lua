@@ -311,18 +311,27 @@ local ask_user_tools = {}
 ask_user_tools.ask_user = helpers.define_tool(
   "ask_user",
   "向用户提问并等待回答（澄清需求/确认意图/缺关键信息时）。question 必填；options 可选（供快速选择）。"
-    .. "同一轮的多次提问会合并为一个多 Tab 弹窗统一作答。",
+    .. "**一次调用只问一个问题**：question 必须是单一问题，options 全部属于该问题；"
+    .. "需要问多个问题时，请分多次调用本工具（每个问题一次调用，可同轮并行发起），"
+    .. "同轮的多次调用会聚合为一个多 Tab 弹窗、逐题作答；"
+    .. "不要把多个问题罗列进同一个 question，也不要把不同问题的选项混在同一个 options 里"
+    .. "（一次调用只有一个答案位，混在一起用户只能选到其中一个）。"
+    .. "某题确实需要多选时用 multi_select=true，而不是把它拆/并成多个问题。",
   {
     type = "object",
     properties = {
-      question = { type = "string", description = "要向用户提出的问题" },
+      question = {
+        type = "string",
+        description = "要向用户提出的问题（单一问题；如需问多个问题，请分多次调用本工具，"
+          .. "不要在一个 question 里罗列多个问题或把多题选项混在一起）",
+      },
       multi_select = {
         type = "boolean",
         description = "可选：该题是否允许多选（默认 false）。为 true 时用户可勾选多个选项，答案以 \", \" 连接各选中 label。",
       },
       options = {
         type = "array",
-        description = "可选：供用户快速选择的选项。每个选项可以是字符串，或对象 { label（选项简介，简短标签）, description（选项描述，可选，更详细说明） }。用户可直接选序号或输入自由回答。",
+        description = "可选：仅属于本问题的候选答案（不同问题的选项不要混在一起，多问题请分多次调用）。每个选项可以是字符串，或对象 { label（选项简介，简短标签）, description（选项描述，可选，更详细说明） }。用户可直接选序号或输入自由回答。",
         items = {
           oneOf = {
             { type = "string", description = "纯字符串选项，该字符串即选项简介" },

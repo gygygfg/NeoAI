@@ -12,6 +12,16 @@ local function find_tool(name)
 end
 
 tests.suite("ask_user", function(_, it)
+  it("工具描述要求一次只问一个问题、多问题分多次调用", function(t)
+    local tl = assert(find_tool("ask_user"), "应注册 ask_user 工具")
+    t.matches("一次调用只问一个问题", tl.description)
+    t.matches("分多次调用", tl.description)
+    t.matches("multi_select", tl.description)
+    local props = assert(tl.parameters).properties
+    t.matches("单一问题", assert(props.question).description)
+    t.matches("分多次调用", assert(props.options).description)
+  end)
+
   it("注册 UI 后提问并回传用户回答", function(t)
     local ask = require("NeoAI.tools.builtin.ask_user")
     local async = require("NeoAI.utils.async")

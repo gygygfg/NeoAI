@@ -28,6 +28,9 @@ local TOOL_CONVENTIONS = table.concat({
   "- 输出超限时截断为「头+尾」，完整内容落盘到沙箱私有 /tmp 并在结果中给出路径，用 `read_file`（offset/limit）回读。",
   "- `git_*` 的 `repo` 缺省=当前会话仓库。",
   "- `run_command` 为交互式 PTY：等待输入时由系统按 description 自动应答；需精确控制可调用 `terminal_send_text`/`terminal_send_keys`/`terminal_kill`。",
+  "- `ask_user` **一次调用只问一个问题**：`question` 为单一问题、`options` 只属于该问题；"
+    .. "需要问多个问题时多次调用本工具（每个问题一次调用，可同轮并行，同轮调用会聚合为多 Tab 弹窗逐题作答），"
+    .. "不要把多个问题或多题选项塞进同一次调用（一次调用只有一个答案位，用户只能选到其中一个）。",
 }, "\n")
 
 local _conventions_unreg = nil

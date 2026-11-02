@@ -405,6 +405,14 @@ when `read_all=false` and the target is not covered by a writable root).
 or `{ label, description }` (label is a short option summary, description is the option description; the two are
 displayed separately in the popup and highlighted).
 
+**Prompt constraints (aligned with the popup shape)**: both the tool description and the system-prompt section
+`tools:conventions` require **one question per call** (`question` is a single question and `options` belong only to
+it); when several questions are needed, **call `ask_user` multiple times** (one call per question, possibly issued
+concurrently in the same round, which then aggregate into multi-tab and are answered one tab at a time). Never list
+several questions in one `question`, nor mix options of different questions into one `options` — a single call has
+one answer slot (single-select), so mixing makes it possible to pick only one of them. Use `multi_select=true` when
+a question genuinely allows multiple answers.
+
 **Same-round aggregation (multi-tab popup)**: multiple `ask_user` calls issued concurrently within the same round
 (same `agent.id` and same `agent._round_seq`) are aggregated into **a single multi-tab popup** answered together
 (a debounce window `ui.ask_user.batch_debounce_ms`, default 25ms, covers sibling-call arrival timing); the top tab
@@ -413,7 +421,7 @@ unanswered dim, and the **rightmost tab is the "Confirm" tab** (opencode-aligned
 form separate batches shown in order (they do not fail outright).
 
 **Interaction (opencode-aligned)**: `1-9` selects/toggles an option (single-select records it; with multiple
-questions it does **not auto-advance** — switch tabs manually); `k/j` or `↑/↓` moves the option focus (the focused
+questions, answering a single-select tab **auto-advances** to the next tab); `k/j` or `↑/↓` moves the option focus (the focused
 row is background-highlighted), `<CR>` selects the focused option; `h/l` or `←/→` switch tabs (keeping
 `<Tab>`/`<S-Tab>` and `]`/`[`); `i` opens free-text input for the current question. **A single single-select
 question submits on selection — no second confirmation, no confirm tab**; multi-select/multi-question batches

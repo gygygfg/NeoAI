@@ -357,6 +357,11 @@ M.execute(agent, name, args, tool_call_id, opts)
 等待期间暂停可暂停计时器。选项既可以是字符串，也可以是 `{ label, description }`（label 为选项简介，
 description 为选项描述，二者在弹窗中分别展示并高亮）。
 
+**提示词约束（与弹窗形态对齐）**：工具描述与系统提示段 `tools:conventions` 都明确要求 **一次调用只问一个问题**
+（`question` 为单一问题、`options` 只属于该问题）；需要问多个问题时请**多次调用** `ask_user`（每个问题一次调用，
+可同轮并行发起，聚合为多 Tab 逐题作答）。禁止把多个问题罗列进一个 `question`，或把不同问题的选项混进同一个
+`options`——一次调用只有一个答案位（单选），混在一起时用户只能选中其中一个；某题确实需要多选时用 `multi_select=true`。
+
 **同轮聚合（多 Tab 弹窗）**：同一轮（同 `agent.id` 且同 `agent._round_seq`）内并发发起的多次 `ask_user`
 会聚合为**一个多 Tab 弹窗**统一作答（去抖窗口 `ui.ask_user.batch_debounce_ms`，默认 25ms 覆盖兄弟调用到达时序）；
 顶部 Tab 栏以 `✓/○` 标记该题是否已答，**当前标签反显加粗**、已答绿色、未答暗灰，最右侧为**「确认」标签**（对齐
