@@ -650,7 +650,13 @@ local DEFAULT_CONFIG = {
     approval = {
       mode = "async", -- async（默认，异步审批：立即沙箱执行，事后确认应用）| prompt | auto_allow | strict
       default_auto_allow = false,
-      timeout_ms = 60000, -- 审批弹窗超时（ms），防止弹窗丢失后工具循环永久挂起
+      -- 审批弹窗超时（ms），防止弹窗丢失后工具循环永久挂起。
+      -- **仅对异步审批生效**（mode="async"：沙箱内先执行、事后确认，以及遮蔽目录/跨挂载点
+      -- 等附加放行）。同步事前审批（mode="prompt"/"strict"）**不设弹窗超时**：弹窗是执行前
+      -- 的唯一闸门，人读弹窗/临时离开的时长不可预估，到点自动拒绝会让同步审批事实上不可用；
+      -- 那条路径只由用户决策、关窗取消（clear_approval）、Agent 中止来结算。
+      -- 0 = 不限（对所有模式都关闭倒计时）。
+      timeout_ms = 60000,
       -- 全局工作区允许目录：对所有工具生效，且包含其全部子目录（配置后子目录无需逐个审批）。
       -- 工具自身与 per_tool 的 allowed_directories 与之并集（只追加，不覆盖全局工作区）。
       allowed_directories = {},

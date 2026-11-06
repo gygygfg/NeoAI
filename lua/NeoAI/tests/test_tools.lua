@@ -1045,34 +1045,51 @@ tests.suite("tools", function(_, it)
     tool_service.reset()
   end)
 
-  it("审批超时拒绝而非永久挂起", function(t)
+  it("审批超时兜底仅对 async 生效：同步事前审批不因弹窗停留而超时", function(t)
     local config_store = require("NeoAI.kernel.config_store")
     config_store.load({
-      tools = { approval = { mode = "prompt", per_tool = {}, timeout_ms = 100 } },
+      tools = { approval = { mode = "prompt", per_tool = {}, timeout_ms = 120 } },
     })
     local tool_service = require("NeoAI.services.tool_service")
-    local registry = require("NeoAI.tools.registry")
-    local helpers = require("NeoAI.tools.builtin.tool_helpers")
-    registry.register(helpers.define_tool(
-      "timeout_tool", "超时工具", { type = "object", properties = {}, required = {} },
-      function(_, on_success) on_success("不应执行") end
-    ))
-    -- 模拟审批 UI 永不回调（弹窗被覆盖/丢失场景）：此前会永久挂起
+    local async = require("NeoAI.utils.async")
+    tool_service.reset()
+    -- 模拟审批 UI 永不回调（弹窗被覆盖/丢失 / 用户正在读弹窗）
     tool_service.set_approval_ui({
       show = function() end,
       hide = function() end,
     })
-    local agent = { id = "timeout-agent" }
-    local settled = false
-    tool_service.execute(agent, "timeout_tool", { description = "测试审批超时" }, nil, {}):then_(function()
-      t.true_(false, "超时工具不应被执行")
-    end):catch(function(e)
-      settled = true
-      t.matches("审批超时", tostring(e.message))
-      print("  approval timeout done")
+
+    -- ① 同步事前审批（prompt/strict）：弹窗就是执行前唯一闸门，停留时间不计入超时预算，
+    --    超过 timeout_ms 也不得自动拒绝（用户读弹窗的时长不可预估）。
+    local sync_done, sync_err = false, nil
+    tool_service.approve_and_execute("sync_gate_tool", {}, {
+      agent = { id = "sync-agent" }, approval_mode = "prompt",
+    }, function() return async.resolve("executed") end):then_(function()
+      sync_done = true
+    end, function(e)
+      sync_done, sync_err = true, e
     end)
-    local got = vim.wait(2000, function() return settled end)
-    t.true_(got, "审批超时应按时拒绝而非永久挂起")
+    vim.wait(400, function() return sync_done end) -- 远超 120ms 预算
+    t.false_(sync_done, "同步审批不应在超时预算内自动拒绝")
+    t.true_(tool_service.has_pending_approval(), "同步审批应继续等待用户决策")
+    -- 不会永久挂起：关窗取消即结算（另见 Agent 中止 / 审批中心决策路径）。
+    tool_service.clear_approval()
+    vim.wait(1000, function() return sync_done end)
+    t.true_(sync_done, "关窗取消应结算挂起的同步审批")
+    t.matches("审批已取消", tostring(sync_err and sync_err.message))
+
+    -- ② 异步审批（async）：保留兜底，超时拒绝而不是永久挂起
+    local async_done, async_err = false, nil
+    tool_service.approve_and_execute("async_tool", {}, {
+      agent = { id = "async-agent" }, approval_mode = "async",
+    }, function() return async.resolve("executed") end):then_(function()
+      async_done = true
+    end, function(e)
+      async_done, async_err = true, e
+    end)
+    local got = vim.wait(2000, function() return async_done end)
+    t.true_(got, "异步审批超时应按时拒绝而非永久挂起")
+    t.matches("审批超时", tostring(async_err and async_err.message))
     tool_service.reset()
   end)
 

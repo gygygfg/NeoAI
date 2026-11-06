@@ -332,6 +332,19 @@ local function _show_approval(tool_name, args, decision_cb, ctx, item)
   end
 end
 
+--- 该审批条目所属的审批模式（同步/异步由它决定超时语义）。
+--- 优先取执行器回写的 `ctx.approval_mode`（无隔离后端 / 无动态强制层时会被强制解析为
+--- `prompt`，见 `tools.executor.effective_approval_mode`），回退到当前配置。
+--- @param item table 审批队列条目
+--- @return string "async" | "prompt" | "strict" | "auto_allow"
+local function _approval_mode_of(item)
+  local ctx = item and item.ctx
+  if type(ctx) == "table" and type(ctx.approval_mode) == "string" and ctx.approval_mode ~= "" then
+    return ctx.approval_mode
+  end
+  return _current_mode()
+end
+
 --- 串行审批队列：一次只展示一个审批弹窗（单槽位）。
 --- 工具执行本身并行，但审批必须串行：并发弹窗会互相覆盖，
 --- 前一个的 decision_cb 永不触发 → Deferred 永不 settle → 工具循环挂起。
@@ -376,7 +389,16 @@ local function _drain_approval_queue()
   -- 条目一旦决策（item.d = nil），超时即失效，不干扰已批准工具的执行。
   -- 超时也必须结算阻塞账目并清掉审批中心镜像条目：否则 Herder 侧计数永久 +1、
   -- 悬浮窗残留「待批准」，pane 停在「等待确认」不回「运行中」。
-  local timeout_ms = config_store.get("tools.approval.timeout_ms")
+  --
+  -- **同步事前审批（mode="prompt"/"strict"）不设弹窗超时**：这条路径没有「沙箱内先执行、
+  -- 事后确认」的兜底，弹窗就是执行前的唯一闸门；人阅读弹窗 / 临时离开的时长无法预估，
+  -- 到点自动拒绝会让同步审批事实上不可用（用户回来时弹窗已消失、调用已被判超时），并反向
+  -- 诱导用户调大超时或改用 async。弹窗丢失的挂起由用户决策、关窗（`clear_approval`）、
+  -- Agent 中止与「失焦暂存 + 审批中心镜像」共同收敛，不依赖倒计时。
+  -- 异步审批（mode="async"，含遮蔽目录/跨挂载点放行）仍保留兜底：那里的弹窗是事后确认或
+  -- 附加放行，倒计时不会误伤「正在读弹窗」的主流程。
+  local timeout_ms = (_approval_mode_of(item) == "async")
+    and config_store.get("tools.approval.timeout_ms") or nil
   if timeout_ms and timeout_ms > 0 then
     vim.defer_fn(function()
       if not item.d then return end -- 已决策，跳过

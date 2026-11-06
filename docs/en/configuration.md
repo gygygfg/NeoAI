@@ -243,7 +243,7 @@ session = {
 approval = {
   mode = "async",              -- async (default: execute immediately in sandbox, confirm apply later) | prompt | auto_allow | strict
   default_auto_allow = false,
-  timeout_ms = 60000,          -- Approval dialog timeout (prevents hanging forever)
+  timeout_ms = 60000,          -- Approval dialog timeout (prevents hanging forever); only for async; prompt/strict (sync pre-execution approval) never times out; 0 = unlimited
   allowed_directories = {},
   allowed_param_groups = {},
   per_tool = {

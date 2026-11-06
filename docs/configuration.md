@@ -230,7 +230,7 @@ session = {
 approval = {
   mode = "async",              -- async（默认，异步审批：立即沙箱执行，事后确认应用）| prompt | auto_allow | strict
   default_auto_allow = false,
-  timeout_ms = 60000,          -- 审批弹窗超时（防永久挂起）
+  timeout_ms = 60000,          -- 审批弹窗超时（防永久挂起）；仅对 async 生效，prompt/strict（同步事前审批）不设超时，0=不限
   allowed_directories = {},
   allowed_param_groups = {},
   per_tool = {

@@ -165,7 +165,11 @@ M.execute(agent, name, args, tool_call_id, opts)
 - Otherwise it enters `approval_queue`, and `_drain_approval_queue` pops up confirmations one at a time (single slot).
 - **Approval timeout fallback**: `tools.approval.timeout_ms` defaults to 60s; on timeout the request is rejected
   rather than hanging forever; once a decision exists (`item.d = nil`), the timeout is void and does not interfere
-  with the execution of already-approved tools.
+  with the execution of already-approved tools. **It only applies to async approval (`mode="async"`)**: synchronous
+  pre-execution approval (`mode="prompt"`/`"strict"`) sets no dialog timeout — there the dialog is the only gate
+  before execution, and nobody can estimate how long a human needs to read it or steps away, so auto-rejecting on a
+  timer makes synchronous approval effectively unusable. That path settles only via user decision, window close
+  (`clear_approval`) or Agent abort.
 
 ### 5.2 Approval UI
 

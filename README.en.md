@@ -447,7 +447,7 @@ require("NeoAI").setup({
     approval = {
       mode = "async",                    -- async (default: run in the sandbox now, confirm & apply after the fact) | prompt | auto_allow | strict
       default_auto_allow = false,
-      timeout_ms = 60000,                -- approval dialog timeout (prevents an indefinite hang)
+      timeout_ms = 60000,                -- approval dialog timeout (prevents an indefinite hang); async only — prompt/strict sync approval never times out
       allowed_directories = {},
       allowed_param_groups = {},
       per_tool = {

@@ -150,7 +150,10 @@ M.execute(agent, name, args, tool_call_id, opts)
 - `auto_allow` 模式或该工具已 `allow_all` → 直接执行。
 - 否则入 `approval_queue`，`_drain_approval_queue` 逐条弹窗（单槽位）。
 - **审批超时兜底**：`tools.approval.timeout_ms` 默认 60s，超时拒绝而不是永久挂起；
-  一旦决策（`item.d = nil`）超时即失效，不干扰已批准工具的执行。
+  一旦决策（`item.d = nil`）超时即失效，不干扰已批准工具的执行。**仅对异步审批
+  （`mode="async"`）生效**：同步事前审批（`mode="prompt"`/`"strict"`）不设弹窗超时——
+  弹窗就是执行前的唯一闸门，人读弹窗/临时离开的时长不可预估，到点自动拒绝会让同步审批
+  事实上不可用；该路径由用户决策、关窗取消（`clear_approval`）、Agent 中止结算。
 
 ### 5.2 审批 UI
 
