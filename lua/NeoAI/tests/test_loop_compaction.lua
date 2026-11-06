@@ -140,6 +140,37 @@ tests.suite("loop_compaction", function(_, it)
     t.eq(false, val, "已取消不应压缩")
   end)
 
+  it("maybe_compact：历史条数超限触发压缩替换（不依赖 token 阈值）", function(t)
+    load_cfg()
+    local config_store = require("NeoAI.kernel.config_store")
+    -- 放大窗口使 token 远低于阈值，只让「条数上限」成为触发条件
+    config_store.set("ai.context_cache.context_window", 1000000)
+    config_store.set("session.max_history_per_session", 3)
+    local restore = stub_summarize()
+    local compactor = require("NeoAI.core.session.compactor")
+    local context_builder = require("NeoAI.core.session.context_builder")
+    local agent = seed_paired_agent()
+    -- seed 为 3 条 user + 1 条 assistant(tool_calls) = 4 条，超过上限 3
+    t.true_(compactor.history_overflow(agent), "应先判定历史条数超限")
+    local done, val = false, nil
+    compactor.maybe_compact(agent, { allow_busy = true }):then_(function(r) done = true; val = r end)
+    t.true_(vim.wait(2000, function() return done end), "异步未完成")
+    t.eq(true, val, "条数超限也应触发压缩")
+    t.not_nil(agent.compaction, "应以检查点覆盖层替换较早上下文")
+    t.true_(agent.compaction.checkpoint.checkpoint)
+    t.false_(compactor.history_overflow(agent), "压缩后请求视图应回到上限内")
+    t.true_(context_builder.request_view(agent)[1].checkpoint, "请求视图首条应为检查点")
+
+    -- 压缩后重新计数：被折叠的消息不再计入，条件不再满足 → 不应立刻重复压缩
+    local replaced_before = agent.compaction.replaced
+    local done2, val2 = false, nil
+    compactor.maybe_compact(agent, { allow_busy = true }):then_(function(r) done2 = true; val2 = r end)
+    t.true_(vim.wait(1000, function() return done2 end), "第二次检查异步未完成")
+    restore()
+    t.eq(false, val2, "压缩后重新计数未超限，不应再次压缩")
+    t.eq(replaced_before, agent.compaction.replaced, "同一批消息不应被重复折叠/重复计数")
+  end)
+
   it("工具循环轮边界触发压缩且循环继续", function(t)
     load_cfg()
     local chat = init_chat()

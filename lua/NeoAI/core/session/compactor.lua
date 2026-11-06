@@ -1,8 +1,10 @@
 --- 上下文压缩
 --- @module 'NeoAI.core.session.compactor'
 --- 后台异步、非阻塞压缩：
---- 1. 达到 token 压力阈值时，先做模型无关的工具结果裁剪（tool_result_pruner）；
----    裁剪后已回到阈值内则跳过摘要调用。
+--- 1. 达到 token 压力阈值（`窗口 * threshold_ratio`）或历史条数安全上限时，先做模型无关的
+---    工具结果裁剪（tool_result_pruner）；裁剪后已回到阈值内则跳过摘要调用。
+---    历史条数超限时**必须**用摘要检查点替换较早上下文，而不是裸截断（裸截断会改写请求
+---    前缀、使 provider 前缀缓存全量失效）；此时调用方用 `maybe_compact` 等待完成后再发送。
 --- 2. 仍需摘要时，折叠第一轮至倒数第二轮（保留最后一轮完整）；若没有更早的用户轮次
 ---    （单轮长工具循环），回退为按 retain 预算的平衡头部缩减，折叠本回合较早轮次；
 ---    溢出恢复则做最大化平衡头部缩减（retain 0，只保留最新一个不可分单元，绝不拆散
@@ -131,6 +133,47 @@ local function _estimate(agent)
   return context_builder.used_tokens(agent, { chars_per_token = caps.chars_per_token })
 end
 
+--- 历史条数上限（session 配置；0/负数视为不限）
+--- @return number|nil
+local function _history_cap()
+  local v = tonumber(config_store.get("session.max_history_per_session"))
+  if not v or v <= 0 then return nil end
+  return v
+end
+
+--- 统计请求视图里参与上下文的消息数。
+--- 口径与 context_builder 的窗口计数一致：system 角色只有运行态/系统更新快照计入；
+--- 压缩覆盖层已生效时按「检查点 + 未替换尾部」计数（否则压缩后永远判定超限）。
+--- @param agent table|nil
+--- @return number
+local function _history_count(agent)
+  local list = (agent and agent.messages) or {}
+  local ok, context_builder = pcall(require, "NeoAI.core.session.context_builder")
+  if ok and context_builder.request_view then
+    local ok2, view = pcall(context_builder.request_view, agent)
+    if ok2 and type(view) == "table" then list = view end
+  end
+  local n = 0
+  for _, m in ipairs(list) do
+    if m.role ~= "system" or m.runtime_context or m.system_update then
+      n = n + 1
+    end
+  end
+  return n
+end
+
+--- 是否超过历史条数上限（超过即应以压缩替换，而不是滑动截断）。
+--- context_builder 的兜底截断只负责「压缩不可用/失败」时的最后防线；
+--- 若压缩后仍无法回到上限内（极小上限 / 无可折叠内容），置 `_history_cap_exhausted`
+--- 不再反复触发摘要调用，交由分块截断兜底。
+--- @param agent table|nil
+--- @return boolean
+function M.history_overflow(agent)
+  if agent and agent._history_cap_exhausted then return false end
+  local cap = _history_cap()
+  return cap ~= nil and _history_count(agent) > cap
+end
+
 --- 切点（位置 idx 之前）是否工具配对平衡：前 idx-1 条消息里没有未配对的 tool_call。
 --- @param messages table
 --- @param idx number 保留区间的起始下标（1-based）
@@ -155,7 +198,8 @@ end
 --- 切点必须工具配对平衡，否则前移切点（并入更多消息）直到平衡；移到头部则返回空。
 --- @param agent table
 --- @param cfg table
---- @param opts table|nil { retain_tokens?, min_shadow? } 溢出恢复传 retain_tokens=0 做最大化缩减
+--- @param opts table|nil { retain_tokens?, retain_messages?, min_shadow? }
+---   溢出恢复传 retain_tokens=0 做最大化缩减；条数触发时传 retain_messages 限制尾部条数。
 --- @return table 被折叠消息数组（保留原顺序，可为空）
 local function _select_shadow_range(agent, cfg, opts)
   opts = opts or {}
@@ -171,14 +215,18 @@ local function _select_shadow_range(agent, cfg, opts)
     local retain_min = cfg.retain_min_tokens or 4096
     if retain_budget < retain_min then retain_budget = retain_min end
   end
+  local retain_messages = tonumber(opts.retain_messages)
   local min_shadow = opts.min_shadow or cfg.min_shadow_messages or 2
 
   local keep_start = #messages + 1
   local tail_tokens = 0
+  local kept = 0
   for i = #messages, 1, -1 do
     tail_tokens = tail_tokens + context_builder.estimate_tokens({ messages[i] })
     keep_start = i
+    kept = kept + 1
     if tail_tokens >= retain_budget then break end
+    if retain_messages and kept >= retain_messages then break end
   end
   -- 工具配对安全：切点不能落在 assistant.tool_calls 与其 tool 结果之间，
   -- 否则压缩后请求会缺少配对的 tool 结果而被 API 拒绝。
@@ -331,6 +379,12 @@ local function _compact(agent, cfg, opts)
 
   local function step(attempt)
     local shadow, added
+    -- 条数触发时限制尾部条数，确保压缩后能真正回到 max_history 以内
+    -- （否则大窗口的 retain_token 预算可能覆盖全部历史，导致“无可折叠”）。
+    local retain_messages
+    if opts.max_history then
+      retain_messages = math.max(1, math.floor(opts.max_history * 0.75))
+    end
     if opts.mode == "overflow" then
       shadow = _select_shadow_range(agent, cfg, opts)
     else
@@ -340,7 +394,7 @@ local function _compact(agent, cfg, opts)
       -- 回退为按保留预算的头部缩减，折叠本回合较早轮次、保留最近尾部；
       -- 切点保持工具配对平衡，避免压缩后出现孤立 tool 结果。
       if not added or added == 0 then
-        shadow = _select_shadow_range(agent, cfg, {})
+        shadow = _select_shadow_range(agent, cfg, { retain_messages = retain_messages })
       end
     end
     if opts.mode == "overflow" or not added or added == 0 then
@@ -380,8 +434,10 @@ local function _compact(agent, cfg, opts)
           agent.cache = cache
         end
       end
-      -- 收敛：仍在阈值之上且还有重试预算则继续折叠更早区间
-      if opts.threshold and _estimate(agent) >= opts.threshold and attempt + 1 < max_attempts then
+      -- 收敛：仍超 token 阈值 / 仍超历史条数上限且还有重试预算则继续折叠更早区间
+      local still_pressure = (opts.threshold and _estimate(agent) >= opts.threshold)
+        or (opts.max_history and _history_count(agent) > opts.max_history)
+      if still_pressure and attempt + 1 < max_attempts then
         return step(attempt + 1)
       end
       return finish(true)
@@ -394,7 +450,44 @@ local function _compact(agent, cfg, opts)
   return step(0)
 end
 
---- 检查 token 压力并按需压缩。
+--- 启动一次压缩（先裁剪工具结果，再按需摘要），并把 Deferred 挂在 agent 上供并发等待/去重。
+--- max_history 非空时表示「历史条数超限」也是本次压缩的目标（压缩后必须回到上限内）。
+--- @param agent table
+--- @param cfg table
+--- @param threshold number token 压力阈值
+--- @param max_history number|nil
+--- @return Deferred resolve(boolean)
+local function _begin(agent, cfg, threshold, max_history)
+  agent._compaction_pending = true
+  local d = _prune_async(agent, cfg):then_(function(pruned)
+    local over_count = max_history ~= nil and _history_count(agent) > max_history
+    -- 仅 token 压力时可因裁剪而提前结束；条数超限必须走摘要替换。
+    if not over_count and pruned and _estimate(agent) < threshold then return true end
+    return _compact(agent, cfg, {
+      mode = "round",
+      threshold = threshold,
+      max_history = max_history,
+    })
+  end):then_(function(compacted)
+    -- 压缩后仍超条数上限：不再反复触发摘要，交由分块截断兜底（避免每轮一次摘要调用）。
+    if max_history ~= nil and _history_count(agent) > max_history then
+      agent._history_cap_exhausted = true
+      logger.warn("[compactor] 压缩后仍超过历史条数上限（%d），后续改用分块截断兜底", max_history)
+    end
+    return compacted
+  end):finally(function()
+    agent._compaction_pending = false
+  end)
+  agent._compaction_deferred = d
+  return d
+end
+
+--- 检查压力并按需压缩（可等待版本）。
+--- 压力来源：
+---   1. token 达到 `窗口 * threshold_ratio`（主触发，保持模型可用能力）；
+---   2. 历史条数超过 `session.max_history_per_session`（窗口即将滑动）。
+--- 无论哪种来源，压缩都用「摘要检查点」替换较早上下文，而不是裸截断——裸截断会让
+--- 请求前缀每轮都变，provider 前缀缓存全量失效。
 --- 默认仅在 Agent 空闲时执行（回合边界）；opts.allow_busy 为真时允许在工具循环
 --- 轮边界（generating/tool_running）执行——此时工具结果已回写、下一轮请求尚未发出，
 --- 可安全折叠历史并复用前缀缓存。
@@ -407,46 +500,56 @@ function M.maybe_compact(agent, opts)
   if cfg.enabled == false then
     return async.resolve(false)
   end
+  if not agent then
+    return async.resolve(false)
+  end
+  -- 已有压缩在进行（含后台启动、尚未进入摘要阶段）：等它结束，避免重复摘要。
+  if agent._compacting or agent._compaction_pending then
+    local inflight = agent._compaction_deferred
+    if inflight and inflight.then_ then
+      return inflight:then_(function() return false end, function() return false end)
+    end
+    return async.resolve(false)
+  end
   if not _can_compact(agent, opts) then
     return async.resolve(false)
   end
   local caps = _caps(agent)
   local window = _window_for(agent, cfg)
   local threshold = window * _threshold_ratio(cfg, caps)
-  local est = _estimate(agent)
-  if est < threshold then
+  local cap = _history_cap()
+  local over_count = cap ~= nil and _history_count(agent) > cap
+  if not over_count and _estimate(agent) < threshold then
     return async.resolve(false)
   end
-  -- 先裁剪工具结果：多数情况下裁剪后即回到阈值内，无需摘要调用
-  return _prune_async(agent, cfg):then_(function(pruned)
-    if pruned and _estimate(agent) < threshold then return true end
-    return _compact(agent, cfg, { mode = "round", threshold = threshold })
-  end)
+  return _begin(agent, cfg, threshold, over_count and cap or nil)
 end
 
---- 后台异步压缩（非阻塞）：达到压力阈值时启动压缩，立即返回，不等待摘要完成。
+--- 后台异步压缩（非阻塞）：达到压力时启动压缩，立即返回，不等待摘要完成。
 --- agent 继续用当前（原始）请求视图执行；压缩完成后覆盖层生效，后续请求与再次压缩
 --- 都基于压缩后的替换。不弹出任何 UI。裁剪同步完成（廉价），摘要异步进行。
+--- 需要「本轮立即使用压缩后视图」的场景（历史窗口滑动、工具轮边界）改用 maybe_compact 等待。
 --- @param agent table Agent
 --- @param opts table|nil { context_cache?, allow_busy? }
 function M.start_background(agent, opts)
   opts = opts or {}
   local cfg = _cfg(opts)
   if cfg.enabled == false then return end
+  if not agent then return end
+  if agent._compacting or agent._compaction_pending then return end
   if not _can_compact(agent, opts) then return end
   local caps = _caps(agent)
   local window = _window_for(agent, cfg)
   local threshold = window * _threshold_ratio(cfg, caps)
-  if _estimate(agent) < threshold then return end
-  _prune_async(agent, cfg):then_(function(pruned)
-    if pruned and _estimate(agent) < threshold then return end
-    local d = _compact(agent, cfg, { mode = "round", threshold = threshold })
-    if d and d.catch then
-      d:catch(function(err)
-        logger.warn("[compactor] 后台压缩失败: %s", tostring(err and err.message or err))
-      end)
-    end
-  end)
+  local cap = _history_cap()
+  local over_count = cap ~= nil and _history_count(agent) > cap
+  if not over_count and _estimate(agent) < threshold then return end
+  local d = _begin(agent, cfg, threshold, over_count and cap or nil)
+  if d and d.catch then
+    d:catch(function(err)
+      logger.warn("[compactor] 后台压缩失败: %s", tostring(err and err.message or err))
+    end)
+  end
 end
 
 --- 强制压缩（上下文溢出恢复用）：跳过压力阈值判断。
@@ -463,6 +566,15 @@ function M.force_compact(agent, opts)
   local cfg = _cfg(opts)
   if cfg.enabled == false then
     return async.resolve(false)
+  end
+  -- 已有压缩在进行：等它完成后再判断是否还需要强制压缩（否则会因 _compacting 直接放弃，
+  -- 让溢出错误原样抛回给调用方）。
+  if agent and (agent._compacting or agent._compaction_pending) then
+    local inflight = agent._compaction_deferred
+    if inflight and inflight.then_ then
+      return inflight:then_(function() return M.force_compact(agent, opts) end,
+        function() return M.force_compact(agent, opts) end)
+    end
   end
   if not _can_compact(agent, opts) then
     return async.resolve(false)

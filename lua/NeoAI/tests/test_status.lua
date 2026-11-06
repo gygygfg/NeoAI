@@ -99,6 +99,43 @@ tests.suite("status", function(_, it)
     t.eq("缓存命中95.32%%", status.segment("cache"), "缓存命中率应为累计且两位小数")
   end)
 
+  it("缓存命中段默认同时展示单次与会话累计", function(t)
+    local chat = init_chat()
+    local status = require("NeoAI.services.status")
+    local agent = chat.new_session({})
+    agent.usage = {
+      requests = 35,
+      cache_ratio = 0.9455,
+      last_prompt = 36143,
+      last_cache_read = 35968,
+    }
+    t.eq("缓存命中99.52%%(会话94.55%%)", status.segment("cache"))
+  end)
+
+  it("缓存段 cache_mode 可控：latest 只显示单次，cumulative 只显示累计", function(t)
+    local config_store = require("NeoAI.kernel.config_store")
+    local chat = init_chat()
+    local status = require("NeoAI.services.status")
+    local agent = chat.new_session({})
+    agent.usage = {
+      requests = 35, cache_ratio = 0.9455,
+      last_prompt = 36143, last_cache_read = 35968,
+    }
+    config_store.set("ui.statusline.cache_mode", "latest")
+    t.eq("缓存命中99.52%%", status.segment("cache"))
+    config_store.set("ui.statusline.cache_mode", "cumulative")
+    t.eq("缓存命中94.55%%", status.segment("cache"))
+    config_store.set("ui.statusline.cache_mode", "both")
+  end)
+
+  it("缓存段无单次数据时回退累计口径", function(t)
+    local chat = init_chat()
+    local status = require("NeoAI.services.status")
+    local agent = chat.new_session({})
+    agent.usage = { requests = 3, cache_ratio = 0.9532 }
+    t.eq("缓存命中95.32%%", status.segment("cache"))
+  end)
+
   it("ui.statusline.enabled=false 时 component 为空", function(t)
     local config_store = require("NeoAI.kernel.config_store")
     local chat = init_chat()

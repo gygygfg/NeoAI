@@ -44,6 +44,7 @@ M.SESSION_DELETED = "session:deleted"
 M.SESSION_SWITCHED = "session:switched"
 M.SESSION_RENAMED = "session:renamed"
 M.SESSION_FORKED = "session:forked"
+M.SESSION_HISTORY_TRUNCATED = "session:history_truncated"
 
 -- ========== 分支 / 树 ==========
 M.BRANCH_CREATED = "branch:created"

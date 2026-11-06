@@ -18,7 +18,7 @@
 - **A rich set of built-in tools** — the AI can call 40+ tools for file operations, code analysis, LSP, Shell commands, and more
 - **Tool approval system** — fine-grained control over tool execution permissions, supporting auto-allow / manual approval / argument-level allowlists
 - **Plan mode (PLAN) and plan extraction** — toggle with `m` or `:NeoAIPlan`; the tool context retains only read-only / informational queries plus `run_command` (read-only research) and `ask_user` (no mutating tools are exposed, and no mode-switching tool is given to the AI); after the AI researches and clarifies, it emits a formatted change plan and ends the turn; once the user confirms (`:NeoAIApprovePlan` or manually toggling the mode), NeoAI switches to CHAT: at the boundary it first runs one **XML plan extraction** (`<target>`/`<stepN>`/`<files>` etc., case-insensitive, retrying up to 3 times when key fields are missing), assembles the execution context, builds the task list automatically per step (`todo_write`), and keeps `<files>`-related tool messages verbatim for cache hits before starting execution
-- **Background context compaction** — as the context threshold approaches, round 1 through the second-to-last round (keeping the last round intact) is folded **asynchronously in the background, non-blocking**, and a checkpoint is written into a **compaction overlay**: subsequent requests and further compactions use the compacted replacement, while chat rendering and session persistence keep the original context (the overlay is saved with the session and survives a restart); compaction opens no floating window; in addition to turn boundaries, **a pressure check runs before every round of the tool loop** (after tool results are written back and before the next request), so long loops converge round by round; on overflow the request is compacted and retried automatically; plan extraction still shows reasoning and content live in a floating window
+- **Background context compaction** — as the context threshold approaches, round 1 through the second-to-last round (keeping the last round intact) is folded **asynchronously in the background, non-blocking**, and a checkpoint is written into a **compaction overlay**: subsequent requests and further compactions use the compacted replacement, while chat rendering and session persistence keep the original context (the overlay is saved with the session and survives a restart); compaction opens no floating window; in addition to turn boundaries, **a pressure check runs before every round of the tool loop** (after tool results are written back and before the next request), so long loops converge round by round; **when the history safety cap is exceeded we compact synchronously before sending (replacing the prefix with a checkpoint instead of truncating it)**; on overflow the request is compacted and retried automatically; plan extraction still shows reasoning and content live in a floating window
 - **Sub-Agent system** — the AI can spawn sub-Agents to run subtasks in parallel, with boundary review
 - **Decoupled frontend/backend architecture** — an event-driven asynchronous architecture that separates the UI from business logic
 - **Highly configurable** — full customization of keymaps, UI layout, log level, and more
@@ -310,7 +310,7 @@ require("NeoAI").setup({
     context_cache = {
       enabled = true,                    -- enable identity consistency + automatic compaction
       context_window = 64000,            -- fallback window: an explicit non-default user value wins, otherwise derived from the model capability table
-      threshold_ratio = 0.8,             -- reaching this ratio triggers background async compaction (non-blocking, no window)
+      threshold_ratio = 0.5,             -- window trigger: compact at 50% of the effective window (count trigger may fire first)
       warn_ratio = 0.85,                 -- the statusline changes color as the limit approaches
       retain_ratio = 0.16,               -- proportion of recent history retained for overflow recovery (regular compaction folds round 1..second-to-last)
       retain_min_tokens = 4096,          -- lower bound for the retained tail during overflow recovery (tokens)
@@ -406,7 +406,7 @@ require("NeoAI").setup({
     auto_save = true,
     auto_naming = true,
     save_path = vim.fn.stdpath("cache") .. "/NeoAI",
-    max_history_per_session = 1000,
+    max_history_per_session = 1000,       -- count trigger: compact when messages exceed it (recounted after compaction)
     file = "sessions.jsonl",             -- append-only JSONL storage
   },
 

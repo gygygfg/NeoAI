@@ -216,11 +216,18 @@ Compaction is **asynchronous in the background and non-blocking**: once the toke
 immediately, while the agent keeps running with the current (original) request view; when the summary completes it writes a **compaction overlay**, and
 subsequent requests and further compactions use the compacted replacement. It opens no floating window (it does not emit `COMPACTION_STARTED` / `COMPACTION_CHUNK`).
 
-Triggers (all still threshold-driven):
+Triggers (**either** the token window or the message count suffices; after compaction the count is recomputed
+from "checkpoint + un-replaced tail", so the same messages are not folded twice):
 
-- **Turn boundary**: `runtime.run` calls `compactor.start_background(agent, { allow_busy = true })` after appending the user message.
-- **Inside the tool loop**: `tool_loop._send_round` calls `start_background(agent, { allow_busy = true })` before each round's send —
-  the previous round's tool results have already been written back and the next round's request has not yet been sent. A long loop thus converges round by round.
+- **Turn boundary**: `runtime.run` checks after appending the user message; when the count is over the cap it
+  waits for `compactor.maybe_compact(agent, { allow_busy = true })` before the first request, otherwise it calls
+  `start_background`.
+- **Inside the tool loop**: `tool_loop._send_round` performs the same check before each round's send — awaiting
+  compaction when the count is over the cap, otherwise starting it in the background. The previous round's tool
+  results have already been written back and the next round's request has not yet been sent.
+
+The threshold is whichever comes first: estimated tokens ≥ `context_window * threshold_ratio` (default 0.5) **or**
+non-system messages > `session.max_history_per_session` (default 1000).
 
 The gate `_can_compact(agent, opts)`: invalid agent / `_compacting` / signal already aborted → refuse;
 when `allow_busy` is true, the `idle` requirement is relaxed (compaction is allowed while in `generating`/`tool_running`).

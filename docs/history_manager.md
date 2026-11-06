@@ -83,7 +83,13 @@ session = {
 `context_builder.build(session)` / `build_from_agent(agent)`：
 
 - 首条消息为 system（`prefix.build_system_prompt` 渲染）。
-- 截断历史：保留最近的 `session.max_history_per_session`（缺省 1000）条非 system。
+- 历史窗口：**窗口（token）和条数（消息数）任一超限都触发压缩**，用摘要检查点替换较早上下文
+  （摘要 + 未替换尾部），而不是裸截断——裸截断每轮改写请求前缀，会让 provider 前缀缓存全量失效。
+  - 窗口触发：估算 token ≥ `context_window * threshold_ratio`（缺省 50%）；
+  - 条数触发：非 system 消息数 > `session.max_history_per_session`（缺省 1000）。
+  压缩后按「检查点 + 未替换尾部」**重新计数**（被折叠的消息不再重复计数）；
+  仅当压缩不可用/失败，才按 `session.history_truncate_step`（缺省 200）**分块滑动**兜底
+  （溢出满一个 step 才移动窗口起点，块内前缀逐字节稳定）。
 - **工具调用协议**：带 `tool_calls` 的 assistant 消息，`content` 必须为 `null`（或省略）；
   发送 `content:""` 会被要求严格的模型判定为格式异常。
 - **推理内容不随历史回传**：`reasoning_content` 不写入 API 消息，内部 `message.reasoning` 仅用于渲染。
@@ -97,11 +103,13 @@ session = {
 后台异步、非阻塞压缩：达到阈值时启动摘要生成后立即返回，agent 不被阻塞，也不弹压缩悬浮窗。
 摘要完成后写入**压缩覆盖层**，后续请求与再次压缩使用压缩后的替换；渲染与会话持久化仍是原始上下文。
 
-1. **触发**：分两处（均保持阈值判断，`start_background` 后台执行）。
-   - **回合边界**：`runtime.run` 追加用户消息后调 `start_background(agent, { allow_busy = true })`。
-   - **工具循环内部**：`tool_loop._send_round` 每轮发送前调 `start_background(agent, { allow_busy = true })`；
+1. **触发**：窗口（token）或条数（消息数）任一超限即触发；回合边界与工具轮边界都会检查。
+   - **回合边界**：`runtime.run` 追加用户消息后检查：条数超限时等待 `maybe_compact` 完成再发首包；
+     其余情况调 `start_background(agent, { allow_busy = true })` 后台压缩。
+   - **工具循环内部**：`tool_loop._send_round` 每轮发送前同样检查：条数超限时等待压缩完成；
      溢出恢复（`recovery`）仍调**阻塞等待**的 `force_compact(agent, { allow_busy = true })`。
-   估算 token 达到 `context_window * threshold_ratio` 阈值时折叠。
+   估算 token 达到 `context_window * threshold_ratio`（缺省 0.5）或消息数超过
+   `session.max_history_per_session`（缺省 1000）时折叠；压缩后重新计数，不重复折叠。
 2. **模型无关裁剪**：先由 `tool_result_pruner.prune_agent` 把超预算的工具结果裁成
    「头部 + 省略标记 + 尾部」（`prune_threshold_chars` / `prune_head_chars` / `prune_tail_chars`），
    含图像引用的结果跳过。裁剪后已回到阈值内则直接结束，无需摘要调用；有裁剪则作废过期 API 用量。
@@ -136,6 +144,6 @@ session = {
 
 ## 7. 相关文档
 
-- [configuration.md](configuration.md)：`session.*` 配置（save_path / max_history_per_session / file）。
+- [configuration.md](configuration.md)：`session.*` 配置（save_path / max_history_per_session / history_truncate_step / file）。
 - [ai_engine.md](ai_engine.md)：`context_builder` / `compactor` 在生成流程中的作用。
 - [EVENTS.md](EVENTS.md)：会话事件（`SESSION_*`）。

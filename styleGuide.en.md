@@ -922,7 +922,7 @@ require("NeoAI").setup({
     context_cache = {            -- prefix cache identity consistency + context compaction
       enabled = true,
       context_window = 64000,
-      threshold_ratio = 0.8,
+      threshold_ratio = 0.5,
       retain_ratio = 0.16,
       retain_min_tokens = 4096,
       compact_max_tokens = 8192,

@@ -214,11 +214,15 @@ API 兼容且前缀缓存确定。
 （原始）请求视图执行；摘要完成后写入**压缩覆盖层**，后续请求与再次压缩都基于压缩后的替换。
 压缩不打开任何悬浮窗（不发射 `COMPACTION_STARTED` / `COMPACTION_CHUNK`）。
 
-触发（均保持阈值判断）：
+触发（窗口与条数两个条件**任一**满足即触发；压缩后按「检查点 + 未替换尾部」重新计数，不重复折叠）：
 
-- **回合边界**：`runtime.run` 追加用户消息后调用 `compactor.start_background(agent, { allow_busy = true })`。
-- **工具循环内部**：`tool_loop._send_round` 每轮发送前调用 `start_background(agent, { allow_busy = true })`——
+- **回合边界**：`runtime.run` 追加用户消息后检查；条数超限时等待 `compactor.maybe_compact(agent, { allow_busy = true })` 完成再发首包，
+  其余情况调用 `start_background` 后台压缩。
+- **工具循环内部**：`tool_loop._send_round` 每轮发送前做同样检查——条数超限时等待压缩，否则后台启动；
   上一轮工具结果已回写、下一轮请求尚未发出。长循环因此逐轮收敛，不至于耗尽上下文后撞溢出。
+
+门槛：估算 token 达到 `context_window * threshold_ratio`（缺省 0.5）**或** 非 system 消息数超过
+`session.max_history_per_session`（缺省 1000）。
 
 门禁 `_can_compact(agent, opts)`：无效 agent / `_compacting` / 信号已 abort → 拒绝；
 `allow_busy` 为真时放宽 `idle` 要求（允许在 `generating`/`tool_running` 下压缩）。

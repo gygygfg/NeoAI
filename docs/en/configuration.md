@@ -121,7 +121,13 @@ context_cache = {
   -- only for endpoints confirmed to render in-history system messages in place.
   system_in_history = false,
   context_window = 64000,       -- Context window fallback: an explicit non-default user value wins, otherwise it is derived from the model capability table
-  threshold_ratio = 0.8,        -- Reaching this ratio triggers background async compaction (non-blocking, no window; explicit-cache models use a more conservative value)
+  -- Compaction triggers (either condition triggers; after compaction the count is recomputed
+  -- from "checkpoint + un-replaced tail", so collapsed messages are never double-counted):
+  --   1) window: estimated tokens reach context_window * threshold_ratio;
+  --   2) count: non-system messages exceed session.max_history_per_session.
+  -- Both replace earlier context with a summary checkpoint (never bare truncation, which
+  -- would invalidate the provider prefix cache).
+  threshold_ratio = 0.5,        -- Window trigger: compact at 50% full (keeps the model capable; explicit-cache models are raised to 0.85)
   retain_ratio = 0.16,          -- Proportion of recent history retained (single-round fallback / overflow recovery; regular compaction folds round 1 through the second-to-last round)
   retain_min_tokens = 4096,     -- Lower bound for the retained tail (single-round fallback / overflow recovery)
   compact_max_tokens = 8192,    -- Max output for the compaction summary
@@ -159,7 +165,7 @@ context_cache = {
 | `chat` | `{mousescroll_max_blank=3, incremental=true, fold="reasoning_tools", process_keep_steps=3}` | Same scrolling/incremental options as above; `fold` selects the folding level: `none` (no folds) / `reasoning_tools` (current behavior: reasoning and tool blocks fold) / `process` (additionally folds the AI intermediate steps of each turn into a “process” fold whose text shows folded rounds, tool success/failure counts, input/output tokens, and cache hit rate; the Step marker is appended to the reasoning/tool fold text as `· Step N` while the role header appears only on role switches as a plain `🤖 AI`; the “process” fold is level 1 while the reasoning/tool blocks inside it are level 2 nested folds, so they stay collapsed when it is expanded; a user message inserted while the AI is running does not start a new turn — Step numbering continues and the segment before the insertion is folded entirely); user and AI messages are both left-aligned (fixed behavior, no config switch); `process_keep_steps` keeps the most recent N intermediate steps expanded **while the current turn is running** (decided only by whether the agent is still working on this turn; a non-empty pending queue does not count; once the turn ends all intermediate steps are folded and only the final step stays expanded) |
 | `ask_user` | `{batch_debounce_ms=25, require_confirm=true}` | User-question popup: `batch_debounce_ms` is the debounce window (ms) for aggregating multiple questions within the same round (covers sibling-call arrival timing; larger aggregates more but delays the first popup); `require_confirm` controls whether a summary page is shown for a second confirmation after all questions are answered (`false` submits directly). The popup collapses to a small top-right window when focus leaves and expands when focused again |
 | `trajectory` | `{log_dir=".../NeoAI/logs"}` | Log directory for the trajectory display mode |
-| `statusline` | `{enabled=true, winbar=true, parts={mode,model,usage,cache,capacity,sandbox}, separator=" ", colors=...}` | lualine statusline; the `sandbox` part shows `待审N` when pending reviews > 0 (`N` is the total number of pending **files**, since the approval unit is a single file), linked to the prominent `NeoAISandboxPending` highlight group by default (bold yellow, override via `colors.sandbox`); when the pending queue contains an **L3 (high-risk)** item, the part appends `⚠危险` and switches to the red `NeoAISandboxDanger` group (override via `colors.sandbox_danger`); when **outside-workspace traces** exist, the part appends `越界N` (`N` = distinct file count; both shown side by side, e.g. `待审2 越界3`); the `usage` part shows **session-cumulative** input/output tokens (`↑` total input, `↓` total output; it no longer jumps with a single request), and the `cache` part shows the **cumulative** cache-hit ratio with **two decimals** (e.g. `缓存命中95.32%`) |
+| `statusline` | `{enabled=true, winbar=true, parts={mode,model,usage,cache,capacity,sandbox}, separator=" ", colors=...}` | lualine statusline; the `sandbox` part shows `待审N` when pending reviews > 0 (`N` is the total number of pending **files**, since the approval unit is a single file), linked to the prominent `NeoAISandboxPending` highlight group by default (bold yellow, override via `colors.sandbox`); when the pending queue contains an **L3 (high-risk)** item, the part appends `⚠危险` and switches to the red `NeoAISandboxDanger` group (override via `colors.sandbox_danger`); when **outside-workspace traces** exist, the part appends `越界N` (`N` = distinct file count; both shown side by side, e.g. `待审2 越界3`); the `usage` part shows **session-cumulative** input/output tokens (`↑` total input, `↓` total output; it no longer jumps with a single request); the `cache` part follows `cache_mode` with **two decimals**: `both` (default) renders `缓存命中latest(cumulative)` (e.g. `缓存命中99.52%(会话94.55%)`, where the first value reflects current prefix-cache quality and the parenthesized one is the provider billing aggregate), `latest` shows only the most recent request, and `cumulative` keeps the legacy session-cumulative value (e.g. `缓存命中95.32%`; also used as fallback when no per-request data exists) |
 
 > **Narrow-screen padding (no config)**: based on the chat main window width, a floating window fills that window
 > when width `< 40`, keeps 5 cols on each side when `40 ≤ width < 100`, and stays screen-ratio centered when
@@ -181,7 +187,15 @@ session = {
   auto_save = true,
   auto_naming = true,
   save_path = ".../NeoAI",
+  -- Count compaction trigger: compact when non-system messages exceed this value (whichever
+  -- of count/window triggers first); after compaction the count is recomputed from
+  -- "checkpoint + un-replaced tail", so collapsed messages are not counted again.
+  -- Only if compaction is unavailable/fails do we fall back to block-wise truncation.
   max_history_per_session = 1000,
+  -- Fallback truncation step (messages): the window start only advances when the overflow
+  -- reaches a full step, keeping the request prefix byte-stable inside a block so the
+  -- provider prefix cache can be reused. 0/1 = exact sliding (legacy behavior).
+  history_truncate_step = 200,
   file = "sessions.jsonl",   -- Append-only JSONL
   -- Redact secrets when persisting history: real/fake secrets are both replaced with
   -- `<密钥占位符>` before writing, so no secret ever reaches disk. Only the on-disk copy is

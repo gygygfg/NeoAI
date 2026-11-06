@@ -114,6 +114,7 @@ vim.api.nvim_create_autocmd("User", {
 | `SESSION_SWITCHED` | `session:switched` | 切换会话 | `{ session_id }` |
 | `SESSION_RENAMED` | `session:renamed` | 会话重命名 | `{ session_id }` |
 | `SESSION_FORKED` | `session:forked` | 会话分支 | `{ parent_id, child }` |
+| `SESSION_HISTORY_TRUNCATED` | `session:history_truncated` | 历史窗口真正滑动（前缀缓存失效一次） | `{ agent_id, start, dropped }` |
 
 ### 分支 / 树
 

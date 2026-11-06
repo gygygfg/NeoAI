@@ -5,6 +5,9 @@
 
 local session_mod = require("NeoAI.core.session.session")
 local config_store = require("NeoAI.kernel.config_store")
+local event_bus = require("NeoAI.kernel.event_bus")
+local events = require("NeoAI.kernel.events")
+local logger = require("NeoAI.kernel.logger")
 
 local M = {}
 
@@ -133,13 +136,75 @@ local function _balance_tools(messages)
   return out
 end
 
+--- 历史窗口截断步长（消息条数）。
+--- 0/1（或未配置）= 旧行为：每次请求精确滑动窗口（前缀每轮都变，缓存全量失效）；
+--- 缺省 200：溢出量满 step 才整体移动一次窗口起点，块内请求前缀逐字节稳定。
+--- 小窗口（显式 max_history 小于 2*step，测试常用）自动降级为精确行为，保持旧语义。
+--- @param max_history number
+--- @param opts table|nil { truncate_step? }
+--- @return number
+local function _truncate_step(max_history, opts)
+  local raw = opts and opts.truncate_step
+  if raw == nil then
+    raw = config_store.get("session.history_truncate_step")
+  end
+  local step = tonumber(raw) or 0
+  if step < 2 then return 1 end
+  local cap = math.max(1, math.floor(max_history / 2))
+  if step > cap then step = cap end
+  return step
+end
+
+--- 计算历史窗口起点。
+--- 分块滑动：只有溢出量达到 step 的整数倍时才移动起点，块内起点恒定，
+--- 从而让「系统提示 + 工具定义 + 稳定历史前缀」逐字节复用 provider 前缀缓存
+--- （旧实现每多一条消息起点就后移一条，请求前缀从第一条历史起就不同，缓存必然全量失效）。
 --- 若窗口从工具结果开始，向前扩展到发起调用的消息，保留完整工具轮次。
-local function _history_start(source, max_history)
-  local start = math.max(1, #source - max_history + 1)
+--- @param source table 请求视图消息
+--- @param max_history number 最多保留的非 system 消息数（软上限，实际为 max_history+step-1）
+--- @param opts table|nil { truncate_step? }
+--- @return number start 1-based 起点
+--- @return number dropped 被丢弃的消息数
+local function _history_start(source, max_history, opts)
+  local n = #source
+  local start = math.max(1, n - max_history + 1)
+  local overflow = n - max_history
+  if overflow > 0 then
+    local step = _truncate_step(max_history, opts)
+    if step > 1 then
+      -- 把起点钉在块边界：块内不移动，溢出满 step 才整体前进 step 条。
+      start = math.max(1, start - (overflow % step))
+    end
+  end
   while start > 1 and source[start] and source[start].role == "tool" do
     start = start - 1
   end
-  return start
+  return start, start - 1
+end
+
+--- 记录窗口滑动（真正改动前缀的时刻），供诊断/状态栏与日志定位缓存失效原因。
+--- 同一 agent 仅在起点发生变化时记一次，避免 estimate_request 等重复构建刷屏。
+--- @param agent table|nil
+--- @param start number
+--- @param dropped number
+local function _note_window_slide(agent, start, dropped)
+  if not agent then return end
+  local prev = agent._history_window_start
+  agent._history_window_start = start
+  if dropped <= 0 or prev == start then return end
+  local cache = agent.cache or {}
+  cache.truncations = (cache.truncations or 0) + 1
+  cache.history_window_start = start
+  cache.history_dropped = dropped
+  agent.cache = cache
+  logger.warn(
+    "[context] 历史窗口滑动：自第 %d 条开始保留（丢弃 %d 条较早消息）——本请求前缀缓存将失效一次",
+    start, dropped)
+  event_bus.emit(events.SESSION_HISTORY_TRUNCATED, {
+    agent_id = agent.id,
+    start = start,
+    dropped = dropped,
+  })
 end
 
 --- 应用压缩覆盖层：检查点消息取代 messages 的前 replaced 条「非运行态快照」消息。
@@ -199,7 +264,7 @@ end
 
 --- 从会话构建上下文消息列表
 --- @param session table
---- @param opts table|nil { max_history?=session 配置, include_system?=true, extra_user?=string|nil }
+--- @param opts table|nil { max_history?=session 配置, include_system?=true, extra_user?=string|nil, truncate_step? }
 --- @return table API 消息数组
 function M.build(session, opts)
   opts = opts or {}
@@ -221,7 +286,7 @@ function M.build(session, opts)
       non_system[#non_system + 1] = m
     end
   end
-  local start = _history_start(non_system, max_history)
+  local start = _history_start(non_system, max_history, opts)
   for i = start, #non_system do
     messages[#messages + 1] = _to_api_message(non_system[i])
   end
@@ -233,7 +298,7 @@ end
 
 --- 从 Agent 构建上下文消息（Agent 持有私有消息队列 + 配置）
 --- @param agent table Agent
---- @param opts table|nil { max_history?, include_system? }
+--- @param opts table|nil { max_history?, include_system?, truncate_step? }
 --- @return table API 消息数组
 function M.build_from_agent(agent, opts)
   opts = opts or {}
@@ -245,7 +310,12 @@ function M.build_from_agent(agent, opts)
     or config_store.get("session.max_history_per_session")
     or 1000
   local source = M.request_view(agent)
-  local start = _history_start(source, max_history)
+  local start, dropped = _history_start(source, max_history, opts)
+  -- 仅在「真实请求构建」（含系统提示）时记录窗口滑动：估算路径 include_system=false，
+  -- 避免状态栏/容量估算重复触发日志与事件。
+  if opts.include_system ~= false then
+    _note_window_slide(agent, start, dropped)
+  end
   for i = start, #source do
     messages[#messages + 1] = _to_api_message(source[i])
   end

@@ -150,6 +150,48 @@ tests.suite("session", function(_, it)
     t.eq("u10", msgs[#msgs].content)
   end)
 
+  it("context_builder 历史窗口分块滑动（块内前缀逐字节稳定）", function(t)
+    local ctx = require("NeoAI.core.session.context_builder")
+    local function build(n)
+      local source = {}
+      for i = 1, n do source[i] = { role = "user", content = "u" .. i } end
+      return ctx.build({ messages = source }, {
+        include_system = false, max_history = 10, truncate_step = 5,
+      })
+    end
+    -- 溢出 4 < step：不移动窗口（保留全部，避免每次都改前缀）
+    local msgs = build(14)
+    t.eq(14, #msgs)
+    t.eq("u1", msgs[1].content)
+    -- 溢出 5：整体前进 5 条，保留 10 条
+    msgs = build(15)
+    t.eq(10, #msgs)
+    t.eq("u6", msgs[1].content)
+    -- 块内：起点保持 u6，只增长尾部（前缀缓存可复用）
+    for n = 16, 19 do
+      msgs = build(n)
+      t.eq("u6", msgs[1].content, "块内窗口起点应保持不变 (n=" .. n .. ")")
+    end
+    -- 溢出 10：再前进 5 条
+    msgs = build(20)
+    t.eq("u11", msgs[1].content)
+
+    -- 显式小窗口（max_history=2）自动降级为精确滑动，保持旧语义
+    local small = ctx.build({
+      messages = { { role = "user", content = "a" }, { role = "user", content = "b" }, { role = "user", content = "c" } },
+    }, { include_system = false, max_history = 2 })
+    t.eq(2, #small)
+    t.eq("b", small[1].content)
+
+    -- 真正滑动时诊断计数一次；块内重复构建不重复计数
+    local agent = { id = "window-agent", messages = {}, config = {}, cache = {} }
+    for i = 1, 15 do agent.messages[i] = { role = "user", content = "m" .. i } end
+    ctx.build_from_agent(agent, { max_history = 10, truncate_step = 5 })
+    t.eq(1, agent.cache.truncations)
+    ctx.build_from_agent(agent, { max_history = 10, truncate_step = 5 })
+    t.eq(1, agent.cache.truncations, "块内重复构建不应重复计数")
+  end)
+
   it("context_builder 从 Agent 构建", function(t)
     require("NeoAI.core.session.session")
     local ctx = require("NeoAI.core.session.context_builder")

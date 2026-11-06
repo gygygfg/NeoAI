@@ -207,8 +207,12 @@ local DEFAULT_CONFIG = {
       -- 系统提示整体替换，并让每次快照变化都改写请求开头 → 多轮前缀缓存命中率骤降。
       -- 仅当端点确认支持 messages 中途 system 且模板按原位渲染时才开启。
       system_in_history = false,
-      context_window = 64000, -- 模型上下文窗口（token 估算）
-      threshold_ratio = 0.8, -- 达到该比例触发压缩
+      context_window = 64000, -- 模型上下文窗口（token 估算；=64000 表示按模型能力表自动推导）
+      -- 压缩触发（两个条件任一满足即触发，压缩后按「检查点 + 未替换尾部」重新计数）：
+      --   1) 窗口：估算 token 达到 context_window * threshold_ratio；
+      --   2) 条数：非 system 消息数超过 session.max_history_per_session。
+      -- 两者都用摘要检查点替换较早上下文，绝不裸截断（裸截断会让前缀缓存全量失效）。
+      threshold_ratio = 0.5, -- 窗口触发：占满 50% 即压缩（为模型保留可用能力；显式缓存模型自动抬到 0.85）
       warn_ratio = 0.85, -- 达到该比例状态栏变色并提示（接近上限）
       retain_ratio = 0.16, -- 保留的最近历史比例（压缩后尾部）
       retain_min_tokens = 4096, -- 尾部保留的下限（token）
@@ -285,6 +289,9 @@ local DEFAULT_CONFIG = {
       winbar = true, -- 是否在聊天主窗口顶部渲染第二行（模式/显示模式/模型/状态）；false 只保留一行
       parts = { "mode", "model", "usage", "cache", "capacity" }, -- component() 拼接的段顺序
       separator = " ", -- 段间分隔符
+      -- cache 段口径：both=单次请求命中率(会话累计)（缺省）；latest=只显示最近一次请求；
+      -- cumulative=只显示会话累计（旧行为）。provider 账单口径对应累计值。
+      cache_mode = "both",
       colors = { -- 各段链接的 nvim 高亮组（避免默认灰暗配色）
         mode = "Title",
         display = "Keyword",
@@ -352,7 +359,14 @@ local DEFAULT_CONFIG = {
     auto_save = true,
     auto_naming = true,
     save_path = vim.fn.stdpath("cache") .. "/NeoAI",
+    -- 条数压缩触发（与 token 窗口阈值二者取先触发者）：非 system 消息数超过该值即压缩，
+    -- 压缩后按「检查点 + 未替换尾部」重新计数（被折叠的消息不再重复计数）。
+    -- 该上限只有压缩不可用/失败时才降级为按 history_truncate_step 分块截断兜底。
     max_history_per_session = 1000,
+    -- 历史截断步长（消息条数）：溢出满 step 才整体移动一次窗口起点，块内请求前缀逐字节
+    -- 稳定，才能复用 provider 前缀缓存。旧实现每轮精确滑动会让缓存全量失效。
+    -- 0/1 = 精确滑动（旧行为，排障/对比用）；实际上限为 max_history_per_session+step-1。
+    history_truncate_step = 200,
     file = "sessions.jsonl",
     -- 落盘历史时对密钥脱敏：真/假密钥一律替换为 `<密钥占位符>` 后再写入 `sessions.jsonl`，
     -- 杜绝把密钥（含沙箱格式保真假密钥）持久化到磁盘。仅影响磁盘副本，内存会话保留 token

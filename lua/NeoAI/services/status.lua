@@ -141,8 +141,16 @@ local function _build_part(info, part)
     return "↑" .. _fmt_tokens(p) .. " ↓" .. _fmt_tokens(c)
   elseif part == "cache" then
     if not info.usage or (not info.usage.requests or info.usage.requests == 0) then return nil end
-    -- 只显示累计命中率（保留两位小数），简洁不堆 token 数
-    return "缓存命中" .. _fmt_pct2(info.usage.cache_ratio or 0)
+    local cum = info.usage.cache_ratio or 0
+    local last = info.usage.last_cache_ratio
+    local mode = config_store.get("ui.statusline.cache_mode") or "both"
+    if mode == "latest" then
+      return "缓存命中" .. _fmt_pct2(last or cum)
+    elseif mode == "both" and last then
+      -- 单次命中率反映当前前缀缓存质量；括号内为会话累计（provider 账单口径）。
+      return "缓存命中" .. _fmt_pct2(last) .. "(会话" .. _fmt_pct2(cum) .. ")"
+    end
+    return "缓存命中" .. _fmt_pct2(cum)
   elseif part == "capacity" then
     if not info.capacity or not info.capacity.total or info.capacity.total <= 0 then return nil end
     if info.capacity.level == "over" then return "上下文超限" end
@@ -395,6 +403,8 @@ function M.get_info()
   end
   if agent then
     local u = agent.usage or {}
+    local last_prompt = tonumber(u.last_prompt)
+    local last_read = tonumber(u.last_cache_read) or 0
     info.usage = {
       prompt = u.prompt or 0,
       completion = u.completion or 0,
@@ -405,6 +415,12 @@ function M.get_info()
       cache_write = u.cache_write or 0,
       cache_miss = u.cache_miss or 0,
       cache_ratio = u.cache_ratio or 0,
+      last_cache_read = last_read,
+      -- 最近一次请求的命中率（provider 返回的 cache_read/last_prompt）。
+      -- 与累计口径区分：短会话累计值会被冷启动与早期小上下文摊薄。
+      last_cache_ratio = (last_prompt and last_prompt > 0)
+        and math.max(0, math.min(1, last_read / last_prompt))
+        or nil,
     }
     -- 上下文容量：优先 API 最近一次请求的真实输入 token，缺失回退完整请求估算
     info.capacity = M.capacity_for(agent)

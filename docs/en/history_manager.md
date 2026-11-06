@@ -85,7 +85,15 @@ Compaction failure preserves the successfully appended records and retries on a 
 `context_builder.build(session)` / `build_from_agent(agent)`:
 
 - The first message is system (rendered by `prefix.build_system_prompt`).
-- History truncation: keeps the most recent `session.max_history_per_session` (default 1000) non-system messages.
+- History window: **either the token window or the message count triggers compaction**, replacing earlier
+  context with a summary checkpoint plus the un-replaced tail, rather than truncating it — truncation rewrites
+  the request prefix every round and invalidates the provider prefix cache.
+  - Window trigger: estimated tokens ≥ `context_window * threshold_ratio` (default 50%).
+  - Count trigger: non-system messages > `session.max_history_per_session` (default 1000).
+  After compaction the count is recomputed from "checkpoint + un-replaced tail" (collapsed messages are not
+  counted again). Only if compaction is unavailable/fails do we fall back to block-wise sliding by
+  `session.history_truncate_step` (default 200); the window start moves a full step at a time, keeping the
+  prefix byte-stable inside a block.
 - **Tool-call protocol**: for an assistant message with `tool_calls`, `content` must be `null` (or omitted);
   sending `content:""` is treated as a malformed format by models that enforce strict validation.
 - **Reasoning content is not sent back with history**: `reasoning_content` is not written into API messages; the internal `message.reasoning` is used only for rendering.
@@ -98,12 +106,15 @@ Compaction failure preserves the successfully appended records and retries on a 
 
 The strategy aligns with deepseek-harness compaction:
 
-1. **Triggering**: in two places.
-   - **Turn boundary**: `runtime.run` calls `maybe_compact(agent)` before a new step (requires `idle`).
-   - **Inside the tool loop**: `tool_loop._send_round` calls `maybe_compact(agent, { allow_busy = true })` before sending each round;
-     overflow recovery (`recovery`) calls `force_compact(agent, { allow_busy = true })`. Both relax the `idle` requirement,
-     because at that moment the previous round's tool results have already been written back and the next request has not been sent yet (or the request has already failed due to overflow), so there are no concurrent writes.
-   Compaction occurs when the estimated token count reaches the `context_window * threshold_ratio` threshold.
+1. **Triggering**: either the token window or the message count can trigger; both turn and tool-round
+   boundaries check them.
+   - **Turn boundary**: `runtime.run` checks after appending the user message; when the count is over the cap
+     it waits for `maybe_compact` before the first request, otherwise it calls `start_background`.
+   - **Inside the tool loop**: `tool_loop._send_round` performs the same check before each round; overflow
+     recovery (`recovery`) still calls the blocking `force_compact(agent, { allow_busy = true })`.
+   Compaction occurs when the estimated token count reaches `context_window * threshold_ratio` (default 0.5)
+   or the message count exceeds `session.max_history_per_session` (default 1000); after compaction the count
+   is recomputed so the same messages are not collapsed twice.
 2. **Model-agnostic pruning**: first `tool_result_pruner.prune_agent` trims oversized tool results into a
    "head + omission marker + tail" form (`prune_threshold_chars` / `prune_head_chars` / `prune_tail_chars`);
    results containing image references are skipped. If after pruning the count is already back within the threshold, it ends directly without a summarization call; if any pruning occurred, stale API usage is invalidated.
@@ -138,6 +149,6 @@ When a session node (no specific round) is chosen in the tree UI, if that sessio
 
 ## 7. Related Documents
 
-- [configuration.md](configuration.md): `session.*` configuration (save_path / max_history_per_session / file).
+- [configuration.md](configuration.md): `session.*` configuration (save_path / max_history_per_session / history_truncate_step / file).
 - [ai_engine.md](ai_engine.md): the role of `context_builder` / `compactor` in the generation flow.
 - [EVENTS.md](EVENTS.md): session events (`SESSION_*`).

@@ -317,15 +317,27 @@ function M.run(agent, content, opts)
     require("NeoAI.kernel.logger").debug("[runtime] check_pressure 失败: %s", tostring(err_p2))
   end
   local compactor = require("NeoAI.core.session.compactor")
-  compactor.start_background(agent, { allow_busy = true })
-  return _run_generation(agent, {}):finally(function()
-    -- 兜底释放：仅在令牌仍属本轮时清除，避免误清掉 AGENT_STATE_CHANGED 刷新
-    -- 链同步启动的下一轮（_finish_idle 已在置 idle 前清掉本轮的令牌，此分支通常
-    -- 只在异常路径（如工具循环被取消且未走 _finish_idle）触发）。
+  -- 兜底释放：仅在令牌仍属本轮时清除，避免误清掉 AGENT_STATE_CHANGED 刷新
+  -- 链同步启动的下一轮（_finish_idle 已在置 idle 前清掉本轮的令牌，此分支通常
+  -- 只在异常路径（如工具循环被取消且未走 _finish_idle）触发）。
+  local function _release_turn_claim()
     if agent._turn_claim == claim_id then
       agent._turn_claim = nil
     end
-  end)
+  end
+  local function _generate()
+    return _run_generation(agent, {})
+  end
+  -- 历史条数即将超限（窗口将滑动）时：先等压缩完成，让首个请求直接使用「检查点 + 尾部」；
+  -- 裸截断会改写请求前缀、使 provider 前缀缓存全量失效，必须避免。
+  -- 其余情况（token 压力）保持后台非阻塞压缩，不阻塞本轮首包。
+  if compactor.history_overflow(agent) then
+    return compactor.maybe_compact(agent, { allow_busy = true })
+      :then_(_generate, _generate)
+      :finally(_release_turn_claim)
+  end
+  compactor.start_background(agent, { allow_busy = true })
+  return _generate():finally(_release_turn_claim)
 end
 
 --- 获取 Agent

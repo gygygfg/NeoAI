@@ -117,7 +117,11 @@ context_cache = {
   -- 仅当端点确认支持 messages 中途 system 且按原位渲染时才开启。
   system_in_history = false,
   context_window = 64000,       -- 上下文窗口兜底值：用户显式非默认值优先，否则按模型能力表推导
-  threshold_ratio = 0.8,        -- 达到该比例触发后台异步压缩（不阻塞、不弹窗；显式缓存模型自动取更保守值）
+  -- 压缩触发（两个条件任一满足即触发；压缩后按「检查点 + 未替换尾部」重新计数，不重复计数）：
+  --   1) 窗口：估算 token 达到 context_window * threshold_ratio；
+  --   2) 条数：非 system 消息数超过 session.max_history_per_session。
+  -- 两种触发都用摘要检查点替换较早上下文（绝不裸截断，裸截断会让前缀缓存全量失效）。
+  threshold_ratio = 0.5,        -- 窗口触发：占满 50% 即压缩（为模型保留可用能力；显式缓存模型自动抬到 0.85）
   retain_ratio = 0.16,          -- 保留的最近历史比例（单轮长循环回退/溢出恢复用；常规压缩折叠第一轮至倒数第二轮）
   retain_min_tokens = 4096,     -- 尾部保留下限（单轮长循环回退/溢出恢复用）
   compact_max_tokens = 8192,    -- 压缩摘要输出上限
@@ -154,7 +158,7 @@ context_cache = {
 | `chat` | `{mousescroll_max_blank=3, incremental=true, fold="reasoning_tools", process_keep_steps=3}` | 鼠标滚轮滚到底时末行下方允许的最大空白行数（0=严格贴底）；`incremental` 开启增量刷新（只重渲染变化的消息块且只写差异行），设为 `false` 降级回整 buffer 全量重写；`fold` 为折叠程度：`none`（不折叠）/ `reasoning_tools`（现状：推理与工具块折叠）/ `process`（额外把每轮的 AI 中间调用收进「过程」折叠，折叠文本显示折叠轮次、工具成功/失败数、输入/输出 token、缓存命中率；Step 标记以 `· Step N` 追加在思考过程/工具调用折叠文本上，角色头只在角色切换时出现且为纯 `🤖 AI`；「过程」为 level 1 折叠，内部推理/工具块为 level 2 嵌套折叠，展开后仍各自收起；AI 运行途中插入的用户消息不开启新轮次，Step 编号连续、插入前的步骤整段收起）；用户消息与 AI 消息一律左对齐（固定行为，无配置开关）；`process_keep_steps` 为 `process` 模式下**本轮进行中**保留展开的最近中间步数（只看 agent 是否还在处理本轮，暂存队列非空不算；轮次结束后中间步骤全部收起，只留最终步骤展开） |
 | `ask_user` | `{batch_debounce_ms=25, require_confirm=true}` | 向用户提问弹窗：`batch_debounce_ms` 为同一轮多次提问的聚合去抖窗口（毫秒，覆盖兄弟调用到达时序；越大越全但首弹越慢）；`require_confirm` 为全部作答后是否展示汇总页二次确认（`false` 时直接提交）。弹窗在焦点离开时自动缩为右上角小窗、重新聚焦时展开 |
 | `trajectory` | `{log_dir=".../NeoAI/logs"}` | 轨迹显示模式的日志保存目录 |
-| `statusline` | `{enabled=true, winbar=true, parts={mode,model,usage,cache,capacity,sandbox}, separator=" ", colors=...}` | lualine 状态栏；`sandbox` 段在沙箱待审数 > 0 时显示 `待审N`（`N` 为待审**文件**总数，审批单位为单个文件），默认链接醒目高亮组 `NeoAISandboxPending`（黄底加粗，可在 `colors.sandbox` 覆盖）；待审队列含 **L3（高危）** 时该段追加 `⚠危险` 并切换为红色危险高亮组 `NeoAISandboxDanger`（可在 `colors.sandbox_danger` 覆盖）；存在**越界访问留痕**时该段追加 `越界N`（`N` 为去重文件数，两者都有时并列显示，如 `待审2 越界3`）；`usage` 段显示**会话累计**输入/输出 token（`↑` 输入合计、`↓` 输出合计，不随单次请求跳变），`cache` 段显示**累计**缓存命中率并保留**两位小数**（如 `缓存命中95.32%`） |
+| `statusline` | `{enabled=true, winbar=true, parts={mode,model,usage,cache,capacity,sandbox}, separator=" ", colors=...}` | lualine 状态栏；`sandbox` 段在沙箱待审数 > 0 时显示 `待审N`（`N` 为待审**文件**总数，审批单位为单个文件），默认链接醒目高亮组 `NeoAISandboxPending`（黄底加粗，可在 `colors.sandbox` 覆盖）；待审队列含 **L3（高危）** 时该段追加 `⚠危险` 并切换为红色危险高亮组 `NeoAISandboxDanger`（可在 `colors.sandbox_danger` 覆盖）；存在**越界访问留痕**时该段追加 `越界N`（`N` 为去重文件数，两者都有时并列显示，如 `待审2 越界3`）；`usage` 段显示**会话累计**输入/输出 token（`↑` 输入合计、`↓` 输出合计，不随单次请求跳变）；`cache` 段按 `cache_mode` 展示并保留**两位小数**：`both`（缺省）为 `缓存命中单次(会话累计)`（如 `缓存命中99.52%(会话94.55%)`，单次值反映当前前缀缓存质量，括号内为 provider 账单口径），`latest` 只显示最近一次请求，`cumulative` 只显示会话累计（旧行为，如 `缓存命中95.32%`；无单次数据时也回退累计） |
 
 > **窄屏浮窗留白（无需配置）**：以「聊天主窗口宽度」为基准，宽度 `< 40` 时浮窗左右占满该窗口、
 > `40 ≤ 宽度 < 100` 时左右各留 5 格、`≥ 100` 时维持按屏幕比例居中。阈值 `40/100` 与留白 `5`
@@ -175,7 +179,13 @@ session = {
   auto_save = true,
   auto_naming = true,
   save_path = ".../NeoAI",
+  -- 条数压缩触发：非 system 消息数超过该值即压缩（与 token 窗口阈值取先触发者）；
+  -- 压缩后按「检查点 + 未替换尾部」重新计数，被折叠的消息不再重复计数。
+  -- 仅当压缩不可用/失败时，才按 history_truncate_step 分块截断兜底。
   max_history_per_session = 1000,
+  -- 兜底截断步长（消息条数）：溢出满 step 才整体移动一次窗口起点，块内请求前缀逐字节
+  -- 稳定，才能复用 provider 前缀缓存；0/1 = 精确滑动（旧行为，排障/对比用）。
+  history_truncate_step = 200,
   file = "sessions.jsonl",   -- 追加式 JSONL
   -- 落盘历史对密钥脱敏：真/假密钥一律替换为 `<密钥占位符>` 后再写入，杜绝把密钥持久化到磁盘。
   -- 仅影响磁盘副本，内存会话仍保留 token（供 detokenize / 界面展示）。false 关闭（不推荐）。

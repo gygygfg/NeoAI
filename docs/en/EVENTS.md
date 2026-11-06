@@ -114,6 +114,7 @@ All event constants are defined in `NeoAI.kernel.events`. They are listed below 
 | `SESSION_SWITCHED` | `session:switched` | Session switched | `{ session_id }` |
 | `SESSION_RENAMED` | `session:renamed` | Session renamed | `{ session_id }` |
 | `SESSION_FORKED` | `session:forked` | Session forked | `{ parent_id, child }` |
+| `SESSION_HISTORY_TRUNCATED` | `session:history_truncated` | History window actually slid (prefix cache invalidated once) | `{ agent_id, start, dropped }` |
 
 ### Branches / Tree
 
