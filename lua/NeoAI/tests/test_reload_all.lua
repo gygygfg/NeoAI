@@ -1,10 +1,10 @@
---- reload_all 热重载实现测试（供 :NeoAIReloadAll 命令使用的底层实现）
+--- reload_all 热重载实现测试（供 :NeoAI ReloadAll 命令使用的底层实现）
 --- @module 'NeoAI.tests.test_reload_all'
 
 local tests = require("NeoAI.tests")
 
 tests.suite("reload_all", function(_, it)
-  it("reload_all 不再注册为 AI 工具（改由 :NeoAIReloadAll 命令驱动）", function(t)
+  it("reload_all 不再注册为 AI 工具（改由 :NeoAI ReloadAll 命令驱动）", function(t)
     local tools = require("NeoAI.tools")
     tools.init()
     local reg = tools.registry

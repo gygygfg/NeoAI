@@ -69,7 +69,7 @@ column `base_col`); thresholds/padding are currently hard-coded:
 
 ### 4.0 Multiple chat instances
 
-A single nvim can host **multiple independent chat instances**: `<leader>ac` / `:NeoAIChat` opens a
+A single nvim can host **multiple independent chat instances**: `<leader>ac` / `:NeoAI Chat` opens a
 new instance **in a new tab** with a unique buffer name (`NeoAI Chat`, `NeoAI Chat 2`, …; the input
 box `NeoAI Input`, `NeoAI Input 2`, …). Existing instances **stay alive** (their own event
 subscriptions / sessions / streaming output) — nothing is replaced and no names are shared.
@@ -479,7 +479,7 @@ recognizes **ownerless** buffers whose `filetype` starts with `neoai` or whose b
 `state.windows`, and input buffers registered by each instance via `manager.register_aux` — kept alive even when
 collapsed, i.e. its window is closed but the buffer survives), safely closes their windows and `nvim_buf_delete(force)` — all
 `pcall`-wrapped, idempotent, never touching non-NeoAI buffers. Result: after a restart the chat UI is fully closed and
-the user must explicitly `:NeoAIChat` (new session); restored `NeoAI Input N` leftovers are no longer spared by a
+the user must explicitly `:NeoAI Chat` (new session); restored `NeoAI Input N` leftovers are no longer spared by a
 blanket "live chat exists ⇒ exempt every input buffer" rule (which would otherwise occupy names — unique input naming
 relies on this).
 
@@ -499,6 +499,51 @@ It also defines the `_G.NeoAIFoldExpr` fallback stub (returns 0) so a restored w
 
 `chat_view.open()` also cleans up first in its create branch (to guard against name clashes), and `close()` deletes the
 input buffer (`input_box.destroy()`) to avoid leaking the named `nofile` buffer.
+
+### 4.9.1 Input box `#` context placeholders
+
+`ui/components/hash_complete.lua` gives the chat input box a "context reference" feature: typing `#` opens candidates,
+and picking one inserts placeholder text such as `#{buffers}` (it does **not** expand immediately) highlighted with
+`NeoAIHashPlaceholder`. Expansion happens **right before sending** (inside `input_box.M.submit`, before `on_submit`),
+so the user can still read/edit/remove a reference instead of having a wall of text in the input box.
+
+| Placeholder | Expands to |
+| --- | --- |
+| `#{buffers}` | All buffers (number / loaded state / type / path) |
+| `#{buffer:NAME}` | Content of the named buffer (matched by name or file name; all matches concatenated) |
+| `#{lsp}` | LSP diagnostics of the context buffer (`file:line:col [level] message`); the context buffer is recorded by `chat_view` before focusing the input box (NeoAI-internal buffers excluded) |
+| `#{message}` / `#{notify}` | Neovim message history since startup (same as `:messages`), capped at `ui.input_box.hash_completion.max_chars` (**counted in characters**, CJK never cut in half) |
+| `#{tool}` / `#{tool:NAME}` | Tool list / a single tool definition (name, description, parameter schema) |
+| `#{skills}` / `#{skills:NAME}` | Skill list / a single skill body |
+| `#{mcp}` / `#{mcp:NAME}` | MCP tool list / a single tool definition |
+
+Implementation notes:
+
+- **Two completion paths**: `completefunc` (manual `<C-x><C-u>`, no dependency) plus an optional nvim-cmp source
+  `neoai_hash` (trigger chars `#`/`:`, auto-popup when cmp is installed). Both only return dict candidates.
+- **Highlighting**: recomputed on `TextChangedI`/`TextChanged`/`InsertLeave` within a fixed extmark namespace;
+  cleaned up on `reset`/`destroy`.
+- **Safe degradation**: unknown keys or missing buffers/skills/tools keep the placeholder **as-is** (never throws,
+  never yields an empty string), so sending is never interrupted; every expansion goes through
+  `utils/stringx.safe_truncate` for UTF-8 safe truncation.
+- **Config**: `ui.input_box.hash_completion = { enabled=true, max_chars=2000, max_bytes=20000 }`; `enabled=false`
+  is a no-op (no completefunc / cmp source / autocmds).
+
+### 4.9.2 Command hints (ui/command_hint.lua)
+
+`:NeoAI` is a single aggregated command (sub-commands are space separated, e.g. `:NeoAI Open`,
+`:NeoAI SandboxReview`). Neovim's `complete=customlist` **only accepts plain string candidates** (the `menu` field of
+candidate dicts is ignored), so the wildmenu cannot carry per-item descriptions. `command_hint` therefore offers two
+layers:
+
+1. nvim-cmp + cmp-cmdline installed: registers the `neoai_cmd` source (`label`/`detail`/`documentation`), letting cmp
+   show the descriptions in its `:` menu. It **does not override** the user's existing `:` sources; it is only offered
+   as an optional source (`{ name = "neoai_cmd" }` in the cmdline sources).
+2. Otherwise: a built-in `nvim_open_float` above the command line listing `name — description`, highlighting the
+   matched prefix, closed on `CmdlineLeave`/`VimResized`.
+
+Install/uninstall is wired into the `commands` plugin's `start`/cleanup, so `:NeoAI ReloadAll` and exit leave no
+leftover autocmds; `ui.command_hint.enabled=false` is a no-op.
 
 ## 5. Display Modes (display_modes)
 

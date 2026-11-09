@@ -76,22 +76,26 @@ tests.suite("sandbox_privilege", function(_, it)
   it("加固：遮蔽目录永不遮蔽项目 .git（cwd 为子目录时 git 工具仍可用）", function(t)
     local runtime = require("NeoAI.sandbox.execution.runtime")
     local fs = require("NeoAI.utils.fs")
-    local home = "/root/neoai_mask_git_test"
+    -- fixture 建在临时目录（不落到 /root 等宿主目录）；无论断言是否失败都递归清理。
+    local home = vim.fn.tempname()
     local proj = home .. "/proj"
-    fs.ensure_dir(proj .. "/.git/objects")
-    fs.ensure_dir(proj .. "/sub")
-    fs.write_file(proj .. "/other.txt", "x")
-    with_config({ tools = { sandbox = {
-      read_all = false, mask_dirs_enabled = true, mask_dirs = { "/root" },
-    } } }, function()
-      local cwd_sub = proj .. "/sub"
-      -- 兄弟条目（父目录下的普通文件）仍被遮蔽
-      t.not_nil(runtime.mask_entry(proj .. "/other.txt", cwd_sub), "普通兄弟条目应被遮蔽")
-      -- 项目 .git（父目录下的兄弟）不被遮蔽，且其内部也不被遮蔽
-      t.nil_(runtime.mask_entry(proj .. "/.git", cwd_sub), "项目 .git 不应被遮蔽")
-      t.nil_(runtime.mask_entry(proj .. "/.git/objects", cwd_sub), ".git 内部不应被遮蔽")
+    local ok, err = pcall(function()
+      fs.ensure_dir(proj .. "/.git/objects")
+      fs.ensure_dir(proj .. "/sub")
+      fs.write_file(proj .. "/other.txt", "x")
+      with_config({ tools = { sandbox = {
+        read_all = false, mask_dirs_enabled = true, mask_dirs = { home },
+      } } }, function()
+        local cwd_sub = proj .. "/sub"
+        -- 兄弟条目（父目录下的普通文件）仍被遮蔽
+        t.not_nil(runtime.mask_entry(proj .. "/other.txt", cwd_sub), "普通兄弟条目应被遮蔽")
+        -- 项目 .git（父目录下的兄弟）不被遮蔽，且其内部也不被遮蔽
+        t.nil_(runtime.mask_entry(proj .. "/.git", cwd_sub), "项目 .git 不应被遮蔽")
+        t.nil_(runtime.mask_entry(proj .. "/.git/objects", cwd_sub), ".git 内部不应被遮蔽")
+      end)
     end)
-    fs.delete_file(home)
+    vim.fn.delete(home, "rf")
+    if not ok then error(err, 0) end
   end)
 
   it("加固：进程内工具硬拦截宿主敏感遮蔽路径（mask_paths）", function(t)

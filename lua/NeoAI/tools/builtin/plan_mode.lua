@@ -34,7 +34,7 @@ local PLAN_POLICY_TEXT = table.concat({
   "   - 实施步骤（先后顺序）",
   "   - 验证方式与回滚方案",
   "4. 输出计划后即结束本轮：不要尝试切换模式或开始执行修改。是否按计划执行由用户决定，",
-  "   用户确认（:NeoAIApprovePlan 或手动切换模式）后系统会把计划转为任务清单（todo）并转入执行。",
+  "   用户确认（:NeoAI ApprovePlan 或手动切换模式）后系统会把计划转为任务清单（todo）并转入执行。",
 }, "\n")
 
 --- 计划模式下可见的只读/信息查询工具白名单
@@ -323,7 +323,7 @@ plan_mode_tools.enter_plan_mode = helpers.define_tool(
 )
 
 -- 说明：不再向 AI 暴露 exit_plan_mode 等模式切换工具。计划完成后由用户手动确认执行
--- （:NeoAIApprovePlan 或手动切换模式），避免 AI 自行退出计划模式并立即开始改动。
+-- （:NeoAI ApprovePlan 或手动切换模式），避免 AI 自行退出计划模式并立即开始改动。
 
 -- ========== 测试辅助 ==========
 

@@ -3,15 +3,15 @@
 > [中文](../chat_enhanced_usage.md) | **English**
 
 > This document describes actual usage of the v3.0 chat interface. The `NeoAI.ui.chat_enhanced` module
-> and the `:NeoAISend` / `:NeoAIMode` / `:NeoAIDemo` / `:NeoAIList` commands mentioned in older
+> and the `:NeoAI Send` / `:NeoAI Mode` / `:NeoAI Demo` / `:NeoAI List` commands mentioned in older
 > versions **do not exist**.
 > Corresponding source: `lua/NeoAI/ui/window/chat_view.lua`, `lua/NeoAI/ui/components/*`.
 
 ## 1. Opening the Chat
 
 ```vim
-:NeoAIChat        " Open the chat interface directly
-:NeoAIOpen        " Open the default view (per ui.default_view, chat/tree)
+:NeoAI Chat        " Open the chat interface directly
+:NeoAI Open        " Open the default view (per ui.default_view, chat/tree)
 ```
 
 Or bind a keymap in your Neovim configuration (`keymaps.global`, default `<leader>ac`).
@@ -53,9 +53,9 @@ The chat window = **main message area (top)** + **input box (bottom, split, heig
 | Cycle mode | `m` | CHAT → PLAN |
 | Cycle display mode | `<C-t>` (insert) / `T` (normal) | chat / trajectory |
 | Hot-reload display mode | `<F5>` | Reload the current display-mode plugin |
-| Approve plan | — | Run `:NeoAIApprovePlan` (or toggle the mode manually); the AI no longer holds a mode-switching tool |
+| Approve plan | — | Run `:NeoAI ApprovePlan` (or toggle the mode manually); the AI no longer holds a mode-switching tool |
 | Tool approval | `<C-a>` | Confirm inside the approval popup |
-| Sandbox review | `<leader>ap` | Equivalent to `:NeoAISandboxReview`; list and apply pending sandbox changes (per-file approval), graded high/medium/low; press `i` to preview that item's diff (temporarily closes the review window and returns with the cursor restored) |
+| Sandbox review | `<leader>ap` | Equivalent to `:NeoAI SandboxReview`; list and apply pending sandbox changes (per-file approval), graded high/medium/low; press `i` to preview that item's diff (temporarily closes the review window and returns with the cursor restored) |
 | Scroll | `j` / `k` / mouse wheel | `j`/`k` move the cursor by line; the wheel smoothly scrolls the viewport, with blank space below the last line capped at `ui.chat.mousescroll_max_blank` lines |
 
 ## 4. Streaming Updates and Floating Windows
@@ -99,17 +99,17 @@ Expand/collapse: `zM` (collapse all) / `zo` (expand) / `zR` (expand all).
 
 ## 6. Plan Mode (PLAN)
 
-`m` or `:NeoAIPlan` toggles plan mode:
+`m` or `:NeoAI Plan` toggles plan mode:
 
 - The tool context keeps only **read-only/information-query tools + `run_command` (read-only research) + `ask_user`**, exposing no
   modifying tools at all and **no mode-switching tool to the AI**.
 - The execution-time gate tightens accordingly; tools outside the visible set are rejected when called.
 - In plan mode the AI researches and asks clarifying questions, then outputs a **clear, well-formatted change
   plan**.
-- After the plan is emitted the turn ends and **the user confirms** (run `:NeoAIApprovePlan` or toggle the mode
+- After the plan is emitted the turn ends and **the user confirms** (run `:NeoAI ApprovePlan` or toggle the mode
   manually); once confirmed, it switches to CHAT mode, parses the plan into a todo
   list, and executes it automatically.
-- Switching modes during generation (`m` / `:NeoAIPlan`) is deferred until the current turn ends,
+- Switching modes during generation (`m` / `:NeoAI Plan`) is deferred until the current turn ends,
   so it does not interrupt an in-progress generation.
 
 ## 7. Asking the User (ask_user)

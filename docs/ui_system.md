@@ -71,7 +71,7 @@
 
 ### 4.0 多聊天实例
 
-同一 nvim 内可并存**多个独立聊天实例**：`<leader>ac` / `:NeoAIChat` 每次在**新标签页**开一个
+同一 nvim 内可并存**多个独立聊天实例**：`<leader>ac` / `:NeoAI Chat` 每次在**新标签页**开一个
 新实例，使用唯一 buffer 名（`NeoAI Chat`、`NeoAI Chat 2`…；输入框 `NeoAI Input`、`NeoAI Input 2`…），
 旧实例**保留并继续运行**（各自事件订阅/会话/流式输出），互不顶替、不共享名称。
 
@@ -359,7 +359,6 @@ level 2 嵌套折叠。因此展开「过程」折叠后，内部思考/工具�
 并减去 winbar 占用的 1 行。
 
 ### 4.7 后台收起 / 恢复
-
 焦点追踪（`WinEnter`/`BufEnter`）判断当前窗口是否属于聊天界面（按显示的 buffer 而非窗口句柄）：
 焦点离开（或主窗口被 `:bnext` 切到别的文件）时收起输入框（`_collapse_aux`），回到聊天时恢复
 （`_restore_aux`，输入 buffer 内容保留）。**特例**：主窗口被切到的 buffer 若属于**另一聊天实例**
@@ -420,7 +419,7 @@ NeoAI 的聊天/输入框/悬浮窗等都是纯 UI 文本，若 LSP 客户端（
 `NeoAI-<数字>` 的**无主** buffer（跳过 `state.windows` 登记的有效窗口 buffer，以及各实例经
 `manager.register_aux` 登记的输入 buffer——收起时窗口虽关、buffer 仍保留），安全关窗 +
 `nvim_buf_delete(force)`，全程 `pcall`、幂等、不触碰非 NeoAI buffer。
-效果：重启后聊天界面完全关闭，用户需显式 `:NeoAIChat` 重开（新会话）；恢复残留的
+效果：重启后聊天界面完全关闭，用户需显式 `:NeoAI Chat` 重开（新会话）；恢复残留的
 `NeoAI Input N` 不会被「有实时聊天即整体豁免」放过而占名（多实例下输入 buffer 名唯一化依赖于此）。
 
 **写入前修复（`SessionWritePost`）**：`buftype=nofile` 的输入 buffer 被多个窗口显示时，`:mksession`
@@ -439,6 +438,53 @@ already exists`，并**中断整个会话恢复**（`:restart` 表现为 `UIEnte
 
 `chat_view.open()` 在新建窗口分支也会先做一次清理（兜底同名冲突），`close()` 连带删除输入 buffer
 （`input_box.destroy()`），避免 `nofile` 命名 buffer 泄漏。
+
+### 4.9.1 输入框 `#` 上下文占位符
+
+`ui/components/hash_complete.lua` 给聊天输入框提供「上下文引用」能力：输入 `#` 弹出候选，
+选中后插入形如 `#{buffers}` 的**占位符文本**（不是立即展开成实际内容），并在输入框中以
+`NeoAIHashPlaceholder` 高亮；真正的内容替换发生在**发送前**（`input_box.M.submit` 里，
+在调用 `on_submit` 之前）。这样用户仍能读到、改到、删掉自己引用的内容，而不是被一坨长文本占满输入框。
+
+| 占位符 | 展开内容 |
+| --- | --- |
+| `#{buffers}` | 当前全部 buffer 列表（编号 / 加载状态 / 类型 / 路径） |
+| `#{buffer:NAME}` | 指定 buffer 的内容（按名称或文件名匹配，多命中全部拼接） |
+| `#{lsp}` | 上下文 buffer 的 LSP 诊断（`文件:行:列 [级别] 消息`）；上下文 buffer 由 `chat_view` 在聚焦输入框前记录（排除 NeoAI 内部 buffer） |
+| `#{message}` / `#{notify}` | Neovim 启动至今的消息历史（等价 `:messages`），上限 `ui.input_box.hash_completion.max_chars`（**按字符计**，CJK 不会被切半） |
+| `#{tool}` / `#{tool:NAME}` | 工具清单 / 单个工具定义（名称、说明、参数 schema） |
+| `#{skills}` / `#{skills:NAME}` | 技能清单 / 单个技能正文 |
+| `#{mcp}` / `#{mcp:NAME}` | MCP 工具清单 / 单个工具定义 |
+
+实现要点：
+
+- **补全两条路径**：`completefunc`（`<C-x><C-u>` 手动触发，无第三方依赖）+ 可选 nvim-cmp 源 `neoai_hash`
+  （触发字符 `#`/`:`，装了 cmp 时自动弹出）。两条路径都只返回 dict 候选（word/menu/info），不装任何依赖。
+- **高亮**：`TextChangedI`/`TextChanged`/`InsertLeave` 时用固定 extmark 命名空间重算；`reset`/`destroy` 清理。
+- **降级安全**：未知键、找不到的 buffer/skill/tool 一律**原样保留**占位符（不抛错、不产生空串），发送不会因解析失败中断；
+  所有展开结果统一经 `utils/stringx.safe_truncate` 做 UTF-8 安全截断。
+- **配置**：`ui.input_box.hash_completion = { enabled=true, max_chars=2000, max_bytes=20000 }`，
+  `enabled=false` 时零副作用（不装 completefunc / cmp 源 / 自动命令）。
+
+缓存与刷新：`#{lsp}` 依赖的「当前文件」不能是输入 buffer 自身，因此 `chat_view` 在创建输入区与
+每次聚焦输入框前都会重新记录 `context_buf`（`:ls` 里 lastused 最新的非 NeoAI 内部 buffer）。
+
+### 4.9.2 命令说明提示（ui/command_hint.lua）
+
+`:NeoAI` 是单条聚合命令（子命令以空格分隔，如 `:NeoAI Open`、`:NeoAI SandboxReview`）。
+Neovim 用户命令的 `complete=customlist` **只接受纯字符串候选**（候选 dict 的 menu 字段被忽略），
+所以 wildmenu 每项无法原生附带说明。`command_hint` 因此分两层呈现：
+
+1. 已装 nvim-cmp + cmp-cmdline：注册 `neoai_cmd` 补全源（提供 `label`/`detail`/`documentation`），
+   由 cmp 自己在 `:` 菜单里展示说明。**不覆盖**用户已有 `:` 源，仅作为可选来源提供
+   （用户可在自己的 cmp 配置里把 `{ name = "neoai_cmd" }` 加进 cmdline 段 sources）。
+2. 否则：用内置 `nvim_open_float` 在命令行上方展示「子命令 — 说明」，随输入高亮匹配项，
+   `CmdlineLeave`/`VimResized` 关闭。
+
+安装/卸载挂在 `commands` 插件的 `start`/清理函数里，因此 `:NeoAI ReloadAll` 与退出都不残留自动命令；
+`ui.command_hint.enabled=false` 时完全零副作用。
+
+---
 
 ## 5. 显示模式（display_modes）
 
@@ -554,7 +600,7 @@ already exists`，并**中断整个会话恢复**（`:restart` 表现为 `UIEnte
 
 聊天上下文键位（`keymaps.chat`）：`insert`(i)、`quit`(q)、`send`、`cancel`(<Esc>)、`toggle_reasoning`(r)、
 `switch_model`(M)、`cycle_mode`(m)、`cycle_display`(<C-t>/T)、`reload_display`(<F5>)、
-`tool_approval`(<C-a>)、`sandbox_review`(<leader>ap，触发 `:NeoAISandboxReview`)、
+`tool_approval`(<C-a>)、`sandbox_review`(<leader>ap，触发 `:NeoAI SandboxReview`)、
 `approval.confirm/confirm_all/add_to_workspace/cancel/cancel_with_reason`（`add_to_workspace` 把所操作文件所在目录并入该工具运行期 `allowed_directories`，仅当前会话生效）。
 另有主消息区内部滚动映射：`j`/`k`（走 `_scroll`，按行移动光标）、
 `<ScrollWheelUp>`/`<ScrollWheelDown>`（走 `_wheel_scroll`，平滑滚动视口并把末行下方留白钳制在

@@ -54,7 +54,7 @@ tests.suite("sandbox_core", function(_, it)
           t.matches("沙箱", msg)
           t.matches("原因", msg, "拒绝消息应写明不可用原因")
           t.matches("修复", msg, "拒绝消息应给出修复指引")
-          t.matches("NeoAIDoctor", msg, "应指向诊断入口")
+          t.matches("NeoAI Doctor", msg, "应指向诊断入口")
           done = true
         end)
       t.true_(vim.wait(2000, function() return done end), "应快速拒绝")

@@ -152,7 +152,7 @@ function M.load(user_config)
     local silent = log_cfg.silent == true or log_cfg.level == "OFF"
     if not silent then
       pcall(vim.notify,
-        ("[NeoAI] 配置校验发现 %d 个问题：%s\n运行 :NeoAIDoctor 查看环境诊断。"):format(
+        ("[NeoAI] 配置校验发现 %d 个问题：%s\n运行 :NeoAI Doctor 查看环境诊断。"):format(
           #errors, errors[1]),
         vim.log.levels.WARN, { title = "NeoAI 配置" })
     end

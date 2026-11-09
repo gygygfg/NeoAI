@@ -100,8 +100,24 @@ nvim --headless --clean -u NONE --cmd "set rtp+=$PWD" \
    路径发生前拦截」需 LSM/bwrap。**无任何动态强制层**（既无 seccomp 又无 eBPF backstop）时强制
    `approval_mode="prompt"`（同步事前审批），**禁止** `async` 的「先执行后审批」。默认异步审批
    （`tools.approval.mode="async"`）：效果类工具立即在沙箱内
-   执行并冻结候选，真实修改进入待审队列，用户经 `:NeoAISandboxReview` 异步确认后应用。
+   执行并冻结候选，真实修改进入待审队列，用户经 `:NeoAI SandboxReview` 异步确认后应用。
    详见 `docs/sandbox.md`。
+
+10. **命令入口单一**：全部用户命令收敛为一条 `:NeoAI <子命令>`（`plugins/builtin/commands.lua` 的
+    `M.SUBCOMMANDS` 为唯一来源）。Neovim 命令名不允许 `.`/`_`/`-`，`complete=customlist` 只接受纯字符串
+    候选——子命令说明由 `ui/command_hint.lua` 呈现（装了 cmp-cmdline 则注册 `neoai_cmd` 源，否则内置浮窗）。
+    新增功能一律**加子命令**（带 `desc` 与 `phase1` 标记），不再新增 `:NeoAI*` 平铺命令；`lazy.lua` 占位命令
+    与真实命令同名，阶段判定必须走 `commands.is_phase1()` 以免两处名单漂移。
+11. **输入框上下文引用**：`#` 占位符（`ui/components/hash_complete.lua`）只插入 `#{...}` 文本并高亮，
+    在 `input_box.M.submit` 里**发送前**才展开；解析失败必须**原样保留**占位符（不得抛错/变空串），
+    所有输出统一经 `utils/stringx.safe_truncate`（UTF-8 安全），`#{message}`/`#{notify}` 按**字符数**封顶。
+12. **仓库约定文件加载**：`AGENTS.md` 通过 `core/session/agents_md.lua` 在会话首个回合注入**一轮
+    `read_file` 工具调用**（assistant tool_calls + tool 结果，id 一一对应），**不得**写进系统提示段
+    （会使 provider 前缀缓存全量失效）。幂等：每个顶层 agent 只一次；子 Agent 不注入。
+    AI 更新 `AGENTS.md` 仍走既有沙箱审批，**禁止**因任何 auto_allow/session_auto 被静默放行。
+13. **并发工具各自出结果**：工具结果按原始调用顺序落库（保证 `tool` 消息与 `assistant.tool_calls` 对齐），
+    但界面**不得**等整批完成才渲染：`tool_loop` 每完成一个工具即经 `kernel/live_metrics.set_result` 发布
+    运行期结果，UI 对尚未配对的结果消息用它渲染（落库后清除）。
 
 ## 代码风格
 

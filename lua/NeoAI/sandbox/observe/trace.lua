@@ -2,7 +2,7 @@
 --- @module 'NeoAI.sandbox.observe.trace'
 --- `read_all`（默认）下沙箱可读整机（仅遮蔽 mask_paths 中的重要配置文件），但**访问 cwd
 --- 之外的用户工作目录**（home/root 等）会在此留痕：写入证据（evidence）+ 事件，并在审批
---- 悬浮窗（`:NeoAISandboxReview`）以「越界访问」区展示。非阻塞：不阻断读取。
+--- 悬浮窗（`:NeoAI SandboxReview`）以「越界访问」区展示。非阻塞：不阻断读取。
 ---
 --- 去重：同一 (tool, path) 只记录一次，避免高频读取刷屏；可按需 `reset()`。
 --- 但同一 (tool, path) 的**多条不同命令**会在既有条目上累积（`commands`，去重有序有界），

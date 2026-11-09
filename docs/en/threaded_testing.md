@@ -2,17 +2,17 @@
 
 > [中文](../threaded_testing.md) | **English**
 
-> NeoAI ships with a **lightweight custom test framework** (no external dependencies, run via `:NeoAITest`).
+> NeoAI ships with a **lightweight custom test framework** (no external dependencies, run via `:NeoAI Test`).
 > All test files live under `lua/NeoAI/tests/`. The `thread_worker.lua` /
-> `thread_scheduler.lua` / `threaded_runner.lua` files and the `:NeoAITestAll` command mentioned in older
+> `thread_scheduler.lua` / `threaded_runner.lua` files and the `:NeoAI TestAll` command mentioned in older
 > docs **do not exist**. The corresponding source is `lua/NeoAI/tests/init.lua`.
 
 ## 1. How to Run
 
 ```vim
-:NeoAITest              " Run all tests
-:NeoAITest flow_tools   " Run a specific suite (by name)
-:NeoAITest test_agent test_herder  " Run multiple suites
+:NeoAI Test              " Run all tests
+:NeoAI Test flow_tools   " Run a specific suite (by name)
+:NeoAI Test test_agent test_herder  " Run multiple suites
 ```
 
 `run_all(...)` dynamically loads `lua/NeoAI/tests/test_*.lua` (idempotently), collects all `suite`

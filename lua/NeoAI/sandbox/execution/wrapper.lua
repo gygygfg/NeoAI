@@ -642,7 +642,7 @@ function M.overlay_gate(specs, opts)
       return false, "SANDBOX_STAGING_UNCOVERED: 存在未发布的暂存改动，但本次命令无 overlay 可写层（"
         .. tostring(why) .. "）；命令将读到真实磁盘、与只读工具的暂存视图分裂，已拒绝执行"
         .. "（无 overlay 时禁止降级）。请先在审批界面应用/丢弃暂存改动，或排查 overlay 可用性"
-        .. "（:NeoAISandboxCaps）；也可设 tools.sandbox.staging_uncovered=\"warn\" 允许降级执行。",
+        .. "（:NeoAI SandboxCaps）；也可设 tools.sandbox.staging_uncovered=\"warn\" 允许降级执行。",
         true, degraded_reason
     end
     degraded_reason = "存在未发布暂存改动但无 overlay 可写层（" .. tostring(why) .. "）"
@@ -3017,7 +3017,7 @@ local function _gate_inner(tool, args, ctx, call_original)
           end)
           pcall(vim.notify,
             "[NeoAI] 沙箱后处理失败，本轮命令的文件改动可能未反映到后续命令："
-              .. tostring(message) .. "（可用 :NeoAISandboxDiag 查看）",
+              .. tostring(message) .. "（可用 :NeoAI SandboxDiag 查看）",
             vim.log.levels.WARN)
         end
         chain:then_(function(settled)

@@ -3,14 +3,14 @@
 > [English](en/testing.md) | **中文**
 
 > NeoAI 采用**轻量自定义测试框架**（`lua/NeoAI/tests/init.lua`，无外部依赖）。
-> 以 `suite` / `it` 组织用例，`t.<断言>` 断言，`:NeoAITest` 运行。
+> 以 `suite` / `it` 组织用例，`t.<断言>` 断言，`:NeoAI Test` 运行。
 > 配合 Mock 对 HTTP、模型、文件系统等做隔离单元/集成测试。
 
 ## 1. 运行
 
 ```vim
-:NeoAITest              " 并行运行全部套件（无参数）
-:NeoAITest flow_tools   " 顺序运行指定套件（按名字，便于调试）
+:NeoAI Test              " 并行运行全部套件（无参数）
+:NeoAI Test flow_tools   " 顺序运行指定套件（按名字，便于调试）
 ```
 
 - **默认并行（无参数）**：`lua/NeoAI/tests/parallel.lua`（薄门面）按「双 lane 有界并发」把全部
@@ -44,10 +44,10 @@
 - **worker 生命周期与退出清理**：在跑 worker 登记到运行器进程表；分片超时/中止时按**进程树**
   清理（先 `jobstop`=SIGTERM，宽限后补 SIGKILL，含脱离 job 进程组的沙箱常驻/PTY 后代）。worker
   侧注入 SIGTERM 处理器：收到信号即 `plugins.stop_all()` 自清后代再退出（nvim 在 SIGTERM 下不执行
-  `VimLeavePre`）。父 nvim 退出（含交互式 `:NeoAITest` 后 `:qa`）时经 `lifecycle.on_shutdown` 调
+  `VimLeavePre`）。父 nvim 退出（含交互式 `:NeoAI Test` 后 `:qa`）时经 `lifecycle.on_shutdown` 调
   `_abort_all()` 兜底结束遗留 worker 进程树，避免后台进程残留。
 
-**隔离运行（重要）**：`:NeoAITest` 会在一个**全新 headless 子进程**（`nvim --headless --clean
+**隔离运行（重要）**：`:NeoAI Test` 会在一个**全新 headless 子进程**（`nvim --headless --clean
 -u NONE --cmd "set rtp+=<插件根>"`）中执行，结果经 `SUMMARY passed=.. failed=..`
 回传到当前实例，绝不触碰当前进程的插件宿主/工具注册表。
 

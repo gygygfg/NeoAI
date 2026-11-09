@@ -151,7 +151,7 @@ function M.install_hint(dep, opts)
   return "安装：" .. cmd
 end
 
---- 生成「沙箱内核能力」报告（供 `:NeoAIDoctor` / `:checkhealth NeoAI` 渲染）。
+--- 生成「沙箱内核能力」报告（供 `:NeoAI Doctor` / `:checkhealth NeoAI` 渲染）。
 --- 判定与 `runtime.backend()` 同源：有隔离后端 = `ok`，否则 `warn`
 --- （不因「装了 unshare 二进制但内核拒绝非特权 userns」而误报可用）。
 --- @param opts table|nil {

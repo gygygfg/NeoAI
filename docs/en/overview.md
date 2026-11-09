@@ -43,7 +43,7 @@ and async-by-default (all I/O non-blocking).
    - Built-in tools: file ops, LSP, treesitter, shell, git, logging, todo,
      plan_mode, ask_user, read_image, web_fetch (disabled by default), sub-agent, skills
    - Tool approval workflow: the default `mode="async"` runs the tool in the sandbox immediately and
-     freezes candidates, with real changes queued for confirmation via `:NeoAISandboxReview`; only
+     freezes candidates, with real changes queued for confirmation via `:NeoAI SandboxReview`; only
      `prompt`/`strict` use the serial single-slot approval dialog (auto-allow config, per-tool
      permission overrides, approval timeout)
    - Sandbox risk levels: L0-L3 map to auto/record/review/block, default `review` (pending review)
@@ -149,7 +149,7 @@ lua/NeoAI/
                              -- plan, todo, plan_mode, ask_user, read_image, skills,
                              -- web_fetch (web fetch, disabled by default), tool_helpers
   utils/                     -- Utilities (async, json, http, fs, work, timer, image, stringx)
-  tests/                     -- Test suite (:NeoAITest)
+  tests/                     -- Test suite (:NeoAI Test)
 ```
 
 Key architectural principles:
@@ -174,7 +174,7 @@ feature: `git`, `node`/`npm` (`web_fetch`), and sandbox-related ones (`bwrap` (b
 When none of the isolation backends is available the sandbox is disabled and falls back to approval
 mode. The full list (per-distro install commands and the Android/Termux limitation) is in
 [README "Prerequisites (dependencies)"](../README.en.md#-prerequisites-dependencies). After
-installing, run `:NeoAIDoctor` or `:checkhealth NeoAI` for a one-stop self-check.
+installing, run `:NeoAI Doctor` or `:checkhealth NeoAI` for a one-stop self-check.
 
 Using lazy.nvim:
 
@@ -208,8 +208,8 @@ require("NeoAI").setup({
 > auto-falls back to a configured provider when the default one has no key.
 
 > **Startup model (lazy by default, no configuration)**: `setup()` only loads the config,
-> bootstraps the kernel, registers plugins, and installs placeholders for all `:NeoAI*`
-> commands and global keymaps. The first trigger drives a **two-phase asynchronous start**
+> bootstraps the kernel, registers plugins, and installs placeholders for the aggregated
+> `:NeoAI <subcommand>` command and global keymaps. The first trigger drives a **two-phase asynchronous start**
 > via `NeoAI.ensure_phase1/ensure_started`: phase 1 (session/agent/model/chat/status/ui) opens
 > the interface as soon as it is ready; phase 2 (tools/sandbox/tool_service/skills/mcp/herder
 > and all `tool.*`) loads in the background frame-by-frame (`kernel.plugins.start_list_async`)
@@ -220,18 +220,18 @@ require("NeoAI").setup({
 Basic usage:
 
 ```vim
-:NeoAIOpen          " Open default UI (configured in ui.default_view)
-:NeoAIChat          " Open chat interface
-:NeoAITree          " Open tree interface
-:NeoAIClose         " Close all NeoAI windows
-:NeoAIKeymaps       " Show current keymap configuration
-:NeoAITest          " Run tests (optionally pass test names)
-:NeoAIChatStatus    " Show chat window status
-:NeoAICycleDisplay  " Cycle display mode (chat / trajectory)
-:NeoAIReloadDisplay " Hot-reload display mode plugin
-:NeoAIPlan          " Toggle plan mode
-:NeoAIApprovePlan   " Approve plan and switch to CHAT mode
-:NeoAIStatusline    " Preview the lualine statusline component content
+:NeoAI Open          " Open default UI (configured in ui.default_view)
+:NeoAI Chat          " Open chat interface
+:NeoAI Tree          " Open tree interface
+:NeoAI Close         " Close all NeoAI windows
+:NeoAI Keymaps       " Show current keymap configuration
+:NeoAI Test          " Run tests (optionally pass test names)
+:NeoAI ChatStatus    " Show chat window status
+:NeoAI CycleDisplay  " Cycle display mode (chat / trajectory)
+:NeoAI ReloadDisplay " Hot-reload display mode plugin
+:NeoAI Plan          " Toggle plan mode
+:NeoAI ApprovePlan   " Approve plan and switch to CHAT mode
+:NeoAI Statusline    " Preview the lualine statusline component content
 ```
 
 ## Herder Terminal State Integration
@@ -310,29 +310,29 @@ require('NeoAI').setup({
 
 | Command | Description |
 | --- | --- |
-| `:NeoAIOpen` | Open default UI (configured in `ui.default_view`: chat or tree) |
-| `:NeoAIChat` | Open chat interface directly |
-| `:NeoAITree` | Open tree interface directly |
-| `:NeoAIClose` | Close all NeoAI windows |
-| `:NeoAIKeymaps` | Display current keymap configuration in floating window |
-| `:NeoAITest [names...]` | Run tests (all, or specific by name) |
-| `:NeoAIChatStatus` | Show chat window status |
-| `:NeoAICycleDisplay` | Cycle chat display mode (chat / trajectory) |
-| `:NeoAIReloadDisplay [name]` | Hot-reload a display mode plugin |
-| `:NeoAIPlan` | Toggle plan mode (read-only/info tools + ask_user) |
-| `:NeoAIApprovePlan` | Approve plan, switch to CHAT, execute task list |
-| `:NeoAIReloadAll` | Hot-reload the whole NeoAI plugin (isolated subprocess pre-check first; cancel on failure) |
-| `:NeoAISandboxReview` | List and apply pending sandbox changes (highlighted by path level) |
-| `:NeoAISandboxCommit` | Apply a sandbox candidate to the real workspace (CAS publish; arg = candidate digest) |
-| `:NeoAISandboxDiscard` | Discard a sandbox candidate |
-| `:NeoAISandboxList` / `:NeoAISandboxShow` | List / inspect pending sandbox candidates |
-| `:NeoAISandboxCaps` / `:NeoAISandboxDiag` | Sandbox runtime capability probe / resource-domain load diagnostics (137/OOM attribution) |
-| `:NeoAISandboxApprove` / `:NeoAISandboxReject` | Approve (no apply) / reject & discard a change set |
-| `:NeoAISandboxApply` / `:NeoAISandboxApplyAll` | Approve and apply one / all pending change sets |
-| `:NeoAISandboxGrant` / `:NeoAISandboxRevoke` | Create a narrow task grant / revoke a grant |
-| `:NeoAISandboxPrune` / `:NeoAISandboxMetrics` | Prune expired candidates by retention / show sandbox metrics |
-| `:NeoAISandboxPublish` / `:NeoAISandboxReplay` | Publish multiple change sets together / replay a recorded policy decision |
-| `:NeoAISandboxAudit` / `:NeoAISandboxAutoApprove` | Sandbox behavior audit & risk assessment / set auto-approval for new sessions (off by default) |
-| `:NeoAIHerderStatus` | Show Herder integration status |
-| `:NeoAIHerderConfig [show\|install\|uninstall]` | View / install / uninstall the Herder display-enhancement config snippet |
-| `:NeoAIStatusline` | Preview the lualine statusline component content |
+| `:NeoAI Open` | Open default UI (configured in `ui.default_view`: chat or tree) |
+| `:NeoAI Chat` | Open chat interface directly |
+| `:NeoAI Tree` | Open tree interface directly |
+| `:NeoAI Close` | Close all NeoAI windows |
+| `:NeoAI Keymaps` | Display current keymap configuration in floating window |
+| `:NeoAI Test [names...]` | Run tests (all, or specific by name) |
+| `:NeoAI ChatStatus` | Show chat window status |
+| `:NeoAI CycleDisplay` | Cycle chat display mode (chat / trajectory) |
+| `:NeoAI ReloadDisplay [name]` | Hot-reload a display mode plugin |
+| `:NeoAI Plan` | Toggle plan mode (read-only/info tools + ask_user) |
+| `:NeoAI ApprovePlan` | Approve plan, switch to CHAT, execute task list |
+| `:NeoAI ReloadAll` | Hot-reload the whole NeoAI plugin (isolated subprocess pre-check first; cancel on failure) |
+| `:NeoAI SandboxReview` | List and apply pending sandbox changes (highlighted by path level) |
+| `:NeoAI SandboxCommit` | Apply a sandbox candidate to the real workspace (CAS publish; arg = candidate digest) |
+| `:NeoAI SandboxDiscard` | Discard a sandbox candidate |
+| `:NeoAI SandboxList` / `:NeoAI SandboxShow` | List / inspect pending sandbox candidates |
+| `:NeoAI SandboxCaps` / `:NeoAI SandboxDiag` | Sandbox runtime capability probe / resource-domain load diagnostics (137/OOM attribution) |
+| `:NeoAI SandboxApprove` / `:NeoAI SandboxReject` | Approve (no apply) / reject & discard a change set |
+| `:NeoAI SandboxApply` / `:NeoAI SandboxApplyAll` | Approve and apply one / all pending change sets |
+| `:NeoAI SandboxGrant` / `:NeoAI SandboxRevoke` | Create a narrow task grant / revoke a grant |
+| `:NeoAI SandboxPrune` / `:NeoAI SandboxMetrics` | Prune expired candidates by retention / show sandbox metrics |
+| `:NeoAI SandboxPublish` / `:NeoAI SandboxReplay` | Publish multiple change sets together / replay a recorded policy decision |
+| `:NeoAI SandboxAudit` / `:NeoAI SandboxAutoApprove` | Sandbox behavior audit & risk assessment / set auto-approval for new sessions (off by default) |
+| `:NeoAI HerderStatus` | Show Herder integration status |
+| `:NeoAI HerderConfig [show\|install\|uninstall]` | View / install / uninstall the Herder display-enhancement config snippet |
+| `:NeoAI Statusline` | Preview the lualine statusline component content |

@@ -93,7 +93,7 @@ resolve_name (alias/fuzzy matching)
 > and registry attach `__sandbox_spec` (effect/paths). The default async review
 > (`tools.approval.mode="async"`) executes effectful tools immediately in the sandbox and freezes
 > a candidate without blocking; real changes enter a review queue and are applied after async
-> confirmation via `:NeoAISandboxReview`. When the sandbox service is missing and
+> confirmation via `:NeoAI SandboxReview`. When the sandbox service is missing and
 > `fail_closed=true`, execution is rejected. See [sandbox.md](sandbox.md).
 >
 > **Note**: in `async` (the default) there is **no pre-execution blocking approval** — the "approval
@@ -141,7 +141,7 @@ or by `ctx.timeout_ms`.
 ## 5. Approval Dialog (services/tool_service.lua)
 
 > The default `async` mode **does not take this path**: the tool has already run in the sandbox and
-> confirmation happens through the review queue (`:NeoAISandboxReview`). This section describes the
+> confirmation happens through the review queue (`:NeoAI SandboxReview`). This section describes the
 > **pre-execution approval dialog** under `prompt`/`strict` modes, plus fallback cases
 > such as masked-directory hits.
 
@@ -400,7 +400,7 @@ when `read_all=false` and the target is not covered by a writable root).
 
 ### 📐 Plan Mode (plan_mode.lua)
 
-`enter_plan_mode` (enter plan mode: the tool context switches to read-only/informational + asking questions). Plan mode **does not give the AI any mode-switching tool**; after the plan is emitted the user runs `:NeoAIApprovePlan` (or toggles the mode manually) to confirm execution. See [configuration.md](configuration.md) and [chat_enhanced_usage.md](chat_enhanced_usage.md) for details.
+`enter_plan_mode` (enter plan mode: the tool context switches to read-only/informational + asking questions). Plan mode **does not give the AI any mode-switching tool**; after the plan is emitted the user runs `:NeoAI ApprovePlan` (or toggles the mode manually) to confirm execution. See [configuration.md](configuration.md) and [chat_enhanced_usage.md](chat_enhanced_usage.md) for details.
 
 ### 💬 Asking the User (ask_user.lua)
 

@@ -52,7 +52,7 @@ lifecycle.on_shutdown(persist)      -- persist active Agents before teardown
 lazy.register(...)                  -- install command/keymap placeholders
 ```
 
-On first trigger (`:NeoAI*` command, global keymap or active API) startup runs in
+On first trigger (`:NeoAI <subcommand>`, global keymap or active API) startup runs in
 **two asynchronous phases**:
 
 ```
@@ -61,7 +61,7 @@ ensure_started() -- phase 2: tools/sandbox/tool_service/skills/mcp/herder + all 
 ```
 
 - `plugins.start_list_async(ids, on_done)` starts one plugin per frame and yields via `vim.defer_fn(...,0)`; the UI opens once phase 1 finishes.
-- `ensure_started_sync(timeout)` lets tests / `:NeoAIReloadAll` wait for both phases synchronously.
+- `ensure_started_sync(timeout)` lets tests / `:NeoAI ReloadAll` wait for both phases synchronously.
 - Read-only accessors (`get_*_service` / `get_statusline*`) never trigger startup.
 
 ## 4. AbortSignal Cascade Cancellation
@@ -83,9 +83,9 @@ The cancellation mechanism is based on the AbortSignal from `async.create_signal
 The exit cleanup triggers `plugins.stop_all()` → each side-effect plugin's `stop`. In particular the **herder plugin's
 `stop` calls `herder.shutdown()`**: if running under Herder and authority was taken over, it clears the display metadata
 and sends `release-agent`, so Herder immediately falls back to screen heuristics and does not retain this session's
-`working`/`blocked` state. `:restart` and `:NeoAIReloadAll` share the same unload path, so they release just as promptly.
+`working`/`blocked` state. `:restart` and `:NeoAI ReloadAll` share the same unload path, so they release just as promptly.
 
-**Test worker fallback**: the child processes spawned by `:NeoAITest` (parallel `parallel.run` or isolated
+**Test worker fallback**: the child processes spawned by `:NeoAI Test` (parallel `parallel.run` or isolated
 `run_isolated`) register into the runner's process table; when the parent nvim exits, `lifecycle.on_shutdown`
 calls `parallel._abort_all()` / `tests._abort_all()` to terminate the running workers and their **entire process
 tree** (walked via `/proc` parent links, including sandbox-resident bwrap / PTY descendants that left the job's

@@ -14,10 +14,10 @@
 - **场景化模型配置** — 按场景（聊天、编程、思考、工具执行、子 Agent、窗口命名）分配不同的 AI 模型和参数
 - **流式响应** — 实时流式显示 AI 生成内容，支持推理过程（reasoning）展示
 - **树形会话管理** — 基于分支树管理多个对话会话，支持分支创建、切换、删除
-- **多聊天实例** — `<leader>ac` / `:NeoAIChat` 每次在**新标签页**开一个独立聊天实例（唯一 buffer 名），可同时开多个聊天、各自独立会话与流式输出、**各自独立的思考/接收参数浮窗与推理显示开关**，旧实例保留继续运行、互不顶替
+- **多聊天实例** — `<leader>ac` / `:NeoAI Chat` 每次在**新标签页**开一个独立聊天实例（唯一 buffer 名），可同时开多个聊天、各自独立会话与流式输出、**各自独立的思考/接收参数浮窗与推理显示开关**，旧实例保留继续运行、互不顶替
 - **丰富的内置工具** — AI 可调用文件操作、代码分析、LSP、Shell 命令等 40+ 工具
 - **工具审批系统** — 细粒度的工具执行权限控制，支持自动允许/手动审批/参数级别白名单
-- **计划模式（PLAN）与计划提取** — 按 `m` 或 `:NeoAIPlan` 切换，工具上下文只保留只读/信息查询 + `run_command`（只读调研）+ `ask_user`（不暴露任何修改类工具，也不向 AI 提供切换模式的工具）；AI 调研澄清后输出格式化修改计划并结束本轮，由用户确认（`:NeoAIApprovePlan` 或手动切换模式）后转入 CHAT：边界处先做一轮 **XML 计划提取**（`<target>`/`<stepN>`/`<files>` 等，忽略大小写、缺失关键字段重试最多 3 次），据此组装执行上下文并按步骤自动建任务清单（`todo_write`），`<files>` 相关工具消息原样保留以保证缓存命中，再开始执行
+- **计划模式（PLAN）与计划提取** — 按 `m` 或 `:NeoAI Plan` 切换，工具上下文只保留只读/信息查询 + `run_command`（只读调研）+ `ask_user`（不暴露任何修改类工具，也不向 AI 提供切换模式的工具）；AI 调研澄清后输出格式化修改计划并结束本轮，由用户确认（`:NeoAI ApprovePlan` 或手动切换模式）后转入 CHAT：边界处先做一轮 **XML 计划提取**（`<target>`/`<stepN>`/`<files>` 等，忽略大小写、缺失关键字段重试最多 3 次），据此组装执行上下文并按步骤自动建任务清单（`todo_write`），`<files>` 相关工具消息原样保留以保证缓存命中，再开始执行
 - **后台上下文压缩** — 接近上下文阈值时**后台异步、非阻塞**地折叠第一轮至倒数第二轮（保留最后一轮），以检查点写入**压缩覆盖层**：后续请求与再次压缩使用压缩后的替换，而聊天渲染与会话持久化仍是原始上下文（覆盖层随会话保存，重开后继续生效）；压缩不弹悬浮窗；除回合边界外，**工具循环每轮发送前也会做压力检查**（工具结果已回写、下一轮请求前），长循环逐轮收敛；**历史条数超过安全上限时先同步压缩再发送（用检查点替换，而不是裸截断改写前缀）**；溢出时自动压缩后重试；计划提取过程仍以悬浮窗实时展示推理与正文
 - **子 Agent 系统** — AI 可创建子 Agent 并行执行子任务，支持边界审核
 - **前后端分离架构** — 事件驱动的异步架构，UI 与业务逻辑解耦
@@ -32,7 +32,7 @@
 - **工具参数接收面板** — 模型流式生成工具调用参数时实时打开「接收参数」悬浮窗（`tool_args_panel`），随分片增量追加、参数结束后自动关闭，与思考过程悬浮窗一致
 - **MCP 支持** — 通过 stdio / Streamable HTTP 连接外部 MCP 服务器，把远端 `tools`/`resources`/`prompts` 注册进工具系统（含预缓存 + 失败驱动的动态刷新，见 [docs/mcp.md](docs/mcp.md)）
 - **Skills 支持** — 扫描 SKILL.md 技能目录，把可用技能列表注入系统提示，模型用 `load_skill` 装载技能正文（Claude/opencode 风格，见 [docs/skills.md](docs/skills.md)）
-- **工具执行沙箱** — 所有工具执行经控制面（预检 → 隔离执行 → 冻结候选 → CAS 发布）；默认异步审批：AI 的修改立即在沙箱内执行并冻结候选，真实工作区改动进入待审队列（聊天窗口状态栏显示醒目的 `待审N` 徽标），用户用 `:NeoAISandboxReview` 或聊天窗口内 `<leader>ap` 键异步确认后应用（默认按文件审批，整包安装/git 原子组按整组审批；应用时保留**原文件快照**，界面「已保存」区可按 `u` **撤销/重做保存**——与快照交换、冲突拒绝）；L3 危险条目二次确认时由 AI 生成一条后果警告并自动打开 diff 展示修改，需再次确认才应用；外部进程经 bwrap/unshare 隔离；命令可写整个文件系统（改动进暂存/候选）、会话内 shell 状态（export/cd）保留；载荷默认 `--cap-drop ALL` + seccomp 基线，并遮蔽 `docker.sock`、宿主凭据等敏感路径（纵深防御）；**权限档位**：命令默认最小权限运行（默认隔离网络），权限不足自动发起升级——T1（网络/容器）隔离内自动执行并留痕，T2（cap/宿主操作）在嵌套 userns 内执行、主机效果冻结为提案异步审批；容器一律在沙箱内真执行——docker/docker-compose/nerdctl 改写为 podman/podman-compose，永不连接宿主 docker daemon；**读取面**默认整机只读（`read_all`，仅遮蔽 `mask_paths` 中的重要配置文件/凭据），访问工作区外用户目录会**留痕**并在审批悬浮窗「越界访问留痕」区展示（非阻塞，状态栏追加 `越界N` 徽标）（见 [docs/sandbox.md](docs/sandbox.md)）
+- **工具执行沙箱** — 所有工具执行经控制面（预检 → 隔离执行 → 冻结候选 → CAS 发布）；默认异步审批：AI 的修改立即在沙箱内执行并冻结候选，真实工作区改动进入待审队列（聊天窗口状态栏显示醒目的 `待审N` 徽标），用户用 `:NeoAI SandboxReview` 或聊天窗口内 `<leader>ap` 键异步确认后应用（默认按文件审批，整包安装/git 原子组按整组审批；应用时保留**原文件快照**，界面「已保存」区可按 `u` **撤销/重做保存**——与快照交换、冲突拒绝）；L3 危险条目二次确认时由 AI 生成一条后果警告并自动打开 diff 展示修改，需再次确认才应用；外部进程经 bwrap/unshare 隔离；命令可写整个文件系统（改动进暂存/候选）、会话内 shell 状态（export/cd）保留；载荷默认 `--cap-drop ALL` + seccomp 基线，并遮蔽 `docker.sock`、宿主凭据等敏感路径（纵深防御）；**权限档位**：命令默认最小权限运行（默认隔离网络），权限不足自动发起升级——T1（网络/容器）隔离内自动执行并留痕，T2（cap/宿主操作）在嵌套 userns 内执行、主机效果冻结为提案异步审批；容器一律在沙箱内真执行——docker/docker-compose/nerdctl 改写为 podman/podman-compose，永不连接宿主 docker daemon；**读取面**默认整机只读（`read_all`，仅遮蔽 `mask_paths` 中的重要配置文件/凭据），访问工作区外用户目录会**留痕**并在审批悬浮窗「越界访问留痕」区展示（非阻塞，状态栏追加 `越界N` 徽标）（见 [docs/sandbox.md](docs/sandbox.md)）
 
 ---
 
@@ -100,9 +100,9 @@ pkg install bubblewrap util-linux strace git curl
 - `web_fetch`（Playwright 浏览器内核）在该平台不可用，不会注册工具、也不会触发依赖安装；
 - 其余功能（对话、工具、LSP、会话树、MCP、Skills 等）不受影响。
 
-> 不确定环境是否就绪？运行 **`:NeoAIDoctor`** 或 **`:checkhealth NeoAI`** 一站式检查版本、curl、
+> 不确定环境是否就绪？运行 **`:NeoAI Doctor`** 或 **`:checkhealth NeoAI`** 一站式检查版本、curl、
 > API Key、沙箱能力与可选依赖；沙箱逐项能力（`bwrap`/`unshare`/`userns`/`overlayfs`/`seccomp`/
-> `cgroup2`/`podman`）用 **`:NeoAISandboxCaps`** 查看。诊断项会直接写明**缺哪个依赖**与安装命令。
+> `cgroup2`/`podman`）用 **`:NeoAI SandboxCaps`** 查看。诊断项会直接写明**缺哪个依赖**与安装命令。
 
 ---
 
@@ -143,7 +143,7 @@ require("NeoAI").setup({})
 ```
 
 > **懒加载（默认，无需配置）**：`setup()` 只加载配置、引导内核并登记插件，同时注册全部
-> `:NeoAI*` 命令与全局快捷键的**占位符**；首次调用时才**异步分两阶段**启动插件图——
+> `:NeoAI <子命令>` 命令与全局快捷键的**占位符**；首次调用时才**异步分两阶段**启动插件图——
 > 阶段 1（UI/chat/status）就绪后立即打开界面，阶段 2（工具/沙箱/skills/mcp 等）在后台
 > 分帧加载，期间编辑器不阻塞。只读访问器（`NeoAI.get_*_service()` / `get_statusline*()`）
 > 不会触发启动，未就绪时返回 `nil`/空串。因此打开 Neovim 不会因 NeoAI 卡顿，也无需
@@ -165,7 +165,7 @@ export OPENAI_API_KEY="your-api-key"
 export ANTHROPIC_API_KEY="your-api-key"
 ```
 
-> 若未配置任何 key，`setup()` 后首次启动会提示一次；随时可用 `:NeoAIDoctor` 复查。
+> 若未配置任何 key，`setup()` 后首次启动会提示一次；随时可用 `:NeoAI Doctor` 复查。
 
 ### 2. 初始化插件
 
@@ -184,35 +184,70 @@ require("NeoAI").setup({
 
 ### 3. 使用命令
 
+所有功能收敛到**一条聚合命令** `:NeoAI`，子命令以空格分隔（`:NeoAI Open`、`:NeoAI SandboxReview`）。
+输入 `:NeoAI ` 后按 `<Tab>` 补全子命令；说明文字由浮动提示窗（或已装的 nvim-cmp + cmp-cmdline）展示。
+
+> Neovim 用户命令名不允许包含 `.` / `_` / `-`（`:NeoAI.Open` 会报 `Invalid command name`），
+> 因此不提供字面点号语法；`complete=customlist` 只接受纯字符串候选，所以菜单项本身无法内嵌说明。
+
 | 命令               | 描述                                             |
 | ------------------ | ------------------------------------------------ |
-| `:NeoAIOpen`       | 打开 NeoAI 主界面                                |
-| `:NeoAIChat`       | 在**新标签页**打开一个**独立聊天实例**（新会话、唯一 buffer 名；旧实例保留继续运行） |
-| `:NeoAITree`       | 打开会话树界面                                   |
-| `:NeoAIClose`      | 关闭所有 NeoAI 窗口                              |
-| `:NeoAIKeymaps`    | 显示当前键位配置                                 |
-| `:NeoAITest`       | 运行测试（不带参数并行全量；带参数顺序运行指定套件） |
-| `:NeoAIChatStatus` | 显示聊天窗口状态                                 |
-| `:NeoAICycleDisplay`| 循环切换聊天显示模式（对话/轨迹）                  |
-| `:NeoAIReloadDisplay`| 热重载显示模式插件（缺省重载当前模式）            |
-| `:NeoAIReloadAll`  | 热重载整个 NeoAI 插件（先做隔离预检，失败则取消）  |
-| `:NeoAIPlan`       | 切换计划模式（工具上下文只保留只读/信息查询 + 提问）|
-| `:NeoAIApprovePlan`| 确认计划并转入 CHAT 模式按任务清单执行             |
-| `:NeoAISandboxCommit`| 应用沙箱候选到真实工作区（CAS 发布，参数为候选摘要）|
-| `:NeoAISandboxReview`| 列出待审修改并选择应用（异步审批；「资源访问」页按 `E` 可增删工作目录/遮蔽目录，仅本会话）             |
-| `:NeoAISandboxApprove` / `:NeoAISandboxReject` | 批准（不应用）/ 拒绝并丢弃变更单元 |
-| `:NeoAISandboxApply` / `:NeoAISandboxApplyAll` | 批准并应用单个 / 全部待审变更单元 |
-| `:NeoAISandboxGrant` / `:NeoAISandboxRevoke` | 创建窄范围任务授权 / 撤销授权 |
-| `:NeoAISandboxPrune` / `:NeoAISandboxMetrics` | 清理过期候选 / 显示沙箱指标 |
-| `:NeoAISandboxPublish` / `:NeoAISandboxReplay` | 组合发布多个变更单元 / 回放策略裁决 |
-| `:NeoAISandboxList` / `:NeoAISandboxShow` | 列出/查看待处理沙箱候选 |
-| `:NeoAISandboxDiscard`| 丢弃沙箱候选（参数为候选摘要）                  |
-| `:NeoAISandboxCaps`| 显示沙箱运行时能力探测结果                        |
-| `:NeoAISandboxDiag`| 显示沙箱资源域/负载诊断（137/OOM 归因）            |
-| `:NeoAISandboxAudit`| 显示沙箱行为审计与风险评估摘要                     |
-| `:NeoAISandboxAutoApprove`| 设置 AI 新会话自动审批（`on`/`off`/`status`，默认关闭）|
-| `:NeoAIDoctor` | 环境诊断（Neovim 版本 / curl / API Key / 沙箱能力 / 可选依赖；等同 `:checkhealth NeoAI` 摘要） |
-| `:NeoAIStatusline` | 预览当前 lualine 状态栏组件内容                    |
+| `:NeoAI Open`       | 打开 NeoAI 主界面                                |
+| `:NeoAI Chat`       | 在**新标签页**打开一个**独立聊天实例**（新会话、唯一 buffer 名；旧实例保留继续运行） |
+| `:NeoAI Tree`       | 打开会话树界面                                   |
+| `:NeoAI Close`      | 关闭所有 NeoAI 窗口                              |
+| `:NeoAI Keymaps`    | 显示当前键位配置                                 |
+| `:NeoAI Test`       | 运行测试（不带参数并行全量；带参数顺序运行指定套件） |
+| `:NeoAI ChatStatus` | 显示聊天窗口状态                                 |
+| `:NeoAI CycleDisplay`| 循环切换聊天显示模式（对话/轨迹）                  |
+| `:NeoAI ReloadDisplay`| 热重载显示模式插件（缺省重载当前模式）            |
+| `:NeoAI ReloadAll`  | 热重载整个 NeoAI 插件（先做隔离预检，失败则取消）  |
+| `:NeoAI Plan`       | 切换计划模式（工具上下文只保留只读/信息查询 + 提问）|
+| `:NeoAI ApprovePlan`| 确认计划并转入 CHAT 模式按任务清单执行             |
+| `:NeoAI SandboxCommit`| 应用沙箱候选到真实工作区（CAS 发布，参数为候选摘要）|
+| `:NeoAI SandboxReview`| 列出待审修改并选择应用（异步审批；「资源访问」页按 `E` 可增删工作目录/遮蔽目录，仅本会话）             |
+| `:NeoAI SandboxApprove` / `:NeoAI SandboxReject` | 批准（不应用）/ 拒绝并丢弃变更单元 |
+| `:NeoAI SandboxApply` / `:NeoAI SandboxApplyAll` | 批准并应用单个 / 全部待审变更单元 |
+| `:NeoAI SandboxGrant` / `:NeoAI SandboxRevoke` | 创建窄范围任务授权 / 撤销授权 |
+| `:NeoAI SandboxPrune` / `:NeoAI SandboxMetrics` | 清理过期候选 / 显示沙箱指标 |
+| `:NeoAI SandboxPublish` / `:NeoAI SandboxReplay` | 组合发布多个变更单元 / 回放策略裁决 |
+| `:NeoAI SandboxList` / `:NeoAI SandboxShow` | 列出/查看待处理沙箱候选 |
+| `:NeoAI SandboxDiscard`| 丢弃沙箱候选（参数为候选摘要）                  |
+| `:NeoAI SandboxCaps`| 显示沙箱运行时能力探测结果                        |
+| `:NeoAI SandboxDiag`| 显示沙箱资源域/负载诊断（137/OOM 归因）            |
+| `:NeoAI SandboxAudit`| 显示沙箱行为审计与风险评估摘要                     |
+| `:NeoAI SandboxAutoApprove`| 设置 AI 新会话自动审批（`on`/`off`/`status`，默认关闭）|
+| `:NeoAI Doctor` | 环境诊断（Neovim 版本 / curl / API Key / 沙箱能力 / 可选依赖；等同 `:checkhealth NeoAI` 摘要） |
+| `:NeoAI Statusline` | 预览当前 lualine 状态栏组件内容                    |
+
+### 3.1 输入框 `#` 上下文占位符
+
+在聊天输入框里输入 `#` 会弹出**上下文占位符**候选；选中后只插入占位符文本（并以
+`NeoAIHashPlaceholder` 高亮），**发送前**才展开成真实内容——你仍可以阅读、修改或删掉它：
+
+| 占位符 | 展开内容 |
+| --- | --- |
+| `#{buffers}` | 当前全部 buffer（编号 / 状态 / 类型 / 路径） |
+| `#{buffer:NAME}` | 指定 buffer 的内容 |
+| `#{lsp}` | 当前编辑文件的 LSP 诊断 |
+| `#{message}` / `#{notify}` | Neovim 启动至今的消息历史（上限 2000 字符，按字符计） |
+| `#{tool}` / `#{tool:NAME}` | 工具清单 / 单个工具定义 |
+| `#{skills}` / `#{skills:NAME}` | 技能清单 / 单个技能正文 |
+| `#{mcp}` / `#{mcp:NAME}` | MCP 工具清单 / 单个工具定义 |
+
+装了 nvim-cmp 时输入 `#` 自动弹候选；否则用插入模式 `<C-x><C-u>` 手动触发。
+未找到的目标（不存在的 buffer/技能）会把占位符**原样**发送，不会报错。
+配置：`ui.input_box.hash_completion = { enabled=true, max_chars=2000, max_bytes=20000 }`。
+
+### 3.2 AGENTS.md 自动加载
+
+仓库根有 `AGENTS.md`（开发约定）时，会话**首个回合**会自动注入一轮 `read_file` 工具调用，
+把约定内容放进上下文供 AI 遵循——不需要你手动提示它去读。要点：
+
+- 只在**新建的顶层会话**注入一次（重开会话、子 Agent 不重复注入）；
+- 不写入系统提示，因此不会破坏 provider 的前缀缓存；
+- AI 需要更新 `AGENTS.md` 时**照常走沙箱审批**，不会被自动放行；
+- 配置：`session.agents_md = { enabled=true, file="AGENTS.md", max_bytes=64*1024 }`。
 
 ### 4. 默认快捷键
 
@@ -645,7 +680,7 @@ require("NeoAI").setup({
 - `NeoAI.get_statusline()` — 返回状态栏文本
 - `require("NeoAI.services.status").segment(name)` — 单个段文本（mode/model/usage/cache/capacity/state/display/pending）
 - `require("NeoAI.services.chat_service").pending_count()` — 当前 Agent 正忙时暂存的待发消息数
-- `:NeoAIStatusline` — 预览当前状态栏组件内容
+- `:NeoAI Statusline` — 预览当前状态栏组件内容
 
 ### Herder 终端状态集成
 
@@ -676,7 +711,7 @@ NeoAI 可以在 **Herder** 管理的 pane 内向 Herder 上报 AI Agent 的真�
 
 **多会话聚合**：单个 Neovim pane 内可能有多个 AI 会话（含子 Agent），NeoAI 聚合成一个固定的
 `source`（默认 `custom:neoai`）统一上报，聚合优先级为 `blocked > working > idle`。所有上报带
-严格递增的 `--seq`，令 Herder 忽略同一 `source` 的旧包，避免并发/异步回调导致状态回退。seq 以**挂钟微秒**为基数（而非每次从 1 开始），因此插件热重载（`:NeoAIReloadAll`）或同一 pane 内重开 nvim 后序号不会回退——否则 Herder 会把新报告当过期包丢弃，表现为“不再跟随生命周期”。
+严格递增的 `--seq`，令 Herder 忽略同一 `source` 的旧包，避免并发/异步回调导致状态回退。seq 以**挂钟微秒**为基数（而非每次从 1 开始），因此插件热重载（`:NeoAI ReloadAll`）或同一 pane 内重开 nvim 后序号不会回退——否则 Herder 会把新报告当过期包丢弃，表现为“不再跟随生命周期”。
 
 **`blocked` 必然解除**：密钥告警 / 网络请求 / 设备访问 / 策略确认四类**阻塞**浮窗共用
 `ui/consent_slot` 的**单槽位**（跨组件串行，任一时刻只展示一个，其余排队），并且每次请求持有
@@ -692,7 +727,7 @@ NeoAI 可以在 **Herder** 管理的 pane 内向 Herder 上报 AI Agent 的真�
 最后一个 Agent 退出时先清除展示元数据再 `release-agent`，避免残留。
 
 **退出 / 重启 / 热重载释放权威**：除「最后一个 Agent 退出」外，**退出 Neovim**、`:restart`、
-`:NeoAIReloadAll` 等一切卸载路径都会在卸载前主动 `report-metadata --clear-*` +
+`:NeoAI ReloadAll` 等一切卸载路径都会在卸载前主动 `report-metadata --clear-*` +
 `release-agent`，令 Herder 立即回退到屏幕启发式绘制，不再残留本次会话的
 `working`/`blocked` 状态（否则退出后 Herder 侧仍显示「生成中」）。仅在**确实接管过权威**
 （上报过非 idle 信号）时才释放，避免多余上报。
@@ -740,8 +775,8 @@ agent 标签）写入 Herdr 配置（`$XDG_CONFIG_HOME/herdr/config.toml`，缺�
 
 | 命令 | 说明 |
 |---|---|
-| `:NeoAIHerderStatus` | 显示集成状态（环境/上报标识/是否已写入展示增强片段） |
-| `:NeoAIHerderConfig [show\|install\|uninstall]` | 预览 / 安装 / 卸载 Herder 展示增强配置片段（写 Herdr 配置 `$XDG_CONFIG_HOME/herdr/config.toml`，缺省 `~/.config/herdr/config.toml`，marker 幂等、写入前备份、`herdr config check` 校验失败自动回滚） |
+| `:NeoAI HerderStatus` | 显示集成状态（环境/上报标识/是否已写入展示增强片段） |
+| `:NeoAI HerderConfig [show\|install\|uninstall]` | 预览 / 安装 / 卸载 Herder 展示增强配置片段（写 Herdr 配置 `$XDG_CONFIG_HOME/herdr/config.toml`，缺省 `~/.config/herdr/config.toml`，marker 幂等、写入前备份、`herdr config check` 校验失败自动回滚） |
 | `herdr agent list` / `herdr pane get "$HERDR_PANE_ID"` | Herdr 侧查看 `agent=neoai`、`display_agent`、`state_labels` |
 | `herdr agent explain <pane-id>` | 查看状态来源（上报型 agent 会提示无检测标签） |
 
@@ -758,7 +793,7 @@ NeoAI 内置了 40+ 工具，AI 可在对话中自动调用，涵盖以下类别
 
 > **关于权限与审批**：所有工具执行都统一经过**沙箱控制面**（预检 → 隔离执行 → 冻结候选 → 授权校验 → CAS 发布）。
 > 默认 `tools.approval.mode = "async"`（异步审批）：效果类工具（编辑 / 删除 / 建目录 / 回滚 / 命令等）在沙箱内立即执行并冻结为候选，
-> **真实工作区改动进入待审队列**，用 `:NeoAISandboxReview` 或聊天窗口内 `<leader>ap` 确认后应用；读取类工具直接放行。
+> **真实工作区改动进入待审队列**，用 `:NeoAI SandboxReview` 或聊天窗口内 `<leader>ap` 确认后应用；读取类工具直接放行。
 > 因此下表不再逐工具标注「是否需审批」，只列主要参数（用途简述）；权限分级与白名单见「工具审批」配置与 [docs/tool_system.md](docs/tool_system.md)。
 
 ### 📁 文件操作工具（读取类直接放行，改动类进待审队列）
@@ -878,11 +913,11 @@ NeoAI 内置了 40+ 工具，AI 可在对话中自动调用，涵盖以下类别
 > 不暴露任何修改类工具（编辑/删除/创建/git 回滚等），**也不向 AI 提供切换模式的工具**；执行期门禁同步收紧，
 > 调用可见集之外的任何工具都会被驳回。AI 在此模式下调研、提问澄清，
 > 并输出**清晰、格式化的修改计划**（目标与背景 / 改动清单 / 实施步骤 / 验证与回滚）。
-> 计划输出后本轮结束，**由用户确认**（执行 `:NeoAIApprovePlan` 或手动切换模式）；
+> 计划输出后本轮结束，**由用户确认**（执行 `:NeoAI ApprovePlan` 或手动切换模式）；
 > 确认后**直接转入 CHAT 模式**，系统把计划解析为任务清单（todo），
 > 并按 `tools.plan_mode.auto_execute_on_approve`（默认开启）自动开始执行。
-> 也可手动执行 `:NeoAIApprovePlan` 完成同样的确认。
-> 生成过程中按 `m` / `:NeoAIPlan` 切换模式会**延迟到当前回合结束后生效**，
+> 也可手动执行 `:NeoAI ApprovePlan` 完成同样的确认。
+> 生成过程中按 `m` / `:NeoAI Plan` 切换模式会**延迟到当前回合结束后生效**，
 > 不会中途改变工具集 / 系统策略 / 模型而打断正在进行的生成。
 
 ### 🪵 日志工具
@@ -894,7 +929,7 @@ NeoAI 内置了 40+ 工具，AI 可在对话中自动调用，涵盖以下类别
 
 ### 🔁 系统工具
 
-> **插件热重载（隔离且安全）**：`:NeoAIReloadAll` 命令无需重启 nvim 即可重载整个 NeoAI 插件
+> **插件热重载（隔离且安全）**：`:NeoAI ReloadAll` 命令无需重启 nvim 即可重载整个 NeoAI 插件
 > （源码改动即时生效）。为避免半加载状态破坏当前会话，采用两阶段策略：
 > 1. **隔离子进程预检**：先启动一个全新 headless nvim（`--clean -u NONE` + rtp=插件根目录），
 >    加载插件并做冒烟校验（核心模块可 require、工具可注册）。任何错误都只留在子进程内，
@@ -1206,13 +1241,13 @@ NeoAI 基于 Neovim 原生 `User` 自动命令实现事件驱动架构，事件�
 运行所有测试（默认并行，多 worker 隔离 headless 子进程）：
 
 ```vim
-:NeoAITest
+:NeoAI Test
 ```
 
 运行指定测试（顺序执行，便于调试）：
 
 ```vim
-:NeoAITest flow_config flow_tools
+:NeoAI Test flow_config flow_tools
 ```
 
 > 并行运行器按「文件（套件）」分片，worker 数默认 `min(nproc, 8)`（`NEOAI_TEST_WORKERS` 可覆盖），
@@ -1264,8 +1299,8 @@ NeoAI 基于 Neovim 原生 `User` 自动命令实现事件驱动架构，事件�
 ### 运行测试
 
 ```vim
-:NeoAITest             " 并行运行所有测试
-:NeoAITest flow_tools  " 顺序运行指定测试
+:NeoAI Test             " 并行运行所有测试
+:NeoAI Test flow_tools  " 顺序运行指定测试
 ```
 
 ---

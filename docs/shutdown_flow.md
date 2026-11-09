@@ -52,7 +52,7 @@ lifecycle.on_shutdown(persist)      -- 关闭前先落盘活跃 Agent 进度
 lazy.register(...)                  -- 注册命令/键位占位符
 ```
 
-首次触发（`:NeoAI*` 命令、全局快捷键或主动 API）后才启动，且分**两阶段异步**：
+首次触发（`:NeoAI <子命令>`、全局快捷键或主动 API）后才启动，且分**两阶段异步**：
 
 ```
 ensure_phase1()  -- 阶段 1：session/agent/model/chat/status/ui/commands/keymaps（UI 就绪）
@@ -60,7 +60,7 @@ ensure_started() -- 阶段 2：tools/sandbox/tool_service/skills/mcp/herder + �
 ```
 
 - `plugins.start_list_async(ids, on_done)` 每帧启动一个插件并 `vim.defer_fn(...,0)` 让出事件循环；阶段 1 完成即打开界面。
-- `ensure_started_sync(timeout)` 供测试 / `:NeoAIReloadAll` 同步等待两阶段完成。
+- `ensure_started_sync(timeout)` 供测试 / `:NeoAI ReloadAll` 同步等待两阶段完成。
 - 只读访问器（`get_*_service` / `get_statusline*`）不触发启动。
 
 ## 4. AbortSignal 级联取消
@@ -82,9 +82,9 @@ ensure_started() -- 阶段 2：tools/sandbox/tool_service/skills/mcp/herder + �
 退出清理会 `plugins.stop_all()` → 各副作用插件 `stop`。其中 **herder 插件的 `stop` 调用
 `herder.shutdown()`**：若当前处于 Herder 环境且接管过权威，先 `report-metadata --clear-*` 再
 `release-agent`，令 Herder 立即回退屏幕启发式绘制、不残留 `working`/`blocked` 状态。
-`:restart` 与 `:NeoAIReloadAll` 走同一条卸载路径，因此同样即时释放。
+`:restart` 与 `:NeoAI ReloadAll` 走同一条卸载路径，因此同样即时释放。
 
-**测试 worker 兜底**：`:NeoAITest`（并行 `parallel.run` 或隔离 `run_isolated`）起的子进程会登记到
+**测试 worker 兜底**：`:NeoAI Test`（并行 `parallel.run` 或隔离 `run_isolated`）起的子进程会登记到
 运行器的进程表；父 nvim 退出时经 `lifecycle.on_shutdown` 调用 `parallel._abort_all()` /
 `tests._abort_all()`，结束在跑 worker 及其**整个进程树**（按 `/proc` 父子关系回溯，含脱离 job
 进程组的沙箱常驻 bwrap / PTY 会话后代）。分片超时/中止时运行器同样做进程树清理（先 `jobstop`

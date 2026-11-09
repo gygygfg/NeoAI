@@ -2,17 +2,17 @@
 
 > [English](en/threaded_testing.md) | **中文**
 
-> NeoAI 自带**轻量自定义测试框架**（无外部依赖，`:NeoAITest` 运行）。
+> NeoAI 自带**轻量自定义测试框架**（无外部依赖，`:NeoAI Test` 运行）。
 > 所有测试文件位于 `lua/NeoAI/tests/`。旧版文档中提到的 `thread_worker.lua` /
-> `thread_scheduler.lua` / `threaded_runner.lua` 及 `:NeoAITestAll` 命令均**不存在**。
+> `thread_scheduler.lua` / `threaded_runner.lua` 及 `:NeoAI TestAll` 命令均**不存在**。
 > 对应源码：`lua/NeoAI/tests/init.lua`。
 
 ## 1. 运行方式
 
 ```vim
-:NeoAITest              " 运行全部测试
-:NeoAITest flow_tools   " 运行指定套件（按名字）
-:NeoAITest test_agent test_herder  " 运行多个套件
+:NeoAI Test              " 运行全部测试
+:NeoAI Test flow_tools   " 运行指定套件（按名字）
+:NeoAI Test test_agent test_herder  " 运行多个套件
 ```
 
 `run_all(...)` 动态加载 `lua/NeoAI/tests/test_*.lua`（幂等），收集所有 `suite` 并执行。

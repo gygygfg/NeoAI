@@ -88,7 +88,7 @@ tests.suite("health", function(_, it)
     t.true_(item.status == "ok" or item.status == "warn", "状态应为 ok/warn（无 error）")
     local text = table.concat(item.info, "\n")
     t.matches("bwrap", text, "文案应点名 bwrap（不再是笼统的「不可用」）")
-    t.true_(text:find("详见 :NeoAISandboxCaps", 1, true) ~= nil, "应保留诊断入口")
+    t.true_(text:find("详见 :NeoAI SandboxCaps", 1, true) ~= nil, "应保留诊断入口")
     -- docker 不参与隔离后端：无论是否安装都不应作为能力列出
     t.true_(text:find("可用工具: ", 1, true) == nil, "不应再输出「可用工具: docker」式的笼统列表")
 

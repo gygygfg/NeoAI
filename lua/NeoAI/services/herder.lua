@@ -63,7 +63,7 @@ local job = _job_default
 
 --- 信号序号的挂钟基数（微秒级）。
 --- herdr 按 (pane, source) 记住已见的最大 --seq，并丢弃更小的（视为过期包）；
---- release-agent 不会清除该记忆。若 seq 每次从 1 开始，插件 reload（:NeoAIReloadAll）
+--- release-agent 不会清除该记忆。若 seq 每次从 1 开始，插件 reload（:NeoAI ReloadAll）
 --- 或同一 pane 内重开 nvim 后，新报告会因序号更小而**全部被丢弃**，表现为
 --- 「herdr 不再跟随 NeoAI 生命周期」。故用挂钟时间做基数，保证跨进程单调不回退
 --- （与 Herdr 官方集成一致：opencode 脚本用 `Date.now() * 1000` 做基数）。

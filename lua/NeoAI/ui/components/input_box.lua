@@ -27,6 +27,8 @@ local function _make()
   cmp_aucmd_id = nil, -- 开启 nvim-cmp 的 InsertEnter 自动命令句柄（便于清理）
   prompt_ns = nil, -- 渲染 "> " 前缀的 extmark 命名空间
   prompt_extmark_id = nil, -- "> " 前缀 extmark id
+  context_buf = nil, -- #{lsp} 使用的「当前文件」（最近聚焦的真实编辑 buffer）
+  hash_aucmds = {}, -- # 占位符高亮用的自动命令句柄
 }
 
 -- ========== 私有函数 ==========
@@ -60,21 +62,47 @@ local function _set_content(content)
   vim.api.nvim_buf_set_lines(state.buf, 0, -1, false, { content })
 end
 
+--- 取 hash_complete 模块（缺失时返回 nil，功能自动降级）
+--- 注意：本函数被 _enable_cmp_for_input 引用，必须定义在其之前（Lua 局部变量
+--- 先引用后声明会解析到 global nil）。
+--- @return table|nil
+local function _hash_mod()
+  local ok, mod = pcall(require, "NeoAI.ui.components.hash_complete")
+  if ok and type(mod) == "table" then return mod end
+  return nil
+end
+
 --- 让 nvim-cmp 在输入框中生效，以支持路径/关键字补全。
 --- nvim-cmp 的 filetype 配置会覆盖全局 enabled（见 config.lua 的 merge 顺序：filetype 后于全局合并），
---- 此处仅针对 neoai_input 这个 filetype 单独放开开关；不覆盖 sources，沿用用户全局配置里的
---- path/buffer 等补全源。
+--- 此处仅针对 neoai_input 这个 filetype 单独放开开关；不覆盖 sources 的**内容**，
+--- 而是在用户全局源之后追加 `neoai_hash`（# 占位符源），从而保留路径/关键字补全。
 --- @return boolean 是否已成功启用
 local function _enable_cmp_for_input()
   local ok, cmp = pcall(require, "cmp")
   if not ok then
     return false
   end
-  cmp.setup.filetype("neoai_input", {
-    enabled = function()
-      return true
-    end,
-  })
+  -- 合并用户全局 sources + neoai_hash（仅在 hash 源已注册时追加，避免 cmp 报未知源）
+  local sources = {}
+  if type(cmp.get_config) == "function" then
+    local okc, cfg = pcall(cmp.get_config)
+    if okc and type(cfg) == "table" and type(cfg.sources) == "table" then
+      for _, s in ipairs(cfg.sources) do sources[#sources + 1] = s end
+    end
+  end
+  local hash_mod = _hash_mod()
+  local hash_ok = hash_mod and type(hash_mod.setup_cmp_source) == "function"
+    and pcall(hash_mod.setup_cmp_source) or false
+  if hash_ok and #sources > 0 then
+    local has = false
+    for _, s in ipairs(sources) do
+      if type(s) == "table" and s.name == hash_mod.CMP_SOURCE then has = true break end
+    end
+    if not has then sources[#sources + 1] = { name = hash_mod.CMP_SOURCE } end
+  end
+  local opts = { enabled = function() return true end }
+  if hash_ok and #sources > 0 then opts.sources = sources end
+  cmp.setup.filetype("neoai_input", opts)
   return true
 end
 
@@ -113,6 +141,52 @@ local function _setup_cmp_completion()
       vim.schedule(_apply_cmp_for_input)
     end,
   })
+end
+
+--- 启用 # 占位符补全与高亮
+--- completefunc 走 <C-x><C-u> 手动触发（无第三方依赖）；nvim-cmp 可用时额外注册
+--- neoai_hash 源（由 _enable_cmp_for_input 并入该 filetype 的 sources），从而实现 # 自动弹出。
+--- 两者都不可用时完全无副作用。
+local function _setup_hash_completion()
+  local hash = _hash_mod()
+  if not hash or not state.buf or not vim.api.nvim_buf_is_valid(state.buf) then return end
+  pcall(hash.setup_cmp_source)
+  pcall(function()
+    vim.bo[state.buf].completefunc = hash.ensure_global()
+  end)
+  pcall(hash.highlight, state.buf)
+  for _, ev in ipairs({ "TextChangedI", "TextChanged", "InsertLeave" }) do
+    state.hash_aucmds[#state.hash_aucmds + 1] = vim.api.nvim_create_autocmd(ev, {
+      buffer = state.buf,
+      callback = function()
+        local mod = _hash_mod()
+        if mod then pcall(mod.highlight, state.buf) end
+      end,
+    })
+  end
+end
+
+--- 清理 # 占位符相关自动命令与高亮
+local function _teardown_hash_completion()
+  for _, id in ipairs(state.hash_aucmds) do
+    pcall(vim.api.nvim_del_autocmd, id)
+  end
+  state.hash_aucmds = {}
+  local hash = _hash_mod()
+  if hash and state.buf and vim.api.nvim_buf_is_valid(state.buf) then
+    pcall(hash.clear, state.buf)
+  end
+end
+
+--- 发送前解析 # 占位符（失败时原样返回，绝不中断发送）
+--- @param content string
+--- @return string
+local function _resolve_hash(content)
+  local hash = _hash_mod()
+  if not hash then return content end
+  local ok, resolved = pcall(hash.resolve, content, { bufnr = state.context_buf })
+  if ok and type(resolved) == "string" then return resolved end
+  return content
 end
 
 --- 绑定输入框键位
@@ -218,6 +292,7 @@ function M.create(opts)
   state.on_cancel = opts.on_cancel
   state.on_quit = opts.on_quit
   state.chat_actions = opts.chat_actions
+  state.context_buf = opts.context_buf or state.context_buf
 
   state.buf = opts.buf or vim.api.nvim_create_buf(false, true)
   -- 给输入 buffer 一个稳定名字，便于会话恢复（:mksession）后识别/清理残留，并在 :ls 中可辨识。
@@ -244,6 +319,8 @@ function M.create(opts)
   state.win_id = opts.win_id
   _set_keymaps()
   -- 启用 nvim-cmp 插入补全（普通 buffer 不再被默认 enabled 排除，无 cmp 时无副作用）
+  -- 注意顺序：# 占位符源需先注册，_setup_cmp_completion 才能把 neoai_hash 并入 sources。
+  _setup_hash_completion()
   _setup_cmp_completion()
   return { buf = state.buf, win_id = state.win_id }
 end
@@ -337,6 +414,18 @@ function M.set_on_cancel(fn)
   state.on_cancel = fn
 end
 
+--- 设置 #{lsp} 等占位符使用的「当前文件」（最近聚焦的真实编辑 buffer）
+--- @param buf number|nil
+function M.set_context_buf(buf)
+  state.context_buf = (buf and vim.api.nvim_buf_is_valid(buf)) and buf or nil
+end
+
+--- 获取 #{lsp} 使用的上下文 buffer
+--- @return number|nil
+function M.get_context_buf()
+  return state.context_buf
+end
+
 --- 提交
 --- @param content string|nil 可选，直接传入内容
 --- @return boolean 是否已提交
@@ -346,6 +435,11 @@ function M.submit(content)
   end
   content = content or _get_content()
   content = content:gsub("^>%s*", ""):gsub("%s+$", "")
+  if content == "" then
+    return false
+  end
+  -- # 占位符解析：发送前把 #{...} 替换为真实上下文（未知键/解析失败原样保留）
+  content = _resolve_hash(content)
   if content == "" then
     return false
   end
@@ -408,6 +502,7 @@ function M.reset()
     unsub()
   end
   state.unsubs = {}
+  _teardown_hash_completion()
   if state.cmp_aucmd_id then
     pcall(vim.api.nvim_del_autocmd, state.cmp_aucmd_id)
     state.cmp_aucmd_id = nil
@@ -422,6 +517,7 @@ function M.reset()
   state.on_cancel = nil
   state.on_quit = nil
   state.chat_actions = nil
+  state.context_buf = nil
   state.submitting = false
 end
 
@@ -463,7 +559,7 @@ end
 for _, name in ipairs({
   "create", "attach_window", "get_buf", "get_win", "get_enter_callback",
   "focus", "set_on_submit", "set_on_cancel", "submit", "on_submitted",
-  "cancel", "clear", "destroy", "reset",
+  "cancel", "clear", "destroy", "reset", "set_context_buf", "get_context_buf",
 }) do
   M[name] = function(...)
     local cur = _cur()

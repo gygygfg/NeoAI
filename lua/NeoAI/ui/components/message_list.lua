@@ -1617,8 +1617,10 @@ end
 --- 供整块构建与「执行中耗时」轻量刷新共用（避免为更新时间重建整块）。
 --- @param tool_call table
 --- @param result_msg table|nil
+--- @param opts table|nil { width?: number } 可用显示宽度；首行超出该宽度且带目的时，
+---   把耗时从尾部提到目的之前（窄窗下行尾耗时会被截断而不可见）
 --- @return string|nil
-local function _tool_header_text(tool_call, result_msg)
+local function _tool_header_text(tool_call, result_msg, opts)
   local fn = tool_call and tool_call["function"]
   if not fn then return nil end
   local name = fn.name or ""
@@ -1627,19 +1629,28 @@ local function _tool_header_text(tool_call, result_msg)
   -- 已完成工具优先用结果消息里持久化的总时长；执行中/无持久化时回退 fold 计时
   local duration = (result_msg and result_msg.duration_ms) or fold.get_duration(tool_call.id)
   local time_str = duration and (" · " .. fold.format_ms(duration)) or ""
+  -- 窄窗降级：首行（含缩进）超出可用宽度时把耗时提到目的之前，否则用户看不到耗时。
+  local time_first = false
+  local width = opts and opts.width
+  if width and time_str ~= "" and desc_str ~= "" then
+    time_first = vim.fn.strdisplaywidth("  " .. name .. desc_str .. time_str) + 8 > width
+  end
+  local function _tail()
+    return time_first and (time_str .. desc_str) or (desc_str .. time_str)
+  end
   if result_msg then
     local failed = _tool_result_failed(result_msg.content)
-    return string.format("%s 工具: %s%s%s", failed and "❌" or "✅", name, desc_str, time_str)
+    return string.format("%s 工具: %s%s", failed and "❌" or "✅", name, _tail())
   end
   -- 结果消息未到达时按各自执行状态渲染（fold 计时记录了每个工具的开始/结束状态）：
   -- 已完成的工具立即显示 ✅/❌ 并锁定总耗时，仍在执行的显示 ⏳ + 实时耗时。
   local status = fold.get_status(tool_call.id)
   if status == "success" then
-    return string.format("✅ 工具: %s%s%s", name, desc_str, time_str)
+    return string.format("✅ 工具: %s%s", name, _tail())
   elseif status == "failure" then
-    return string.format("❌ 工具: %s%s%s", name, desc_str, time_str)
+    return string.format("❌ 工具: %s%s", name, _tail())
   end
-  return string.format("⏳ 调用工具: %s%s%s", name, desc_str, time_str)
+  return string.format("⏳ 调用工具: %s%s", name, _tail())
 end
 
 --- 追加单个工具块（调用 + 结果合并成一个折叠块）。
@@ -1651,7 +1662,35 @@ end
 --- @param marks table 与 lines 并行的元数据数组
 --- @param tool_call table
 --- @param result_msg table|nil 对应的工具结果消息
-local function _append_tool_block(lines, marks, tool_call, result_msg)
+--- 追加 AGENTS.md 自动注入折叠块
+--- 自动注入的 read_file 结果可能达 64KB，绝不能全量写进聊天 buffer；这里只展示
+--- 路径与字节数，正文已在模型上下文中。
+--- @param lines table
+--- @param marks table
+--- @param tool_call table|nil
+--- @param result_msg table|nil
+local function _append_agents_md_block(lines, marks, tool_call, result_msg)
+  local path = "AGENTS.md"
+  local fn = tool_call and tool_call["function"]
+  if fn and type(fn.arguments) == "string" and fn.arguments ~= "" then
+    local ok, args = pcall(json.decode_or_nil, fn.arguments)
+    if ok and type(args) == "table" and type(args.file_path) == "string" then path = args.file_path end
+  end
+  local rows = { "📄 AGENTS.md 规范已加载" }
+  rows[#rows + 1] = "路径: " .. path
+  if result_msg and type(result_msg.content) == "string" then
+    rows[#rows + 1] = ("内容: %d 字节（已注入上下文；更新 AGENTS.md 需经沙箱审批）"):format(#result_msg.content)
+  end
+  _append_fold_block(lines, marks, rows, "tool", { fold_kind = "tool" })
+end
+
+local function _append_tool_block(lines, marks, tool_call, result_msg, opts)
+  -- AGENTS.md 自动注入轮：紧凑折叠块（不复述正文与参数 JSON）
+  local md_meta = (result_msg and result_msg.meta) or (tool_call and tool_call.meta) or nil
+  if type(md_meta) == "table" and md_meta.agents_md then
+    _append_agents_md_block(lines, marks, tool_call, result_msg)
+    return
+  end
   local fn = tool_call["function"]
   -- 同一工具块的参数/结果只 JSON 解码一次：结果同时供密钥扫描与结果渲染，参数同时供
   -- 密钥扫描与参数渲染。超大工具输出下重复解码是可见的主线程开销。
@@ -1689,7 +1728,7 @@ local function _append_tool_block(lines, marks, tool_call, result_msg)
   -- 含密钥的工具调用：完整展示参数/结果（不截断），并在行内高亮密钥值。
   local has_secret = secret_lines ~= nil
   local rows = {}
-  local header_text = _tool_header_text(tool_call, result_msg)
+  local header_text = _tool_header_text(tool_call, result_msg, opts)
   if header_text then rows[#rows + 1] = header_text end
   -- 结构化调用参数：无论工具最终成功/失败，展开折叠都能看到本次调用传了哪些参数
   local arg_lines = _tool_arguments_lines(fn, { full = has_secret, decoded = decoded_args, has_decoded = true, oversized = args_oversized })
@@ -1836,10 +1875,12 @@ end
 --- @return table|nil
 local function _msg_opts(is_stream, opts)
   local tw = opts and opts.table_width
-  if not is_stream and not tw then return nil end
+  local twd = opts and opts.tool_width
+  if not is_stream and not tw and not twd then return nil end
   local o = {}
   if is_stream then o.streaming = true end
   if tw then o.table_width = tw end
+  if twd then o.tool_width = twd end
   return o
 end
 
@@ -1855,12 +1896,62 @@ local function _sig(opts, turn_end, extra, show)
     show and "R" or "-",
     (opts and opts.streaming) and "S" or "-",
     (opts and opts.table_width) or "-",
+    (opts and opts.tool_width) or "-",
     turn_end and "T" or "-",
   }
   for _, e in ipairs(extra or {}) do
     p[#p + 1] = e
   end
   return table.concat(p, "\1")
+end
+
+--- 运行期工具结果的伪消息缓存：tool_call_id → { sig, msg }。
+--- 缓存是为了让块的「廉价输入比较」（按引用比 res）稳定：若每次都新建表格，
+--- 每帧都会判定为变化而重建整块。
+local _live_msg_cache = {}
+
+--- 为尚未落库的工具结果构造伪 tool 消息（无则返回 nil）。
+--- 并发工具调用的结果按原始顺序统一落库（保证 tool 消息顺序与 assistant.tool_calls 一致），
+--- 因此只要本轮有一个工具未完成，其余已完成的结果就进不了 messages。这里从
+--- `kernel.live_metrics` 读取「完成即发布」的运行期结果，让每个工具**各自**展示自己的结果，
+--- 而不是等整批完成后才一起出现。落库后 core 会清掉暂存，这里也随之失效（改用真实消息）。
+--- @param tc table tool_call
+--- @return table|nil 伪 tool 消息（结构同真实结果消息）
+local function _live_result_msg(tc)
+  local id = tc and tc.id
+  if not id then return nil end
+  local ok, lm = pcall(require, "NeoAI.kernel.live_metrics")
+  if not ok or type(lm.get_result) ~= "function" then return nil end
+  local r = lm.get_result(id)
+  if type(r) ~= "table" then
+    _live_msg_cache[id] = nil
+    return nil
+  end
+  local content = r.content
+  if type(content) ~= "string" then content = "" end
+  local notice = r.notice
+  local sig = tostring(#content) .. ":" .. tostring(r.duration_ms) .. ":"
+    .. tostring(type(notice) == "string" and #notice or 0)
+  local hit = _live_msg_cache[id]
+  if hit and hit.sig == sig then return hit.msg end
+  local fn = tc["function"]
+  local msg = {
+    role = "tool",
+    tool_call_id = id,
+    tool_name = fn and fn.name or nil,
+    content = content,
+    duration_ms = r.duration_ms,
+    notice = notice,
+    secret_paths = r.secret_paths,
+    _live = true, -- 标记：仅用于渲染，非持久化消息
+  }
+  _live_msg_cache[id] = { sig = sig, msg = msg }
+  return msg
+end
+
+--- 清空运行期结果缓存（测试/会话重置用）
+function M.reset_live_results()
+  _live_msg_cache = {}
 end
 
 --- 把消息序列切分为可缓存的渲染块。每个块 = 一条消息；带工具调用的 assistant
@@ -1880,6 +1971,9 @@ local function _blocks(msgs, opts, prev, show)
   local n = 0
   local i = 1
   local tw = opts and opts.table_width
+  -- 工具首行可用宽度：优先取调用方给定的 tool_width（由 table_width 派生或窗口宽度探测），
+  -- 用于窄窗下把耗时提到目的之前。
+  local tool_width = opts and (opts.tool_width or opts.table_width)
   if show == nil then show = _show_for(nil) end
   local streaming = opts and opts.streaming
   local fold_mode = _fold_mode()
@@ -1917,6 +2011,9 @@ local function _blocks(msgs, opts, prev, show)
         if msgs[ridx] and msgs[ridx].role == "tool" then
           res = msgs[ridx]
           ridx = ridx + 1
+        end
+        if res == nil then
+          res = _live_result_msg(tc)
         end
         paired[#paired + 1] = { tc = tc, res = res }
       end
@@ -2000,7 +2097,7 @@ local function _blocks(msgs, opts, prev, show)
             _append_reasoning(lines, marks, snap, eopts, show)
             _append_content(lines, marks, snap, eopts)
             for _, pp in ipairs(paired) do
-              _append_tool_block(lines, marks, pp.tc, pp.res)
+              _append_tool_block(lines, marks, pp.tc, pp.res, { width = tool_width })
             end
             if turn_end then
               _append_turn_sep(lines, marks)
@@ -2139,8 +2236,9 @@ end
 --- 重写引发折叠闪烁）；改为仅改写首行文本，块其余内容复用缓存。
 --- @param lines table 行数组（BlockCache 的 new_lines）
 --- @param marks table 与 lines 并行的元数据
+--- @param opts table|nil { width?: number } 可用显示宽度（窄窗下首行耗时前置，与构建时一致）
 --- @return boolean changed
-function M.refresh_tool_times(lines, marks)
+function M.refresh_tool_times(lines, marks, opts)
   local changed = false
   -- 以 lines 长度为准遍历：marks 与 lines 并行但多数元素为 nil，`#marks` 会在首个
   -- nil 处截断（角色头/空行），导致工具首行元数据被跳过。
@@ -2150,7 +2248,7 @@ function M.refresh_tool_times(lines, marks)
     if th and th.tc and not th.res then
       local status = fold.get_status(th.id)
       if status ~= "success" and status ~= "failure" then
-        local text = _tool_header_text(th.tc, nil)
+        local text = _tool_header_text(th.tc, nil, opts)
         if text then
           local newline = "  " .. text
           if lines[i] ~= newline then
@@ -2164,15 +2262,44 @@ function M.refresh_tool_times(lines, marks)
   return changed
 end
 
+--- 当前显示该 buffer 的窗口可用宽度（窗口宽 - 2），无窗口时返回 nil。
+--- 供工具首行「窄窗耗时前置」使用；测试/无窗口上下文返回 nil（保持宽窗顺序）。
+--- @param buf number
+--- @return number|nil
+local function _buf_tool_width(buf)
+  local ok, win = pcall(vim.fn.bufwinid, buf)
+  if not ok or type(win) ~= "number" or win <= 0 then return nil end
+  local okw, w = pcall(vim.api.nvim_win_get_width, win)
+  if not okw or type(w) ~= "number" or w <= 0 then return nil end
+  return math.max(20, w - 2)
+end
+
+--- 给渲染选项补上工具首行可用宽度（优先 table_width，其次探测显示窗口宽度）。
+--- @param buf number
+--- @param opts table|nil
+--- @return table|nil
+local function _with_tool_width(buf, opts)
+  local tw = opts and (opts.tool_width or opts.table_width)
+  if tw then return opts end
+  local w = _buf_tool_width(buf)
+  if not w then return opts end
+  local o = {}
+  for k, v in pairs(opts or {}) do o[k] = v end
+  o.tool_width = w
+  return o
+end
+
 --- 渲染消息列表到 buffer（默认对话模式，增量：块缓存 + 差分写入）
 --- @param buf number
 --- @param messages table 数组
---- @param opts table|nil { streaming? boolean; table_width? number }
----   streaming 流式生成中时不对表格填充；table_width 限制表格总显示宽度（随窗口自适应）
+--- @param opts table|nil { streaming? boolean; table_width? number; tool_width? number }
+---   streaming 流式生成中时不对表格填充；table_width 限制表格总显示宽度（随窗口自适应）；
+---   tool_width 为工具首行可用宽度（窄窗下把耗时提到目的之前）
 --- @return table 增量写入结果 { changed, start, removed, inserted, full }
 function M.render_chat(buf, messages, opts)
   local msgs = messages or {}
   local show = _show_for(buf)
+  opts = _with_tool_width(buf, opts)
   if not _incremental_enabled() then
     return _render_chat_full(buf, msgs, opts, show)
   end
@@ -2187,7 +2314,7 @@ function M.render_chat(buf, messages, opts)
     marks = { nil, nil, nil, nil }
   end
   -- 执行中工具的首行耗时就地刷新（块缓存命中时也能更新，且不重建整块）。
-  M.refresh_tool_times(lines, marks)
+  M.refresh_tool_times(lines, marks, { width = opts and (opts.tool_width or opts.table_width) })
   cache.new_lines = lines
   cache.new_marks = marks
   -- 推理块起始行必须在写入 buffer **之前**登记：foldexpr 依赖 is_reasoning_start 判定

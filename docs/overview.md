@@ -37,7 +37,7 @@ NeoAI 是一款面向 Neovim 的 AI 驱动聊天插件，可将 AI 助手直接�
    - 内置工具：file ops、LSP、treesitter、shell、git、logging、todo、
      plan_mode、ask_user、read_image、web_fetch（默认不启用）、sub-agent、skills
    - 工具审批工作流：默认 `mode="async"`——工具立即在沙箱内执行并冻结候选，
-     真实修改进待审队列（`:NeoAISandboxReview` 确认应用）；`prompt`/`strict` 才用
+     真实修改进待审队列（`:NeoAI SandboxReview` 确认应用）；`prompt`/`strict` 才用
      串行单槽队列弹窗确认（自动允许配置、按工具权限覆盖、审批超时）
    - 沙箱风险分级：L0-L3 对应 auto/record/review/block，默认 `review`（待审）
    - Plan mode：仅允许只读/信息类工具 + ask_user；修改类工具受门控
@@ -142,7 +142,7 @@ lua/NeoAI/
                              -- plan、todo、plan_mode、ask_user、read_image、skills、
                              -- web_fetch（网页抓取，默认不启用）、tool_helpers
   utils/                     -- 工具函数（async、json、http、fs、work、timer、image、stringx）
-  tests/                     -- 测试套件（:NeoAITest）
+  tests/                     -- 测试套件（:NeoAI Test）
 ```
 
 关键架构原则：
@@ -164,7 +164,7 @@ lua/NeoAI/
 （`bwrap`（bubblewrap 包）或 `unshare` + 非特权 user namespace；seccomp 需 `util-linux` ≥ 2.32 的
 `setpriv --seccomp-filter`；观测用 `bpftrace`/`strace`；容器门面仅 `podman`）。两者都缺失时沙箱
 禁用并退回审批模式。完整清单（含各发行版安装命令与 Android/Termux 限制）见
-[README「前置要求（依赖清单）」](../README.md#-前置要求依赖清单)。安装后运行 `:NeoAIDoctor` 或
+[README「前置要求（依赖清单）」](../README.md#-前置要求依赖清单)。安装后运行 `:NeoAI Doctor` 或
 `:checkhealth NeoAI` 可一站式自检。
 
 使用 lazy.nvim：
@@ -199,7 +199,7 @@ require("NeoAI").setup({
 > Key 时自动回退到已配置 Key 的提供商。
 
 > **启动模型（懒加载，默认，无需配置）**：`setup()` 只加载配置、引导内核、登记插件，并
-> 注册全部 `:NeoAI*` 命令与全局快捷键的占位符。首次触发时由 `NeoAI.ensure_phase1/ensure_started`
+> 注册聚合命令 `:NeoAI <子命令>` 与全局快捷键的占位符。首次触发时由 `NeoAI.ensure_phase1/ensure_started`
 > 驱动**两阶段异步启动**：阶段 1（session/agent/model/chat/status/ui）就绪后立即打开界面；
 > 阶段 2（tools/sandbox/tool_service/skills/mcp/herder 及全部 `tool.*`）在后台按帧加载
 > （`kernel.plugins.start_list_async`），期间事件循环不被阻塞。只读访问器不会触发启动。
@@ -209,19 +209,19 @@ require("NeoAI").setup({
 基本用法：
 
 ```vim
-:NeoAIOpen          " 打开默认 UI（由 ui.default_view 配置）
-:NeoAIChat          " 打开聊天界面
-:NeoAITree          " 打开树界面
-:NeoAIClose         " 关闭所有 NeoAI 窗口
-:NeoAIKeymaps       " 显示当前快捷键配置
-:NeoAITest          " 运行测试（可选传入测试名称）
-:NeoAIChatStatus    " 显示聊天窗口状态
-:NeoAICycleDisplay  " 循环切换显示模式（chat / trajectory）
-:NeoAIReloadDisplay " 热重载显示模式插件
-:NeoAIPlan          " 切换 plan mode
-:NeoAIApprovePlan   " 批准 plan 并切换到 CHAT 模式
-:NeoAIStatusline    " 预览 lualine 状态栏组件内容
-:NeoAIDoctor        " 环境诊断（版本/curl/API Key/沙箱能力/可选依赖）
+:NeoAI Open          " 打开默认 UI（由 ui.default_view 配置）
+:NeoAI Chat          " 打开聊天界面
+:NeoAI Tree          " 打开树界面
+:NeoAI Close         " 关闭所有 NeoAI 窗口
+:NeoAI Keymaps       " 显示当前快捷键配置
+:NeoAI Test          " 运行测试（可选传入测试名称）
+:NeoAI ChatStatus    " 显示聊天窗口状态
+:NeoAI CycleDisplay  " 循环切换显示模式（chat / trajectory）
+:NeoAI ReloadDisplay " 热重载显示模式插件
+:NeoAI Plan          " 切换 plan mode
+:NeoAI ApprovePlan   " 批准 plan 并切换到 CHAT 模式
+:NeoAI Statusline    " 预览 lualine 状态栏组件内容
+:NeoAI Doctor        " 环境诊断（版本/curl/API Key/沙箱能力/可选依赖）
 ```
 
 ## Herder 终端状态集成
@@ -296,29 +296,29 @@ require('NeoAI').setup({
 
 | 命令 | 说明 |
 | --- | --- |
-| `:NeoAIOpen` | 打开默认 UI（由 `ui.default_view` 配置：chat 或 tree） |
-| `:NeoAIChat` | 直接打开聊天界面 |
-| `:NeoAITree` | 直接打开树界面 |
-| `:NeoAIClose` | 关闭所有 NeoAI 窗口 |
-| `:NeoAIKeymaps` | 在浮动窗口中显示当前快捷键配置 |
-| `:NeoAITest [names...]` | 运行测试（全部，或按名称指定） |
-| `:NeoAIChatStatus` | 显示聊天窗口状态 |
-| `:NeoAICycleDisplay` | 循环切换聊天显示模式（chat / trajectory） |
-| `:NeoAIReloadDisplay [name]` | 热重载某个显示模式插件 |
-| `:NeoAIPlan` | 切换 plan mode（只读/信息类工具 + ask_user） |
-| `:NeoAIApprovePlan` | 批准 plan，切换到 CHAT，执行任务列表 |
-| `:NeoAIReloadAll` | 热重载整个 NeoAI 插件（先隔离子进程预检，失败则取消） |
-| `:NeoAISandboxReview` | 列出并应用待审的沙箱修改（按路径级别高亮） |
-| `:NeoAISandboxCommit` | 应用沙箱候选到真实工作区（CAS 发布，参数为候选摘要） |
-| `:NeoAISandboxDiscard` | 丢弃沙箱候选 |
-| `:NeoAISandboxList` / `:NeoAISandboxShow` | 列出 / 查看待处理沙箱候选 |
-| `:NeoAISandboxCaps` / `:NeoAISandboxDiag` | 沙箱运行时能力探测 / 资源域负载诊断（137/OOM 归因） |
-| `:NeoAISandboxApprove` / `:NeoAISandboxReject` | 批准（不应用）/ 拒绝并丢弃变更单元 |
-| `:NeoAISandboxApply` / `:NeoAISandboxApplyAll` | 批准并应用单个 / 全部待审变更单元 |
-| `:NeoAISandboxGrant` / `:NeoAISandboxRevoke` | 创建窄范围任务授权 / 撤销授权 |
-| `:NeoAISandboxPrune` / `:NeoAISandboxMetrics` | 按保留期清理过期候选 / 显示沙箱运行指标 |
-| `:NeoAISandboxPublish` / `:NeoAISandboxReplay` | 组合发布多个变更单元 / 回放已记录的策略裁决 |
-| `:NeoAISandboxAudit` / `:NeoAISandboxAutoApprove` | 沙箱行为审计与风险评估 / 设置新会话自动审批（默认关闭） |
-| `:NeoAIHerderStatus` | 显示 Herder 集成状态 |
-| `:NeoAIHerderConfig [show\|install\|uninstall]` | 查看 / 安装 / 卸载 Herder 展示增强配置片段 |
-| `:NeoAIStatusline` | 预览 lualine 状态栏组件内容 |
+| `:NeoAI Open` | 打开默认 UI（由 `ui.default_view` 配置：chat 或 tree） |
+| `:NeoAI Chat` | 直接打开聊天界面 |
+| `:NeoAI Tree` | 直接打开树界面 |
+| `:NeoAI Close` | 关闭所有 NeoAI 窗口 |
+| `:NeoAI Keymaps` | 在浮动窗口中显示当前快捷键配置 |
+| `:NeoAI Test [names...]` | 运行测试（全部，或按名称指定） |
+| `:NeoAI ChatStatus` | 显示聊天窗口状态 |
+| `:NeoAI CycleDisplay` | 循环切换聊天显示模式（chat / trajectory） |
+| `:NeoAI ReloadDisplay [name]` | 热重载某个显示模式插件 |
+| `:NeoAI Plan` | 切换 plan mode（只读/信息类工具 + ask_user） |
+| `:NeoAI ApprovePlan` | 批准 plan，切换到 CHAT，执行任务列表 |
+| `:NeoAI ReloadAll` | 热重载整个 NeoAI 插件（先隔离子进程预检，失败则取消） |
+| `:NeoAI SandboxReview` | 列出并应用待审的沙箱修改（按路径级别高亮） |
+| `:NeoAI SandboxCommit` | 应用沙箱候选到真实工作区（CAS 发布，参数为候选摘要） |
+| `:NeoAI SandboxDiscard` | 丢弃沙箱候选 |
+| `:NeoAI SandboxList` / `:NeoAI SandboxShow` | 列出 / 查看待处理沙箱候选 |
+| `:NeoAI SandboxCaps` / `:NeoAI SandboxDiag` | 沙箱运行时能力探测 / 资源域负载诊断（137/OOM 归因） |
+| `:NeoAI SandboxApprove` / `:NeoAI SandboxReject` | 批准（不应用）/ 拒绝并丢弃变更单元 |
+| `:NeoAI SandboxApply` / `:NeoAI SandboxApplyAll` | 批准并应用单个 / 全部待审变更单元 |
+| `:NeoAI SandboxGrant` / `:NeoAI SandboxRevoke` | 创建窄范围任务授权 / 撤销授权 |
+| `:NeoAI SandboxPrune` / `:NeoAI SandboxMetrics` | 按保留期清理过期候选 / 显示沙箱运行指标 |
+| `:NeoAI SandboxPublish` / `:NeoAI SandboxReplay` | 组合发布多个变更单元 / 回放已记录的策略裁决 |
+| `:NeoAI SandboxAudit` / `:NeoAI SandboxAutoApprove` | 沙箱行为审计与风险评估 / 设置新会话自动审批（默认关闭） |
+| `:NeoAI HerderStatus` | 显示 Herder 集成状态 |
+| `:NeoAI HerderConfig [show\|install\|uninstall]` | 查看 / 安装 / 卸载 Herder 展示增强配置片段 |
+| `:NeoAI Statusline` | 预览 lualine 状态栏组件内容 |

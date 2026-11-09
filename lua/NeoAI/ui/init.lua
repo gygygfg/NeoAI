@@ -112,7 +112,7 @@ function M.chat_status()
   chat_view.show_status()
 end
 
---- 打开沙箱待审审批界面（供 :NeoAISandboxReview 命令经 services.ui 调用）
+--- 打开沙箱待审审批界面（供 :NeoAI SandboxReview 命令经 services.ui 调用）
 function M.open_sandbox_review()
   M.init()
   require("NeoAI.ui.components.sandbox_review").open()

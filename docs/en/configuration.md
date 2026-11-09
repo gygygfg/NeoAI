@@ -161,7 +161,8 @@ context_cache = {
 | `split` | `{size=80, direction="right"}` | split window |
 | `colors` | Per-segment highlights | User/AI/reasoning/title colors |
 | `tree` | `{foldenable=false, ...auto_close_on_select=true}` | Session tree folding/auto-close |
-| `input_box` | `{idle_height=1, min_height=5, max_ratio=0.8}` | Input box height (idle/focused/growth cap) |
+| `input_box` | `{idle_height=1, min_height=5, max_ratio=0.8, hash_completion={enabled=true, max_chars=2000, max_bytes=20000}}` | Input box height (idle/focused/growth cap). `hash_completion` enables `#` context placeholders in the input box: typing `#` offers candidates (`#{buffers}` / `#{tool}` / `#{lsp}` …), inserted placeholders are highlighted with `NeoAIHashPlaceholder`, and they are only expanded **right before sending**; `max_chars` caps `#{message}`/`#{notify}` by **character count** (CJK safe), `max_bytes` caps other expansions (UTF-8 safe truncation); `enabled=false` disables everything (no completefunc / cmp source / highlight autocmds) |
+| `command_hint` | `{enabled=true}` | Sub-command hints for `:NeoAI <subcommand>`: reuses nvim-cmp + cmp-cmdline when installed (registers the `neoai_cmd` source with detail/documentation), otherwise falls back to a built-in float listing `name — description`; `enabled=false` is a no-op. No third-party dependency is introduced |
 | `chat` | `{mousescroll_max_blank=3, incremental=true, fold="reasoning_tools", process_keep_steps=3}` | Same scrolling/incremental options as above; `fold` selects the folding level: `none` (no folds) / `reasoning_tools` (current behavior: reasoning and tool blocks fold) / `process` (additionally folds the AI intermediate steps of each turn into a “process” fold whose text shows folded rounds, tool success/failure counts, input/output tokens, and cache hit rate; the Step marker is appended to the reasoning/tool fold text as `· Step N` while the role header appears only on role switches as a plain `🤖 AI`; the “process” fold is level 1 while the reasoning/tool blocks inside it are level 2 nested folds, so they stay collapsed when it is expanded; a user message inserted while the AI is running does not start a new turn — Step numbering continues and the segment before the insertion is folded entirely); user and AI messages are both left-aligned (fixed behavior, no config switch); `process_keep_steps` keeps the most recent N intermediate steps expanded **while the current turn is running** (decided only by whether the agent is still working on this turn; a non-empty pending queue does not count; once the turn ends all intermediate steps are folded and only the final step stays expanded) |
 | `ask_user` | `{batch_debounce_ms=25, require_confirm=true}` | User-question popup: `batch_debounce_ms` is the debounce window (ms) for aggregating multiple questions within the same round (covers sibling-call arrival timing; larger aggregates more but delays the first popup); `require_confirm` controls whether a summary page is shown for a second confirmation after all questions are answered (`false` submits directly). The popup collapses to a small top-right window when focus leaves and expands when focused again |
 | `trajectory` | `{log_dir=".../NeoAI/logs"}` | Log directory for the trajectory display mode |
@@ -214,6 +215,13 @@ session = {
     "deno.json", "pyproject.toml", "setup.py", "requirements.txt", "Cargo.toml",
     "go.mod", "pom.xml", "build.gradle", "CMakeLists.txt", "Makefile",
     "composer.json", "Gemfile", "project.godot", ".project" },
+  -- Repository-level convention file (AGENTS.md) auto-load: on the session's first turn, if the
+  -- file is found by walking up from the session cwd, one read_file tool round is injected
+  -- (assistant tool_calls + tool result) so the conventions are in context. Injected once per
+  -- session and deliberately **not** written into the system prompt (keeps prefix cache stable).
+  --   file: file name; max_bytes: injection cap (UTF-8 safe truncation with a marker)
+  -- Note: AI updates to AGENTS.md still go through the usual sandbox approval.
+  agents_md = { enabled = true, file = "AGENTS.md", max_bytes = 64 * 1024 },
 }
 ```
 
@@ -286,7 +294,7 @@ approval = {
 > (`runtime.isolation_available()` is false, e.g. Android/Termux), the sandbox is disabled and execution
 > **falls back to approval mode** — `async` is forced to `prompt` (the command runs on the host after blocking
 > pre-execution approval), while user-configured `prompt`/`strict`/`auto_allow` are preserved.
-> You can also press `E` on the "Resource Access" page of `:NeoAISandboxReview` to open a directory editor and
+> You can also press `E` on the "Resource Access" page of `:NeoAI SandboxReview` to open a directory editor and
 > hot-add/remove this list (plus masked dirs `sandbox.mask_dirs` and the `sandbox.mask_dirs_enabled` toggle) —
 > **session-only, not persisted to disk**.
 
@@ -376,7 +384,7 @@ sandbox = {
   -- only the important config files/credentials in `mask_paths` (~/.ssh, ~/.aws, /etc/shadow,
   -- sudoers, docker.sock, ...) plus the sandbox's own storage are masked; `mask_dirs` (home/root
   -- sibling dirs) are no longer mount-masked, but accessing user dirs outside cwd is **traced**
-  -- (evidence + `sandbox:outside_access` event) and shown in the `:NeoAISandboxReview` window under
+  -- (evidence + `sandbox:outside_access` event) and shown in the `:NeoAI SandboxReview` window under
   -- "越界访问留痕" (non-blocking, still allowed). When the overlay is unavailable it degrades to a
   -- whole-root read-only view plus a session-private writable layer over the writable roots (seeded
   -- with real content via `degraded_seed`). When false, falls back to the minimal read-only allowlist.
@@ -433,7 +441,7 @@ sandbox = {
   mask_dirs = { "/home", "/root" }, -- masked dirs (supports * globs)
   mask_dirs_approval = true,       -- request approval on masked hits (reuses tool approval UI)
   -- The masked-dir list and master switch can be hot-edited via `E` on the "Resource Access" page of
-  -- `:NeoAISandboxReview` (session-only).
+  -- `:NeoAI SandboxReview` (session-only).
   -- Kernel-level behavior observation (eBPF/strace/procfs): decides "outside-workspace access" and
   -- "secret-file access" from actual syscalls, replacing/augmenting command-string heuristics;
   -- events are attributed precisely to the attempt cgroup.
@@ -465,7 +473,7 @@ sandbox = {
   journal_capture = "auto",
   -- Diagnostics (off by default): enable when investigating 137 / OOM / resource-domain kills.
   -- Records to the NeoAI log only; never changes execution or model-visible results. Pair with
-  -- `:NeoAISandboxDiag` to inspect host/container limits and load.
+  -- `:NeoAI SandboxDiag` to inspect host/container limits and load.
   diagnostics = {
     enabled = false,          -- master switch (when on, also logs [sandbox-profile] stage timings: gate:<tool> end-to-end + settle freeze/settle)
     log_kill_caller = false,  -- cgroup.kill caller traceback (who killed the process tree)
@@ -840,8 +848,8 @@ sandbox = {
 
 > Every tool call goes through the control plane: preflight → isolated execution → freeze candidate →
 > CAS publish. The default `dry_run` does not write the real workspace; candidates enter an async
-> review queue — use `:NeoAISandboxReview` to view/apply, or
-> `:NeoAISandboxApprove/Reject/Apply <change_set_id>`; `:NeoAISandboxList/Show/Discard/Caps` manage
+> review queue — use `:NeoAI SandboxReview` to view/apply, or
+> `:NeoAI SandboxApprove/Reject/Apply <change_set_id>`; `:NeoAI SandboxList/Show/Discard/Caps` manage
 > candidates and inspect runtime capabilities. Rules run in a restricted environment with
 > instruction/wall-clock budgets; rule errors produce `DENY`. See [sandbox.md](sandbox.md).
 
@@ -929,7 +937,7 @@ herder = {
   into `~/.config/herdr/config.toml` on startup (skipped if already installed, backs up first, rolls back if
   `herdr config check` fails) — no manual action required.
 - See the [README Herder section](../README.en.md) and [`integrations/herdr/`](../../integrations/herdr/README.md).
-- Commands: `:NeoAIHerderStatus`, `:NeoAIHerderConfig [show|install|uninstall]`.
+- Commands: `:NeoAI HerderStatus`, `:NeoAI HerderConfig [show|install|uninstall]`.
 
 ### 2.7 `log`
 
@@ -1081,8 +1089,8 @@ resources = { pressure = { simulate = "critical" } }
 Then:
 
 - `:checkhealth NeoAI` shows a "resource pressure" item (level / available memory / PSI / active degradations);
-- `:NeoAISandboxCaps` appends `pressure=... observe=off(pressure:critical)` plus the degradation list;
-- `:NeoAISandboxDiag` prints the `pressure` snapshot, the capped sandbox memory limit and `pressure_degradations`.
+- `:NeoAI SandboxCaps` appends `pressure=... observe=off(pressure:critical)` plus the degradation list;
+- `:NeoAI SandboxDiag` prints the `pressure` snapshot, the capped sandbox memory limit and `pressure_degradations`.
 
 Per-item isolation: set `degrade.<item> = false` (e.g. disable only the render throttle), or
 `simulate = "ok"` to pin the lowest level. Setting `enabled = false` restores the pre-change
@@ -1096,7 +1104,7 @@ Plan mode is a **per-agent state** (`agent.plan_mode`); when active:
 2. **Keeps only read-only/informational tools in the tool context, plus `run_command` (read-only research) + `ask_user`** (the `PLAN_SAFE_TOOLS` allowlist + `PLAN_EXTRA_TOOLS`), exposing no mutating tools and **no mode-switching tool to the AI**.
 3. **Tightens the execution-time gate accordingly** (`plan_mode.check_tool`): in plan mode, any tool outside the visible set is rejected.
 
-**Plan confirmation**: after the AI emits the plan the turn ends; the user confirms by running `:NeoAIApprovePlan` (or toggling the mode manually);
+**Plan confirmation**: after the AI emits the plan the turn ends; the user confirms by running `:NeoAI ApprovePlan` (or toggling the mode manually);
 `chat_service.approve_plan` then parses the plan into a task list (todo) → exits plan mode (switching to CHAT)
 → automatically starts execution according to `auto_execute_on_approve` (enabled by default).
 

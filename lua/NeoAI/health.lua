@@ -2,7 +2,7 @@
 --- @module 'NeoAI.health'
 --- 提供两处入口：
 ---   1. `:checkhealth NeoAI`（Neovim 自动发现 `lua/NeoAI/health.lua` 并调用 `M.check()`）；
----   2. `:NeoAIDoctor`（把同一份结果以 `vim.notify` 汇总输出，便于随手排查）。
+---   2. `:NeoAI Doctor`（把同一份结果以 `vim.notify` 汇总输出，便于随手排查）。
 --- 覆盖：Neovim 版本、curl、libuv 线程池、API key / 默认 provider、沙箱内核能力、可选依赖、插件状态。
 --- 纯只读探测，不产生副作用。
 
@@ -137,7 +137,7 @@ function M.collect()
     if report then
       local info = {}
       for _, line in ipairs(report.lines) do info[#info + 1] = line end
-      info[#info + 1] = "详见 :NeoAISandboxCaps / docs/sandbox.md。"
+      info[#info + 1] = "详见 :NeoAI SandboxCaps / docs/sandbox.md。"
       add("沙箱内核能力", report.status, info)
     else
       -- 探测不可用（极少数裁剪环境）：退回二进制检查，保证 :checkhealth 不报错，
@@ -156,7 +156,7 @@ function M.collect()
           .. "无命名空间隔离后端，将禁用沙箱并退回审批模式"
           .. "（命令经事前审批后直接在宿主执行，写入直接落盘、不冻结待审候选）。"
       end
-      lines[#lines + 1] = "详见 :NeoAISandboxCaps / docs/sandbox.md。"
+      lines[#lines + 1] = "详见 :NeoAI SandboxCaps / docs/sandbox.md。"
       add("沙箱内核能力", has("bwrap") and "ok" or "warn", lines)
     end
   end
@@ -285,14 +285,14 @@ function M.check()
     end
   end
   health.info("")
-  health.info("运行 :NeoAIDoctor 可取得同样的摘要（便于随手排查）。")
+  health.info("运行 :NeoAI Doctor 可取得同样的摘要（便于随手排查）。")
 end
 
---- 汇总为一行行文本（供 :NeoAIDoctor 输出）
+--- 汇总为一行行文本（供 :NeoAI Doctor 输出）
 --- @return string
 function M.summary()
   local icon = { ok = "✓", warn = "!", error = "✗" }
-  local lines = { "NeoAI 诊断（:NeoAIDoctor）" }
+  local lines = { "NeoAI 诊断（:NeoAI Doctor）" }
   for _, item in ipairs(M.collect()) do
     local mark = icon[item.status] or "?"
     lines[#lines + 1] = ("[%s] %s"):format(mark, item.name)
@@ -304,7 +304,7 @@ function M.summary()
   return table.concat(lines, "\n")
 end
 
---- :NeoAIDoctor 命令入口：notify 汇总（有 error 用 ERROR 级，warn 用 WARN 级）。
+--- :NeoAI Doctor 命令入口：notify 汇总（有 error 用 ERROR 级，warn 用 WARN 级）。
 function M.doctor()
   local items = M.collect()
   local worst = "ok"
@@ -344,7 +344,7 @@ function M.first_run_hint()
   vim.notify(
     "[NeoAI] 尚未配置任何 AI 提供商的 API Key，AI 功能不可用。\n"
       .. "请设置环境变量（如 DEEPSEEK_API_KEY / OPENAI_API_KEY）或在 setup 中配置 "
-      .. "ai.providers.*.api_key，然后运行 :NeoAIDoctor 确认。",
+      .. "ai.providers.*.api_key，然后运行 :NeoAI Doctor 确认。",
     vim.log.levels.WARN, { title = "NeoAI 首次使用" })
 end
 

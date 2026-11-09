@@ -14,10 +14,10 @@
 - **Scenario-based model configuration** — assign a different AI model and parameters to each scenario (chat, coding, thinking, tool execution, sub-Agent, window naming)
 - **Streaming responses** — display AI output in real time as a stream, including reasoning traces
 - **Tree-based session management** — manage multiple chat sessions as a branch tree, with branch creation, switching, and deletion
-- **Multiple chat instances** — `<leader>ac` / `:NeoAIChat` opens an **independent chat instance in a new tab** (unique buffer name); run several chats at once, each with its own session, streaming output, **its own reasoning / tool-args floats, and its own reasoning-visibility toggle**, while existing instances stay alive
+- **Multiple chat instances** — `<leader>ac` / `:NeoAI Chat` opens an **independent chat instance in a new tab** (unique buffer name); run several chats at once, each with its own session, streaming output, **its own reasoning / tool-args floats, and its own reasoning-visibility toggle**, while existing instances stay alive
 - **A rich set of built-in tools** — the AI can call 40+ tools for file operations, code analysis, LSP, Shell commands, and more
 - **Tool approval system** — fine-grained control over tool execution permissions, supporting auto-allow / manual approval / argument-level allowlists
-- **Plan mode (PLAN) and plan extraction** — toggle with `m` or `:NeoAIPlan`; the tool context retains only read-only / informational queries plus `run_command` (read-only research) and `ask_user` (no mutating tools are exposed, and no mode-switching tool is given to the AI); after the AI researches and clarifies, it emits a formatted change plan and ends the turn; once the user confirms (`:NeoAIApprovePlan` or manually toggling the mode), NeoAI switches to CHAT: at the boundary it first runs one **XML plan extraction** (`<target>`/`<stepN>`/`<files>` etc., case-insensitive, retrying up to 3 times when key fields are missing), assembles the execution context, builds the task list automatically per step (`todo_write`), and keeps `<files>`-related tool messages verbatim for cache hits before starting execution
+- **Plan mode (PLAN) and plan extraction** — toggle with `m` or `:NeoAI Plan`; the tool context retains only read-only / informational queries plus `run_command` (read-only research) and `ask_user` (no mutating tools are exposed, and no mode-switching tool is given to the AI); after the AI researches and clarifies, it emits a formatted change plan and ends the turn; once the user confirms (`:NeoAI ApprovePlan` or manually toggling the mode), NeoAI switches to CHAT: at the boundary it first runs one **XML plan extraction** (`<target>`/`<stepN>`/`<files>` etc., case-insensitive, retrying up to 3 times when key fields are missing), assembles the execution context, builds the task list automatically per step (`todo_write`), and keeps `<files>`-related tool messages verbatim for cache hits before starting execution
 - **Background context compaction** — as the context threshold approaches, round 1 through the second-to-last round (keeping the last round intact) is folded **asynchronously in the background, non-blocking**, and a checkpoint is written into a **compaction overlay**: subsequent requests and further compactions use the compacted replacement, while chat rendering and session persistence keep the original context (the overlay is saved with the session and survives a restart); compaction opens no floating window; in addition to turn boundaries, **a pressure check runs before every round of the tool loop** (after tool results are written back and before the next request), so long loops converge round by round; **when the history safety cap is exceeded we compact synchronously before sending (replacing the prefix with a checkpoint instead of truncating it)**; on overflow the request is compacted and retried automatically; plan extraction still shows reasoning and content live in a floating window
 - **Sub-Agent system** — the AI can spawn sub-Agents to run subtasks in parallel, with boundary review
 - **Decoupled frontend/backend architecture** — an event-driven asynchronous architecture that separates the UI from business logic
@@ -32,7 +32,7 @@
 - **Tool argument receiving panel** — while the model streams tool-call arguments, a "receiving arguments" floating window (`tool_args_panel`) opens in real time, appending each chunk incrementally and closing automatically once the arguments end, consistent with the reasoning floating window
 - **MCP support** — connect to external MCP servers over stdio / Streamable HTTP and register remote `tools`/`resources`/`prompts` in the tool system (with pre-caching + failure-driven dynamic refresh, see [docs/en/mcp.md](docs/en/mcp.md))
 - **Skills support** — scan SKILL.md skill directories and inject the list of available skills into the system prompt; the model loads the skill body with `load_skill` (Claude/opencode style, see [docs/en/skills.md](docs/en/skills.md))
-- **Tool execution sandbox** — every tool call goes through the control plane (preflight → isolated execution → freeze candidate → CAS publish); the default async review executes AI changes immediately in the sandbox and freezes candidates, with real workspace changes queued for the user to confirm via `:NeoAISandboxReview` or the `<leader>ap` key in the chat window (per-file approval by default; whole-package installs / git atomic groups approve as a unit; an **original-file snapshot** is kept on apply, and the review window's "已保存" section lets `u` **undo/redo the save** by swapping with the snapshot, refusing on conflict; a prominent `待审N` badge is shown in the chat statusline), and L3 dangerous items get an AI-generated consequence warning with an auto-opened diff before a second confirmation; external processes are isolated via bwrap/unshare; commands can write the whole filesystem (changes staged as candidates) with session shell state (export/cd) preserved; the payload runs with `--cap-drop ALL` plus a seccomp baseline and masks host-sensitive paths such as `docker.sock` and host credentials (defense in depth); **privilege tiers**: commands run with least privilege by default (network isolated by default) and automatically request escalation when privilege is insufficient — T1 (network / containers) runs isolated and recorded, T2 (caps / host operations) runs inside a nested userns with host effects frozen as proposals for async approval; containers always really execute inside the sandbox — docker/docker-compose/nerdctl are rewritten to podman/podman-compose and the host docker daemon is never contacted; the **read surface** is whole-host read-only by default (`read_all`, masking only the important config files/credentials in `mask_paths`), and accessing user dirs outside the workspace is **traced** and shown in the review window under "越界访问留痕" (non-blocking; the statusline appends a `越界N` badge) (see [docs/en/sandbox.md](docs/en/sandbox.md))
+- **Tool execution sandbox** — every tool call goes through the control plane (preflight → isolated execution → freeze candidate → CAS publish); the default async review executes AI changes immediately in the sandbox and freezes candidates, with real workspace changes queued for the user to confirm via `:NeoAI SandboxReview` or the `<leader>ap` key in the chat window (per-file approval by default; whole-package installs / git atomic groups approve as a unit; an **original-file snapshot** is kept on apply, and the review window's "已保存" section lets `u` **undo/redo the save** by swapping with the snapshot, refusing on conflict; a prominent `待审N` badge is shown in the chat statusline), and L3 dangerous items get an AI-generated consequence warning with an auto-opened diff before a second confirmation; external processes are isolated via bwrap/unshare; commands can write the whole filesystem (changes staged as candidates) with session shell state (export/cd) preserved; the payload runs with `--cap-drop ALL` plus a seccomp baseline and masks host-sensitive paths such as `docker.sock` and host credentials (defense in depth); **privilege tiers**: commands run with least privilege by default (network isolated by default) and automatically request escalation when privilege is insufficient — T1 (network / containers) runs isolated and recorded, T2 (caps / host operations) runs inside a nested userns with host effects frozen as proposals for async approval; containers always really execute inside the sandbox — docker/docker-compose/nerdctl are rewritten to podman/podman-compose and the host docker daemon is never contacted; the **read surface** is whole-host read-only by default (`read_all`, masking only the important config files/credentials in `mask_paths`), and accessing user dirs outside the workspace is **traced** and shown in the review window under "越界访问留痕" (non-blocking; the statusline appends a `越界N` badge) (see [docs/en/sandbox.md](docs/en/sandbox.md))
 
 ---
 
@@ -104,9 +104,9 @@ The kernel forbids **unprivileged user namespaces** (SELinux rejects `clone(CLON
   registered and no dependency installation is triggered;
 - Everything else (chat, tools, LSP, session tree, MCP, Skills, ...) is unaffected.
 
-> Not sure whether your environment is ready? Run **`:NeoAIDoctor`** or **`:checkhealth NeoAI`** for a
+> Not sure whether your environment is ready? Run **`:NeoAI Doctor`** or **`:checkhealth NeoAI`** for a
 > one-stop check of version, curl, API keys, sandbox capabilities and optional dependencies; use
-> **`:NeoAISandboxCaps`** for per-item sandbox capabilities (`bwrap`/`unshare`/`userns`/`overlayfs`/
+> **`:NeoAI SandboxCaps`** for per-item sandbox capabilities (`bwrap`/`unshare`/`userns`/`overlayfs`/
 > `seccomp`/`cgroup2`/`podman`). Diagnostics name the **missing dependency** and its install command.
 
 ---
@@ -148,7 +148,7 @@ require("NeoAI").setup({})
 ```
 
 > **Lazy by default (no configuration needed)**: `setup()` only loads the config, bootstraps the
-> kernel, registers plugins, and installs **placeholder** `:NeoAI*` commands and global keymaps.
+> kernel, registers plugins, and installs **placeholder** `:NeoAI <subcommand>` command and global keymaps.
 > The plugin graph is started on first use, **asynchronously in two phases** — phase 1
 > (UI/chat/status) opens the interface as soon as it is ready, while phase 2 (tools/sandbox/
 > skills/mcp, etc.) keeps loading in the background in chunks, never blocking the editor.
@@ -173,7 +173,7 @@ export ANTHROPIC_API_KEY="your-api-key"
 ```
 
 > If no key is configured, a one-time hint appears after `setup()` on first start; run
-> `:NeoAIDoctor` anytime to re-check.
+> `:NeoAI Doctor` anytime to re-check.
 
 ### 2. Initialize the plugin
 
@@ -192,35 +192,72 @@ require("NeoAI").setup({
 
 ### 3. Commands
 
+All features are grouped under a **single command** `:NeoAI`, with space-separated sub-commands
+(`:NeoAI Open`, `:NeoAI SandboxReview`). Press `<Tab>` after `:NeoAI ` to complete sub-commands; descriptions are
+shown by a floating hint (or by your nvim-cmp + cmp-cmdline setup when installed).
+
+> Neovim command names reject `.` / `_` / `-` (`:NeoAI.Open` raises `Invalid command name`), so there is no dotted
+> syntax; and `complete=customlist` only accepts plain string candidates, so menu items cannot embed descriptions.
+
 | Command            | Description                                      |
 | ------------------ | ------------------------------------------------ |
-| `:NeoAIOpen`       | Open the main NeoAI UI                           |
-| `:NeoAIChat`       | Open an **independent chat instance in a new tab** (new session, unique buffer name; existing instances stay alive) |
-| `:NeoAITree`       | Open the session tree UI                         |
-| `:NeoAIClose`      | Close all NeoAI windows                          |
-| `:NeoAIKeymaps`    | Show the current keymap configuration            |
-| `:NeoAITest`       | Run tests (parallel full run with no arguments; sequential run of named suites with arguments) |
-| `:NeoAIChatStatus` | Show the chat window status                      |
-| `:NeoAICycleDisplay`| Cycle through chat display modes (chat/trace)   |
-| `:NeoAIReloadDisplay`| Hot-reload the display mode plugin (reloads the current mode by default) |
-| `:NeoAIReloadAll`  | Hot-reload the whole NeoAI plugin (isolated pre-check first; cancel on failure) |
-| `:NeoAIPlan`       | Toggle plan mode (the tool context retains only read-only / informational queries + asking the user) |
-| `:NeoAIApprovePlan`| Confirm the plan and switch to CHAT mode to execute it per the task list |
-| `:NeoAISandboxCommit`| Apply a sandbox candidate to the real workspace (CAS publish; arg = candidate digest) |
-| `:NeoAISandboxReview`| List pending changes and apply the selected one (async review; press `E` on the "Resource Access" page to add/remove workspace/masked dirs, session-only) |
-| `:NeoAISandboxApprove` / `:NeoAISandboxReject` | Approve (no apply) / reject & discard a change set |
-| `:NeoAISandboxApply` / `:NeoAISandboxApplyAll` | Approve and apply one / all pending change sets |
-| `:NeoAISandboxGrant` / `:NeoAISandboxRevoke` | Create a narrow task grant / revoke a grant |
-| `:NeoAISandboxPrune` / `:NeoAISandboxMetrics` | Prune expired candidates / show sandbox metrics |
-| `:NeoAISandboxPublish` / `:NeoAISandboxReplay` | Publish multiple change sets together / replay a policy decision |
-| `:NeoAISandboxList` / `:NeoAISandboxShow` | List / inspect pending sandbox candidates |
-| `:NeoAISandboxDiscard`| Discard a sandbox candidate (arg = candidate digest) |
-| `:NeoAISandboxCaps`| Show sandbox runtime capability probe results |
-| `:NeoAISandboxDiag`| Show sandbox resource-domain / load diagnostics (137/OOM attribution) |
-| `:NeoAISandboxAudit`| Show the sandbox behavior-audit and risk-assessment summary |
-| `:NeoAISandboxAutoApprove`| Set auto-approval for new AI sessions (`on`/`off`/`status`, off by default) |
-| `:NeoAIDoctor` | Environment diagnostics (Neovim version / curl / API keys / sandbox capability / optional deps; same summary as `:checkhealth NeoAI`) |
-| `:NeoAIStatusline` | Preview the content of the current lualine statusline components |
+| `:NeoAI Open`       | Open the main NeoAI UI                           |
+| `:NeoAI Chat`       | Open an **independent chat instance in a new tab** (new session, unique buffer name; existing instances stay alive) |
+| `:NeoAI Tree`       | Open the session tree UI                         |
+| `:NeoAI Close`      | Close all NeoAI windows                          |
+| `:NeoAI Keymaps`    | Show the current keymap configuration            |
+| `:NeoAI Test`       | Run tests (parallel full run with no arguments; sequential run of named suites with arguments) |
+| `:NeoAI ChatStatus` | Show the chat window status                      |
+| `:NeoAI CycleDisplay`| Cycle through chat display modes (chat/trace)   |
+| `:NeoAI ReloadDisplay`| Hot-reload the display mode plugin (reloads the current mode by default) |
+| `:NeoAI ReloadAll`  | Hot-reload the whole NeoAI plugin (isolated pre-check first; cancel on failure) |
+| `:NeoAI Plan`       | Toggle plan mode (the tool context retains only read-only / informational queries + asking the user) |
+| `:NeoAI ApprovePlan`| Confirm the plan and switch to CHAT mode to execute it per the task list |
+| `:NeoAI SandboxCommit`| Apply a sandbox candidate to the real workspace (CAS publish; arg = candidate digest) |
+| `:NeoAI SandboxReview`| List pending changes and apply the selected one (async review; press `E` on the "Resource Access" page to add/remove workspace/masked dirs, session-only) |
+| `:NeoAI SandboxApprove` / `:NeoAI SandboxReject` | Approve (no apply) / reject & discard a change set |
+| `:NeoAI SandboxApply` / `:NeoAI SandboxApplyAll` | Approve and apply one / all pending change sets |
+| `:NeoAI SandboxGrant` / `:NeoAI SandboxRevoke` | Create a narrow task grant / revoke a grant |
+| `:NeoAI SandboxPrune` / `:NeoAI SandboxMetrics` | Prune expired candidates / show sandbox metrics |
+| `:NeoAI SandboxPublish` / `:NeoAI SandboxReplay` | Publish multiple change sets together / replay a policy decision |
+| `:NeoAI SandboxList` / `:NeoAI SandboxShow` | List / inspect pending sandbox candidates |
+| `:NeoAI SandboxDiscard`| Discard a sandbox candidate (arg = candidate digest) |
+| `:NeoAI SandboxCaps`| Show sandbox runtime capability probe results |
+| `:NeoAI SandboxDiag`| Show sandbox resource-domain / load diagnostics (137/OOM attribution) |
+| `:NeoAI SandboxAudit`| Show the sandbox behavior-audit and risk-assessment summary |
+| `:NeoAI SandboxAutoApprove`| Set auto-approval for new AI sessions (`on`/`off`/`status`, off by default) |
+| `:NeoAI Doctor` | Environment diagnostics (Neovim version / curl / API keys / sandbox capability / optional deps; same summary as `:checkhealth NeoAI`) |
+| `:NeoAI Statusline` | Preview the content of the current lualine statusline components |
+
+### 3.1 Input box `#` context placeholders
+
+Typing `#` in the chat input box lists **context placeholders**. Picking one inserts placeholder text (highlighted
+with `NeoAIHashPlaceholder`); it is expanded into real content only **right before sending**, so you can still read,
+edit or delete it:
+
+| Placeholder | Expands to |
+| --- | --- |
+| `#{buffers}` | All buffers (number / state / type / path) |
+| `#{buffer:NAME}` | Content of the named buffer |
+| `#{lsp}` | LSP diagnostics of the file you are editing |
+| `#{message}` / `#{notify}` | Neovim message history since startup (max 2000 characters, counted in characters) |
+| `#{tool}` / `#{tool:NAME}` | Tool list / a single tool definition |
+| `#{skills}` / `#{skills:NAME}` | Skill list / a single skill body |
+| `#{mcp}` / `#{mcp:NAME}` | MCP tool list / a single tool definition |
+
+With nvim-cmp installed the candidates pop up automatically; otherwise use `<C-x><C-u>` in insert mode.
+Unresolvable targets (missing buffer/skill) keep the placeholder **as-is** — sending never fails.
+Config: `ui.input_box.hash_completion = { enabled=true, max_chars=2000, max_bytes=20000 }`.
+
+### 3.2 AGENTS.md auto-load
+
+When the repository root has `AGENTS.md` (development conventions), the **first turn** of a session automatically
+injects one `read_file` tool round so the conventions are in the AI's context — no manual prompting needed.
+
+- Injected once, only into a newly created top-level session (reopened sessions and sub-agents are skipped);
+- Never written into the system prompt, so the provider prefix cache stays intact;
+- AI updates to `AGENTS.md` still go through the usual sandbox approval;
+- Config: `session.agents_md = { enabled=true, file="AGENTS.md", max_bytes=64*1024 }`.
 
 ### 4. Default Keymaps
 
@@ -654,7 +691,7 @@ Related public APIs:
 - `NeoAI.get_statusline()` — returns the statusline text
 - `require("NeoAI.services.status").segment(name)` — text of a single segment (mode/model/usage/cache/capacity/state/display/pending)
 - `require("NeoAI.services.chat_service").pending_count()` — number of queued messages held while the current Agent is busy
-- `:NeoAIStatusline` — previews the current statusline component content
+- `:NeoAI Statusline` — previews the current statusline component content
 
 ### Herder terminal status integration
 
@@ -708,7 +745,7 @@ shows `display_agent = "NeoAI"` with localized state labels (`生成中` / `等�
 tag; when the last Agent exits it clears the display metadata before `release-agent`.
 
 **Releasing authority on quit/restart/reload**: besides "last Agent exits", every unload path — **quitting Neovim**,
-`:restart`, `:NeoAIReloadAll` — clears the display metadata and sends `release-agent` before unloading, so Herder
+`:restart`, `:NeoAI ReloadAll` — clears the display metadata and sends `release-agent` before unloading, so Herder
 immediately falls back to screen heuristics and does not retain this session's `working`/`blocked` state. It only
 releases when authority was actually taken over (a non-idle signal was reported), avoiding redundant reports.
 
@@ -757,8 +794,8 @@ shows no prompt. Set `auto_install = false` to disable; manual commands are also
 
 | Command | Description |
 |---|---|
-| `:NeoAIHerderStatus` | Show integration status (environment / report identity / whether the display-enhancement snippet is installed) |
-| `:NeoAIHerderConfig [show\|install\|uninstall]` | Preview / install / uninstall the Herder display-enhancement config snippet (writes the Herdr config `$XDG_CONFIG_HOME/herdr/config.toml`, default `~/.config/herdr/config.toml`, marker-idempotent, backs up first, rolls back if `herdr config check` fails) |
+| `:NeoAI HerderStatus` | Show integration status (environment / report identity / whether the display-enhancement snippet is installed) |
+| `:NeoAI HerderConfig [show\|install\|uninstall]` | Preview / install / uninstall the Herder display-enhancement config snippet (writes the Herdr config `$XDG_CONFIG_HOME/herdr/config.toml`, default `~/.config/herdr/config.toml`, marker-idempotent, backs up first, rolls back if `herdr config check` fails) |
 | `herdr agent list` / `herdr pane get "$HERDR_PANE_ID"` | Inspect `agent=neoai`, `display_agent`, `state_labels` on the Herder side |
 | `herdr agent explain <pane-id>` | View the status source (a reporting-only agent reports no detection label) |
 
@@ -778,7 +815,7 @@ categories:
 execution → freeze candidate → authorization check → CAS publish). The default `tools.approval.mode = "async"`
 (asynchronous approval) means effectful tools (edit / delete / mkdir / rollback / commands, etc.) run inside the sandbox
 immediately and their results are frozen as candidates, while **real workspace changes enter the pending-review queue**
-apply them with `:NeoAISandboxReview` or `<leader>ap` inside the chat window; read-only tools pass straight through.
+apply them with `:NeoAI SandboxReview` or `<leader>ap` inside the chat window; read-only tools pass straight through.
 So the tables below no longer mark each tool as "needs approval" — they list only the main parameters (and what each
 one does). For risk levels and allowlists see the `approval` config and [docs/en/tool_system.md](docs/en/tool_system.md).
 
@@ -900,10 +937,10 @@ one does). For risk levels and allowlists see the `approval` config and [docs/en
 > gating is tightened accordingly, and any tool outside the visible set is rejected. In this mode the AI investigates,
 > asks clarifying questions,
 > and produces a **clear, well-formatted change plan** (goals and background / list of changes / implementation steps / verification and rollback).
-> After the plan is emitted the turn ends and **the user confirms** (run `:NeoAIApprovePlan` or toggle the mode manually);
+> After the plan is emitted the turn ends and **the user confirms** (run `:NeoAI ApprovePlan` or toggle the mode manually);
 > after confirmation it **switches directly to CHAT mode**, the system parses the plan into a task list (todos),
 > and execution starts automatically according to `tools.plan_mode.auto_execute_on_approve` (on by default).
-> During generation, switching modes via `m` / `:NeoAIPlan` is **deferred until the current turn ends**,
+> During generation, switching modes via `m` / `:NeoAI Plan` is **deferred until the current turn ends**,
 > so an in-progress generation is never interrupted by a mid-flight change to the toolset / system policy / model.
 
 ### 🪵 Logging Tools
@@ -915,7 +952,7 @@ one does). For risk levels and allowlists see the `approval` config and [docs/en
 
 ### 🔁 System Tools
 
-> **Plugin hot-reload (isolated & safe)**: the `:NeoAIReloadAll` command
+> **Plugin hot-reload (isolated & safe)**: the `:NeoAI ReloadAll` command
 > reloads the whole NeoAI plugin without restarting nvim (so source edits take effect immediately).
 > To avoid a half-loaded state corrupting the live session, it uses a two-phase strategy:
 > 1. **Isolated subprocess pre-check**: first spawn a fresh headless nvim (`--clean -u NONE` + rtp=plugin root),
@@ -1133,7 +1170,7 @@ NeoAI/
 │   ├── stringx.lua           # String extensions
 │   └── textmetrics.lua       # Pure-Lua text metrics (display width/codepoint slicing/wrapping; thread-pool ready)
 │
-└── tests/                      # Tests (custom + parallel runner, :NeoAITest; 105 test_*.lua files total)
+└── tests/                      # Tests (custom + parallel runner, :NeoAI Test; 105 test_*.lua files total)
     ├── init.lua               # Assertions + sequential runner + isolated child runner
     ├── parallel.lua           # Parallel runner (file-level sharding / LPT balancing / timing cache)
     ├── test_kernel.lua        # Kernel (config_store/event_bus/events/lifecycle)
@@ -1229,13 +1266,13 @@ See [docs/EVENTS.md](docs/en/EVENTS.md) for details (the single authoritative ev
 Run all tests (parallel by default, isolated headless workers):
 
 ```vim
-:NeoAITest
+:NeoAI Test
 ```
 
 Run specific tests (sequential, for debugging):
 
 ```vim
-:NeoAITest flow_config flow_tools
+:NeoAI Test flow_config flow_tools
 ```
 
 > The parallel runner shards by file (suite); worker count defaults to `min(nproc, 8)`
@@ -1287,8 +1324,8 @@ Run specific tests (sequential, for debugging):
 ### Running Tests
 
 ```vim
-:NeoAITest             " run all tests in parallel
-:NeoAITest flow_tools  " run specific tests sequentially
+:NeoAI Test             " run all tests in parallel
+:NeoAI Test flow_tools  " run specific tests sequentially
 ```
 
 ---

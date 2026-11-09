@@ -87,7 +87,7 @@ resolve_name（别名/模糊匹配）
 > **沙箱强制**：所有工具执行都经 `services.sandbox.gate`；加载器与注册表为工具附加
 > `__sandbox_spec`（effect/paths）。默认异步审批（`tools.approval.mode="async"`）：
 > 效果类工具立即在沙箱内执行并冻结候选，不阻塞等待；真实修改进入待审队列，用
-> `:NeoAISandboxReview` 异步确认后应用。沙箱服务缺失且 `fail_closed=true` 时拒绝执行。
+> `:NeoAI SandboxReview` 异步确认后应用。沙箱服务缺失且 `fail_closed=true` 时拒绝执行。
 > 详见 [sandbox.md](sandbox.md)。
 >
 > **注意**：`async`（默认）模式下**不做执行前阻塞审批**——上面的「审批决策」分支被跳过，
@@ -129,7 +129,7 @@ resolve_name（别名/模糊匹配）
 
 ## 5. 审批弹窗（services/tool_service.lua）
 
-> 默认 `async` 模式下**不走这条路径**：工具已在沙箱内执行，确认由待审队列（`:NeoAISandboxReview`）完成。
+> 默认 `async` 模式下**不走这条路径**：工具已在沙箱内执行，确认由待审队列（`:NeoAI SandboxReview`）完成。
 > 本节描述 `prompt`/`strict` 模式下的**执行前弹窗审批**，以及遮蔽目录命中等兜底场景。
 
 审批是**串行单槽位**设计：工具执行本身并行（tool_loop 并发发起），但「弹窗确认」串行化——
@@ -352,7 +352,7 @@ M.execute(agent, name, args, tool_call_id, opts)
 
 ### 📐 计划模式（plan_mode.lua）
 
-`enter_plan_mode`（进入计划模式：工具上下文切换为只读/信息 + 提问）。计划模式**不向 AI 提供切换模式的工具**，计划输出后由用户执行 `:NeoAIApprovePlan`（或手动切换模式）确认执行。详见 [configuration.md](configuration.md) 与 [chat_enhanced_usage.md](chat_enhanced_usage.md)。
+`enter_plan_mode`（进入计划模式：工具上下文切换为只读/信息 + 提问）。计划模式**不向 AI 提供切换模式的工具**，计划输出后由用户执行 `:NeoAI ApprovePlan`（或手动切换模式）确认执行。详见 [configuration.md](configuration.md) 与 [chat_enhanced_usage.md](chat_enhanced_usage.md)。
 
 ### 💬 向用户提问（ask_user.lua）
 

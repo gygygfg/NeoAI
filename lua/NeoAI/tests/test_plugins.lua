@@ -301,7 +301,7 @@ tests.suite("plugins", function(_, it)
     plugins.stop_all()
     local stopped_has_shell = registry.has("run_command")
     local stopped_svc = services.has("services.chat_service")
-    local stopped_cmd = vim.fn.exists(":NeoAIChat")
+    local stopped_cmd = vim.fn.exists(":NeoAI")
 
     local res = plugins.start_all()
     local after_tools = registry.count()

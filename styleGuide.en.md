@@ -92,17 +92,19 @@ NeoAI/
 ├── plugins/                      # Plugin catalog and default composition
 │   ├── catalog.lua               # Builtin registration (service providers + side effects + tool.*), disable/replace
 │   └── builtin/
-│       ├── commands.lua          # Command plugin (:NeoAI* register/delete)
+│       ├── commands.lua          # Command plugin (aggregated `:NeoAI <subcommand>` register/delete)
 │       └── keymaps.lua           # Global keymap plugin (register/delete)
 │
 ├── ui/                           # Presentation layer
 │   ├── init.lua                  # UI orchestration (approval UI + sub-agent monitoring)
+│   ├── command_hint.lua          # `:NeoAI` sub-command hints (cmp source / built-in float)
 │   ├── window/                   # Window management
 │   │   ├── manager.lua           # Window manager (float/tab/split)
 │   │   ├── chat_view.lua         # Chat view
 │   │   └── tree_view.lua         # Session tree view
 │   ├── components/               # Reusable components
 │   │   ├── input_box.lua         # Input box
+│   │   ├── hash_complete.lua     # Input box `#` placeholders (complete/highlight/resolve on send)
 │   │   ├── message_list.lua      # Message list rendering
 │   │   ├── reasoning_panel.lua   # Reasoning panel
 │   │   ├── model_picker.lua      # Model picker (async list loading)
@@ -519,7 +521,7 @@ subscriptions) were registered but never released, making hot reload and test is
 
 **Cleanup contract**: every registration (commands, global keymaps, event subscriptions, prompt
 sections, MCP connections, tools, statusline listeners, UI injection) must return a cleanup function
-invoked by the host on unload. `:NeoAIReloadAll` calls `plugins.stop_all()` before
+invoked by the host on unload. `:NeoAI ReloadAll` calls `plugins.stop_all()` before
 clearing the cache and reloading.
 
 > See [docs/plugins.md](docs/en/plugins.md).
@@ -1078,7 +1080,7 @@ async.all({ deferred1, deferred2 })
 
 **Test framework**: a custom lightweight framework (`tests/init.lua`), no external dependencies, runnable headless.
 
-- How to run: `:NeoAITest [suite_name ...]` (no arguments runs everything).
+- How to run: `:NeoAI Test [suite_name ...]` (no arguments runs everything).
 - Assertion API: `eq / ne / not_eq / true_ / false_ / nil_ / not_nil / matches / ok / deep_eq / sleep / throws`.
 - Organization: `suite(name, fn)` defines a suite, `it(name, fn)` defines a case, plus the `before_each` hook.
 - Dynamic loading: `run_all` automatically loads `tests/test_*.lua` via glob.
@@ -1135,6 +1137,10 @@ async.all({ deferred1, deferred2 })
 | `tools/builtin/ask_user.lua` | Ask-the-user tool (UI seam + vim.ui.input fallback)      |
 | `tools/builtin/todo.lua`     | Todo list (whole-table replacement semantics + system prompt injection)  |
 | `ui/components/fold.lua`     | Fold component                                 |
+| `ui/components/hash_complete.lua`| Input box `#` context placeholders (candidates/highlight/resolve) |
+| `ui/command_hint.lua`        | `:NeoAI` sub-command hints                     |
+| `core/session/agents_md.lua` | AGENTS.md discovery and injection              |
+| `kernel/live_metrics.lua`    | Live metrics bridge (tool timing + runtime results) |
 
 ---
 

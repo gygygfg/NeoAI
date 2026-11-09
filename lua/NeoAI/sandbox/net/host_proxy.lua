@@ -972,7 +972,7 @@ function M.ensure()
         vim.schedule(function()
           vim.notify(
             "[NeoAI] 沙箱网络过滤代理启动失败，外部网络请求将不经同意门禁（直连）。\n"
-              .. "原因：" .. tostring(err) .. "\n运行 :NeoAIDoctor 查看网络同意诊断。",
+              .. "原因：" .. tostring(err) .. "\n运行 :NeoAI Doctor 查看网络同意诊断。",
             vim.log.levels.WARN, { title = "NeoAI 沙箱网络" })
         end)
       end)

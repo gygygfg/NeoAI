@@ -306,6 +306,10 @@ function M.run(agent, content, opts)
   -- 系统提示保持逐字节稳定，前缀缓存不因它们变化而失效。
   require("NeoAI.core.session.runtime_context").ensure(agent)
   agent_mod.add_message(agent, "user", content, opts and opts.message_extra or nil)
+  -- 会话首个回合：若工作区存在 AGENTS.md，则注入一轮 read_file 工具调用（assistant
+  -- tool_calls + tool 结果）把开发约定放进历史。放在用户消息**之后**：个别 provider
+  -- 要求首条消息为 user，放在最前会被拒。幂等：每个 agent 只注入一次。
+  pcall(function() require("NeoAI.core.session.agents_md").ensure(agent) end)
   event_bus.emit(events.MESSAGE_SENT, { agent_id = agent.id, content = content })
   -- 上下文压缩改为后台异步：达到压力阈值时在后台生成摘要（折叠第一轮至倒数第二轮），
   -- 不阻塞本轮请求；完成后覆盖层对后续请求与再次压缩生效。压力提示保持原样。

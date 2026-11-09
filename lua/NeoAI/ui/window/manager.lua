@@ -284,7 +284,7 @@ end
 
 --- 清理会话恢复残留的 NeoAI 界面 buffer/窗口（:restart / :mksession 恢复后调用）。
 --- 目标：:restart 后不再出现「空的 NeoAI Chat buffer + 输入框 buffer」这类孤儿，
---- 聊天界面完全关闭，用户需显式 `:NeoAIChat` 重开（新会话）。
+--- 聊天界面完全关闭，用户需显式 `:NeoAI Chat` 重开（新会话）。
 --- 做法（全程 pcall、幂等，不触碰非 NeoAI buffer）：
 ---   1. 关闭显示孤儿 buffer 的**非末窗口**（末窗口留待第 2 步替换，避免整标签页被关掉）；
 ---   2. 对仍显示孤儿 buffer 的末窗口，切换到干净 buffer（无则新建空 buffer）；

@@ -92,17 +92,19 @@ NeoAI/
 ├── plugins/                    # 插件目录与默认组合
 │   ├── catalog.lua            # 内置插件登记（服务提供方 + 副作用 + tool.*），处理禁用/替换
 │   └── builtin/
-│       ├── commands.lua       # 命令插件（:NeoAI* 注册/删除）
+│       ├── commands.lua       # 命令插件（聚合命令 :NeoAI <子命令> 注册/删除）
 │       └── keymaps.lua        # 全局键位插件（注册/删除）
 │
 ├── ui/                         # 表现层
 │   ├── init.lua               # UI 编排（审批 UI + 子 Agent 监控）
+│   ├── command_hint.lua       # :NeoAI 子命令说明提示（cmp 源 / 内置浮窗）
 │   ├── window/                # 窗口管理
 │   │   ├── manager.lua        # 窗口管理器（float/tab/split）
 │   │   ├── chat_view.lua     # 聊天视图
 │   │   └── tree_view.lua     # 会话树视图
 │   ├── components/            # 可复用组件
 │   │   ├── input_box.lua     # 输入框
+│   │   ├── hash_complete.lua # 输入框 # 上下文占位符（补全/高亮/发送前解析）
 │   │   ├── message_list.lua  # 消息列表渲染
 │   │   ├── reasoning_panel.lua# 思考过程面板
 │   │   ├── model_picker.lua  # 模型选择器（异步加载列表）
@@ -1064,7 +1066,7 @@ async.all({ deferred1, deferred2 })
 
 **测试框架**：自定义轻量框架（`tests/init.lua`），无外部依赖，headless 可跑。
 
-- 运行方式：`:NeoAITest [suite_name ...]`（空参数运行全部）。
+- 运行方式：`:NeoAI Test [suite_name ...]`（空参数运行全部）。
 - 断言 API：`eq / ne / not_eq / true_ / false_ / nil_ / not_nil / matches / ok / deep_eq / sleep / throws`。
 - 组织方式：`suite(name, fn)` 定义套件，`it(name, fn)` 定义用例，`before_each` 钩子。
 - 动态加载：`run_all` 通过 glob 自动加载 `tests/test_*.lua`。
@@ -1121,6 +1123,10 @@ async.all({ deferred1, deferred2 })
 | `tools/builtin/ask_user.lua` | 向用户提问工具（UI seam + vim.ui.input 回退）      |
 | `tools/builtin/todo.lua`     | 待办清单（整表替换语义 + 系统提示注入）  |
 | `ui/components/fold.lua`     | 折叠组件                                 |
+| `ui/components/hash_complete.lua`| 输入框 `#` 上下文占位符（候选/高亮/解析）|
+| `ui/command_hint.lua`        | `:NeoAI` 子命令说明提示                   |
+| `core/session/agents_md.lua` | AGENTS.md 自动发现与注入                  |
+| `kernel/live_metrics.lua`    | 实时指标桥（工具计时 + 运行期结果）       |
 
 ---
 

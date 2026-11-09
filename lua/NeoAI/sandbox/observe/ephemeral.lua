@@ -3,7 +3,7 @@
 --- 沙箱内临时根（`/tmp`、`/var/tmp` 等，见 `tools.sandbox.ephemeral_roots`）的写入为
 --- **会话私有、nvim 退出即丢弃**：不进入待审队列、不 CAS 发布、也不弹审批悬浮窗
 --- （见 `sandbox.execution.wrapper` 的 `_settle_candidate`）。本模块只做**只读留痕**，
---- 使审批悬浮窗（`:NeoAISandboxReview` 的「越界/异常」页）能展示 AI 在临时根写过哪些文件——
+--- 使审批悬浮窗（`:NeoAI SandboxReview` 的「越界/异常」页）能展示 AI 在临时根写过哪些文件——
 --- 不改变任何效果与发布语义，仍不产生待审候选。
 ---
 --- 去重：同一 (tool, path) 只记录一次，避免高频写入刷屏；可按需 `reset()`。

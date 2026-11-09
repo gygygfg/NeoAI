@@ -11,7 +11,7 @@ local DEFAULT_CONFIG = {
     default_model = "auto", -- "auto" = 使用 registry 第一个可用模型
     -- 当 default_provider 未配置 api_key、而其他 provider 已配置时，自动回退到第一个
     -- 已配置 key 的 provider（按名排序，确定性），避免「配了 key 却用不了」。
-    -- 默认关闭（不改写用户显式选择）；需要时设为 true。诊断见 :NeoAIDoctor。
+    -- 默认关闭（不改写用户显式选择）；需要时设为 true。诊断见 :NeoAI Doctor。
     auto_select_provider = false,
     providers = {
       deepseek = {
@@ -262,7 +262,15 @@ local DEFAULT_CONFIG = {
       idle_height = 1, -- 光标在主聊天区域时输入框高度
       min_height = 5, -- 光标在输入框内时的最小高度（起始）
       max_ratio = 0.8, -- 输入框随内容增长的上限（主窗口高度占比）
+      -- `#` 占位符补全：输入 # 弹出上下文占位符（#{buffers} / #{tool} / #{lsp} 等），
+      -- 插入后高亮显示，**发送前**才替换为真实内容。
+      --   max_chars：`#{message}` / `#{notify}` 的字符数上限（按字符计，CJK 不会切半）
+      --   max_bytes：其他占位符解析结果的字节数上限（UTF-8 安全截断）
+      hash_completion = { enabled = true, max_chars = 2000, max_bytes = 20000 },
     },
+    -- `:NeoAI <子命令>` 的说明提示：已装 nvim-cmp + cmp-cmdline 时注册 neoai_cmd 源，
+    -- 否则用内置浮窗展示「子命令 — 说明」。false 则完全关闭（无任何自动命令）。
+    command_hint = { enabled = true },
     chat = {
       -- 鼠标滚轮滚到底部时，末行下方允许留出的最大空白行数（0 = 严格贴底不留白）
       mousescroll_max_blank = 3,
@@ -383,6 +391,13 @@ local DEFAULT_CONFIG = {
     -- `$PWD` 不可用时退回编辑器当前 cwd。子会话始终继承父会话工作目录，不做检测。
     detect_root = true, -- 总开关；false 则直接使用 cwd（旧行为，不做检测与 $PWD 回退）
     git_markers = { ".git" },
+    -- 仓库级开发约定文件（AGENTS.md）自动加载：会话首个回合若在工作区（从会话 cwd 向上）
+    -- 找到该文件，则自动注入一轮 read_file 工具调用（assistant tool_calls + tool 结果）
+    -- 把约定放进上下文，供 AI 遵循。每次会话只注入一次；内容不进系统提示（避免前缀缓存失效）。
+    --   file：文件名（默认 AGENTS.md）
+    --   max_bytes：注入内容上限，超限按 UTF-8 安全截断并标注
+    -- 注意：AI 若需更新 AGENTS.md，写入仍走既有沙箱审批，不会因本开关自动放行。
+    agents_md = { enabled = true, file = "AGENTS.md", max_bytes = 64 * 1024 },
     root_markers = {
       ".luarc.json", ".luarc.jsonc",
       "package.json", "tsconfig.json", "deno.json",
@@ -701,7 +716,7 @@ local DEFAULT_CONFIG = {
     },
     -- 工具执行沙箱（对齐《Agent 沙箱 dry-run 与 commit 架构设计 v2》）。
     -- 所有工具执行经控制面：预检 → 隔离执行 → 冻结候选 → 校验授权 → CAS 发布。
-    -- 默认 dry_run：只产出候选，不写真实工作区；用 :NeoAISandboxCommit 显式应用。
+    -- 默认 dry_run：只产出候选，不写真实工作区；用 :NeoAI SandboxCommit 显式应用。
     sandbox = {
       enabled = true, -- 总开关；关闭且 fail_closed=true 时拒绝所有工具执行
       fail_closed = true, -- 沙箱服务缺失/被禁用时是否拒绝执行（不得静默降级）

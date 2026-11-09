@@ -423,7 +423,7 @@ is only kept for other `approval.mode` values (`prompt`/`strict`).
   surfaced to the user only via a **prominent statusline badge** (the `sandbox` part shows a
   bold yellow `待审N` only when pending reviews > 0, see [configuration.md](configuration.md)).
 - Async confirmation commands:
-  - `:NeoAISandboxReview` — open the review UI (`ui/components/sandbox_review.lua`)
+  - `:NeoAI SandboxReview` — open the review UI (`ui/components/sandbox_review.lua`)
     (**it opens even with no pending / approval / trace items, showing an empty view — no
     "nothing to review" notice and no auto-close**; refreshing into an empty queue keeps the
     window open, and new items arriving are picked up by the event subscription), which
@@ -842,9 +842,9 @@ is only kept for other `approval.mode` values (`prompt`/`strict`).
       **Auto audit** (`ai_audit.auto`, default `false`): when enabled, opening the review UI runs the
       audit automatically and re-audits when the pending set changes; `key` (default `a`) still
       triggers it manually.
-  - `:NeoAISandboxApprove <id>` / `:NeoAISandboxReject <id>` — approve (no apply) / reject & discard.
-  - `:NeoAISandboxApply <id>` — approve and apply (CAS publish); `:NeoAISandboxApplyAll` applies all.
-  - `:NeoAISandboxList` / `:NeoAISandboxShow` / `:NeoAISandboxDiscard <digest>` / `:NeoAISandboxCommit <digest>`.
+  - `:NeoAI SandboxApprove <id>` / `:NeoAI SandboxReject <id>` — approve (no apply) / reject & discard.
+  - `:NeoAI SandboxApply <id>` — approve and apply (CAS publish); `:NeoAI SandboxApplyAll` applies all.
+  - `:NeoAI SandboxList` / `:NeoAI SandboxShow` / `:NeoAI SandboxDiscard <digest>` / `:NeoAI SandboxCommit <digest>`.
     Discarding a candidate also marks any `PENDING` change sets referencing it as `REJECTED`
     (`review.discard_by_digest`); otherwise reopening the chat/review UI would show a stale
     pending item whose candidate no longer exists and cannot be applied.
@@ -1168,7 +1168,7 @@ network-consent / tool-approval ones, subject to focus gating):
     `ephemeral_roots = {}` to disable (then `/tmp` goes through normal review/approval).
     - **Read-only trace**: although ephemeral-root writes produce no pending candidate and are never
       published, they are shown per file under the **ephemeral-write trace** section of the
-      `:NeoAISandboxReview` window's "Out-of-bounds·Anomaly" page (with tool and command), and a
+      `:NeoAI SandboxReview` window's "Out-of-bounds·Anomaly" page (with tool and command), and a
       `sandbox:ephemeral_write` event is emitted for live refresh — visibility only; it changes
       neither the effect nor the publish semantics (still no candidate, no publish).
   - Broad directories such as `/root`, `/home`, `/etc` are no longer overlaid by default, so host
@@ -1699,7 +1699,7 @@ the facade (`sandbox/systemd/systemd.lua`) with a **fake parser** covering only 
   to enable diagnostics. With `tools.sandbox.diagnostics.enabled=true`, `cgroup.kill` records the
   caller traceback and command end records resource-domain memory/pids events (log only, no behavior
   change).
-- **Diagnostics command**: `:NeoAISandboxDiag` prints host/container cgroup limits (`memory.max` /
+- **Diagnostics command**: `:NeoAI SandboxDiag` prints host/container cgroup limits (`memory.max` /
   `memory.events` / `pids.max`), load, PID1 (systemd detection), the container quota
   (`cgroup_quota`) and resolved sandbox limits, to tell "sandbox resource domain" apart from "host
   container OOM".
@@ -1810,7 +1810,7 @@ only and **never** participates in any gate decision.
     and `run_command` shows a **tier-specific notice** ("running in the T2 privileged tier inside a
     nested namespace … host effects will be frozen as proposals for review") **to the user only**,
     instead of the "overlay unavailable" degraded warning, to avoid misleading the user.
-  - **Diagnosing the degraded reason**: `:NeoAISandboxCaps` prints `overlay=ready` or
+  - **Diagnosing the degraded reason**: `:NeoAI SandboxCaps` prints `overlay=ready` or
     `overlay=unavailable(<reason>)`; `runtime.overlay_diagnosis()` probes the real execution paths
     (cwd + sandbox overlay base dir) for **writability** (mount + write probe, matching the real
     gate) and returns `{ available, reason, flags, userns }`. `runtime.overlay_reason()` returns
@@ -1842,7 +1842,7 @@ only and **never** participates in any gate decision.
     every user-facing "sandbox unavailable" message goes through this module and is structured as
     "**which dependency is missing → why it is needed → one install hint**", keeping the internal
     reason code for evidence/log reconciliation:
-    - The `:NeoAIDoctor` / `:checkhealth NeoAI` "sandbox kernel capabilities" item is **derived from
+    - The `:NeoAI Doctor` / `:checkhealth NeoAI` "sandbox kernel capabilities" item is **derived from
       the same source as** `runtime.backend()` (functional probe, not binary existence): `ok` when a
       backend exists, `warn` otherwise, naming each gap — `bwrap` missing (`bubblewrap` package),
       `unshare` installed but unprivileged userns rejected by the kernel
@@ -1858,8 +1858,8 @@ only and **never** participates in any gate decision.
       `/proc/sys` masking", plus an install hint.
     - The fail-closed rejection message (`tools/executor.lua`) states the **cause** (sandbox disabled
       in config / no isolation backend and which dependencies are missing / sandbox service not
-      initialized) and the **fix** (install per the hint and restart, or run `:NeoAIDoctor` /
-      `:NeoAISandboxCaps`).
+      initialized) and the **fix** (install per the hint and restart, or run `:NeoAI Doctor` /
+      `:NeoAI SandboxCaps`).
     - Observer backend fallback notices (`sandbox/observe/observer.lua`) are merged into **at most
       one** message containing the eBPF-unavailable reason, the backend actually used, and install
       hints for missing dependencies.
@@ -1997,7 +1997,7 @@ defense-in-depth to the bwrap prefix by default (`--cap-drop ALL` plus the tier 
   > nor writable. With `read_all=false` these paths fall back to read-only.
   - **Outside-workspace tracing (non-blocking)**: accessing user working dirs outside `cwd` (under
     home/root) records evidence (kind=observation), emits a `sandbox:outside_access` event, and is
-    shown in the `:NeoAISandboxReview` window under "越界访问留痕"; the read is still allowed, not
+    shown in the `:NeoAI SandboxReview` window under "越界访问留痕"; the read is still allowed, not
     blocked. In that view traces are **merged by file path** (multiple tools for the same path collapse
     into one line `[tool1, tool2] path`) and **sorted by path ascending**; the statusline `sandbox`
     part also shows `越界N` when traces exist (`N` = distinct file count), in addition to pending
@@ -2346,8 +2346,8 @@ Handling (`sandbox/execution/runtime.lua`):
   `unshare --user --map-root-user true` fails: Ubuntu 24.04+ restricts unprivileged userns via
   AppArmor — `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`; Debian/Arch —
   `sudo sysctl -w kernel.unprivileged_userns_clone=1`.
-- **Diagnostics**: `:NeoAISandboxCaps` prints `bwrap_version`, `overlay=ready|unavailable(...)`,
-  `seccomp_mode` and `backstop`; `:NeoAIDoctor` names the missing dependency and how to install or
+- **Diagnostics**: `:NeoAI SandboxCaps` prints `bwrap_version`, `overlay=ready|unavailable(...)`,
+  `seccomp_mode` and `backstop`; `:NeoAI Doctor` names the missing dependency and how to install or
   enable it.
 
 ## 7. Configuration
@@ -2470,8 +2470,8 @@ the candidate is **auto-applied via CAS** (equivalent to `TASK_POLICY_MATCH`) an
 otherwise it enters async user review. Revocation is immediate.
 
 ```
-:NeoAISandboxGrant [path] [ttl_sec] [max_files]   -- create a narrow grant
-:NeoAISandboxRevoke <grant_id>                    -- revoke (no args lists all)
+:NeoAI SandboxGrant [path] [ttl_sec] [max_files]   -- create a narrow grant
+:NeoAI SandboxRevoke <grant_id>                    -- revoke (no args lists all)
 ```
 
 ### Network (allowed by default + recorded)
@@ -2538,9 +2538,9 @@ inconclusive results (resolved via `reconcile`, never blindly replayed).
 
 ### Retention & metrics
 
-`:NeoAISandboxPrune` removes terminal (rejected/applied/failed/conflict) candidates and change sets
+`:NeoAI SandboxPrune` removes terminal (rejected/applied/failed/conflict) candidates and change sets
 past `retention.candidate_days`; items referenced by recovery/reconcile/queued apply are kept.
-`:NeoAISandboxMetrics` reports candidate/pending/applied/rejected/conflict counts. The store root
+`:NeoAI SandboxMetrics` reports candidate/pending/applied/rejected/conflict counts. The store root
 and its subdirectories (`candidates`/`reviews`/`evidence`/`receipts`/`host_ops`) are chmodded to
 `0700` so other local users cannot enumerate/read unpublished content or command details.
 > Boundary: a same-uid local process can read/write these files (equivalent to any of the user's
@@ -2556,14 +2556,14 @@ and its subdirectories (`candidates`/`reviews`/`evidence`/`receipts`/`host_ops`)
   `publication_intent_hash` bound to member revisions and the composed digest. No publish side effects.
 - `apply_set(set)` CAS-publishes the composed candidate; on success all members are marked `APPLIED`
   and a receipt is written. Selecting B without its dependency A never smuggles A in.
-- Command: `:NeoAISandboxPublish <id> [id...]`.
+- Command: `:NeoAI SandboxPublish <id> [id...]`.
 
 ### Policy replay
 
 - Effectful decisions are recorded as evidence (facts + `policy.version`); `replay(evidence_id)`
   re-evaluates with the same rules and facts and compares `decision`/`reason_codes`, returning `same`
   and `version_mismatch`.
-- Command: `:NeoAISandboxReplay <evidence_id>`. Replay is offline by default and never re-sends real
+- Command: `:NeoAI SandboxReplay <evidence_id>`. Replay is offline by default and never re-sends real
   external write requests.
 
 ### Evidence retention
@@ -2599,7 +2599,7 @@ actually allows (making it a no-op, with the OOM triggered by the outer containe
 reads `/proc/self/cgroup` to locate the current cgroup and walks up the `/sys/fs/cgroup` parent chain
 to the nearest finite `memory.max`/`cpu.max`, taking the **min** with the host-derived value (explicit
 static values still win); the CPU core budget is likewise capped by the container CPU quota. The
-container quota is shown by `:NeoAISandboxDiag` in the `cgroup_quota` field.
+container quota is shown by `:NeoAI SandboxDiag` in the `cgroup_quota` field.
 
 All concurrent attempts share a parent domain `neoai`: the parent's `cpu.max` is the global budget
 `max(1, cores-2)` (derived internally, reserving two cores for nvim/UI), and each child's `cpu.max`
@@ -2634,8 +2634,8 @@ staging base (process overlay / private tmp) plus the sandbox store root (candid
 service overlay), and rejects write/process tools when exceeded (`SANDBOX_DISK_LIMIT_EXCEEDED`) so
 staging cannot fill the host disk. Usage is recursively measured on a **worker thread and cached**
 (TTL 5s); the gate only reads the cache and never runs a synchronous `du` at command start, passing
-through while the measurement is not ready. See the `disk` field of `:NeoAISandboxDiag`. When over the
-cap, apply/reject pending candidates (`:NeoAISandboxReview`), prune expired ones (`:NeoAISandboxPrune`),
+through while the measurement is not ready. See the `disk` field of `:NeoAI SandboxDiag`. When over the
+cap, apply/reject pending candidates (`:NeoAI SandboxReview`), prune expired ones (`:NeoAI SandboxPrune`),
 or raise the cap.
 
 ### Seeded view without overlay (`tools.sandbox.degraded_seed`)
@@ -3316,7 +3316,7 @@ The sandbox **never binds the host `/var/run/docker.sock`** (always masked). Con
 
 T2 commands run inside a nested userns (`--unshare-all` + optional `--cap-add`, caps scoped to
 that userns), so they **cannot directly affect the host**. Their host effects are frozen by
-`hostop.freeze()` as proposals shown in `:NeoAISandboxReview` (with the command and a `[T2]`
+`hostop.freeze()` as proposals shown in `:NeoAI SandboxReview` (with the command and a `[T2]`
 badge); after the user approves, `review.apply` replays the command on the host and writes a
 receipt (`SANDBOX_HOST_OP_APPLIED`); rejecting never executes it (`SANDBOX_HOST_OP_REJECTED`).
 The tool call never blocks.
@@ -3369,14 +3369,14 @@ a root disguise). Writable sandbox dirs (overlay upper/work, staging, session) a
 write-read-delete with the real execution path and payload uid, cached by
 `(lower, upper.dev, uid, gid)`. Mount success does not imply writability (non-root plus upper
 ownership/DAC can yield EROFS/EACCES), so overlay is used only when it both mounts **and** writes;
-otherwise it degrades to a bind-mounted private writable dir. Diagnose via `:NeoAISandboxCaps` /
+otherwise it degrades to a bind-mounted private writable dir. Diagnose via `:NeoAI SandboxCaps` /
 `runtime.overlay_diagnosis()`.
 
 **All writes staged + privilege-first publish**: command writes always go to the overlay/staging
 (never the real disk). The actual publish (CAS) goes through `sandbox/execution/writer.lua`: it first attempts
 as the non-root payload (the root process drops via `setpriv`), yielding `writer=nonroot`; on a
 permission error (EACCES/EPERM/EROFS) it returns `NEEDS_ROOT`, and `review.apply` marks
-`apply_state=NEEDS_ROOT` and queues it in `:NeoAISandboxReview` (no auto-escalation). After the user
+`apply_state=NEEDS_ROOT` and queues it in `:NeoAI SandboxReview` (no auto-escalation). After the user
 confirms (`allow_root=true`), the plugin writes as root if it is root, otherwise via `sudo`
 (inheriting the tty); the receipt records `writer`/`escalated`. The baseline is re-verified before the
 escalated write (TOCTOU).
@@ -3390,7 +3390,7 @@ silently.
 **Explicit root request when root is missing**: when the payload is **non-root** (NeoAI started as a
 non-root user, or `tools.sandbox.run_as.uid != 0`) and a command fails on a permission error (result
 matches `PERMISSION_DENIED`), besides auto-escalation an explicit **`ROOT_REQUIRED` host-op
-proposal** is frozen (`hostop`, entering the `:NeoAISandboxReview` pending queue + statusline badge);
+proposal** is frozen (`hostop`, entering the `:NeoAI SandboxReview` pending queue + statusline badge);
 after the user approves, the command is replayed on the host with root/`sudo` (inheriting the tty).
 It never fails silently and never escalates silently; when root is available (`run_as.uid = 0`) no
 such request is generated (to avoid false positives). Package installs are excluded (`hostop`
@@ -3522,7 +3522,7 @@ the sandbox degrades per a **three-layer behavioral model** and **never silently
 - **Config** (`tools.sandbox.seccomp`): `enabled` (default true), `filter_path`, `allow_namespaces`,
   `on_unavailable` (`"degrade"` default | `"deny"` restores old fail-closed), `backstop` (`"ebpf"`
   default | `"off"`), `require_backstop` (default false; true = hard-deny when layers 1 and 2 are both
-  unavailable). `:NeoAIDoctor` / `:NeoAISandboxCaps` report `seccomp_mode` (`bwrap`|`unshare`|`none`)
+  unavailable). `:NeoAI Doctor` / `:NeoAI SandboxCaps` report `seccomp_mode` (`bwrap`|`unshare`|`none`)
   and backstop availability.
 
 ### 18.3 Container facade (`sandbox/execution/container.lua`)
@@ -3566,7 +3566,7 @@ audit/UI, never to the model). Config: `tools.sandbox.container`
 
 `tools.sandbox.review.session_auto_approve` (default false): when on, L0/L1 risks auto-apply while
 L2+ and packages/secrets still require review. This lets even a local model manage agent behavior
-under write protection. Toggle at runtime with `:NeoAISandboxAutoApprove [on|off|status]`.
+under write protection. Toggle at runtime with `:NeoAI SandboxAutoApprove [on|off|status]`.
 
 ### 18.5 Extra rules for package installs
 
@@ -3587,11 +3587,11 @@ freeze time to avoid whole-unit publish conflicts.
   redaction for logs/evidence and emits `SANDBOX_SENSITIVE_REDACTED`.
 - **Behavior audit** (`sandbox/observe/audit.lua`): records read/call/process/network/secret/privilege/
   container/package observations, accumulating a weighted risk score and anomaly count;
-  `:NeoAISandboxAudit` shows the summary. High-risk observations emit `SANDBOX_AUDIT_ANOMALY`.
+  `:NeoAI SandboxAudit` shows the summary. High-risk observations emit `SANDBOX_AUDIT_ANOMALY`.
 
 ### 18.7 Commands and events
 
-- Commands: `:NeoAISandboxAudit`, `:NeoAISandboxAutoApprove [on|off|status]`.
+- Commands: `:NeoAI SandboxAudit`, `:NeoAI SandboxAutoApprove [on|off|status]`.
 - Events: `SANDBOX_RISK_ASSESSED` / `SANDBOX_RISK_BLOCKED` / `SANDBOX_AUDIT_OBSERVED` /
   `SANDBOX_AUDIT_ANOMALY` / `SANDBOX_CONTAINER_PLANNED` / `SANDBOX_CONTAINER_UNSUPPORTED` /
   `SANDBOX_SYSTEMD_ROUTED` / `SANDBOX_SYSTEMD_UNSUPPORTED` / `SANDBOX_SENSITIVE_REDACTED`.
@@ -3724,7 +3724,7 @@ mitigation can still be bypassed by more elaborate commands.
   `CAP_NET_ADMIN`); list them explicitly in the tier/global config.
 - **cgroup controller gating (fixed)**: `memory.max`/`pids.max`/`cpu.max` are written only when the
   controller is actually present in `cgroup.controllers`; results are surfaced via
-  `handle.applied`/`handle.unavailable`, and `:NeoAISandboxDiag` adds `cgroup_controllers`, so
+  `handle.applied`/`handle.unavailable`, and `:NeoAI SandboxDiag` adds `cgroup_controllers`, so
   `resolved_limits` (intent) is no longer mistaken for applied state. Missing controllers / failed
   writes are logged, no longer silently over-claimed.
 - **Delegated subtree physical capping (fixed)**: `prepare_delegated` is now **two-level** — limits are

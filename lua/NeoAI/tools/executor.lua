@@ -328,7 +328,7 @@ local function _execute_tool(tool, args, ctx, timer)
         message = "沙箱服务不可用且 fail_closed=true，拒绝执行工具: " .. tostring(tool and tool.name)
           .. "。原因：" .. _sandbox_unavailable_reason(cfg)
           .. "。修复：按上面的依赖提示安装/启用后重启 Neovim，"
-          .. "或运行 :NeoAIDoctor / :NeoAISandboxCaps 查看逐项诊断"
+          .. "或运行 :NeoAI Doctor / :NeoAI SandboxCaps 查看逐项诊断"
           .. "（临时放行可设 tools.sandbox.fail_closed=false，不推荐）。",
       })
     end

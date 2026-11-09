@@ -118,7 +118,7 @@ placeholders. On first trigger (command, keymap or active API), startup is drive
 | Plugin id | Effect | Cleanup |
 | --- | --- | --- |
 | `ui` | Register approval/ask-user/sub-agent UI | close windows + remove UI injection |
-| `commands` | Register all `:NeoAI*` commands | delete commands |
+| `commands` | Register the aggregated `:NeoAI <subcommand>` command (+ `ui/command_hint` sub-command hints) | delete the command + uninstall hint autocmds |
 | `keymaps` | Register global keymaps | delete keymaps |
 | `model_prefetch` | Background model-list refresh | cancel scheduling |
 | `mcp.connect` | Connect MCP servers | `mcp.shutdown()` |
@@ -172,12 +172,12 @@ Every side effect must be unloadable and is invoked by the host on `stop`:
 - Herder: `herder.reset()`
 
 `lifecycle.shutdown()` runs the cleanup function registered in `setup()` (which calls
-`plugins.stop_all()`); `:NeoAIReloadAll` also calls `plugins.stop_all()` before
+`plugins.stop_all()`); `:NeoAI ReloadAll` also calls `plugins.stop_all()` before
 clearing the module cache and reloading.
 
 ## 6. Hot Reload
 
-The controlled reload in `:NeoAIReloadAll`:
+The controlled reload in `:NeoAI ReloadAll`:
 
 1. Snapshot the `NeoAI.*` module cache (for rollback);
 2. Read the current config, session id;

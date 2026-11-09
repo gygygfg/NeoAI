@@ -3,14 +3,14 @@
 > [中文](../testing.md) | **English**
 
 > NeoAI uses a **lightweight custom test framework** (`lua/NeoAI/tests/init.lua`, no external dependencies).
-> Tests are organized with `suite` / `it`, assertions use `t.<assertion>`, and `:NeoAITest` runs them.
+> Tests are organized with `suite` / `it`, assertions use `t.<assertion>`, and `:NeoAI Test` runs them.
 > Combined with mocks, it enables isolated unit and integration tests for HTTP, models, the file system, and more.
 
 ## 1. Running
 
 ```vim
-:NeoAITest              " run all suites in parallel (no args)
-:NeoAITest flow_tools   " run a specific suite sequentially (by name, for debugging)
+:NeoAI Test              " run all suites in parallel (no args)
+:NeoAI Test flow_tools   " run a specific suite sequentially (by name, for debugging)
 ```
 
 - **Parallel by default (no args)**: `lua/NeoAI/tests/parallel.lua` (thin facade) dispatches every
@@ -53,10 +53,10 @@
   after a grace period, including sandbox-resident / PTY descendants that left the job's process group).
   Each worker injects a SIGTERM handler: on signal it runs `plugins.stop_all()` to self-clean its
   descendants before exiting (nvim does not run `VimLeavePre` under SIGTERM). When the parent nvim exits
-  (including interactive `:NeoAITest` followed by `:qa`), `lifecycle.on_shutdown` calls `_abort_all()` as a
+  (including interactive `:NeoAI Test` followed by `:qa`), `lifecycle.on_shutdown` calls `_abort_all()` as a
   fallback to terminate leftover worker trees, so no background processes are left behind.
 
-**Isolated execution (important)**: `:NeoAITest` runs inside a **fresh headless child
+**Isolated execution (important)**: `:NeoAI Test` runs inside a **fresh headless child
 process** (`nvim --headless --clean -u NONE --cmd "set rtp+=<plugin root>"`) and reports the result
 back via a `SUMMARY passed=.. failed=..` line. It never touches the current instance's plugin host or
 tool registry.

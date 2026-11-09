@@ -163,6 +163,17 @@ local function _execute_single(agent, tool_call, tool_service, opts)
       tool_call_id = tool_call.id, duration_ms = duration_ms,
     })
     require("NeoAI.kernel.live_metrics").clear(tool_call.id)
+    -- 运行期结果发布：并发工具的结果按原始顺序统一落库，若等全部完成才写，先完成的工具
+    -- 在界面上就一直看不到结果（一个慢工具拖住全部）。这里完成即发布，UI 对尚未配对的
+    -- 结果消息用它渲染；正式落库后由下面的 clear_result 回收。
+    pcall(function()
+      require("NeoAI.kernel.live_metrics").set_result(tool_call.id, {
+        content = result_str,
+        duration_ms = duration_ms,
+        notice = exec_opts.ui_notice,
+        secret_paths = exec_opts.observed_secret_paths,
+      })
+    end)
     return { tool_call_id = tool_call.id, name = name, result_str = result_str, duration_ms = duration_ms,
       notice = exec_opts.ui_notice, secret_paths = exec_opts.observed_secret_paths }
   end, function(err)
@@ -177,6 +188,15 @@ local function _execute_single(agent, tool_call, tool_service, opts)
       tool_call_id = tool_call.id, duration_ms = duration_ms,
     })
     require("NeoAI.kernel.live_metrics").clear(tool_call.id)
+    -- 失败也立即发布结果，理由同成功分支（并发工具不互相拖累）。
+    pcall(function()
+      require("NeoAI.kernel.live_metrics").set_result(tool_call.id, {
+        content = result_str,
+        duration_ms = duration_ms,
+        notice = exec_opts.ui_notice,
+        secret_paths = exec_opts.observed_secret_paths,
+      })
+    end)
     return { tool_call_id = tool_call.id, name = name, result_str = result_str, duration_ms = duration_ms,
       notice = exec_opts.ui_notice, secret_paths = exec_opts.observed_secret_paths }
   end)
@@ -203,8 +223,8 @@ function M._tool_definitions(agent)
       else
         -- 注册表仍为空（阶段 2 尚未加载）：触发全量启动，本轮先按现有工具集发送。
         -- 诊断：若 `is_fully_started()` 已为 true 却无任何工具，说明运行态被外部改写过
-        -- （历史上 `:NeoAITest` 同进程运行会 reset registry / stop plugins）；此时发出的
-        -- 请求会缺失 run_command 等全部内置工具。:NeoAITest 现已隔离到子进程，此告警用于
+        -- （历史上 `:NeoAI Test` 同进程运行会 reset registry / stop plugins）；此时发出的
+        -- 请求会缺失 run_command 等全部内置工具。:NeoAI Test 现已隔离到子进程，此告警用于
         -- 暴露其它同类不一致，避免再次静默退化。
         pcall(function()
           local NeoAI = require("NeoAI")
@@ -456,6 +476,10 @@ function M.run(agent, tool_calls, tool_service, opts)
           agent:add_tool_result(res.tool_call_id, res.name, res.result_str, {
             duration_ms = res.duration_ms, notice = res.notice, secret_paths = res.secret_paths,
           })
+          -- 已落库：回收运行期结果（UI 之后从消息队列读取，不再需要这份暂存）
+          pcall(function()
+            require("NeoAI.kernel.live_metrics").clear_result(res.tool_call_id)
+          end)
         end
       end
 

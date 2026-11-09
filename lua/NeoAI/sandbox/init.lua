@@ -1140,7 +1140,7 @@ function M.session_auto()
   return review.session_auto()
 end
 
---- overlay 可用性诊断（供 :NeoAISandboxCaps 展示）
+--- overlay 可用性诊断（供 :NeoAI SandboxCaps 展示）
 --- @param root string|nil
 --- @return table { available: boolean, reason: string|nil }
 function M.overlay_diagnosis(root)

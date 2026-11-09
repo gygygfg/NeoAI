@@ -335,47 +335,81 @@ local function _tool_status(first)
   return nil
 end
 
+--- 耗时文本模式（如 "1.2s" / "800ms" / "30.0s"）
+local TIME_TOKEN = "%d+%.?%d*%s*[msd]+"
+
+--- 从「工具名之后」的尾部文本中剥离耗时，返回耗时与剩余文本。
+--- 耗时可能在行尾（宽窗正常顺序：`· 目的 · 1.2s`），也可能紧跟工具名之后
+--- （窄窗降级顺序：`· 1.2s · 目的`，见 message_list 的窄窗时间前置）。
+--- @param tail string 工具名之后的文本
+--- @return string|nil time 耗时文本（不含 "· "）
+--- @return string rest 剥离耗时后的文本
+local function _strip_time(tail)
+  tail = tail or ""
+  -- 行尾：` · 1.2s`
+  local t = tail:match("%·%s*(" .. TIME_TOKEN .. ")%s*$")
+  if t then
+    return t, (tail:gsub("%·%s*" .. TIME_TOKEN .. "%s*$", ""))
+  end
+  -- 紧跟工具名：` · 1.2s · 目的`
+  local t2 = tail:match("^%s*%·%s*(" .. TIME_TOKEN .. ")%s*%·")
+  if t2 then
+    return t2, (tail:gsub("^%s*%·%s*" .. TIME_TOKEN .. "%s*%·", " · "))
+  end
+  return nil, tail
+end
+
 --- 识别折叠类型、状态、名称与目的说明（按折叠首行）
 --- 工具块首行格式：<状态 emoji> 调用工具: name [· 目的] [· 耗时]（执行中）或
 --- <状态 emoji> 工具: name [· 目的] [· 耗时]（已完成），目的/耗时可选。
+--- 窄窗下降级格式把耗时提到目的之前（`name · 1.2s · 目的`），此处两种顺序都兼容。
 --- @param first string 折叠首行
 --- @return string kind "reasoning" | "tool_call" | "tool_result"
 --- @return string|nil status "running" | "success" | "failure"（工具类折叠）
 --- @return string|nil name 工具名（工具类折叠）
 --- @return string|nil desc 目的说明（工具类折叠，可无）
+--- @return string|nil time 耗时文本（如 "1.2s"，可无）
 function M.detect(first)
-  local head = first
+  local head = first or ""
   local status = _tool_status(head)
-  -- 耗时形如 " · 1.2s" / " · 800ms"（纯数字+单位），先剥掉；剩余部分解析 name 与 desc，
-  -- 避免 name/desc 里的 " · " 干扰耗时识别。非耗时结尾（如无耗时的中文描述）不剥。
-  local time = head:match("%·%s*%d+%.?%d*%s*[msd]+%s*$")
-  local body = head
-  if time then
-    body = head:gsub("%·%s*%d+%.?%d*%s*[msd]+%s*$", "")
-  end
-  local call_name = body:match("调用工具:%s*([^%s%(%·]+)")
+  local kind, name
+  local call_name = head:match("调用工具:%s*([^%s%(%·]+)")
   if call_name then
-    local desc = body:match("调用工具:%s*[^%s%(%·]+%s*·%s*(.-)%s*$")
-    return "tool_call", status or "running", call_name, desc
+    kind, name = "tool_call", call_name
+  else
+    local tool_name = head:match("工具:%s*([^%s%(%·]+)")
+    if tool_name then kind, name = "tool_result", tool_name end
   end
-  local tool_name = body:match("工具:%s*([^%s%(%·]+)")
-  if tool_name then
-    local desc = body:match("工具:%s*[^%s%(%·]+%s*·%s*(.-)%s*$")
-    return "tool_result", status or "success", tool_name, desc
+  if not kind then
+    -- 子 Agent 结果块：首行 "✅ 子 Agent: <名字>"（可能带 " · 1.2s"）
+    local sa = head:match("子 Agent[:：]%s*(.+)$")
+    if sa then
+      local sa_time, sa_rest = _strip_time(sa)
+      return "sub_agent", status or "success", vim.trim(sa_rest or sa), nil, sa_time
+    end
+    return "reasoning", nil, nil, nil
   end
-  -- 子 Agent 结果块：首行 "✅ 子 Agent: <名字>"
-  local sa_name = body:match("子 Agent[:：]%s*(.+)$")
-  if sa_name then
-    return "sub_agent", status or "success", vim.trim(sa_name), nil
+  local marker = kind == "tool_call" and "调用工具:" or "工具:"
+  local tail = head:match(marker .. "%s*" .. vim.pesc(name) .. "%s*(.*)$") or ""
+  local time, rest = _strip_time(tail)
+  -- 目的说明必须由 " · " 引导：工具名之后可能是参数括号（如 `bash({"cmd":"pwd"})`）、
+  -- 目的（`· 目的`）或耗时（已完成），括号内容不能当描述。
+  local desc = rest:match("^%s*%·%s*(.+)$")
+  if desc then
+    desc = desc:gsub("%s+$", "")
+    if desc == "" then desc = nil end
   end
-  return "reasoning", nil, nil, nil
+  return kind, status or (kind == "tool_call" and "running" or "success"), name, desc, time
 end
 
---- 提取首行末尾的耗时文本（形如 " · 1.2s" / " · 800ms" / " · 30.0s"）
---- @param first string
---- @return string|nil
-local function _extract_time(first)
-  return first:match("%·%s*(%d+%.?%d*%s*[msd]+)%s*$")
+--- 折叠文本的可用显示宽度。
+--- @param opts table|nil { width?: number }
+--- @return number|nil
+local function _usable_width(opts)
+  if opts and type(opts.width) == "number" and opts.width > 0 then return opts.width end
+  local ok, w = pcall(vim.api.nvim_win_get_width, 0)
+  if ok and type(w) == "number" and w > 0 then return w end
+  return nil
 end
 
 --- 生成折叠占位文本（纯函数，供 foldtext 与测试使用）
@@ -389,28 +423,34 @@ end
 --- @param count number 折叠行数
 --- @param is_reasoning boolean|nil 是否为已登记的推理块（默认 true，保持旧语义）
 --- @param step_txt string|nil Step 标记（如 "Step 3"），仅添加到思考过程/工具调用折叠
+--- @param opts table|nil { width?: number } 可用显示宽度；折叠文本超出该宽度时
+---   把耗时从尾部提到目的之前（窄窗下行尾耗时会被截断而不可见）
 --- @return string
-function M.label(first, count, is_reasoning, step_txt)
-  local kind, status, name, desc = M.detect(first)
+function M.label(first, count, is_reasoning, step_txt, opts)
+  local kind, status, name, desc, time = M.detect(first)
   -- Step 标记插在 emoji 之后、内容之前（`🔧 Step 18 grep…`），而非追加到尾部：
   -- 尾部信息是状态与耗时，同一行里靠前的 Step 号更容易一眼对齐扫读。
   local prefix = (type(step_txt) == "string" and step_txt ~= "") and (step_txt .. " ") or ""
   if kind == "sub_agent" then
     local status_emoji = STATUS_EMOJI[status] or "🤖"
-    local time_str = _extract_time(first)
-    if time_str then
-      return string.format("  🤖 子 Agent %s %s %s", name or "", status_emoji, time_str)
+    if time then
+      return string.format("  🤖 子 Agent %s %s %s", name or "", status_emoji, time)
     end
     return string.format("  🤖 子 Agent %s %s", name or "", status_emoji)
   end
   if kind == "tool_call" or kind == "tool_result" then
     local status_emoji = STATUS_EMOJI[status] or "⏳"
     local desc_str = desc and (desc ~= "") and (" · " .. desc) or ""
-    local time_str = _extract_time(first)
-    if time_str then
-      return string.format("  🔧 %s%s%s %s %s", prefix, name, desc_str, status_emoji, time_str)
+    -- 宽窗（默认）顺序：name · 目的 ⏳ 1.2s（耗时在尾部，与工具块首行一致）
+    local wide = string.format("  🔧 %s%s%s %s", prefix, name, desc_str, status_emoji)
+    if time then wide = wide .. " " .. time end
+    -- 窄窗：折叠文本超出可用宽度时把耗时提到目的之前（name ⏳ 1.2s · 目的），
+    -- 否则行尾的时间会被窗口截断、完全看不到。
+    local w = _usable_width(opts)
+    if w and time and desc_str ~= "" and vim.fn.strdisplaywidth(wide) > w then
+      return string.format("  🔧 %s%s %s %s%s", prefix, name, status_emoji, time, desc_str)
     end
-    return string.format("  🔧 %s%s%s %s", prefix, name, desc_str, status_emoji)
+    return wide
   end
   if is_reasoning == false then
     return M.generic_label(first, count)
@@ -454,11 +494,13 @@ function M.foldtext()
   local step_txt = M.get_step_label(buf0, start)
   local first = vim.fn.getline(start) or ""
   local kind = M.detect(first)
+  -- 当前窗口可用宽度：折叠文本超出时把耗时提到目的之前（窄窗下行尾耗时会被截断）
+  local width_opts = { width = _usable_width() }
   if kind == "tool_call" or kind == "tool_result" or kind == "sub_agent" then
-    return M.label(first, count, true, step_txt)
+    return M.label(first, count, true, step_txt, width_opts)
   end
   local buf = vim.api.nvim_get_current_buf()
-  return M.label(first, count, M.is_reasoning_start(buf, start), step_txt)
+  return M.label(first, count, M.is_reasoning_start(buf, start), step_txt, width_opts)
 end
 
 -- ========== expr 折叠 ==========

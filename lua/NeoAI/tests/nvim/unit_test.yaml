@@ -1,5 +1,5 @@
 name: "NeoAI 单元测试"
-description: "加载插件并运行内置测试套件 (:NeoAITest)，结果写入 /tmp/neoai_unit_tests.txt"
+description: "加载插件并运行内置测试套件 (:NeoAI Test)，结果写入 /tmp/neoai_unit_tests.txt"
 nvim_args:
   - "-u"
   - "NONE"

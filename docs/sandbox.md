@@ -474,7 +474,7 @@ token（`NEOKEY_…`）或格式保真假密钥时**拒绝写盘**（`SECRET_TOK
   修改已完成；待审状态只通过**醒目的状态栏徽标**提示用户（`statusline` 的 `sandbox`
   段，仅在待审数 > 0 时显示黄底加粗的 `待审N`，见 [configuration.md](configuration.md)）。
 - 异步确认命令：
-  - `:NeoAISandboxReview` — 打开待审审批界面（`ui/components/sandbox_review.lua`）
+  - `:NeoAI SandboxReview` — 打开待审审批界面（`ui/components/sandbox_review.lua`）
     （**无待审/审批/留痕事项时同样打开窗口并展示空界面，不弹「无事项」提示、不自动关闭**；
     刷新到空队列亦保持窗口，新事项到达由事件订阅自动刷新）：
     按文件路径级别高亮 —— **工作区文件=绿色、用户目录=黄色、系统路径=红色**，
@@ -629,7 +629,7 @@ token（`NEOKEY_…`）或格式保真假密钥时**拒绝写盘**（`SECRET_TOK
       上限 `max_concurrent`（默认 10）：在途审计请求超出即排队 FIFO，避免 auto 频繁触发时请求风暴。
       **自动审计**（`ai_audit.auto`，默认 `false`）：开启后打开待审界面即自动发起审计，待审
       集合变化时自动重审；也可随时按 `key`（默认 `a`）手动触发。
-  - **多级页面审批悬浮窗（审批分流）**：`:NeoAISandboxReview` 采用多级页面，页头按
+  - **多级页面审批悬浮窗（审批分流）**：`:NeoAI SandboxReview` 采用多级页面，页头按
     **待修改 / 工具行为 / 资源访问 / 网络请求 / 越界·异常** 分页，`h`/`l`（或 `←`/`→`）切换、
     各页计数醒目。**页标签采用 Mason 高亮风格**（存在 mason.nvim 高亮组时链接复用其块状配色，
     见 `ui/mason_hl.lua`：当前页=`MasonHighlightBlockBold`、其它页=`MasonHighlight`）。
@@ -682,9 +682,9 @@ token（`NEOKEY_…`）或格式保真假密钥时**拒绝写盘**（`SECRET_TOK
       弹窗）列表；按 `E` 打开设备编辑器浮窗——`a` 添加允许设备（`tools.sandbox.devices.allowed`）、
       `d` 删除光标处设备、`q`/`Esc` 关闭。改动经 `config_store.set` 热更新**仅当前会话生效，不写盘，
       重开 nvim 恢复默认**。危险设备访问门禁见 §「危险设备访问门禁」。
-  - `:NeoAISandboxApprove <id>` / `:NeoAISandboxReject <id>` — 批准（不应用）/ 拒绝并丢弃。
-  - `:NeoAISandboxApply <id>` — 批准并应用（CAS 发布）；`:NeoAISandboxApplyAll` 批量应用。
-  - `:NeoAISandboxList` / `:NeoAISandboxShow` / `:NeoAISandboxDiscard <digest>` / `:NeoAISandboxCommit <digest>`。
+  - `:NeoAI SandboxApprove <id>` / `:NeoAI SandboxReject <id>` — 批准（不应用）/ 拒绝并丢弃。
+  - `:NeoAI SandboxApply <id>` — 批准并应用（CAS 发布）；`:NeoAI SandboxApplyAll` 批量应用。
+  - `:NeoAI SandboxList` / `:NeoAI SandboxShow` / `:NeoAI SandboxDiscard <digest>` / `:NeoAI SandboxCommit <digest>`。
     丢弃候选会同步把引用该候选的 `PENDING` 变更单元标记为 `REJECTED`（`review.discard_by_digest`），
     否则重开聊天/审批界面会重新显示一个候选已不存在、无法应用的待审项。
 - 选择性应用：`sandbox.apply(id, { files = { ... } })` 只应用指定文件子集（重新冻结组合候选后 CAS）；
@@ -1398,7 +1398,7 @@ stdout/stderr/退出码返回。宿主侧由 `sandbox/systemd/systemd_ipc.lua` �
   超限」，均未命中则回传「被强制终止（137/SIGKILL）」并提示开启诊断。
   `tools.sandbox.diagnostics.enabled=true` 时，`cgroup.kill` 记录调用方堆栈、
   命令结束记录资源域 memory/pids 事件（仅日志，不改变行为）。
-- **诊断命令**：`:NeoAISandboxDiag` 输出宿主/容器 cgroup 限制（`memory.max` / `memory.events` /
+- **诊断命令**：`:NeoAI SandboxDiag` 输出宿主/容器 cgroup 限制（`memory.max` / `memory.events` /
   `pids.max`）、负载、PID1（systemd 探测）、容器实际配额（`cgroup_quota`）与已解析沙箱限制，
   用于区分「沙箱资源域」与「宿主容器 OOM」。
 - **环境不匹配提示**：命令输出命中 `System has not been booted with systemd` /
@@ -1497,7 +1497,7 @@ stdout/stderr/退出码返回。宿主侧由 `sandbox/systemd/systemd_ipc.lua` �
     「降级」**。该档单独以 `ctx.sandbox_userns` 标记，`run_command` 显示**特权档专用提示**
     （「以特权档（T2）在嵌套命名空间内执行……主机效果将冻结为提案待审」），**仅用户可见**，
     不使用「overlay 不可用」的降级告警文案，避免误导。
-  - **排查降级原因**：`:NeoAISandboxCaps` 输出 `overlay=ready` 或
+  - **排查降级原因**：`:NeoAI SandboxCaps` 输出 `overlay=ready` 或
     `overlay=unavailable(<原因>)`；`runtime.overlay_diagnosis()` 用真实执行路径
     （cwd + 沙箱 overlay 基目录）实测 **可写性**（挂载 + 写入探针，与真实门禁一致）并返回
     `{ available, reason, flags, userns }`。`runtime.overlay_reason()` 对「能挂载但载荷写不
@@ -1523,7 +1523,7 @@ stdout/stderr/退出码返回。宿主侧由 `sandbox/systemd/systemd_ipc.lua` �
   - **依赖缺失提示**（`sandbox/execution/deps.lua`，纯文案 + 只读探测）：所有面向用户的
     「沙箱不可用」文案统一走该模块，结构为「**缺哪个依赖 → 为什么需要 → 一句安装提示**」，
     并保留内部原因码便于与 evidence/日志对账：
-    - `:NeoAIDoctor` / `:checkhealth NeoAI` 的「沙箱内核能力」项与 `runtime.backend()` **同源**
+    - `:NeoAI Doctor` / `:checkhealth NeoAI` 的「沙箱内核能力」项与 `runtime.backend()` **同源**
       （功能实测，不看二进制存在性）：有后端为 `ok`，无后端为 `warn` 并逐项点名——缺
       `bwrap`（`bubblewrap` 包）、`unshare` 已装但非特权 userns 被内核拒绝
       (`unshare --user --map-root-user true` 失败)、或未装 `unshare`（`util-linux` 包）；
@@ -1536,7 +1536,7 @@ stdout/stderr/退出码返回。宿主侧由 `sandbox/systemd/systemd_ipc.lua` �
       挂载/capability 与 `/proc/sys` 遮蔽」，并附安装提示。
     - 门禁 fail-closed 拒绝消息（`tools/executor.lua`）写明「原因」（配置中已关闭沙箱 /
       无隔离后端且缺哪些依赖 / 沙箱服务未初始化）与「修复」（按依赖提示安装并重启，
-      或运行 `:NeoAIDoctor` / `:NeoAISandboxCaps` 诊断）。
+      或运行 `:NeoAI Doctor` / `:NeoAI SandboxCaps` 诊断）。
     - 观测后端回退通知（`sandbox/observe/observer.lua`）合并为**至多一条**，含 eBPF 不可用
       原因、实际回退到的后端与缺失依赖的安装提示。
     - 平台判定：`$PREFIX` 含 `com.termux` 判 Termux、存在 `/system/build.prop` 判 Android；
@@ -1667,7 +1667,7 @@ seccomp（含设备节点屏障）**——沙箱内进程看到的是一份「�
   > 不可见、不可写。`read_all=false` 时这些路径退回只读。
   - **越界访问留痕（非阻塞）**：访问 `cwd` 之外的用户工作目录（home/root 之下）时记录
     证据（`evidence` kind=observation）并发出 `sandbox:outside_access` 事件，同时在审批悬浮窗
-    `:NeoAISandboxReview` 的「越界访问留痕」区展示；仍直接放行读取，不阻断。展示时**按文件
+    `:NeoAI SandboxReview` 的「越界访问留痕」区展示；仍直接放行读取，不阻断。展示时**按文件
     路径合并**（同一路径的多个工具合并为一行 `[tool1, tool2] path`）并**按路径升序排序**；
     状态栏 `sandbox` 段在有待审变更之外，也会在有留痕时显示 `越界N`（`N` 为去重文件数）。
     去重按 `(tool, path)`，但**同一 `(tool, path)` 的多条不同命令会在该条目上累积**
@@ -1949,8 +1949,8 @@ bwrap 在 init 阶段**创建挂载点**，任意一条挂载失败都会让整�
   Ubuntu 24.04+ 由 AppArmor 限制非特权 userns，可 `sudo sysctl -w
   kernel.apparmor_restrict_unprivileged_userns=0`；Debian/Arch 可
   `sudo sysctl -w kernel.unprivileged_userns_clone=1`。
-- **诊断**：`:NeoAISandboxCaps` 输出 `bwrap_version`、`overlay=ready|unavailable(...)`、
-  `seccomp_mode`、`backstop`；`:NeoAIDoctor` 给出缺哪个依赖及安装/启用方式。
+- **诊断**：`:NeoAI SandboxCaps` 输出 `bwrap_version`、`overlay=ready|unavailable(...)`、
+  `seccomp_mode`、`backstop`；`:NeoAI Doctor` 给出缺哪个依赖及安装/启用方式。
 
 ## 7. 配置
 
@@ -2070,8 +2070,8 @@ run_command overlay 候选捕获（含删除 whiteout 捕获与尝试目录清�
 （等价 `TASK_POLICY_MATCH`）并消费预算；否则进入用户异步审批。撤销即时生效。
 
 ```
-:NeoAISandboxGrant [path] [ttl_sec] [max_files]   -- 创建窄范围授权
-:NeoAISandboxRevoke <grant_id>                    -- 撤销（无参数列出全部）
+:NeoAI SandboxGrant [path] [ttl_sec] [max_files]   -- 创建窄范围授权
+:NeoAI SandboxRevoke <grant_id>                    -- 撤销（无参数列出全部）
 ```
 
 ### 网络（默认放行 + 记录）
@@ -2128,8 +2128,8 @@ run_command overlay 候选捕获（含删除 whiteout 捕获与尝试目录清�
 
 ### 保留期与指标
 
-`:NeoAISandboxPrune` 按 `retention.candidate_days` 清理已终结（已拒绝/已应用/失败/冲突）的
-候选与变更单元；有恢复/对账/已排队引用者不清理。`:NeoAISandboxMetrics` 输出候选/待审/已应用/
+`:NeoAI SandboxPrune` 按 `retention.candidate_days` 清理已终结（已拒绝/已应用/失败/冲突）的
+候选与变更单元；有恢复/对账/已排队引用者不清理。`:NeoAI SandboxMetrics` 输出候选/待审/已应用/
 已拒绝/冲突计数。存储根及子目录（`candidates`/`reviews`/`evidence`/`receipts`/`host_ops`）
 权限收紧为 `0700`，避免同机其他用户枚举/读取未发布内容与命令详情。
 > 边界：同一 uid 的本地进程可读写这些文件（与能读写用户其它文件等价），不属本插件的防护范围；
@@ -2144,13 +2144,13 @@ run_command overlay 候选捕获（含删除 whiteout 捕获与尝试目录清�
   组合摘要）。此步无发布副作用。
 - `apply_set(set)` 对组合候选做 CAS 发布；成功后标记所有成员 `APPLIED` 并写回执。
   选择 B 而未选依赖 A 时不会夹带 A：缺依赖返回 `BLOCKED_DEPENDENCY`。
-- 命令：`:NeoAISandboxPublish <id> [id...]`。
+- 命令：`:NeoAI SandboxPublish <id> [id...]`。
 
 ### 策略回放
 
 - 效果类裁决会记录为证据（含事实与 `policy.version`）；`replay(evidence_id)` 用同版规则
   与同一事实重放并比对 `decision`/`reason_codes`，返回 `same` 与 `version_mismatch`。
-- 命令：`:NeoAISandboxReplay <evidence_id>`。回放默认禁用联网，不重新发送真实外部写请求。
+- 命令：`:NeoAI SandboxReplay <evidence_id>`。回放默认禁用联网，不重新发送真实外部写请求。
 
 ### 证据保留期
 
@@ -2179,7 +2179,7 @@ PID = `pids_max`（默认 8192）；静态
 会把 `memory.max` 设得比容器实际可用还高（形同虚设，OOM 由外层容器触发而子域 `memory.events`
 无 `oom_kill` 记录，137 归因落空）。故推导时还会读 `/proc/self/cgroup` 定位当前 cgroup，沿
 `/sys/fs/cgroup` 父链向上取最近的有限 `memory.max`/`cpu.max`，与宿主推导**取 min**（静态显式值
-仍优先）；CPU 核数预算同样受容器 CPU 配额封顶。容器配额经 `:NeoAISandboxDiag` 的
+仍优先）；CPU 核数预算同样受容器 CPU 配额封顶。容器配额经 `:NeoAI SandboxDiag` 的
 `cgroup_quota` 字段展示。
 
 所有并发任务挂在共享父域 `neoai` 下：父域 `cpu.max` = 全局预算 `max(1, 核数-2)`
@@ -2208,8 +2208,8 @@ CPU 之外**的核，避免与 nvim 抢占同一核；单核宿主或 `taskset` 
 （进程 overlay / 私有 tmp）与沙箱存储根（候选/待审/证据/服务 overlay）的总占用，超限时拒绝
 写类/外部进程工具（`SANDBOX_DISK_LIMIT_EXCEEDED`），避免暂存撑满宿主磁盘。用量经工作线程
 **异步递归统计并缓存**（TTL 5s），门禁只读缓存、不在命令开始处做同步 `du`，统计未就绪时放行；
-诊断见 `:NeoAISandboxDiag` 的 `disk` 字段。超限时可用 `:NeoAISandboxReview` 应用/拒绝待审候选、
-`:NeoAISandboxPrune` 清理过期候选，或调大该上限。
+诊断见 `:NeoAI SandboxDiag` 的 `disk` 字段。超限时可用 `:NeoAI SandboxReview` 应用/拒绝待审候选、
+`:NeoAI SandboxPrune` 清理过期候选，或调大该上限。
 
 ### 无 overlay 播种视图（`tools.sandbox.degraded_seed`）
 
@@ -2269,7 +2269,7 @@ overlay 会 `EINVAL`），此时命令只能运行在「只读根 + 私有可写
   仅告警），`"deny"` 恢复旧 fail-closed（`SANDBOX_SECCOMP_UNAVAILABLE`）。详见 §1 / §18
   「seccomp 基线与三层行为强制」。
 - 降级绝不静默：写证据 `sandbox_degrade` + 发 `SANDBOX_DEGRADED` 事件 + `vim.notify`（会话去重）+
-  结果提示；`:NeoAIDoctor` / `:NeoAISandboxCaps` 报告 `seccomp_mode`（`bwrap`|`unshare`|`none`）。
+  结果提示；`:NeoAI Doctor` / `:NeoAI SandboxCaps` 报告 `seccomp_mode`（`bwrap`|`unshare`|`none`）。
 
 ### 内容寻址缓存
 
@@ -2787,7 +2787,7 @@ UI 未注册但为**交互式 Neovim** 时，回退到内建 `confirm` **暂停�
 ### T2 主机效果提案
 
 T2 命令在嵌套 userns 内执行（`--unshare-all` + 可选 `--cap-add`，cap 被限制在该 userns），
-因此**不会直接影响宿主**。其主机效果由 `hostop.freeze()` 冻结为提案，进入 `:NeoAISandboxReview`
+因此**不会直接影响宿主**。其主机效果由 `hostop.freeze()` 冻结为提案，进入 `:NeoAI SandboxReview`
 待审队列（展示命令与 `[T2]` 徽标）；用户审批后 `review.apply` 在主机上 replay 命令并写回执
 （`SANDBOX_HOST_OP_APPLIED`），拒绝则不执行（`SANDBOX_HOST_OP_REJECTED`）。全程不阻塞工具调用。
 
@@ -2830,12 +2830,12 @@ upper/work、暂存、会话）会 chown 到该 uid。
 **overlay 可写实测**：`runtime.overlay_writable(lower, upper, work)` 在选层前用真实执行路径 +
 真实载荷 uid 实测「写-读-删」三段，结果按 `(lower, upper.dev, uid, gid)` 缓存。挂载成功不代表
 可写（非 root + upper 归属/DAC 可能 EROFS/EACCES），故「能挂 **且** 能写」才用 overlay，否则
-降级为 bind 私有可写目录。`:NeoAISandboxCaps` / `runtime.overlay_diagnosis()` 可排查。
+降级为 bind 私有可写目录。`:NeoAI SandboxCaps` / `runtime.overlay_diagnosis()` 可排查。
 
 **写入全暂存 + 落盘降权优先**：命令的写入全部进入 overlay/暂存（不碰真实盘）。真正落盘
 （CAS 发布）经 `sandbox/execution/writer.lua`：先以非 root 载荷身份尝试（root 进程用 `setpriv` 降权执行），
 成功即 `writer=nonroot`；失败且为权限错误（EACCES/EPERM/EROFS）则返回 `NEEDS_ROOT`，由
-`review.apply` 标记 `apply_state=NEEDS_ROOT` 并进入 `:NeoAISandboxReview` 待审（不自动提权）。
+`review.apply` 标记 `apply_state=NEEDS_ROOT` 并进入 `:NeoAI SandboxReview` 待审（不自动提权）。
 用户确认（`allow_root=true`）后：插件为 root 则以 root 写入，否则以 `sudo`（继承 tty）写入；
 回执记录 `writer`/`escalated`。提权重试前重新校验基线（防 TOCTOU）。
 
@@ -2846,7 +2846,7 @@ upper/work、暂存、会话）会 chown 到该 uid。
 
 **缺 root 时显式向用户索要**：当载荷**非 root**（NeoAI 非 root 启动，或 `tools.sandbox.run_as.uid != 0`）
 且命令因权限不足失败（结果命中 `PERMISSION_DENIED`）时，除自动升档外还会**显式冻结一条
-`ROOT_REQUIRED` 主机操作提案**（`hostop`，进入 `:NeoAISandboxReview` 待审队列 + 状态栏徽标）；
+`ROOT_REQUIRED` 主机操作提案**（`hostop`，进入 `:NeoAI SandboxReview` 待审队列 + 状态栏徽标）；
 用户审批后以 root/`sudo`（继承 tty）在宿主 replay 该命令。不静默失败、也不静默提权；有 root
 （`run_as.uid = 0`）时不生成该请求（避免误报）。包安装不在此列（`hostop` 拒绝包安装，绝不在
 宿主机安装）。
@@ -2975,7 +2975,7 @@ seccomp 是**唯一**能拦住「不经 overlayfs 的效果」（典型：`mknod
 - **配置**（`tools.sandbox.seccomp`）：`enabled`（默认 true）、`filter_path`、`allow_namespaces`、
   `on_unavailable`（`"degrade"` 默认 | `"deny"` 恢复旧 fail-closed）、`backstop`（`"ebpf"` 默认 |
   `"off"`）、`require_backstop`（默认 false；true = 第 1、2 层均不可用时硬拒）。
-  `:NeoAIDoctor` / `:NeoAISandboxCaps` 报告 `seccomp_mode`（`bwrap`|`unshare`|`none`）与兜底可用性。
+  `:NeoAI Doctor` / `:NeoAI SandboxCaps` 报告 `seccomp_mode`（`bwrap`|`unshare`|`none`）与兜底可用性。
 
 ### 18.3 容器门面（`sandbox/execution/container.lua`）
 
@@ -3011,7 +3011,7 @@ containers.conf，也不把 docker 伪装成「daemon 未运行」错误——�
 
 `tools.sandbox.review.session_auto_approve`（默认 false）：开启后 L0/L1 风险自动应用，
 L2+ 与包/密钥仍进入待审。目的是即便仅靠本地模型的智能水平，也能在写入保护下管理 agent
-行为。命令 `:NeoAISandboxAutoApprove [on|off|status]` 可随时切换。
+行为。命令 `:NeoAI SandboxAutoApprove [on|off|status]` 可随时切换。
 
 ### 18.5 安装包额外规则
 
@@ -3029,12 +3029,12 @@ L2+ 与包/密钥仍进入待审。目的是即便仅靠本地模型的智能水
   命中即 token 化（可无损还原）并留痕。`secret.redact()` 提供破坏性脱敏（用于日志/证据），
   发出 `SANDBOX_SENSITIVE_REDACTED`。
 - **行为审计**（`sandbox/observe/audit.lua`）：记录 AI 的读取/调用/进程/网络/密钥/提权/容器/包安装等
-  观测，累计加权风险分与异常计数；`:NeoAISandboxAudit` 查看摘要。高风险观测发出
+  观测，累计加权风险分与异常计数；`:NeoAI SandboxAudit` 查看摘要。高风险观测发出
   `SANDBOX_AUDIT_ANOMALY`。
 
 ### 18.7 命令与事件
 
-- 命令：`:NeoAISandboxAudit`、`:NeoAISandboxAutoApprove [on|off|status]`。
+- 命令：`:NeoAI SandboxAudit`、`:NeoAI SandboxAutoApprove [on|off|status]`。
 - 事件：`SANDBOX_RISK_ASSESSED` / `SANDBOX_RISK_BLOCKED` / `SANDBOX_AUDIT_OBSERVED` /
   `SANDBOX_AUDIT_ANOMALY` / `SANDBOX_CONTAINER_PLANNED` / `SANDBOX_CONTAINER_UNSUPPORTED` /
   `SANDBOX_SYSTEMD_ROUTED` / `SANDBOX_SYSTEMD_UNSUPPORTED` / `SANDBOX_SENSITIVE_REDACTED`。
@@ -3144,7 +3144,7 @@ L2+ 与包/密钥仍进入待审。目的是即便仅靠本地模型的智能水
   （如 `CAP_NET_ADMIN`），必须在档位/全局显式列出。
 - **cgroup 控制器门禁（已修复）**：仅当 `cgroup.controllers` 实际暴露对应控制器时才写
   `memory.max`/`pids.max`/`cpu.max`；写入结果经 `handle.applied`/`handle.unavailable` 暴露，
-  `:NeoAISandboxDiag` 增加 `cgroup_controllers`，避免把 `resolved_limits`（意图）当作已生效。
+  `:NeoAI SandboxDiag` 增加 `cgroup_controllers`，避免把 `resolved_limits`（意图）当作已生效。
   控制器缺失/写入失败时记录告警，不再静默虚报。
 - **委派子树物理封顶（已修复）**：`prepare_delegated` 改为**两层**——限额写在不可写的
   `limit_path`（`.../neoai_deleg_<id>`，不暴露给沙箱），暴露给沙箱的是其下可写叶子

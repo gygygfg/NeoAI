@@ -10,7 +10,7 @@
 ---
 --- 本模块在会话载入后（SessionLoadPost）与非正常启动兜底（VimEnter +
 --- `v:startreason ~= "normal"`）清理这些孤儿，使聊天界面完全关闭，用户需显式
---- `:NeoAIChat` 重开（新会话）。清理逻辑在 `ui.window.manager.cleanup_session_orphans`，
+--- `:NeoAI Chat` 重开（新会话）。清理逻辑在 `ui.window.manager.cleanup_session_orphans`，
 --- 此处只负责「何时触发」，懒 require 以免在启动早期加载 UI 模块。
 ---
 --- 另外在 `SessionWritePost` 处**修复会话文件**：同一输入 buffer 被多个窗口显示时，

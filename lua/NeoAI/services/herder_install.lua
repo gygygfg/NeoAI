@@ -12,7 +12,7 @@
 ---
 --- 特性：marker 幂等（已装/键已存在则跳过）、写入前备份、写入后 `herdr config check` 校验失败自动回滚。
 --- - 默认由 `services.herder` 在**启动时**异步、静默、幂等地触发（见 `install_async`），无需用户操作；
---- - 也提供 `:NeoAIHerderConfig [show|install|uninstall]` 手动控制（会给出提示）。
+--- - 也提供 `:NeoAI HerderConfig [show|install|uninstall]` 手动控制（会给出提示）。
 
 local M = {}
 

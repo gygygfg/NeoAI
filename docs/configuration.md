@@ -22,7 +22,7 @@
 
 `load` 的校验逻辑：检查 `ai.default_provider`、`ai.providers` 各 provider 的 `base_url`、
 `ai.modes` 结构，收集错误并记日志（不阻断）。当存在校验错误时（且日志未静默），会额外
-以 `vim.notify` 提示一次并指引运行 `:NeoAIDoctor`；错误明细可用 `config_store.validation_errors()` 读取。
+以 `vim.notify` 提示一次并指引运行 `:NeoAI Doctor`；错误明细可用 `config_store.validation_errors()` 读取。
 
 ## 2. 配置结构
 
@@ -154,7 +154,8 @@ context_cache = {
 | `split` | `{size=80, direction="right"}` | split 窗口 |
 | `colors` | 各段高亮 | 用户/AI/推理/标题色 |
 | `tree` | `{foldenable=false, ...auto_close_on_select=true}` | 会话树折叠/自动关闭 |
-| `input_box` | `{idle_height=1, min_height=5, max_ratio=0.8}` | 输入框高度（空闲/聚焦/增长上限） |
+| `input_box` | `{idle_height=1, min_height=5, max_ratio=0.8, hash_completion={enabled=true, max_chars=2000, max_bytes=20000}}` | 输入框高度（空闲/聚焦/增长上限）。`hash_completion` 为输入框 `#` 上下文占位符补全：输入 `#` 弹出候选（`#{buffers}` / `#{tool}` / `#{lsp}` 等），插入后以 `NeoAIHashPlaceholder` 高亮，**发送前**才替换为真实内容；`max_chars` 为 `#{message}`/`#{notify}` 的**字符数**上限（按字符计，中文不会被切半），`max_bytes` 为其他占位符解析结果的字节上限（UTF-8 安全截断）；`enabled=false` 完全关闭（不装 completefunc / cmp 源 / 高亮自动命令）。详见 [ui_system.md](ui_system.md)「输入框 # 占位符」 |
+| `command_hint` | `{enabled=true}` | `:NeoAI <子命令>` 的说明提示：已装 nvim-cmp + cmp-cmdline 时注册 `neoai_cmd` 补全源（提供 detail/documentation），否则用内置浮窗展示「子命令 — 说明」并随输入高亮匹配项；`enabled=false` 时零副作用（不注册任何自动命令 / 补全源）。不引入任何第三方依赖 |
 | `chat` | `{mousescroll_max_blank=3, incremental=true, fold="reasoning_tools", process_keep_steps=3}` | 鼠标滚轮滚到底时末行下方允许的最大空白行数（0=严格贴底）；`incremental` 开启增量刷新（只重渲染变化的消息块且只写差异行），设为 `false` 降级回整 buffer 全量重写；`fold` 为折叠程度：`none`（不折叠）/ `reasoning_tools`（现状：推理与工具块折叠）/ `process`（额外把每轮的 AI 中间调用收进「过程」折叠，折叠文本显示折叠轮次、工具成功/失败数、输入/输出 token、缓存命中率；Step 标记以 `· Step N` 追加在思考过程/工具调用折叠文本上，角色头只在角色切换时出现且为纯 `🤖 AI`；「过程」为 level 1 折叠，内部推理/工具块为 level 2 嵌套折叠，展开后仍各自收起；AI 运行途中插入的用户消息不开启新轮次，Step 编号连续、插入前的步骤整段收起）；用户消息与 AI 消息一律左对齐（固定行为，无配置开关）；`process_keep_steps` 为 `process` 模式下**本轮进行中**保留展开的最近中间步数（只看 agent 是否还在处理本轮，暂存队列非空不算；轮次结束后中间步骤全部收起，只留最终步骤展开） |
 | `ask_user` | `{batch_debounce_ms=25, require_confirm=true}` | 向用户提问弹窗：`batch_debounce_ms` 为同一轮多次提问的聚合去抖窗口（毫秒，覆盖兄弟调用到达时序；越大越全但首弹越慢）；`require_confirm` 为全部作答后是否展示汇总页二次确认（`false` 时直接提交）。弹窗在焦点离开时自动缩为右上角小窗、重新聚焦时展开 |
 | `trajectory` | `{log_dir=".../NeoAI/logs"}` | 轨迹显示模式的日志保存目录 |
@@ -201,6 +202,12 @@ session = {
     "deno.json", "pyproject.toml", "setup.py", "requirements.txt", "Cargo.toml",
     "go.mod", "pom.xml", "build.gradle", "CMakeLists.txt", "Makefile",
     "composer.json", "Gemfile", "project.godot", ".project" },
+  -- 仓库级开发约定文件（AGENTS.md）自动加载：会话首个回合若从会话 cwd 向上找到该文件，
+  -- 自动注入一轮 read_file 工具调用（assistant tool_calls + tool 结果）把约定放入上下文，
+  -- 供 AI 遵循；每次会话只注入一次，且**不写入系统提示**（避免前缀缓存失效）。
+  --   file：文件名；max_bytes：注入内容上限（超限按 UTF-8 安全截断并标注）
+  -- 注意：AI 更新 AGENTS.md 仍走既有沙箱审批，不会因本开关自动放行。
+  agents_md = { enabled = true, file = "AGENTS.md", max_bytes = 64 * 1024 },
 }
 ```
 
@@ -270,7 +277,7 @@ approval = {
 > **无隔离回退**：当宿主无任何命名空间隔离后端（`runtime.isolation_available()` 为 false，如
 > Android/Termux）时，沙箱被禁用并**退回审批模式**——`async` 会被强制为 `prompt`（命令经事前
 > 阻塞审批后直接在宿主执行），用户显式配置的 `prompt`/`strict`/`auto_allow` 予以保留。
-> 亦可在 `:NeoAISandboxReview`「资源访问」页按 `E` 打开目录编辑器热增删本列表（及遮蔽目录
+> 亦可在 `:NeoAI SandboxReview`「资源访问」页按 `E` 打开目录编辑器热增删本列表（及遮蔽目录
 > `sandbox.mask_dirs`、切换 `sandbox.mask_dirs_enabled`）——**仅当前会话生效，不写盘**。
 
 **worker（后台任务进程）**：
@@ -349,7 +356,7 @@ sandbox = {
   -- 宿主盘不受影响；仅遮蔽 mask_paths 中的重要配置文件/凭据（~/.ssh、~/.aws、/etc/shadow、
   -- sudoers、docker.sock 等）与沙箱自身存储；mask_dirs（home/root 兄弟目录）不再挂载遮蔽，但
   -- 访问 cwd 之外的用户目录会**留痕**（evidence + `sandbox:outside_access` 事件）并在审批悬浮窗
-  -- `:NeoAISandboxReview` 的「越界访问留痕」区展示（非阻塞，仍放行）。overlay 不可用时降级为
+  -- `:NeoAI SandboxReview` 的「越界访问留痕」区展示（非阻塞，仍放行）。overlay 不可用时降级为
   -- 「整机只读 + 可写根会话私有可写层（`degraded_seed` 播种真实内容）」。false 时退回最小只读白名单。
   read_all = true,
   -- 最小只读系统集（白名单，仅在 read_all=false 时生效）：仅这些宿主根/子树/文件以只读方式
@@ -399,7 +406,7 @@ sandbox = {
   mask_dirs_enabled = true,        -- 总开关
   mask_dirs = { "/home", "/root" }, -- 遮蔽目录列表（支持 * 通配）
   mask_dirs_approval = true,       -- 命中遮蔽目录时弹窗审批（复用工具审批 UI）
-  -- 上述遮蔽目录列表与总开关可在 `:NeoAISandboxReview`「资源访问」页按 `E` 热编辑（仅当前会话）。
+  -- 上述遮蔽目录列表与总开关可在 `:NeoAI SandboxReview`「资源访问」页按 `E` 热编辑（仅当前会话）。
   -- 内核级行为观测（eBPF/strace/procfs）：以实际 syscall 判定「越界访问」与「密钥文件访问」，
   -- 替代/补充命令字符串解析启发式；事件按 attempt cgroup 精确归属。
   -- 后端优先级 auto：ebpf（bpftrace，需 root）→ strace（命令前缀包裹）→ procfs（/proc/<pid>/fd）。
@@ -425,7 +432,7 @@ sandbox = {
   -- 设为 "off" 关闭。注意：事件按 cgroup 归属，背靠背无间隔的命令可能整体漏事件 → 空日志回退。
   journal_capture = "auto",
   -- 诊断埋点（默认关）：排查 137 / OOM / 资源域终止时开启，仅在 NeoAI 日志记录，
-  -- 不改变执行行为、不写入模型可见结果。配合 `:NeoAISandboxDiag` 查看宿主/容器限制与负载。
+  -- 不改变执行行为、不写入模型可见结果。配合 `:NeoAI SandboxDiag` 查看宿主/容器限制与负载。
   diagnostics = {
     enabled = false,          -- 总开关（开启后另记录 [sandbox-profile] 分段耗时：gate:<tool> 端到端 + settle 冻结/结算）
     log_kill_caller = false,  -- cgroup.kill 调用方堆栈（定位谁终止了进程树）
@@ -739,8 +746,8 @@ sandbox = {
 ```
 
 > 所有工具执行经控制面：预检 → 隔离执行 → 冻结候选 → CAS 发布。默认 `dry_run` 不写真实
-> 工作区，候选进入异步待审队列，用 `:NeoAISandboxReview` 查看并应用，或
-> `:NeoAISandboxApprove/Reject/Apply <change_set_id>`；`:NeoAISandboxList/Show/Discard/Caps`
+> 工作区，候选进入异步待审队列，用 `:NeoAI SandboxReview` 查看并应用，或
+> `:NeoAI SandboxApprove/Reject/Apply <change_set_id>`；`:NeoAI SandboxList/Show/Discard/Caps`
 > 管理候选与查看运行时能力。策略规则在受限环境执行并有指令/墙钟预算；规则异常统一 DENY。
 > 详见 [sandbox.md](sandbox.md)。
 
@@ -822,7 +829,7 @@ herder = {
 - 展示增强片段：`auto_install = true` 时启动即**异步、静默、幂等**写入 `~/.config/herdr/config.toml`
   （已安装跳过、写入前备份、`herdr config check` 失败回滚），无需手动执行。
 - 详见 [README 的 Herder 章节](../README.md) 与 [`integrations/herdr/`](../integrations/herdr/README.md)。
-- 命令：`:NeoAIHerderStatus`、`:NeoAIHerderConfig [show|install|uninstall]`。
+- 命令：`:NeoAI HerderStatus`、`:NeoAI HerderConfig [show|install|uninstall]`。
 
 ### 2.7 `log`
 
@@ -965,8 +972,8 @@ resources = { pressure = { simulate = "critical" } }
 随后：
 
 - `:checkhealth NeoAI` 可见「资源压力」项（等级 / 可用内存 / PSI / 已生效降级项）；
-- `:NeoAISandboxCaps` 末尾显示 `pressure=... observe=off(pressure:critical)` 与降级清单；
-- `:NeoAISandboxDiag` 输出 `pressure` 快照、封顶后的沙箱内存上限与 `pressure_degradations`。
+- `:NeoAI SandboxCaps` 末尾显示 `pressure=... observe=off(pressure:critical)` 与降级清单；
+- `:NeoAI SandboxDiag` 输出 `pressure` 快照、封顶后的沙箱内存上限与 `pressure_degradations`。
 
 单点隔离排查：把 `degrade.<项>` 设为 `false`（如仅关渲染降频）；或
 `simulate = "ok"` 使所有降级判定恒为最低档。总开关 `enabled = false` 则完全退回改动前行为。
@@ -979,7 +986,7 @@ resources = { pressure = { simulate = "critical" } }
 2. **工具上下文只保留只读/信息查询工具 + `run_command`（只读调研）+ `ask_user`**（`PLAN_SAFE_TOOLS` 白名单 + `PLAN_EXTRA_TOOLS`），不暴露任何修改类工具，也**不向 AI 提供切换模式的工具**。
 3. **执行期门禁同步收紧**（`plan_mode.check_tool`）：计划模式下调用可见集之外的任何工具都会被驳回。
 
-**计划确认**：AI 输出计划后本轮结束，由用户执行 `:NeoAIApprovePlan`（或手动切换模式）确认，
+**计划确认**：AI 输出计划后本轮结束，由用户执行 `:NeoAI ApprovePlan`（或手动切换模式）确认，
 经 `chat_service.approve_plan` 解析计划为任务清单（todo）→ 退出计划模式（转入 CHAT）
 → 按 `auto_execute_on_approve`（默认开启）自动开始执行。
 

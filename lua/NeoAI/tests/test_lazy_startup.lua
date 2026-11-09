@@ -34,7 +34,7 @@ local ok, err = xpcall(function()
   assert(NeoAI.is_phase1_done() == false, "setup 后阶段 1 不应已完成")
   assert(NeoAI.is_fully_started() == false, "setup 后不应已启动")
   assert(services.use("services.ui") == nil, "setup 后 ui 服务不应已提供")
-  assert(vim.fn.exists(":NeoAIOpen") == 2, "占位命令 NeoAIOpen 应存在")
+  assert(vim.fn.exists(":NeoAI") == 2, "占位命令 :NeoAI 应存在")
 
   local found = false
   for _, m in ipairs(vim.api.nvim_get_keymap("n")) do

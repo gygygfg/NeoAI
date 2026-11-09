@@ -3,14 +3,14 @@
 > [English](en/chat_enhanced_usage.md) | **中文**
 
 > 本文档描述 v3.0 聊天界面的实际使用。旧版提到的 `NeoAI.ui.chat_enhanced` 模块、
-> `:NeoAISend` / `:NeoAIMode` / `:NeoAIDemo` / `:NeoAIList` 命令均**不存在**。
+> `:NeoAI Send` / `:NeoAI Mode` / `:NeoAI Demo` / `:NeoAI List` 命令均**不存在**。
 > 对应源码：`lua/NeoAI/ui/window/chat_view.lua`、`lua/NeoAI/ui/components/*`。
 
 ## 1. 打开聊天
 
 ```vim
-:NeoAIChat        " 直接打开聊天界面
-:NeoAIOpen        " 打开默认界面（按 ui.default_view，chat/tree）
+:NeoAI Chat        " 直接打开聊天界面
+:NeoAI Open        " 打开默认界面（按 ui.default_view，chat/tree）
 ```
 
 或在 Neovim 配置中绑定快捷键（`keymaps.global`，默认 `<leader>ac`）。
@@ -47,9 +47,9 @@
 | 循环模式 | `m` | CHAT → PLAN |
 | 循环显示模式 | `<C-t>`（插入）/ `T`（普通） | chat / trajectory |
 | 热重载显示模式 | `<F5>` | 重载当前显示模式插件 |
-| 确认计划 | — | 执行 `:NeoAIApprovePlan`（或手动切换模式）；AI 不再持有切换模式的工具 |
+| 确认计划 | — | 执行 `:NeoAI ApprovePlan`（或手动切换模式）；AI 不再持有切换模式的工具 |
 | 工具审批 | `<C-a>` | 审批弹窗内确认 |
-| 沙箱待审审批 | `<leader>ap` | 等价 `:NeoAISandboxReview`，列出并应用待审的沙箱修改（审批单位为单个文件）；按高危/中危/低危分级，按 `i` 预览该条目修改 diff（临时关闭审批窗，关闭后返回并恢复光标） |
+| 沙箱待审审批 | `<leader>ap` | 等价 `:NeoAI SandboxReview`，列出并应用待审的沙箱修改（审批单位为单个文件）；按高危/中危/低危分级，按 `i` 预览该条目修改 diff（临时关闭审批窗，关闭后返回并恢复光标） |
 | 滚动 | `j` / `k` / 鼠标滚轮 | `j`/`k` 按行移动光标；滚轮平滑滚动视口，末行留白不超 `ui.chat.mousescroll_max_blank` 行 |
 
 ## 4. 流式更新与悬浮窗
@@ -81,14 +81,14 @@
 
 ## 6. 计划模式（PLAN）
 
-`m` 或 `:NeoAIPlan` 切换计划模式：
+`m` 或 `:NeoAI Plan` 切换计划模式：
 
 - 工具上下文只保留**只读/信息查询工具 + `run_command`（只读调研）+ `ask_user`**，不暴露任何修改类工具，也**不向 AI 提供切换模式的工具**。
 - 执行期门禁同步收紧，调用可见集之外的工具会被驳回。
 - AI 在计划模式下调研、提问澄清，输出**清晰、格式化的修改计划**。
-- 计划输出后本轮结束，**由用户确认**（执行 `:NeoAIApprovePlan` 或手动切换模式），
+- 计划输出后本轮结束，**由用户确认**（执行 `:NeoAI ApprovePlan` 或手动切换模式），
   确认后转入 CHAT 模式，把计划解析为任务清单（todo）并自动执行。
-- 生成过程中切换模式（`m` / `:NeoAIPlan`）会延迟到当前回合结束后生效，
+- 生成过程中切换模式（`m` / `:NeoAI Plan`）会延迟到当前回合结束后生效，
   不打断正在进行的生成。
 
 ## 7. 向用户提问（ask_user）

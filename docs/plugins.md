@@ -118,7 +118,7 @@ stop：逆序执行清理 → 注销服务 → stopped
 | 插件 id | 作用 | 清理 |
 | --- | --- | --- |
 | `ui` | 注册审批/提问/子 Agent 监控 UI | 关闭窗口 + 解除 UI 注入 |
-| `commands` | 注册全部 `:NeoAI*` 命令 | 删除命令 |
+| `commands` | 注册单条聚合命令 `:NeoAI <子命令>`（+ 子命令说明提示 `ui/command_hint`） | 删除命令 + 卸载提示自动命令 |
 | `keymaps` | 注册全局快捷键 | 删除键位 |
 | `model_prefetch` | 启动后台拉取模型列表 | 调度取消 |
 | `mcp.connect` | 连接 MCP 服务器 | `mcp.shutdown()` |
@@ -172,11 +172,11 @@ require("NeoAI").setup({
 - Herder：`herder.reset()`
 
 `lifecycle.shutdown()` 会执行 `setup()` 登记的清理函数（内部调用 `plugins.stop_all()`）；
-`:NeoAIReloadAll` 也先 `plugins.stop_all()` 再清缓存重载。
+`:NeoAI ReloadAll` 也先 `plugins.stop_all()` 再清缓存重载。
 
 ## 6. 热重载
 
-`:NeoAIReloadAll` 的受控重载流程：
+`:NeoAI ReloadAll` 的受控重载流程：
 
 1. 快照 `NeoAI.*` 模块缓存（失败回滚用）；
 2. 读取当前配置、会话 id；

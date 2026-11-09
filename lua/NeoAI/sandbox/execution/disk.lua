@@ -153,7 +153,7 @@ function M.check()
   if used >= limit then
     return false, string.format(
       "SANDBOX_DISK_LIMIT_EXCEEDED: 沙箱暂存已用 %.1f GiB ≥ 上限 %.1f GiB；"
-      .. "请应用/拒绝待审候选（:NeoAISandboxReview）或清理过期候选（:NeoAISandboxPrune），"
+      .. "请应用/拒绝待审候选（:NeoAI SandboxReview）或清理过期候选（:NeoAI SandboxPrune），"
       .. "也可调大 tools.sandbox.limits.disk_bytes",
       used / 1073741824, limit / 1073741824)
   end

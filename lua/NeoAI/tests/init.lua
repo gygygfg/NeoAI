@@ -292,6 +292,14 @@ local function _install_test_defaults()
     if uc.herder.auto_install == nil then
       uc.herder.auto_install = false
     end
+    -- 测试默认关闭 AGENTS.md 自动注入：是否注入取决于「仓库里有没有 AGENTS.md」，
+    -- 而测试既可能跑在仓库内（有）、也可能跑在导出的临时目录里（没有），会让按消息条数/
+    -- 请求轮数断言的用例随运行位置漂移（先多出 assistant(tool_calls)+tool 两条）。
+    -- 专项用例（test_agents_md）显式开启并注入临时目录的 AGENTS.md。
+    uc.session = uc.session or {}
+    if uc.session.agents_md == nil then
+      uc.session.agents_md = { enabled = false }
+    end
     return orig_config_load(uc)
   end
   pcall(function()
@@ -549,7 +557,7 @@ end
 -- / `sandbox.shutdown()` / `config_store.load` 等），而运行器没有 after_each 恢复；若在用户
 -- 正在使用的 nvim 进程内运行，会把线上插件宿主/工具注册表清空，且 `NeoAI.is_fully_started()`
 -- 仍为 true，懒加载门禁不会重新注册工具 —— 表现为后续请求（如 run_command）工具集为空。
--- 因此 `:NeoAITest` 一律在全新 headless 子进程中运行，绝不触碰当前进程状态。
+-- 因此 `:NeoAI Test` 一律在全新 headless 子进程中运行，绝不触碰当前进程状态。
 
 --- 子进程预置脚本（注入套件名）
 --- @param names table 套件名数组

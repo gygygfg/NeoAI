@@ -216,6 +216,32 @@ local function _input_idle_height()
   return math.max(1, _input_box_cfg().idle_height or 1)
 end
 
+--- 是否为 NeoAI 内部 buffer（聊天/输入/树/辅助）：不作为 #{lsp} 的上下文文件。
+--- @param buf number
+--- @return boolean
+local function _is_internal_buf(buf)
+  if not buf or not vim.api.nvim_buf_is_valid(buf) then return true end
+  local name = vim.api.nvim_buf_get_name(buf)
+  if name:match("^NeoAI ") then return true end
+  if (vim.bo[buf].filetype or ""):match("^neoai") then return true end
+  if (vim.bo[buf].buftype or "") ~= "" then return true end
+  return false
+end
+
+--- 取「最近聚焦的真实编辑 buffer」，供输入框 #{lsp} 判定当前文件。
+--- 输入框聚焦时当前 buffer 是输入 buffer，不能直接用它；这里按 :ls 的 lastused 倒序
+--- 取第一个非 NeoAI 内部、非常规 buftype 的已列 buffer。
+--- @return number|nil
+local function _resolve_context_buf()
+  local ok, infos = pcall(vim.fn.getbufinfo, { buflisted = 1 })
+  if not ok or type(infos) ~= "table" then return nil end
+  table.sort(infos, function(a, b) return (a.lastused or 0) > (b.lastused or 0) end)
+  for _, info in ipairs(infos) do
+    if not _is_internal_buf(info.bufnr) then return info.bufnr end
+  end
+  return nil
+end
+
 -- 输入框非模块级函数，但 _create_input_area（在下方定义）会引用，需提前声明。
 local _register_input_resize
 
@@ -370,7 +396,7 @@ local function _render(keep_view)
   -- 聚焦实例的内容写进自己的 buffer，自身流式更新反而丢失）。
   local get_messages = chat_service.get_messages_for_agent
   -- 服务不可用（插件停止/热重载期间已注销 services.chat_service）：跳过渲染而非报错。
-  -- 典型触发：:NeoAIReloadAll → plugins.stop_all 停止沙箱（cgroup.release 的 vim.wait 处理事件循环）
+  -- 典型触发：:NeoAI ReloadAll → plugins.stop_all 停止沙箱（cgroup.release 的 vim.wait 处理事件循环）
   -- 时，先前调度的渲染回调执行，而此时 chat_service 已注销（get_messages 为 nil）。
   if type(get_messages) ~= "function" then return false end
   local messages = get_messages(state.agent_id)
@@ -1050,6 +1076,8 @@ end
 --- 焦点移到输入框并进入插入模式（Agent 结束后回到输入位）
 local function _focus_input_insert()
   if not state.input_win_id or not vim.api.nvim_win_is_valid(state.input_win_id) then return end
+  -- 刷新 #{lsp} 的上下文文件：聚焦输入框前最近的真实编辑 buffer
+  input_box.set_context_buf(_resolve_context_buf())
   input_box.focus()
 end
 
@@ -1233,11 +1261,11 @@ local function _build_chat_actions()
       require("NeoAI.ui.components.tool_approval").init()
     end,
     sandbox_review = function()
-      if vim.fn.exists(":NeoAISandboxReview") ~= 2 then
+      if vim.fn.exists(":NeoAI") ~= 2 then
         vim.notify("[NeoAI] 沙箱审批命令不可用", vim.log.levels.WARN)
         return
       end
-      vim.cmd("NeoAISandboxReview")
+      vim.cmd("NeoAI SandboxReview")
     end,
   }
 end
@@ -1340,6 +1368,7 @@ end
 --- @param fresh boolean|nil true=首次/重开（input_box.create 新建 buffer+键位）；false=收起后恢复（复用已有输入 buffer）
 local function _create_input_area(fresh)
   local win = _create_input_window()
+  local ctx_buf = _resolve_context_buf()
   if fresh then
     input_box.create({
       -- 唯一输入 buffer 名（多实例各自不同），供 :ls 辨识与会话恢复识别/清理。
@@ -1349,6 +1378,8 @@ local function _create_input_area(fresh)
       on_quit = function() M.close() end,
       -- 同步主界面的 chat 上下文按键到输入框（quit/cancel/toggle_reasoning/switch_model/cycle_mode/tool_approval）
       chat_actions = _build_chat_actions(),
+      -- #{lsp} 等占位符使用的「当前文件」（聚焦输入框前的真实编辑 buffer）
+      context_buf = ctx_buf,
     })
     -- 输入框随内容增高：注册文本/光标变化时重算高度
     _register_input_resize()
@@ -1356,6 +1387,7 @@ local function _create_input_area(fresh)
     window_manager.register_aux(input_box.get_buf())
   end
   input_box.attach_window(win)
+  input_box.set_context_buf(ctx_buf)
   _mark_input_win(win)
   state.input_win_id = win
   -- 兜底去重：若历史遗留/竞态还留着别的输入窗口（同一输入 buffer），只保留刚建的这个，
@@ -2123,7 +2155,7 @@ function M.open(opts)
       -- Tree selection must replace the active conversation, not reuse its buffer.
       _switch_agent(chat_service.load_session(opts.session_id, { round = opts.round }))
     elseif opts.new_session and not opts.session_id then
-      -- 显式要求新会话（:NeoAIChat / <leader>ac）：不复用当前会话，另起一段对话。
+      -- 显式要求新会话（:NeoAI Chat / <leader>ac）：不复用当前会话，另起一段对话。
       _switch_agent(chat_service.new_session({}))
     end
     -- 再次打开/从会话树选择时也可能遇到聊天窗口已被切到别的 buffer 的情况，

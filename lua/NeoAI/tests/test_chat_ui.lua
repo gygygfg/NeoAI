@@ -3195,7 +3195,7 @@ tests.suite("chat_ui", function(_, it)
     chat_service.reset()
   end)
 
-  it("open({new_session=true}) 已有窗口时切换到新会话（:NeoAIChat 语义）", function(t)
+  it("open({new_session=true}) 已有窗口时切换到新会话（:NeoAI Chat 语义）", function(t)
     local chat_view = require("NeoAI.ui.window.chat_view")
     local chat_service = require("NeoAI.services.chat_service")
     chat_view.reset()
@@ -3356,7 +3356,7 @@ tests.suite("chat_ui", function(_, it)
     t.eq("NeoAI Chat", vim.fn.fnamemodify(vim.api.nvim_buf_get_name(first.buf), ":t"),
       "历史会话应命名 NeoAI Chat")
 
-    -- 2) <leader>ac / :NeoAIChat → 新标签页 + 新实例（唯一名）
+    -- 2) <leader>ac / :NeoAI Chat → 新标签页 + 新实例（唯一名）
     local second = chat_view.open({ new_window = true })
     t.eq("NeoAI Chat 2", vim.fn.fnamemodify(vim.api.nvim_buf_get_name(second.buf), ":t"),
       "new_window 应新开 NeoAI Chat 2，而非复用旧 buffer")
