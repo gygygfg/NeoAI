@@ -142,6 +142,7 @@ local function _get_or_create_agent(opts)
     state.agents[agent.id] = { session_id = session.id }
     state.sessions[session.id] = agent.id
     state.current_agent_id = agent.id
+    require("NeoAI.sandbox.privileged").set_current(agent.id)
   end
   return agent
 end
@@ -207,6 +208,8 @@ local function _build_persist_session(agent)
         -- 工具结果的 UI-only 元数据（不进入模型上下文，仅审批/渲染用）：必须随会话持久化，
         -- 否则关闭会话再打开后密钥告警、沙箱降级/特权档提示、耗时等「额外提示」会消失。
         tool_name = msg.tool_name,
+        -- AGENTS.md 自动注入轮等 UI-only 标记：随会话持久化，重开后仍按折叠块渲染。
+        meta = msg.meta,
         duration_ms = msg.duration_ms,
         notice = msg.notice,
         secret_paths = msg.secret_paths,
@@ -229,6 +232,9 @@ local function _build_persist_session(agent)
   session.metadata.plan = {
     active = agent.plan_mode == true,
     plan = agent.plan,
+  }
+  session.metadata.privileged = {
+    active = agent.privileged_mode == true,
   }
   -- 压缩覆盖层随会话持久化：重开后仍用压缩替换发请求；渲染/持久化的 messages 仍是原始上下文。
   if agent.compaction then
@@ -440,24 +446,36 @@ end
 -- ========== 生成中切换模式（延迟到本轮结束应用） ==========
 
 --- 当前实际生效的模式（不含待应用的目标模式）
---- @return string "chat" | "plan"
+--- @return string "chat" | "plan" | "privileged"
 local function _actual_mode()
   local agent = M.get_current_agent()
-  if agent and agent.plan_mode == true then return "plan" end
+  if not agent then return "chat" end
+  if agent.plan_mode == true then return "plan" end
+  if agent.privileged_mode == true then return "privileged" end
   return "chat"
 end
 
 --- 应用目标模式到 Agent（要求 Agent 空闲，同步）
 --- @param agent table
---- @param target string "chat" | "plan"
+--- @param target string "chat" | "plan" | "privileged"
+--- @return boolean ok
+--- @return string|nil reason
 local function _apply_target_mode(agent, target)
   local plan_mode = require("NeoAI.tools.builtin.plan_mode")
+  local privileged_mode = require("NeoAI.tools.builtin.privileged_mode")
   if target == "plan" then
+    privileged_mode.exit(agent)
     plan_mode.enter(agent)
+  elseif target == "privileged" then
+    plan_mode.exit(agent)
+    local ok, reason = privileged_mode.enter(agent)
+    if not ok then return false, reason end
   else
     plan_mode.exit(agent)
+    privileged_mode.exit(agent)
   end
   runtime.apply_mode(agent, target)
+  return true
 end
 
 --- Agent 空闲时应用暂存的模式切换（若有）
@@ -724,6 +742,7 @@ function M.set_current_agent(agent_id)
   if not agent_id then return end
   if not runtime.get(agent_id) then return end
   state.current_agent_id = agent_id
+  require("NeoAI.sandbox.privileged").set_current(agent_id)
 end
 
 --- 指定 Agent 暂存队列中的消息数（agent 正忙时入队的待发消息）。
@@ -876,6 +895,7 @@ local function _forget_deleted_session(session_id)
         break
       end
     end
+    require("NeoAI.sandbox.privileged").set_current(state.current_agent_id)
   end
 end
 
@@ -949,7 +969,7 @@ function M.cancel_generation()
   if tool_service then tool_service.clear_approval() end
 end
 
---- 把当前运行模式（chat/plan/auto）对应的 provider/model 配置应用到 Agent
+--- 把当前运行模式（chat/plan/privileged）对应的 provider/model 配置应用到 Agent
 --- @param agent table|nil
 local function _apply_current_mode(agent)
   agent = agent or M.get_current_agent()
@@ -959,12 +979,17 @@ end
 
 --- 请求切换到目标模式：Agent 空闲时立即应用；生成中（generating/tool_running）则暂存，
 --- 待本轮结束（Agent 回到 idle）后应用，避免中途改变工具集 / 系统策略 / 模型而打断当前回合。
---- @param target string "chat" | "plan"
---- @return string 目标模式
---- @return boolean 是否已立即应用（false = 已暂存待本轮结束）
+--- @param target string "chat" | "plan" | "privileged"
+--- @return string 目标模式（不可用时为当前实际模式）
+--- @return boolean 是否已立即应用（false = 已暂存待本轮结束或不可用）
+--- @return string|nil reason 不可用原因码
 local function _request_mode(target)
   local agent = M.get_current_agent()
-  if not agent then return target, false end
+  if not agent then return target, false, "NO_AGENT" end
+  if target == "privileged" then
+    local ok, reason = require("NeoAI.tools.builtin.privileged_mode").available()
+    if not ok then return _actual_mode(), false, reason end
+  end
   if _is_busy(agent) then
     pending_mode = target
     pending_mode_agent_id = agent.id
@@ -973,7 +998,8 @@ local function _request_mode(target)
   end
   pending_mode = nil
   pending_mode_agent_id = nil
-  _apply_target_mode(agent, target)
+  local ok, reason = _apply_target_mode(agent, target)
+  if not ok then return _actual_mode(), false, reason end
   return target, true
 end
 
@@ -1004,6 +1030,22 @@ function M.toggle_plan_mode()
   local target = (M.get_mode() == "plan") and "chat" or "plan"
   _request_mode(target)
   return target == "plan"
+end
+
+--- 切换当前 Agent 的高权限模式（网络仅记录、可直连 docker/podman）
+--- @return boolean|nil active 切换后的状态（无 Agent 或不可用时 nil）
+--- @return string|nil reason 不可用原因码
+function M.toggle_privileged_mode()
+  local agent = M.get_current_agent()
+  if not agent then return nil, "NO_AGENT" end
+  if M.get_mode() == "privileged" then
+    _request_mode("chat")
+    return false, nil
+  end
+  local ok, reason = require("NeoAI.tools.builtin.privileged_mode").available()
+  if not ok then return nil, reason end
+  _request_mode("privileged")
+  return true, nil
 end
 
 --- 用户确认计划：解析计划为任务清单（todo）→ 退出计划模式（直接转入 CHAT）→ 可选自动执行。
@@ -1067,7 +1109,7 @@ end
 --- 当前模式（互斥：一次只处于一种模式）。
 --- 生成中切换时返回待应用的目标模式，让状态栏/UI 立即反映用户意图；
 --- 实际生效（工具集/系统策略/模型）在 Agent 空闲后由 _apply_pending_mode 应用。
---- @return string "chat" | "plan"
+--- @return string "chat" | "plan" | "privileged"
 function M.get_mode()
   if pending_mode then return pending_mode end
   return _actual_mode()
@@ -1079,11 +1121,28 @@ function M.has_pending_mode()
   return pending_mode ~= nil
 end
 
---- 循环切换模式：chat -> plan -> chat
+--- 模式的展示标签
+--- @param mode string|nil 省略时取当前模式
+--- @return string
+function M.mode_label(mode)
+  local labels = { chat = "CHAT", plan = "PLAN", privileged = "PRIV" }
+  return labels[mode or M.get_mode()] or "CHAT"
+end
+
+--- 循环切换模式：chat -> plan -> [privileged] -> chat。
+--- 高权限模式 opt-in 且仅异步审批可用；不可用时在 CHAT/PLAN 间循环。
 --- @return string 切换后的模式
 function M.cycle_mode()
   local mode = M.get_mode()
-  local target = (mode == "chat") and "plan" or "chat"
+  local target
+  if mode == "chat" then
+    target = "plan"
+  elseif mode == "plan" then
+    local ok = require("NeoAI.tools.builtin.privileged_mode").available()
+    target = ok and "privileged" or "chat"
+  else
+    target = "chat"
+  end
   -- 无 Agent 时先创建（新会话从 CHAT 开始，再应用目标模式）
   local agent = M.get_current_agent()
   if not agent then
@@ -1142,6 +1201,7 @@ function M.load_session(session_id, opts)
     local existing = runtime.get(existing_agent_id)
     if existing then
       state.current_agent_id = existing.id
+      require("NeoAI.sandbox.privileged").set_current(existing.id)
       return existing
     end
   end
@@ -1184,6 +1244,9 @@ function M.load_session(session_id, opts)
   -- 不再注册系统提示段，系统提示保持逐字节稳定以复用前缀缓存。
   local plan_mode = require("NeoAI.tools.builtin.plan_mode")
   plan_mode.restore(agent, session.metadata and session.metadata.plan)
+  -- 还原高权限模式（计划模式优先；未启用/非异步审批时静默回退 CHAT）
+  local privileged_mode = require("NeoAI.tools.builtin.privileged_mode")
+  privileged_mode.restore(agent, session.metadata and session.metadata.privileged)
   -- 还原压缩覆盖层：仅当载入链恰好等于会话自身消息时应用（分支链含祖先/下游，索引会错位，
   -- 此时放弃还原，由后续阈值触发重新压缩）。
   local comp = session.metadata and session.metadata.compaction
@@ -1206,7 +1269,9 @@ function M.load_session(session_id, opts)
   state.sessions[session.id] = agent.id
   state.agents[agent.id] = { session_id = session.id }
   state.current_agent_id = agent.id
-  -- 恢复会话后按还原的模式（含计划模式）应用对应 provider/model 配置
+  -- 沙箱侧按「当前 agent」判断进程级高权限策略（网络代理/容器门面）。
+  require("NeoAI.sandbox.privileged").set_current(agent.id)
+  -- 恢复会话后按还原的模式（含计划/高权限模式）应用对应 provider/model 配置
   _apply_current_mode(agent)
   -- 会话保存了显式选择的模型/提供商时以其为准，覆盖模式默认（避免重开后回退到
   -- 模式默认模型而把不属于该提供商的模型 id 发往错误端点）。
@@ -1249,6 +1314,7 @@ function M.reset()
   state.agents = {}
   state.sessions = {}
   state.current_agent_id = nil
+  pcall(function() require("NeoAI.sandbox.privileged").set_current(nil) end)
   -- 注销会话删除订阅，避免跨测试/重载残留重复清理
   for _, unsub in ipairs(session_cleanup_unsubs) do
     if unsub then pcall(unsub) end

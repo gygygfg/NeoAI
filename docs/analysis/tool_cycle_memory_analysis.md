@@ -157,8 +157,10 @@ end
 ### 4.3 前缀缓存身份
 
 `prefix.verify_cache_identity` 跨请求比对 fingerprint，身份变更即前缀缓存失效（用于诊断与统计）。
-`context_builder` 不把 `reasoning_content` 写回历史，避免使 DeepSeek 前缀缓存从该 assistant
-消息起失效。
+`context_builder` 默认不把 `reasoning_content` 写回历史，避免使 DeepSeek 前缀缓存从该 assistant
+消息起失效；但 DeepSeek thinking + tools 是协议例外：请求携带 `tools` 时必须回传历史
+`reasoning_content`（否则 400），由方言 `reasoning_echo="with_tools"` 在编码阶段输出。reasoning
+生成后不再变化，属稳定字节，不会破坏前缀缓存。
 
 ### 4.4 会话/子 Agent 清理
 

@@ -100,6 +100,10 @@ tests.suite("agents_md", function(_, it)
     t.true_(call.tool_calls[1]["function"].arguments:find("start_line", 1, true) ~= nil,
       "参数须显式带行范围（否则大文件只回大纲）")
     t.true_(call.meta and call.meta.agents_md == true, "assistant 消息应带 agents_md 标记")
+    t.true_(type(call.reasoning) == "string" and call.reasoning ~= "",
+      "虚构轮必须带占位 reasoning（DeepSeek thinking + tools 要求历史 assistant 回传 reasoning_content）")
+    t.true_(agents_md.is_target(root .. "/AGENTS.md", root), "约定文件应识别为只读免审批目标")
+    t.false_(agents_md.is_target(root .. "/OTHER.md", root), "其他文件不应命中免审批豁免")
 
     local res = agent.messages[3]
     t.eq("tool", res.role)
@@ -110,6 +114,36 @@ tests.suite("agents_md", function(_, it)
 
     vim.fn.delete(root, "rf")
     end)
+  end)
+
+  it("backfill 为旧会话的虚构工具轮补齐占位 reasoning", function(t)
+    local agent = {
+      id = "old_agents_md",
+      messages = {
+        {
+          role = "assistant", content = "", meta = { agents_md = true },
+          tool_calls = { { id = "c1", type = "function", ["function"] = { name = "read_file", arguments = "{}" } } },
+        },
+        { role = "tool", tool_call_id = "c1", content = "old", meta = { agents_md = true } },
+      },
+    }
+    t.true_(agents_md.backfill(agent), "无 reasoning 时应补齐")
+    t.true_(type(agent.messages[1].reasoning) == "string" and agent.messages[1].reasoning ~= "")
+    t.false_(agents_md.backfill(agent), "已补齐后应幂等")
+
+    -- meta 不随会话持久化：旧会话靠调用 id 前缀识别
+    local legacy = {
+      id = "old_agents_md2",
+      messages = {
+        {
+          role = "assistant", content = "",
+          tool_calls = { { id = "neoai_agents_md_old", type = "function",
+            ["function"] = { name = "read_file", arguments = "{}" } } },
+        },
+      },
+    }
+    t.true_(agents_md.backfill(legacy), "旧会话应按 id 前缀补齐")
+    t.true_(type(legacy.messages[1].reasoning) == "string" and legacy.messages[1].reasoning ~= "")
   end)
 
   it("inject 幂等：第二次不再注入", function(t)

@@ -1508,6 +1508,9 @@ end
 --- @return Deferred|nil
 local function _maybe_container(attempt, args, ctx, spec)
   if spec.effect ~= "process" then return nil end
+  -- 高权限模式：容器命令按原文直连（docker 可连宿主 daemon），门面完全不接管。
+  local okp, privileged = pcall(require, "NeoAI.sandbox.privileged")
+  if okp and privileged.active(ctx and ctx.agent and ctx.agent.id) then return nil end
   local cfg = config_store.get("tools.sandbox.container") or {}
   if cfg.enabled == false then return nil end
   if type(args.command) ~= "string" or args.command == "" then return nil end
@@ -1788,6 +1791,9 @@ local function _gate_inner(tool, args, ctx, call_original)
     local net = config_store.get("tools.sandbox.network") or {}
     local pmode = net.block_proxy_evasion
     if pmode == false then pmode = "allow" elseif pmode == "deny" then pmode = "deny" else pmode = "ask" end
+    -- 高权限模式：不拦截代理规避（网络整体已放行，仅记录）。
+    local okp, privileged = pcall(require, "NeoAI.sandbox.privileged")
+    if okp and privileged.active(ctx.agent and ctx.agent.id) then pmode = "allow" end
     if pmode ~= "allow" then
       local ok_rt, rt = pcall(require, "NeoAI.sandbox.execution.runtime")
       if ok_rt and rt.host_local_block_enabled and rt.host_local_block_enabled() then
@@ -2677,7 +2683,8 @@ local function _gate_inner(tool, args, ctx, call_original)
       end
     end
 
-    local resolved = privilege.resolve(req.tier, req)
+    local resolved = privilege.resolve(req.tier, req,
+      { process = true, agent_id = ctx.agent and ctx.agent.id })
     if not resolved.ok then
       return _fail(resolved.reason)
     end
@@ -3048,7 +3055,7 @@ local function _gate_inner(tool, args, ctx, call_original)
           if esc and esc.tier > current_tier then
             local r2 = privilege.resolve(esc.tier, {
               tier = esc.tier, docker = req.docker, network = req.network, sysadmin = req.sysadmin,
-            })
+            }, { process = true, agent_id = ctx.agent and ctx.agent.id })
             if r2.ok then
               local built2 = _build_prefix(r2.privileges)
               if built2 then

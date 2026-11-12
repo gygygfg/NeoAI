@@ -86,7 +86,7 @@ opts.wait / opts.on_done / opts.timings_path / opts.verbose`）；顺序隔离�
 
 回归会**跳过环境能力依赖套件**（无特权 runner 上必然失败，失败源于环境而非代码）：
 `gateway`、`multimodal`、`integration`、`timer`、`pty`，以及沙箱专项套件
-`sandbox_{core,session,view,privilege,secret,ops}`、`sandbox_governance`、
+`sandbox_{core,session,view,privilege,secret,ops}`、`sandbox_governance`、`sandbox_privileged`、
 `sandbox_hardening`、`sandbox_service`、`sandbox_systemd`——它们需要 systemd init /
 unshare-userns / netns / 交互式审批 / PTY 等能力。其余套件必须全绿（含沙箱中不依赖
 上述能力的子套件，如 `sandbox_ai_audit`、`sandbox_boundary_*` 等）。跳过清单直接写在
@@ -181,7 +181,7 @@ end)
 | `test_protocol_adapter` | 协议编解码 |
 | `test_prompt_cache / test_cache_strategy / test_cache_usage` | 显式缓存、前缀缓存策略、缓存命中用量 |
 | `test_model_picker` | 模型选择器 |
-| `test_modes` | 模式（CHAT/PLAN） |
+| `test_modes / test_privileged_mode` | 模式（CHAT/PLAN/PRIV：opt-in、async 门槛、互斥与持久化） |
 | `test_multimodal` | 多模态图像 |
 | `test_tools / test_tool_pending` | 工具执行、工具待发/暂存 |
 | `test_pty` | 交互式 PTY：按键映射、/proc 阻塞读检测、判官注入、经门禁的 run_command 自动应答 |

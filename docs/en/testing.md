@@ -101,7 +101,7 @@ The `.github/workflows/ci.yml` workflow runs two jobs on push / PR:
 The regression **skips environment-capability suites** (they inevitably fail on unprivileged
 runners — the failure is environmental, not code): `gateway`, `multimodal`, `integration`,
 `timer`, `pty`, plus the sandbox-specific suites `sandbox_{core,session,view,privilege,secret,ops}`,
-`sandbox_governance`, `sandbox_hardening`, `sandbox_service`, `sandbox_systemd` — these need
+`sandbox_governance`, `sandbox_privileged`, `sandbox_hardening`, `sandbox_service`, `sandbox_systemd` — these need
 systemd init / unshare-userns / netns / interactive approval / PTY capabilities. All remaining
 suites must be green (including the sandbox sub-suites that do not need those capabilities, e.g.
 `sandbox_ai_audit`, `sandbox_boundary_*`). The skip list lives in the workflow's inline `-c`
@@ -195,7 +195,7 @@ ensures there are no leftover subscriptions or state between tests.
 | `test_protocol_adapter` | Protocol encoding and decoding |
 | `test_prompt_cache / test_cache_strategy / test_cache_usage` | Explicit cache, prefix cache strategy, cache hit usage |
 | `test_model_picker` | Model picker |
-| `test_modes` | Modes (CHAT/PLAN) |
+| `test_modes / test_privileged_mode` | Modes (CHAT/PLAN/PRIV: opt-in, async gate, mutual exclusion, persistence) |
 | `test_multimodal` | Multimodal images |
 | `test_tools / test_tool_pending` | Tool execution, pending/staged tools |
 | `test_pty` | Interactive PTY: key mapping, /proc blocked-read detection, judge injection, sandboxed run_command auto-answer |

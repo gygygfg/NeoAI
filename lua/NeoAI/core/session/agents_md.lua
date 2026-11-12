@@ -21,7 +21,14 @@ local DEFAULTS = {
   enabled = true,
   file = "AGENTS.md",
   max_bytes = 64 * 1024,
+  auto_allow_read = true,
 }
+
+--- 虚构工具调用轮的 assistant reasoning。
+--- DeepSeek thinking 模式要求「请求携带 tools 时所有历史 assistant 必须回传
+--- reasoning_content」；这一轮是我们构造的，没有被真实模型生成，因此必须补一个占位
+--- reasoning，否则首轮请求会直接 400。
+local SYNTHETIC_REASONING = "先读取本工作区的开发约定（AGENTS.md），后续实现需遵守其中的规则。"
 
 -- ========== 私有函数 ==========
 
@@ -105,6 +112,27 @@ function M.load(path)
   }
 end
 
+--- 指定路径是否是当前工作区的约定文件（读取该文件免沙箱审批）。
+--- 仅用于只读工具（read_file）；写入/编辑仍走既有审批。
+--- @param path string|nil
+--- @param start string|nil 起始目录（默认 cwd）
+--- @return boolean
+function M.is_target(path, start)
+  if type(path) ~= "string" or path == "" then return false end
+  local base = start or vim.fn.getcwd()
+  local target = M.find(base, _cfg().file)
+  if not target then return false end
+  local expanded = vim.fn.expand(path)
+  if expanded:sub(1, 1) ~= "/" then expanded = _join(_norm(base), expanded) end
+  local abs = vim.fn.fnamemodify(expanded, ":p")
+  if abs ~= "/" then abs = abs:gsub("/+$", "") end
+  local okr, real = pcall(vim.fn.resolve, abs)
+  if okr and type(real) == "string" and real ~= "" then abs = real end
+  local okt, real_target = pcall(vim.fn.resolve, target)
+  if okt and type(real_target) == "string" and real_target ~= "" then target = real_target end
+  return abs == target
+end
+
 --- 注入说明（追加在工具结果末尾，明确「须遵守」与「写入需审批」）
 --- @return string
 local function _directive()
@@ -112,6 +140,37 @@ local function _directive()
     .. "以上是本工作区的开发约定（AGENTS.md），请在后续所有实现中遵守。\n"
     .. "如果开发约定发生变化（新增/调整规则、目录结构变更等），可主动更新 AGENTS.md；"
     .. "写入会经过沙箱审批，不会自动放行。"
+end
+
+--- 为历史会话中「旧版注入的虚构工具轮」补齐占位 reasoning。
+--- 旧版本注入的 assistant(tool_calls=read_file) 没有 reasoning；DeepSeek thinking + tools
+--- 会在恢复该会话后的首个请求直接 400。这里按 agents_md 标记就地补齐（幂等）。
+--- @param agent table|nil
+--- @return boolean changed
+function M.backfill(agent)
+  if type(agent) ~= "table" or type(agent.messages) ~= "table" then return false end
+  if agent._agents_md_reasoning_backfilled then return false end
+  agent._agents_md_reasoning_backfilled = true
+  local changed = false
+  for _, m in ipairs(agent.messages) do
+    if m.role == "assistant" and (type(m.reasoning) ~= "string" or m.reasoning == "") then
+      local synthetic = m.meta and m.meta.agents_md == true
+      if not synthetic then
+        -- meta 不随会话持久化；旧会话靠调用 id 前缀识别（见 inject 的 call_id）。
+        for _, tc in ipairs(m.tool_calls or {}) do
+          if type(tc.id) == "string" and tc.id:find("neoai_agents_md_", 1, true) == 1 then
+            synthetic = true
+            break
+          end
+        end
+      end
+      if synthetic then
+        m.reasoning = SYNTHETIC_REASONING
+        changed = true
+      end
+    end
+  end
+  return changed
 end
 
 --- 判断 agent 是否应注入（顶层 agent + 未注入过 + 配置开启）
@@ -160,6 +219,9 @@ function M.inject(agent, opts)
   local meta = { agents_md = true }
 
   agent_mod.add_message(agent, "assistant", "", {
+    -- 虚构轮必须带 reasoning：DeepSeek thinking + tools 会校验历史 assistant 的
+    -- reasoning_content（无则 400）。占位文本仅用于满足协议，不伪装成真实思考内容。
+    reasoning = SYNTHETIC_REASONING,
     tool_calls = {
       {
         id = call_id,
@@ -180,6 +242,8 @@ end
 --- @param agent table
 --- @return boolean injected
 function M.ensure(agent)
+  -- 先补齐旧会话的占位 reasoning（幂等），再尝试首次注入。
+  pcall(M.backfill, agent)
   local ok, injected = pcall(M.inject, agent)
   if ok then return injected == true end
   return false
@@ -191,6 +255,7 @@ function M.reset(agent)
   if type(agent) == "table" then
     agent._agents_md_injected = nil
     agent._agents_md_path = nil
+    agent._agents_md_reasoning_backfilled = nil
   end
 end
 

@@ -208,6 +208,9 @@ end
 --- 网络访问策略：`ask`（默认）| `allow` | `deny`。`state.opts.access` 优先（测试/内部注入）。
 --- @return string
 local function _access_policy()
+  -- 高权限模式：一律放行（仍记录目标），优先于配置与测试注入。
+  local okp, privileged = pcall(require, "NeoAI.sandbox.privileged")
+  if okp and privileged.active() then return "allow" end
   local p = state.opts.access
   if p ~= "allow" and p ~= "deny" and p ~= "ask" then
     local ok, cfg = pcall(function()
@@ -509,6 +512,19 @@ local function _record(host, port, proto, decision)
   state.records[#state.records + 1] = {
     host = host, port = port, proto = proto, decision = decision, at = os.time(),
   }
+  -- 高权限模式：把放行/拦截目标额外写入独立环形缓冲，供 :NeoAI SandboxAudit network
+  -- 查看（host_proxy.summary 只回传拦截项，且会在命令结束时 drain）。
+  local okp, privileged = pcall(require, "NeoAI.sandbox.privileged")
+  if okp and privileged.active() then
+    local okc, cfg = pcall(function()
+      return require("NeoAI.kernel.config_store").get("tools.privileged_mode") or {}
+    end)
+    if not okc or cfg.record_network ~= false then
+      pcall(privileged.record, {
+        host = host, port = port, proto = proto, decision = decision, at = os.time(),
+      })
+    end
+  end
 end
 
 -- ========== 连接与转发 ==========
@@ -957,7 +973,10 @@ end
 function M.ensure()
   if state.server then return { host = state.host, port = state.port } end
   local cfg = require("NeoAI.kernel.config_store").get("tools.sandbox.network") or {}
-  if cfg.host_local_block == false then return nil end
+  -- 高权限模式即使配置关闭 host_local_block 也要启动代理（仅记录放行目标）。
+  local okp, privileged = pcall(require, "NeoAI.sandbox.privileged")
+  local recording = okp and privileged.active()
+  if cfg.host_local_block == false and not recording then return nil end
   local port = tonumber(cfg.host_local_proxy_port) or 0
   local addr, err = M.start("127.0.0.1", port)
   if not addr and port ~= 0 then
@@ -997,6 +1016,19 @@ end
 function M.address()
   if not state.server then return nil end
   return { host = state.host, port = state.port }
+end
+
+--- 读取最近的网络决策记录（新→旧，不破坏原记录；供 SandboxAudit network）
+--- @param limit number|nil 默认 50
+--- @return table 数组
+function M.recent(limit)
+  local n = tonumber(limit) or 50
+  if n < 1 then n = 1 end
+  local out = {}
+  for i = #state.records, math.max(1, #state.records - n + 1), -1 do
+    out[#out + 1] = vim.deepcopy(state.records[i])
+  end
+  return out
 end
 
 --- 取出并清空记录

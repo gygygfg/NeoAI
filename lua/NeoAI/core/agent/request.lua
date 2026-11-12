@@ -109,9 +109,13 @@ local function _build_request(messages, opts)
     or config_store.get("ai.reasoning_effort")
   reasoning_effort = profiles.normalize_effort(dialect, reasoning_effort)
 
-  -- 协议编码：内部规范 → 各协议 wire 形态（Anthropic system/blocks、Gemini contents 等）
-  local encoded = a.encode_messages(messages, dialect)
+  -- 协议编码：内部规范 → 各协议 wire 形态（Anthropic system/blocks、Gemini contents 等）。
+  -- 先编码工具：OpenAI 方言需要知道本次请求是否携带 tools（DeepSeek thinking 模式下
+  -- 携带 tools 时必须回传历史 reasoning_content，见 adapter.openai.encode_messages）。
   local tools = a.encode_tools(opts.tools, dialect)
+  local encoded = a.encode_messages(messages, dialect, {
+    has_tools = type(tools) == "table" and #tools > 0,
+  })
 
   -- 请求参数回落：显式 opts → 场景配置（modes 的 temperature/max_tokens）
   local ac = opts.agent_config or {}

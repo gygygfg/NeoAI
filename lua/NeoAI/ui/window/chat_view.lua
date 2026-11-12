@@ -1206,10 +1206,11 @@ local function _build_chat_actions()
     insert = function() input_box.focus() end,
     send = function() input_box.focus() end,
     cycle_mode = function()
-      local names = { chat = "CHAT", plan = "PLAN" }
       local mode = chat_service.cycle_mode()
       local suffix = chat_service.has_pending_mode() and "（将在本轮生成结束后生效）" or ""
-      vim.notify("[NeoAI] 模式已切换: " .. (names[mode] or mode) .. suffix, vim.log.levels.INFO)
+      local label = chat_service.mode_label(mode)
+      vim.notify("[NeoAI] 模式已切换: " .. label .. suffix,
+        mode == "privileged" and vim.log.levels.WARN or vim.log.levels.INFO)
       _render()
     end,
     cycle_display = function()

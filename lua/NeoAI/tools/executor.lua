@@ -678,12 +678,28 @@ local function _execute_after_secret_guard(tool, resolved, args, ctx)
   local can_approve = ctx.tool_service ~= nil
     and (not ctx.is_sub_agent or mode ~= "async")
   local in_process_fs = spec.effect == "read" or spec.effect == "fs_write"
+  -- 工作区约定文件（AGENTS.md）的**只读**访问免沙箱审批：它由会话首轮自动注入，
+  -- 模型后续重读同一文件不应再次打断用户。写入/编辑仍按既有审批（auto_allow_read 只作用于 read）。
+  local agents_md_read = false
+  if resolved == "read_file" and spec.effect == "read" then
+    local acfg = config_store.get("session.agents_md") or {}
+    if acfg.auto_allow_read ~= false then
+      local p = args and (args.file_path or args.filepath or args.path or args.file)
+      local okam, am = pcall(require, "NeoAI.core.session.agents_md")
+      if okam and type(am.is_target) == "function" then
+        local okt, target = pcall(am.is_target, p, ctx.agent and ctx.agent.cwd)
+        agents_md_read = okt and target == true
+      end
+    end
+  end
   local needs_approval = false
   if masked_hit then
     if masked_hard then
       return async.reject({ kind = "sandbox", message = "路径位于宿主敏感遮蔽路径: " .. masked_hit })
     end
-    if approval_on and can_approve then
+    if agents_md_read then
+      -- 约定文件只读：不弹遮蔽审批（读取内容本就由会话首轮自动注入）。
+    elseif approval_on and can_approve then
       ctx.sandbox_unmask = ctx.sandbox_unmask or {}
       ctx.sandbox_unmask[#ctx.sandbox_unmask + 1] = masked_hit
       needs_approval = true
@@ -691,7 +707,8 @@ local function _execute_after_secret_guard(tool, resolved, args, ctx)
       return async.reject({ kind = "sandbox", message = "路径位于遮蔽目录且不可审批: " .. masked_hit })
     end
   end
-  if mode ~= "async" and validator.check_approval(resolved, args, approval_config, mode) then
+  if mode ~= "async" and not agents_md_read
+    and validator.check_approval(resolved, args, approval_config, mode) then
     needs_approval = true
   end
 

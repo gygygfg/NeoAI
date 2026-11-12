@@ -44,7 +44,7 @@
 | 关闭窗口 | `q` | |
 | 切换思考显示 | `r` | `message_list.toggle_reasoning` |
 | 切换模型 | `M` | 弹出模型选择器 |
-| 循环模式 | `m` | CHAT → PLAN |
+| 循环模式 | `m` | CHAT → PLAN → PRIV（PRIV 默认 opt-in） |
 | 循环显示模式 | `<C-t>`（插入）/ `T`（普通） | chat / trajectory |
 | 热重载显示模式 | `<F5>` | 重载当前显示模式插件 |
 | 确认计划 | — | 执行 `:NeoAI ApprovePlan`（或手动切换模式）；AI 不再持有切换模式的工具 |
@@ -90,6 +90,13 @@
   确认后转入 CHAT 模式，把计划解析为任务清单（todo）并自动执行。
 - 生成过程中切换模式（`m` / `:NeoAI Plan`）会延迟到当前回合结束后生效，
   不打断正在进行的生成。
+
+### 6.1 高权限模式（PRIV，opt-in）
+
+`tools.privileged_mode.enabled=true` 且 `tools.approval.mode="async"` 时，`m` 会在 PLAN 之后
+进入 PRIV，也可用 `:NeoAI Privileged` 切换。PRIV 下网络不拦截、仅记录目标；docker/podman
+可直接使用（docker 连接宿主 daemon）。该模式默认关闭，容器产生的宿主变更不进入候选/审批，
+详见 [configuration.md](configuration.md) 与 [sandbox.md](sandbox.md) 的安全边界说明。
 
 ## 7. 向用户提问（ask_user）
 

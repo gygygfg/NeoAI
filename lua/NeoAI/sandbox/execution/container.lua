@@ -202,6 +202,9 @@ end
 ---   manager, sub?, mode ("namespace"|"no_share"), share_namespace, command, reason?, rewritten?
 --- }
 function M.plan(command)
+  -- 高权限模式：容器命令按原文执行（不注入 namespace 共享标志、不改写）。
+  local okp, privileged = pcall(require, "NeoAI.sandbox.privileged")
+  if okp and privileged.active() then return nil end
   local cfg = _cfg()
   if cfg.enabled == false then return nil end
   if type(command) ~= "string" or command == "" then return nil end
@@ -268,6 +271,9 @@ end
 --- @return table|nil { manager, original_manager?, sub?, mode="sandbox"|"unsupported",
 ---   reason?, command?, rewritten? }
 function M.facade(command)
+  -- 高权限模式：不接管容器运行时（docker 直连宿主 daemon，podman 直接执行）。
+  local okp, privileged = pcall(require, "NeoAI.sandbox.privileged")
+  if okp and privileged.active() then return nil end
   local cfg = _cfg()
   if cfg.enabled == false then return nil end
   if type(command) ~= "string" or command == "" then return nil end

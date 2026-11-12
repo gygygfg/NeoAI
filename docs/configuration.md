@@ -171,7 +171,7 @@ context_cache = {
 | --- | --- |
 | `global` | `toggle_ui`(<leader>aa)、`open_chat`(<leader>ac)、`open_tree`(<leader>at)、`close_all`(<leader>aq) |
 | `tree` | `quit`(q)、`select`(<CR>)、`new_child`(n)、`new_root`(N)、`delete_dialog`(d，删除当前轮次)、`delete_branch`(D，删除所属会话及全部子分支)、`expand`(o)、`collapse`(O) |
-| `chat` | `insert`(i)、`quit`(q)、`send`、`cancel`(<Esc>)、`toggle_reasoning`(r)、`switch_model`(M)、`cycle_mode`(m)、`switch_sub_agent`(<leader>as，在新窗口打开子 Agent 会话)、`sub_agent_list`(<leader>al，子 Agent 列表弹出窗)、`cycle_display`(<C-t>/T)、`reload_display`(<F5>)、`tool_approval`(<C-a>)、`sandbox_review`(<leader>ap，查看并应用待审的沙箱修改)、`approval.*` |
+| `chat` | `insert`(i)、`quit`(q)、`send`、`cancel`(<Esc>)、`toggle_reasoning`(r)、`switch_model`(M)、`cycle_mode`(m，CHAT/PLAN/PRIV)、`switch_sub_agent`(<leader>as，在新窗口打开子 Agent 会话)、`sub_agent_list`(<leader>al，子 Agent 列表弹出窗)、`cycle_display`(<C-t>/T)、`reload_display`(<F5>)、`tool_approval`(<C-a>)、`sandbox_review`(<leader>ap，查看并应用待审的沙箱修改)、`approval.*` |
 
 ### 2.4 `session`
 
@@ -207,7 +207,7 @@ session = {
   -- 供 AI 遵循；每次会话只注入一次，且**不写入系统提示**（避免前缀缓存失效）。
   --   file：文件名；max_bytes：注入内容上限（超限按 UTF-8 安全截断并标注）
   -- 注意：AI 更新 AGENTS.md 仍走既有沙箱审批，不会因本开关自动放行。
-  agents_md = { enabled = true, file = "AGENTS.md", max_bytes = 64 * 1024 },
+  agents_md = { enabled = true, file = "AGENTS.md", max_bytes = 64 * 1024, auto_allow_read = true },
 }
 ```
 
@@ -227,6 +227,7 @@ session = {
 | `todo.enabled` | `true` | 待办工具 + 系统提示注入 |
 | `web_fetch` | 见下（默认 `enabled=false`） | 网页抓取：无头浏览器渲染动态页面并转 Markdown |
 | `plan_mode` | `{enabled=true, auto_execute_on_approve=true, distill_on_execute=true, distill_parallel=true, distill_front=true, distill_max_attempts=2, extract_max_tokens=nil, extra_safe_tools={}, mutating_tools=...}` | 计划模式 |
+| `privileged_mode` | `{enabled=false, require_async_approval=true, override_offline=true, docker_socket="", record_network=true, max_records=1000}` | 高权限模式（opt-in）：网络仅记录不拦截、可直连 docker/podman；仅异步审批可进入 |
 | `sub_agent` | `{final_instruction="最后请总结你的工作：…"}` | 子 Agent：创建时自动追加到其任务提示末尾的收尾指令（要求最后总结工作）；设为 `""` 可关闭。子 Agent 完成后其最终正文会自动回传主 Agent |
 | `approval` | 见下 | 工具审批 |
 | `sandbox` | 见下 | 工具执行沙箱（dry-run/commit、隔离后端、策略） |
@@ -1021,7 +1022,28 @@ resources = { pressure = { simulate = "critical" } }
 
 状态持久化在 `session.metadata.plan`，恢复会话时还原（`plan_mode.restore`）。
 
-## 4. 相关文档
+## 4. 高权限模式（tools/privileged_mode）
+
+高权限模式是与 CHAT/PLAN 并列的第三种会话模式（per-agent 状态 `agent.privileged_mode`），
+默认 **opt-in 关闭**。启用后按 `m` 在 `CHAT → PLAN → PRIV → CHAT` 间循环，或执行
+`:NeoAI Privileged` 切换；仅当 `tools.approval.mode="async"` 时允许进入。
+
+激活时**只放宽两项**：
+
+1. **网络不拦截，仅记录**：强制 `access="allow"`，覆盖 `ask`/`deny`、`offline=true` 与受控
+   白名单；仍启动宿主侧 `host_proxy` 记录目标（`:NeoAI SandboxAudit network` 可查看）。
+2. **容器直用**：旁路容器门面（不改写 `docker→podman`、不生成入口桩、不伪装 daemon 错误）；
+   `docker` 挂载宿主 socket（自动探测或 `docker_socket` 指定）并注入 `DOCKER_HOST`；
+   `podman/buildah` 即使门面关闭也补容器能力/vfs 存储/seccomp 例外。
+
+**安全边界**：开启后 docker 容器由宿主 daemon 在沙箱外创建，**不进入候选/审批**；
+`/run/docker.sock` 等价宿主 root 能力。文件的普通读写仍沿用沙箱 overlay 与待审规则。
+AI 更新 AGENTS.md 等写入仍需要审批，不受本模式影响。
+
+状态持久化在 `session.metadata.privileged`，恢复会话时还原；与计划模式互斥（计划模式优先）。
+默认 `tools.privileged_mode.enabled=false`，**不会**出现在 `m` 循环中。
+
+## 5. 相关文档
 
 - [README 配置章节](../README.md)：完整配置示例。
 - [tool_system.md](tool_system.md)：`tools.*` 工具/审批配置的运行时行为。

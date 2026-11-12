@@ -113,8 +113,12 @@ nvim --headless --clean -u NONE --cmd "set rtp+=$PWD" \
     所有输出统一经 `utils/stringx.safe_truncate`（UTF-8 安全），`#{message}`/`#{notify}` 按**字符数**封顶。
 12. **仓库约定文件加载**：`AGENTS.md` 通过 `core/session/agents_md.lua` 在会话首个回合注入**一轮
     `read_file` 工具调用**（assistant tool_calls + tool 结果，id 一一对应），**不得**写进系统提示段
-    （会使 provider 前缀缓存全量失效）。幂等：每个顶层 agent 只一次；子 Agent 不注入。
-    AI 更新 `AGENTS.md` 仍走既有沙箱审批，**禁止**因任何 auto_allow/session_auto 被静默放行。
+    （会使 provider 前缀缓存全量失效）。该虚构轮必须带一个**占位 reasoning**：DeepSeek thinking +
+    tools 要求请求中所有历史 assistant 回传 `reasoning_content`，缺失会直接 400（即便这一轮是
+    NeoAI 自己构造的）。幂等：每个顶层 agent 只一次；子 Agent 不注入。
+    `AGENTS.md` 的**只读**访问免沙箱审批（`session.agents_md.auto_allow_read`，默认开，仅作用于
+    `read_file`）；AI **更新** `AGENTS.md` 仍走既有沙箱审批，**禁止**因任何 auto_allow/session_auto
+    被静默放行。
 13. **并发工具各自出结果**：工具结果按原始调用顺序落库（保证 `tool` 消息与 `assistant.tool_calls` 对齐），
     但界面**不得**等整批完成才渲染：`tool_loop` 每完成一个工具即经 `kernel/live_metrics.set_result` 发布
     运行期结果，UI 对尚未配对的结果消息用它渲染（落库后清除）。

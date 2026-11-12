@@ -259,6 +259,9 @@ function M.dispose(agent)
   end)
   local plan_mode = require("NeoAI.tools.builtin.plan_mode")
   plan_mode.cleanup(agent)
+  pcall(function()
+    require("NeoAI.tools.builtin.privileged_mode").cleanup(agent)
+  end)
   agent_mod.dispose(agent)
   state.agents[agent.id] = nil
   if agent.session_id then

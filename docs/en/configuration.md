@@ -179,7 +179,7 @@ context_cache = {
 | --- | --- |
 | `global` | `toggle_ui`(<leader>aa), `open_chat`(<leader>ac), `open_tree`(<leader>at), `close_all`(<leader>aq) |
 | `tree` | `quit`(q), `select`(<CR>), `new_child`(n), `new_root`(N), `delete_dialog`(d, delete selected round), `delete_branch`(D, delete owning session and all descendants), `expand`(o), `collapse`(O) |
-| `chat` | `insert`(i), `quit`(q), `send`, `cancel`(<Esc>), `toggle_reasoning`(r), `switch_model`(M), `cycle_mode`(m), `switch_sub_agent`(<leader>as, open a sub-agent session in a new window), `sub_agent_list`(<leader>al, sub-agent list popup), `cycle_display`(<C-t>/T), `reload_display`(<F5>), `tool_approval`(<C-a>), `sandbox_review`(<leader>ap, view and apply pending sandbox changes), `approval.*` |
+| `chat` | `insert`(i), `quit`(q), `send`, `cancel`(<Esc>), `toggle_reasoning`(r), `switch_model`(M), `cycle_mode`(m, CHAT/PLAN/PRIV), `switch_sub_agent`(<leader>as, open a sub-agent session in a new window), `sub_agent_list`(<leader>al, sub-agent list popup), `cycle_display`(<C-t>/T), `reload_display`(<F5>), `tool_approval`(<C-a>), `sandbox_review`(<leader>ap, view and apply pending sandbox changes), `approval.*` |
 
 ### 2.4 `session`
 
@@ -221,7 +221,7 @@ session = {
   -- session and deliberately **not** written into the system prompt (keeps prefix cache stable).
   --   file: file name; max_bytes: injection cap (UTF-8 safe truncation with a marker)
   -- Note: AI updates to AGENTS.md still go through the usual sandbox approval.
-  agents_md = { enabled = true, file = "AGENTS.md", max_bytes = 64 * 1024 },
+  agents_md = { enabled = true, file = "AGENTS.md", max_bytes = 64 * 1024, auto_allow_read = true },
 }
 ```
 
@@ -241,6 +241,7 @@ session = {
 | `todo.enabled` | `true` | Todo tool + system prompt injection |
 | `web_fetch` | See below (`enabled=false` by default) | Web fetch: render dynamic pages in a headless browser and convert to Markdown |
 | `plan_mode` | `{enabled=true, auto_execute_on_approve=true, distill_on_execute=true, distill_parallel=true, distill_front=true, distill_max_attempts=2, extract_max_tokens=nil, extra_safe_tools={}, mutating_tools=...}` | Plan mode |
+| `privileged_mode` | `{enabled=false, require_async_approval=true, override_offline=true, docker_socket="", record_network=true, max_records=1000}` | Privileged mode (opt-in): network is record-only, docker/podman direct; async approval only |
 | `sub_agent` | `{final_instruction="summarize your work at the end..."}` | Sub-agents: an instruction auto-appended to a sub-agent's task prompt (asks it to summarize its work); set to `""` to disable. On completion the sub-agent's final body is delivered back to the main agent automatically |
 | `approval` | See below | Tool approval |
 | `sandbox` | See below | Tool execution sandbox (dry-run/commit, isolation backend, policy) |
@@ -1145,7 +1146,30 @@ Neither the extraction instruction nor the AI's reply enters `agent.messages`; t
 
 The state is persisted in `session.metadata.plan` and restored when the session is resumed (`plan_mode.restore`).
 
-## 4. Related Documentation
+## 4. Privileged Mode (`tools/privileged_mode`)
+
+Privileged mode is a third session mode alongside CHAT/PLAN (per-agent `agent.privileged_mode`), **opt-in and off
+by default**. When enabled, `m` cycles `CHAT → PLAN → PRIV → CHAT`, or use `:NeoAI Privileged`; it can only be
+entered when `tools.approval.mode="async"`.
+
+It relaxes exactly two things:
+
+1. **Network is not blocked, only recorded**: force `access="allow"`, overriding `ask`/`deny`, `offline=true`
+   and the controlled allowlist. The host-side `host_proxy` still records targets (see
+   `:NeoAI SandboxAudit network`).
+2. **Direct containers**: bypass the container facade (no `docker→podman` rewrite, no entry stubs, no fake
+   daemon errors); `docker` mounts the host socket (auto-detected or `docker_socket`) and injects `DOCKER_HOST`;
+   `podman/buildah` get container capabilities/vfs storage/seccomp exception even when the facade is disabled.
+
+**Security boundary**: containers created through docker run outside the sandbox on the host daemon and are
+**not** frozen into candidates/approvals; `/run/docker.sock` is equivalent to host root. Ordinary file
+read/write still uses the sandbox overlay and review pipeline. Writes such as updating AGENTS.md still require
+approval and are not affected by this mode.
+
+State is persisted in `session.metadata.privileged` and restored on resume; it is mutually exclusive with plan
+mode (plan mode wins). Default `tools.privileged_mode.enabled=false`, so it does **not** appear in the `m` cycle.
+
+## 5. Related Documentation
 
 - [README configuration section](../../README.en.md): full configuration example.
 - [tool_system.md](tool_system.md): runtime behavior of the `tools.*` tool/approval configuration.

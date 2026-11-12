@@ -118,9 +118,14 @@ _runtime._run_generation(agent, opts)
 
 - 首条系统消息由 `prefix.build_system_prompt(agent)` 渲染（有序段拼接）。
 - 工具调用协议要求：带 `tool_calls` 的 assistant 消息，`content` 必须为 `null`（或省略）。
-- **推理内容（reasoning_content）不随历史回传**：避免每次请求重复发送整段思维链、
+- **推理内容（reasoning_content）默认不随历史回传**：避免每次请求重复发送整段思维链、
   使 DeepSeek 前缀缓存从该 assistant 消息起字节不一致而失效。内部 `message.reasoning`
-  仍保留用于渲染。
+  仍保留用于渲染，并保留在出站消息对象上由协议方言决定是否编码。
+  **例外（DeepSeek thinking + tools）**：请求携带 `tools` 时，DeepSeek 协议要求回传所有
+  历史 assistant 的 `reasoning_content`（缺失返回 400 invalid_request_error）。方言
+  `reasoning_echo="with_tools"`（内置 DeepSeek OpenAI profile）会在带工具时输出该字段；
+  无工具的压缩/计划提取等辅助调用不回传。reasoning 生成后不再变化，属稳定字节，不会
+  破坏前缀缓存。
 - **运行时上下文快照**（`core/session/runtime_context.lua`）：todo/计划模式/常驻技能等易变
   状态以追加快照注入历史，内容变化才追加新快照，旧快照不改写。支持 messages 中途 system 的
   端点（DeepSeek 两种协议）使用 `role="system"` 提升优先级；其余端点回退 `user`。两种角色

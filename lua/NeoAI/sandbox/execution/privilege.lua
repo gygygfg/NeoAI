@@ -575,11 +575,54 @@ function M.classify(_, args, spec, opts)
   }
 end
 
+--- 高权限模式：把宿主 docker socket 挂载进沙箱并解除遮蔽。
+--- 仅当 socket/测试哨兵文件存在时挂载；路径可由 `tools.privileged_mode.docker_socket` 覆盖。
+--- @param priv table 档位 privileges（原地修改）
+--- @return boolean mounted
+local function _append_host_docker(priv)
+  local cfg = config_store.get("tools.privileged_mode") or {}
+  local candidates = {
+    cfg.docker_socket,
+    "/run/docker.sock",
+    "/var/run/docker.sock",
+  }
+  local xdg = os.getenv("XDG_RUNTIME_DIR")
+  if type(xdg) == "string" and xdg ~= "" then
+    candidates[#candidates + 1] = xdg .. "/docker.sock"
+  end
+  local src = nil
+  for _, p in ipairs(candidates) do
+    if type(p) == "string" and p ~= "" then
+      local st = vim.uv.fs_stat(p)
+      if st and (st.type == "socket" or st.type == "file") then
+        src = p
+        break
+      end
+    end
+  end
+  if not src then return false end
+  local okr, real = pcall(vim.fn.resolve, src)
+  if not okr or type(real) ~= "string" or real == "" then real = src end
+  local dst = "/run/docker.sock"
+  priv.mounts = priv.mounts or {}
+  priv.mounts[#priv.mounts + 1] = { src = real, dst = dst, mode = "rw" }
+  priv.unmask = priv.unmask or {}
+  for _, p in ipairs({ dst, "/var/run/docker.sock", real }) do
+    if not vim.tbl_contains(priv.unmask, p) then
+      priv.unmask[#priv.unmask + 1] = p
+    end
+  end
+  priv.env = priv.env or {}
+  priv.env.DOCKER_HOST = "unix://" .. dst
+  return true
+end
+
 --- 解析档位对应的具体隔离参数
 --- @param tier number
 --- @param req table|nil classify() 返回（含 docker/network）
+--- @param opts table|nil { process?=boolean, agent_id?=string }
 --- @return table { ok, privileges?, reason? }
-function M.resolve(tier, req)
+function M.resolve(tier, req, opts)
   local cfg = _cfg()
   if cfg.enabled == false then
     return { ok = false, reason = "PRIVILEGE_DISABLED" }
@@ -588,6 +631,10 @@ function M.resolve(tier, req)
   if tier > max_tier then
     return { ok = false, reason = "PRIVILEGE_TIER_EXCEEDS_MAX: " .. tostring(tier) .. " > " .. tostring(max_tier) }
   end
+  local privileged_active = false
+  pcall(function()
+    privileged_active = require("NeoAI.sandbox.privileged").active(opts and opts.agent_id)
+  end)
   local t = _tier_cfg(tier)
   local priv = {
     tier = tier,
@@ -600,6 +647,10 @@ function M.resolve(tier, req)
     userns = t.userns == true,
     env = {},
   }
+  -- 高权限模式：进程命令可直连宿主 docker daemon（仅此模式例外）。
+  if privileged_active and opts and opts.process then
+    _append_host_docker(priv)
+  end
   -- 容器命令：沙箱内只走 podman/buildah（无守护进程）。**永不连接宿主 docker daemon**——
   -- 容器由宿主 daemon 在沙箱外创建、无法约束，且挂载路径改写不是安全边界，故不再挂载/解除
   -- docker.sock 遮蔽（保持遮蔽；真实 docker 二进制自然报「daemon 未运行」）。
@@ -610,7 +661,10 @@ function M.resolve(tier, req)
     -- （不改写运行时、不注入 STORAGE_DRIVER/BUILDAH_ISOLATION、不授予容器档能力、不注入
     -- containers.conf），运行时由宿主自身提供。
     local ccfg = config_store.get("tools.sandbox.container") or {}
-    if ccfg.enabled ~= false then
+    -- 高权限模式：即使容器门面默认关闭，无守护进程的 podman/buildah 也按容器档授予能力，
+    -- 使其可直接运行（docker 只需宿主 socket，见 _append_host_docker）。
+    local privileged_container = privileged_active and req.container == true
+    if ccfg.enabled ~= false or privileged_container then
       priv.env.STORAGE_DRIVER = priv.env.STORAGE_DRIVER or "vfs"
       priv.env.BUILDAH_ISOLATION = priv.env.BUILDAH_ISOLATION or "chroot"
       -- 容器运行时在沙箱内创建容器需要宿主能力（命名空间/mount/pivot_root/mknod/chown…），
@@ -624,7 +678,7 @@ function M.resolve(tier, req)
           if type(c) == "string" and c ~= "" then priv.cap_add[#priv.cap_add + 1] = c end
         end
       end
-      if ccfg.seccomp == false then priv.seccomp = false end
+      if ccfg.seccomp == false or privileged_container then priv.seccomp = false end
       if ccfg.containers_conf ~= false then priv.containers_conf = true end
     end
   end

@@ -210,6 +210,33 @@ local SUBCOMMANDS = {
     end,
   },
   {
+    name = "Privileged",
+    phase1 = true,
+    desc = "切换高权限模式（网络仅记录、可直连 docker/podman）",
+    handler = function()
+      local chat_service = _svc("services.chat_service")
+      if not chat_service then return end
+      local active, reason = chat_service.toggle_privileged_mode()
+      local ui = _svc("services.ui")
+      local view = ui and ui.get_chat_view()
+      if view then view.refresh() end
+      if active == nil then
+        local text = reason == "PRIVILEGED_MODE_DISABLED"
+          and "高权限模式未启用（设置 tools.privileged_mode.enabled = true）"
+          or reason == "PRIVILEGED_MODE_REQUIRES_ASYNC"
+          and "高权限模式仅支持异步审批（tools.approval.mode = \"async\"）"
+          or reason == "NO_AGENT"
+          and "无当前 Agent，无法切换高权限模式"
+          or tostring(reason or "未知原因")
+        vim.notify("[NeoAI] 无法切换高权限模式：" .. text, vim.log.levels.WARN)
+      else
+        local suffix = chat_service.has_pending_mode() and "（将在本轮生成结束后生效）" or ""
+        vim.notify("[NeoAI] 高权限模式已" .. (active and "开启" or "关闭") .. suffix,
+          active and vim.log.levels.WARN or vim.log.levels.INFO)
+      end
+    end,
+  },
+  {
     name = "ApprovePlan",
     phase1 = true,
     desc = "确认计划并转入 CHAT 执行",
@@ -580,8 +607,31 @@ local SUBCOMMANDS = {
   },
   {
     name = "SandboxAudit",
-    desc = "显示沙箱行为审计与风险评估摘要",
-    handler = function()
+    desc = "显示沙箱行为审计与风险评估摘要（network = 查看网络访问记录）",
+    handler = function(sub_opts)
+      local kind = _first_arg(sub_opts)
+      if kind == "network" then
+        local ok, hp = pcall(require, "NeoAI.sandbox.net.host_proxy")
+        if not ok then return end
+        -- 高权限模式另有一份不会被 host_proxy.summary drain 的环形记录；优先读取它。
+        local recs = {}
+        local okp, sp = pcall(require, "NeoAI.sandbox.privileged")
+        if okp and type(sp.records) == "function" then recs = sp.records(50) end
+        if #recs == 0 then recs = hp.recent(50) end
+        if #recs == 0 then
+          vim.notify("[NeoAI] 暂无网络访问记录", vim.log.levels.INFO)
+          return
+        end
+        local lines = {}
+        for _, r in ipairs(recs) do
+          local at = os.date("%H:%M:%S", tonumber(r.at) or os.time())
+          lines[#lines + 1] = ("%s  %-10s %s:%s -> %s"):format(
+            at, tostring(r.proto or "?"), tostring(r.host or "?"), tostring(r.port or "?"),
+            tostring(r.decision or "?"))
+        end
+        vim.notify("[NeoAI] 最近网络访问记录：\n" .. table.concat(lines, "\n"), vim.log.levels.INFO)
+        return
+      end
       local ok, audit = pcall(require, "NeoAI.sandbox.observe.audit")
       if not ok then return end
       vim.notify("[NeoAI] " .. audit.summary(), vim.log.levels.INFO)

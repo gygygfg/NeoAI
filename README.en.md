@@ -18,6 +18,7 @@
 - **A rich set of built-in tools** — the AI can call 40+ tools for file operations, code analysis, LSP, Shell commands, and more
 - **Tool approval system** — fine-grained control over tool execution permissions, supporting auto-allow / manual approval / argument-level allowlists
 - **Plan mode (PLAN) and plan extraction** — toggle with `m` or `:NeoAI Plan`; the tool context retains only read-only / informational queries plus `run_command` (read-only research) and `ask_user` (no mutating tools are exposed, and no mode-switching tool is given to the AI); after the AI researches and clarifies, it emits a formatted change plan and ends the turn; once the user confirms (`:NeoAI ApprovePlan` or manually toggling the mode), NeoAI switches to CHAT: at the boundary it first runs one **XML plan extraction** (`<target>`/`<stepN>`/`<files>` etc., case-insensitive, retrying up to 3 times when key fields are missing), assembles the execution context, builds the task list automatically per step (`todo_write`), and keeps `<files>`-related tool messages verbatim for cache hits before starting execution
+- **Privileged mode (PRIV, opt-in)** — cycle with `m` or toggle with `:NeoAI Privileged`; network is record-only and docker/podman can be used directly (docker connects to the host daemon). Off by default and async-approval only; see `docs/en/configuration.md` and `docs/sandbox.md` for the security boundary
 - **Background context compaction** — as the context threshold approaches, round 1 through the second-to-last round (keeping the last round intact) is folded **asynchronously in the background, non-blocking**, and a checkpoint is written into a **compaction overlay**: subsequent requests and further compactions use the compacted replacement, while chat rendering and session persistence keep the original context (the overlay is saved with the session and survives a restart); compaction opens no floating window; in addition to turn boundaries, **a pressure check runs before every round of the tool loop** (after tool results are written back and before the next request), so long loops converge round by round; **when the history safety cap is exceeded we compact synchronously before sending (replacing the prefix with a checkpoint instead of truncating it)**; on overflow the request is compacted and retried automatically; plan extraction still shows reasoning and content live in a floating window
 - **Sub-Agent system** — the AI can spawn sub-Agents to run subtasks in parallel, with boundary review
 - **Decoupled frontend/backend architecture** — an event-driven asynchronous architecture that separates the UI from business logic
@@ -212,6 +213,7 @@ shown by a floating hint (or by your nvim-cmp + cmp-cmdline setup when installed
 | `:NeoAI ReloadDisplay`| Hot-reload the display mode plugin (reloads the current mode by default) |
 | `:NeoAI ReloadAll`  | Hot-reload the whole NeoAI plugin (isolated pre-check first; cancel on failure) |
 | `:NeoAI Plan`       | Toggle plan mode (the tool context retains only read-only / informational queries + asking the user) |
+| `:NeoAI Privileged` | Toggle privileged mode (record-only network, direct docker/podman; opt-in) |
 | `:NeoAI ApprovePlan`| Confirm the plan and switch to CHAT mode to execute it per the task list |
 | `:NeoAI SandboxCommit`| Apply a sandbox candidate to the real workspace (CAS publish; arg = candidate digest) |
 | `:NeoAI SandboxReview`| List pending changes and apply the selected one (async review; press `E` on the "Resource Access" page to add/remove workspace/masked dirs, session-only) |
@@ -257,7 +259,7 @@ injects one `read_file` tool round so the conventions are in the AI's context �
 - Injected once, only into a newly created top-level session (reopened sessions and sub-agents are skipped);
 - Never written into the system prompt, so the provider prefix cache stays intact;
 - AI updates to `AGENTS.md` still go through the usual sandbox approval;
-- Config: `session.agents_md = { enabled=true, file="AGENTS.md", max_bytes=64*1024 }`.
+- Config: `session.agents_md = { enabled=true, file="AGENTS.md", max_bytes=64*1024, auto_allow_read=true }` (read-only access skips sandbox approval; writes still require it).
 
 ### 4. Default Keymaps
 
@@ -421,7 +423,7 @@ require("NeoAI").setup({
       cancel = { key = "<Esc>", desc = "Cancel generation" },
       switch_model = { key = "M", desc = "Switch model" },
       toggle_reasoning = { key = "r", desc = "Toggle the display of the reasoning process" },
-      cycle_mode = { key = "m", desc = "Cycle through modes (CHAT/PLAN)" },
+      cycle_mode = { key = "m", desc = "Cycle through modes (CHAT/PLAN/PRIV)" },
       cycle_display = {
         insert = { key = "<C-t>", desc = "Cycle display modes (chat/trajectory)" },
         normal = { key = "T", desc = "Cycle display modes (chat/trajectory)" },
@@ -480,6 +482,14 @@ require("NeoAI").setup({
       distill_max_attempts = 2,          -- per-lane max attempts on the parallel path (only target/steps retry when missing)
       extra_safe_tools = {},             -- extensions to the plan mode allowlist
       -- mutating_tools = { ... },       -- mutating tools (the visible set in plan mode already covers this semantics)
+    },
+    privileged_mode = {
+      enabled = false,                   -- opt-in: privileged mode (record-only network, direct docker/podman)
+      require_async_approval = true,     -- only allowed when tools.approval.mode="async"
+      override_offline = true,           -- lift tools.sandbox.offline=true (still recorded through host_proxy)
+      docker_socket = "",                -- host docker socket; empty = auto-detect
+      record_network = true,             -- record allowed network targets (:NeoAI SandboxAudit network)
+      max_records = 1000,
     },
     approval = {
       mode = "async",                    -- async (default: run in the sandbox now, confirm & apply after the fact) | prompt | auto_allow | strict
@@ -1131,6 +1141,7 @@ NeoAI/
 │       ├── plan.lua           # Sub-agent + boundary review
 │       ├── todo.lua           # Todo list (todo_write/read/clear + prompt segment)
 │       ├── plan_mode.lua      # Plan mode (enter_plan_mode + tool filtering/gating)
+│       ├── privileged_mode.lua# Privileged mode (record-only network + direct containers)
 │       ├── ask_user.lua       # Ask the user
 │       ├── read_image.lua     # Image reading (multimodal)
 │       ├── skills.lua         # Skills tools (list_skills/load_skill + prompt segment)
@@ -1199,6 +1210,7 @@ NeoAI/
     ├── test_herder.lua        # Herder status reporting
     ├── test_ask_user.lua      # Ask the user
     ├── test_plan_mode.lua     # Plan mode
+    ├── test_privileged_mode.lua # Privileged mode (opt-in/async gate/mutual exclusion)
     ├── test_plan_distill.lua  # Plan extraction
     ├── test_todo.lua          # Todo list
     ├── test_sub_agent_result.lua # Sub-agent results

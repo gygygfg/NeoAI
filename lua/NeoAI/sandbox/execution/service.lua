@@ -268,8 +268,13 @@ local function _build(svc, opts)
   end
   svc.specs = specs
 
+  local privileged_active = false
+  pcall(function()
+    local sp = require("NeoAI.sandbox.privileged")
+    privileged_active = sp.active() and sp.override_offline()
+  end)
   local priv = {
-    network = (opts.network ~= false) and sandbox_cfg.offline ~= true,
+    network = (opts.network ~= false) and (sandbox_cfg.offline ~= true or privileged_active),
     cap_add = {}, mounts = {}, userns = false, unmask = roots,
   }
   -- 与 run_command/exec 共用同一「稳定」临时根（/tmp、/var/tmp、/run）：服务据此看到 AI 写入

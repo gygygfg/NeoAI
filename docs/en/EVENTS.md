@@ -179,6 +179,7 @@ All event constants are defined in `NeoAI.kernel.events`. They are listed below 
 | --- | --- | --- | --- |
 | `TODO_UPDATED` | `todo:updated` | To-do list updated | `{ session_id, count, counts }` |
 | `PLAN_MODE_CHANGED` | `plan_mode:changed` | Plan mode toggled | `{ agent_id, active }` |
+| `PRIVILEGED_MODE_CHANGED` | `privileged_mode:changed` | Privileged mode toggled | `{ agent_id, active }` |
 
 ### MCP
 

@@ -109,6 +109,9 @@ end
 --- @return boolean 是否成功
 function M.enter(agent)
   if not agent then return false end
+  -- 互斥：进入计划模式时退出高权限模式（会触发 PRIVILEGED_MODE_CHANGED）。
+  local privileged_mode = require("NeoAI.tools.builtin.privileged_mode")
+  if privileged_mode.is_active(agent) then privileged_mode.exit(agent) end
   agent.plan_mode = true
   -- 记录进入计划模式时的消息数，供 plan_distill 切分「计划阶段调研窗口」。
   agent._plan_enter_index = #(agent.messages or {})
@@ -149,6 +152,9 @@ function M.restore(agent, state)
   if not agent or not state then return end
   agent.plan = state.plan
   if state.active then
+    -- 计划模式与高权限模式互斥：历史元数据若同时为 true，计划模式优先。
+    local privileged_mode = require("NeoAI.tools.builtin.privileged_mode")
+    if privileged_mode.is_active(agent) then privileged_mode.exit(agent) end
     agent.plan_mode = true
     _apply_section(agent, true)
   end

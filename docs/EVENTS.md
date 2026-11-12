@@ -179,6 +179,7 @@ vim.api.nvim_create_autocmd("User", {
 | --- | --- | --- | --- |
 | `TODO_UPDATED` | `todo:updated` | 待办清单更新 | `{ session_id, count, counts }` |
 | `PLAN_MODE_CHANGED` | `plan_mode:changed` | 计划模式切换 | `{ agent_id, active }` |
+| `PRIVILEGED_MODE_CHANGED` | `privileged_mode:changed` | 高权限模式切换 | `{ agent_id, active }` |
 
 ### MCP
 

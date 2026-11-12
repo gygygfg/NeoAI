@@ -148,6 +148,9 @@ end
 --- 访问策略：`ask`（弹窗同意，默认）| `allow`（直接放行）| `deny`（直接拒绝）
 --- @return string
 function M.policy()
+  -- 高权限模式：不拦截网络（仍由 host_proxy 记录目标），覆盖 access=ask/deny。
+  local ok, privileged = pcall(require, "NeoAI.sandbox.privileged")
+  if ok and privileged.active() then return "allow" end
   local p = _cfg().access
   if p ~= "allow" and p ~= "deny" then p = "ask" end
   return p

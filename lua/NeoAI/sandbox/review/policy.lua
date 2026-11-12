@@ -150,16 +150,21 @@ function M.evaluate(facts)
     end
   end
   if facts.effect == "network" then
-    local sb = require("NeoAI.kernel.config_store").get("tools.sandbox") or {}
-    if sb.offline == true then
-      -- 显式离线：硬拒绝网络
-      results[#results + 1] = { decision = "DENY", reason_codes = { "NETWORK_OFFLINE" } }
-    elseif type(sb.network) == "table" and sb.network.enabled == true then
-      -- 可选更严格模式：受控网关按声明端点校验
-      local url = facts.args and (facts.args.url or facts.args.endpoint)
-      local ok, reason = require("NeoAI.sandbox.net.network").authorize(url, {})
-      if not ok then
-        results[#results + 1] = { decision = "DENY", reason_codes = { reason } }
+    -- 高权限模式：网络不拦截（仅记录），覆盖 offline 与受控白名单。
+    local okp, privileged = pcall(require, "NeoAI.sandbox.privileged")
+    local bypass = okp and privileged.active() and privileged.override_offline()
+    if not bypass then
+      local sb = require("NeoAI.kernel.config_store").get("tools.sandbox") or {}
+      if sb.offline == true then
+        -- 显式离线：硬拒绝网络
+        results[#results + 1] = { decision = "DENY", reason_codes = { "NETWORK_OFFLINE" } }
+      elseif type(sb.network) == "table" and sb.network.enabled == true then
+        -- 可选更严格模式：受控网关按声明端点校验
+        local url = facts.args and (facts.args.url or facts.args.endpoint)
+        local ok, reason = require("NeoAI.sandbox.net.network").authorize(url, {})
+        if not ok then
+          results[#results + 1] = { decision = "DENY", reason_codes = { reason } }
+        end
       end
     end
     -- 默认放行：仅记录（不拦截）

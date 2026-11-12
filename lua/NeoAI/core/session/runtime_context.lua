@@ -48,7 +48,7 @@ local function _snapshot_role(agent)
   return "user"
 end
 
---- 渲染当前运行上下文（todos + 计划模式 + 已装载技能），空则返回 ""
+--- 渲染当前运行上下文（todos + 计划模式/高权限模式 + 已装载技能），空则返回 ""
 --- @param agent table
 --- @return string
 local function _render(agent)
@@ -62,6 +62,10 @@ local function _render(agent)
   local plan_mode = require("NeoAI.tools.builtin.plan_mode")
   if plan_mode.is_active(agent) then
     blocks[#blocks + 1] = plan_mode.policy_text()
+  end
+  local privileged_mode = require("NeoAI.tools.builtin.privileged_mode")
+  if privileged_mode.is_active(agent) then
+    blocks[#blocks + 1] = privileged_mode.policy_text()
   end
   -- 已装载技能（skills.persist_loaded）：以快照方式常驻而非改写系统提示——改写系统提示会让
   -- 整段前缀缓存失效（历史每轮全量重算）。按技能名排序保证确定性。

@@ -96,8 +96,11 @@ Compaction failure preserves the successfully appended records and retries on a 
   prefix byte-stable inside a block.
 - **Tool-call protocol**: for an assistant message with `tool_calls`, `content` must be `null` (or omitted);
   sending `content:""` is treated as a malformed format by models that enforce strict validation.
-- **Reasoning content is not sent back with history**: `reasoning_content` is not written into API messages; the internal `message.reasoning` is used only for rendering.
-  This avoids re-sending the entire chain of thought and invalidating the DeepSeek prefix cache starting from that assistant message.
+- **Reasoning content is not sent back with history by default**: `reasoning_content` is not written into API messages; the internal
+  `message.reasoning` is used for rendering. This avoids re-sending the entire chain of thought and invalidating the DeepSeek prefix cache
+  starting from that assistant message. **DeepSeek thinking + tools exception**: when the request carries `tools`, the protocol requires prior
+  `reasoning_content` to be passed back (otherwise 400); the dialect option `reasoning_echo="with_tools"` emits it during encoding, while
+  tool-less helper calls do not echo it.
 - `build_prefix(agent, range_messages)`: builds the compaction replay prefix (system + the specified range), so that helper summarization calls can reuse the prefix cache.
 - `build_fork_context(session, task)`: the initial context for a child session derived from a parent session.
 - `estimate_tokens(messages)`: rough token estimate (characters/4).

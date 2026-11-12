@@ -76,9 +76,10 @@ M.ASK_USER_ANSWERED = "ask_user:answered"
 M.TOOL_ARG_CHUNK = "tool:arg_chunk"
 M.TOOL_ARG_COMPLETED = "tool:arg_completed"
 
--- ========== 待办 / 计划模式 ==========
+-- ========== 待办 / 计划模式 / 高权限模式 ==========
 M.TODO_UPDATED = "todo:updated"
 M.PLAN_MODE_CHANGED = "plan_mode:changed"
+M.PRIVILEGED_MODE_CHANGED = "privileged_mode:changed"
 
 -- ========== 模型 ==========
 M.MODELS_UPDATED = "models:updated"

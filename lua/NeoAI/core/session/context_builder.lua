@@ -84,11 +84,17 @@ local function _to_api_message(message)
   if content ~= "" or message.role ~= "assistant" or not has_tool_calls then
     out.content = content
   end
-  -- 推理内容（reasoning_content / 思维链）不随历史回传，仅用于 UI 展示：
-  --   1) 符合 OpenAI/DeepSeek 协议（assistant 消息无 reasoning_content 字段）；
-  --   2) 避免每次请求把整段思维链重复发送，显著降低 prompt token；
-  --   3) 推理内容若随两轮之间的变化写回，会让 DeepSeek 前缀缓存从该 assistant 消息起
-  --      字节不一致而失效（这里规避，缓存命中率更高）。内部 message.reasoning 仍保留用于渲染。
+  -- 推理内容（reasoning_content / 思维链）**保留在出站对象上**，由 adapter 按方言
+  -- `reasoning_echo` 决定是否编码为 wire 字段：
+  --   * 默认（"never"）= 不随历史回传，避免重复发送整段思维链、降低 prompt token；
+  --   * DeepSeek thinking 模式：请求携带 tools 时协议要求回传所有历史 assistant 的
+  --     reasoning_content（否则 400 invalid_request_error），由 openai adapter 在
+  --     `reasoning_echo="with_tools"` 时输出。它是一次生成后不再变化的稳定字节，
+  --     因此不会破坏前缀缓存。内部 message.reasoning 同时仍用于 UI 渲染。
+  if message.role == "assistant" and type(message.reasoning) == "string"
+    and message.reasoning ~= "" then
+    out.reasoning = message.reasoning
+  end
   if has_tool_calls then
     out.tool_calls = message.tool_calls
   end

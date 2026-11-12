@@ -50,7 +50,7 @@ The chat window = **main message area (top)** + **input box (bottom, split, heig
 | Close window | `q` | |
 | Toggle reasoning display | `r` | `message_list.toggle_reasoning` |
 | Switch model | `M` | Opens the model selector |
-| Cycle mode | `m` | CHAT → PLAN |
+| Cycle mode | `m` | CHAT → PLAN → PRIV (PRIV is opt-in) |
 | Cycle display mode | `<C-t>` (insert) / `T` (normal) | chat / trajectory |
 | Hot-reload display mode | `<F5>` | Reload the current display-mode plugin |
 | Approve plan | — | Run `:NeoAI ApprovePlan` (or toggle the mode manually); the AI no longer holds a mode-switching tool |
@@ -111,6 +111,14 @@ Expand/collapse: `zM` (collapse all) / `zo` (expand) / `zR` (expand all).
   list, and executes it automatically.
 - Switching modes during generation (`m` / `:NeoAI Plan`) is deferred until the current turn ends,
   so it does not interrupt an in-progress generation.
+
+### 6.1 Privileged Mode (PRIV, opt-in)
+
+When `tools.privileged_mode.enabled=true` and `tools.approval.mode="async"`, `m` enters PRIV after
+PLAN, or use `:NeoAI Privileged`. In PRIV the network is not blocked (targets are recorded) and
+docker/podman can be used directly (docker connects to the host daemon). It is off by default;
+host changes made by containers bypass the candidate/approval pipeline. See
+[configuration.md](configuration.md) and [sandbox.md](sandbox.md) for the security boundary.
 
 ## 7. Asking the User (ask_user)
 

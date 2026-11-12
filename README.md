@@ -18,6 +18,7 @@
 - **丰富的内置工具** — AI 可调用文件操作、代码分析、LSP、Shell 命令等 40+ 工具
 - **工具审批系统** — 细粒度的工具执行权限控制，支持自动允许/手动审批/参数级别白名单
 - **计划模式（PLAN）与计划提取** — 按 `m` 或 `:NeoAI Plan` 切换，工具上下文只保留只读/信息查询 + `run_command`（只读调研）+ `ask_user`（不暴露任何修改类工具，也不向 AI 提供切换模式的工具）；AI 调研澄清后输出格式化修改计划并结束本轮，由用户确认（`:NeoAI ApprovePlan` 或手动切换模式）后转入 CHAT：边界处先做一轮 **XML 计划提取**（`<target>`/`<stepN>`/`<files>` 等，忽略大小写、缺失关键字段重试最多 3 次），据此组装执行上下文并按步骤自动建任务清单（`todo_write`），`<files>` 相关工具消息原样保留以保证缓存命中，再开始执行
+- **高权限模式（PRIV，opt-in）** — 按 `m` 循环或 `:NeoAI Privileged` 切换；网络不拦截仅记录、可直接使用 docker/podman（docker 直连宿主 daemon）。默认关闭且仅异步审批可用，安全边界见 `docs/configuration.md` 与 `docs/sandbox.md`
 - **后台上下文压缩** — 接近上下文阈值时**后台异步、非阻塞**地折叠第一轮至倒数第二轮（保留最后一轮），以检查点写入**压缩覆盖层**：后续请求与再次压缩使用压缩后的替换，而聊天渲染与会话持久化仍是原始上下文（覆盖层随会话保存，重开后继续生效）；压缩不弹悬浮窗；除回合边界外，**工具循环每轮发送前也会做压力检查**（工具结果已回写、下一轮请求前），长循环逐轮收敛；**历史条数超过安全上限时先同步压缩再发送（用检查点替换，而不是裸截断改写前缀）**；溢出时自动压缩后重试；计划提取过程仍以悬浮窗实时展示推理与正文
 - **子 Agent 系统** — AI 可创建子 Agent 并行执行子任务，支持边界审核
 - **前后端分离架构** — 事件驱动的异步架构，UI 与业务逻辑解耦
@@ -203,6 +204,7 @@ require("NeoAI").setup({
 | `:NeoAI ReloadDisplay`| 热重载显示模式插件（缺省重载当前模式）            |
 | `:NeoAI ReloadAll`  | 热重载整个 NeoAI 插件（先做隔离预检，失败则取消）  |
 | `:NeoAI Plan`       | 切换计划模式（工具上下文只保留只读/信息查询 + 提问）|
+| `:NeoAI Privileged` | 切换高权限模式（网络仅记录、可直连 docker/podman；需先启用）|
 | `:NeoAI ApprovePlan`| 确认计划并转入 CHAT 模式按任务清单执行             |
 | `:NeoAI SandboxCommit`| 应用沙箱候选到真实工作区（CAS 发布，参数为候选摘要）|
 | `:NeoAI SandboxReview`| 列出待审修改并选择应用（异步审批；「资源访问」页按 `E` 可增删工作目录/遮蔽目录，仅本会话）             |
@@ -247,7 +249,7 @@ require("NeoAI").setup({
 - 只在**新建的顶层会话**注入一次（重开会话、子 Agent 不重复注入）；
 - 不写入系统提示，因此不会破坏 provider 的前缀缓存；
 - AI 需要更新 `AGENTS.md` 时**照常走沙箱审批**，不会被自动放行；
-- 配置：`session.agents_md = { enabled=true, file="AGENTS.md", max_bytes=64*1024 }`。
+- 配置：`session.agents_md = { enabled=true, file="AGENTS.md", max_bytes=64*1024, auto_allow_read=true }`（只读免沙箱审批；写入仍需审批）。
 
 ### 4. 默认快捷键
 
@@ -409,7 +411,7 @@ require("NeoAI").setup({
       cancel = { key = "<Esc>", desc = "取消生成" },
       switch_model = { key = "M", desc = "切换模型" },
       toggle_reasoning = { key = "r", desc = "切换思考过程显示" },
-      cycle_mode = { key = "m", desc = "循环切换模式（CHAT/PLAN）" },
+      cycle_mode = { key = "m", desc = "循环切换模式（CHAT/PLAN/PRIV）" },
       cycle_display = {
         insert = { key = "<C-t>", desc = "循环切换显示模式（对话/轨迹）" },
         normal = { key = "T", desc = "循环切换显示模式（对话/轨迹）" },
@@ -469,6 +471,14 @@ require("NeoAI").setup({
       distill_max_attempts = 2,          -- 并行路径单通道最大尝试次数（仅 target/steps 缺失时重试）
       extra_safe_tools = {},             -- 计划模式白名单扩展
       -- mutating_tools = { ... },       -- 修改类工具（计划模式可见集已覆盖此语义）
+    },
+    privileged_mode = {
+      enabled = false,                   -- opt-in：高权限模式（网络仅记录、可直连 docker/podman）
+      require_async_approval = true,     -- 仅 tools.approval.mode="async" 时允许进入
+      override_offline = true,           -- 解除 tools.sandbox.offline=true 的硬离线（仍经 host_proxy 记录）
+      docker_socket = "",                -- 宿主 docker socket；空 = 自动探测
+      record_network = true,             -- 记录放行的网络目标（:NeoAI SandboxAudit network）
+      max_records = 1000,
     },
     approval = {
       mode = "async",                    -- async（默认，异步审批：立即沙箱执行，事后确认应用）| prompt | auto_allow | strict
@@ -1105,6 +1115,7 @@ NeoAI/
 │       ├── plan.lua           # 子 Agent + 边界审核
 │       ├── todo.lua           # 待办清单（todo_write/read/clear + 提示段）
 │       ├── plan_mode.lua      # 计划模式（enter_plan_mode + 工具过滤/门禁）
+│       ├── privileged_mode.lua# 高权限模式（网络仅记录 + 容器直连）
 │       ├── ask_user.lua       # 向用户提问
 │       ├── read_image.lua     # 图像读取（多模态）
 │       ├── web_fetch.lua      # 网页抓取（无头浏览器渲染 + 注入 JS + 转 Markdown，默认不启用）
@@ -1174,6 +1185,7 @@ NeoAI/
     ├── test_herder.lua        # Herder 状态上报
     ├── test_ask_user.lua      # 向用户提问
     ├── test_plan_mode.lua     # 计划模式
+    ├── test_privileged_mode.lua # 高权限模式（opt-in/async 门槛/互斥）
     ├── test_plan_distill.lua  # 计划提取
     ├── test_todo.lua          # 待办清单
     ├── test_sub_agent_result.lua # 子 Agent 结果

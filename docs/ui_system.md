@@ -599,7 +599,7 @@ Neovim 用户命令的 `complete=customlist` **只接受纯字符串候选**（�
 当前键位配置。
 
 聊天上下文键位（`keymaps.chat`）：`insert`(i)、`quit`(q)、`send`、`cancel`(<Esc>)、`toggle_reasoning`(r)、
-`switch_model`(M)、`cycle_mode`(m)、`cycle_display`(<C-t>/T)、`reload_display`(<F5>)、
+`switch_model`(M)、`cycle_mode`(m，CHAT/PLAN/PRIV)、`cycle_display`(<C-t>/T)、`reload_display`(<F5>)、
 `tool_approval`(<C-a>)、`sandbox_review`(<leader>ap，触发 `:NeoAI SandboxReview`)、
 `approval.confirm/confirm_all/add_to_workspace/cancel/cancel_with_reason`（`add_to_workspace` 把所操作文件所在目录并入该工具运行期 `allowed_directories`，仅当前会话生效）。
 另有主消息区内部滚动映射：`j`/`k`（走 `_scroll`，按行移动光标）、

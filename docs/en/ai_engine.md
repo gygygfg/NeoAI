@@ -119,9 +119,13 @@ emitting `TOOL_CALL_DETECTED`) and emits `TOOL_ARG_COMPLETED`.
 
 - The first system message is rendered by `prefix.build_system_prompt(agent)` (ordered section concatenation).
 - The tool call protocol requires: for an assistant message with `tool_calls`, `content` must be `null` (or omitted).
-- **Reasoning content (reasoning_content) is not sent back with the history**: this avoids resending the whole chain of thought on every request,
-  which would make DeepSeek's prefix cache byte-inconsistent from that assistant message onward and thus invalidate it. The internal `message.reasoning`
-  is still kept for rendering.
+- **Reasoning content (reasoning_content) is not sent back with the history by default**: this avoids resending the whole chain of thought on every
+  request, which would make DeepSeek's prefix cache byte-inconsistent from that assistant message onward and thus invalidate it. The internal
+  `message.reasoning` is still kept for rendering and is retained on the outbound message for the protocol dialect to decide whether to encode it.
+  **Exception (DeepSeek thinking + tools)**: when the request carries `tools`, the DeepSeek protocol requires every previous assistant
+  `reasoning_content` to be passed back (otherwise it returns a 400 invalid_request_error). The dialect option `reasoning_echo="with_tools"`
+  (the built-in DeepSeek OpenAI profile) emits it when tools are present; tool-less helper calls such as compaction or plan extraction do not echo it.
+  Reasoning is stable once generated, so echoing it does not break the prefix cache.
 - **Runtime-context snapshots** (`core/session/runtime_context.lua`): volatile state such as todos, plan mode, and persisted skills is injected into
   history as append-only snapshots; a new snapshot is appended only when the content changes, and old snapshots are never rewritten. Endpoints that
   accept mid-history system messages (both DeepSeek protocols) use `role="system"` for higher priority; other endpoints fall back to `user`. Both

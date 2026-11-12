@@ -239,10 +239,17 @@ function openai.models_path(_)
 end
 
 --- 编码消息：内部规范 → OpenAI 形（图像块 → image_url）
+--- DeepSeek thinking 模式：请求携带 tools 时，协议要求回传所有历史 assistant 消息的
+--- `reasoning_content`（缺失会返回 400 invalid_request_error）。由方言
+--- `reasoning_echo="with_tools"` 开启；无 tools 的请求（压缩/计划提取等辅助调用）
+--- 不回传，避免无意义的 payload 膨胀。
 --- @param messages table
---- @param _ table|nil
+--- @param dialect table|nil
+--- @param opts table|nil { has_tools?=boolean }
 --- @return table { messages = table }
-function openai.encode_messages(messages, _)
+function openai.encode_messages(messages, dialect, opts)
+  local echo = (dialect and dialect.reasoning_echo) or "never"
+  local has_tools = type(opts) == "table" and opts.has_tools == true
   local out = {}
   for _, m in ipairs(messages or {}) do
     local msg = { role = m.role }
@@ -261,6 +268,10 @@ function openai.encode_messages(messages, _)
     end
     if m.tool_calls then msg.tool_calls = m.tool_calls end
     if m.tool_call_id then msg.tool_call_id = m.tool_call_id end
+    if m.role == "assistant" and echo == "with_tools" and has_tools
+      and type(m.reasoning) == "string" and m.reasoning ~= "" then
+      msg.reasoning_content = m.reasoning
+    end
     out[#out + 1] = msg
   end
   return { messages = out }

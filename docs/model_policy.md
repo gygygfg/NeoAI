@@ -106,7 +106,9 @@ NeoAI 在 DeepSeek 方言层先归一化为 `low`/`high`/`max`。Anthropic 兼�
 ## 5. Token 节省要点
 
 1. **稳定前缀**：系统提示按有序段渲染、工具按名典序输出（`prefix.lua`），任何字节变化都会从首个变更 token 起使前缀缓存失效。
-2. **推理内容不回传**：思维链仅用于 UI，不随历史发送（默认策略），避免重复发送与破坏前缀；Anthropic 工具循环若因无 signature 报错，可用方言 `reasoning_echo="within_round"` 在同一轮内保留。
+2. **推理内容默认不回传**：思维链仅用于 UI，不随历史发送（默认策略），避免重复发送与破坏前缀。两个例外：
+   - **DeepSeek thinking + tools**：请求携带 `tools` 时必须回传历史 `reasoning_content`，否则 400；内置 DeepSeek OpenAI profile 用 `reasoning_echo="with_tools"` 自动开启（无工具的辅助调用不回传）。
+   - Anthropic 工具循环若因无 signature 报错，可用方言 `reasoning_echo="within_round"` 在同一轮内保留。
 3. **压缩用替换而非追加**：检查点消息 `<compacted-summary>` 替换被折叠区间，替换点之前的未变前缀仍可复用缓存。
 4. **把大而公共的内容放最前**、相近前缀的请求集中发（提高公共前缀检测命中率）。
 5. **显式断点**避免重写易变内容；**流式**需 `stream_options.include_usage` 才能拿到 usage 统计命中。
@@ -147,6 +149,11 @@ ai = {
   未知模型回退 64000（因此默认值不会屏蔽 Gemini 1M / Claude 200k 等真实窗口）。
 
 **`reasoning_kind` 取值**：`none` / `effort` / `budget` / `output_config_effort` / `enable_thinking` / `thinking_object` / `openrouter_object` / `thinking_config`。
+
+**`reasoning_echo` 取值**：`never`（默认，不回传）/ `with_tools`（请求携带 tools 时回传
+assistant 的 `reasoning_content`；内置 DeepSeek OpenAI profile 默认开启）/
+`within_round`（Anthropic 同一轮内以 thinking block 回传）。若第三方 DeepSeek 兼容端点
+不接受该字段，可在 `dialects` 中显式覆盖为 `never`。
 
 **降级保证**：显式缓存注入或远端缓存对象创建失败时**静默降级为隐式缓存**，绝不阻断请求；
 压缩后对显式缓存 `invalidate`（Gemini 删除并待下次重建），会话销毁时 `dispose` 清理。

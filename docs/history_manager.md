@@ -92,8 +92,10 @@ session = {
   （溢出满一个 step 才移动窗口起点，块内前缀逐字节稳定）。
 - **工具调用协议**：带 `tool_calls` 的 assistant 消息，`content` 必须为 `null`（或省略）；
   发送 `content:""` 会被要求严格的模型判定为格式异常。
-- **推理内容不随历史回传**：`reasoning_content` 不写入 API 消息，内部 `message.reasoning` 仅用于渲染。
+- **推理内容默认不随历史回传**：`reasoning_content` 默认不写入 API 消息，内部 `message.reasoning` 用于渲染。
   避免重复发送整段思维链、使 DeepSeek 前缀缓存从该 assistant 消息起失效。
+  **DeepSeek thinking + tools 例外**：请求携带 `tools` 时协议要求回传历史 `reasoning_content`
+  （否则 400），由方言 `reasoning_echo="with_tools"` 在编码阶段输出；无工具的辅助调用不回传。
 - `build_prefix(agent, range_messages)`：构建压缩回放前缀（system + 指定区间），供压缩辅助调用复用前缀缓存。
 - `build_fork_context(session, task)`：从父会话派生子会话的初始上下文。
 - `estimate_tokens(messages)`：token 粗估（字符/4）。

@@ -668,6 +668,9 @@ end
 --- 注入**禁用桩**：容器命令按真机「docker 守护进程未运行」样式报错，从而禁用容器内操作。
 --- @return table|nil { dir, podman, compose, disabled }
 local function _container_stubs()
+  -- 高权限模式：不生成任何 docker→podman 入口桩，容器命令按宿主真实运行时执行。
+  local okp, privileged = pcall(require, "NeoAI.sandbox.privileged")
+  if okp and privileged.active() then return nil end
   -- 容器门面默认关闭（`tools.sandbox.container.enabled = false`）：不生成 docker/nerdctl/
   -- docker-compose → podman 的入口桩，容器命令按宿主真实运行时执行（无封装）。
   if (config_store.get("tools.sandbox.container") or {}).enabled == false then return nil end
@@ -2103,6 +2106,15 @@ end
 --- 是否启用「宿主本机访问拦截」代理（默认开）。offline=true 时网络已硬隔离，无需代理。
 --- @return boolean
 local function _host_local_block_enabled()
+  -- 高权限模式：仍启动宿主过滤代理用于**记录**（策略已改为 allow），即使配置关闭
+  -- host_local_block 也保证网络目标可被审计。若用户显式保留 offline 硬隔离
+  -- （override_offline=false），则不注入代理（网络已不可达，代理无意义）。
+  local okp, privileged = pcall(require, "NeoAI.sandbox.privileged")
+  if okp and privileged.active() then
+    local sandbox = config_store.get("tools.sandbox") or {}
+    if sandbox.offline == true and not privileged.override_offline() then return false end
+    return true
+  end
   local netcfg = config_store.get("tools.sandbox.network") or {}
   if netcfg.host_local_block == false then return false end
   local sandbox = config_store.get("tools.sandbox") or {}
@@ -3128,9 +3140,13 @@ function M.process_prefix(opts)
   local cfg = config_store.get("tools.sandbox") or {}
   local offline = cfg.offline ~= false
   local priv = opts.privileges
+  -- 高权限模式：解除 offline/独立 netns 网关的硬网络隔离（仍经 host_proxy 记录）。
+  local ok_priv, privileged = pcall(require, "NeoAI.sandbox.privileged")
+  local privileged_active = ok_priv and privileged.active()
+    and privileged.override_offline() or false
   -- 独立 netns + 宿主网关模式：沙箱只能到达宿主网关（探测端口，服务被拦）。
   local net_gateway = require("NeoAI.sandbox.net.net_gateway")
-  local gateway_mode = net_gateway.enabled()
+  local gateway_mode = net_gateway.enabled() and not privileged_active
   if gateway_mode and backend ~= "bwrap" then
     return nil, "GATEWAY_REQUIRES_BWRAP: 网络网关模式仅支持 bwrap 后端"
   end
@@ -3454,10 +3470,11 @@ function M.process_prefix(opts)
     --   网关模式：网络由外部 netns 提供（仅可达宿主网关），此处不再处理 net 标志；
     --   档位显式指定时以档位为准（T0 默认放行网络，经 host_proxy 拦截本机；T1/T2 允许网络）；
     --   未指定档位时维持旧语义：带 userns 隔离 net 后按需 --share-net，否则 offline 才隔离。
-    --   offline=true 为硬隔离，优先级高于档位（网络类工具与进程网络一律断开）。
+    --   offline=true 为硬隔离，但高权限模式显式解除（网络放行 + host_proxy 记录）。
     if not gateway_mode then
       local want_net
-      if offline then want_net = false
+      if privileged_active then want_net = true
+      elseif offline then want_net = false
       elseif priv then want_net = priv.network == true
       else want_net = true end
       if userns then
@@ -3558,9 +3575,11 @@ function M.process_prefix(opts)
   end
   local argv = { "unshare", "--user", "--map-root-user", "--mount", "--pid", "--fork",
     "--ipc", "--uts", "--mount-proc" }
-  -- 网络：档位显式指定时以档位为准；否则仅 offline=true 时隔离 net。
+  -- 网络：高权限模式解除隔离；否则档位显式指定时以档位为准，未指定时仅 offline=true 隔离。
   local want_net
-  if priv then want_net = priv.network == true else want_net = not offline end
+  if privileged_active then want_net = true
+  elseif priv then want_net = priv.network == true
+  else want_net = not offline end
   if not want_net then
     table.insert(argv, "--net")
   end

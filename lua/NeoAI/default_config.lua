@@ -118,6 +118,8 @@ local DEFAULT_CONFIG = {
     modes = {
       chat = { provider = "deepseek", model = "auto", temperature = 0.7, stream = true },
       plan = { provider = "deepseek", model = "auto", temperature = 0.3, stream = true },
+      -- 高权限模式（opt-in）：网络仅记录不拦截、容器直连。默认关闭，见 tools.privileged_mode。
+      privileged = { provider = "deepseek", model = "auto", temperature = 0.5, stream = true },
     },
     -- 输出被截断（finish_reason=length/max_tokens/MAX_TOKENS）且无工具调用时的处理：
     -- 自动附加续写提示重发（提示只进请求、不落库），直到获得正文/工具调用或达到次数上限；
@@ -343,7 +345,7 @@ local DEFAULT_CONFIG = {
       cancel = { key = "<Esc>", desc = "取消生成" },
       toggle_reasoning = { key = "r", desc = "切换思考过程显示" },
       switch_model = { key = "M", desc = "切换模型" },
-      cycle_mode = { key = "m", desc = "循环切换模式（CHAT/PLAN）" },
+      cycle_mode = { key = "m", desc = "循环切换模式（CHAT/PLAN/PRIV）" },
       switch_sub_agent = { key = "<leader>as", desc = "切换到子 Agent 会话（新窗口）" },
       sub_agent_list = { key = "<leader>al", desc = "子 Agent 列表弹出窗" },
       cycle_display = {
@@ -397,7 +399,7 @@ local DEFAULT_CONFIG = {
     --   file：文件名（默认 AGENTS.md）
     --   max_bytes：注入内容上限，超限按 UTF-8 安全截断并标注
     -- 注意：AI 若需更新 AGENTS.md，写入仍走既有沙箱审批，不会因本开关自动放行。
-    agents_md = { enabled = true, file = "AGENTS.md", max_bytes = 64 * 1024 },
+    agents_md = { enabled = true, file = "AGENTS.md", max_bytes = 64 * 1024, auto_allow_read = true },
     root_markers = {
       ".luarc.json", ".luarc.jsonc",
       "package.json", "tsconfig.json", "deno.json",
@@ -661,6 +663,19 @@ local DEFAULT_CONFIG = {
         "git_restore",
         "confirm_file_change",
       },
+    },
+    -- 高权限模式（与 CHAT/PLAN 并列的第三种会话模式，按 m 循环切换）。
+    -- **安全提示**：开启后可直连宿主 docker daemon（等价宿主 root 能力），网络不再拦截；
+    -- 仅应在明确信任当前任务时手动启用。默认 opt-in 关闭。
+    privileged_mode = {
+      enabled = false, -- 总开关；false 时 m 只在 CHAT/PLAN 间循环
+      require_async_approval = true, -- 仅 tools.approval.mode="async" 时允许进入
+      override_offline = true, -- 解除 tools.sandbox.offline=true 的硬离线（仍经 host_proxy 记录）
+      -- 宿主 docker socket 路径；空 = 自动探测 /run/docker.sock、/var/run/docker.sock、
+      -- $XDG_RUNTIME_DIR/docker.sock。仅高权限模式的进程命令会挂载/解除遮蔽。
+      docker_socket = "",
+      record_network = true, -- 高权限模式下把放行的网络目标写入记录（:NeoAI SandboxAudit network）
+      max_records = 1000, -- 网络记录环形缓冲上限
     },
     approval = {
       mode = "async", -- async（默认，异步审批：立即沙箱执行，事后确认应用）| prompt | auto_allow | strict

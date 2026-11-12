@@ -166,9 +166,11 @@ avoiding accidental deletion of the previous turn's history.
 ### 4.3 Prefix Cache Identity
 
 `prefix.verify_cache_identity` compares the fingerprint across requests; an identity change means the prefix
-cache is invalidated (used for diagnostics and statistics). `context_builder` does not write
+cache is invalidated (used for diagnostics and statistics). By default `context_builder` does not write
 `reasoning_content` back into history, avoiding invalidating the DeepSeek prefix cache starting from that
-assistant message.
+assistant message. DeepSeek thinking + tools is a protocol exception: when the request carries `tools`, prior
+`reasoning_content` must be passed back (otherwise 400), emitted by the dialect option
+`reasoning_echo="with_tools"`. Reasoning is stable once generated, so it does not break the prefix cache.
 
 ### 4.4 Session/Sub-Agent Cleanup
 

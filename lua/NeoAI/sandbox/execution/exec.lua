@@ -302,8 +302,13 @@ function M.open(argv, opts)
     candidate.cleanup(attempt.attempt_id)
     return nil, nil, "SANDBOX_MATERIALIZE_TYPE_CONFLICT: " .. tostring(conflicts[1] and conflicts[1].real)
   end
+  local privileged_active = false
+  pcall(function()
+    local sp = require("NeoAI.sandbox.privileged")
+    privileged_active = sp.active() and sp.override_offline()
+  end)
   local priv = {
-    network = (opts.network ~= false) and cfg.offline ~= true,
+    network = (opts.network ~= false) and (cfg.offline ~= true or privileged_active),
     cap_add = {}, mounts = {}, userns = false, unmask = roots,
   }
   local prefix, perr = runtime.process_prefix({

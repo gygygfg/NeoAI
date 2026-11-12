@@ -72,6 +72,9 @@ local PROFILES = {
   deepseek = {
     protocol = "openai", reasoning_kind = "effort", default_effort = "high",
     effort_map = "deepseek", thinking_toggle = true, system_in_history = false,
+    -- DeepSeek thinking 模式 + tools：请求携带 tools 时必须回传历史 assistant 的
+    -- reasoning_content，否则 400 invalid_request_error。无 tools 的辅助调用不回传。
+    reasoning_echo = "with_tools",
   },
   -- DeepSeek 的 Anthropic 兼容端点：推理用 output_config.effort（budget_tokens 会被忽略）。
   -- 仅在 provider.api_type="anthropic" 时命中；模型 id 仍走 deepseek 前缀。

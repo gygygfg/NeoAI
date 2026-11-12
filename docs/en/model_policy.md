@@ -126,10 +126,13 @@ errors and never blocks.
 1. **Stable prefix**: the system prompt is rendered from ordered segments and tools are output in
    lexicographic order by name (`prefix.lua`); any byte change invalidates the prefix cache from
    the first changed token onward.
-2. **Reasoning content is not echoed back**: the chain of thought is UI-only and is not sent with
-   the history (default policy), avoiding repeated sending and prefix disruption; if Anthropic's
-   tool loop errors due to a missing signature, the dialect option
-   `reasoning_echo="within_round"` can retain it within the same round.
+2. **Reasoning content is not echoed back by default**: the chain of thought is UI-only and is not
+   sent with the history (default policy), avoiding repeated sending and prefix disruption. Two exceptions:
+   - **DeepSeek thinking + tools**: when the request carries `tools`, prior `reasoning_content` must be
+     passed back or the API returns 400; the built-in DeepSeek OpenAI profile enables this via
+     `reasoning_echo="with_tools"` (tool-less helper calls do not echo it).
+   - If Anthropic's tool loop errors due to a missing signature, the dialect option
+     `reasoning_echo="within_round"` can retain it within the same round.
 3. **Compaction replaces rather than appends**: the checkpoint message `<compacted-summary>`
    replaces the folded interval, so the unchanged prefix before the replacement point can still
    reuse the cache.
@@ -176,6 +179,11 @@ ai = {
   to 64000 (so the default value does not mask real windows such as Gemini 1M / Claude 200k).
 
 **`reasoning_kind` values**: `none` / `effort` / `budget` / `output_config_effort` / `enable_thinking` / `thinking_object` / `openrouter_object` / `thinking_config`.
+
+**`reasoning_echo` values**: `never` (default, do not echo) / `with_tools` (echo the assistant's
+`reasoning_content` when the request carries tools; enabled by default for the built-in DeepSeek
+OpenAI profile) / `within_round` (Anthropic: echo as thinking blocks within the same round). If a
+third-party DeepSeek-compatible endpoint rejects the field, override it to `never` in `dialects`.
 
 **Degradation guarantee**: when explicit cache injection or remote cache object creation fails, it
 **silently degrades to implicit caching** and never blocks the request; after compaction, explicit

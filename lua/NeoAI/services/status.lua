@@ -129,8 +129,8 @@ end
 --- @return string|nil
 local function _build_part(info, part)
   if part == "mode" then
-    local label = info.mode == "plan" and "PLAN" or "CHAT"
-    return "[" .. label .. "]"
+    local labels = { chat = "CHAT", plan = "PLAN", privileged = "PRIV" }
+    return "[" .. (labels[info.mode] or "CHAT") .. "]"
   elseif part == "model" then
     return _fmt_model(info.model)
   elseif part == "usage" then
@@ -268,6 +268,7 @@ local function _capacity_key(agent)
     tostring(agent.model),
     tostring(provider_name),
     tostring(agent.plan_mode),
+    tostring(agent.privileged_mode),
   }, "|")
 end
 
@@ -538,7 +539,7 @@ function M.watch()
     events.AGENT_ABORTED, events.MODEL_SWITCHED,
     events.SESSION_LOADED, events.MESSAGE_ADDED,
     events.MESSAGE_QUEUED, events.MESSAGE_SENT,
-    events.PLAN_MODE_CHANGED,
+    events.PLAN_MODE_CHANGED, events.PRIVILEGED_MODE_CHANGED,
     events.DISPLAY_MODE_CHANGED, events.TODO_UPDATED,
     events.SANDBOX_REVIEW_ENQUEUED, events.SANDBOX_REVIEW_APPROVED,
     events.SANDBOX_REVIEW_REJECTED, events.SANDBOX_REVIEW_SUPERSEDED,
