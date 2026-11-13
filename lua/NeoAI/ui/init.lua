@@ -142,6 +142,60 @@ function M.switch_view(mode)
   end
 end
 
+-- ========== 窗口模式（tab / float / split） ==========
+
+--- 支持的窗口模式（对应 `ui.window_mode`）
+local WINDOW_MODES = { tab = true, float = true, split = true }
+
+--- 当前生效的窗口模式：有打开的聊天窗口时返回该窗口的生效模式（可能来自运行期
+--- `:NeoAI WindowMode` 的实例级覆盖），否则返回配置默认值 `ui.window_mode`。
+--- @return string
+function M.window_mode()
+  if chat_view.has_window() then
+    local m = chat_view.get_window_mode()
+    if m then return m end
+  end
+  return config_store.get("ui.window_mode") or "tab"
+end
+
+--- 切换**当前聊天窗口**的窗口模式并重建该窗口（不写 `ui.window_mode` 配置）。
+--- 语义：
+---   * 只影响当前聊天实例（当前 buffer）；其它聊天实例与会话树保持原样，不重建；
+---   * 不持久化——新开的聊天窗口（`<leader>ac` / `:NeoAI Chat` / 子 Agent 窗口）与重启后
+---     仍按 `ui.window_mode` 配置的默认模式；
+---   * Agent 生成中 / 工具执行中**也可切换**：重建窗口时保留 Agent（只解绑窗口），
+---     当前回合继续跑，切换只重绘 UI；
+---   * 没有打开的聊天窗口时无窗口可切，仅提示到配置里修改默认模式。
+--- @param mode string|nil "tab"|"float"|"split"；nil/空 = 只查询当前模式
+--- @return string 当前（或切换后）生效的模式
+--- @return boolean 是否已重建窗口
+function M.set_window_mode(mode)
+  local cur = M.window_mode()
+  if mode == nil or mode == "" then return cur, false end
+  local m = tostring(mode):lower()
+  if not WINDOW_MODES[m] then
+    vim.notify("[NeoAI] 未知窗口模式: " .. tostring(mode) .. "（可选: tab / float / split）", vim.log.levels.WARN)
+    return cur, false
+  end
+  if not chat_view.has_window() then
+    vim.notify(("[NeoAI] 当前没有打开的聊天窗口，默认窗口模式请在配置 ui.window_mode 中修改（当前: %s）")
+      :format(cur), vim.log.levels.WARN)
+    return cur, false
+  end
+  local changed, rebuilt = chat_view.set_window_mode(m)
+  if not changed then
+    vim.notify(("[NeoAI] 当前窗口已是 %s 模式"):format(m), vim.log.levels.INFO)
+    return m, false
+  end
+  if rebuilt then
+    vim.notify(("[NeoAI] 当前窗口已切换为 %s 模式（仅本次窗口；新开窗口仍按配置 ui.window_mode）")
+      :format(m), vim.log.levels.INFO)
+  else
+    vim.notify(("[NeoAI] 窗口模式已设为 %s，但窗口重建失败（详见上方错误）"):format(m), vim.log.levels.WARN)
+  end
+  return m, rebuilt
+end
+
 --- 重置（测试用/插件卸载）：关闭窗口并释放 UI 注入与事件监听
 function M.reset()
   M.close_all()

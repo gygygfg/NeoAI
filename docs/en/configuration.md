@@ -155,10 +155,10 @@ context_cache = {
 | Key | Default | Description |
 | --- | --- | --- |
 | `default_view` | `"chat"` | Default view (chat/tree) |
-| `window_mode` | `"tab"` | Window mode (float/tab/split) |
+| `window_mode` | `"tab"` | Default window mode for newly opened windows/sessions (float/tab/split); `:NeoAI WindowMode [tab\|float\|split]` at runtime switches the **current chat window only** (config is not written, later windows keep following it) and also works while an Agent is generating or running tools (the rebuild keeps the Agent alive, so the current turn is not interrupted) |
 | `window` | `{width=80, height=24, border="rounded"}` | float window |
 | `float` | `{min_width=24, min_height=4}` | Minimum size floor for all floating windows; a single `compute` call can override with explicit `min_w`/`min_h`, and 0 removes the floor |
-| `split` | `{size=80, direction="right"}` | split window |
+| `split` | `{size=80, direction="right", max_ratio=0.5, min_rest=20}` | split window: `direction` is `right`/`left`/`top`/`bottom`; `size` is the desired size (columns for left/right, rows for top/bottom), clamped to `min(floor(screen cols\|rows × max_ratio), screen cols\|rows - min_rest - 1)` and then by `size`, so it never fills the screen and squeezes the original window away. Default `max_ratio=0.5`: the NeoAI window takes at most half the screen while the original window keeps at least 20 columns/rows |
 | `colors` | Per-segment highlights | User/AI/reasoning/title colors |
 | `tree` | `{foldenable=false, ...auto_close_on_select=true}` | Session tree folding/auto-close |
 | `input_box` | `{idle_height=1, min_height=5, max_ratio=0.8, hash_completion={enabled=true, max_chars=2000, max_bytes=20000}}` | Input box height (idle/focused/growth cap). `hash_completion` enables `#` context placeholders in the input box: typing `#` offers candidates (`#{buffers}` / `#{tool}` / `#{lsp}` …), inserted placeholders are highlighted with `NeoAIHashPlaceholder`, and they are only expanded **right before sending**; `max_chars` caps `#{message}`/`#{notify}` by **character count** (CJK safe), `max_bytes` caps other expansions (UTF-8 safe truncation); `enabled=false` disables everything (no completefunc / cmp source / highlight autocmds) |
@@ -166,7 +166,7 @@ context_cache = {
 | `chat` | `{mousescroll_max_blank=3, incremental=true, fold="reasoning_tools", process_keep_steps=3}` | Same scrolling/incremental options as above; `fold` selects the folding level: `none` (no folds) / `reasoning_tools` (current behavior: reasoning and tool blocks fold) / `process` (additionally folds the AI intermediate steps of each turn into a “process” fold whose text shows folded rounds, tool success/failure counts, input/output tokens, and cache hit rate; the Step marker is appended to the reasoning/tool fold text as `· Step N` while the role header appears only on role switches as a plain `🤖 AI`; the “process” fold is level 1 while the reasoning/tool blocks inside it are level 2 nested folds, so they stay collapsed when it is expanded; a user message inserted while the AI is running does not start a new turn — Step numbering continues and the segment before the insertion is folded entirely); user and AI messages are both left-aligned (fixed behavior, no config switch); `process_keep_steps` keeps the most recent N intermediate steps expanded **while the current turn is running** (decided only by whether the agent is still working on this turn; a non-empty pending queue does not count; once the turn ends all intermediate steps are folded and only the final step stays expanded) |
 | `ask_user` | `{batch_debounce_ms=25, require_confirm=true}` | User-question popup: `batch_debounce_ms` is the debounce window (ms) for aggregating multiple questions within the same round (covers sibling-call arrival timing; larger aggregates more but delays the first popup); `require_confirm` controls whether a summary page is shown for a second confirmation after all questions are answered (`false` submits directly). The popup collapses to a small top-right window when focus leaves and expands when focused again |
 | `trajectory` | `{log_dir=".../NeoAI/logs"}` | Log directory for the trajectory display mode |
-| `statusline` | `{enabled=true, winbar=true, parts={mode,model,usage,cache,capacity,sandbox}, separator=" ", colors=...}` | lualine statusline; the `sandbox` part shows `待审N` when pending reviews > 0 (`N` is the total number of pending **files**, since the approval unit is a single file), linked to the prominent `NeoAISandboxPending` highlight group by default (bold yellow, override via `colors.sandbox`); when the pending queue contains an **L3 (high-risk)** item, the part appends `⚠危险` and switches to the red `NeoAISandboxDanger` group (override via `colors.sandbox_danger`); when **outside-workspace traces** exist, the part appends `越界N` (`N` = distinct file count; both shown side by side, e.g. `待审2 越界3`); the `usage` part shows **session-cumulative** input/output tokens (`↑` total input, `↓` total output; it no longer jumps with a single request); the `cache` part follows `cache_mode` with **two decimals**: `both` (default) renders `缓存命中latest(cumulative)` (e.g. `缓存命中99.52%(会话94.55%)`, where the first value reflects current prefix-cache quality and the parenthesized one is the provider billing aggregate), `latest` shows only the most recent request, and `cumulative` keeps the legacy session-cumulative value (e.g. `缓存命中95.32%`; also used as fallback when no per-request data exists) |
+| `statusline` | `{enabled=true, winbar=true, parts={mode,model,usage,cache,capacity,sandbox}, separator=" ", colors=...}` | lualine statusline; the `sandbox` part shows `待审N` when pending reviews > 0 (`N` is the total number of pending **files**, since the approval unit is a single file), linked to the prominent `NeoAISandboxPending` highlight group by default (bold yellow, override via `colors.sandbox`); when the pending queue contains an **L3 (high-risk)** item, the part appends `⚠危险` and switches to the red `NeoAISandboxDanger` group (override via `colors.sandbox_danger`); when **outside-workspace traces** exist, the part appends `越界N` (`N` = distinct file count; both shown side by side, e.g. `待审2 越界3`); the `usage` part shows **session-cumulative** input/output tokens (`↑` total input, `↓` total output; it no longer jumps with a single request); the `cache` part follows `cache_mode` with **two decimals**: `both` (default) renders `hit latest(cumulative)` (e.g. `命中99.52%(会话94.55%)`, where the first value reflects current prefix-cache quality and the parenthesized one is the provider billing aggregate), `latest` shows only the most recent request, and `cumulative` keeps the legacy session-cumulative value (e.g. `命中95.32%`; also used as fallback when no per-request data exists); the `capacity` part shows the context **usage ratio** (used / window, starting at `0%` and growing as it fills, e.g. `占用42%`), tinted by level (`capacity_warn` / `capacity_over`) and rendered as `上下文超限` once over the limit |
 
 > **Narrow-screen padding (no config)**: based on the chat main window width, a floating window fills that window
 > when width `< 40`, keeps 5 cols on each side when `40 ≤ width < 100`, and stays screen-ratio centered when
@@ -241,7 +241,7 @@ session = {
 | `todo.enabled` | `true` | Todo tool + system prompt injection |
 | `web_fetch` | See below (`enabled=false` by default) | Web fetch: render dynamic pages in a headless browser and convert to Markdown |
 | `plan_mode` | `{enabled=true, auto_execute_on_approve=true, distill_on_execute=true, distill_parallel=true, distill_front=true, distill_max_attempts=2, extract_max_tokens=nil, extra_safe_tools={}, mutating_tools=...}` | Plan mode |
-| `privileged_mode` | `{enabled=false, require_async_approval=true, override_offline=true, docker_socket="", record_network=true, max_records=1000}` | Privileged mode (opt-in): network is record-only, docker/podman direct; async approval only |
+| `privileged_mode` | `{enabled=false, require_async_approval=true, override_offline=true, docker_socket="", unmask_ssh_keys=true, record_network=true, max_records=1000}` | Privileged mode (opt-in): record-only network, direct docker/podman, SSH keys unmasked; async approval only |
 | `sub_agent` | `{final_instruction="summarize your work at the end..."}` | Sub-agents: an instruction auto-appended to a sub-agent's task prompt (asks it to summarize its work); set to `""` to disable. On completion the sub-agent's final body is delivered back to the main agent automatically |
 | `approval` | See below | Tool approval |
 | `sandbox` | See below | Tool execution sandbox (dry-run/commit, isolation backend, policy) |
@@ -1152,7 +1152,7 @@ Privileged mode is a third session mode alongside CHAT/PLAN (per-agent `agent.pr
 by default**. When enabled, `m` cycles `CHAT → PLAN → PRIV → CHAT`, or use `:NeoAI Privileged`; it can only be
 entered when `tools.approval.mode="async"`.
 
-It relaxes exactly two things:
+It relaxes exactly these three things:
 
 1. **Network is not blocked, only recorded**: force `access="allow"`, overriding `ask`/`deny`, `offline=true`
    and the controlled allowlist. The host-side `host_proxy` still records targets (see
@@ -1160,11 +1160,24 @@ It relaxes exactly two things:
 2. **Direct containers**: bypass the container facade (no `docker→podman` rewrite, no entry stubs, no fake
    daemon errors); `docker` mounts the host socket (auto-detected or `docker_socket`) and injects `DOCKER_HOST`;
    `podman/buildah` get container capabilities/vfs storage/seccomp exception even when the facade is disabled.
+3. **SSH keys are not masked**: `~/.ssh`, `/root/.ssh`, `/home/*/.ssh` and ssh-agent sockets are excluded from
+   masking (`unmask_ssh_keys=true`); `read_file`/`run_command`/`git`/`ssh` can read and use host keys.
 
 **Security boundary**: containers created through docker run outside the sandbox on the host daemon and are
 **not** frozen into candidates/approvals; `/run/docker.sock` is equivalent to host root. Ordinary file
 read/write still uses the sandbox overlay and review pipeline. Writes such as updating AGENTS.md still require
 approval and are not affected by this mode.
+
+**Decision scope and timing**:
+
+- Network allowance is **process-wide**: while any PRIV session exists in the process, network traffic is
+  allowed and recorded (`host_proxy` is a shared singleton; its connection callbacks carry no agent context).
+  Switching chat-window focus, focusing a sub-agent window, or creating a session that points `current` at
+  another agent does **not** bring the PRIV network prompt back; exiting the last PRIV session restores
+  `tools.sandbox.network.access`.
+- Switching modes during a generation applies the network/container/SSH policy **immediately**; only the
+  model/provider switch (`ai.modes.privileged`) is deferred to the end of the turn. The `m` /
+  `:NeoAI Privileged` notification distinguishes these two cases.
 
 State is persisted in `session.metadata.privileged` and restored on resume; it is mutually exclusive with plan
 mode (plan mode wins). Default `tools.privileged_mode.enabled=false`, so it does **not** appear in the `m` cycle.

@@ -54,6 +54,7 @@ tests.suite("sandbox_service", function(_, it)
   end)
 
   it("service：停止时把服务改动捕获回工作区暂存", function(t)
+    if tests.requires_sandbox() then return end
     local dir = vim.fn.tempname()
     vim.fn.mkdir(dir, "p")
     with_config({ tools = { sandbox = sandbox_config() } }, function()
@@ -171,6 +172,7 @@ tests.suite("sandbox_service", function(_, it)
   end)
 
   it("service：停止先发 SIGTERM 优雅退出（trap 生效），不立即 SIGKILL", function(t)
+    if tests.requires_sandbox() then return end
     local dir = vim.fn.tempname()
     vim.fn.mkdir(dir, "p")
     with_config({
@@ -201,6 +203,7 @@ tests.suite("sandbox_service", function(_, it)
   end)
 
   it("service：载荷忽略 SIGTERM 时，stop_timeout_ms 后 SIGKILL", function(t)
+    if tests.requires_sandbox() then return end
     local dir = vim.fn.tempname()
     vim.fn.mkdir(dir, "p")
     with_config({
@@ -225,6 +228,7 @@ tests.suite("sandbox_service", function(_, it)
   end)
 
   it("stop_all：对长驻服务同样优雅停止并捕获改动", function(t)
+    if tests.requires_sandbox() then return end
     local dir = vim.fn.tempname()
     vim.fn.mkdir(dir, "p")
     with_config({

@@ -234,13 +234,20 @@ local DEFAULT_CONFIG = {
 
   ui = {
     default_view = "chat",
+    -- 新开窗口/会话的默认窗口模式；运行期 `:NeoAI WindowMode` 只切换当前窗口（不写本配置，
+    -- 也不会影响之后新开的窗口）。
     window_mode = "tab",
     -- float 模式下按屏幕比例计算主浮窗尺寸（大屏更大、小屏更小），随窗口 resize 实时跟随；
     -- 如需固定尺寸，可显式配置 width/height，此时作为比例尺寸的**上限**生效（向后兼容）。
     window = { w_ratio = 0.85, h_ratio = 0.85, border = "rounded" },
     -- 所有悬浮窗的最小尺寸兜底，避免小窗口下浮窗过窄过矮导致渲染糟糕。
     float = { min_width = 24, min_height = 4 },
-    split = { size = 80, direction = "right" },
+    -- split 模式：size 为期望尺寸（right/left 为列数，top/bottom 为行数）；
+    -- max_ratio 与 min_rest 共同收敛实际尺寸，避免把 NeoAI 以外的窗口挤没（表现为占满整屏）：
+    --   cap = min(floor(屏幕列/行数 * max_ratio), 屏幕列/行数 - min_rest - 1)，size 再按 cap 截断
+    --   （公式里的 -1 预留给 split 分隔线，保证原窗口实际仍能保留 min_rest 列/行）。
+    -- 默认 max_ratio=0.5：NeoAI 窗口最多占屏幕一半，原窗口至少保留 20 列/行。
+    split = { size = 80, direction = "right", max_ratio = 0.5, min_rest = 20 },
     -- ask_user 多题聚合弹窗：
     --   batch_debounce_ms：同轮多次提问的聚合去抖窗口（覆盖兄弟调用到达时序，越大越全但首弹越慢）
     --   require_confirm：全部作答后是否展示汇总页二次确认（false 直接提交）
@@ -665,8 +672,8 @@ local DEFAULT_CONFIG = {
       },
     },
     -- 高权限模式（与 CHAT/PLAN 并列的第三种会话模式，按 m 循环切换）。
-    -- **安全提示**：开启后可直连宿主 docker daemon（等价宿主 root 能力），网络不再拦截；
-    -- 仅应在明确信任当前任务时手动启用。默认 opt-in 关闭。
+    -- **安全提示**：开启后可直连宿主 docker daemon（等价宿主 root 能力），网络不再拦截，
+    -- SSH 私钥/agent 路径也不再遮蔽；仅应在明确信任当前任务时手动启用。默认 opt-in 关闭。
     privileged_mode = {
       enabled = false, -- 总开关；false 时 m 只在 CHAT/PLAN 间循环
       require_async_approval = true, -- 仅 tools.approval.mode="async" 时允许进入
@@ -674,7 +681,10 @@ local DEFAULT_CONFIG = {
       -- 宿主 docker socket 路径；空 = 自动探测 /run/docker.sock、/var/run/docker.sock、
       -- $XDG_RUNTIME_DIR/docker.sock。仅高权限模式的进程命令会挂载/解除遮蔽。
       docker_socket = "",
-      record_network = true, -- 高权限模式下把放行的网络目标写入记录（:NeoAI SandboxAudit network）
+      -- 不遮蔽 SSH 私钥/agent 路径（~/.ssh、/root/.ssh、ssh-agent socket 等）。
+      -- 仅高权限模式生效；默认开。设为 false 可保留默认遮蔽。
+      unmask_ssh_keys = true,
+      record_network = true, -- 存在 PRIV 会话期间（进程级）把放行的网络目标写入记录（:NeoAI SandboxAudit network）
       max_records = 1000, -- 网络记录环形缓冲上限
     },
     approval = {

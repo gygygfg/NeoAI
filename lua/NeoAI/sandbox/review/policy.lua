@@ -151,8 +151,9 @@ function M.evaluate(facts)
   end
   if facts.effect == "network" then
     -- 高权限模式：网络不拦截（仅记录），覆盖 offline 与受控白名单。
+    -- 判据为进程级（任一 PRIV 会话存在），不随 UI 焦点/当前 Agent 漂移。
     local okp, privileged = pcall(require, "NeoAI.sandbox.privileged")
-    local bypass = okp and privileged.active() and privileged.override_offline()
+    local bypass = okp and privileged.network_active() and privileged.override_offline()
     if not bypass then
       local sb = require("NeoAI.kernel.config_store").get("tools.sandbox") or {}
       if sb.offline == true then

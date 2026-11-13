@@ -15,6 +15,7 @@ vim.g.neoai_test = true
 local state = {
   suites = {}, -- { { name, tests = { { name, fn } }, before_each = fn } }
   current_suite = nil,
+  skipped = 0, -- 当前套件中因缺少环境能力而跳过的用例数（计入通过，另作统计）
 }
 
 --- 定义测试套件
@@ -167,6 +168,42 @@ function assert_helpers.throws(fn)
   return ok, err
 end
 
+-- ========== 环境能力门控 ==========
+
+--- 当前进程是否具备命名空间隔离后端（bwrap / unshare+userns）。
+--- 在 NeoAI 自身沙箱内运行测试（嵌套），或内核禁止非特权 userns / 容器无 CAP_SYS_ADMIN
+--- 时可能不可用；此时产品行为是退回审批模式（见 executor.effective_approval_mode），
+--- 依赖真实隔离的用例应跳过而不是失败。
+--- @return boolean
+function M.sandbox_available()
+  local ok, rt = pcall(require, "NeoAI.sandbox.execution.runtime")
+  if not ok or type(rt) ~= "table" or type(rt.isolation_available) ~= "function" then
+    return false
+  end
+  local oki, v = pcall(rt.isolation_available)
+  return oki and v == true
+end
+
+--- 条件满足时跳过当前用例：打印一行 SKIP（默认输出只展示失败/套件摘要，故不打扰），
+--- 用例计为通过。返回 true 时调用方应立即 `return`。
+--- @param cond boolean 是否跳过
+--- @param reason string|nil
+--- @return boolean skipped
+function M.skip_if(cond, reason)
+  if not cond then return false end
+  state.skipped = state.skipped + 1
+  print(("  ↷ SKIP: %s"):format(reason or "缺少所需环境能力"))
+  return true
+end
+
+--- 依赖真实命名空间隔离的用例前置守卫（无后端时跳过）。
+--- 用法：用例开头 `if tests.requires_sandbox() then return end`
+--- @return boolean skipped
+function M.requires_sandbox()
+  return M.skip_if(not M.sandbox_available(),
+    "需要可用的沙箱隔离后端（当前无 bwrap 或 unshare/userns；常见于沙箱内运行测试）")
+end
+
 -- ========== 运行器 ==========
 
 --- 是否输出逐用例明细（默认安静：仅失败 + 套件摘要；NEOAI_TEST_VERBOSE=1 还原）。
@@ -177,6 +214,7 @@ end
 
 local function _run_suite(suite)
   local passed, failed = 0, 0
+  state.skipped = 0
   local errors = {}
   -- 可选按用例名过滤（子串匹配，逗号分隔多模式），便于隔离复现/跳过危险用例：
   --   NEOAI_TEST_ONLY=<p1,p2>  仅运行名字含任一模式的用例
@@ -219,7 +257,7 @@ local function _run_suite(suite)
       end
     end
   end
-  return passed, failed, errors
+  return passed, failed, errors, state.skipped
 end
 
 -- ========== 测试环境准备 ==========
@@ -229,9 +267,43 @@ end
 --- 测试环境通常以 root 运行且工作区文件归 root，非 root 载荷无法写入。非 root 场景的
 --- 专项用例自行传入 tools.sandbox.run_as 覆盖。
 --- @return function restore 恢复原始 config_store.load
+--- 选择测试用沙箱存储根：
+---   * `NEOAI_TEST_SANDBOX_ROOT` 显式指定时优先；
+---   * 默认 `stdpath("cache")/NeoAI/sandbox-tests-<pid>`（磁盘，避免把大 overlay 暂存写进 tmpfs）；
+---   * cache 不可写（典型：在 NeoAI 自身沙箱内跑测试 / 只读 home）时退 `/var/tmp` → `/tmp`。
+--- 名称只用下划线/数字：临时路径常被 `t.matches(base, ...)` 当 Lua 模式使用，连字符会成为
+--- 模式修饰符（如 `0-NeoAI` 被解析成 `0-`）导致误判。
+--- @return string root, boolean owned
+local function _test_sandbox_root()
+  local env_root = vim.env.NEOAI_TEST_SANDBOX_ROOT
+  if env_root and env_root ~= "" then return env_root, false end
+  local function usable(dir)
+    pcall(vim.fn.mkdir, dir, "p")
+    local probe = dir .. "/.neoai_probe"
+    local f = io.open(probe, "w")
+    if not f then return false end
+    f:close()
+    pcall(os.remove, probe)
+    return true
+  end
+  local cache_root = vim.fn.stdpath("cache") .. "/NeoAI/sandbox_tests_" .. vim.fn.getpid()
+  if usable(cache_root) then return cache_root, true end
+  for _, base in ipairs({ "/var/tmp", "/tmp" }) do
+    if vim.fn.isdirectory(base) == 1 then
+      local dir = base .. "/neoai_test_sandbox_" .. vim.fn.getpid()
+      if usable(dir) then return dir, true end
+    end
+  end
+  return cache_root, true
+end
+
 local function _install_test_defaults()
   local config_store = require("NeoAI.kernel.config_store")
   local orig_config_load = config_store.load
+  -- 沙箱存储根重定向到临时目录：默认 `stdpath("cache")/NeoAI/sandbox` 在
+  -- 「NeoAI 自身沙箱内运行测试」/只读 home 下可能不可写，导致服务启动失败、候选无法物化。
+  -- 临时目录在沙箱内可写，且运行结束即清理（可用 NEOAI_TEST_SANDBOX_ROOT 固定路径）。
+  local sandbox_root, own_root = _test_sandbox_root()
   ---@diagnostic disable-next-line: duplicate-set-field
   config_store.load = function(user_config)
     local uc = vim.deepcopy(user_config or {})
@@ -246,6 +318,9 @@ local function _install_test_defaults()
     end
     if uc.tools.sandbox.run_as == nil then
       uc.tools.sandbox.run_as = { uid = 0, gid = 0 }
+    end
+    if uc.tools.sandbox.workspace_root == nil then
+      uc.tools.sandbox.workspace_root = sandbox_root
     end
     -- 测试默认关闭内核级观测（eBPF/strace/procfs）：避免每个进程工具都挂 bpftrace，
     -- 保持离线可复现与速度。观测专项用例自行覆盖 tools.sandbox.observe。
@@ -308,6 +383,8 @@ local function _install_test_defaults()
       cur.tools = cur.tools or {}
       cur.tools.sandbox = cur.tools.sandbox or {}
       cur.tools.sandbox.run_as = { uid = 0, gid = 0 }
+      -- 强制重定向（默认 cache 路径在嵌套沙箱内可能只读）；专项用例可显式覆盖。
+      cur.tools.sandbox.workspace_root = sandbox_root
       -- 同上面的 load 包装：默认值 async 会弹审批浮窗并等待点击，headless 下等不到人 →
       -- 工具循环挂起。这里强制为 auto_allow（需要审批流程的用例自行 load 覆盖）。
       cur.tools.approval = cur.tools.approval or {}
@@ -339,7 +416,10 @@ local function _install_test_defaults()
       orig_config_load(cur)
     end
   end)
-  return function() config_store.load = orig_config_load end
+  return function()
+    config_store.load = orig_config_load
+    if own_root and sandbox_root then pcall(vim.fn.delete, sandbox_root, "rf") end
+  end
 end
 
 --- 读取按分片加载过滤器（子进程由 `_isolated_script` 注入 NEOAI_TEST_MODULES）。
@@ -431,7 +511,7 @@ end
 --- @return table { passed, failed, errors }
 function M.run_all(...)
   local requested = { ... }
-  local total_passed, total_failed = 0, 0
+  local total_passed, total_failed, total_skipped = 0, 0, 0
   local all_errors = {}
   local suite_timings = {}
 
@@ -526,12 +606,13 @@ function M.run_all(...)
         pcall(function() require("NeoAI.tools").reload_tools() end)
       end
       local suite_t0 = vim.uv.hrtime()
-      local p, f, errs = _run_suite(suite)
+      local p, f, errs, sk = _run_suite(suite)
       local suite_ms = (vim.uv.hrtime() - suite_t0) / 1e6
       suite_timings[suite.name] = suite_ms
       print(("TIMING %s %.1f"):format(suite.name, suite_ms))
       total_passed = total_passed + p
       total_failed = total_failed + f
+      total_skipped = total_skipped + (tonumber(sk) or 0)
       for _, e in ipairs(errs) do all_errors[#all_errors + 1] = e end
     end
   end, debug.traceback)
@@ -547,8 +628,16 @@ function M.run_all(...)
     total_failed = total_failed + 1
   end
 
-  print(string.format("\n=== 结果: %d 通过, %d 失败 ===", total_passed, total_failed))
-  return { passed = total_passed, failed = total_failed, errors = all_errors, timings = suite_timings }
+  if total_skipped > 0 then
+    print(string.format("\n=== 结果: %d 通过, %d 失败, %d 跳过（缺少环境能力） ===",
+      total_passed, total_failed, total_skipped))
+  else
+    print(string.format("\n=== 结果: %d 通过, %d 失败 ===", total_passed, total_failed))
+  end
+  return {
+    passed = total_passed, failed = total_failed, skipped = total_skipped,
+    errors = all_errors, timings = suite_timings,
+  }
 end
 
 -- ========== 隔离子进程运行 ==========
@@ -612,13 +701,14 @@ function M._isolated_script(names, opts)
     "end",
     'local r = require("NeoAI.tests").run_all(unpack(names))',
     'print(("SUMMARY passed=%d failed=%d"):format(r.passed, r.failed))',
+    'if (r.skipped or 0) > 0 then print(("SKIPPED %d"):format(r.skipped)) end',
     "for _, e in ipairs(r.errors or {}) do",
     '  io.stdout:write("ERROR:: " .. tostring(e) .. "\\n")',
     "end",
     "-- 结果 sidecar：父端只读小 JSON，避免缓冲/扫描整段 stdout。",
     "if result_path then",
     "  local okj, enc = pcall(vim.json.encode, {",
-    "    passed = r.passed, failed = r.failed,",
+    "    passed = r.passed, failed = r.failed, skipped = r.skipped or 0,",
     "    errors = r.errors or {}, timings = r.timings or {},",
     "  })",
     "  if okj then",

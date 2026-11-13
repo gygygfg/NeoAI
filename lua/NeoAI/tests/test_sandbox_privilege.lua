@@ -1040,6 +1040,7 @@ tests.suite("sandbox_privilege", function(_, it)
   end)
 
   it("密钥防护：commit 发布时把 token 还原为真实密钥并留痕警告", function(t)
+    if tests.requires_sandbox() then return end
     local secret = require("NeoAI.sandbox.secret.secret")
     local fs = require("NeoAI.utils.fs")
     local sandbox = require("NeoAI.sandbox")

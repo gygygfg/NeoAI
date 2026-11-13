@@ -149,8 +149,9 @@ end
 --- @return string
 function M.policy()
   -- 高权限模式：不拦截网络（仍由 host_proxy 记录目标），覆盖 access=ask/deny。
+  -- 判据为进程级（任一 PRIV 会话存在），不随 UI 焦点/当前 Agent 漂移。
   local ok, privileged = pcall(require, "NeoAI.sandbox.privileged")
-  if ok and privileged.active() then return "allow" end
+  if ok and privileged.network_active() then return "allow" end
   local p = _cfg().access
   if p ~= "allow" and p ~= "deny" then p = "ask" end
   return p

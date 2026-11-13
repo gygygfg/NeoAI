@@ -30,17 +30,25 @@ local function _masked_target(tool_name, args, ctx)
   local runtime = require("NeoAI.sandbox.execution.runtime")
   local cwd = (ctx and (ctx.sandbox_exec_cwd or ctx.cwd)) or vim.fn.getcwd()
   local spec = tool_spec.get(tool_name)
+  -- 高权限模式：SSH 密钥/agent 路径不遮蔽（仅 read_file 等进程内读也应可访问）。
+  local ssh_unmask = nil
+  local okp, sp = pcall(require, "NeoAI.sandbox.privileged")
+  if okp and sp.active(ctx and ctx.agent and ctx.agent.id) then
+    local pcfg = config_store.get("tools.privileged_mode") or {}
+    if pcfg.unmask_ssh_keys ~= false then ssh_unmask = sp end
+  end
   for _, field in ipairs(spec.paths or {}) do
     local p = args and args[field]
     if type(p) == "string" and p ~= "" then
       local abs = vim.fn.fnamemodify(p, ":p")
+      local priv_ssh = ssh_unmask and ssh_unmask.is_ssh_path(abs) or false
       -- 先判宿主敏感遮蔽路径（mask_paths/沙箱存储，硬拒绝），再判遮蔽目录（mask_dirs，可审批）。
       -- 二者可能重叠（如 /root/.ssh 既在 mask_paths 又位于遮蔽目录 /root 下）；若先判
       -- mask_dirs，软命中会遮蔽硬命中，使非进程内 fs 工具（如 read_image）在无审批界面时放行。
-      local masked = runtime.is_masked_path(abs)
-      if masked then return masked, true end
+      local masked = runtime.is_masked_path(abs, priv_ssh and ssh_unmask.ssh_unmask_paths() or nil)
+      if masked and not priv_ssh then return masked, true end
       local hit = runtime.mask_entry(abs, cwd)
-      if hit then return hit end
+      if hit and not priv_ssh then return hit end
     end
   end
   if not runtime.mask_dirs_enabled() then return nil end
@@ -53,8 +61,11 @@ local function _masked_target(tool_name, args, ctx)
         if not s then break end
         local e2 = e
         while e2 < #cmd and cmd:sub(e2 + 1, e2 + 1):match("[%w%._%-/]") do e2 = e2 + 1 end
-        local hit = runtime.mask_entry(cmd:sub(s, e2), cwd)
-        if hit then return hit end
+        local candidate = cmd:sub(s, e2)
+        if not (ssh_unmask and ssh_unmask.is_ssh_path(candidate)) then
+          local hit = runtime.mask_entry(candidate, cwd)
+          if hit then return hit end
+        end
         init = e + 1
       end
     end

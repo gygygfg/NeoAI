@@ -76,6 +76,25 @@ function M.policy_text()
   return PRIVILEGED_POLICY_TEXT
 end
 
+--- 仅应用/撤销沙箱侧策略（网络放行、容器直连、SSH 不遮蔽），不改计划模式、agent 标志与模型。
+--- 供「生成中切换高权限模式」使用：策略立即生效，避免本轮后续工具调用仍弹窗/被拦；
+--- 模型/计划模式切换由 chat_service 在本轮结束后应用。
+--- 幂等：状态未变化时不重复发事件。
+--- @param agent table
+--- @param active boolean
+--- @return boolean changed 沙箱注册表是否发生变化
+function M.set_policy(agent, active)
+  if not agent then return false end
+  local sandbox_privileged = require("NeoAI.sandbox.privileged")
+  active = active == true
+  local was = sandbox_privileged.is_marked(agent.id)
+  sandbox_privileged.mark(agent.id, active)
+  if active then sandbox_privileged.set_current(agent.id) end
+  if was == active then return false end
+  event_bus.emit(events.PRIVILEGED_MODE_CHANGED, { agent_id = agent.id, active = active })
+  return true
+end
+
 --- 进入高权限模式（同时退出计划模式）
 --- @param agent table
 --- @return boolean ok
@@ -84,14 +103,17 @@ function M.enter(agent)
   if not agent then return false, "NO_AGENT" end
   local ok, reason = M.available()
   if not ok then return false, reason end
+  local sandbox_privileged = require("NeoAI.sandbox.privileged")
+  if agent.privileged_mode == true and sandbox_privileged.is_marked(agent.id) then
+    -- 已在 PRIV（如生成中已提前应用策略）：幂等，不重复通知/事件。
+    sandbox_privileged.set_current(agent.id)
+    return true
+  end
   -- 互斥：先退出计划模式（会触发 PLAN_MODE_CHANGED）。
   local plan_mode = require("NeoAI.tools.builtin.plan_mode")
   if plan_mode.is_active(agent) then plan_mode.exit(agent) end
   agent.privileged_mode = true
-  local sandbox_privileged = require("NeoAI.sandbox.privileged")
-  sandbox_privileged.mark(agent.id, true)
-  sandbox_privileged.set_current(agent.id)
-  event_bus.emit(events.PRIVILEGED_MODE_CHANGED, { agent_id = agent.id, active = true })
+  M.set_policy(agent, true)
   _notify("[NeoAI] 高权限模式已开启：网络不拦截（仅记录），可直接使用 docker/podman。",
     vim.log.levels.WARN)
   return true
@@ -102,14 +124,8 @@ end
 --- @return boolean
 function M.exit(agent)
   if not agent then return false end
-  local was_active = agent.privileged_mode == true
   agent.privileged_mode = false
-  pcall(function()
-    require("NeoAI.sandbox.privileged").mark(agent.id, false)
-  end)
-  if was_active then
-    event_bus.emit(events.PRIVILEGED_MODE_CHANGED, { agent_id = agent.id, active = false })
-  end
+  M.set_policy(agent, false)
   return true
 end
 
@@ -135,10 +151,7 @@ function M.restore(agent, state)
   local ok = M.available()
   if not ok then return end
   agent.privileged_mode = true
-  local sandbox_privileged = require("NeoAI.sandbox.privileged")
-  sandbox_privileged.mark(agent.id, true)
-  sandbox_privileged.set_current(agent.id)
-  event_bus.emit(events.PRIVILEGED_MODE_CHANGED, { agent_id = agent.id, active = true })
+  M.set_policy(agent, true)
 end
 
 --- 清理 agent 级状态（销毁时）

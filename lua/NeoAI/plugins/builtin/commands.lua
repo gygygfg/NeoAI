@@ -177,6 +177,23 @@ local SUBCOMMANDS = {
     end,
   },
   {
+    name = "WindowMode",
+    phase1 = true,
+    desc = "切换窗口模式（tab/float/split；缺省显示当前模式）",
+    handler = function(sub_opts)
+      local ui = _svc("services.ui")
+      if not ui then return end
+      local mode = _first_arg(sub_opts)
+      if mode == nil or mode == "" then
+        vim.notify(("[NeoAI] 当前窗口模式: %s（可选: tab / float / split）"):format(ui.window_mode()),
+          vim.log.levels.INFO)
+        return
+      end
+      -- 切换并立即重建已打开窗口；Agent 正在运行时仅更新配置（避免打断当前回合）。
+      ui.set_window_mode(mode)
+    end,
+  },
+  {
     name = "ReloadDisplay",
     phase1 = true,
     desc = "热重载显示模式插件（缺省重载当前模式）",
@@ -188,6 +205,49 @@ local SUBCOMMANDS = {
       local plugin = chat_view.reload_display(name)
       if plugin then
         vim.notify("[NeoAI] 显示模式插件已热重载: " .. (plugin.label or plugin.name), vim.log.levels.INFO)
+      end
+    end,
+  },
+  {
+    name = "Compact",
+    phase1 = true,
+    desc = "手动压缩当前会话上下文（忽略压力阈值，保留最近一轮）",
+    handler = function()
+      local chat_service = _svc("services.chat_service")
+      if not chat_service then return end
+      local agent = chat_service.get_current_agent()
+      if not agent then
+        vim.notify("[NeoAI] 无当前 Agent，无法压缩上下文", vim.log.levels.WARN)
+        return
+      end
+      if agent._compacting or agent._compaction_pending then
+        vim.notify("[NeoAI] 上下文压缩正在进行，请稍候", vim.log.levels.INFO)
+        return
+      end
+      -- 压缩会在轮次边界替换较早历史的请求视图；生成/工具执行中强行压缩会与消息写入竞态。
+      if agent.state == "generating" or agent.state == "tool_running" then
+        vim.notify("[NeoAI] Agent 正在运行，请等本轮结束后再手动压缩", vim.log.levels.WARN)
+        return
+      end
+      local compactor = require("NeoAI.core.session.compactor")
+      vim.notify("[NeoAI] 开始手动压缩上下文…", vim.log.levels.INFO)
+      local d = compactor.compact_now(agent)
+      local function done(ok)
+        local status = _svc("services.status")
+        if status and status.refresh then status.refresh() end
+        local ui = _svc("services.ui")
+        local view = ui and ui.get_chat_view()
+        if view then view.refresh() end
+        if ok then
+          vim.notify("[NeoAI] 上下文压缩完成（较早历史已替换为检查点）", vim.log.levels.INFO)
+        else
+          vim.notify("[NeoAI] 可折叠的上下文过少，未执行压缩", vim.log.levels.WARN)
+        end
+      end
+      if d and d.then_ then
+        d:then_(done, function(err)
+          vim.notify("[NeoAI] 上下文压缩失败: " .. tostring(err and err.message or err), vim.log.levels.ERROR)
+        end)
       end
     end,
   },
@@ -212,7 +272,7 @@ local SUBCOMMANDS = {
   {
     name = "Privileged",
     phase1 = true,
-    desc = "切换高权限模式（网络仅记录、可直连 docker/podman）",
+    desc = "切换高权限模式（网络仅记录、直连 docker/podman、不遮蔽 SSH 密钥）",
     handler = function()
       local chat_service = _svc("services.chat_service")
       if not chat_service then return end
@@ -230,7 +290,7 @@ local SUBCOMMANDS = {
           or tostring(reason or "未知原因")
         vim.notify("[NeoAI] 无法切换高权限模式：" .. text, vim.log.levels.WARN)
       else
-        local suffix = chat_service.has_pending_mode() and "（将在本轮生成结束后生效）" or ""
+        local suffix = chat_service.pending_mode_hint and chat_service.pending_mode_hint() or ""
         vim.notify("[NeoAI] 高权限模式已" .. (active and "开启" or "关闭") .. suffix,
           active and vim.log.levels.WARN or vim.log.levels.INFO)
       end
@@ -868,7 +928,19 @@ function M.complete(arglead, cmdline, cursorpos)
   local rest = line:match("^%S+%s(.*)$") or ""
   -- arglead 之前若已有其他 token，说明正在补全第二个及以后的参数 → 不补全子命令
   local before = #rest >= #arglead and rest:sub(1, #rest - #arglead) or rest
-  if before:find("%S") then return {} end
+  if before:find("%S") then
+    -- 唯一支持参数补全的子命令：WindowMode 补 tab / float / split。
+    local first = line:match("^%S+%s+(%S+)")
+    if first and first:lower() == "windowmode" then
+      local lead = arglead:lower()
+      local out = {}
+      for _, m in ipairs({ "tab", "float", "split" }) do
+        if lead == "" or m:sub(1, #lead) == lead then out[#out + 1] = m end
+      end
+      return out
+    end
+    return {}
+  end
   local lead = arglead:lower()
   local out = {}
   for _, spec in ipairs(SUBCOMMANDS) do

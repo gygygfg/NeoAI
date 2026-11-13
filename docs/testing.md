@@ -15,13 +15,24 @@
 
 - **默认并行（无参数）**：`lua/NeoAI/tests/parallel.lua`（薄门面）按「双 lane 有界并发」把全部
   套件分派到隔离 headless 子进程：**light lane** 把非资源重套件按实测耗时 LPT 分片成
-  `min(nproc, 8)` 个进程并发执行（环境变量 `NEOAI_TEST_WORKERS` 可覆盖）；**heavy lane** 对
-  资源重/时序敏感套件（默认 `sandbox*`、`pty`）**一套件一子进程**并发执行（上限
-  `NEOAI_TEST_HEAVY_WORKERS`，默认 2；`=1` 等价旧串行通道）。两 lane **重叠执行**、任一子进程
-  结束即回填，约束 `#light≤W`、`#heavy≤H`、`W+H≤核数`。分片权重优先用实测耗时缓存
+  `核数 - heavy` 个进程并发执行（自动推导，上限 16；环境变量 `NEOAI_TEST_WORKERS` 可覆盖）；
+  **heavy lane** 对资源重/时序敏感套件（默认 `sandbox*`、`pty`）**一套件一子进程**并发执行
+  （自动推导 ≈ `核数/2`，并按可用内存收敛；`NEOAI_TEST_HEAVY_WORKERS` 可覆盖；`=1` 等价旧串行
+  通道）。两 lane **重叠执行**、任一子进程结束即回填，约束 `#light≤W`、`#heavy≤H`、
+  `W+H≤核数-2`（预留两核给系统/编辑器，核数很少时至少 2 路）。
+  分片权重优先用实测耗时缓存
   `.neoai_test_timings.json`（gitignored，仓库根），无缓存时按用例数做 LPT 贪心均衡。
-  职责拆分为 `NeoAI.tests.runner.*` 子模块（config / timings / shard / spawn / scheduler / report）。
-  可用 `opts.serial_suites`（模式数组或判定函数）覆盖 heavy 判定。
+  职责拆分为 `NeoAI.tests.runner.*` 子模块（config / timings / shard / spawn / scheduler /
+  memguard / report）。并发计划按**实际核数 + 可用内存**动态分配：heavy 每路预留 1536MB、light
+  每路 512MB，内存不足时从 heavy 让位并压缩 light（各至少 1 路）；运行期每个分片启动前再由
+  `runner/memguard` 做一次内存许可（不足则短暂等待，超时放行，绝不挂起）。报告头部显示本次
+  使用的核数与可用内存；`NEOAI_TEST_MEM_MB` 可覆盖可用内存（MB，便于复现/固定 CI 机型）。可用 `opts.serial_suites`（模式数组或判定函数）覆盖 heavy 判定。
+- **环境能力门控（沙箱内跑测试）**：依赖真实命名空间隔离（`bwrap` / `unshare`+userns）或宿主机
+  `CAP_NET_ADMIN` 的用例，在缺少该能力时（典型：**在 NeoAI 自身沙箱内运行测试**、受限容器）
+  自动跳过并打印 `↷ SKIP: …`（计为通过，不计失败）；并行报告额外输出
+  `SUMMARY-SKIP skipped=N` 并在表头标注「跳过 N 例」。测试进程的沙箱存储根默认重定向到临时
+  目录（`NEOAI_TEST_SANDBOX_ROOT` 可固定用于复现），避免只读 home/cache 下服务启动或候选
+  物化失败。
 - **结果回传与主线程卸载**：每个 worker 把结果写入 **sidecar**（小 JSON：passed/failed/errors/timings），
   并把 stdout/stderr 直接落盘为**日志文件**；父进程只读小 sidecar（O(分片数)），不再逐行缓冲或
   全量扫描整段输出、不驻留分片全量输出；失败时按需**懒读日志尾部**（日志路径 + 末尾 N 行）定位。
@@ -87,13 +98,16 @@ opts.wait / opts.on_done / opts.timings_path / opts.verbose`）；顺序隔离�
 回归会**跳过环境能力依赖套件**（无特权 runner 上必然失败，失败源于环境而非代码）：
 `gateway`、`multimodal`、`integration`、`timer`、`pty`，以及沙箱专项套件
 `sandbox_{core,session,view,privilege,secret,ops}`、`sandbox_governance`、`sandbox_privileged`、
-`sandbox_hardening`、`sandbox_service`、`sandbox_systemd`——它们需要 systemd init /
+`sandbox_hardening`、`sandbox_service`、`sandbox_systemd` 及其拆分套件（`_facade`/`_gate`/`_wait`/`_transient`/`_pipe`/`_run`/`_timer`）——它们需要 systemd init /
 unshare-userns / netns / 交互式审批 / PTY 等能力。其余套件必须全绿（含沙箱中不依赖
 上述能力的子套件，如 `sandbox_ai_audit`、`sandbox_boundary_*` 等）。跳过清单直接写在
 workflow 的 `-c` 内联脚本中；本地等价运行见 1.1（去掉过滤即为本机全量）。
 
 > 原单文件 `test_sandbox.lua` 已按用例主题拆分为 `test_sandbox_{core,session,view,privilege,secret,ops}.lua`
-> 六个套件（用例彼此独立、无跨用例共享状态，总数不变）。
+> 六个套件（用例彼此独立、无跨用例共享状态，总数不变）。`test_sandbox_systemd.lua` 同理拆分为
+> `_facade` / `_gate` / `_wait` / `_transient` / `_pipe` / `_run` / `_timer`（共享辅助放
+> `tests/sandbox_systemd_helpers.lua`）——原文件串行 36–43s 的门面/定时器等待改由 heavy lane
+> 并行执行，整轮测试显著缩短。
 
 ## 2. 测试组织
 
@@ -212,7 +226,14 @@ end)
 | `test_merge3` | 三方合并纯 Lua diff3：单侧改动取该侧、同区间同结果去重、同区间异结果冲突、非重叠改动合并、删除/插入/空文件、无尾换行、超大文件 `too_large` 回退 |
 | `test_sandbox_merge` | 发布三方合并：无外部改动直写、外部非重叠改动合并保留、外部重叠冲突 `MERGE_CONFLICT` 且真实文件零改动、外部已是候选结果幂等跳过、无 base_blob 回退严格 CAS、`merge=false` 回退、同步与异步语义一致 |
 | `test_sandbox_conflict_ai` | 合并冲突留待审：apply 返回 CONFLICT 且条目保持 PENDING/记录 `merge_conflict`、真实文件零改动、`has_merge_conflict`、`notify_conflict_ai` 组装冲突说明并经 `chat_service` 注入会话 |
-| `test_sandbox_systemd` | systemctl 门面（方案 A）：独立调用解析与路由、unit 解析与类型门禁、依赖闭包（Requires/Wants/After、缺失依赖）、start 静默成功、status/is-active/is-system-running/is-failed 真实风格输出与退出码、不支持动词返回真实错误（不暴露沙箱）、门禁拦截不调用宿主 systemctl；Service 属性解析与 `show --property`、pending enable 虚拟视图、`reset-failed` 清除 degraded、`kill`+`Restart=always` 自动重启与 NRestarts、`.timer` 调度与 `systemd-run --on-active` 瞬态定时器 |
+| `test_sandbox_systemd` | systemctl 门面（方案 A）·解析/外观：独立调用解析与路由、unit 解析与类型门禁、依赖闭包（Requires/Wants/After、缺失依赖）、is-system-running/is-failed 真实风格输出、list-units/journalctl/systemd-analyze 合成、Service 属性与 `show --property`、`reset-failed`、hostnamectl/timedatectl/dmesg |
+| `test_sandbox_systemd_facade` | systemctl 门面 · 生命周期：start 静默成功、status/is-active/stop、基线系统单元 start/stop/restart、enable/mask/power 真实错误（不暴露沙箱）、pending enable 虚拟视图 |
+| `test_sandbox_systemd_gate` | systemctl 门面 · 门禁：run_command 的 systemctl/systemd-analyze 路由到沙箱服务（不调用宿主 systemctl）、查询类动词非零退出不包装为工具失败、沙箱私有视图（`/run/systemd/system`、`/etc/systemd/system` 写入对门面可见） |
+| `test_sandbox_systemd_wait` | `systemd-run --unit=… --wait`：解析、启动并等待单元结束 |
+| `test_sandbox_systemd_transient` | systemd-run 瞬态单元：status/cat/show/is-enabled/stop/restart 一致性 |
+| `test_sandbox_systemd_pipe` | `systemd-run --pipe/-P`：回传输出与退出码（不再报不支持） |
+| `test_sandbox_systemd_run` | oneshot 等待退出码、`kill`+`Restart=always` 自动重启与 NRestarts 累加 |
+| `test_sandbox_systemd_timer` | `.timer` OnActiveSec 调度与 `systemd-run --on-active` 瞬态定时器（含真实等待） |
 | `test_sandbox_maintscript` | systemd 门面入口：`process_prefix` 把极薄入口覆盖绑定真实二进制路径（不再 PATH 前置 `/tmp/.dynbin`）、包安装注入 policy-rc.d、入口经文件 IPC 转发到 Lua 门面（stdout/stderr/退出码与真实 systemctl 一致） |
 | `test_net_consent` | 沙箱网络访问同意：策略 ask/allow/deny、内部端口登记免权限、headless 失败关闭、弹窗 allow_once/deny/allow_session 记忆、外部目标按策略处理 |
 | `test_device_consent` | 危险设备访问门禁：`risk.device_access`/`device_path_match` 检测（/dev/kvm、/dev/net/tun、of=、重定向、引号、glob）与不误判；动作/超时/本会话允许列表；request 决策（headless 拒绝、弹窗允许、会话记住、超时自动阻止）；`bind_mounts` 生成 `--dev-bind`；动态监测 `_device_observe`（命中记录并终止命令树、已允许/无害不阻断）；静态回退端到端（deny 拒绝 / ask 批准后执行 / allow 直接放行）；eBPF 动态端到端（可用时） |

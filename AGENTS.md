@@ -18,8 +18,12 @@ NeoAI 是一个 Neovim AI 编程助手插件（Lua）。分层：
 
 ```bash
 # 运行全部内置测试（并行，双 lane 有界并发，输出 SUMMARY passed/failed）
-# 可选环境变量 NEOAI_TEST_WORKERS 覆盖 light 通道 worker 数（默认 min(nproc, 8)）
-#                 NEOAI_TEST_HEAVY_WORKERS 覆盖 heavy 通道并发上限（默认 2；=1 回退旧串行通道）
+# 可选环境变量 NEOAI_TEST_WORKERS 覆盖 light 通道 worker 数（默认按实际核数与可用内存动态分配：
+#                  light=核数-heavy，上限 16；每 heavy 分片预留 1536MB、每 light 分片 512MB）
+#                 NEOAI_TEST_HEAVY_WORKERS 覆盖 heavy 通道并发上限（默认核数/2；总并发硬上限 = 核数-2；=1 回退旧串行通道）
+#                 运行期每个分片启动前还会经 runner/memguard 做一次内存许可（有界等待后放行）
+#                 NEOAI_TEST_MEM_MB 可覆盖可用内存（MB，便于复现/CI 固定机器规格）
+#                 NEOAI_TEST_SANDBOX_ROOT 固定测试进程的沙箱存储根（默认临时目录；沙箱内/只读 cache 场景必要）
 #                 NEOAI_TEST_VERBOSE=1 还原逐用例明细打印（默认仅失败 + 套件摘要）
 nvim --headless --clean -u NONE --cmd "set rtp+=$PWD" \
   --cmd "lua require('NeoAI').setup({ log={level='ERROR'}, session={auto_save=false} })" \
@@ -36,7 +40,7 @@ nvim --headless --clean -u NONE --cmd "set rtp+=$PWD" \
   `lua/NeoAI/tests/runner/{config,timings,shard,spawn,scheduler,report}.lua`。按「文件（套件）」
   分派到隔离 headless 子进程，采用**双 lane 有界并发**：light（非资源重套件，LPT 分片成 W 个
   进程）与 heavy（`sandbox*`/`pty`，一套件一进程，上限 H）**重叠执行**、任一子进程结束即回填，
-  约束 `#light≤W`、`#heavy≤H`、`W+H≤核数`。权重优先用实测耗时缓存 `.neoai_test_timings.json`
+  约束 `#light≤W`、`#heavy≤H`、`W+H≤核数-2`（预留两核给系统/编辑器）。权重优先用实测耗时缓存 `.neoai_test_timings.json`
   （gitignored），无缓存按用例数。文件级分片保证固定端口（各文件唯一）与文件内固定临时路径
   不跨 worker 冲突；子进程注入独立 `mcp.cache_path`。
 - **主线程卸载（父进程 + worker 子进程）**：每个 worker 把结果写入 **sidecar**（小 JSON）并把

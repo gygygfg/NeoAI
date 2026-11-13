@@ -209,8 +209,9 @@ end
 --- @return string
 local function _access_policy()
   -- 高权限模式：一律放行（仍记录目标），优先于配置与测试注入。
+  -- 判据为进程级（任一 PRIV 会话存在），不随 UI 焦点/当前 Agent 漂移。
   local okp, privileged = pcall(require, "NeoAI.sandbox.privileged")
-  if okp and privileged.active() then return "allow" end
+  if okp and privileged.network_active() then return "allow" end
   local p = state.opts.access
   if p ~= "allow" and p ~= "deny" and p ~= "ask" then
     local ok, cfg = pcall(function()
@@ -515,7 +516,7 @@ local function _record(host, port, proto, decision)
   -- 高权限模式：把放行/拦截目标额外写入独立环形缓冲，供 :NeoAI SandboxAudit network
   -- 查看（host_proxy.summary 只回传拦截项，且会在命令结束时 drain）。
   local okp, privileged = pcall(require, "NeoAI.sandbox.privileged")
-  if okp and privileged.active() then
+  if okp and privileged.network_active() then
     local okc, cfg = pcall(function()
       return require("NeoAI.kernel.config_store").get("tools.privileged_mode") or {}
     end)
@@ -974,8 +975,9 @@ function M.ensure()
   if state.server then return { host = state.host, port = state.port } end
   local cfg = require("NeoAI.kernel.config_store").get("tools.sandbox.network") or {}
   -- 高权限模式即使配置关闭 host_local_block 也要启动代理（仅记录放行目标）。
+  -- 判据为进程级：任一 PRIV 会话存在即启动，避免焦点切换后记录丢失。
   local okp, privileged = pcall(require, "NeoAI.sandbox.privileged")
-  local recording = okp and privileged.active()
+  local recording = okp and privileged.network_active()
   if cfg.host_local_block == false and not recording then return nil end
   local port = tonumber(cfg.host_local_proxy_port) or 0
   local addr, err = M.start("127.0.0.1", port)

@@ -52,6 +52,7 @@ function M.record(agg, sid, names, started_ns, res)
   local ms = (vim.uv.hrtime() - started_ns) / 1e6
   local passed = tonumber(res.passed) or 0
   local failed = tonumber(res.failed) or 0
+  local skipped = tonumber(res.skipped) or 0
   -- 回退：无结构化结果且带输出时，从输出扫描 SUMMARY/TIMING。
   local output = res.output
   if (passed + failed) == 0 and output and output ~= "" then
@@ -69,6 +70,7 @@ function M.record(agg, sid, names, started_ns, res)
     names = names,
     passed = passed,
     failed = failed,
+    skipped = skipped,
     produced = produced,
     exit_code = res.exit_code,
     elapsed_ms = ms,
@@ -84,6 +86,7 @@ function M.record(agg, sid, names, started_ns, res)
   end
   agg.passed = agg.passed + shard.passed
   agg.failed = agg.failed + shard.failed
+  agg.skipped = (agg.skipped or 0) + shard.skipped
   for _, e in ipairs(res.errors or {}) do agg.errors[#agg.errors + 1] = e end
   agg.shards[sid] = shard
 end
@@ -101,8 +104,16 @@ end
 --- @param opts table
 function M.print(agg, opts)
   local heavy = agg.heavy_workers or 0
-  print(("\n=== NeoAI 并行测试（%d 分片 / %d light + %d heavy worker，%.1fs） ===")
-    :format(#agg.shards, agg.workers, heavy, agg.elapsed_ms / 1000))
+  local extra = ""
+  if agg.cores then
+    extra = (" · %d 核"):format(agg.cores)
+    if agg.mem_gb then extra = extra .. (" / 可用内存 %.1fGB"):format(agg.mem_gb) end
+  end
+  if (agg.skipped or 0) > 0 then
+    extra = extra .. (" · 跳过 %d 例"):format(agg.skipped)
+  end
+  print(("\n=== NeoAI 并行测试（%d 分片 / %d light + %d heavy worker%s，%.1fs） ===")
+    :format(#agg.shards, agg.workers, heavy, extra, agg.elapsed_ms / 1000))
   for i = 1, #agg.shards do
     local sh = agg.shards[i]
     if sh then
@@ -113,6 +124,9 @@ function M.print(agg, opts)
     end
   end
   print(("SUMMARY passed=%d failed=%d"):format(agg.passed, agg.failed))
+  if (agg.skipped or 0) > 0 then
+    print(("SUMMARY-SKIP skipped=%d（缺少环境能力）"):format(agg.skipped))
+  end
   if agg.failed > 0 or (opts and opts.verbose) then
     for i = 1, #agg.shards do
       local sh = agg.shards[i]

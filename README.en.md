@@ -18,7 +18,7 @@
 - **A rich set of built-in tools** — the AI can call 40+ tools for file operations, code analysis, LSP, Shell commands, and more
 - **Tool approval system** — fine-grained control over tool execution permissions, supporting auto-allow / manual approval / argument-level allowlists
 - **Plan mode (PLAN) and plan extraction** — toggle with `m` or `:NeoAI Plan`; the tool context retains only read-only / informational queries plus `run_command` (read-only research) and `ask_user` (no mutating tools are exposed, and no mode-switching tool is given to the AI); after the AI researches and clarifies, it emits a formatted change plan and ends the turn; once the user confirms (`:NeoAI ApprovePlan` or manually toggling the mode), NeoAI switches to CHAT: at the boundary it first runs one **XML plan extraction** (`<target>`/`<stepN>`/`<files>` etc., case-insensitive, retrying up to 3 times when key fields are missing), assembles the execution context, builds the task list automatically per step (`todo_write`), and keeps `<files>`-related tool messages verbatim for cache hits before starting execution
-- **Privileged mode (PRIV, opt-in)** — cycle with `m` or toggle with `:NeoAI Privileged`; network is record-only and docker/podman can be used directly (docker connects to the host daemon). Off by default and async-approval only; see `docs/en/configuration.md` and `docs/sandbox.md` for the security boundary
+- **Privileged mode (PRIV, opt-in)** — cycle with `m` or toggle with `:NeoAI Privileged`; network is record-only (process-wide: while a PRIV session exists, traffic is allowed and recorded, and focus switches never prompt), docker/podman can be used directly (docker connects to the host daemon), and SSH keys are not masked; switching during a generation applies the policy immediately and defers only the model. Off by default and async-approval only; see `docs/en/configuration.md` and `docs/sandbox.md` for the security boundary
 - **Background context compaction** — as the context threshold approaches, round 1 through the second-to-last round (keeping the last round intact) is folded **asynchronously in the background, non-blocking**, and a checkpoint is written into a **compaction overlay**: subsequent requests and further compactions use the compacted replacement, while chat rendering and session persistence keep the original context (the overlay is saved with the session and survives a restart); compaction opens no floating window; in addition to turn boundaries, **a pressure check runs before every round of the tool loop** (after tool results are written back and before the next request), so long loops converge round by round; **when the history safety cap is exceeded we compact synchronously before sending (replacing the prefix with a checkpoint instead of truncating it)**; on overflow the request is compacted and retried automatically; plan extraction still shows reasoning and content live in a floating window
 - **Sub-Agent system** — the AI can spawn sub-Agents to run subtasks in parallel, with boundary review
 - **Decoupled frontend/backend architecture** — an event-driven asynchronous architecture that separates the UI from business logic
@@ -210,6 +210,8 @@ shown by a floating hint (or by your nvim-cmp + cmp-cmdline setup when installed
 | `:NeoAI Test`       | Run tests (parallel full run with no arguments; sequential run of named suites with arguments) |
 | `:NeoAI ChatStatus` | Show the chat window status                      |
 | `:NeoAI CycleDisplay`| Cycle through chat display modes (chat/trace)   |
+| `:NeoAI WindowMode`| Switch the window mode of the current chat window (tab/float/split; current window only, config untouched; works while the Agent is generating or running tools; no arg prints the current mode) |
+| `:NeoAI Compact`   | Manually compact the current session context (ignores the pressure threshold, keeps the latest round) |
 | `:NeoAI ReloadDisplay`| Hot-reload the display mode plugin (reloads the current mode by default) |
 | `:NeoAI ReloadAll`  | Hot-reload the whole NeoAI plugin (isolated pre-check first; cancel on failure) |
 | `:NeoAI Plan`       | Toggle plan mode (the tool context retains only read-only / informational queries + asking the user) |
@@ -368,12 +370,14 @@ require("NeoAI").setup({
   -- ===== UI configuration =====
   ui = {
     default_view = "chat",               -- default view: tree / chat
-    window_mode = "tab",                 -- window mode: float / tab / split
+    window_mode = "tab",                 -- default window mode for new windows: float / tab / split (:NeoAI WindowMode only switches the current window)
     window = { w_ratio = 0.85, h_ratio = 0.85, border = "rounded" }, -- float window sized by screen ratio; follows resizes; explicit width/height act as caps
     float = { min_width = 24, min_height = 4 }, -- minimum size floor for all floating windows
     -- Narrow-screen padding (hard-coded, no config): based on the chat main window width, a floating
     -- window fills the window when width < 40, keeps 5 cols on each side when 40 <= width < 100,
     -- and stays screen-ratio centered when >= 100.
+    -- split: size is the desired size (cols/rows); max_ratio (default 0.5) + min_rest (default 20)
+    -- clamp it, so the NeoAI window takes at most half the screen and the original keeps >= 20 cols/rows
     split = { size = 80, direction = "right" },
     colors = {                           -- highlight group linked by each element
       background = "Normal", border = "FloatBorder",
@@ -488,6 +492,7 @@ require("NeoAI").setup({
       require_async_approval = true,     -- only allowed when tools.approval.mode="async"
       override_offline = true,           -- lift tools.sandbox.offline=true (still recorded through host_proxy)
       docker_socket = "",                -- host docker socket; empty = auto-detect
+      unmask_ssh_keys = true,            -- do not mask ~/.ssh / ssh-agent paths
       record_network = true,             -- record allowed network targets (:NeoAI SandboxAudit network)
       max_records = 1000,
     },
@@ -662,7 +667,7 @@ your own lualine and are left untouched. The display is deliberately concise: cl
 no truncated blocks:
 
 - **Line 1 (winbar)** identity: `[mode] model state`
-- **Line 2 (statusline)** metrics: `↑prompt ↓completion cache-hit x% remaining-capacity y% pending N`
+- **Line 2 (statusline)** metrics: `↑prompt ↓completion hit99.5%(session94.5%) usage y% pending N`
 
 > `pending N`: while the Agent is busy (generating / tool_running / the generation slot is occupied), messages you
 > send are queued first and this badge appears in the statusline as a reminder; once the message is actually sent,
@@ -1287,8 +1292,10 @@ Run specific tests (sequential, for debugging):
 :NeoAI Test flow_config flow_tools
 ```
 
-> The parallel runner shards by file (suite); worker count defaults to `min(nproc, 8)`
-> (override with `NEOAI_TEST_WORKERS`) and self-balances using a measured-timing cache.
+> The parallel runner shards by file (suite); worker counts are derived from the core count
+> (total cap = `cores - 2`, two cores reserved; light = `cap - heavy`, heavy ≈ `cores/2` and
+> memory-aware; override with `NEOAI_TEST_WORKERS` /
+> `NEOAI_TEST_HEAVY_WORKERS`) and self-balances using a measured-timing cache.
 > See [docs/en/testing.md](docs/en/testing.md).
 
 ---

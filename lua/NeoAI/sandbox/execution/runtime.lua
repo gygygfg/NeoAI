@@ -2110,7 +2110,7 @@ local function _host_local_block_enabled()
   -- host_local_block 也保证网络目标可被审计。若用户显式保留 offline 硬隔离
   -- （override_offline=false），则不注入代理（网络已不可达，代理无意义）。
   local okp, privileged = pcall(require, "NeoAI.sandbox.privileged")
-  if okp and privileged.active() then
+  if okp and privileged.network_active() then
     local sandbox = config_store.get("tools.sandbox") or {}
     if sandbox.offline == true and not privileged.override_offline() then return false end
     return true
@@ -3141,8 +3141,9 @@ function M.process_prefix(opts)
   local offline = cfg.offline ~= false
   local priv = opts.privileges
   -- 高权限模式：解除 offline/独立 netns 网关的硬网络隔离（仍经 host_proxy 记录）。
+  -- 判据为进程级（任一 PRIV 会话存在），不随 UI 焦点/当前 Agent 漂移。
   local ok_priv, privileged = pcall(require, "NeoAI.sandbox.privileged")
-  local privileged_active = ok_priv and privileged.active()
+  local privileged_active = ok_priv and privileged.network_active()
     and privileged.override_offline() or false
   -- 独立 netns + 宿主网关模式：沙箱只能到达宿主网关（探测端口，服务被拦）。
   local net_gateway = require("NeoAI.sandbox.net.net_gateway")
@@ -3404,7 +3405,9 @@ function M.process_prefix(opts)
     -- docker 守护进程**，一律走 podman）。如此 `docker …`（含脚本/管道/复合命令）都实际执行 podman，
     -- 而非仅靠命令首个 token 改写。podman 不可用时不注入（容器操作由门面禁用）。
     do
-      local cstubs = _container_stubs()
+      -- 入口桩按**执行 Agent** 判定（`priv.privileged`）：PRIV 会话的命令按宿主真实运行时执行，
+      -- 其它窗口的命令仍走 podman 桩，避免「焦点在哪一侧」改变容器语义。
+      local cstubs = (priv and priv.privileged) and nil or _container_stubs()
       if cstubs then
         for _, name in ipairs({ "docker", "docker-compose", "nerdctl", "podman-compose" }) do
           local src = cstubs.dir .. "/" .. name

@@ -103,6 +103,52 @@ tests.suite("compaction_overlay", function(_, it)
     t.eq(3, #agent.messages, "原始消息不应被改动")
   end)
 
+  it("compact_now：手动压缩忽略压力阈值并保留最近一轮", function(t)
+    local config_store = require("NeoAI.kernel.config_store")
+    -- 窗口取得极大 → token 压力阈值永远不会自然触发；手动压缩仍应执行。
+    config_store.load({
+      ai = {
+        default_provider = "p1",
+        providers = { p1 = { api_type = "openai", base_url = "http://x", api_key = "k" } },
+        context_cache = {
+          enabled = true, context_window = 1000000, threshold_ratio = 0.5,
+          retain_ratio = 0.1, retain_min_tokens = 4, min_shadow_messages = 2,
+          include_identity = false,
+        },
+      },
+    })
+    local agent_mod = require("NeoAI.core.agent.agent")
+    local compactor = require("NeoAI.core.session.compactor")
+    local agent = agent_mod.create({ config = { system_prompt = "persona", provider = "p1", model = "gpt-4o" } })
+    agent_mod.add_message(agent, "user", "第一轮问题")
+    agent_mod.add_message(agent, "assistant", "第一轮回答")
+    agent_mod.add_message(agent, "user", "第二轮问题")
+    agent_mod.add_message(agent, "assistant", "第二轮回答")
+
+    local request_mod = require("NeoAI.core.agent.request")
+    local orig = request_mod.send_stream
+    local calls = 0
+    ---@diagnostic disable-next-line: duplicate-set-field
+    request_mod.send_stream = function()
+      calls = calls + 1
+      return async.resolve({ content = "## 摘要\n- 压缩后的检查点", usage = nil })
+    end
+
+    local d = compactor.compact_now(agent)
+    t.true_(vim.wait(2000, function() return agent.compaction ~= nil end), "手动压缩应完成")
+    request_mod.send_stream = orig
+
+    t.eq(1, calls, "手动压缩应恰好摘要一次（不做阈值收敛重试）")
+    t.not_nil(agent.compaction, "应写入覆盖层")
+    t.eq(4, #agent.messages, "原始消息不应被改动")
+    local context_builder = require("NeoAI.core.session.context_builder")
+    local view = context_builder.request_view(agent)
+    t.eq(3, #view, "请求视图 = 检查点 + 最近一轮")
+    t.true_(view[1].checkpoint)
+    t.eq("第二轮问题", view[2].content)
+    t.true_(d ~= nil, "应返回 Deferred")
+  end)
+
   it("压缩覆盖层随会话持久化并在重开时恢复", function(t)
     local config_store = require("NeoAI.kernel.config_store")
     local TEST_DIR = "/tmp/neoai_test_compaction_overlay"

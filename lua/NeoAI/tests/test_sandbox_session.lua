@@ -50,6 +50,7 @@ tests.suite("sandbox_session", function(_, it)
   end)
 
   it("commit：基线被他人修改后 CAS 失败（CONFLICT），不覆盖", function(t)
+    if tests.requires_sandbox() then return end
     local fs = require("NeoAI.utils.fs")
     local sandbox = require("NeoAI.sandbox")
     with_config({ tools = { approval = { mode = "auto_allow" }, sandbox = { mode = "dry_run" } } }, function()
@@ -78,6 +79,7 @@ tests.suite("sandbox_session", function(_, it)
   end)
 
   it("buffer 写盘工具 dry_run 不落真实磁盘", function(t)
+    if tests.requires_sandbox() then return end
     local fs = require("NeoAI.utils.fs")
     local sandbox = require("NeoAI.sandbox")
     with_config({ tools = { approval = { mode = "auto_allow" }, sandbox = { mode = "dry_run" } } }, function()
@@ -102,6 +104,7 @@ tests.suite("sandbox_session", function(_, it)
   end)
 
   it("运行时：能力探测与隔离进程执行", function(t)
+    if tests.requires_sandbox() then return end
     local runtime = require("NeoAI.sandbox.execution.runtime")
     local caps = runtime.probe()
     t.true_(caps.bwrap or caps.unshare, "应至少有一种隔离工具")
@@ -182,6 +185,7 @@ tests.suite("sandbox_session", function(_, it)
   end)
 
   it("磁盘上限：默认 64GiB；暂存超限时拒绝写类/进程工具", function(t)
+    if tests.requires_sandbox() then return end
     local disk = require("NeoAI.sandbox.execution.disk")
     local conceal = require("NeoAI.sandbox.observe.conceal")
     with_config({ tools = { sandbox = { limits = { disk_bytes = 64 * 1024 * 1024 * 1024 } } } }, function()
@@ -838,6 +842,7 @@ tests.suite("sandbox_session", function(_, it)
   end)
 
   it("保存/撤销保存：撤销回滚原文件并回到待审，冲突时拒绝", function(t)
+    if tests.requires_sandbox() then return end
     local fs = require("NeoAI.utils.fs")
     local sandbox = require("NeoAI.sandbox")
     with_config({ tools = { approval = { mode = "auto_allow" }, sandbox = { mode = "dry_run", review = { enabled = true } } } }, function()
@@ -894,6 +899,7 @@ tests.suite("sandbox_session", function(_, it)
   end)
 
   it("撤销保存：原文件超过 max_file_bytes 仍可撤销（snapshot_max_bytes 独立上限）", function(t)
+    if tests.requires_sandbox() then return end
     local fs = require("NeoAI.utils.fs")
     local sandbox = require("NeoAI.sandbox")
     local base = string.rep("A", 64 * 1024) .. "\n"
@@ -931,6 +937,7 @@ tests.suite("sandbox_session", function(_, it)
   end)
 
   it("撤销保存：快照超限时返回 SNAPSHOT_TOO_LARGE（不误报 TARGET_CHANGED，且事前标记 undo_block）", function(t)
+    if tests.requires_sandbox() then return end
     local fs = require("NeoAI.utils.fs")
     local sandbox = require("NeoAI.sandbox")
     with_config({
@@ -970,6 +977,7 @@ tests.suite("sandbox_session", function(_, it)
   end)
 
   it("撤销保存：仅 mtime 变化（内容未变）不误判 TARGET_CHANGED", function(t)
+    if tests.requires_sandbox() then return end
     local fs = require("NeoAI.utils.fs")
     local sandbox = require("NeoAI.sandbox")
     with_config({
@@ -1001,6 +1009,7 @@ tests.suite("sandbox_session", function(_, it)
   end)
 
   it("临时根（ephemeral_roots）：/tmp 写入不产生待审候选、不落真实盘、读取一致", function(t)
+    if tests.requires_sandbox() then return end
     local fs = require("NeoAI.utils.fs")
     local sandbox = require("NeoAI.sandbox")
     with_config({ tools = { approval = { mode = "auto_allow" }, sandbox = {

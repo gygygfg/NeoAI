@@ -15,15 +15,29 @@
 
 - **Parallel by default (no args)**: `lua/NeoAI/tests/parallel.lua` (thin facade) dispatches every
   suite across isolated headless child processes via **bounded-concurrency dual lanes**: the
-  **light lane** shards non-heavy suites by measured timing into `min(nproc, 8)` processes (override
-  with `NEOAI_TEST_WORKERS`); the **heavy lane** runs resource-heavy / timing-sensitive suites
-  (default `sandbox*`, `pty`) **one suite per child process**, capped by `NEOAI_TEST_HEAVY_WORKERS`
-  (default 2; `=1` reproduces the old serial channel). Both lanes run **overlapped** and refill as
-  soon as any child exits, constrained by `#light<=W`, `#heavy<=H`, `W+H<=cores`. Shard weights prefer
+  **light lane** shards non-heavy suites by measured timing into `cores - heavy` processes (auto,
+  capped at 16; override with `NEOAI_TEST_WORKERS`); the **heavy lane** runs resource-heavy /
+  timing-sensitive suites (default `sandbox*`, `pty`) **one suite per child process**, auto-tuned to
+  about `cores/2` (memory-aware; override with `NEOAI_TEST_HEAVY_WORKERS`; `=1` reproduces
+  the old serial channel). Both lanes run **overlapped** and refill as soon as any child exits,
+  constrained by `#light<=W`, `#heavy<=H`, `W+H<=cores-2` (two cores reserved for the system/editor;
+  at least two lanes when cores are scarce). Shard weights prefer
   the measured timing cache `.neoai_test_timings.json` (gitignored, repo root); without a cache it
   falls back to case-count LPT balancing. Responsibilities are split into `NeoAI.tests.runner.*`
-  submodules (config / timings / shard / spawn / scheduler / report). Override the heavy
-  classification with `opts.serial_suites` (pattern list or predicate).
+  submodules (config / timings / shard / spawn / scheduler / memguard / report). The concurrency plan
+  is derived from the **actual core count and available memory**: 1536MB reserved per heavy worker and
+  512MB per light worker; under memory pressure heavy yields first and light is shrunk (each keeps at
+  least one lane). Before every shard starts, `runner/memguard` re-checks available memory (brief
+  bounded wait, then launch anyway — never hangs). The report header shows the core count and available
+  memory used for this run (`NEOAI_TEST_MEM_MB` overrides available memory in MB for reproducible CI).
+  Override the heavy classification with `opts.serial_suites` (pattern list or predicate).
+- **Capability gating (running tests inside a sandbox)**: cases that need real namespace isolation
+  (`bwrap` / `unshare`+userns) or host `CAP_NET_ADMIN` are **skipped** when unavailable (typically
+  when the suite runs inside NeoAI's own sandbox or a restricted container), printing `↷ SKIP: …`
+  and counting as passed; the parallel report additionally prints `SUMMARY-SKIP skipped=N` and marks
+  `skipped N` in the header. The test process redirects the sandbox store root to a temp directory by
+  default (`NEOAI_TEST_SANDBOX_ROOT` pins it for reproduction) so service start / candidate
+  materialization never fails on a read-only home/cache.
 - **Result plumbing & main-thread offload**: each worker writes a **sidecar** (small JSON:
   passed/failed/errors/timings) and streams stdout/stderr straight to a **log file**; the parent only
   reads the small sidecar (O(shards)), never buffers/scans the whole output or retains per-shard full
@@ -101,7 +115,7 @@ The `.github/workflows/ci.yml` workflow runs two jobs on push / PR:
 The regression **skips environment-capability suites** (they inevitably fail on unprivileged
 runners — the failure is environmental, not code): `gateway`, `multimodal`, `integration`,
 `timer`, `pty`, plus the sandbox-specific suites `sandbox_{core,session,view,privilege,secret,ops}`,
-`sandbox_governance`, `sandbox_privileged`, `sandbox_hardening`, `sandbox_service`, `sandbox_systemd` — these need
+`sandbox_governance`, `sandbox_privileged`, `sandbox_hardening`, `sandbox_service`, `sandbox_systemd` and its split suites (`_facade`/`_gate`/`_wait`/`_transient`/`_pipe`/`_run`/`_timer`) — these need
 systemd init / unshare-userns / netns / interactive approval / PTY capabilities. All remaining
 suites must be green (including the sandbox sub-suites that do not need those capabilities, e.g.
 `sandbox_ai_audit`, `sandbox_boundary_*`). The skip list lives in the workflow's inline `-c`
@@ -225,7 +239,14 @@ ensures there are no leftover subscriptions or state between tests.
 | `test_merge3` | Pure-Lua three-way merge (diff3): single-side change wins, identical same-region changes dedupe, differing same-region changes conflict, non-overlapping changes merge, delete/insert/empty-file, no trailing newline, oversized file `too_large` fallback |
 | `test_sandbox_merge` | Three-way merge on publish: direct write when unchanged, merge preserving non-overlapping external changes, `MERGE_CONFLICT` with zero real-file change on overlap, idempotent skip when external already equals the candidate result, strict-CAS fallback without base_blob, `merge=false` fallback, sync/async parity |
 | `test_sandbox_conflict_ai` | Merge conflicts stay pending: apply returns CONFLICT while the entry stays PENDING and `merge_conflict` is recorded, real file unchanged, `has_merge_conflict`, and `notify_conflict_ai` composes a conflict note and injects it via `chat_service` |
-| `test_sandbox_systemd` | systemctl facade (option A): standalone-call parsing and routing, unit parsing and type gating, dependency closure (Requires/Wants/After, missing deps), silent `start` success, real-style `status`/`is-active`/`is-system-running`/`is-failed` output and exit codes, unsupported verbs return real errors (no sandbox leakage), gate interception without calling host systemctl; Service-property parsing and `show --property`, pending-enable virtual view, `reset-failed` clearing degraded, `kill`+`Restart=always` auto-restart with NRestarts, `.timer` scheduling and `systemd-run --on-active` transient timers |
+| `test_sandbox_systemd` | systemctl facade (option A) · parsing/appearance: standalone-call parsing and routing, unit parsing and type gating, dependency closure (Requires/Wants/After, missing deps), real-style `status`/`is-active`/`is-system-running`/`is-failed`, synthesized `list-units`/`journalctl`/`systemd-analyze`, Service properties and `show --property`, `reset-failed`, hostnamectl/timedatectl/dmesg |
+| `test_sandbox_systemd_facade` | systemctl facade · lifecycle: silent `start`, `status`/`is-active`/`stop`, baseline system units start/stop/restart, real errors for enable/mask/power (no sandbox leakage), pending-enable virtual view |
+| `test_sandbox_systemd_gate` | systemctl facade · gate: `run_command` systemctl/systemd-analyze routed to the sandbox service (never the host), query verbs with non-zero exit not wrapped as tool failures, sandbox-private view (`/run/systemd/system`, `/etc/systemd/system` writes visible to the facade) |
+| `test_sandbox_systemd_wait` | `systemd-run --unit=… --wait`: parse, start and wait for the unit to finish |
+| `test_sandbox_systemd_transient` | systemd-run transient units: `status`/`cat`/`show`/`is-enabled`/`stop`/`restart` consistency |
+| `test_sandbox_systemd_pipe` | `systemd-run --pipe/-P`: output and exit code propagation (no longer unsupported) |
+| `test_sandbox_systemd_run` | oneshot waits for exit code; `kill` + `Restart=always` auto-restart with NRestarts |
+| `test_sandbox_systemd_timer` | `.timer` OnActiveSec scheduling and `systemd-run --on-active` transient timers (real waits) |
 | `test_sandbox_maintscript` | systemd facade entry: `process_prefix` binds the thin entry over the real binary paths (no more PATH-prepended `/tmp/.dynbin`), package installs inject policy-rc.d, and the entry forwards over file IPC to the Lua facade (stdout/stderr/exit code match real systemctl) |
 | `test_net_consent` | Sandbox network consent: ask/allow/deny policy, internal-port registration is permission-free, headless fail-closed, prompt allow_once/deny/allow_session memory, external targets handled per policy |
 | `test_device_consent` | Dangerous-device access gate: `risk.device_access`/`device_path_match` detection (/dev/kvm, /dev/net/tun, of=, redirection, quotes, globs) and no false positives; action/timeout/session allowlist; request decisions (headless deny, prompt allow, session remember, timeout auto-block); `bind_mounts` produces `--dev-bind`; dynamic monitoring `_device_observe` (records and terminates the command tree on a hit; allowed/benign not blocked); static-fallback end-to-end (deny rejected / ask approved then runs / allow passes); eBPF dynamic end-to-end (when available) |

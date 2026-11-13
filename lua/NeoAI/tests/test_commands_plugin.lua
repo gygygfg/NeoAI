@@ -77,6 +77,19 @@ tests.suite("commands_plugin", function(_, it)
     t.eq(0, #none)
   end)
 
+  it("WindowMode 第二个参数补全 tab/float/split", function(t)
+    local full = "NeoAI WindowMode "
+    t.eq(3, #commands.complete("", full, #full), "空 arglead 应返回全部模式")
+    local f = commands.complete("f", full .. "f", #full + 1)
+    t.eq(1, #f, "前缀过滤")
+    t.eq("float", f[1])
+    local none = commands.complete("z", full .. "z", #full + 1)
+    t.eq(0, #none, "无匹配前缀返回空")
+    -- 其它子命令的第二参数仍不补全
+    local other = "NeoAI Open z"
+    t.eq(0, #commands.complete("z", other, #other))
+  end)
+
   it("分发未知子命令给出用法提示且不抛错", function(t)
     local notified = nil
     local orig = vim.notify

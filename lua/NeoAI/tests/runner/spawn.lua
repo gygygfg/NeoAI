@@ -54,6 +54,12 @@ function M.get()
   return spawner or M.default_spawn
 end
 
+--- 是否处于注入（测试）模式
+--- @return boolean
+function M.is_injected()
+  return spawner ~= nil
+end
+
 --- 结束所有在跑 worker 的进程树（父端退出/中止时兜底；幂等）。
 function M.abort_all()
   for job in pairs(active_jobs) do

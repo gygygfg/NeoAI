@@ -297,6 +297,53 @@ tests.suite("tools", function(_, it)
     vim.fn.delete(path)
   end)
 
+  it("edit_file：命名空间活跃时仅 eligible 路径走 overlay 视图（私有 tmpfs 根回退宿主）", function(t)
+    local ns = require("NeoAI.sandbox.execution.ns_fs")
+    local file_ops = require("NeoAI.tools.builtin.file_ops")
+    local def
+    for _, d in ipairs(file_ops.get_tools()) do
+      if d.name == "edit_file" then def = d end
+    end
+    t.not_nil(def, "应注册 edit_file")
+    local fs = require("NeoAI.utils.fs")
+    local saved = { active = ns.active, eligible = ns.eligible, read = ns.read, write = ns.write }
+    local used = { read = false, write = false }
+    ns.active = function() return true end
+    -- 与真实实现一致：/tmp、/var/tmp、/run 等会话私有根不可走命名空间视图。
+    ns.eligible = function(p)
+      return not tostring(p):match("^/tmp/") and not tostring(p):match("^/var/tmp/")
+    end
+    ns.read = function() used.read = true; return "alpha\nbeta\n" end
+    ns.write = function() used.write = true; return true end
+    local ok, err = pcall(function()
+      local function call(args)
+        local done, out, e = false, nil, nil
+        def.func(args, function(v) out, done = v, true end, function(x) e, done = x, true end)
+        t.true_(vim.wait(8000, function() return done end), "edit_file 应完成")
+        return out, e
+      end
+
+      -- 私有 tmpfs 根（/tmp）：必须回退宿主路径，不得进入 overlay 视图。
+      local host_path = vim.fn.tempname() .. ".txt"
+      fs.write_file(host_path, "alpha\nbeta\n")
+      local out = call({ file_path = host_path, old_text = "alpha", new_text = "A", description = "t" })
+      t.matches("1 处替换", tostring(out), "tmpfs 根内文件应走宿主编辑")
+      t.eq("A\nbeta\n", fs.read_file(host_path))
+      t.false_(used.read, "tmpfs 根内路径不得读命名空间视图")
+      t.false_(used.write, "tmpfs 根内路径不得写命名空间视图")
+      vim.fn.delete(host_path)
+
+      -- 非私有根：走命名空间 overlay 视图（读→改→写）。
+      local ns_path = "/root/neoai_ns_view_fake.txt"
+      local out2 = call({ file_path = ns_path, old_text = "alpha", new_text = "A", description = "t" })
+      t.matches("1 处替换", tostring(out2), "eligible 路径应走 overlay 视图")
+      t.true_(used.read, "eligible 路径应读命名空间视图")
+      t.true_(used.write, "eligible 路径应写命名空间视图")
+    end)
+    ns.active, ns.eligible, ns.read, ns.write = saved.active, saved.eligible, saved.read, saved.write
+    if not ok then error(err, 0) end
+  end)
+
   it("delete_node：删除引入语法错误时在结果中警示", function(t)
     local tree_ops = require("NeoAI.tools.builtin.tree_ops")
     local def

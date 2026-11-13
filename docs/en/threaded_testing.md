@@ -81,15 +81,21 @@ _abort_all` signatures); concurrency orchestration and result handling are split
 | `runner/shard.lua` | LPT sharding, discovery-manifest parsing (incl. name→module) |
 | `runner/spawn.lua` | Child execution: log-to-disk + result sidecar, process-tree cleanup |
 | `runner/scheduler.lua` | Bounded-concurrency pool (re-entrancy-safe trampoline) + dual-lane orchestration |
+| `runner/memguard.lua` | Runtime memory admission: per-shard budget check before launch (bounded wait) |
 | `runner/report.lua` | Result aggregation, lazy log-tail for failed shards, reporting |
 
 Dual lane: light (many suites/process, W lanes) and heavy (`sandbox*`/`pty`, one suite/process, H lanes)
-run **overlapped**, constrained by `#light<=W`, `#heavy<=H`, `W+H<=cores`; `NEOAI_TEST_HEAVY_WORKERS=1`
-falls back to the old serial channel.
+run **overlapped**, constrained by `#light<=W`, `#heavy<=H`, `W+H<=cores-2` (two cores are reserved for
+the system/editor). Defaults are derived from the core count: light = `total cap - heavy` (also capped at
+16), heavy ≈ `cores/2`. Concurrency is also bounded
+by **actual available memory** (1536MB per heavy worker, 512MB per light worker; heavy yields first,
+each lane keeps at least one). Each shard passes through `runner/memguard` before launch, and the report
+header prints the cores and available memory. Override with `NEOAI_TEST_WORKERS` /
+`NEOAI_TEST_HEAVY_WORKERS`; `NEOAI_TEST_HEAVY_WORKERS=1` falls back to the old serial channel.
 
 ## 3. List of Test Files
 
-`lua/NeoAI/tests/` contains **126** `test_*.lua` files in total (plus `init.lua` as the runner, `parallel.lua` as the parallel runner, and `http_server.lua` / `sandbox_stub.lua` / `sandbox_boundary_helpers.lua` as test helpers), organized by category:
+`lua/NeoAI/tests/` contains **159** `test_*.lua` files in total (plus `init.lua` as the runner, `parallel.lua` as the parallel runner, and `http_server.lua` / `sandbox_stub.lua` / `sandbox_boundary_helpers.lua` / `sandbox_systemd_helpers.lua` as test helpers), organized by category:
 
 > **Authoritative source**: the list below is a quick index; the actual set is always `ls lua/NeoAI/tests/test_*.lua` (new suites need no doc change here).
 
@@ -103,7 +109,7 @@ falls back to the old serial channel.
 | UI | `chat_ui`, `tree_ui`, `chat_keys`, `display_modes`, `fold`, `markdown`, `ui_components`, `geometry`, `incremental`, `stream_batching`, `status` |
 | MCP | `mcp_client`, `mcp_transport`, `mcp_bridge`, `mcp_cache` |
 | Skills / Herder | `skills`, `herder`, `herder_install` |
-| Sandbox (incl. grants / replay / observation / network consent) | `sandbox_ai_audit`, `sandbox_background`, `sandbox_boundary_consistency`, `sandbox_boundary_escape`, `sandbox_boundary_net`, `sandbox_conflict_ai`, `sandbox_core`, `sandbox_governance`, `sandbox_hardening`, `sandbox_instance`, `sandbox_loss_audit`, `sandbox_lost_update`, `sandbox_lsp`, `sandbox_maintscript`, `sandbox_merge`, `sandbox_mountview`, `sandbox_namespace`, `sandbox_ops`, `sandbox_overlay_invalidate`, `sandbox_package_signature`, `sandbox_privdrop`, `sandbox_privilege`, `sandbox_publish_async`, `sandbox_review`, `sandbox_script_scan`, `sandbox_secret`, `sandbox_service`, `sandbox_session`, `sandbox_shims`, `sandbox_staging`, `sandbox_symlink`, `sandbox_systemd`, `sandbox_systemd_user`, `sandbox_view`, `grant`, `replay`, `observer`, `review_cache`, `net_consent`, `gateway` |
+| Sandbox (incl. grants / replay / observation / network consent) | `sandbox_ai_audit`, `sandbox_background`, `sandbox_boundary_consistency`, `sandbox_boundary_escape`, `sandbox_boundary_net`, `sandbox_conflict_ai`, `sandbox_core`, `sandbox_governance`, `sandbox_hardening`, `sandbox_instance`, `sandbox_loss_audit`, `sandbox_lost_update`, `sandbox_lsp`, `sandbox_maintscript`, `sandbox_merge`, `sandbox_mountview`, `sandbox_namespace`, `sandbox_ops`, `sandbox_overlay_invalidate`, `sandbox_package_signature`, `sandbox_privdrop`, `sandbox_privilege`, `sandbox_publish_async`, `sandbox_review`, `sandbox_script_scan`, `sandbox_secret`, `sandbox_service`, `sandbox_session`, `sandbox_shims`, `sandbox_staging`, `sandbox_symlink`, `sandbox_systemd`, `sandbox_systemd_facade`, `sandbox_systemd_gate`, `sandbox_systemd_wait`, `sandbox_systemd_transient`, `sandbox_systemd_pipe`, `sandbox_systemd_run`, `sandbox_systemd_timer`, `sandbox_systemd_user`, `sandbox_view`, `grant`, `replay`, `observer`, `review_cache`, `net_consent`, `gateway` |
 | Secret guard | `secret_async`, `secret_fake`, `secret_highlight`, `secret_provenance` |
 | Test framework / infrastructure | `test_runner`, `parallel_runner`, `integration`, `http`, `async`, `timer`, `work_codec` |
 

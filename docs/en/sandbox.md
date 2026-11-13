@@ -3556,6 +3556,26 @@ command in the `effect="process"` branch:
   real binary is still the in-sandbox podman, and the shim adds the shared flags for `run`/`create`), so
   they cannot reach the host daemon.
 
+**Explicit exception for privileged mode** (`tools.privileged_mode.enabled=true` and
+`tools.approval.mode="async"` only): after the user manually enters PRIV, the container facade and
+entry shims are bypassed entirely, `docker` mounts the host `/run/docker.sock` (or the configured
+`docker_socket`) and injects `DOCKER_HOST`, `podman/buildah` get container capabilities, the network
+is forced to `access="allow"` with `offline=true` lifted (still recorded through `host_proxy`), and
+SSH key/agent paths (`~/.ssh`, `/home/*/.ssh`, `/run/ssh-agent.socket`, …) are no longer masked
+(`unmask_ssh_keys=true`). Containers are then created by the host daemon outside the sandbox and
+**do not enter the candidate/approval pipeline**; the socket is equivalent to host root capability,
+and reading/using SSH private keys no longer goes through mask approval. Ordinary file I/O still
+goes through the overlay/review flow. The mode is off by default and cannot be entered by the AI.
+
+**Decision scope and timing**: network allowance is **process-wide** — while any PRIV session exists
+in the process, network traffic is allowed and recorded (the host-side filtering proxy is a shared
+singleton and its connection callbacks carry no agent context). Switching UI focus between chat
+windows / sub-agent windows, or creating a session that points `current` at another agent, does
+**not** bring the network prompt back or stop PRIV recording; exiting the last PRIV session restores
+`tools.sandbox.network.access`. Switching PRIV (including leaving it) during a generation applies the
+network/container/SSH policy **immediately** and defers only the model/provider switch to the end of
+the turn.
+
 A controlled plan is stored as `kind="container"` evidence and emits `SANDBOX_CONTAINER_PLANNED`;
 rejected calls emit `SANDBOX_CONTAINER_UNSUPPORTED` and are audited (the real reason goes only to
 audit/UI, never to the model). Config: `tools.sandbox.container`

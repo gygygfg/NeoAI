@@ -1509,13 +1509,15 @@ end
 local function _maybe_container(attempt, args, ctx, spec)
   if spec.effect ~= "process" then return nil end
   -- 高权限模式：容器命令按原文直连（docker 可连宿主 daemon），门面完全不接管。
+  -- 按**执行 Agent** 判定（子 Agent / 其它窗口不会继承 PRIV 的容器直连能力）。
   local okp, privileged = pcall(require, "NeoAI.sandbox.privileged")
-  if okp and privileged.active(ctx and ctx.agent and ctx.agent.id) then return nil end
+  local is_priv = okp and privileged.active(ctx and ctx.agent and ctx.agent.id)
+  if is_priv then return nil end
   local cfg = config_store.get("tools.sandbox.container") or {}
   if cfg.enabled == false then return nil end
   if type(args.command) ~= "string" or args.command == "" then return nil end
   local container = require("NeoAI.sandbox.execution.container")
-  local plan = container.facade(args.command)
+  local plan = container.facade(args.command, { privileged = is_priv })
   if not plan then return nil end
   -- docker/docker-compose/nerdctl → podman 改写：改写在沙箱内执行，容器随沙箱 namespace 隔离。
   if plan.mode == "sandbox" and plan.rewritten and plan.command then
@@ -1565,6 +1567,11 @@ end
 --- @return boolean
 local function _resident_eligible(attempt, spec, args, req)
   if not spec or spec.effect ~= "process" then return false end
+  -- 高权限模式会改变遮蔽（SSH 密钥）与网络策略；常驻命名空间在创建后无法变更挂载，
+  -- 故 PRIV 会话存在期间强制走一次性路径，避免复用进入 PRIV 前/后的旧遮蔽视图。
+  -- 判据为进程级（任一 PRIV 会话存在）：常驻实例的遮蔽/网络视图是进程级共享的。
+  local okp, privileged = pcall(require, "NeoAI.sandbox.privileged")
+  if okp and privileged.network_active() then return false end
   if attempt.tool_name ~= "run_command" then return false end
   if spec.long_lived then return false end
   -- 交互式（PTY）run_command 需要一次性路径的沙箱前缀与 stdin/PTY，常驻命令服务器不适用。
@@ -1791,9 +1798,11 @@ local function _gate_inner(tool, args, ctx, call_original)
     local net = config_store.get("tools.sandbox.network") or {}
     local pmode = net.block_proxy_evasion
     if pmode == false then pmode = "allow" elseif pmode == "deny" then pmode = "deny" else pmode = "ask" end
-    -- 高权限模式：不拦截代理规避（网络整体已放行，仅记录）。
+    -- 高权限模式：不拦截代理规避（网络整体已放行，仅记录）。判据为进程级（任一 PRIV 会话存在）。
     local okp, privileged = pcall(require, "NeoAI.sandbox.privileged")
-    if okp and privileged.active(ctx.agent and ctx.agent.id) then pmode = "allow" end
+    if okp and (privileged.active(ctx.agent and ctx.agent.id) or privileged.network_active()) then
+      pmode = "allow"
+    end
     if pmode ~= "allow" then
       local ok_rt, rt = pcall(require, "NeoAI.sandbox.execution.runtime")
       if ok_rt and rt.host_local_block_enabled and rt.host_local_block_enabled() then
@@ -2396,7 +2405,9 @@ local function _gate_inner(tool, args, ctx, call_original)
     -- docker 依赖外部 daemon，保持受控 socket 并记录原因）。重写命令以注入共享标志。
     pcall(function()
       local container = require("NeoAI.sandbox.execution.container")
-      local plan = container.plan(args and args.command)
+      local okp, privileged = pcall(require, "NeoAI.sandbox.privileged")
+      local is_priv = okp and privileged.active(ctx.agent and ctx.agent.id)
+      local plan = container.plan(args and args.command, { privileged = is_priv })
       if plan then
         if plan.rewritten then args.command = plan.command end
         attempt.container_command = plan.command

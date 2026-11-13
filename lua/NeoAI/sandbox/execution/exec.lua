@@ -305,10 +305,11 @@ function M.open(argv, opts)
   local privileged_active = false
   pcall(function()
     local sp = require("NeoAI.sandbox.privileged")
-    privileged_active = sp.active() and sp.override_offline()
+    privileged_active = sp.network_active() and sp.override_offline()
   end)
   local priv = {
     network = (opts.network ~= false) and (cfg.offline ~= true or privileged_active),
+    privileged = privileged_active,
     cap_add = {}, mounts = {}, userns = false, unmask = roots,
   }
   local prefix, perr = runtime.process_prefix({

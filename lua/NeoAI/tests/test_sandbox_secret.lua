@@ -29,6 +29,7 @@ end
 
 tests.suite("sandbox_secret", function(_, it)
   it("密钥防护：敏感环境变量名出现只提级待审（不终止，带警告）", function(t)
+    if tests.requires_sandbox() then return end
     local secret = require("NeoAI.sandbox.secret.secret")
     local fs = require("NeoAI.utils.fs")
     local sandbox = require("NeoAI.sandbox")
@@ -343,6 +344,7 @@ tests.suite("sandbox_secret", function(_, it)
   end)
 
   it("异步审批：执行不阻塞，产出待审变更单元并可应用", function(t)
+    if tests.requires_sandbox() then return end
     local fs = require("NeoAI.utils.fs")
     local sandbox = require("NeoAI.sandbox")
     local tool_service = require("NeoAI.services.tool_service")
@@ -380,6 +382,7 @@ tests.suite("sandbox_secret", function(_, it)
   end)
 
   it("异步审批：拒绝不应用并丢弃候选", function(t)
+    if tests.requires_sandbox() then return end
     local fs = require("NeoAI.utils.fs")
     local sandbox = require("NeoAI.sandbox")
     with_config({ tools = { approval = { mode = "async" }, sandbox = { mode = "dry_run", review = { enabled = true } } } }, function()

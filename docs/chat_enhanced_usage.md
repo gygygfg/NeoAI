@@ -95,8 +95,10 @@
 
 `tools.privileged_mode.enabled=true` 且 `tools.approval.mode="async"` 时，`m` 会在 PLAN 之后
 进入 PRIV，也可用 `:NeoAI Privileged` 切换。PRIV 下网络不拦截、仅记录目标；docker/podman
-可直接使用（docker 连接宿主 daemon）。该模式默认关闭，容器产生的宿主变更不进入候选/审批，
-详见 [configuration.md](configuration.md) 与 [sandbox.md](sandbox.md) 的安全边界说明。
+可直接使用（docker 连接宿主 daemon）。网络放行为**进程级**口径：进程内存在 PRIV 会话即整体放行
+并记录，切换聊天窗口焦点/新建会话不会重新弹窗；生成过程中切换时策略立即生效，仅模型切换延后到
+本轮结束。该模式默认关闭，容器产生的宿主变更不进入候选/审批，详见
+[configuration.md](configuration.md) 与 [sandbox.md](sandbox.md) 的安全边界说明。
 
 ## 7. 向用户提问（ask_user）
 

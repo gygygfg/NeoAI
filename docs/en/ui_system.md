@@ -25,9 +25,33 @@
 ## 2. Window Management (manager.lua)
 
 Supports three window modes (`ui.window_mode`): `float` / `tab` / `split`.
+At runtime `:NeoAI WindowMode [tab|float|split]` switches modes for the **current chat window only**
+(the current buffer): that single window is rebuilt, nothing else. It does **not** write the
+`ui.window_mode` config and does not rebuild other chat instances or the session tree, so windows opened
+later (`<leader>ac`, `:NeoAI Chat`, sub-agent windows) and after a restart still follow the configured
+default. Switching **works while an Agent is generating or running tools** too: the rebuild uses the
+"keep the Agent" path (`chat_service.detach_window_keep_agent` only unbinds the window, never `dispose`s),
+so the same Agent is re-attached to the new window and the current turn keeps running — switching only
+repaints the UI (full `_render` plus scrolling to the end). The switched mode is kept per instance
+(`state.window_mode` in `chat_view`; `nil` = follow config).
+
+Layout per mode:
+
+- `float`: the chat window is a screen-ratio float (`ui.window.w_ratio/h_ratio`, `border`), and the
+  **input box is a float too** — same width as the chat float, placed right below its bottom border
+  (`row = chat content row + chat height + 2`), with the chat window shrunk to make room so both together
+  still occupy the original overall height.
+- `split`: split by `ui.split.direction` (`right`/`left`/`top`/`bottom`) with the size clamped to
+  `min(floor(screen cols/rows * ui.split.max_ratio), screen cols/rows - ui.split.min_rest - 1)` and then
+  capped by `ui.split.size` — an oversized `size` can no longer squeeze the original window away
+  (previously it filled the whole screen). Defaults are `max_ratio = 0.5`, `min_rest = 20`: the NeoAI
+  window takes **at most half the screen** and the original window keeps at least 20 columns/rows.
+- `tab`: a full new tab page, with the input box as a split below the chat window.
 
 - `create(window_type, opts)`: creates a window, sets `filetype` (`neoai`), names the buffer (`NeoAI Chat` / `NeoAI Sessions`),
   and fires `WINDOW_OPENED`.
+- `set_bottom_reserve(win_id, lines)` / `get_float_geometry(win_id)`: bottom reserve of a float window
+  (used by `chat_view` when placing the input float); the reserve is honored when geometry is recomputed on `VimResized`.
 - **Disabling LSP**: `_disable_lsp` sets the buffer to `buftype=nofile`, sets `b:copilot_disabled`/`b:copilot_disable`,
   and applies a catch-all interception via `LspAttach` (tagging with `b:neoai_ui`), so any LSP client (including Copilot) is immediately detached when it tries to attach.
 - **Unified window config**: disables `number`/`relativenumber`/`signcolumn`/`foldcolumn`/`list`/`colorcolumn`/`spell`.
@@ -130,7 +154,11 @@ After the agent completes/errors/aborts, the input box is auto-focused and inser
 
 ### 4.1 Layout
 
-Main message area (top, `expr` folds) + input split window (bottom, height 3, `winfixheight`).
+Main message area (top, `expr` folds) + input area (bottom). In `tab`/`split` modes the input area is a
+plain window from `belowright split` (content-adaptive height, `winfixheight`, folds disabled); in `float` mode
+it is an **independent float** (`relative=editor`, `style=minimal`, same `border` as the chat float), as wide
+as the chat float and hugging its bottom border, with the chat window shrunk to make room (see §2). Both
+shapes share the same input buffer and the same focus/collapse/restore path.
 
 ### 4.2 Event Subscriptions
 
@@ -344,11 +372,11 @@ windows such as the terminal (`services.pty`) to subscribe to. Scrolling / curso
 
 ### 4.6 Input Box Linkage and Scrolling
 
-Main message area (top) + input split (bottom, height 3). After sending, focus returns to the main window and enters
+Main message area (top) + input area (bottom). After sending, focus returns to the main window and enters
 normal mode (you can scroll and browse during generation); the main body and the input box share the same set of chat
 context keymaps (`_build_chat_actions`). `input_box` renders the `> ` prefix with `virt_text` (it does not use
 `buftype=prompt`, to avoid conflicts with nvim-cmp), and enables completion for the `neoai_input` filetype.
-`attach_window` binds the input buffer into the input split window. The input buffer is a `nofile` scratch buffer
+`attach_window` binds the input buffer into the input window (split or float). The input buffer is a `nofile` scratch buffer
 (named `NeoAI Input`; with multiple instances the name is derived from the chat title, e.g. `NeoAI Input 2`/
 `NeoAI Input 3`, so session restore can identify/clean it and `:ls` is readable).
 

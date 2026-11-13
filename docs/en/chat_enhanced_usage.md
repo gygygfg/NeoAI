@@ -116,9 +116,13 @@ Expand/collapse: `zM` (collapse all) / `zo` (expand) / `zR` (expand all).
 
 When `tools.privileged_mode.enabled=true` and `tools.approval.mode="async"`, `m` enters PRIV after
 PLAN, or use `:NeoAI Privileged`. In PRIV the network is not blocked (targets are recorded) and
-docker/podman can be used directly (docker connects to the host daemon). It is off by default;
-host changes made by containers bypass the candidate/approval pipeline. See
-[configuration.md](configuration.md) and [sandbox.md](sandbox.md) for the security boundary.
+docker/podman can be used directly (docker connects to the host daemon). Network allowance is a
+**process-wide** decision: while any PRIV session exists, network traffic is allowed and recorded —
+switching window focus or creating a new session does not bring the prompt back. Switching modes
+during a generation applies the policy immediately and defers only the model switch to the end of
+the turn. It is off by default; host changes made by containers bypass the candidate/approval
+pipeline. See [configuration.md](configuration.md) and [sandbox.md](sandbox.md) for the security
+boundary.
 
 ## 7. Asking the User (ask_user)
 

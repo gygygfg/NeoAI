@@ -3010,9 +3010,17 @@ containers.conf，也不把 docker 伪装成「daemon 未运行」错误——�
 **高权限模式的显式例外**（`tools.privileged_mode.enabled=true` + 仅 `tools.approval.mode="async"`）：
 用户手动进入 PRIV 模式后，容器门面与入口桩完全旁路，`docker` 挂载宿主
 `/run/docker.sock`（或配置的 `docker_socket`）并注入 `DOCKER_HOST`，`podman/buildah` 补容器能力；
-网络强制 `access="allow"`、解除 `offline=true`，但仍经 `host_proxy` 记录目标。此时容器由宿主
-daemon 在沙箱外创建、**不进入候选/审批**，socket 等价宿主 root 能力；文件的普通读写仍走
-overlay/待审。该模式默认关闭，不能由 AI 自行切换到 PRIV。
+网络强制 `access="allow"`、解除 `offline=true`，但仍经 `host_proxy` 记录目标；SSH 密钥/agent 路径
+（`~/.ssh`、`/home/*/.ssh`、`/run/ssh-agent.socket` 等）不进入遮蔽挂载（`unmask_ssh_keys=true`）。
+此时容器由宿主 daemon 在沙箱外创建、**不进入候选/审批**，socket 等价宿主 root 能力；SSH 私钥的
+读取/使用也不再经过遮蔽审批。文件的普通读写仍走 overlay/待审。该模式默认关闭，不能由 AI 自行
+切换到 PRIV。
+
+**判定口径与生效时机**：网络放行是**进程级**的——只要进程内仍存在一个 PRIV 会话，网络即整体放行
+并记录（宿主侧过滤代理是共享单例，连接回调里没有 Agent 上下文）。UI 焦点在多个聊天窗口 / 子 Agent
+窗口之间切换，或新建会话把「当前 Agent」指向别的会话，都**不会**让 PRIV 的网络重新弹窗或停止记录；
+退出最后一个 PRIV 会话后恢复按 `tools.sandbox.network.access` 处理。生成过程中切换 PRIV（含退出）
+时，网络/容器/SSH 策略**立即生效**，只有模型与提供商切换延迟到本轮结束（避免打断进行中的回合）。
 
 ### 18.4 新会话自动审批（默认关闭）
 

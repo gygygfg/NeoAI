@@ -318,6 +318,8 @@ require('NeoAI').setup({
 | `:NeoAI Test [names...]` | Run tests (all, or specific by name) |
 | `:NeoAI ChatStatus` | Show chat window status |
 | `:NeoAI CycleDisplay` | Cycle chat display mode (chat / trajectory) |
+| `:NeoAI WindowMode [tab\|float\|split]` | Switch the window mode of the **current chat window**: only that window is rebuilt (config untouched, later windows still follow `ui.window_mode`); it also works while the Agent is generating or running tools (the Agent is preserved, so the current turn continues); no arg prints the current mode |
+| `:NeoAI Compact` | Manually compact the current session context (ignores the pressure threshold, keeps the latest round) |
 | `:NeoAI ReloadDisplay [name]` | Hot-reload a display mode plugin |
 | `:NeoAI Plan` | Toggle plan mode (read-only/info tools + ask_user) |
 | `:NeoAI ApprovePlan` | Approve plan, switch to CHAT, execute task list |

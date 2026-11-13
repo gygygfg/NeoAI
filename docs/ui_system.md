@@ -24,9 +24,29 @@
 ## 2. 窗口管理（manager.lua）
 
 支持三种窗口模式（`ui.window_mode`）：`float` / `tab` / `split`。
+运行期可用 `:NeoAI WindowMode [tab|float|split]` 切换：**只作用于当前聊天窗口**（当前 buffer），
+重建该窗口即止——不写 `ui.window_mode` 配置，也不重建其它聊天实例与会话树，因此
+新开窗口/新会话（`<leader>ac`、`:NeoAI Chat`、子 Agent 窗口）以及重启后仍按配置的默认模式。
+**Agent 正在生成/执行工具时也能切换**：重建走「保留 Agent」路径（`chat_service.detach_window_keep_agent`
+只解绑窗口、不 `dispose`），同一 Agent 重新绑到新窗口，当前回合继续跑，切换只重绘 UI
+（`_render` 全量重绘并把视口滚到末尾）。
+切换后的模式记录在实例内（`chat_view` 的 `state.window_mode`，`nil` = 跟随配置）。
+
+三种模式的布局要点：
+
+- `float`：主聊天窗为屏幕比例浮窗（`ui.window.w_ratio/h_ratio`、`border`）；**输入框也是浮窗**，
+  宽度与主浮窗一致、紧贴主浮窗下边框之下（`row = 主浮窗内容首行 + 主浮窗高 + 2`，即隔 1 行下边框 + 1 行输入浮窗上边框），
+  主浮窗相应缩短让出高度，两者合计仍占原整体高度（比例尺寸不变）。
+- `split`：按 `ui.split.direction`（`right`/`left`/`top`/`bottom`）分割，尺寸收敛为
+  `min(floor(屏幕列/行数 * ui.split.max_ratio), 屏幕列/行数 - ui.split.min_rest - 1)`，
+  再按 `ui.split.size` 截断——避免 `size` 过大把原有窗口挤没（表现为占满整个屏幕）。
+  默认 `max_ratio = 0.5`、`min_rest = 20`：**NeoAI 窗口最多占屏幕一半**，原窗口至少保留 20 列/行。
+- `tab`：新标签页全屏显示，输入框为主窗口下方 split。
 
 - `create(window_type, opts)`：创建窗口，设置 `filetype`（`neoai`），命名 buffer（`NeoAI Chat` / `NeoAI Sessions`），
   触发 `WINDOW_OPENED`。（输入框 buffer 由 `input_box` 命名为 `NeoAI Input`。）
+- `set_bottom_reserve(win_id, lines)` / `get_float_geometry(win_id)`：浮动窗口的底部预留高度
+  （由 `chat_view` 在摆放输入浮窗时调用），`VimResized` 重算几何时同样扣掉预留。
 - `cleanup_session_orphans()`：清理 `:restart` / `-S` 会话恢复带入的**界面孤儿 buffer**（详见 §4.9）。
 - **禁用 LSP**：`_disable_lsp` 把 buffer 设为 `buftype=nofile`、设 `b:copilot_disabled`/`b:copilot_disable`，
   并通过 `LspAttach` 兜底拦截（打 `b:neoai_ui` 标记），任何 LSP 客户端（含 Copilot）试图挂载时立即解绑。
@@ -119,7 +139,10 @@ Agent 完成/出错/取消后，仅当**当前窗口就是聊天主消息区、�
 
 ### 4.1 布局
 
-主消息区（上，`expr` 折叠）+ 输入 split 窗（下，高度 3，`winfixheight`）。
+主消息区（上，`expr` 折叠）+ 输入区（下）。`tab`/`split` 模式下输入区是从主窗口 `belowright split`
+出来的普通窗口（高度按内容自适应、`winfixheight`、禁用折叠）；`float` 模式下输入区是**独立浮窗**
+（`relative=editor`、`style=minimal`、`border` 同主浮窗），宽度与主浮窗一致并紧贴其下边框之下，
+主浮窗同步缩短让出高度（见 §2）。两种形态共用同一套输入 buffer 与焦点/收起恢复通道。
 
 ### 4.2 事件订阅
 
@@ -300,10 +323,10 @@ level 2 嵌套折叠。因此展开「过程」折叠后，内部思考/工具�
 
 ### 4.6 输入框联动与滚动
 
-主消息区（上）+ 输入 split（下，高度 3）。发送后切回主窗口并进入普通模式（生成期间可滚动浏览）；
+主消息区（上）+ 输入区（下）。发送后切回主窗口并进入普通模式（生成期间可滚动浏览）；
 主体与输入框共用一套 chat 上下文键位（`_build_chat_actions`）。`input_box` 用 `virt_text` 渲染 `> `
 前缀（不用 `buftype=prompt`，避免与 nvim-cmp 冲突），并放开 `neoai_input` filetype 的补全。
-`attach_window` 负责把输入 buffer 绑进输入 split 窗口。输入 buffer 是 `nofile` 暂存 buffer（命名为
+`attach_window` 负责把输入 buffer 绑进输入窗口（split 或 float 浮窗）。输入 buffer 是 `nofile` 暂存 buffer（命名为
 `NeoAI Input`；多实例按聊天名派生唯一名 `NeoAI Input 2`/`NeoAI Input 3`…，便于会话恢复识别/清理与
 `:ls` 辨识）。
 

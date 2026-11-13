@@ -148,10 +148,10 @@ context_cache = {
 | 键 | 默认 | 说明 |
 | --- | --- | --- |
 | `default_view` | `"chat"` | 默认界面（chat/tree） |
-| `window_mode` | `"tab"` | 窗口模式（float/tab/split） |
+| `window_mode` | `"tab"` | 新开窗口/会话的默认窗口模式（float/tab/split）；运行期 `:NeoAI WindowMode [tab\|float\|split]` **只切换当前聊天窗口**（不写本配置，新开窗口仍按本配置），Agent 生成中/工具执行中同样可切换（重建时保留 Agent，当前回合不中断） |
 | `window` | `{w_ratio=0.85, h_ratio=0.85, border="rounded"}` | float 窗口：按屏幕比例计算尺寸（大屏更大、小屏更小），并随窗口 resize 实时跟随；如需固定尺寸可显式配置 `width`/`height`，此时作为比例尺寸的**上限**（向后兼容） |
 | `float` | `{min_width=24, min_height=4}` | 所有悬浮窗的最小尺寸兜底（避免小窗口下浮窗渲染糟糕）；单个 `compute` 调用可用显式 `min_w`/`min_h` 覆盖，传 0 解除默认下限 |
-| `split` | `{size=80, direction="right"}` | split 窗口 |
+| `split` | `{size=80, direction="right", max_ratio=0.5, min_rest=20}` | split 窗口：`direction` 为 `right`/`left`/`top`/`bottom`；`size` 为期望尺寸（左右分割为列数、上下分割为行数），实际尺寸收敛为 `min(floor(屏幕列\|行数 × max_ratio), 屏幕列\|行数 - min_rest - 1)` 再按 `size` 截断，避免占满整屏把原有窗口挤没。默认 `max_ratio=0.5`：NeoAI 窗口最多占屏幕一半，原窗口至少保留 20 列/行 |
 | `colors` | 各段高亮 | 用户/AI/推理/标题色 |
 | `tree` | `{foldenable=false, ...auto_close_on_select=true}` | 会话树折叠/自动关闭 |
 | `input_box` | `{idle_height=1, min_height=5, max_ratio=0.8, hash_completion={enabled=true, max_chars=2000, max_bytes=20000}}` | 输入框高度（空闲/聚焦/增长上限）。`hash_completion` 为输入框 `#` 上下文占位符补全：输入 `#` 弹出候选（`#{buffers}` / `#{tool}` / `#{lsp}` 等），插入后以 `NeoAIHashPlaceholder` 高亮，**发送前**才替换为真实内容；`max_chars` 为 `#{message}`/`#{notify}` 的**字符数**上限（按字符计，中文不会被切半），`max_bytes` 为其他占位符解析结果的字节上限（UTF-8 安全截断）；`enabled=false` 完全关闭（不装 completefunc / cmp 源 / 高亮自动命令）。详见 [ui_system.md](ui_system.md)「输入框 # 占位符」 |
@@ -159,7 +159,7 @@ context_cache = {
 | `chat` | `{mousescroll_max_blank=3, incremental=true, fold="reasoning_tools", process_keep_steps=3}` | 鼠标滚轮滚到底时末行下方允许的最大空白行数（0=严格贴底）；`incremental` 开启增量刷新（只重渲染变化的消息块且只写差异行），设为 `false` 降级回整 buffer 全量重写；`fold` 为折叠程度：`none`（不折叠）/ `reasoning_tools`（现状：推理与工具块折叠）/ `process`（额外把每轮的 AI 中间调用收进「过程」折叠，折叠文本显示折叠轮次、工具成功/失败数、输入/输出 token、缓存命中率；Step 标记以 `· Step N` 追加在思考过程/工具调用折叠文本上，角色头只在角色切换时出现且为纯 `🤖 AI`；「过程」为 level 1 折叠，内部推理/工具块为 level 2 嵌套折叠，展开后仍各自收起；AI 运行途中插入的用户消息不开启新轮次，Step 编号连续、插入前的步骤整段收起）；用户消息与 AI 消息一律左对齐（固定行为，无配置开关）；`process_keep_steps` 为 `process` 模式下**本轮进行中**保留展开的最近中间步数（只看 agent 是否还在处理本轮，暂存队列非空不算；轮次结束后中间步骤全部收起，只留最终步骤展开） |
 | `ask_user` | `{batch_debounce_ms=25, require_confirm=true}` | 向用户提问弹窗：`batch_debounce_ms` 为同一轮多次提问的聚合去抖窗口（毫秒，覆盖兄弟调用到达时序；越大越全但首弹越慢）；`require_confirm` 为全部作答后是否展示汇总页二次确认（`false` 时直接提交）。弹窗在焦点离开时自动缩为右上角小窗、重新聚焦时展开 |
 | `trajectory` | `{log_dir=".../NeoAI/logs"}` | 轨迹显示模式的日志保存目录 |
-| `statusline` | `{enabled=true, winbar=true, parts={mode,model,usage,cache,capacity,sandbox}, separator=" ", colors=...}` | lualine 状态栏；`sandbox` 段在沙箱待审数 > 0 时显示 `待审N`（`N` 为待审**文件**总数，审批单位为单个文件），默认链接醒目高亮组 `NeoAISandboxPending`（黄底加粗，可在 `colors.sandbox` 覆盖）；待审队列含 **L3（高危）** 时该段追加 `⚠危险` 并切换为红色危险高亮组 `NeoAISandboxDanger`（可在 `colors.sandbox_danger` 覆盖）；存在**越界访问留痕**时该段追加 `越界N`（`N` 为去重文件数，两者都有时并列显示，如 `待审2 越界3`）；`usage` 段显示**会话累计**输入/输出 token（`↑` 输入合计、`↓` 输出合计，不随单次请求跳变）；`cache` 段按 `cache_mode` 展示并保留**两位小数**：`both`（缺省）为 `缓存命中单次(会话累计)`（如 `缓存命中99.52%(会话94.55%)`，单次值反映当前前缀缓存质量，括号内为 provider 账单口径），`latest` 只显示最近一次请求，`cumulative` 只显示会话累计（旧行为，如 `缓存命中95.32%`；无单次数据时也回退累计） |
+| `statusline` | `{enabled=true, winbar=true, parts={mode,model,usage,cache,capacity,sandbox}, separator=" ", colors=...}` | lualine 状态栏；`sandbox` 段在沙箱待审数 > 0 时显示 `待审N`（`N` 为待审**文件**总数，审批单位为单个文件），默认链接醒目高亮组 `NeoAISandboxPending`（黄底加粗，可在 `colors.sandbox` 覆盖）；待审队列含 **L3（高危）** 时该段追加 `⚠危险` 并切换为红色危险高亮组 `NeoAISandboxDanger`（可在 `colors.sandbox_danger` 覆盖）；存在**越界访问留痕**时该段追加 `越界N`（`N` 为去重文件数，两者都有时并列显示，如 `待审2 越界3`）；`usage` 段显示**会话累计**输入/输出 token（`↑` 输入合计、`↓` 输出合计，不随单次请求跳变）；`cache` 段按 `cache_mode` 展示并保留**两位小数**：`both`（缺省）为 `命中单次(会话累计)`（如 `命中99.52%(会话94.55%)`，单次值反映当前前缀缓存质量，括号内为 provider 账单口径），`latest` 只显示最近一次请求，`cumulative` 只显示会话累计（旧行为，如 `命中95.32%`；无单次数据时也回退累计）；`capacity` 段显示上下文**占用比**（已用/窗口，从 `0%` 起算、越用越大，如 `占用42%`），接近/超出上限时按级别配色（`capacity_warn` / `capacity_over`），超限时显示「上下文超限」 |
 
 > **窄屏浮窗留白（无需配置）**：以「聊天主窗口宽度」为基准，宽度 `< 40` 时浮窗左右占满该窗口、
 > `40 ≤ 宽度 < 100` 时左右各留 5 格、`≥ 100` 时维持按屏幕比例居中。阈值 `40/100` 与留白 `5`
@@ -227,7 +227,7 @@ session = {
 | `todo.enabled` | `true` | 待办工具 + 系统提示注入 |
 | `web_fetch` | 见下（默认 `enabled=false`） | 网页抓取：无头浏览器渲染动态页面并转 Markdown |
 | `plan_mode` | `{enabled=true, auto_execute_on_approve=true, distill_on_execute=true, distill_parallel=true, distill_front=true, distill_max_attempts=2, extract_max_tokens=nil, extra_safe_tools={}, mutating_tools=...}` | 计划模式 |
-| `privileged_mode` | `{enabled=false, require_async_approval=true, override_offline=true, docker_socket="", record_network=true, max_records=1000}` | 高权限模式（opt-in）：网络仅记录不拦截、可直连 docker/podman；仅异步审批可进入 |
+| `privileged_mode` | `{enabled=false, require_async_approval=true, override_offline=true, docker_socket="", unmask_ssh_keys=true, record_network=true, max_records=1000}` | 高权限模式（opt-in）：网络仅记录不拦截、可直连 docker/podman、不遮蔽 SSH 密钥；仅异步审批可进入 |
 | `sub_agent` | `{final_instruction="最后请总结你的工作：…"}` | 子 Agent：创建时自动追加到其任务提示末尾的收尾指令（要求最后总结工作）；设为 `""` 可关闭。子 Agent 完成后其最终正文会自动回传主 Agent |
 | `approval` | 见下 | 工具审批 |
 | `sandbox` | 见下 | 工具执行沙箱（dry-run/commit、隔离后端、策略） |
@@ -1028,17 +1028,28 @@ resources = { pressure = { simulate = "critical" } }
 默认 **opt-in 关闭**。启用后按 `m` 在 `CHAT → PLAN → PRIV → CHAT` 间循环，或执行
 `:NeoAI Privileged` 切换；仅当 `tools.approval.mode="async"` 时允许进入。
 
-激活时**只放宽两项**：
+激活时**只放宽以下三项**：
 
 1. **网络不拦截，仅记录**：强制 `access="allow"`，覆盖 `ask`/`deny`、`offline=true` 与受控
    白名单；仍启动宿主侧 `host_proxy` 记录目标（`:NeoAI SandboxAudit network` 可查看）。
 2. **容器直用**：旁路容器门面（不改写 `docker→podman`、不生成入口桩、不伪装 daemon 错误）；
    `docker` 挂载宿主 socket（自动探测或 `docker_socket` 指定）并注入 `DOCKER_HOST`；
    `podman/buildah` 即使门面关闭也补容器能力/vfs 存储/seccomp 例外。
+3. **SSH 密钥不遮蔽**：`~/.ssh`、`/root/.ssh`、`/home/*/.ssh` 以及 ssh-agent socket 不进入
+   遮蔽挂载（`unmask_ssh_keys=true`）；`read_file`/`run_command`/`git`/`ssh` 均可读取/使用宿主密钥。
 
 **安全边界**：开启后 docker 容器由宿主 daemon 在沙箱外创建，**不进入候选/审批**；
 `/run/docker.sock` 等价宿主 root 能力。文件的普通读写仍沿用沙箱 overlay 与待审规则。
 AI 更新 AGENTS.md 等写入仍需要审批，不受本模式影响。
+
+**判定口径与生效时机**：
+
+- 网络放行是**进程级**口径：进程内只要仍有一个 PRIV 会话，网络即整体放行并写入记录
+  （`host_proxy` 是共享单例，连接回调没有 Agent 上下文）。切换聊天窗口焦点、打开/聚焦子 Agent
+  窗口、新建会话（`current` 指向别的 Agent）都**不会**让 PRIV 网络重新弹窗；退出最后一个 PRIV
+  会话后恢复按 `tools.sandbox.network.access` 处理。
+- 生成过程中切换模式时，网络/容器/SSH 策略**立即生效**，只有模型与提供商（`ai.modes.privileged`）
+  切换延后到本轮结束；`m` / `:NeoAI Privileged` 的提示会区分这两种情形。
 
 状态持久化在 `session.metadata.privileged`，恢复会话时还原；与计划模式互斥（计划模式优先）。
 默认 `tools.privileged_mode.enabled=false`，**不会**出现在 `m` 循环中。

@@ -178,6 +178,7 @@ local function _make_instance()
     win_id = nil, -- 主窗口
     buf = nil, -- 主 buffer（消息列表）
     input_win_id = nil, -- 输入窗口
+    window_mode = nil, -- 本实例窗口模式覆盖（nil = 跟随 ui.window_mode 配置；:NeoAI WindowMode 只改这里）
     unsubs = {},
     agent_id = nil,
   session_id = nil, -- 本实例绑定的会话 id（删除会话时据此精确关闭窗口）
@@ -214,6 +215,18 @@ local function _input_box_cfg()
 end
 local function _input_idle_height()
   return math.max(1, _input_box_cfg().idle_height or 1)
+end
+
+--- 本实例实际生效的窗口模式：实例级覆盖（`:NeoAI WindowMode` 运行期切换）优先，
+--- 否则读 `ui.window_mode` 配置。新开实例不带覆盖，因此沿用配置默认值。
+--- @return string "tab" | "float" | "split"
+local function _input_layout_mode()
+  if state.window_mode == "tab" or state.window_mode == "float" or state.window_mode == "split" then
+    return state.window_mode
+  end
+  local ok, v = pcall(function() return config_store.get("ui.window_mode") end)
+  if ok and (v == "tab" or v == "float" or v == "split") then return v end
+  return "tab"
 end
 
 --- 是否为 NeoAI 内部 buffer（聊天/输入/树/辅助）：不作为 #{lsp} 的上下文文件。
@@ -1207,7 +1220,7 @@ local function _build_chat_actions()
     send = function() input_box.focus() end,
     cycle_mode = function()
       local mode = chat_service.cycle_mode()
-      local suffix = chat_service.has_pending_mode() and "（将在本轮生成结束后生效）" or ""
+      local suffix = chat_service.pending_mode_hint and chat_service.pending_mode_hint() or ""
       local label = chat_service.mode_label(mode)
       vim.notify("[NeoAI] 模式已切换: " .. label .. suffix,
         mode == "privileged" and vim.log.levels.WARN or vim.log.levels.INFO)
@@ -1355,6 +1368,104 @@ local function _create_input_window()
   return win
 end
 
+-- ========== float 模式输入浮窗 ==========
+-- float 模式下主聊天窗是浮窗，输入框不能再用 `belowright split`（那会变成占满整行的普通窗口，
+-- 与主浮窗错位）。改为在主浮窗下边框之下创建一个等宽的独立浮窗，并把主浮窗相应缩短让出高度，
+-- 使「主浮窗 + 输入浮窗」合计仍占原整体高度（与 split 模式下两者叠放的心智模型一致）。
+
+--- 输入浮窗边框：与主浮窗保持一致（ui.window.border，默认 rounded）。
+--- @return string
+local function _float_input_border()
+  local cfg = config_store.get("ui.window") or {}
+  return cfg.border or "rounded"
+end
+
+--- 边框占用的屏幕行数（上下各一行；"none" 不占行）。
+--- @param border string|table|nil
+--- @return number
+local function _border_rows(border)
+  if border == nil or border == "none" or border == "" then return 0 end
+  return 2
+end
+
+--- 按期望输入行数摆放 float 模式的输入浮窗，并同步主浮窗的底部预留高度。
+--- 主浮窗先缩短（window_manager.set_bottom_reserve），再按其**最新**位置计算输入浮窗 row，
+--- 避免用旧高度算出 1 行错位/重叠。
+--- @param h number 期望输入区行数（不含边框）
+local function _apply_float_input_layout(h)
+  local iwin = state.input_win_id
+  local main_win = state.win_id
+  if not (iwin and vim.api.nvim_win_is_valid(iwin)) then return end
+  if not (main_win and vim.api.nvim_win_is_valid(main_win)) then return end
+  local b_rows = _border_rows(_float_input_border())
+  local float_cfg = config_store.get("ui.float") or {}
+  local min_main = math.max(1, tonumber(float_cfg.min_height) or 4)
+  -- 整体可用高度：优先取窗口管理器登记的完整几何（含已让给输入浮窗的预留）；
+  -- 取不到时退化为「当前主窗高 + 期望输入高」。
+  local geom = window_manager.get_float_geometry and window_manager.get_float_geometry(main_win) or nil
+  local want_h = math.max(1, math.floor(tonumber(h) or 1))
+  local full_h = (geom and geom.height) or (vim.api.nvim_win_get_height(main_win) + want_h + b_rows)
+  local reserve = want_h + b_rows
+  local max_reserve = math.max(0, full_h - min_main)
+  if reserve > max_reserve then reserve = max_reserve end
+  local ih = math.max(1, math.min(want_h, reserve - b_rows))
+  window_manager.set_bottom_reserve(main_win, reserve)
+  local ok_pos, pos = pcall(vim.api.nvim_win_get_position, main_win)
+  if not ok_pos or type(pos) ~= "table" then return end
+  local main_h = vim.api.nvim_win_get_height(main_win)
+  local width = math.max(1, vim.api.nvim_win_get_width(main_win))
+  pcall(vim.api.nvim_win_set_config, iwin, {
+    relative = "editor",
+    width = width,
+    height = ih,
+    col = pos[2] or 0,
+    row = (pos[1] or 0) + main_h + 1 + math.max(0, b_rows - 1),
+  })
+  -- 主浮窗高度变了（视口随之变矮/变高）：若此时焦点在主浮窗，重新贴底，
+  -- 避免底部若干行被顶出视口（split 模式由窗口自身维持光标行可见，无需此补偿）。
+  if vim.api.nvim_get_current_win() == main_win then
+    pcall(_scroll_to_end)
+  end
+end
+
+--- float 模式：输入浮窗关闭后恢复主浮窗全高（tab/split 无操作）。
+local function _release_float_input_reserve()
+  if _input_layout_mode() ~= "float" then return end
+  if state.win_id and vim.api.nvim_win_is_valid(state.win_id) then
+    window_manager.set_bottom_reserve(state.win_id, 0)
+  end
+end
+
+--- 在 float 模式的主浮窗下方创建输入浮窗（不 touch input_box 的状态，仅建窗口+接管 buffer）。
+--- @return number win_id
+local function _create_input_float()
+  local main_win = state.win_id
+  local buf = input_box.get_buf()
+  if not (buf and vim.api.nvim_buf_is_valid(buf)) then
+    buf = vim.api.nvim_create_buf(false, true)
+  end
+  local ok_pos, pos = pcall(vim.api.nvim_win_get_position, main_win)
+  if not ok_pos or type(pos) ~= "table" then pos = { 0, 0 } end
+  local win = vim.api.nvim_open_win(buf, false, {
+    relative = "editor",
+    width = math.max(1, vim.api.nvim_win_get_width(main_win)),
+    height = _input_idle_height(),
+    col = pos[2] or 0,
+    row = (pos[1] or 0) + vim.api.nvim_win_get_height(main_win) + 2,
+    style = "minimal",
+    border = _float_input_border(),
+  })
+  -- 输入窗口是纯文本输入区：不折行、始终禁用折叠（浮窗不会继承主窗口的 fold 选项，
+  -- 这里显式设置以与 split 模式行为一致）。
+  vim.wo[win].wrap = false
+  vim.wo[win].foldenable = false
+  vim.wo[win].foldmethod = "manual"
+  _mark_input_win(win)
+  state.input_win_id = win
+  _apply_float_input_layout(_input_idle_height())
+  return win
+end
+
 --- 派生本实例输入 buffer 的唯一名：`NeoAI Chat` → `NeoAI Input`；`NeoAI Chat 2` → `NeoAI Input 2`。
 --- 多实例下各实例输入 buffer 名字唯一，避免第二个实例因重名而改名失败、退化为无名 buffer。
 --- @return string
@@ -1365,11 +1476,11 @@ local function _derive_input_name()
   return "NeoAI Input"
 end
 
---- 创建输入区（主窗口下方 split，高度 3）
+--- 创建输入区：tab/split 模式为主窗口下方 split；float 模式为主浮窗下方等宽输入浮窗。
 --- @param fresh boolean|nil true=首次/重开（input_box.create 新建 buffer+键位）；false=收起后恢复（复用已有输入 buffer）
 local function _create_input_area(fresh)
-  local win = _create_input_window()
   local ctx_buf = _resolve_context_buf()
+  -- 先建输入 buffer 再建窗口：float 模式的输入浮窗需要已存在的 buffer 才能 nvim_open_win。
   if fresh then
     input_box.create({
       -- 唯一输入 buffer 名（多实例各自不同），供 :ls 辨识与会话恢复识别/清理。
@@ -1386,6 +1497,12 @@ local function _create_input_area(fresh)
     _register_input_resize()
     -- 登记输入 buffer 为「辅助 buffer」：收起（窗口关闭、buffer 保留）后仍豁免会话恢复孤儿清理。
     window_manager.register_aux(input_box.get_buf())
+  end
+  local win
+  if _input_layout_mode() == "float" then
+    win = _create_input_float()
+  else
+    win = _create_input_window()
   end
   input_box.attach_window(win)
   input_box.set_context_buf(ctx_buf)
@@ -1430,10 +1547,16 @@ local function _compute_input_height()
 end
 
 --- 设置输入窗口高度（winfixheight 不影响程序化调整）
+--- float 模式下浮动窗口没有「窗口高度」概念，改走几何更新（同步主浮窗底部预留）。
 --- @param h number
 local function _set_input_height(h)
   if not state.input_win_id or not vim.api.nvim_win_is_valid(state.input_win_id) then return end
-  vim.api.nvim_win_set_height(state.input_win_id, math.max(1, h))
+  local want = math.max(1, h)
+  if _input_layout_mode() == "float" then
+    _apply_float_input_layout(want)
+    return
+  end
+  vim.api.nvim_win_set_height(state.input_win_id, want)
 end
 
 --- 按当前焦点窗口同步输入框高度：输入窗口聚焦 → 随内容增高；主窗口聚焦 → 收起为 1 行。
@@ -1522,6 +1645,7 @@ local function _schedule_collapse_retry()
     local w = state.input_win_id
     if not (w and vim.api.nvim_win_is_valid(w)) then
       state.input_win_id = nil
+      _release_float_input_reserve()
       return
     end
     if _is_chat_affiliated(vim.api.nvim_get_current_win()) then
@@ -1532,6 +1656,7 @@ local function _schedule_collapse_retry()
     if pcall(vim.api.nvim_win_close, w, true) or not vim.api.nvim_win_is_valid(w) then
       state.input_win_id = nil
       _collapse_retry_left = 0
+      _release_float_input_reserve()
       return
     end
     _schedule_collapse_retry()
@@ -1555,6 +1680,8 @@ local function _collapse_aux()
   local ok = pcall(vim.api.nvim_win_close, win, true)
   if ok or not vim.api.nvim_win_is_valid(win) then
     state.input_win_id = nil
+    -- float 模式：输入浮窗已关闭，主浮窗恢复全高（否则底部会永久缺一块）。
+    _release_float_input_reserve()
     return
   end
   -- 关闭失败：保留句柄，下一拍重试；期间句柄仍有效，_restore_aux 不会再建第二个。
@@ -1591,7 +1718,7 @@ local function _restore_aux()
     pcall(input_box.attach_window, existing)
     _mark_input_win(existing)
     _dedupe_input_wins(existing)
-    pcall(vim.api.nvim_win_set_height, existing, _input_idle_height())
+    pcall(_set_input_height, _input_idle_height())
     return
   end
   -- 输入窗口缺失/失效：重建。重入守卫：创建输入窗口时 :split 会同步触发 WinEnter，
@@ -1833,6 +1960,8 @@ local function _on_win_closed(ev) -- luacheck: ignore ev
   if not win then return end
   if state.input_win_id and win == state.input_win_id then
     state.input_win_id = nil
+    -- float 模式：输入浮窗被用户关掉（:q / <C-w>c），主浮窗恢复全高。
+    _release_float_input_reserve()
     return
   end
   if state.win_id and win == state.win_id and not state.closing then
@@ -1990,6 +2119,16 @@ local function _register_resize_reflow()
         message_list.invalidate(state.buf)
         _schedule_render(true)
       end
+      -- float 模式：主浮窗由 geometry.track 在 VimResized 时重算，输入浮窗依赖主浮窗的
+      -- 位置/宽度，必须等主浮窗重算完成后再重排（vim.schedule 延后到下一拍，避免读到旧位置）。
+      if _input_layout_mode() == "float" then
+        vim.schedule(function()
+          if not M.has_window() then return end
+          local iwin = state.input_win_id
+          if not (iwin and vim.api.nvim_win_is_valid(iwin)) then return end
+          _set_input_height(vim.api.nvim_win_get_height(iwin))
+        end)
+      end
     end,
   })
 end
@@ -2146,13 +2285,17 @@ local function _switch_agent(agent)
 end
 
 --- 打开聊天窗口
---- @param opts table|nil { session_id?, round?, new_session? }
----   session_id: 加载指定会话；new_session（且未给 session_id）: 强制新建会话而非复用当前会话。
+--- @param opts table|nil { session_id?, round?, new_session?, agent? }
+---   session_id: 加载指定会话；new_session（且未给 session_id）: 强制新建会话而非复用当前会话；
+---   agent: 复用调用方传入的既有 Agent（窗口模式切换重建用：不新建/不加载，运行中的回合继续）。
 --- @return table { win_id, buf }
 function M.open(opts)
   opts = opts or {}
   if state.win_id and vim.api.nvim_win_is_valid(state.win_id) then
-    if opts.session_id and opts.session_id ~= chat_service.get_current_session_id() then
+    if opts.agent then
+      -- 显式指定 Agent：窗口复用但会话要换成传入的 Agent。
+      if opts.agent.id ~= state.agent_id then _switch_agent(opts.agent) end
+    elseif opts.session_id and opts.session_id ~= chat_service.get_current_session_id() then
       -- Tree selection must replace the active conversation, not reuse its buffer.
       _switch_agent(chat_service.load_session(opts.session_id, { round = opts.round }))
     elseif opts.new_session and not opts.session_id then
@@ -2178,7 +2321,11 @@ function M.open(opts)
   -- 幂等、全程 pcall；已登记的实时窗口 buffer 不会被误删。
   pcall(window_manager.cleanup_session_orphans)
 
-  local created = window_manager.create("chat", { title = state.title or "NeoAI Chat" })
+  local created = window_manager.create("chat", {
+    title = state.title or "NeoAI Chat",
+    -- 实例级模式覆盖（运行期 :NeoAI WindowMode 只改本窗口）；nil = 跟随 ui.window_mode 配置。
+    mode = state.window_mode,
+  })
   state.win_id = created.win_id
   -- 登记浮窗窄屏留白的基准窗口（聊天主窗口）：<100 列时浮窗相对本窗口留白/占满。
   geometry.set_narrow_base(state.win_id)
@@ -2198,9 +2345,12 @@ function M.open(opts)
   vim.bo[state.buf].shiftwidth = 2
   -- 按 ui.chat.fold 应用折叠（none 关闭；reasoning_tools/process 用 expr 折叠）。
   _apply_fold_mode()
-  -- 获取/创建 Agent（若有 session_id 则加载已有会话）
+  -- 获取/创建 Agent：优先复用调用方传入的 Agent（窗口模式切换重建：运行中的回合不中断），
+  -- 其次按 session_id 加载已有会话，最后新建会话。
   local agent
-  if opts.session_id then
+  if opts.agent then
+    agent = opts.agent
+  elseif opts.session_id then
     agent = chat_service.load_session(opts.session_id, { round = opts.round })
   else
     agent = chat_service.new_session({})
@@ -2283,7 +2433,10 @@ function M.open(opts)
 end
 
 --- 关闭聊天窗口
-function M.close()
+--- @param opts table|nil { keep_agent? boolean } keep_agent=true 时**只解绑窗口、保留 Agent**
+---   （窗口模式切换等重建场景：运行中的回合不中断，会话已落盘）；默认 false = 持久化并销毁 Agent。
+function M.close(opts)
+  opts = opts or {}
   state.closing = true
   _stop_tool_tick()
   fold.clear_timing()
@@ -2317,7 +2470,12 @@ function M.close()
   -- 兜底：清掉任何残留显示输入 buffer 的输入窗口，避免关闭后留下空窗口或多出来的输入框。
   _dedupe_input_wins(nil)
   if state.win_id and vim.api.nvim_win_is_valid(state.win_id) then
-    chat_service.detach_window(state.win_id)
+    if opts.keep_agent then
+      -- 保留 Agent（窗口重建）：仅解绑窗口 + 落盘，不 dispose、不清暂存队列/审批槽位。
+      chat_service.detach_window_keep_agent(state.win_id)
+    else
+      chat_service.detach_window(state.win_id)
+    end
     window_manager.close(state.win_id)
   end
   -- 清理 buffer，避免重复打开后 :ls 出现多个同名残留
@@ -2355,6 +2513,51 @@ function M.close()
   -- 缓存以 buffer 为键，关闭前已删除 buffer，回收其块缓存避免泄漏
   incremental.reset()
   state.closing = false
+end
+
+--- 本实例当前生效的窗口模式（实例级覆盖优先，否则 `ui.window_mode` 配置值）。
+--- @return string "tab" | "float" | "split"
+function M.get_window_mode()
+  return _input_layout_mode()
+end
+
+--- 切换**本实例**的窗口模式并重建本窗口（不影响其它聊天实例，也不写 `ui.window_mode` 配置）。
+--- 重建 = 关窗时**保留 Agent**，再按新模式把同一 Agent 绑到新窗口：会话不丢、运行中的回合不中断，
+--- 因此 Agent 正在生成/执行工具时也可切换（切换只重绘 UI）。
+--- Agent 已不存在（如会话被删除）时回退为按 `session_id` 重开。
+--- @param mode string "tab" | "float" | "split"
+--- @return boolean changed 模式是否发生变化
+--- @return boolean rebuilt 是否已重建窗口
+function M.set_window_mode(mode)
+  if mode ~= "tab" and mode ~= "float" and mode ~= "split" then
+    return false, false
+  end
+  if _input_layout_mode() == mode then
+    return false, false
+  end
+  state.window_mode = mode
+  if not M.has_window() then return true, false end
+  -- close 会清空 state.agent_id / state.session_id，先取出要复用的 Agent 与会话 id。
+  local agent = chat_service.get_agent(state.agent_id)
+  local sid = state.session_id
+  local ok_close, err_close = pcall(M.close, { keep_agent = agent ~= nil })
+  if not ok_close then
+    state.window_mode = nil
+    local msg = tostring(err_close)
+    vim.notify(msg:match("E%d+:[^\n]*") or msg, vim.log.levels.ERROR)
+    return true, false
+  end
+  -- 有存活 Agent 时直接复用它（运行中也不打断）；否则按会话 id 重开。
+  local reopen_opts = agent and { agent = agent } or (sid and { session_id = sid } or {})
+  local ok, err = pcall(M.open, reopen_opts)
+  if not ok then
+    -- 重建失败：回退为「跟随配置」，避免实例停在半关闭状态。
+    state.window_mode = nil
+    local msg = tostring(err)
+    vim.notify(msg:match("E%d+:[^\n]*") or msg, vim.log.levels.ERROR)
+    return true, false
+  end
+  return true, true
 end
 
 --- 是否有打开的窗口
@@ -2704,6 +2907,49 @@ function ChatView.has_window()
   return _current_inst() ~= nil
 end
 
+--- 是否有任一聊天实例的 Agent 正在生成/执行工具（或正在压缩上下文）。
+--- 通用查询（状态展示/测试用）。窗口模式切换**不再**依赖它：`set_window_mode` 重建时
+--- 保留 Agent（只解绑窗口），运行中切换不会中断当前回合。
+--- @return boolean
+function ChatView.is_busy()
+  local runtime = require("NeoAI.core.agent.runtime")
+  for i = #_order, 1, -1 do
+    local inst = _instances[_order[i]]
+    if inst and inst._is_alive() then
+      local aid = inst._agent_id()
+      local agent = aid and runtime.get(aid) or nil
+      if agent then
+        -- 只认「正在跑」的状态：error/idle 等终态不应阻止重建。
+        local st = agent.state
+        if st == "generating" or st == "tool_running" then return true end
+        -- 压缩/摘要进行中：关窗会销毁 Agent 并中断压缩，等它结束更安全。
+        if agent._compacting or agent._compaction_pending then return true end
+      end
+    end
+  end
+  return false
+end
+
+--- 按当前 `ui.window_mode` 重建全部聊天实例（保留各实例绑定的会话）。
+--- 注意：关窗会**销毁** Agent，故仅适用于空闲状态的全量重建；单窗口模式切换请用
+--- `set_window_mode`（保留 Agent，运行中也可切）。
+--- @return number 重建的实例数
+function ChatView.reopen_all()
+  local items = {}
+  for i = 1, #_order do
+    local inst = _instances[_order[i]]
+    if inst and inst._is_alive() then
+      -- 用表包一层：session_id 可能为 nil，直接放进数组会截断 ipairs。
+      items[#items + 1] = { session_id = inst._session_id() }
+    end
+  end
+  ChatView.close_all()
+  for _, item in ipairs(items) do
+    ChatView.open_new(item.session_id and { session_id = item.session_id } or {})
+  end
+  return #items
+end
+
 --- 重置（测试用）：关闭全部实例。
 function ChatView.reset()
   ChatView.close_all()
@@ -2713,7 +2959,7 @@ end
 for _, name in ipairs({
   "refresh", "flush", "_sync_follow", "show_status", "cycle_display", "set_display",
   "reload_display", "_recompute_folds", "_mark_folds_dirty", "_is_folds_dirty", "is_following",
-  "_input_win_id",
+  "_input_win_id", "set_window_mode", "get_window_mode",
 }) do
   ChatView[name] = function(...)
     local cur = _current_inst()

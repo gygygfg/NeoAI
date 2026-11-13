@@ -145,17 +145,17 @@ local function _build_part(info, part)
     local last = info.usage.last_cache_ratio
     local mode = config_store.get("ui.statusline.cache_mode") or "both"
     if mode == "latest" then
-      return "缓存命中" .. _fmt_pct2(last or cum)
+      return "命中" .. _fmt_pct2(last or cum)
     elseif mode == "both" and last then
       -- 单次命中率反映当前前缀缓存质量；括号内为会话累计（provider 账单口径）。
-      return "缓存命中" .. _fmt_pct2(last) .. "(会话" .. _fmt_pct2(cum) .. ")"
+      return "命中" .. _fmt_pct2(last) .. "(会话" .. _fmt_pct2(cum) .. ")"
     end
-    return "缓存命中" .. _fmt_pct2(cum)
+    return "命中" .. _fmt_pct2(cum)
   elseif part == "capacity" then
     if not info.capacity or not info.capacity.total or info.capacity.total <= 0 then return nil end
     if info.capacity.level == "over" then return "上下文超限" end
-    -- 剩余容量 = 1 - 已用比例
-    return "剩余容量" .. _fmt_pct(math.max(0, 1 - info.capacity.pct))
+    -- 占用比 = 已用比例（从 0% 起算，越用越大；旧实现显示剩余容量，起点是 100%）
+    return "占用" .. _fmt_pct(math.max(0, info.capacity.pct))
   elseif part == "state" then
     return info.state or "idle"
   elseif part == "sub_agents" then

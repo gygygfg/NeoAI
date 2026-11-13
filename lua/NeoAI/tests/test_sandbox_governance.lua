@@ -260,6 +260,7 @@ tests.suite("sandbox_governance", function(_, it)
   end)
 
   it("容器门面：docker 门禁拒绝且回传真机样式错误（不落宿主机、不泄露沙箱）", function(t)
+    if tests.requires_sandbox() then return end
     with_config({
       tools = {
         approval = { mode = "auto_allow" },
@@ -400,6 +401,7 @@ tests.suite("sandbox_governance", function(_, it)
   end)
 
   it("包安装失败不升级 T2、不冻结主机提案（绝不宿主机安装）", function(t)
+    if tests.requires_sandbox() then return end
     local sandbox = require("NeoAI.sandbox")
     local hostop = require("NeoAI.sandbox.execution.hostop")
     local fs = require("NeoAI.utils.fs")

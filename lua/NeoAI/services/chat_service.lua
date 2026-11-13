@@ -39,6 +39,9 @@ local queue_state_sub = nil -- 监听 Agent 状态变化以在 turn 结束时机
 -- 保证当前回合在旧模式下跑完（不中途改工具集 / 系统策略 / 模型）。
 local pending_mode = nil
 local pending_mode_agent_id = nil
+-- 生成中切换模式时**已立即应用**的策略动作（"grant"=已放行 PRIV / "revoke"=已收回放行），
+-- 仅用于提示文案；模型/计划模式仍随 pending_mode 在本轮结束后应用。
+local pending_policy = nil
 
 -- 前向声明：会话删除清理订阅（实现见下文「会话删除后的运行时回收」）。
 -- 在创建/加载 Agent 时懒注册，避免聊天服务未被使用时也挂事件订阅。
@@ -487,6 +490,7 @@ local function _apply_pending_mode(agent)
   local target = pending_mode
   pending_mode = nil
   pending_mode_agent_id = nil
+  pending_policy = nil
   _apply_target_mode(agent, target)
 end
 
@@ -735,6 +739,15 @@ function M.get_current_agent()
   return runtime.get(state.current_agent_id)
 end
 
+--- 按 agent_id 获取存活的 Agent（不存在或已销毁时返回 nil）。
+--- 供 UI 精确取「本实例绑定的 Agent」（多实例下不依赖 current_agent_id）。
+--- @param agent_id string|nil
+--- @return table|nil
+function M.get_agent(agent_id)
+  if not agent_id then return nil end
+  return runtime.get(agent_id)
+end
+
 --- 设置「当前 Agent」（多聊天实例：焦点切到某实例时把 current 指向其 Agent，
 --- 使既有 get_current_agent()/状态栏/审批等调用自动落到聚焦实例）。
 --- @param agent_id string|nil
@@ -957,6 +970,25 @@ function M.detach_window(win_id)
   if tool_service then tool_service.clear_approval() end
 end
 
+--- 解绑窗口但**保留** Agent 生命周期（窗口重建场景：切换窗口模式）。
+--- 与 detach_window 的差异：只做「同步持久化 + 解除窗口映射」，**不** dispose Agent、
+--- **不**拒绝暂存队列（`_flush_pending`）、**不**清理审批弹窗（`clear_approval`）——
+--- 这些都属于 Agent 侧运行态，重建窗口后同一 Agent 会重新 attach，正在进行的回合不能被打断。
+--- @param win_id number
+--- @return boolean ok
+--- @return any err 持久化失败原因（Agent 仍保留，调用方可继续重建）
+function M.detach_window_keep_agent(win_id)
+  local agent_id = state.windows[win_id]
+  if not agent_id then return true end
+  local agent = runtime.get(agent_id)
+  if agent then
+    local ok, err = _persist_agent_sync(agent)
+    if not ok then return false, err end
+  end
+  state.windows[win_id] = nil
+  return true
+end
+
 --- 取消当前生成
 function M.cancel_generation()
   local agent = M.get_current_agent()
@@ -991,6 +1023,22 @@ local function _request_mode(target)
     if not ok then return _actual_mode(), false, reason end
   end
   if _is_busy(agent) then
+    -- 生成中切换：**策略立即生效**（网络放行/容器直连/SSH 不遮蔽），只有模型/provider
+    -- 与计划模式的切换延迟到本轮结束——否则本轮后续工具调用（例如沙箱内跑测试）仍会
+    -- 按旧策略弹网络同意窗 / 被 offline 拒绝，用户看到的却是 PRIV。
+    local privileged_mode = require("NeoAI.tools.builtin.privileged_mode")
+    local sp = require("NeoAI.sandbox.privileged")
+    if target == "privileged" then
+      privileged_mode.set_policy(agent, true)
+      pending_policy = "grant"
+    elseif privileged_mode.is_active(agent) or sp.is_marked(agent.id) then
+      -- 离开 PRIV（chat/plan）：先收回放行，安全侧立即生效。
+      -- 注意：生成中提前应用的策略只标记沙箱注册表（agent 标志延后），故两处都要看。
+      privileged_mode.set_policy(agent, false)
+      pending_policy = "revoke"
+    else
+      pending_policy = nil
+    end
     pending_mode = target
     pending_mode_agent_id = agent.id
     _ensure_queue_observer()
@@ -998,6 +1046,7 @@ local function _request_mode(target)
   end
   pending_mode = nil
   pending_mode_agent_id = nil
+  pending_policy = nil
   local ok, reason = _apply_target_mode(agent, target)
   if not ok then return _actual_mode(), false, reason end
   return target, true
@@ -1078,6 +1127,7 @@ function M.approve_plan(opts)
   agent.plan = plan
   pending_mode = nil -- 确认计划后清除待应用的模式切换（以本次退出为准）
   pending_mode_agent_id = nil
+  pending_policy = nil
   plan_mode.exit(agent) -- 直接转入 CHAT 模式
   _apply_current_mode(agent) -- 按退出后的模式应用 provider/model 配置
   _persist_agent(agent)
@@ -1119,6 +1169,26 @@ end
 --- @return boolean
 function M.has_pending_mode()
   return pending_mode ~= nil
+end
+
+--- 待本轮结束应用的目标模式（无则 nil）。
+--- 生成中切换 PRIV 时策略已立即生效，仅模型/provider 延迟——调用方据此生成准确提示。
+--- @return string|nil
+function M.pending_mode()
+  return pending_mode
+end
+
+--- 模式切换提示后缀：区分「策略已立即生效（仅模型延后）」与「整轮延迟」。
+--- @return string 无待应用切换时为空串
+function M.pending_mode_hint()
+  if not pending_mode then return "" end
+  if pending_policy == "grant" then
+    return "（网络/容器已立即生效；模型将在本轮生成结束后切换）"
+  end
+  if pending_policy == "revoke" then
+    return "（网络放行已立即收回；模型将在本轮生成结束后切换）"
+  end
+  return "（将在本轮生成结束后生效）"
 end
 
 --- 模式的展示标签
@@ -1180,6 +1250,7 @@ function M.new_session(opts)
   -- 新会话从 CHAT（或显式 opts.mode）开始，丢弃上一会话遗留的待应用模式切换
   pending_mode = nil
   pending_mode_agent_id = nil
+  pending_policy = nil
   local o = vim.tbl_extend("force", {}, opts, { mode = opts.mode or "chat" })
   return _get_or_create_agent(o)
 end
@@ -1325,6 +1396,7 @@ function M.reset()
   -- 清理待应用的模式切换与状态监听，避免跨测试/重载残留
   pending_mode = nil
   pending_mode_agent_id = nil
+  pending_policy = nil
   if queue_state_sub then
     queue_state_sub()
     queue_state_sub = nil

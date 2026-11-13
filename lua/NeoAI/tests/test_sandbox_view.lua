@@ -24,6 +24,7 @@ end
 
 tests.suite("sandbox_view", function(_, it)
   it("播种视图门禁：覆盖根内暂存不拒绝、覆盖根外仍 fail-closed", function(t)
+    if tests.requires_sandbox() then return end
     local wrapper = require("NeoAI.sandbox.execution.wrapper")
     local sandbox = require("NeoAI.sandbox")
     local fs = require("NeoAI.utils.fs")

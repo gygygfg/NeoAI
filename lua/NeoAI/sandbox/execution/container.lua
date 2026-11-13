@@ -196,15 +196,25 @@ function M.detect(command)
   return nil
 end
 
+--- 高权限判定：显式 `opts.privileged` 优先（按**执行 Agent** 判定），否则退回进程级
+--- 「当前 Agent」判定（直接调用方/测试的兼容路径）。
+--- @param opts table|nil { privileged?: boolean }
+--- @return boolean
+local function _privileged(opts)
+  if type(opts) == "table" and opts.privileged ~= nil then return opts.privileged == true end
+  local okp, privileged = pcall(require, "NeoAI.sandbox.privileged")
+  return (okp and privileged.active()) or false
+end
+
 --- 分析命令并给出受控计划（必要时重写命令）
 --- @param command string|nil
+--- @param opts table|nil { privileged?: boolean 按执行 Agent 判定（PRIV 时不接管） }
 --- @return table|nil plan {
 ---   manager, sub?, mode ("namespace"|"no_share"), share_namespace, command, reason?, rewritten?
 --- }
-function M.plan(command)
+function M.plan(command, opts)
   -- 高权限模式：容器命令按原文执行（不注入 namespace 共享标志、不改写）。
-  local okp, privileged = pcall(require, "NeoAI.sandbox.privileged")
-  if okp and privileged.active() then return nil end
+  if _privileged(opts) then return nil end
   local cfg = _cfg()
   if cfg.enabled == false then return nil end
   if type(command) ~= "string" or command == "" then return nil end
@@ -268,12 +278,12 @@ end
 ---     真机样式 docker 错误，真实原因仅进 UI/审计）；
 ---   * 远程/连接型选项（`--remote`/`-H`/`--connection`）与宿主 VM 子命令（`machine`）→ `unsupported`。
 --- @param command string
+--- @param opts table|nil { privileged?: boolean 按执行 Agent 判定（PRIV 时不接管） }
 --- @return table|nil { manager, original_manager?, sub?, mode="sandbox"|"unsupported",
 ---   reason?, command?, rewritten? }
-function M.facade(command)
+function M.facade(command, opts)
   -- 高权限模式：不接管容器运行时（docker 直连宿主 daemon，podman 直接执行）。
-  local okp, privileged = pcall(require, "NeoAI.sandbox.privileged")
-  if okp and privileged.active() then return nil end
+  if _privileged(opts) then return nil end
   local cfg = _cfg()
   if cfg.enabled == false then return nil end
   if type(command) ~= "string" or command == "" then return nil end

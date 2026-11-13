@@ -124,6 +124,7 @@ tests.suite("sandbox_core", function(_, it)
   end)
 
   it("dry_run：不写真实工作区，冻结候选后可 CAS 发布", function(t)
+    if tests.requires_sandbox() then return end
     local fs = require("NeoAI.utils.fs")
     local sandbox = require("NeoAI.sandbox")
     with_config({ tools = { approval = { mode = "auto_allow" }, sandbox = { mode = "dry_run" } } }, function()
@@ -152,6 +153,7 @@ tests.suite("sandbox_core", function(_, it)
   end)
 
   it("工作区映射：同一文件多次编辑叠加、读回沙箱内容、结果路径为原文件", function(t)
+    if tests.requires_sandbox() then return end
     local fs = require("NeoAI.utils.fs")
     local sandbox = require("NeoAI.sandbox")
     with_config({ tools = { approval = { mode = "async" }, sandbox = { mode = "dry_run", review = { enabled = true } } } }, function()
@@ -201,6 +203,7 @@ tests.suite("sandbox_core", function(_, it)
   end)
 
   it("待审：应用被取代的旧变更单元时重定向到最新版本（不报 NOT_APPROVED）", function(t)
+    if tests.requires_sandbox() then return end
     local fs = require("NeoAI.utils.fs")
     local sandbox = require("NeoAI.sandbox")
     with_config({ tools = { approval = { mode = "async" }, sandbox = { mode = "dry_run", review = { enabled = true } } } }, function()
@@ -239,6 +242,7 @@ tests.suite("sandbox_core", function(_, it)
   end)
 
   it("沙箱不可见：list/search/exists 反映暂存改动且不泄露暂存路径", function(t)
+    if tests.requires_sandbox() then return end
     local fs = require("NeoAI.utils.fs")
     local sandbox = require("NeoAI.sandbox")
     with_config({ tools = { approval = { mode = "async" }, sandbox = { mode = "dry_run", review = { enabled = true } } } }, function()
@@ -947,6 +951,7 @@ tests.suite("sandbox_core", function(_, it)
   end)
 
   it("沙箱不可见：treesitter 读取暂存内容且不泄露暂存路径", function(t)
+    if tests.requires_sandbox() then return end
     local fs = require("NeoAI.utils.fs")
     local sandbox = require("NeoAI.sandbox")
     with_config({ tools = { approval = { mode = "async" }, sandbox = { mode = "dry_run", review = { enabled = true } } } }, function()
@@ -974,6 +979,7 @@ tests.suite("sandbox_core", function(_, it)
   end)
 
   it("沙箱不可见：delete_node 基于暂存内容修改并写回暂存（不二次暂存）", function(t)
+    if tests.requires_sandbox() then return end
     local fs = require("NeoAI.utils.fs")
     local sandbox = require("NeoAI.sandbox")
     with_config({ tools = { approval = { mode = "async" }, sandbox = { mode = "dry_run", review = { enabled = true } } } }, function()
@@ -1030,6 +1036,7 @@ tests.suite("sandbox_core", function(_, it)
   end)
 
   it("新建文件：首次 edit_file 暂存目录缺失也能成功（不报 ENOENT）", function(t)
+    if tests.requires_sandbox() then return end
     local fs = require("NeoAI.utils.fs")
     local sandbox = require("NeoAI.sandbox")
     with_config({ tools = {
@@ -1595,6 +1602,7 @@ tests.suite("sandbox_core", function(_, it)
   end)
 
   it("沙箱：文件写入工具拒绝目录目标（避免把目录覆盖成文件）", function(t)
+    if tests.requires_sandbox() then return end
     local fs = require("NeoAI.utils.fs")
     local sandbox = require("NeoAI.sandbox")
     local dir = vim.fn.tempname()

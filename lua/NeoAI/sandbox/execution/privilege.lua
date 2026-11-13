@@ -641,6 +641,7 @@ function M.resolve(tier, req, opts)
     name = t.name,
     review = t.review or "auto",
     network = t.network ~= false,
+    privileged = privileged_active,
     cap_add = vim.deepcopy(t.cap_add or {}),
     mounts = vim.deepcopy(t.mounts or {}),
     unmask = vim.deepcopy(t.unmask or {}),
@@ -650,6 +651,18 @@ function M.resolve(tier, req, opts)
   -- 高权限模式：进程命令可直连宿主 docker daemon（仅此模式例外）。
   if privileged_active and opts and opts.process then
     _append_host_docker(priv)
+  end
+  -- 高权限模式：不遮蔽 SSH 私钥/agent 路径（默认开，可用 unmask_ssh_keys=false 关闭）。
+  if privileged_active then
+    local pcfg = config_store.get("tools.privileged_mode") or {}
+    if pcfg.unmask_ssh_keys ~= false then
+      local sp = require("NeoAI.sandbox.privileged")
+      for _, p in ipairs(sp.ssh_unmask_paths()) do
+        if not vim.tbl_contains(priv.unmask, p) then
+          priv.unmask[#priv.unmask + 1] = p
+        end
+      end
+    end
   end
   -- 容器命令：沙箱内只走 podman/buildah（无守护进程）。**永不连接宿主 docker daemon**——
   -- 容器由宿主 daemon 在沙箱外创建、无法约束，且挂载路径改写不是安全边界，故不再挂载/解除

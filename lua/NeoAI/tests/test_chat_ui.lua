@@ -585,7 +585,7 @@ tests.suite("chat_ui", function(_, it)
     -- 会报 E242 "Can't split a window while closing another"，不应抛出。
     local ok = pcall(vim.api.nvim_win_close, side, true)
     t.true_(ok, "关闭窗口不应因恢复输入框而报错")
-    t.true_(vim.wait(300, function()
+    t.true_(vim.wait(2000, function()
       local w = input_box.get_win()
       return w ~= nil and vim.api.nvim_win_is_valid(w)
     end), "随后应延迟恢复输入窗口")

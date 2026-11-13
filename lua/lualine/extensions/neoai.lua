@@ -3,7 +3,7 @@
 --- 在聊天主消息窗口（filetype == 'neoai'）内，用 NeoAI 状态栏代替默认状态栏；
 --- 输入框等其它 NeoAI buffer 保留用户自己的 lualine，不被污染。刻意简洁：
 ---   第 1 行（winbar）：身份 —— 模式 / 模型 / 状态
----   第 2 行（statusline）：指标 —— 用量 / 缓存命中率 / 剩余容量
+---   第 2 行（statusline）：指标 —— 用量 / 缓存命中率 / 上下文占用比
 --- 关闭 winbar（ui.statusline.winbar = false）时退化为单行：身份 + 指标。
 --- 各段均显式链接到鲜艳高亮组，active / inactive 一致，避免默认灰暗配色（虚化）。
 --- 开启方式二选一：

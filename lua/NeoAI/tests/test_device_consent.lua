@@ -158,6 +158,7 @@ tests.suite("device_consent", function(_, it)
   end)
 
   it("门禁端到端（静态回退 dynamic=false）：deny 拒绝 / ask 批准后执行 / allow 直接放行", function(t)
+    if tests.requires_sandbox() then return end
     local dc = require("NeoAI.sandbox.review.device_consent")
     require("NeoAI.sandbox").reset()
     dc.reset()

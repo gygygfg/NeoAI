@@ -18,7 +18,7 @@
 - **丰富的内置工具** — AI 可调用文件操作、代码分析、LSP、Shell 命令等 40+ 工具
 - **工具审批系统** — 细粒度的工具执行权限控制，支持自动允许/手动审批/参数级别白名单
 - **计划模式（PLAN）与计划提取** — 按 `m` 或 `:NeoAI Plan` 切换，工具上下文只保留只读/信息查询 + `run_command`（只读调研）+ `ask_user`（不暴露任何修改类工具，也不向 AI 提供切换模式的工具）；AI 调研澄清后输出格式化修改计划并结束本轮，由用户确认（`:NeoAI ApprovePlan` 或手动切换模式）后转入 CHAT：边界处先做一轮 **XML 计划提取**（`<target>`/`<stepN>`/`<files>` 等，忽略大小写、缺失关键字段重试最多 3 次），据此组装执行上下文并按步骤自动建任务清单（`todo_write`），`<files>` 相关工具消息原样保留以保证缓存命中，再开始执行
-- **高权限模式（PRIV，opt-in）** — 按 `m` 循环或 `:NeoAI Privileged` 切换；网络不拦截仅记录、可直接使用 docker/podman（docker 直连宿主 daemon）。默认关闭且仅异步审批可用，安全边界见 `docs/configuration.md` 与 `docs/sandbox.md`
+- **高权限模式（PRIV，opt-in）** — 按 `m` 循环或 `:NeoAI Privileged` 切换；网络不拦截仅记录（进程级：存在 PRIV 会话即整体放行+记录，焦点切换不弹窗）、可直接使用 docker/podman（docker 直连宿主 daemon）、不遮蔽 SSH 密钥；生成中切换时策略立即生效、仅模型延后。默认关闭且仅异步审批可用，安全边界见 `docs/configuration.md` 与 `docs/sandbox.md`
 - **后台上下文压缩** — 接近上下文阈值时**后台异步、非阻塞**地折叠第一轮至倒数第二轮（保留最后一轮），以检查点写入**压缩覆盖层**：后续请求与再次压缩使用压缩后的替换，而聊天渲染与会话持久化仍是原始上下文（覆盖层随会话保存，重开后继续生效）；压缩不弹悬浮窗；除回合边界外，**工具循环每轮发送前也会做压力检查**（工具结果已回写、下一轮请求前），长循环逐轮收敛；**历史条数超过安全上限时先同步压缩再发送（用检查点替换，而不是裸截断改写前缀）**；溢出时自动压缩后重试；计划提取过程仍以悬浮窗实时展示推理与正文
 - **子 Agent 系统** — AI 可创建子 Agent 并行执行子任务，支持边界审核
 - **前后端分离架构** — 事件驱动的异步架构，UI 与业务逻辑解耦
@@ -201,6 +201,8 @@ require("NeoAI").setup({
 | `:NeoAI Test`       | 运行测试（不带参数并行全量；带参数顺序运行指定套件） |
 | `:NeoAI ChatStatus` | 显示聊天窗口状态                                 |
 | `:NeoAI CycleDisplay`| 循环切换聊天显示模式（对话/轨迹）                  |
+| `:NeoAI WindowMode`| 切换当前聊天窗口的窗口模式（tab/float/split，仅本次窗口生效、不写配置；Agent 生成中/工具执行中也可切换；缺省显示当前模式） |
+| `:NeoAI Compact`   | 手动压缩当前会话上下文（忽略压力阈值，保留最近一轮） |
 | `:NeoAI ReloadDisplay`| 热重载显示模式插件（缺省重载当前模式）            |
 | `:NeoAI ReloadAll`  | 热重载整个 NeoAI 插件（先做隔离预检，失败则取消）  |
 | `:NeoAI Plan`       | 切换计划模式（工具上下文只保留只读/信息查询 + 提问）|
@@ -357,11 +359,13 @@ require("NeoAI").setup({
   -- ===== UI 配置 =====
   ui = {
     default_view = "chat",               -- 默认界面：tree / chat
-    window_mode = "tab",                 -- 窗口模式：float / tab / split
+    window_mode = "tab",                 -- 新开窗口的默认窗口模式：float / tab / split（运行期 :NeoAI WindowMode 只切换当前窗口）
     window = { w_ratio = 0.85, h_ratio = 0.85, border = "rounded" }, -- float 窗口按屏幕比例；resize 实时跟随；显式 width/height 作为上限
     float = { min_width = 24, min_height = 4 }, -- 所有悬浮窗最小尺寸兜底
     -- 窄屏留白（硬编码，无需配置）：以「聊天主窗口宽度」为基准，宽度 < 40 时浮窗左右占满
     -- 该窗口；40 ≤ 宽度 < 100 时左右各留 5 格；≥ 100 时维持按屏幕比例居中。
+    -- split：size 为期望尺寸（列数/行数）；max_ratio（默认 0.5）+ min_rest（默认 20）共同收敛，
+    -- 即 NeoAI 窗口最多占屏幕一半、原窗口至少保留 20 列/行
     split = { size = 80, direction = "right" },
     colors = {                           -- 各元素链接的高亮组
       background = "Normal", border = "FloatBorder",
@@ -477,6 +481,7 @@ require("NeoAI").setup({
       require_async_approval = true,     -- 仅 tools.approval.mode="async" 时允许进入
       override_offline = true,           -- 解除 tools.sandbox.offline=true 的硬离线（仍经 host_proxy 记录）
       docker_socket = "",                -- 宿主 docker socket；空 = 自动探测
+      unmask_ssh_keys = true,            -- 不遮蔽 ~/.ssh / ssh-agent 路径
       record_network = true,             -- 记录放行的网络目标（:NeoAI SandboxAudit network）
       max_records = 1000,
     },
@@ -654,7 +659,7 @@ require("lualine").setup({
 的 lualine，不被污染。展示刻意简洁，干净分行、无重复、无成片截断：
 
 - **第 1 行（winbar）** 身份：`[模式] 模型 状态`
-- **第 2 行（statusline）** 指标：`↑prompt ↓completion 缓存命中99.5%(会话94.5%) 剩余容量y% 待发N`
+- **第 2 行（statusline）** 指标：`↑prompt ↓completion 命中99.5%(会话94.5%) 占用y% 待发N`
 
 > `待发N`：Agent 正忙（generating / tool_running / 生成槽被占用）时你发送的消息会先暂存，
 > 状态栏出现该徽标提醒；消息真正发送后徽标自动消失（计数归零不渲染）。
@@ -1262,8 +1267,9 @@ NeoAI 基于 Neovim 原生 `User` 自动命令实现事件驱动架构，事件�
 :NeoAI Test flow_config flow_tools
 ```
 
-> 并行运行器按「文件（套件）」分片，worker 数默认 `min(nproc, 8)`（`NEOAI_TEST_WORKERS` 可覆盖），
-> 并用实测耗时缓存自均衡。详见 [docs/testing.md](docs/testing.md)。
+> 并行运行器按「文件（套件）」分片，worker 数按核数自动推导（总并发硬上限 = `核数 - 2`，预留两核；light = `总上限 - heavy`，heavy ≈ `核数/2`
+> 并按可用内存收敛；`NEOAI_TEST_WORKERS` / `NEOAI_TEST_HEAVY_WORKERS` 可覆盖），并用实测耗时缓存自均衡。
+> 详见 [docs/testing.md](docs/testing.md)。
 
 ---
 

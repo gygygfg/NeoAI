@@ -8,11 +8,12 @@
 --- 两条 lane（重叠执行，任一子进程结束即回填）：
 ---   * light：非资源重套件，按历史实测耗时 LPT 分片成 W 个进程（多套件/进程）；
 ---   * heavy：资源重/时序敏感套件（sandbox*/pty），一套件一子进程，受 heavy 并发上限 H 约束，
----     按耗时降序 LPT 排队。约束 #light≤W、#heavy≤H、W+H≤核数。
+---     按耗时降序 LPT 排队。约束 #light≤W、#heavy≤H、W+H≤核数-2（预留两核给系统/编辑器）。
 ---
 --- 职责拆分到 `NeoAI.tests.runner.*` 子模块：
 ---   config（常量/并发解析）、timings（耗时缓存）、shard（LPT/清单解析）、
----   spawn（子进程执行：输出落盘 + sidecar）、scheduler（有界并发池）、report（聚合与报告）。
+---   spawn（子进程执行：输出落盘 + sidecar）、scheduler（有界并发池）、
+---   memguard（运行期内存许可）、report（聚合与报告）。
 --- 本文件保留对外签名与语义：run/shard/_discover/_set_spawner/reset/_abort_all。
 
 local tests = require("NeoAI.tests")
@@ -21,6 +22,7 @@ local timings_mod = require("NeoAI.tests.runner.timings")
 local shard_mod = require("NeoAI.tests.runner.shard")
 local spawn = require("NeoAI.tests.runner.spawn")
 local scheduler = require("NeoAI.tests.runner.scheduler")
+local memguard = require("NeoAI.tests.runner.memguard")
 local report = require("NeoAI.tests.runner.report")
 
 local M = {}
@@ -116,8 +118,8 @@ end
 
 --- 并行运行测试套件。
 --- @param opts table|nil {
----   workers?: number,             light 通道 worker 数（默认 min(nproc,8)，NEOAI_TEST_WORKERS 覆盖）
----   heavy_workers?: number,       heavy 通道并发上限（默认 2，NEOAI_TEST_HEAVY_WORKERS 覆盖；=1 回退串行）
+---   workers?: number,             light 通道 worker 数（默认按核数自动：核数-heavy，上限 16；NEOAI_TEST_WORKERS 覆盖）
+---   heavy_workers?: number,       heavy 通道并发上限（默认按核数自动：核数/2，受 核数-2 与可用内存约束；NEOAI_TEST_HEAVY_WORKERS 覆盖；=1 回退串行）
 ---   suites?: string[],            仅运行指定套件名（默认全部）
 ---   timeout_ms?: number,          单分片超时（默认 15 分钟）
 ---   total_timeout_ms?: number,    wait=true 时总超时
@@ -139,6 +141,7 @@ function M.run(opts)
   local agg = {
     passed = 0,
     failed = 0,
+    skipped = 0,
     errors = {},
     shards = {},
     workers = 0,
@@ -206,17 +209,17 @@ function M.run(opts)
     end
   end
 
-  -- 4) 并发解析：light W，heavy H（W+H≤核数），并以单元数钳制
-  local light_workers = math.min(config.resolve_workers(opts), math.max(1, #light))
+  -- 4) 并发计划：按**实际核数与可用内存**动态分配（heavy/light 各有内存预算），
+  --    再以单元数钳制。
+  local plan = config.plan(opts)
+  local light_workers = math.min(plan.light, math.max(1, #light))
   if #light == 0 then light_workers = 0 end
-  local heavy_workers = config.resolve_heavy_workers(opts, math.max(1, light_workers))
-  if #heavy > 0 then
-    heavy_workers = math.min(heavy_workers, #heavy)
-  else
-    heavy_workers = 0
-  end
+  local heavy_workers = math.min(plan.heavy, math.max(1, #heavy))
+  if #heavy == 0 then heavy_workers = 0 end
   agg.workers = light_workers
   agg.heavy_workers = heavy_workers
+  agg.cores = plan.cores
+  agg.mem_gb = plan.mem_mb and (plan.mem_mb / 1024) or nil
 
   -- 5) 组装单元：light = LPT 分片；heavy = 一套件一进程（按耗时降序排队）
   local sid = 0
@@ -262,14 +265,21 @@ function M.run(opts)
   -- 6) 双 lane 有界并发执行（light 池 W 路 + heavy 池 H 路，重叠，任一结束即回填）
   local function start_unit(unit, done)
     local req = _make_req(unit, timeout_ms)
-    local started = vim.uv.hrtime()
-    spawn.get()(req, {
-      timeout_ms = timeout_ms,
-      on_done = function(res)
-        report.record(agg, unit.sid, unit.names, started, res)
-        done()
-      end,
-    })
+    local function launch()
+      local started = vim.uv.hrtime()
+      spawn.get()(req, {
+        timeout_ms = timeout_ms,
+        on_done = function(res)
+          report.record(agg, unit.sid, unit.names, started, res)
+          done()
+        end,
+      })
+    end
+    -- 注入执行器（测试）不走内存门控，保持同步语义。
+    if spawn.is_injected() then return launch() end
+    -- 运行期动态内存许可：可用内存不足以容纳该分片预算时短暂等待（有界，绝不挂起）。
+    local need = unit.kind == "heavy" and config.HEAVY_MEM_BUDGET_MB or config.LIGHT_MEM_BUDGET_MB
+    memguard.admit(need, launch)
   end
 
   scheduler.run_dual(light_units, heavy_units, light_workers, heavy_workers, start_unit, finish)
@@ -293,6 +303,7 @@ end
 --- 重置注入状态（测试用）
 function M.reset()
   spawn.reset()
+  memguard.reset()
 end
 
 --- 结束所有在跑 worker 的进程树（父端退出/中止时兜底；幂等）。

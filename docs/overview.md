@@ -304,6 +304,8 @@ require('NeoAI').setup({
 | `:NeoAI Test [names...]` | 运行测试（全部，或按名称指定） |
 | `:NeoAI ChatStatus` | 显示聊天窗口状态 |
 | `:NeoAI CycleDisplay` | 循环切换聊天显示模式（chat / trajectory） |
+| `:NeoAI WindowMode [tab\|float\|split]` | 切换**当前聊天窗口**的窗口模式：只重建该窗口（不写配置、新开窗口仍按 `ui.window_mode`）；Agent 生成中/工具执行中也可切换（重建时保留 Agent，当前回合不中断）；缺省显示当前模式 |
+| `:NeoAI Compact` | 手动压缩当前会话上下文（忽略压力阈值，保留最近一轮） |
 | `:NeoAI ReloadDisplay [name]` | 热重载某个显示模式插件 |
 | `:NeoAI Plan` | 切换 plan mode（只读/信息类工具 + ask_user） |
 | `:NeoAI ApprovePlan` | 批准 plan，切换到 CHAT，执行任务列表 |

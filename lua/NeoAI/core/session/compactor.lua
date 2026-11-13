@@ -454,15 +454,18 @@ end
 --- max_history 非空时表示「历史条数超限」也是本次压缩的目标（压缩后必须回到上限内）。
 --- @param agent table
 --- @param cfg table
---- @param threshold number token 压力阈值
+--- @param threshold number|nil token 压力阈值（nil = 手动触发，不做 token 收敛重试）
 --- @param max_history number|nil
+--- @param force boolean|nil true = 手动压缩：裁剪后即便已回到阈值内也继续摘要折叠
 --- @return Deferred resolve(boolean)
-local function _begin(agent, cfg, threshold, max_history)
+local function _begin(agent, cfg, threshold, max_history, force)
   agent._compaction_pending = true
   local d = _prune_async(agent, cfg):then_(function(pruned)
     local over_count = max_history ~= nil and _history_count(agent) > max_history
-    -- 仅 token 压力时可因裁剪而提前结束；条数超限必须走摘要替换。
-    if not over_count and pruned and _estimate(agent) < threshold then return true end
+    -- 仅 token 压力时可因裁剪而提前结束；条数超限 / 手动触发必须走摘要替换。
+    if not force and not over_count and pruned and threshold and _estimate(agent) < threshold then
+      return true
+    end
     return _compact(agent, cfg, {
       mode = "round",
       threshold = threshold,
@@ -583,6 +586,39 @@ function M.force_compact(agent, opts)
     if pruned and _estimate(agent) < _window_for(agent, cfg) then return true end
     return _compact(agent, cfg, { mode = "overflow", retain_tokens = 0, min_shadow = 1 })
   end)
+end
+
+--- 手动压缩（`:NeoAI Compact`）：跳过 token 压力阈值判断，按常规回合策略压缩一次。
+--- 常规策略 = 折叠第一轮至倒数第二轮并保留最后一轮完整；单轮长工具循环则按 retain 预算
+--- 收缩头部。与 `force_compact`（溢出恢复，retain 0 的最大化缩减）不同，这里保留最近一轮，
+--- 手动触发不应把刚结束的上下文也压掉。可折叠区间不足时返回 false（不报错）。
+--- @param agent table Agent
+--- @param opts table|nil { context_cache?, allow_busy? }（缺省仅在 idle 时执行）
+--- @return Deferred resolve(boolean) 是否发生了压缩
+function M.compact_now(agent, opts)
+  opts = opts or {}
+  local cfg = _cfg(opts)
+  if cfg.enabled == false then
+    return async.resolve(false)
+  end
+  if not agent then
+    return async.resolve(false)
+  end
+  -- 已有压缩在进行：等它结束（重复手动触发不应叠一次摘要调用）。
+  if agent._compacting or agent._compaction_pending then
+    local inflight = agent._compaction_deferred
+    if inflight and inflight.then_ then
+      return inflight:then_(function() return false end, function() return false end)
+    end
+    return async.resolve(false)
+  end
+  if not _can_compact(agent, opts) then
+    return async.resolve(false)
+  end
+  -- 不做阈值判断：手动触发一律先裁剪、再摘要折叠（threshold 传 nil 避免无谓的收敛重试）。
+  local cap = _history_cap()
+  local over_count = cap ~= nil and _history_count(agent) > cap
+  return _begin(agent, cfg, nil, over_count and cap or nil, true)
 end
 
 --- 构建检查点消息（供测试直接使用）

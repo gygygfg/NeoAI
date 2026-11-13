@@ -67,8 +67,8 @@ tests.suite("status", function(_, it)
     t.true_(c:find("deepseek", 1, true) ~= nil, "component 含模型")
     t.matches("↑30%.0k", c, "component 含累计 prompt 用量")
     t.matches("↓5%.0k", c, "component 含累计 completion 用量")
-    t.matches("缓存命中83%.33%%", c, "component 含累计缓存命中率（两位小数）")
-    t.matches("剩余容量", c, "component 含剩余容量")
+    t.matches("命中83%.33%%", c, "component 含累计缓存命中率（两位小数）")
+    t.matches("占用", c, "component 含上下文占用比")
   end)
 
   it("segment 按段输出", function(t)
@@ -90,16 +90,16 @@ tests.suite("status", function(_, it)
     t.eq("↑30.0k ↓5.0k", status.segment("usage"), "usage 应为累计而非最近一次")
   end)
 
-  it("缓存命中段展示累计命中率且保留两位小数", function(t)
+  it("命中段展示累计命中率且保留两位小数", function(t)
     local chat = init_chat()
     local status = require("NeoAI.services.status")
     local agent = chat.new_session({})
     agent.usage = { requests = 3, cache_ratio = 0.9532 }
     -- segment 为 statusline 安全会转义 %（%%），断言按转义后文本
-    t.eq("缓存命中95.32%%", status.segment("cache"), "缓存命中率应为累计且两位小数")
+    t.eq("命中95.32%%", status.segment("cache"), "缓存命中率应为累计且两位小数")
   end)
 
-  it("缓存命中段默认同时展示单次与会话累计", function(t)
+  it("命中段默认同时展示单次与会话累计", function(t)
     local chat = init_chat()
     local status = require("NeoAI.services.status")
     local agent = chat.new_session({})
@@ -109,7 +109,7 @@ tests.suite("status", function(_, it)
       last_prompt = 36143,
       last_cache_read = 35968,
     }
-    t.eq("缓存命中99.52%%(会话94.55%%)", status.segment("cache"))
+    t.eq("命中99.52%%(会话94.55%%)", status.segment("cache"))
   end)
 
   it("缓存段 cache_mode 可控：latest 只显示单次，cumulative 只显示累计", function(t)
@@ -122,9 +122,9 @@ tests.suite("status", function(_, it)
       last_prompt = 36143, last_cache_read = 35968,
     }
     config_store.set("ui.statusline.cache_mode", "latest")
-    t.eq("缓存命中99.52%%", status.segment("cache"))
+    t.eq("命中99.52%%", status.segment("cache"))
     config_store.set("ui.statusline.cache_mode", "cumulative")
-    t.eq("缓存命中94.55%%", status.segment("cache"))
+    t.eq("命中94.55%%", status.segment("cache"))
     config_store.set("ui.statusline.cache_mode", "both")
   end)
 
@@ -133,7 +133,7 @@ tests.suite("status", function(_, it)
     local status = require("NeoAI.services.status")
     local agent = chat.new_session({})
     agent.usage = { requests = 3, cache_ratio = 0.9532 }
-    t.eq("缓存命中95.32%%", status.segment("cache"))
+    t.eq("命中95.32%%", status.segment("cache"))
   end)
 
   it("ui.statusline.enabled=false 时 component 为空", function(t)
@@ -266,6 +266,8 @@ tests.suite("status", function(_, it)
     t.eq("api", cap.source)
     t.eq("warn", cap.level, "120000/131072 ≈ 0.92 应为 warn")
     t.matches("↑100", status.segment("usage"), "usage 段显示累计用量（容量另走 last_prompt）")
+    -- 占用比从 0% 起算（旧实现显示「剩余容量」，起点是 100%）
+    t.eq("占用92%%", status.segment("capacity"), "容量段应显示已用占比")
 
     agent.usage.last_prompt = 140000
     t.eq("over", status.capacity_for(agent).level)

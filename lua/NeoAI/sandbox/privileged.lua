@@ -19,6 +19,7 @@ local state = {
   current_id = nil,
   records = {},    -- 网络记录环形缓冲（新→旧）
   max_records = 1000,
+  ssh_paths = nil, -- 高权限模式解除遮蔽的 SSH 密钥/agent 路径缓存
 }
 
 local function _limit()
@@ -78,6 +79,16 @@ function M.any_active()
   return next(state.agents) ~= nil
 end
 
+--- 网络放行判据（**进程级**）：进程内任一 Agent 处于高权限模式即放行。
+--- 网络代理（`host_proxy`）是进程级共享单例，连接回调里没有 Agent 上下文，无法按连接
+--- 归属判定；因此按「存在 PRIV 会话」整进程放行并记录。UI 焦点切换（多聊天窗口 / 子 Agent
+--- 窗口 / 新建会话会把 current 指向别的 Agent）不再改变放行与记录结果。
+--- 与文档「网络代理是共享单例，其它窗口/后台命令继承网络放行策略」的边界一致。
+--- @return boolean
+function M.network_active()
+  return next(state.agents) ~= nil
+end
+
 --- 高权限模式是否解除 `offline=true` 的硬网络隔离（默认 true）。
 --- @return boolean
 function M.override_offline()
@@ -85,6 +96,43 @@ function M.override_offline()
     return require("NeoAI.kernel.config_store").get("tools.privileged_mode") or {}
   end)
   return not (ok and cfg.override_offline == false)
+end
+
+--- 高权限模式解除遮蔽的 SSH 密钥 / agent 路径（按当前用户与 home 展开）。
+--- 仅用于 unmask；是否启用由 `tools.privileged_mode.unmask_ssh_keys` 控制（默认开）。
+--- @return string[]
+function M.ssh_unmask_paths()
+  if state.ssh_paths then return state.ssh_paths end
+  local out, seen = {}, {}
+  local function add(p)
+    if type(p) ~= "string" or p == "" then return end
+    if not seen[p] then seen[p] = true; out[#out + 1] = p end
+  end
+  add("/root/.ssh")
+  local home_ssh = vim.fn.expand("~/.ssh")
+  if type(home_ssh) == "string" and home_ssh ~= "" then add(home_ssh) end
+  for _, p in ipairs(vim.fn.glob("/home/*/.ssh", false, true)) do add(p) end
+  add("/root/.ssh-agent")
+  add("/run/ssh-agent.socket")
+  for _, p in ipairs(vim.fn.glob("/run/user/*/ssh*", false, true)) do add(p) end
+  for _, p in ipairs(vim.fn.glob("/tmp/ssh-*", false, true)) do add(p) end
+  state.ssh_paths = out
+  return out
+end
+
+--- 指定路径是否属于 SSH 密钥/agent 路径（含子路径）。
+--- @param path string|nil
+--- @return boolean
+function M.is_ssh_path(path)
+  if type(path) ~= "string" or path == "" then return false end
+  local abs = vim.fn.fnamemodify(vim.fn.expand(path), ":p")
+  if abs ~= "/" then abs = abs:gsub("/+$", "") end
+  for _, p in ipairs(M.ssh_unmask_paths()) do
+    local base = vim.fn.fnamemodify(p, ":p")
+    if base ~= "/" then base = base:gsub("/+$", "") end
+    if abs == base or abs:sub(1, #base + 1) == base .. "/" then return true end
+  end
+  return false
 end
 
 --- 追加一条网络访问记录（新→旧，有界环形缓冲）
@@ -132,6 +180,7 @@ function M.reset()
   state.current_id = nil
   state.records = {}
   state.max_records = 1000
+  state.ssh_paths = nil
 end
 
 return M

@@ -5,6 +5,7 @@
 local tests = require("NeoAI.tests")
 local parallel = require("NeoAI.tests.parallel")
 
+--- 并发解析测试：按实际核数与可用内存动态分配 light/heavy
 tests.suite("parallel_runner", function(_, it, before_each)
   before_each(function()
     parallel.reset()
@@ -36,6 +37,72 @@ tests.suite("parallel_runner", function(_, it, before_each)
     t.eq(5, suites[2].cases)
     t.eq("gamma", suites[3].name, "被粘连的套件不得丢失")
     t.eq("NeoAI.tests.test_gamma", suites[3].module)
+  end)
+
+  it("并发计划：按实际核数与可用内存动态分配 light/heavy", function(t)
+    local cfg = require("NeoAI.tests.runner.config")
+    local saved_w, saved_h = vim.env.NEOAI_TEST_WORKERS, vim.env.NEOAI_TEST_HEAVY_WORKERS
+    vim.env.NEOAI_TEST_WORKERS = nil
+    vim.env.NEOAI_TEST_HEAVY_WORKERS = nil
+    local function plan(opts, cores, mem_mb)
+      local p = cfg.plan(opts, cores, mem_mb)
+      return p.light, p.heavy
+    end
+    local l, h
+    l, h = plan({}, 16, 65536)
+    t.eq(6, l, "16 核：light = (核数-2) - heavy")
+    t.eq(8, h, "16 核：heavy = 核数/2")
+    l, h = plan({}, 8, 32768)
+    t.eq(2, l, "8 核：总数上限 6，light 取余量")
+    t.eq(4, h, "8 核：heavy = 4")
+    l, h = plan({}, 4, 16384)
+    t.eq(1, l, "4 核：总数上限 2，heavy+light 各 1")
+    t.eq(1, h, "4 核：heavy 给 light 让位")
+    l, h = plan({}, 2, 4096)
+    t.eq(1, l, "2 核：light 至少 1")
+    t.eq(1, h, "2 核：heavy 给 light 留核")
+    -- 内存紧：heavy 先收敛，并给 light 留 ≥1 路预算
+    l, h = plan({}, 16, 3072)
+    t.eq(3, l, "3GB：light 按剩余内存分配")
+    t.eq(1, h, "3GB：heavy 收敛到 1")
+    l, h = plan({}, 8, 600)
+    t.eq(1, l, "内存极紧：light 至少 1")
+    t.eq(1, h, "内存极紧：heavy 至少 1")
+    l, h = plan({}, 64, 8192)
+    t.eq(4, h, "64 核 8GB：heavy 按内存收敛且给 light 留 2 路")
+    t.eq(4, l, "64 核 8GB：light 用剩余内存")
+    l, h = plan({ heavy_workers = 1 }, 16, 65536)
+    t.eq(1, h, "=1 回退串行 heavy")
+    t.eq(13, l, "heavy 让出的核给 light（总数上限 核数-2）")
+    l, h = plan({ workers = 1, heavy_workers = 99 }, 64, 262144)
+    t.eq(62, h, "heavy 硬上限 = 核数 - 2")
+    t.eq(1, l, "显式 light 保持 1")
+    l, h = plan({ heavy_workers = 99 }, 64, 65536)
+    t.eq(42, h, "heavy 另受可用内存预算约束")
+    t.eq(2, l, "剩余内存决定 light")
+    l, h = plan({ workers = 48 }, 16, 65536)
+    t.eq(48, l, "显式 light 覆盖不受上限约束")
+    t.eq(8, h, "显式 light 不影响 heavy 自动值")
+    vim.env.NEOAI_TEST_WORKERS = saved_w
+    vim.env.NEOAI_TEST_HEAVY_WORKERS = saved_h
+  end)
+
+  it("内存许可：内存充足立即启动，不足则等待后放行", function(t)
+    local mg = require("NeoAI.tests.runner.memguard")
+    local launched = 0
+    mg._set_available_mb(function() return 100000 end)
+    mg.admit(1536, function() launched = launched + 1 end)
+    t.eq(1, launched, "内存充足应同步启动")
+
+    local calls, started = 0, false
+    mg._set_available_mb(function()
+      calls = calls + 1
+      return calls == 1 and 100 or 100000
+    end)
+    mg.admit(1536, function() started = true end)
+    t.false_(started, "内存不足时不得立即启动")
+    t.true_(vim.wait(3000, function() return started end), "内存恢复后应启动")
+    mg.reset()
   end)
 
   it("分片：LPT 贪心把最重套件独立成档", function(t)

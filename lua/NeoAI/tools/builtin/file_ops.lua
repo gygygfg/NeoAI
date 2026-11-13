@@ -795,7 +795,9 @@ file_tools.edit_file = helpers.define_tool(
 
     if mode == "write" then
       local ns = _ns_fs()
-      if ns and ns.active() then
+      -- eligible：私有 tmpfs 根（/tmp、/var/tmp、/run）内路径在沙箱内是会话私有目录，
+      -- overlay 视图与宿主真实路径不一致，必须回退宿主暂存路径（否则读/写落到错误视图）。
+      if ns and ns.eligible(filepath) then
         _pipe(_with_file_lock(filepath, function()
           local ok, werr = ns.write(filepath, args.content or "")
           if not ok then return async.reject({ kind = "sandbox", message = "写入失败: " .. tostring(werr) }) end
@@ -816,7 +818,7 @@ file_tools.edit_file = helpers.define_tool(
     end
     if mode == "append" then
       local ns = _ns_fs()
-      if ns and ns.active() then
+      if ns and ns.eligible(filepath) then
         _pipe(_with_file_lock(filepath, function()
           local ok, werr = ns.append(filepath, args.content or "")
           if not ok then return async.reject({ kind = "sandbox", message = "追加失败: " .. tostring(werr) }) end
@@ -880,7 +882,7 @@ file_tools.edit_file = helpers.define_tool(
     end
     -- overlay 权威模式：在命名空间 overlay 内「读→改→写」（同一文件锁内串行化）。
     local ns = _ns_fs()
-    if ns and ns.active() then
+    if ns and ns.eligible(filepath) then
       _pipe(_with_file_lock(filepath, function()
         local content, rerr = ns.read(filepath)
         if content == nil then
@@ -1137,7 +1139,7 @@ file_tools.create_directory = helpers.define_tool(
   function(args, on_success, on_error)
     local target = _expand(args.file_path)
     local ns = _ns_fs()
-    if ns and ns.active() and ns.mkdir(target) then
+    if ns and ns.eligible(target) and ns.mkdir(target) then
       on_success("目录已创建: " .. target)
       return
     end
@@ -1163,7 +1165,7 @@ file_tools.ensure_dir = helpers.define_tool(
   function(args, on_success, on_error)
     local target = _expand(args.file_path)
     local ns = _ns_fs()
-    if ns and ns.active() and ns.mkdir(target) then
+    if ns and ns.eligible(target) and ns.mkdir(target) then
       on_success("目录已就绪: " .. target)
       return
     end
@@ -1185,7 +1187,7 @@ file_tools.delete_file = helpers.define_tool("delete_file", "删除文件。file
 }, function(args, on_success, on_error)
   local target = _expand(args.file_path)
   local ns = _ns_fs()
-  if ns and ns.active() then
+  if ns and ns.eligible(target) then
     if ns.exists(target) == false then
       on_error("文件不存在: " .. target)
       return

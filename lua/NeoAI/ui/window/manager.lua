@@ -13,6 +13,7 @@ local M = {}
 
 local state = {
   windows = {}, -- win_id -> { type, buf, win, mode }
+  floats = {},  -- win_id -> { geom_opts, reserve }：浮动窗口几何参数与底部预留行数
   aux = {},     -- buf -> true：辅助 buffer（输入框等）登记，供会话恢复孤儿清理豁免
 }
 
@@ -49,7 +50,8 @@ local function _disable_lsp(buf)
 end
 
 --- 创建浮动窗口
---- @param opts table { buf?, width?, height?, border?, title? }
+--- @param opts table { buf?, width?, height?, border?, title?, bottom_reserve? }
+---   bottom_reserve：底部预留行数（如聊天窗口为输入浮窗让出的高度），实际高度 = 比例高度 - 预留
 --- @return number win_id, number buf_id
 local function _open_float(opts)
   local cfg = _window_config()
@@ -67,11 +69,12 @@ local function _open_float(opts)
     -- 主界面窗口（chat/tree）本身不套用窄屏留白规则：它是浮窗的基准，不是浮窗。
     narrow = false,
   }
+  local reserve = math.max(0, math.floor(tonumber(opts.bottom_reserve) or 0))
   local geom = geometry.compute(geom_opts)
   local win = vim.api.nvim_open_win(buf, true, {
     relative = "editor",
     width = geom.width,
-    height = geom.height,
+    height = math.max(1, geom.height - reserve),
     col = geom.col,
     row = geom.row,
     style = "minimal",
@@ -80,8 +83,19 @@ local function _open_float(opts)
     title_pos = "center",
   })
   _configure_window(win)
-  -- 登记：编辑器窗口 resize 时按比例重算跟随。
-  geometry.track(win, geom_opts)
+  -- 登记：编辑器窗口 resize 时按比例重算跟随（并按最新预留行数扣减高度）。
+  state.floats[win] = { geom_opts = geom_opts, reserve = reserve }
+  geometry.track(win, geom_opts, function(w, g)
+    local rec = state.floats[w]
+    local r = rec and rec.reserve or 0
+    pcall(vim.api.nvim_win_set_config, w, {
+      relative = "editor",
+      width = g.width,
+      height = math.max(1, g.height - r),
+      col = g.col,
+      row = g.row,
+    })
+  end)
   return win, buf
 end
 
@@ -104,13 +118,39 @@ local function _open_tab(opts)
   return win, buf
 end
 
+--- 收敛 split 尺寸：取「屏幕比例上限」与「原窗口保底占用」两者较小值，
+--- 避免 size 配置过大时把 NeoAI 窗口以外的窗口挤到 0（表现为占满整个屏幕）。
+--- 保底计算预留 1 列/行给 split 分隔线（状态行/竖线），使「原窗口 >= min_rest」在实际布局中成立。
+--- 默认 max_ratio=0.5（最多占屏幕一半）、min_rest=20；与 default_config 的 ui.split 保持一致。
+--- @param want number 期望尺寸（列或行）
+--- @param total number 屏幕总列数/行数
+--- @param split_cfg table ui.split 配置（max_ratio / min_rest）
+--- @return number
+local function _clamp_split_size(want, total, split_cfg)
+  total = math.max(1, math.floor(tonumber(total) or 1))
+  local max_ratio = tonumber(split_cfg.max_ratio) or 0.5
+  if max_ratio <= 0 or max_ratio > 1 then max_ratio = 0.5 end
+  local min_rest = tonumber(split_cfg.min_rest) or 20
+  if min_rest < 0 then min_rest = 20 end
+  local cap = math.min(math.floor(total * max_ratio), total - math.floor(min_rest) - 1)
+  cap = math.max(1, cap)
+  local n = math.floor(tonumber(want) or cap)
+  if n < 1 then n = 1 end
+  return math.min(n, cap)
+end
+
 --- 创建 split 窗口
 --- @param opts table { buf?, direction?, size? }
+---   size：right/left 为列数、top/bottom 为行数；均受 ui.split.max_ratio / min_rest 收敛
 --- @return number win_id, number buf_id
 local function _open_split(opts)
   local split_cfg = config_store.get("ui.split") or {}
   local direction = opts.direction or split_cfg.direction or "right"
-  local size = opts.size or split_cfg.size or 80
+  local vertical = (direction == "top" or direction == "bottom") -- 上下分割：尺寸语义为行数
+  -- 可用空间：上下分割按屏幕行数（扣掉命令行），左右分割按屏幕列数。
+  local total = vertical and math.max(1, vim.o.lines - 1) or math.max(1, vim.o.columns)
+  local want = opts.size or split_cfg.size or (vertical and math.floor(total * 0.35) or 80)
+  local size = _clamp_split_size(want, total, split_cfg)
   local buf = opts.buf or vim.api.nvim_create_buf(false, true)
   vim.bo[buf].filetype = opts.filetype or "neoai"
   _disable_lsp(buf)
@@ -118,9 +158,13 @@ local function _open_split(opts)
   if direction == "top" then cmd = "topleft split" end
   if direction == "bottom" then cmd = "botright split" end
   vim.cmd(cmd)
-  vim.api.nvim_win_set_width(vim.api.nvim_get_current_win(), size)
-  vim.api.nvim_set_current_buf(buf)
   local win = vim.api.nvim_get_current_win()
+  if vertical then
+    vim.api.nvim_win_set_height(win, size)
+  else
+    vim.api.nvim_win_set_width(win, size)
+  end
+  vim.api.nvim_set_current_buf(buf)
   _configure_window(win)
   return win, buf
 end
@@ -153,11 +197,37 @@ function M.create(window_type, opts)
   return { win_id = win_id, buf = buf, mode = mode }
 end
 
+--- 调整浮动窗口的底部预留行数（如聊天窗口为输入浮窗让出高度）。
+--- 只改高度（row/col/width 保持不变），并同步 resize 跟随记录，避免 VimResized 后丢失预留。
+--- 非浮动窗口（tab/split）无预留概念，直接忽略。
+--- @param win_id number
+--- @param lines number 预留行数（0 表示恢复全高）
+function M.set_bottom_reserve(win_id, lines)
+  local rec = state.floats[win_id]
+  if not rec then return end
+  rec.reserve = math.max(0, math.floor(tonumber(lines) or 0))
+  if not vim.api.nvim_win_is_valid(win_id) then return end
+  local g = geometry.compute(rec.geom_opts)
+  pcall(vim.api.nvim_win_set_config, win_id, {
+    height = math.max(1, g.height - rec.reserve),
+  })
+end
+
+--- 浮动窗口的完整几何（不含底部预留）：chat_view 据此计算输入浮窗可占用的总高度。
+--- @param win_id number
+--- @return table|nil { width, height, col, row }
+function M.get_float_geometry(win_id)
+  local rec = state.floats[win_id]
+  if not rec then return nil end
+  return geometry.compute(rec.geom_opts)
+end
+
 --- 关闭窗口
 --- @param win_id number
 function M.close(win_id)
   local info = state.windows[win_id]
   geometry.untrack(win_id)
+  state.floats[win_id] = nil
   if not info then
     -- 可能是外部创建的窗口
     if vim.api.nvim_win_is_valid(win_id) then
@@ -181,6 +251,7 @@ function M.close_all()
   end
   state.windows = {}
   state.aux = {}
+  state.floats = {}
 end
 
 --- 登记辅助 buffer（如各实例的输入框）：会话恢复孤儿清理时豁免，即使其窗口已收起。

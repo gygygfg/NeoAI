@@ -79,14 +79,19 @@ end)
 | `runner/shard.lua` | LPT 分片、发现清单解析（含 name→module） |
 | `runner/spawn.lua` | 子进程执行：日志落盘 + 结果 sidecar、进程树清理 |
 | `runner/scheduler.lua` | 有界并发池（trampoline 防重入）与双 lane 编排 |
+| `runner/memguard.lua` | 运行期内存许可：分片启动前按预算检查可用内存（有界等待后放行） |
 | `runner/report.lua` | 结果聚合、失败分片懒读日志尾部、报告 |
 
 双 lane：light（多套件/进程，W 路）与 heavy（`sandbox*`/`pty` 一套件/进程，H 路）**重叠执行**，
-约束 `#light≤W`、`#heavy≤H`、`W+H≤核数`；`NEOAI_TEST_HEAVY_WORKERS=1` 回退为旧串行通道。
+约束 `#light≤W`、`#heavy≤H`、`W+H≤核数-2`（预留两核给系统/编辑器）。默认并发按核数自动推导：
+light = `总上限 - heavy`（另上限 16），heavy ≈ `核数/2`。并发还受**实际可用内存**约束：heavy 每路 1536MB、light
+每路 512MB，内存不足时先收敛 heavy 再压缩 light（各至少 1 路）；分片启动前经 `runner/memguard`
+动态许可，报告头部打印核数与可用内存。`NEOAI_TEST_WORKERS` / `NEOAI_TEST_HEAVY_WORKERS` 覆盖，
+`NEOAI_TEST_HEAVY_WORKERS=1` 回退为旧串行通道。
 
 ## 3. 测试文件清单
 
-`lua/NeoAI/tests/` 下共 **126** 个 `test_*.lua`（另 `init.lua` 为运行器、`parallel.lua` 为并行运行器、`http_server.lua` / `sandbox_stub.lua` / `sandbox_boundary_helpers.lua` 为测试辅助），按类别划分：
+`lua/NeoAI/tests/` 下共 **159** 个 `test_*.lua`（另 `init.lua` 为运行器、`parallel.lua` 为并行运行器、`http_server.lua` / `sandbox_stub.lua` / `sandbox_boundary_helpers.lua` / `sandbox_systemd_helpers.lua` 为测试辅助），按类别划分：
 
 > **权威来源**：下为速览索引，实际清单以 `ls lua/NeoAI/tests/test_*.lua` 为准（新增套件无需回改本文）。
 
@@ -100,7 +105,7 @@ end)
 | UI | `chat_ui`、`tree_ui`、`chat_keys`、`display_modes`、`fold`、`markdown`、`ui_components`、`geometry`、`incremental`、`stream_batching`、`status` |
 | MCP | `mcp_client`、`mcp_transport`、`mcp_bridge`、`mcp_cache` |
 | Skills / Herder | `skills`、`herder`、`herder_install` |
-| 沙箱（含授权 / 回放 / 观测 / 网络同意） | `sandbox_ai_audit`、`sandbox_background`、`sandbox_boundary_consistency`、`sandbox_boundary_escape`、`sandbox_boundary_net`、`sandbox_conflict_ai`、`sandbox_core`、`sandbox_governance`、`sandbox_hardening`、`sandbox_instance`、`sandbox_loss_audit`、`sandbox_lost_update`、`sandbox_lsp`、`sandbox_maintscript`、`sandbox_merge`、`sandbox_mountview`、`sandbox_namespace`、`sandbox_ops`、`sandbox_overlay_invalidate`、`sandbox_package_signature`、`sandbox_privdrop`、`sandbox_privilege`、`sandbox_publish_async`、`sandbox_review`、`sandbox_script_scan`、`sandbox_secret`、`sandbox_service`、`sandbox_session`、`sandbox_shims`、`sandbox_staging`、`sandbox_symlink`、`sandbox_systemd`、`sandbox_systemd_user`、`sandbox_view`、`grant`、`replay`、`observer`、`review_cache`、`net_consent`、`gateway` |
+| 沙箱（含授权 / 回放 / 观测 / 网络同意） | `sandbox_ai_audit`、`sandbox_background`、`sandbox_boundary_consistency`、`sandbox_boundary_escape`、`sandbox_boundary_net`、`sandbox_conflict_ai`、`sandbox_core`、`sandbox_governance`、`sandbox_hardening`、`sandbox_instance`、`sandbox_loss_audit`、`sandbox_lost_update`、`sandbox_lsp`、`sandbox_maintscript`、`sandbox_merge`、`sandbox_mountview`、`sandbox_namespace`、`sandbox_ops`、`sandbox_overlay_invalidate`、`sandbox_package_signature`、`sandbox_privdrop`、`sandbox_privilege`、`sandbox_publish_async`、`sandbox_review`、`sandbox_script_scan`、`sandbox_secret`、`sandbox_service`、`sandbox_session`、`sandbox_shims`、`sandbox_staging`、`sandbox_symlink`、`sandbox_systemd`、`sandbox_systemd_facade`、`sandbox_systemd_gate`、`sandbox_systemd_wait`、`sandbox_systemd_transient`、`sandbox_systemd_pipe`、`sandbox_systemd_run`、`sandbox_systemd_timer`、`sandbox_systemd_user`、`sandbox_view`、`grant`、`replay`、`observer`、`review_cache`、`net_consent`、`gateway` |
 | 密钥防护 | `secret_async`、`secret_fake`、`secret_highlight`、`secret_provenance` |
 | 测试框架 / 基础设施 | `test_runner`、`parallel_runner`、`integration`、`http`、`async`、`timer`、`work_codec` |
 
