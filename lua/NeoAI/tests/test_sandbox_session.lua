@@ -735,6 +735,44 @@ tests.suite("sandbox_session", function(_, it)
       "非缓存 home 路径仍应命中")
   end)
 
+  it("越界访问判定：headless 浏览器临时 profile/缓存默认不计入（包安装不再混入）", function(t)
+    local runtime = require("NeoAI.sandbox.execution.runtime")
+    local home = vim.fn.expand("~")
+    t.nil_(runtime.outside_workspace(
+      home .. "/.cache/chromium-headless/scoped_dirHPmnU0/Default/Cache/Cache_Data/index",
+      "/root/proj"), "~/.cache/chromium-headless 应忽略")
+    -- `~/.config` 一侧装的是同一批启动的临时 profile（Singleton 锁），不在 `~/.cache` 下
+    t.nil_(runtime.outside_workspace(
+      home .. "/.config/chromium-headless/scoped_dirHPmnU0/SingletonLock",
+      "/root/proj"), "~/.config/chromium-headless 应忽略")
+    t.nil_(runtime.outside_workspace(home .. "/.cache/ms-playwright/chromium-1200/x", "/root/proj"),
+      "~/.cache/ms-playwright 应忽略")
+    t.eq(home .. "/.config/other/x", runtime.outside_workspace(home .. "/.config/other/x", "/root/proj"),
+      "非浏览器临时目录的 ~/.config 路径仍应命中")
+  end)
+
+  it("越界访问判定：trace_ignore_paths 通配条目多命中时全部生效", function(t)
+    local runtime = require("NeoAI.sandbox.execution.runtime")
+    local fs = require("NeoAI.utils.fs")
+    local home = vim.fn.expand("~")
+    local base = home .. "/.cache/nvim/neoai_globtest_" .. tostring(vim.fn.getpid())
+    fs.ensure_dir(base .. "-a")
+    fs.ensure_dir(base .. "-b")
+    local ok, err = pcall(function()
+      with_config({ tools = { sandbox = { observe = { trace_ignore_paths = { base .. "-*" } } } } },
+        function()
+          -- 旧实现先 expand 再 glob：expand 会把两个匹配拼成换行串 → 通配条目静默失效
+          t.nil_(runtime.outside_workspace(base .. "-a/x", "/root/proj"), "第一个命中项应忽略")
+          t.nil_(runtime.outside_workspace(base .. "-b/x", "/root/proj"), "第二个命中项应忽略")
+          t.eq(base .. "-c/x", runtime.outside_workspace(base .. "-c/x", "/root/proj"),
+            "未命中的兄弟路径仍应计入")
+        end)
+    end)
+    vim.fn.delete(base .. "-a", "rf")
+    vim.fn.delete(base .. "-b", "rf")
+    if not ok then error(err, 0) end
+  end)
+
   it("越界访问判定：trace_ignore_paths 可配置且变更后缓存失效", function(t)
     local runtime = require("NeoAI.sandbox.execution.runtime")
     local home = vim.fn.expand("~")

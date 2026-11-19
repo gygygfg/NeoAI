@@ -172,6 +172,47 @@ tests.suite("sandbox_privilege", function(_, it)
     vim.fn.delete(dir, "rf")
   end)
 
+  it("加固：不可捕获运行时目录（non_capture_paths）默认覆盖无头浏览器临时 profile/缓存", function(t)
+    local runtime = require("NeoAI.sandbox.execution.runtime")
+    local fs = require("NeoAI.utils.fs")
+    local home = vim.fn.expand("~")
+    -- 默认值：无头浏览器每次启动重建的临时 profile（~/.config 一侧）与磁盘缓存（~/.cache 一侧）
+    t.true_(runtime.is_non_capture_path(
+      home .. "/.cache/chromium-headless/scoped_dirHPmnU0/Default/Cache/Cache_Data/index"),
+      "~/.cache/chromium-headless 应不可捕获")
+    t.true_(runtime.is_non_capture_path(
+      home .. "/.config/chromium-headless/scoped_dirHPmnU0/SingletonLock"),
+      "~/.config/chromium-headless 应不可捕获")
+    t.false_(runtime.is_non_capture_path(home .. "/.cache/chromium/xyz"),
+      "真实浏览器 profile 不应命中")
+    t.false_(runtime.is_non_capture_path(home .. "/.config/chromium-headless.bak/x"),
+      "前缀边界不应命中")
+    -- 并集语义：自身运行时仍然不可捕获
+    t.true_(runtime.is_non_capture_path(vim.fn.stdpath("cache") .. "/NeoAI/neoai.log"),
+      "自身运行时路径应不可捕获")
+    t.false_(runtime.is_self_runtime_path(home .. "/.cache/chromium-headless/x"),
+      "is_self_runtime_path 仍只覆盖 NeoAI 自身（两类语义分开）")
+    -- 可配置 + 通配（多命中全部生效）
+    local dir = vim.fn.tempname()
+    fs.ensure_dir(dir .. "/runtime-a")
+    fs.ensure_dir(dir .. "/runtime-b")
+    with_config({ tools = { sandbox = { non_capture_paths = { dir .. "/runtime-*" } } } }, function()
+      t.true_(runtime.is_non_capture_path(dir .. "/runtime-a/cache/x"), "通配第一个命中应生效")
+      t.true_(runtime.is_non_capture_path(dir .. "/runtime-b/cache/x"), "通配第二个命中应生效")
+      t.false_(runtime.is_non_capture_path(dir .. "/runtime-c/cache/x"), "未命中项不应生效")
+      t.false_(runtime.is_non_capture_path(dir .. "/src/a.txt"), "普通文件不应生效")
+    end)
+    -- 恢复默认后自定义前缀失效
+    t.false_(runtime.is_non_capture_path(dir .. "/runtime-a/cache/x"), "恢复默认后自定义前缀不应生效")
+    -- `{}` 关闭：默认的浏览器临时目录也不再排除（配置可完全关闭该机制）
+    with_config({ tools = { sandbox = { non_capture_paths = {} } } }, function()
+      t.false_(runtime.is_non_capture_path(
+        home .. "/.cache/chromium-headless/scoped_dirX/Default/Cache/Cache_Data/index"),
+        "{} 应关闭不可捕获机制")
+    end)
+    vim.fn.delete(dir, "rf")
+  end)
+
   it("性能回归：遮蔽路径 glob/规范化按配置缓存，不随逐文件判定重算", function(t)
     local runtime = require("NeoAI.sandbox.execution.runtime")
     local glob = vim.fn.glob

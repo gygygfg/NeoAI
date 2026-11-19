@@ -718,9 +718,19 @@ token（`NEOKEY_…`）或格式保真假密钥时**拒绝写盘**（`SECRET_TOK
      `/var/cache/apt` 等），仅对包安装候选生效。这些文件由包管理器随时重新生成，应用时基线
      往往已变化，会触发 `CONFLICT/BASELINE_CHANGED`；剔除不影响安装效果
      （`/var/lib/dpkg/status`、包文件等仍应用），宿主可自行 `apt update` 重建索引。
+     条目支持 `~` 展开与 `*` 通配（多命中全部生效）。
      另按 `packages.skip_bytecode_cache`（默认开）跳过 Python 字节码缓存（`__pycache__/**`、
      `*.pyc`）：解释器随时重建，`.py` 源码与 `.dist-info` 仍正常入队。
-  3. **NeoAI 自身运行时/状态路径**——`<stdpath cache>/NeoAI`、`<stdpath state>/NeoAI`、
+  3. **不可捕获运行时目录**——`tools.sandbox.non_capture_paths`（`runtime.is_non_capture_path`）：
+     沙箱内程序自己产生、与用户意图无关的运行时/临时目录，默认是无头浏览器每次启动重建的临时
+     profile 与磁盘缓存（`~/.cache/chromium-headless`、`~/.config/chromium-headless`、
+     playwright/puppeteer 等）。整棵子树在**捕获阶段**即被跳过（hint 过滤、全量遍历、「写日志漏
+     事件」判定都不计入），因此不会进入候选/待审，也不计越界访问留痕；沙箱内仍可正常读写。
+     与第 2 项的关键差别：**不限包安装命令**，`officecli`/`fc-list`/`pdftoppm` 等命令也不会再把
+     这些文件混进变更集；而 `volatile_paths` 只在包安装候选上生效。原因同第 4 项——这类目录由
+     工具随时重写，冻结后应用时基线必变（`BASELINE_CHANGED`），会否决整个变更单元。
+     发布时命中该列表同样是硬拒绝（`SANDBOX_NON_CAPTURE_TARGET`），作为纵深防御。
+  4. **NeoAI 自身运行时/状态路径**——`<stdpath cache>/NeoAI`、`<stdpath state>/NeoAI`、
      `<stdpath data>/NeoAI`，以及可配置的 `log.path`、`tools.sandbox.workspace_root`（涵盖日志、
      会话、缓存、沙箱 store 等）。这些位于用户工作区之外且由插件**持续写入**（日志实时增长），
      在整机根 overlay 下会被捕获为候选，应用时基线必然已变（`BASELINE_CHANGED`）；故在捕获遍历

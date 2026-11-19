@@ -40,6 +40,7 @@ local state = {
   store_root_canon = nil, -- store 根的规范化形式（避免逐文件 resolve）
   self_paths_cache = nil, -- { key = string, paths = string[] } 沙箱自有作用域路径（越界留痕排除用）
   self_runtime_cache = nil, -- { key = string, fn = function, roots = string[] } NeoAI 自身运行时/状态目录匹配器缓存
+  non_capture_cache = nil, -- { list = <table ref>, fn = function, roots = string[] } 不可捕获运行时目录匹配器缓存
   degrade = nil, -- 最近一次防御层降级信息 { layer, mode, reason, fallback }
   degrade_notified = {}, -- 会话内 notify 去重（key -> true）
   degrade_audited = {}, -- 证据/事件去重（key -> hrtime(ms)，抑制同一命令的重复评估）
@@ -2601,6 +2602,52 @@ function M.self_runtime_roots()
   return (cached and cached.roots) or {}
 end
 
+--- 不可捕获运行时目录匹配器（`tools.sandbox.non_capture_paths`）：沙箱内程序自己产生的、
+--- 与用户意图无关的运行时/临时目录（典型：无头浏览器的临时 profile 与磁盘缓存、崩溃上报、
+--- 单实例 socket 目录）。整棵子树**不捕获为候选**（任何工具/命令）、不进入待审、不发布，
+--- 也不计越界访问留痕；沙箱内仍可正常读写（只是不冻结）。
+--- 与 `packages.volatile_paths` 的区别：后者只在「包安装」候选上生效，本项对所有候选生效。
+--- 条目支持 `~`/`$VAR` 展开与 `*` 通配（`fs.glob_roots`）。按配置表引用缓存：这是按文件
+--- 判定的热路径（捕获遍历 / 冻结 / 越界留痕），不可逐次展开 glob。
+--- @return function(path:string)->boolean
+local function _non_capture_matcher()
+  local cfg = config_store.get("tools.sandbox.non_capture_paths")
+  local list = type(cfg) == "table" and cfg or {}
+  local cached = state.non_capture_cache
+  if cached and cached.list == list then return cached.fn end
+  local roots = {}
+  for _, p in ipairs(list) do
+    for _, r in ipairs(fs.glob_roots(p)) do roots[#roots + 1] = r end
+  end
+  local fn = function(path)
+    if type(path) ~= "string" or path == "" then return false end
+    for _, r in ipairs(roots) do
+      if path == r or path:sub(1, #r + 1) == r .. "/" then return true end
+    end
+    return false
+  end
+  state.non_capture_cache = { list = list, fn = fn, roots = roots }
+  return fn
+end
+
+--- 配置的不可捕获运行时根（展开后，供捕获 worker 整棵子树跳过）。
+--- @return string[]
+function M.non_capture_roots()
+  _non_capture_matcher()
+  local cached = state.non_capture_cache
+  return (cached and cached.roots) or {}
+end
+
+--- 路径是否「不可捕获」：NeoAI 自身运行时/搬出层（`is_self_runtime_path`）+ 用户配置的
+--- `tools.sandbox.non_capture_paths`。这些路径不进候选、不进待审、不发布。
+--- @param path string|nil 绝对路径
+--- @return boolean
+function M.is_non_capture_path(path)
+  if type(path) ~= "string" or path == "" then return false end
+  if M.is_self_runtime_path(path) then return true end
+  return _non_capture_matcher()(path)
+end
+
 --- 目标路径是否命中宿主敏感遮蔽路径（`tools.sandbox.mask_paths` + 沙箱自身存储）。
 --- 供**进程内** read/fs_write 工具显式拦截：这些工具不经 namespace，mount 遮蔽对其无效，
 --- 必须由执行器按此查询 fail-closed。不含按 cwd 的遮蔽目录（由 `mask_entry` 处理，
@@ -2860,35 +2907,34 @@ local DEFAULT_TRACE_IGNORE_PATHS = {
 }
 
 --- 越界留痕忽略匹配器：合并 `tools.sandbox.observe.trace_ignore_paths`（默认
---- `DEFAULT_TRACE_IGNORE_PATHS`）与 `tools.sandbox.packages.volatile_paths`。
+--- `DEFAULT_TRACE_IGNORE_PATHS`）、不可捕获运行时目录（`tools.sandbox.non_capture_paths`）
+--- 与 `tools.sandbox.packages.volatile_paths`。
 --- 支持 `~` 展开与 glob（`*`）。按配置表引用缓存（观测热路径高频调用，避免逐事件展开/glob）。
 --- @return function(path) -> boolean
 local function _trace_ignore_matcher()
   local ocfg = config_store.get("tools.sandbox.observe")
   local list = (type(ocfg) == "table" and ocfg.trace_ignore_paths) or DEFAULT_TRACE_IGNORE_PATHS
+  local ncfg = config_store.get("tools.sandbox.non_capture_paths")
+  local non_capture = type(ncfg) == "table" and ncfg or nil
   local pcfg = config_store.get("tools.sandbox.packages")
   local volatile = type(pcfg) == "table" and pcfg.volatile_paths or nil
   local cache = state.trace_ignore_cache
-  if cache and cache.list == list and cache.volatile == volatile then return cache.fn end
+  if cache and cache.list == list and cache.volatile == volatile
+    and cache.non_capture == non_capture then
+    return cache.fn
+  end
   local roots = {}
-  local function add(p)
-    if type(p) ~= "string" or p == "" or p == "/" then return end
-    p = vim.fn.expand(p):gsub("/+$", "")
-    if p == "" or p == "/" then return end
-    if p:find("[*?[]") then
-      local ok, matches = pcall(vim.fn.glob, p, false, true)
-      if ok and type(matches) == "table" then
-        for _, m in ipairs(matches) do
-          m = tostring(m):gsub("/+$", "")
-          if m ~= "" and m ~= "/" then roots[#roots + 1] = m end
-        end
-      end
-    else
-      roots[#roots + 1] = p
+  local function add_list(listp)
+    if type(listp) ~= "table" then return end
+    -- 模式 → 前缀根：通配条目由 fs.glob_roots 交给 glob 展开（glob 自己处理 `~`）。
+    -- 绝不能先 `vim.fn.expand`——它会吞掉通配符并把多命中拼成换行串，导致永不命中。
+    for _, p in ipairs(listp) do
+      for _, r in ipairs(fs.glob_roots(p)) do roots[#roots + 1] = r end
     end
   end
-  if type(list) == "table" then for _, p in ipairs(list) do add(p) end end
-  if type(volatile) == "table" then for _, p in ipairs(volatile) do add(p) end end
+  add_list(list)
+  add_list(non_capture)
+  add_list(volatile)
   local fn = function(path)
     if type(path) ~= "string" or path == "" then return false end
     for _, r in ipairs(roots) do
@@ -2896,7 +2942,7 @@ local function _trace_ignore_matcher()
     end
     return false
   end
-  state.trace_ignore_cache = { list = list, volatile = volatile, fn = fn }
+  state.trace_ignore_cache = { list = list, volatile = volatile, non_capture = non_capture, fn = fn }
   return fn
 end
 
@@ -3905,6 +3951,7 @@ function M.reset()
   state.apk_repos = nil
   state.maven_settings = nil
   state.self_paths_cache = nil
+  state.non_capture_cache = nil
   state.mountinfo_cache = nil
   state.mountinfo_override = nil
   pcall(M.cleanup_tmp_roots)

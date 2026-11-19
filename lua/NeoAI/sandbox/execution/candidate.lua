@@ -969,7 +969,7 @@ function M.unpublished_under(root)
   if base == "" then base = "/" end
   for real, ws in pairs(state.workspace) do
     local under = (base == "/") or real == base or real:sub(1, #base + 1) == base .. "/"
-    if under and not runtime.is_git_internal(real) and not runtime.is_self_runtime_path(real) then
+    if under and not runtime.is_git_internal(real) and not runtime.is_non_capture_path(real) then
       local unpublished = false
       -- 符号链接以**链接目标字符串**为内容：用 `lstat` 判定存在性并直接比较目标，
       -- 不能走 `filereadable`/`_read`（会跟随链接读到目标内容，得出错误的「已发布」结论）。
@@ -2328,9 +2328,10 @@ function M.capture_overlay(attempt_id, real_root, upper_root)
         -- opaque 目录标记（.wh..wh..opq）仅表示上层目录内容被替换，跳过不产生候选
         local whiteout, real_name = _is_whiteout(name, t)
         local child_rel = rel == "" and real_name or (rel .. "/" .. real_name)
-        -- NeoAI 自身运行时/状态目录（日志/会话/缓存等）整棵子树不捕获：插件持续写入，冻结为候选后
-        -- 应用时基线必变（BASELINE_CHANGED），会否决**整个**变更单元。
-        if not runtime.is_self_runtime_path(real_root .. "/" .. child_rel) then
+        -- NeoAI 自身运行时/状态目录与「不可捕获」运行时目录（日志/会话/缓存/浏览器临时 profile 等）
+        -- 整棵子树不捕获：插件与工具持续写入，冻结为候选后应用时基线必变（BASELINE_CHANGED），
+        -- 会否决**整个**变更单元。
+        if not runtime.is_non_capture_path(real_root .. "/" .. child_rel) then
           if whiteout then
             -- 目录/文件 whiteout：只登记节点本身。删除在发布时是一次 rename 搬出（见
             -- `sandbox/execution/retired.lua`），绝不遍历目录树展开后代（避免 8012 文件单元与
@@ -3028,12 +3029,12 @@ function M.capture_overlay_async(attempt_id, real_root, upper_root, hint, opts)
     local list = {}
     paths_set = {}
     for p in pairs(hint.writes or {}) do
-      if under(p) and not paths_set[p] and not runtime.is_self_runtime_path(p) then
+      if under(p) and not paths_set[p] and not runtime.is_non_capture_path(p) then
         paths_set[p] = true; list[#list + 1] = p
       end
     end
     for p in pairs(hint.deletes or {}) do
-      if under(p) and not paths_set[p] and not runtime.is_self_runtime_path(p) then
+      if under(p) and not paths_set[p] and not runtime.is_non_capture_path(p) then
         paths_set[p] = true; list[#list + 1] = p
       end
     end
@@ -3068,11 +3069,16 @@ function M.capture_overlay_async(attempt_id, real_root, upper_root, hint, opts)
         if name ~= ".wh..wh..opq" and name ~= session_basename then
           local child = rel == "" and name or (rel .. "/" .. name)
           if t == "directory" then
-            scan(dir .. "/" .. name, child)
+            local dir_real = (root == "" and "/" or (root .. "/")) .. child
+            -- 不可捕获运行时目录（浏览器临时 profile/缓存等）整棵子树跳过：既不计数，
+            -- 也不参与「写日志漏事件」判定（它的写入永不冻结，无需回退全量遍历）。
+            if not runtime.is_non_capture_path(dir_real) then
+              scan(dir .. "/" .. name, child)
+            end
           else
             total = total + 1
             local real = (root == "" and "/" or (root .. "/")) .. child
-            if not covered[real] and not runtime.is_self_runtime_path(real) then
+            if not covered[real] and not runtime.is_non_capture_path(real) then
               uncovered = uncovered + 1
               local st = vim.uv.fs_lstat(dir .. "/" .. name)
               -- 时间窗口判定：mtime 落在命令窗口内 → 本次命令确实改过它，而写日志没记到。
@@ -3121,8 +3127,11 @@ function M.capture_overlay_async(attempt_id, real_root, upper_root, hint, opts)
   end
   local expected_encoded = _encode_expected(state.materialized[upper_root], paths_set)
   local ws_encoded = _encode_ws(state.workspace, root, paths_set)
-  -- 自身运行时/状态根目录：传入 worker 以在遍历/按路径处理时整棵子树跳过。
-  local self_encoded = _encode_paths(runtime.self_runtime_roots())
+  -- 自身运行时/状态根 + 不可捕获运行时目录：传入 worker 以在遍历/按路径处理时整棵子树跳过。
+  local skip_roots = {}
+  for _, r in ipairs(runtime.self_runtime_roots()) do skip_roots[#skip_roots + 1] = r end
+  for _, r in ipairs(runtime.non_capture_roots()) do skip_roots[#skip_roots + 1] = r end
+  local self_encoded = _encode_paths(skip_roots)
     .. tostring(#sha_src) .. ":" .. sha_src
   return work.run_codec(_capture_worker, {
     upper_root = upper_root,
@@ -3290,23 +3299,10 @@ local function _volatile_matcher()
   end
   local roots = {}
   if type(list) == "table" then
+    -- 模式 → 前缀根：通配条目由 fs.glob_roots 交给 glob 展开（glob 自己处理 `~`）。
+    -- 绝不能先 `vim.fn.expand`——它会吞掉通配符并把多命中拼成换行串，导致永不命中。
     for _, p in ipairs(list) do
-      if type(p) == "string" and p ~= "" and p ~= "/" then
-        p = vim.fn.expand(p):gsub("/+$", "")
-        if p ~= "" and p ~= "/" then
-          if p:find("[*?[]") then
-            local okg, matches = pcall(vim.fn.glob, p, false, true)
-            if okg and type(matches) == "table" then
-              for _, m in ipairs(matches) do
-                m = m:gsub("/+$", "")
-                if m ~= "" and m ~= "/" then roots[#roots + 1] = m end
-              end
-            end
-          else
-            roots[#roots + 1] = p
-          end
-        end
-      end
+      for _, r in ipairs(fs.glob_roots(p)) do roots[#roots + 1] = r end
     end
   end
   local function under(p, r) return p == r or p:sub(1, #r + 1) == r .. "/" end
@@ -3419,9 +3415,10 @@ local function _filter_unpublishable(files, attempt, classify)
     elseif volatile and volatile(f.path) then
       dropped.volatile = dropped.volatile + 1
       if #dropped.volatile_paths < 20 then dropped.volatile_paths[#dropped.volatile_paths + 1] = f.path end
-    elseif runtime.is_self_runtime_path(f.path) then
-      -- NeoAI 自身运行时/状态（日志、会话、缓存、沙箱 store 等）：插件持续写入、位于用户工作区
-      -- 之外，冻结为候选后应用时基线必变（BASELINE_CHANGED），必须剔除。
+    elseif runtime.is_non_capture_path(f.path) then
+      -- NeoAI 自身运行时/状态（日志、会话、缓存、沙箱 store 等）与配置的「不可捕获」运行时目录
+      -- （如无头浏览器的临时 profile/缓存）：工具持续写入、与用户意图无关，冻结为候选后应用时
+      -- 基线必变（BASELINE_CHANGED），必须剔除。
       dropped.self = dropped.self + 1
       if #dropped.self_paths < 20 then dropped.self_paths[#dropped.self_paths + 1] = f.path end
     else
@@ -3433,7 +3430,7 @@ local function _filter_unpublishable(files, attempt, classify)
   if dropped.masked > 0 or dropped.volatile > 0 or dropped.git > 0 or dropped.self > 0 then
     pcall(function()
       require("NeoAI.kernel.logger").warn(
-        "[sandbox] 冻结时跳过不可发布文件：遮蔽 %d、易变缓存 %d、.git 内部 %d、自身运行时 %d",
+        "[sandbox] 冻结时跳过不可发布文件：遮蔽 %d、易变缓存 %d、.git 内部 %d、自身/不可捕获运行时 %d",
         dropped.masked, dropped.volatile, dropped.git, dropped.self)
     end)
   end
@@ -4421,6 +4418,10 @@ local function _publish_validate(candidate)
     -- NeoAI 自身运行时/状态（日志/会话/缓存/沙箱 store）：绝不发布（否则应用时基线必变）。
     if runtime.is_self_runtime_path(resolved) then
       return { ok = false, state = "FAILED", reason = "SANDBOX_SELF_TARGET: " .. tostring(resolved) }
+    end
+    -- 配置的「不可捕获」运行时目录（无头浏览器临时 profile/缓存等）：同样绝不发布。
+    if runtime.is_non_capture_path(resolved) then
+      return { ok = false, state = "FAILED", reason = "SANDBOX_NON_CAPTURE_TARGET: " .. tostring(resolved) }
     end
     -- `.git` 瞬态/配置类绝不发布（对象/指针按原子顺序发布，见 _apply_order）。
     local gc = runtime.git_path_class(resolved)

@@ -811,7 +811,7 @@ tests.suite("sandbox_secret", function(_, it)
     vim.fn.delete(dir, "rf")
   end)
 
-  it("冻结：剔除有效遮蔽与易变包缓存文件（避免整单元发布失败）", function(t)
+  it("冻结：剔除有效遮蔽与易变包缓存文件（通配条目多命中，避免整单元发布失败）", function(t)
     local fs = require("NeoAI.utils.fs")
     local sandbox = require("NeoAI.sandbox")
     local candidate = require("NeoAI.sandbox.execution.candidate")
@@ -824,6 +824,11 @@ tests.suite("sandbox_secret", function(_, it)
     local volatile_dir = dir .. "/apt/lists"
     fs.ensure_dir(volatile_dir)
     local volatile_file = volatile_dir .. "/Packages"
+    -- 第二个匹配项：用于验证 `volatile_paths` 的通配条目在**多命中**时全部生效
+    -- （旧实现先 `vim.fn.expand` 再 glob，多命中会拼成换行串 → 整条通配静默失效）。
+    local volatile_dir2 = dir .. "/apt-cache/lists"
+    fs.ensure_dir(volatile_dir2)
+    local volatile_file2 = volatile_dir2 .. "/Packages"
     local normal = dir .. "/normal.txt"
     -- Python 字节码缓存：包安装/导入时随时重建，冻结时应跳过（默认开启）。
     local pyc_dir = dir .. "/pkg/__pycache__"
@@ -835,7 +840,7 @@ tests.suite("sandbox_secret", function(_, it)
       tools = { sandbox = {
         workspace_root = vim.fn.tempname() .. "/sb",
         mask_paths = { masked, unmasked },
-        packages = { volatile_paths = { volatile_dir } },
+        packages = { volatile_paths = { dir .. "/apt*" } },
       } },
     }, function()
       sandbox.reset()
@@ -850,6 +855,7 @@ tests.suite("sandbox_secret", function(_, it)
       stage(masked, "secret\n")
       stage(unmasked, "allowed\n")
       stage(volatile_file, "index\n")
+      stage(volatile_file2, "index\n")
       stage(normal, "ok\n")
       stage(pyc_file, "pyc\n")
       stage(loose_pyc, "pyc\n")
@@ -859,6 +865,7 @@ tests.suite("sandbox_secret", function(_, it)
       for _, f in ipairs(cand.files) do paths[f.path] = true end
       t.nil_(paths[masked], "遮蔽文件应被剔除")
       t.nil_(paths[volatile_file], "易变包缓存应被剔除")
+      t.nil_(paths[volatile_file2], "通配条目第二个命中项也应被剔除")
       t.nil_(paths[pyc_file], "__pycache__ 内的 .pyc 应被剔除")
       t.nil_(paths[loose_pyc], "散落的 .pyc 应被剔除")
       t.not_nil(paths[module_py], "同一目录下的 .py 源码应保留")
@@ -866,7 +873,7 @@ tests.suite("sandbox_secret", function(_, it)
       t.not_nil(paths[unmasked], "被 unmask 放行的遮蔽文件应保留")
       t.not_nil(cand.dropped, "应记录剔除信息")
       t.eq(1, cand.dropped.masked, "应记录剔除的遮蔽文件数")
-      t.eq(3, cand.dropped.volatile, "应记录剔除的易变/字节码缓存数")
+      t.eq(4, cand.dropped.volatile, "应记录剔除的易变/字节码缓存数")
       candidate.cleanup(a.attempt_id)
     end)
     vim.fn.delete(dir, "rf")

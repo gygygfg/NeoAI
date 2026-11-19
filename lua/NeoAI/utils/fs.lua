@@ -25,6 +25,37 @@ function M.expand(path)
   return path
 end
 
+--- 把配置里的「路径模式」解析成一组前缀根（供遮蔽/忽略/易变缓存判定逐路径前缀匹配）。
+--- 含通配符（`*` `?` `[`）的条目交给 `vim.fn.glob` 展开（glob 自身会处理 `~` 与 `$VAR`）；
+--- 不含通配符的条目只展开 `~`/`$VAR`。
+--- **不能**先用 `vim.fn.expand` 再 glob：`expand()` 自己就会展开通配符，多命中时会把结果
+--- 拼成 `<NL>` 分隔的整串，使后续「含通配符」分支永不命中（默认配置里的
+--- `~/.cache/keyring-*` 等条目曾因此静默失效）。模式当前无匹配 → 返回空表。
+--- 需在主线程调用（内部用 vim.fn.expand / vim.fn.glob）。
+--- @param pattern string|nil 配置条目（绝对路径、`~`/`$VAR` 开头或含通配符）
+--- @return string[] 展开后的路径数组（已去尾部 `/`，不含空串与根 `/`）
+function M.glob_roots(pattern)
+  local out = {}
+  if type(pattern) ~= "string" or pattern == "" or pattern == "/" then return out end
+  local raw = pattern:gsub("/+$", "")
+  if raw == "" or raw == "/" then return out end
+  if raw:find("[*?[]") then
+    local ok, matches = pcall(vim.fn.glob, raw, false, true)
+    if ok and type(matches) == "table" then
+      for _, m in ipairs(matches) do
+        m = tostring(m):gsub("/+$", "")
+        if m ~= "" and m ~= "/" then out[#out + 1] = m end
+      end
+    end
+    return out
+  end
+  local ok, e = pcall(vim.fn.expand, raw)
+  local p = (ok and type(e) == "string" and e ~= "") and e or raw
+  p = p:gsub("/+$", "")
+  if p ~= "" and p ~= "/" then out[#out + 1] = p end
+  return out
+end
+
 --- 判断文件是否存在
 --- @param path string
 --- @return boolean

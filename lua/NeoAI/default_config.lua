@@ -955,6 +955,22 @@ local DEFAULT_CONFIG = {
       -- nvim 退出即丢弃**，不进入待审队列、不 CAS 发布、也不弹审批悬浮窗（内容仅在暂存层，
       -- 供本次会话读取一致）。设为 `{}` 可关闭（/tmp 下也走正常待审/审批）。
       ephemeral_roots = { "/tmp", "/var/tmp" },
+      -- 不可捕获运行时目录：沙箱内程序自己产生的、与用户意图无关的运行时/临时目录——典型是
+      -- 无头浏览器（chromium/chrome/playwright）每次启动重建的**临时 profile 与磁盘缓存**
+      -- （`scoped_dir<rand>` 下的 HTTP 缓存、V8 Code Cache、Singleton 锁）。整棵子树
+      -- **不捕获为候选**（任何工具/命令，不限包安装）、不进待审、不发布，也不计越界访问留痕；
+      -- 沙箱内仍可正常读写（只是不冻结）。这是与 `packages.volatile_paths` 的关键差别：后者
+      -- 只在包安装候选上生效，本项对全部候选生效，因此 `pip`/`uv sync` 之外的 `officecli`、
+      -- `fc-list`、`pdftoppm` 等命令也不会再把这些文件混进变更集。
+      -- 支持 `~`/`$VAR` 展开与 `*` 通配（多命中全部生效）。`{}` 关闭（回到普通捕获语义）。
+      -- 注意：只放「程序自己重建、丢了不影响用户」的目录；不要放真实用户 profile。
+      non_capture_paths = {
+        -- 无头浏览器：`~/.cache` 一侧是磁盘缓存，`~/.config` 一侧是同一次启动的临时 profile
+        -- （`Singleton*` 锁），两边都要列。
+        "~/.cache/chromium-headless", "~/.config/chromium-headless",
+        "~/.cache/google-chrome-headless", "~/.config/google-chrome-headless",
+        "~/.cache/ms-playwright", "~/.cache/puppeteer",
+      },
       -- 临时根私有目录位置：host（默认）= 建在宿主根之下的隐藏临时子目录
       -- （如 /tmp/.cache-<tag>/<session>），命名空间映射回该根，AI 只见自己的私有子目录
       -- （隔离 AI，宿主 /tmp 内容不可见）；session = 建在会话进程目录下（旧行为）。
@@ -1431,7 +1447,10 @@ local DEFAULT_CONFIG = {
         -- 应用时真实文件往往已变化，触发 `CONFLICT/BASELINE_CHANGED` 并否决**整个**变更单元，
         -- 使安装无法落盘。跳过它们不影响安装效果（包文件/`/var/lib/dpkg/status` 等仍会应用），
         -- 宿主可自行 `apt update` 重新生成索引。支持 `~` 展开与 `*` 通配；设为 `{}` 关闭跳过。
+        -- 该列表同时合并进 `observe.trace_ignore_paths`（越界访问留痕忽略）。
         -- 注意：**不要**放入 `/var/lib/dpkg/status`、`/var/lib/dpkg/info` 等安装状态文件。
+        -- 「与用户意图无关、程序自己重建」的运行时目录（如无头浏览器临时 profile/缓存）请放
+        -- `tools.sandbox.non_capture_paths`（对全部候选生效，且不计留痕），不要放这里。
         volatile_paths = {
           -- Debian/Ubuntu：索引与下载缓存
           "/var/lib/apt/lists", "/var/cache/apt",

@@ -996,6 +996,52 @@ tests.suite("sandbox_ops", function(_, it)
     vim.fn.delete(root, "rf")
   end)
 
+  it("捕获：non_capture_paths（运行时目录）整棵子树不入候选（同步/异步）", function(t)
+    local fs = require("NeoAI.utils.fs")
+    local sandbox = require("NeoAI.sandbox")
+    local candidate = require("NeoAI.sandbox.execution.candidate")
+    local control = require("NeoAI.sandbox.execution.control")
+    local store = require("NeoAI.sandbox.state.store")
+    local base = fs.canonical(vim.fn.tempname())
+    local dir = base .. "/app"
+    local upper = base .. "/upper"
+    fs.ensure_dir(dir .. "/src")
+    fs.ensure_dir(upper .. "/src")
+    fs.ensure_dir(upper .. "/rt/browser/cache")
+    fs.write_file(upper .. "/src/a.txt", "a\n")
+    fs.write_file(upper .. "/rt/browser/cache/x", "cache\n")
+    with_config({ tools = { sandbox = {
+      enabled = true, mode = "dry_run",
+      non_capture_paths = { dir .. "/rt" },
+    } } }, function()
+      sandbox.reset()
+      local function capture(sync)
+        local a = control.new_attempt("run_command", { command = "build" }, {}, { effect = "process" })
+        candidate.begin(a, assert(store.root()))
+        if sync then
+          candidate.capture_overlay(a.attempt_id, dir, upper)
+        else
+          local done = false
+          candidate.capture_overlay_async(a.attempt_id, dir, upper):then_(
+            function() done = true end, function() done = true end)
+          t.true_(vim.wait(20000, function() return done end), "异步捕获应完成")
+        end
+        local cand = candidate.finish(a.attempt_id)
+        local paths = {}
+        for _, f in ipairs(cand and cand.files or {}) do paths[f.path] = f.action end
+        candidate.cleanup(a.attempt_id)
+        return paths
+      end
+      local paths = capture(true)
+      t.eq("create", paths[dir .. "/src/a.txt"], "同步：普通文件应被捕获")
+      t.nil_(paths[dir .. "/rt/browser/cache/x"], "同步：不可捕获运行时目录整棵子树不应入候选")
+      local apaths = capture(false)
+      t.eq("create", apaths[dir .. "/src/a.txt"], "异步：普通文件应被捕获")
+      t.nil_(apaths[dir .. "/rt/browser/cache/x"], "异步：不可捕获运行时目录整棵子树不应入候选")
+    end)
+    vim.fn.delete(base, "rf")
+  end)
+
   it("捕获：目录 whiteout 只登记节点（删除=搬出，不遍历目录树）", function(t)
     local fs = require("NeoAI.utils.fs")
     local sandbox = require("NeoAI.sandbox")
