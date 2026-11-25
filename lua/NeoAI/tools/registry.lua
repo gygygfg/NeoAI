@@ -150,6 +150,7 @@ function M.resolve_name(raw_name)
     mkdir = "create_directory", cd = "run_command",
     cmd = "run_command", shell = "run_command", bash = "run_command",
     git = "run_command",
+    websearch = "web_search",
     webfetch = "web_fetch", fetch = "web_fetch",
     task = "create_sub_agent", agent = "create_sub_agent",
     send_sub_agent = "send_sub_agent_message",

@@ -587,45 +587,22 @@ local DEFAULT_CONFIG = {
     todo = {
       enabled = true, -- 待办清单工具 + 系统提示注入
     },
-    -- 网页抓取：把动态网页（React/Vue/SPA）在无头浏览器中渲染后转成 Markdown。
-    --
-    -- ⚠️ 依赖提示：启用本工具（enabled = true）会自动检查和安装 Node 依赖，
-    --   需在系统中预先安装【node 与 npm】（>=18，需在 PATH 中）；随后工具会
-    --   在缓存目录（stdpath('cache')/NeoAI/web_fetch）内自动执行：
-    --     npm i playwright turndown @mozilla/readability
-    --     npx playwright install chromium   （下载浏览器内核，首次较慢）
-    --   即启用会安装 node 与 playwright 相关依赖，请确保网络通畅、磁盘充足。
-    --   本工具默认【不启用】；不使用 Web 抓取时保持 enabled = false 即可。
-    web_fetch = {
-      enabled = false, -- 总开关（默认关闭；开启后才会注册工具、安装依赖、抓取）
-      auto_install = true, -- 启用后在后台自动检查/安装依赖（关闭则首次调用时按需安装）；安装内容：playwright + turndown + @mozilla/readability + 浏览器内核
-      engine = "chromium", -- 浏览器引擎：chromium | firefox | webkit
-      format = "markdown", -- 默认输出格式：markdown | text（只输出正文，不含原始 HTML）
-      timeout_ms = 45000, -- 单次抓取总超时（ms，含启动浏览器）；<=0 时用 nav_timeout_ms + 15s
-      nav_timeout_ms = 30000, -- 页面导航/等待超时（ms）
-      max_bytes = 2 * 1024 * 1024, -- 单次返回内容上限（字节，超出截断）
-      -- ↓ 图片处理：正文中的图片不写入 Markdown，而是转存到临时目录（mktemp -d，退出 nvim 时删除），
-      --   正文原位保留 [image: 路径] 占位符，可按需用 read_image 查看。
-      max_images = 50, -- 单次抓取最多转存图片数（超出直接丢弃）
-      max_image_bytes = 5 * 1024 * 1024, -- 单张图片字节上限（超出则占位符回退为原始 URL）
-      image_timeout_ms = 15000, -- 单张远程图片下载超时（ms）
-      install_timeout_ms = 600000, -- 依赖安装超时（ms，首次下载浏览器内核可能较久）
-      node_path = "", -- 自定义 node 可执行文件路径（空则用 PATH 中的 node）
-      install_os_deps = false, -- 安装浏览器时是否附带系统依赖（需要 root/sudo，一般无需开启）
-      -- ↓ 受限网络（国内镜像 / 代理异常）下的下载与代理控制；默认全空 = 完全沿用系统行为
-      npm_registry = "", -- npm 源；空则用系统 npm 配置。国内可设 "https://registry.npmmirror.com/"
-      playwright_download_host = "", -- 浏览器内核下载基址；空则用官方 CDN。国内可设 "https://registry.npmmirror.com/-/binary/playwright"
-      http_proxy = "", -- 安装/渲染时显式设置的 HTTP 代理；空则不覆盖继承值
-      https_proxy = "", -- 安装/渲染时显式设置的 HTTPS 代理；空则不覆盖继承值
-      ignore_system_proxy = false, -- true = 安装/渲染时清空继承的代理变量（应对本机代理损坏/不可用）
-      -- 注入脚本目录（可扩展/覆盖内置脚本；同名用户脚本优先）
-      -- 内置脚本：clean（通用去噪）、readability（正文提取）
-      scripts_dir = vim.fn.stdpath("config") .. "/NeoAI/web_fetch/scripts",
-      cache = {
-        enabled = true, -- 结果缓存开关
-        ttl_sec = 3600, -- 缓存有效期（秒）；<=0 表示不过期
-        max_entries = 200, -- 缓存条目数上限
-        max_bytes = 500 * 1024 * 1024, -- 缓存总大小上限（字节，默认 500MB；超出按最旧优先淘汰）
+    -- 网页能力（DeepSeek Web Search / Fetch API，对齐 DeepSeek Harness 的工具契约）。
+    -- 只有当前 Agent 的 provider 为 DeepSeek（或 base_url 指向 api.deepseek.com）时，
+    -- web_search / web_fetch 才会出现在工具列表里；其他 provider 直接看不到这两个工具。
+    web = {
+      base_url = "", -- DeepSeek API 基址；空 = 用当前 DeepSeek provider 的 base_url
+      api_key = "", -- DeepSeek API key；空 = 用当前 DeepSeek provider 的 api_key
+      search = {
+        enabled = false, -- 总开关（默认关闭；关闭时 get_tools() 返回空）
+        max_results = 8, -- 一次调用返回的来源数量上限
+        max_queries = 4, -- 一次调用接受的查询数量上限；结果按排名轮询合并
+        timeout_ms = 30000, -- 单次搜索 HTTP 超时（ms）
+      },
+      fetch = {
+        enabled = false, -- 总开关（默认关闭）
+        timeout_ms = 30000, -- 单次抓取 HTTP 超时（ms）
+        max_output_chars = 200000, -- 单次返回文本上限（字符，超出截断并追加提示）
       },
     },
     -- 子 Agent：每个子 Agent 独立持久化会话，完成后把最终正文自动回传给主 Agent。
@@ -736,6 +713,7 @@ local DEFAULT_CONFIG = {
         lsp_rename = { auto_allow = false },
         lsp_format = { auto_allow = false },
         delete_node = { auto_allow = false },
+        web_search = { auto_allow = true },
         web_fetch = { auto_allow = true },
       },
     },

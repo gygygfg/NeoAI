@@ -225,7 +225,7 @@ session = {
 | `lsp` | `{timeout_ms=10000, start_timeout_ms=15000, auto_start=true, attach_timeout_ms=3000, check={...}}` | LSP 请求超时（服务器无响应快速失败）；`start_timeout_ms` 为等待客户端**完成 initialize** 的超时（仅当确有 server 启动在途时使用：缺失客户端时 `auto_start` 会按编辑器 LSP 配置派生并自主启动，沙箱可用优先 `@neoai-sandbox` 克隆并纳入保活/回收，无沙箱且无未发布暂存改动时回退非沙箱客户端）；`attach_timeout_ms` 为「完全无候选」时等待客户端附加/快速失败的超时（文件不在 buffer 时自动后台打开、或服务器启动/重启期间客户端尚未附加时，LSP 工具等待其就绪再发请求，超时后仍发一次以给出准确错误），而非立即报「无 LSP 客户端」。`check` 为 `lsp_check` 工具（项目级全量诊断）配置：`enabled`/`timeout_ms`/`servers`（按 server 名映射 CLI 检查命令，argv 占位符 `{path}`/`{root}`/`{level}`/`{server}`/`{out}`，`format=lua-ls|pyright|clangd|text`，可选 `extensions`（缺省 server 按目标扩展名自动选择）、`bin`（覆盖可执行文件路径）、`requires_file`（只支持单文件，如 clangd）、可选 `root_files`，可选 `auto_config`/`auto_config_file`：根缺少项目配置时用内置默认配置执行本次检查（沙箱内、不写入工作区））；内置 `lua-language-server`/`pyright`/`clangd`，未显式指定 `server` 时只选 **PATH 中已安装**的 server。在沙箱内执行、全量重算，支持目录/glob、严重级别过滤与基线比对（`{out}` 指向沙箱可写/宿主可读的结果文件，因 lua-language-server 的 JSON 写文件而非 stdout） |
 | `guard.repeat_tool` | `{enabled=true, thresholds={3,5,8}, messages=...}` | 连续重复工具调用提醒 |
 | `todo.enabled` | `true` | 待办工具 + 系统提示注入 |
-| `web_fetch` | 见下（默认 `enabled=false`） | 网页抓取：无头浏览器渲染动态页面并转 Markdown |
+| `web` | 见下（默认 `search.enabled=false`、`fetch.enabled=false`） | DeepSeek Web Search / Fetch（仅 DeepSeek provider 暴露） |
 | `plan_mode` | `{enabled=true, auto_execute_on_approve=true, distill_on_execute=true, distill_parallel=true, distill_front=true, distill_max_attempts=2, extract_max_tokens=nil, extra_safe_tools={}, mutating_tools=...}` | 计划模式 |
 | `privileged_mode` | `{enabled=false, require_async_approval=true, override_offline=true, docker_socket="", unmask_ssh_keys=true, record_network=true, max_records=1000}` | 高权限模式（opt-in）：网络仅记录不拦截、可直连 docker/podman、不遮蔽 SSH 密钥；仅异步审批可进入 |
 | `sub_agent` | `{final_instruction="最后请总结你的工作：…"}` | 子 Agent：创建时自动追加到其任务提示末尾的收尾指令（要求最后总结工作）；设为 `""` 可关闭。子 Agent 完成后其最终正文会自动回传主 Agent |
@@ -753,50 +753,40 @@ sandbox = {
 > 管理候选与查看运行时能力。策略规则在受限环境执行并有指令/墙钟预算；规则异常统一 DENY。
 > 详见 [sandbox.md](sandbox.md)。
 
-**web_fetch（网页抓取，默认不启用）**：
+**web（DeepSeek 网页搜索 / 抓取，默认不启用）**：
 
 ```lua
-web_fetch = {
-  enabled = false,                 -- 总开关（默认关闭；开启后才会注册工具/安装依赖/抓取）
-  auto_install = true,             -- 启用后在后台自动检查/安装依赖；false 则首次调用时按需安装
-  engine = "chromium",             -- 浏览器引擎：chromium | firefox | webkit
-  format = "markdown",             -- 默认输出格式：markdown | text（只输出正文，不含原始 HTML）
-  timeout_ms = 45000,              -- 单次抓取总超时（ms，含启动浏览器）；<=0 时用 nav_timeout_ms + 15s
-  nav_timeout_ms = 30000,          -- 页面导航/等待超时（ms）
-  max_bytes = 2 * 1024 * 1024,     -- 单次返回内容上限（字节，超出截断）
-  install_timeout_ms = 600000,     -- 依赖安装超时（ms，首次下载浏览器内核可能较久）
-  node_path = "",                  -- 自定义 node 可执行文件路径（空则用 PATH 中的 node）
-  install_os_deps = false,         -- 安装浏览器时是否附带系统依赖（需 root/sudo，一般无需）
-  -- 受限网络（国内镜像 / 代理异常）下的下载与代理控制；默认全空 = 沿用系统行为
-  npm_registry = "",               -- npm 源；空则用系统 npm 配置。国内可设 "https://registry.npmmirror.com/"
-  playwright_download_host = "",   -- 浏览器内核下载基址；空则用官方 CDN。国内可设 "https://registry.npmmirror.com/-/binary/playwright"
-  http_proxy = "",                 -- 安装/渲染时显式设置的 HTTP 代理；空则不覆盖继承值
-  https_proxy = "",                -- 安装/渲染时显式设置的 HTTPS 代理；空则不覆盖继承值
-  ignore_system_proxy = false,     -- true = 安装/渲染时清空继承的代理变量（应对本机代理损坏/不可用）
-  -- 注入脚本目录（可扩展/覆盖内置脚本；同名用户脚本优先）
-  -- 内置脚本：clean（通用去噪）、readability（正文提取）
-  scripts_dir = vim.fn.stdpath("config") .. "/NeoAI/web_fetch/scripts",
-  cache = {
-    enabled = true,                -- 结果缓存开关
-    ttl_sec = 3600,                -- 缓存有效期（秒）；<=0 表示不过期
-    max_entries = 200,             -- 缓存条目数上限
-    max_bytes = 500 * 1024 * 1024, -- 缓存总大小上限（字节，默认 500MB；超出按最旧优先淘汰）
+web = {
+  base_url = "", -- DeepSeek API 基址；空 = 用当前 DeepSeek provider 的 base_url
+  api_key = "",  -- DeepSeek API key；空 = 用当前 DeepSeek provider 的 api_key
+
+  search = {
+    enabled = false,   -- web_search 总开关（默认关闭；关闭时 get_tools() 返回空）
+    max_results = 8,   -- 一次调用返回的来源数量上限
+    max_queries = 4,   -- 一次调用接受的查询数量上限；结果按排名轮询合并
+    timeout_ms = 30000,-- 单次搜索 HTTP 超时（ms）
+  },
+
+  fetch = {
+    enabled = false,           -- web_fetch 总开关（默认关闭）
+    timeout_ms = 30000,        -- 单次抓取 HTTP 超时（ms）
+    max_output_chars = 200000, -- 单次返回文本上限（字符，超出截断并追加提示）
   },
 },
 ```
 
-> **运行时行为**：禁用时零副作用（不注册工具、不安装依赖）；启用后依赖装到缓存目录
-> （`stdpath('cache')/NeoAI/web_fetch`）并使用同一目录下的 `browsers/`，**不改动系统环境**。
-> **依赖与浏览器内核的安装在宿主直接执行、不经沙箱**：安装产物（`node_modules`、可达数百 MB
-> 的内核）若进入沙箱 overlay 会被每条 `run_command` 反复捕获；渲染仍在沙箱内执行（浏览器从
-> 宿主只读可见）。
-> 若 `node`/`npm` 缺失，不自动调用系统包管理器，而是返回可操作的错误提示。
-> **平台限制**：Playwright 不提供 Android 原生浏览器内核，**Android/Termux（及任何 Android
-> aarch64 用户空间）上该工具会被直接拒绝**（不注册工具、不触发依赖安装，工具调用返回明确说明），
-> 避免白下载 `node_modules` 后 `npx playwright install` 必然失败（退出码 44）。
-> 需要网页抓取时请在桌面 Linux/macOS/Windows 上运行 NeoAI，或先用远端服务抓取正文再回传。
+> **工具契约**（对齐 DeepSeek Harness）：
+> - `web_search({ queries = { "q1", "q2" } })`：1–`max_queries` 个查询并发执行，结果按排名轮询合并、
+>   按 URL 去重并截断到 `max_results`；输出 `Sources:` markdown 来源列表与引用提示。
+> - `web_fetch({ url = "https://example.com" })`：输出 `Fetched <url> (HTTP 200)` + 不可信内容提示 + 正文。
+>
+> **provider 门控**：两个工具只对 DeepSeek provider 的 Agent 暴露（provider 名为 `deepseek`，或该
+> provider 的 `base_url` 指向 `api.deepseek.com`）。其他 provider 的请求中工具会被直接移除，执行函数
+> 内部也会再次校验。
+>
+> **依赖**：仅需 `curl`（NeoAI 所有 HTTP 请求共用）；不再依赖 Node/Playwright，也没有浏览器内核安装、
+> 图片转存或抓取缓存。`approval.per_tool.web_search = { auto_allow = true }`、
 > `approval.per_tool.web_fetch = { auto_allow = true }`（默认自动放行）。
-> 管线：Lua 编排 → bash 装依赖 → Node/Playwright 渲染并注入 JS → 取 DOM → turndown 转 Markdown。
 
 ### 2.6 `herder`
 

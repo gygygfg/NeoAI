@@ -93,6 +93,7 @@ local SPECS = {
   service_logs = { effect = "read" },
   service_status = { effect = "read" },
   -- 网络
+  web_search = { effect = "network" },
   web_fetch = { effect = "network" },
   -- read_image 的 file_path 可为本地路径：进程内读盘，必须纳入遮蔽判定（URL 分支不受影响）。
   read_image = { effect = "network", paths = { "file_path" } },

@@ -100,7 +100,7 @@ light = `总上限 - heavy`（另上限 16），heavy ≈ `核数/2`。并发还
 | 内核 / 插件 / 服务 / 运行时 | `kernel`、`plugins`、`services`、`service_tool`、`lazy_plugin`、`lazy_startup`、`commands_plugin`、`keymaps_plugin`、`reload_all`、`lock`、`trace_retention` |
 | 会话 / Agent / 上下文 / 模式 | `session`、`session_store`、`session_progress`、`agent`、`runtime_context`、`guard`、`overflow`、`loop_compaction`、`compaction_overlay`、`truncation`、`max_tokens`、`pending_queue`、`sub_agent_result`、`abort_tools`、`modes` |
 | 模型 / 协议 / 缓存 | `model_registry`、`model_capabilities`、`model_profiles`、`model_metadata`、`model_picker`、`protocol_adapter`、`prompt_cache`、`cache_strategy`、`cache_usage` |
-| 工具系统 | `tools`、`tool_pending`、`tool_result_pruner`、`output_guard`、`approval_hub`、`plan_mode`、`plan_distill`、`todo`、`ask_user`、`read_image`、`web_fetch`、`multimodal` |
+| 工具系统 | `tools`、`tool_pending`、`tool_result_pruner`、`output_guard`、`approval_hub`、`plan_mode`、`plan_distill`、`todo`、`ask_user`、`read_image`、`web_search`/`web_fetch`、`multimodal` |
 | 文件 / Shell / LSP / 文本 | `fs_io`、`guest_fs`、`git_ops`、`lsp_check`、`lsp_guard`、`pty`、`ansi`、`stringx`、`textmetrics`、`sha256`、`merge3` |
 | UI | `chat_ui`、`tree_ui`、`chat_keys`、`display_modes`、`fold`、`markdown`、`ui_components`、`geometry`、`incremental`、`stream_batching`、`status` |
 | MCP | `mcp_client`、`mcp_transport`、`mcp_bridge`、`mcp_cache` |

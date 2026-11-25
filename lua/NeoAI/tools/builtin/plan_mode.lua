@@ -43,8 +43,8 @@ local PLAN_SAFE_TOOLS = {
   -- 文件读取 / 搜索
   "read_file", "list_files", "search_files", "file_exists",
   "read_image",
-  -- 网页抓取（只读、信息获取）
-  "web_fetch",
+  -- 网页搜索/抓取（只读、信息获取；仅 DeepSeek provider 暴露）
+  "web_search", "web_fetch",
   -- 语法树只读查询
   "parse_file", "query_tree", "get_node_at_position", "get_node_type",
   "get_node_range", "is_named_node", "get_parent_node", "get_child_nodes",

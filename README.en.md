@@ -27,7 +27,7 @@
 - **⚠️⚠️⚠️Requests are sent with curl** — if curl is not available in the environment, requests may fail
 - **Pending message queue** — messages sent while the Agent is busy are queued automatically, a `待发N` ("N pending") badge appears in the statusline as a reminder, and the badge disappears once the messages are actually sent
 - **Multimodal images** — the `read_image` tool loads PNG/JPEG/WebP/GIF and injects them into multimodal models (content-addressed attachment storage + request-time pixel/byte budget offload, automatically degrading to text when the model does not support images)
-- **Web fetch (web_fetch)** — render dynamic pages (React/Vue/SPA) in a headless browser, inject JS, take the final DOM and convert it to Markdown with a general converter; **disabled by default**, and once enabled it auto-installs deps into the cache dir and caches results by URL (default cap 500MB)
+- **Web search/fetch (web_search / web_fetch)** — mirror the DeepSeek Harness tool contract: `web_search` runs concurrent searches and merges sources, `web_fetch` retrieves a page body; backed by the DeepSeek Web Search/Fetch API, **visible only to Agents using a DeepSeek provider**, and disabled by default
 - **lualine statusline integration** — show model usage, cache-hit rate, and context capacity in real time inside the chat window via `nvim-lualine` (the model/usage/cache/capacity sections are customizable)
 - **Herder status reporting** — report Agent state (working/idle/blocked) in real time inside the Herder pane, automatically aggregating multiple sessions, with a strictly increasing `--seq` to guard against concurrent rollback
 - **Tool argument receiving panel** — while the model streams tool-call arguments, a "receiving arguments" floating window (`tool_args_panel`) opens in real time, appending each chunk incrementally and closing automatically once the arguments end, consistent with the reasoning floating window
@@ -53,7 +53,6 @@
 | Feature | Dependency | Distro package | When missing |
 | --- | --- | --- | --- |
 | `git_*` tools, worktrees | `git` | `git` | git tools are not registered |
-| `web_fetch` rendering | `node` + `npm` | `nodejs` / `npm` | Off by default, auto-installed on first use (unsupported on Android/Termux — the tool is simply not registered) |
 | **Sandbox isolation (preferred)** | `bwrap` **>= 0.11** (overlay needs `--overlay-src`) | `bubblewrap` | Sandbox disabled → **falls back to approval mode** (commands run on the host after blocking pre-approval; writes land on disk directly, no staged candidates). bwrap is the only backend supporting the overlay staging layer, tier mounts/capabilities and `/proc/sys` masking; **Docker/Podman are not required** |
 | **Sandbox isolation (fallback)** | `unshare` + unprivileged user namespaces | `util-linux` | Used when `bwrap` is absent; if the kernel forbids unprivileged userns (`/proc/sys/kernel/unprivileged_userns_clone=0`, SELinux rejecting `clone(CLONE_NEWUSER)`) this backend is unusable too → approval mode |
 | seccomp baseline (unshare backend) | `setpriv --seccomp-filter` | `util-linux` **>= 2.32** | seccomp cannot be applied → three-layer model: eBPF behavior backstop, or "warn + audit only" |
@@ -68,7 +67,7 @@
 ```bash
 # Debian / Ubuntu
 sudo apt install -y bubblewrap util-linux strace git curl
-sudo apt install -y bpftrace podman nodejs npm     # optional: eBPF backstop / container facade / web_fetch
+sudo apt install -y bpftrace podman                # optional: eBPF backstop / container facade
 
 # Fedora / RHEL
 sudo dnf install -y bubblewrap util-linux strace git curl
@@ -101,8 +100,8 @@ The kernel forbids **unprivileged user namespaces** (SELinux rejects `clone(CLON
 - Installing `bubblewrap` / `util-linux` still **cannot enable sandbox isolation** → the sandbox is
   disabled automatically and falls back to **approval mode** (`tools.approval.mode` is forced from
   `async` to `prompt`: commands run on the host after blocking pre-approval);
-- `web_fetch` (Playwright browser engine) is unavailable on this platform: the tool is not
-  registered and no dependency installation is triggered;
+- `web_search` / `web_fetch` still work (only `curl` is needed, no browser engine), but they are
+  still visible only to Agents using a DeepSeek provider;
 - Everything else (chat, tools, LSP, session tree, MCP, Skills, ...) is unaffected.
 
 > Not sure whether your environment is ready? Run **`:NeoAI Doctor`** or **`:checkhealth NeoAI`** for a
@@ -1008,39 +1007,35 @@ Remote `tools/list` → one NeoAI tool per remote tool; `resources`/`prompts` �
 > The system prompt injects the list of "available skills" (`skills.inject_mode`), and the model can `load_skill` to load the body text.
 > See [docs/en/skills.md](docs/en/skills.md).
 
-### 🌐 Web Fetch Tool (disabled by default)
+### 🌐 Web Search/Fetch Tools (DeepSeek, disabled by default)
 
-| Tool name   | Description | Parameters |
-| ----------- | ----------- | -------- |
-| `web_fetch` | Fetch a page and render it to readable content (Markdown/plain text, body only, no raw HTML); for dynamic pages it runs JS in a headless browser and takes the final DOM | `url` (required); `selector`/`wait_selector`/`wait_ms` for locating and waiting; `script` (`clean`/`readability`); `format` (`markdown`/`text`); `force_refresh` (skip cache) |
+The tool contract mirrors DeepSeek Harness:
 
-**Pipeline**: Neovim (Lua only orchestrates) → bash checks/installs deps → Node + Playwright renders and injects JS → final DOM → turndown converts to Markdown → returned (optionally cached). Lua never parses dynamic pages itself.
+| Tool name | Description | Parameters |
+| --- | --- | --- |
+| `web_search` | Search the web for current information; returns an optional summary and a source URL list | `queries` (required, 1–`max_queries` queries; results are merged round-robin by rank) |
+| `web_fetch` | Fetch a page and return its readable body | `url` (required, http/https) |
 
-- **Disabled by default**: set `tools.web_fetch.enabled = true`; while off, the tool is not registered and no dependency is installed.
-- **Auto dependency install**: once enabled, bash checks and installs Node deps (`playwright` / `turndown` / `@mozilla/readability`) and the browser engine **inside the cache dir** (`stdpath('cache')/NeoAI/web_fetch`, browsers under `browsers/`) — no root, no system changes. With `auto_install = true` (default) it installs in the background and the first call waits for it.
-- **No system Node install**: if `node`/`npm` is missing, an actionable error is returned (it will not silently run a system package manager).
-- **Platform limit (unavailable on Android/Termux)**: Playwright ships no Android browser engine, so in an Android aarch64 userspace (including Termux) **the tool is rejected up front** — `get_tools()` registers nothing, dependency installation is never triggered, and calls return a clear explanation, avoiding a pointless `node_modules` download followed by a guaranteed `npx playwright install` failure (exit code 44). Run NeoAI on desktop Linux/macOS/Windows for web fetching.
-- **Restricted networks (CN mirrors / broken proxy)**: `tools.web_fetch` adds optional `npm_registry`, `playwright_download_host`, `http_proxy` / `https_proxy` and `ignore_system_proxy` keys; all empty = inherit system behavior. For CN environments: `npm_registry = "https://registry.npmmirror.com/"`, `playwright_download_host = "https://registry.npmmirror.com/-/binary/playwright"`; if a broken local proxy breaks downloads, set `ignore_system_proxy = true` to go direct.
-- **Injection scripts**: built-in scripts live in `assets/web_fetch/scripts/` (`clean` generic denoise, `readability` article extraction); you can drop same-named scripts into `tools.web_fetch.scripts_dir` (default `stdpath('config')/NeoAI/web_fetch/scripts`) to **override** the built-ins, or select one with the `script` arg.
-- **Cache**: results are cached by URL + args with TTL / entry-count / **total-size cap (default 500MB)**, evicting oldest first; a single entry larger than the cap is not cached.
-- **Args**: `url` (required), `selector`, `wait_selector`, `wait_ms`, `script`, `format` (`markdown`/`text`), `force_refresh`.
-- **Output format**: always Markdown or plain text, never raw HTML; `<style>`/`<script>` and similar noise are stripped before conversion so CSS never leaks into the content.
-- **Images**: images are **not written into the Markdown** (avoids base64 bloat); they are saved to a temp dir (created via `mktemp -d`, e.g. `/tmp/neoai_web_fetch.XXXXXX/`) and the body keeps an inline `[image: <path>]` placeholder you can open with `read_image`. The dir is **auto-deleted when Neovim exits**. Caps: `max_images` / `max_image_bytes` / `image_timeout_ms`.
+- **Only visible to DeepSeek providers**: both tools appear in a request only when the Agent's provider is `deepseek` (or the provider's `base_url` points at `api.deepseek.com`). For other providers `tools.environment.filter_tools` removes them, and the executors validate the provider again.
+- **Disabled by default**: set `tools.web.search.enabled = true` / `tools.web.fetch.enabled = true`; while off, nothing is registered.
+- **Backend**: DeepSeek Web Search/Fetch API (`POST {base_url}/v1/tools/search`, `/v1/tools/fetch`). The API URL and key default to the active DeepSeek provider; override with `tools.web.base_url` / `tools.web.api_key`.
+- **No browser dependency**: no Node/npm/Playwright, no browser-engine install, no image extraction and no fetch cache; only `curl` is needed (shared by all NeoAI HTTP requests).
+- **Output**:
+  - `web_search`: `External web content follows...` + a `Sources:` markdown list + `Cite the relevant URLs...`; `No results found.` when empty; a `(Showing the first N sources...)` note when truncated.
+  - `web_fetch`: `Fetched <url> (HTTP 200)` + an untrusted-content notice + the body; content beyond `max_output_chars` is UTF-8-safely truncated with a notice.
 
 ```lua
 require("NeoAI").setup({
   tools = {
-    web_fetch = {
-      enabled = true,            -- default false
-      engine = "chromium",       -- chromium | firefox | webkit
-      cache = { max_bytes = 500 * 1024 * 1024 },
+    web = {
+      base_url = "",            -- empty = ai.providers.deepseek.base_url
+      api_key = "",             -- empty = ai.providers.deepseek.api_key
+      search = { enabled = true, max_results = 8, max_queries = 4, timeout_ms = 30000 },
+      fetch = { enabled = true, timeout_ms = 30000, max_output_chars = 200000 },
     },
   },
 })
 ```
-
-> Requires `node` (>=18) and `npm` in `PATH` (use `tools.web_fetch.node_path` to point at a node binary).
-> The first enable downloads the browser engine, so make sure the network is available.
 
 ---
 ## 🏗️ Architecture
@@ -1051,12 +1046,6 @@ Built on the v3.0 architecture guide (see [styleGuide.md](styleGuide.en.md)), fo
 NeoAI/
 ├── init.lua                    # Main entry: extremely thin, only setup + command/keymap registration, business logic lazy-loaded
 ├── default_config.lua          # Default config (pure data, zero logic)
-│
-├── assets/                     # Bundled resources shipped with the plugin
-│   └── web_fetch/              # Web fetch runtime (copied into the cache dir)
-│       ├── render_url.js       # Playwright renderer (JS injection + turndown)
-│       ├── package.json        # Node dependency list (playwright/turndown/readability)
-│       └── scripts/            # Built-in injection scripts (clean / readability)
 │
 ├── kernel/                     # Kernel layer (lowest level, zero business dependencies)
 │   ├── events.lua             # Event constant registry (domain:verb naming)
@@ -1135,7 +1124,8 @@ NeoAI/
 │   ├── executor.lua           # Tool executor (aliases/approval/timeout)
 │   ├── validator.lua          # Argument validation + approval decisions
 │   ├── packer.lua             # Tool grouping/packing
-│   ├── environment.lua        # Tool environment probing (workspace/git, disabled if unavailable)
+│   ├── environment.lua        # Tool environment probing (workspace/git/provider, disabled if unavailable)
+│   ├── web_provider.lua       # DeepSeek Web Search/Fetch shared backend (provider/auth/formatting)
 │   └── builtin/               # Built-in tools
 │       ├── file_ops.lua       # File operations + confirm_file_change
 │       ├── shell.lua          # Shell commands
@@ -1149,6 +1139,8 @@ NeoAI/
 │       ├── privileged_mode.lua# Privileged mode (record-only network + direct containers)
 │       ├── ask_user.lua       # Ask the user
 │       ├── read_image.lua     # Image reading (multimodal)
+│       ├── web_search.lua     # DeepSeek web search (off by default, DeepSeek providers only)
+│       ├── web_fetch.lua      # DeepSeek web fetch (off by default, DeepSeek providers only)
 │       ├── skills.lua         # Skills tools (list_skills/load_skill + prompt segment)
 │       └── tool_helpers.lua   # Tool definition helpers
 │

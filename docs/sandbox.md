@@ -189,7 +189,7 @@ token（`NEOKEY_…`）或格式保真假密钥时**拒绝写盘**（`SECRET_TOK
 | `in_process` | 进程内状态变更（todo/plan/ask_user/skills 等） | 进程内执行，记录回执 |
 | `fs_write` | 写宿主文件系统 | 写入私有暂存层，冻结候选 |
 | `process` | 启动外部进程（run_command 等） | 经 `runtime.process_prefix` 隔离执行 |
-| `network` | 网络副作用（web_fetch/read_image） | 默认放行并记录证据（不拦截）；`offline=true` 才拒绝 |
+| `network` | 网络副作用（web_search/web_fetch/read_image） | 默认放行并记录证据（不拦截）；`offline=true` 才拒绝 |
 
 未知工具按类别默认归类；仍未知按最保守的 `process` 处理。
 
@@ -1720,8 +1720,8 @@ seccomp（含设备节点屏障）**——沙箱内进程看到的是一份「�
     overlay」的兼容模式（写入仍进暂存待审），不堆叠 overlay、不产生额外计算；批准结果按挂载点
     缓存在当前 Agent，后续命令不再重复弹窗。子 Agent / 无审批能力时 fail-closed 拒绝并说明原因。
 - **工具子进程统一经沙箱（`NeoAI.sandbox.execution.exec`）**：所有工具内部 spawn 的子进程
-  （`run_command` 的 shell、`git` 操作、`read_image` 的 curl 下载、`web_fetch` 的
-  bash/node 渲染与依赖安装、MCP stdio server 等）都在 bwrap 命名空间内创建，而非宿主。
+  （`run_command` 的 shell、`git` 操作、`read_image` 的 curl 下载、MCP stdio server 等）
+  都在 bwrap 命名空间内创建，而非宿主。
   这些辅助进程不做候选冻结（只写工具自身缓存/临时目录），通过 `rw_binds` 以可写方式暴露
   工具自身目录（宿主与沙箱同路径可见），通过 `ro_binds` 只读暴露命令所在目录；其余读取面
   沿用最小只读白名单与宿主敏感路径遮蔽。工具临时/下载目录统一落在共享根
@@ -2086,7 +2086,7 @@ run_command overlay 候选捕获（含删除 whiteout 捕获与尝试目录清�
 
 ### 网络（默认放行 + 记录）
 
-网络**默认不拦截**（`tools.sandbox.offline=false`）：网络类工具（`web_fetch`/`read_image`）
+网络**默认不拦截**（`tools.sandbox.offline=false`）：网络类工具（`web_search`/`web_fetch`/`read_image`）
 正常执行，并把端点写入证据（`evidence` kind=`network`）与策略回放记录；`run_command`
 进程默认共享宿主网络（bwrap `--share-net`）。
 - `tools.sandbox.offline=true`：硬拒绝网络类工具（`NETWORK_OFFLINE`），并隔离进程网络

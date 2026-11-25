@@ -2002,12 +2002,13 @@ tests.suite("tools", function(_, it)
     local registry = require("NeoAI.tools.registry")
     registry.reset()
     local helpers = require("NeoAI.tools.builtin.tool_helpers")
-    for _, n in ipairs({ "run_command", "list_files", "search_files", "web_fetch", "create_sub_agent", "todo_write" }) do
+    for _, n in ipairs({ "run_command", "list_files", "search_files", "web_search", "web_fetch", "create_sub_agent", "todo_write" }) do
       registry.register(helpers.define_tool(n, "x", nil, function() end))
     end
     t.eq("run_command", registry.resolve_name("bash"))
     t.eq("list_files", registry.resolve_name("glob"))
     t.eq("search_files", registry.resolve_name("grep"))
+    t.eq("web_search", registry.resolve_name("websearch"))
     t.eq("web_fetch", registry.resolve_name("webfetch"))
     t.eq("create_sub_agent", registry.resolve_name("task"))
     t.eq("todo_write", registry.resolve_name("todowrite"))

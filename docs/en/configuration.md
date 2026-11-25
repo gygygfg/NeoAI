@@ -239,7 +239,7 @@ session = {
 | `lsp` | `{timeout_ms=10000, start_timeout_ms=15000, auto_start=true, attach_timeout_ms=3000, check={...}}` | LSP request timeout (fail fast when the server does not respond); `start_timeout_ms` is how long to wait for a client to **finish initializing** (used only when a server start is genuinely in flight: with no client, `auto_start` derives and starts a server from the editor LSP config, preferring an `@neoai-sandbox` clone subject to keep-alive/reclamation when the sandbox is available, and falling back to a non-sandbox client when it is not and the file has no unpublished staged changes); `attach_timeout_ms` bounds the wait / fast-fail when there is a fully absent candidate (when a file is not in any buffer and is auto-opened in the background, or a starting/restarting server has no client yet, LSP tools wait for it to be ready before requesting — still issuing one request on timeout to return an accurate error — instead of failing immediately with "no LSP client"). `check` configures the `lsp_check` tool (project-wide diagnostics): `enabled`/`timeout_ms`/`servers` (per-server CLI check command mapping, argv placeholders `{path}`/`{root}`/`{level}`/`{server}`/`{out}`, `format=lua-ls|pyright|clangd|text`, optional `extensions` (used to auto-select a default server by target extension), `bin` (executable override), `requires_file` (single-file only, e.g. clangd), optional `root_files`, optional `auto_config`/`auto_config_file`: run the check with built-in defaults when the root lacks project config (inside the sandbox, never written to the workspace)); it ships built-in `lua-language-server`/`pyright`/`clangd`, and without an explicit `server` only **PATH-installed** servers are chosen. Executed inside the sandbox, fully recomputed, with directory/glob, severity filtering and baseline diff (`{out}` points to a sandbox-writable/host-readable result file, because lua-language-server writes JSON to a file rather than stdout) |
 | `guard.repeat_tool` | `{enabled=true, thresholds={3,5,8}, messages=...}` | Reminder for consecutive repeated tool calls |
 | `todo.enabled` | `true` | Todo tool + system prompt injection |
-| `web_fetch` | See below (`enabled=false` by default) | Web fetch: render dynamic pages in a headless browser and convert to Markdown |
+| `web` | See below (`search.enabled=false`, `fetch.enabled=false` by default) | DeepSeek Web Search / Fetch (only exposed to DeepSeek providers) |
 | `plan_mode` | `{enabled=true, auto_execute_on_approve=true, distill_on_execute=true, distill_parallel=true, distill_front=true, distill_max_attempts=2, extract_max_tokens=nil, extra_safe_tools={}, mutating_tools=...}` | Plan mode |
 | `privileged_mode` | `{enabled=false, require_async_approval=true, override_offline=true, docker_socket="", unmask_ssh_keys=true, record_network=true, max_records=1000}` | Privileged mode (opt-in): record-only network, direct docker/podman, SSH keys unmasked; async approval only |
 | `sub_agent` | `{final_instruction="summarize your work at the end..."}` | Sub-agents: an instruction auto-appended to a sub-agent's task prompt (asks it to summarize its work); set to `""` to disable. On completion the sub-agent's final body is delivered back to the main agent automatically |
@@ -855,53 +855,42 @@ sandbox = {
 > candidates and inspect runtime capabilities. Rules run in a restricted environment with
 > instruction/wall-clock budgets; rule errors produce `DENY`. See [sandbox.md](sandbox.md).
 
-**web_fetch (web fetch, disabled by default)**:
+**web (DeepSeek web search / fetch, disabled by default)**:
 
 ```lua
-web_fetch = {
-  enabled = false,                 -- Master switch (off by default; only then is the tool registered / deps installed / fetching allowed)
-  auto_install = true,             -- After enabling, install deps in the background; false installs on first call
-  engine = "chromium",             -- Browser engine: chromium | firefox | webkit
-  format = "markdown",             -- Default output format: markdown | text (body only, no raw HTML)
-  timeout_ms = 45000,              -- Total fetch timeout (ms, incl. browser startup); <=0 uses nav_timeout_ms + 15s
-  nav_timeout_ms = 30000,          -- Page navigation/wait timeout (ms)
-  max_bytes = 2 * 1024 * 1024,     -- Max content returned per call (bytes, truncated beyond)
-  install_timeout_ms = 600000,     -- Dependency install timeout (ms; first browser download can take a while)
-  node_path = "",                  -- Custom node binary path (empty = node from PATH)
-  install_os_deps = false,         -- Also install OS deps for the browser (needs root/sudo; rarely necessary)
-  -- Download/proxy control for restricted networks (CN mirrors / broken proxy); all empty = inherit system behavior
-  npm_registry = "",               -- npm registry; empty = system npm config. CN: "https://registry.npmmirror.com/"
-  playwright_download_host = "",   -- Browser download base URL; empty = official CDN. CN: "https://registry.npmmirror.com/-/binary/playwright"
-  http_proxy = "",                 -- Explicit HTTP proxy for install/render; empty = do not override inherited value
-  https_proxy = "",                -- Explicit HTTPS proxy for install/render; empty = do not override inherited value
-  ignore_system_proxy = false,     -- true = clear inherited proxy vars during install/render (for a broken local proxy)
-  -- Injection script dir (extend/override built-ins; same-named user scripts win)
-  -- Built-ins: clean (generic denoise), readability (article extraction)
-  scripts_dir = vim.fn.stdpath("config") .. "/NeoAI/web_fetch/scripts",
-  cache = {
-    enabled = true,                -- Result cache switch
-    ttl_sec = 3600,                -- Cache TTL (seconds); <=0 means no expiry
-    max_entries = 200,             -- Max number of cached entries
-    max_bytes = 500 * 1024 * 1024, -- Max total cache size (bytes, default 500MB; evicts oldest first)
+web = {
+  base_url = "", -- DeepSeek API base URL; empty = active DeepSeek provider's base_url
+  api_key = "",  -- DeepSeek API key; empty = active DeepSeek provider's api_key
+
+  search = {
+    enabled = false,    -- web_search master switch (off by default; get_tools() returns nothing while off)
+    max_results = 8,    -- Max sources returned by one call
+    max_queries = 4,    -- Max queries accepted by one call; merged round-robin by rank
+    timeout_ms = 30000, -- Per-search HTTP timeout (ms)
+  },
+
+  fetch = {
+    enabled = false,           -- web_fetch master switch (off by default)
+    timeout_ms = 30000,        -- Per-fetch HTTP timeout (ms)
+    max_output_chars = 200000, -- Max returned text (characters; truncated with a notice)
   },
 },
 ```
 
-> **Runtime behavior**: while disabled there are zero side effects (no tool registration, no dependency install);
-> once enabled, deps are installed into the cache dir (`stdpath('cache')/NeoAI/web_fetch`) and browsers are kept in the
-> same dir's `browsers/` — **the system environment is never modified**. **Dependency/browser installation runs on the
-> host, outside the sandbox**: the install artifacts (`node_modules`, a browser engine that can be hundreds of MB) would
-> otherwise enter the sandbox overlay and be re-captured by every `run_command`; rendering still runs inside the sandbox
-> (browsers are read-only visible from the host). If `node`/`npm` is missing it does not invoke a
-> system package manager, but returns an actionable error.
-> **Platform limit**: Playwright ships no Android browser engine, so on **Android/Termux (any Android aarch64
-> userspace) this tool is rejected up front** — the tool is not registered, dependency installation is never
-> triggered, and tool calls return a clear explanation. This avoids downloading `node_modules` only for
-> `npx playwright install` to fail (exit code 44). Run NeoAI on desktop Linux/macOS/Windows for web fetching, or
-> fetch the page body through a remote service first.
-> `approval.per_tool.web_fetch = { auto_allow = true }` (auto-allowed
-> by default). Pipeline: Lua orchestrates → bash installs deps → Node/Playwright renders and injects JS → final DOM →
-> turndown converts to Markdown.
+> **Model-facing contract** (matches DeepSeek Harness):
+> - `web_search({ queries = { "q1", "q2" } })`: runs 1–`max_queries` searches concurrently, merges results
+>   round-robin by rank, deduplicates by URL and caps at `max_results`; returns a `Sources:` markdown list and
+>   a citation reminder.
+> - `web_fetch({ url = "https://example.com" })`: returns `Fetched <url> (HTTP 200)` + an untrusted-content
+>   notice + the body.
+>
+> **Provider gating**: both tools are exposed only to Agents whose provider is DeepSeek (`deepseek`, or a
+> provider whose `base_url` points at `api.deepseek.com`). Other providers get neither tool in the request,
+> and the executors validate the provider again.
+>
+> **Dependencies**: only `curl` (shared by all NeoAI HTTP requests). No Node/Playwright, browser-engine install,
+> image extraction or fetch cache. `approval.per_tool.web_search = { auto_allow = true }` and
+> `approval.per_tool.web_fetch = { auto_allow = true }` (auto-allowed by default).
 
 ### 2.6 `herder`
 

@@ -203,9 +203,7 @@ function M.collect()
   -- 可选依赖
   local opt = {}
   if vim.fn.executable("git") == 1 then opt[#opt + 1] = "git" end
-  if vim.fn.executable("node") == 1 then opt[#opt + 1] = "node" end
-  if vim.fn.executable("npm") == 1 then opt[#opt + 1] = "npm" end
-  add("可选依赖", "ok", { #opt > 0 and ("已找到: " .. table.concat(opt, ", ")) or "未找到 git/node/npm（git 工具与 web_fetch 渲染将不可用）。" })
+  add("可选依赖", "ok", { #opt > 0 and ("已找到: " .. table.concat(opt, ", ")) or "未找到 git（git 工具将不可用）。" })
 
   -- 资源压力（内存/PSI/负载）：低内存环境是「卡顿甚至无法 SSH」的常见真因，
   -- 这里展示当前等级与已生效的降级项，便于用户理解「插件为什么变保守」。

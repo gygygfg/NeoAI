@@ -104,7 +104,7 @@ header prints the cores and available memory. Override with `NEOAI_TEST_WORKERS`
 | Kernel / plugins / services / runtime | `kernel`, `plugins`, `services`, `service_tool`, `lazy_plugin`, `lazy_startup`, `commands_plugin`, `keymaps_plugin`, `reload_all`, `lock`, `trace_retention` |
 | Session / agent / context / modes | `session`, `session_store`, `session_progress`, `agent`, `runtime_context`, `guard`, `overflow`, `loop_compaction`, `compaction_overlay`, `truncation`, `max_tokens`, `pending_queue`, `sub_agent_result`, `abort_tools`, `modes` |
 | Model / protocol / cache | `model_registry`, `model_capabilities`, `model_profiles`, `model_metadata`, `model_picker`, `protocol_adapter`, `prompt_cache`, `cache_strategy`, `cache_usage` |
-| Tool system | `tools`, `tool_pending`, `tool_result_pruner`, `output_guard`, `approval_hub`, `plan_mode`, `plan_distill`, `todo`, `ask_user`, `read_image`, `web_fetch`, `multimodal` |
+| Tool system | `tools`, `tool_pending`, `tool_result_pruner`, `output_guard`, `approval_hub`, `plan_mode`, `plan_distill`, `todo`, `ask_user`, `read_image`, `web_search`/`web_fetch`, `multimodal` |
 | Files / shell / LSP / text | `fs_io`, `guest_fs`, `git_ops`, `lsp_check`, `lsp_guard`, `pty`, `ansi`, `stringx`, `textmetrics`, `sha256`, `merge3` |
 | UI | `chat_ui`, `tree_ui`, `chat_keys`, `display_modes`, `fold`, `markdown`, `ui_components`, `geometry`, `incremental`, `stream_batching`, `status` |
 | MCP | `mcp_client`, `mcp_transport`, `mcp_bridge`, `mcp_cache` |

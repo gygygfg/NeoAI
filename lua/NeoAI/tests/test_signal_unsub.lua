@@ -1,9 +1,8 @@
 --- 取消订阅（Signal）生命周期测试
 --- @module 'NeoAI.tests.test_signal_unsub'
 --- 回归：长生命周期 agent.signal 上的订阅必须在进程结算后反注册，否则同一会话内每次
---- exec/web_fetch/resident 调用都会向同一 signal 追加永不释放的监听器，导致内存无界增长。
---- 历史缺陷：exec._spawn / runtime.run / resident / web_fetch._run_bash_host 只 subscribe
---- 不保存返回的 unsub。
+--- exec/resident 调用都会向同一 signal 追加永不释放的监听器，导致内存无界增长。
+--- 历史缺陷：exec._spawn / runtime.run / resident 只 subscribe 不保存返回的 unsub。
 
 local tests = require("NeoAI.tests")
 local async = require("NeoAI.utils.async")

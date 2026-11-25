@@ -41,7 +41,7 @@ and async-by-default (all I/O non-blocking).
 
 5. Tool System
    - Built-in tools: file ops, LSP, treesitter, shell, git, logging, todo,
-     plan_mode, ask_user, read_image, web_fetch (disabled by default), sub-agent, skills
+     plan_mode, ask_user, read_image, web_search/web_fetch (DeepSeek search/fetch, disabled by default), sub-agent, skills
    - Tool approval workflow: the default `mode="async"` runs the tool in the sandbox immediately and
      freezes candidates, with real changes queued for confirmation via `:NeoAI SandboxReview`; only
      `prompt`/`strict` use the serial single-slot approval dialog (auto-allow config, per-tool
@@ -147,7 +147,8 @@ lua/NeoAI/
     environment.lua          -- Tool environment probing (disable unavailable)
     builtin/                 -- file_ops, shell, git_ops, lsp_ops, tree_ops, log_ops,
                              -- plan, todo, plan_mode, ask_user, read_image, skills,
-                             -- web_fetch (web fetch, disabled by default), tool_helpers
+                             -- web_search/web_fetch (DeepSeek search/fetch, disabled by default),
+                             -- web_provider (shared backend), tool_helpers
   utils/                     -- Utilities (async, json, http, fs, work, timer, image, stringx)
   tests/                     -- Test suite (:NeoAI Test)
 ```
@@ -168,7 +169,7 @@ Key architectural principles:
 
 **Prerequisites**: Neovim >= 0.10 (0.13+ recommended; uses the `vim.uv` multithreading API) and
 `curl` (the only HTTP transport — without it no model request can be sent). Optional dependencies by
-feature: `git`, `node`/`npm` (`web_fetch`), and sandbox-related ones (`bwrap` (bubblewrap) or
+feature: `git` and sandbox-related ones (`bwrap` (bubblewrap) or
 `unshare` + unprivileged user namespaces; seccomp needs `setpriv --seccomp-filter` from
 `util-linux` >= 2.32; observation uses `bpftrace`/`strace`; the container facade uses `podman` only).
 When none of the isolation backends is available the sandbox is disabled and falls back to approval

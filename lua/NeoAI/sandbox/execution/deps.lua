@@ -38,8 +38,8 @@ local state = {
 }
 
 --- 当前平台判定：`termux` | `android` | `linux` | 其它 sysname 小写。
---- 判定依据与 `tools/builtin/web_fetch.lua` 的平台守卫同源：Termux 的 `$PREFIX` 指向
---- com.termux 应用目录；Android 用户空间存在 `/system/build.prop`（桌面 Linux 没有该文件）。
+--- 判定依据：Termux 的 `$PREFIX` 指向 com.termux 应用目录；Android 用户空间存在
+--- `/system/build.prop`（桌面 Linux 没有该文件）。
 --- @return string
 function M.platform()
   if state.platform_override ~= nil then return state.platform_override end

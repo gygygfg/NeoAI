@@ -240,7 +240,7 @@ function M._tool_definitions(agent)
     end
   end
   local environment = require("NeoAI.tools.environment")
-  local tools = environment.filter_tools(agent.tools or {})
+  local tools = environment.filter_tools(agent.tools or {}, agent)
   -- 计划模式：工具上下文只保留只读/信息查询 + ask_user（不暴露任何修改类工具）
   local plan_mode = require("NeoAI.tools.builtin.plan_mode")
   tools = plan_mode.apply_tool_filter(agent, tools)

@@ -218,7 +218,7 @@ command). Guarantees:
 | `in_process` | In-process state changes (todo/plan/ask_user/skills) | In-process, receipt |
 | `fs_write` | Host filesystem writes | Write to private staging, freeze candidate |
 | `process` | External process (run_command, etc.) | Isolated via `runtime.process_prefix` |
-| `network` | Network side effects (web_fetch/read_image) | Allowed by default and recorded (not blocked); only `offline=true` denies |
+| `network` | Network side effects (web_search/web_fetch/read_image) | Allowed by default and recorded (not blocked); only `offline=true` denies |
 
 Unknown tools fall back to category defaults; still unknown is treated conservatively as `process`.
 
@@ -2075,8 +2075,7 @@ defense-in-depth to the bwrap prefix by default (`--cap-drop ALL` plus the tier 
   software inventory). The same read surface is used by the LSP namespace overlay (see §5).
 - **Tool child processes go through the sandbox (`NeoAI.sandbox.execution.exec`)**: every child process a tool
   spawns internally (the `run_command` shell, `git` operations, `read_image`'s curl download,
-  `web_fetch`'s bash/node rendering and dependency install, MCP stdio servers, …) is created inside
-  the bwrap namespace rather than on the host. These helper processes do not freeze candidates (they
+  MCP stdio servers, …) is created inside the bwrap namespace rather than on the host. These helper processes do not freeze candidates (they
   only write the tool's own cache/temp dirs); `rw_binds` exposes the tool's own dirs read-write (host
   and sandbox see the same path) and `ro_binds` exposes the command's directory read-only, while the
   rest of the read surface keeps the minimal allowlist and host-sensitive masking. Tool temp/download
@@ -2491,7 +2490,7 @@ otherwise it enters async user review. Revocation is immediate.
 ### Network (allowed by default + recorded)
 
 Network is **not blocked by default** (`tools.sandbox.offline=false`): network tools
-(`web_fetch`/`read_image`) execute normally and their endpoint is recorded in evidence
+(`web_search`/`web_fetch`/`read_image`) execute normally and their endpoint is recorded in evidence
 (kind=`network`) and the policy replay log; `run_command` processes share the host network
 (bwrap `--share-net`).
 - `tools.sandbox.offline=true`: hard-deny network tools (`NETWORK_OFFLINE`) and isolate process

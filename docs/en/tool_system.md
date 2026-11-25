@@ -57,7 +57,7 @@ Tool definitions support two execution forms (`executor._call_tool`):
 > **opencode-style aliases (additive, back-compatible)**: `executor._normalize_arguments` accepts
 > `filePath → file_path`, `oldString/newString → old_text/new_text`, `pattern → query`,
 > `glob → include`, `timeout → timeout_ms`; `registry.resolve_name` accepts opencode tool names
-> `bash/glob/grep/webfetch/task/todowrite/todoread`. Old names keep working.
+> `bash/glob/grep/websearch/webfetch/task/todowrite/todoread`. Old names keep working.
 
 ## 3. Tool Registration
 
@@ -66,7 +66,7 @@ Tool definitions support two execution forms (`executor._call_tool`):
 `tool_helpers.lua` is the tool-definition helper library and is not part of the built-in list.
 
 Built-in tool modules: `file_ops` / `shell` / `git_ops` / `lsp_ops` / `tree_ops` / `log_ops` / `plan` (sub-agent) /
-`todo` / `plan_mode` / `ask_user` / `read_image` / `web_fetch` (web fetch, disabled by default) / `skills` (skill tools + system prompt section).
+`todo` / `plan_mode` / `ask_user` / `read_image` / `web_search` + `web_fetch` (DeepSeek search/fetch, disabled by default) / `skills` (skill tools + system prompt section).
 (The `service` long-lived-service module is no longer registered; background processes are carried by the
 session-resident sandbox instance, see `sandbox/execution/resident.lua`.)
 MCP remote tools are registered dynamically by `services/mcp/init.lua` (`category = "mcp"`, `source = "mcp"`); see [mcp.md](mcp.md) for details.
@@ -452,17 +452,25 @@ per-request image **count is unlimited by default** (consecutive calls never dro
 `ai.attachments.request_image.maxRequestImages` (provider hard limit) and the byte budget
 `maxRequestBytes` bound it. See [configuration.md](configuration.md) (multimodal).
 
-### 🌐 Web fetch (web_fetch.lua, disabled by default)
+### 🌐 Web search / fetch (web_search / web_fetch, disabled by default)
 
-`web_fetch`: renders dynamic pages (React/Vue/SPA) in a headless browser, injects JS, takes the final DOM and
-converts it to Markdown with a general converter (turndown). **Disabled by default** (`tools.web_fetch.enabled = false`;
-while off, `get_tools()` returns nothing — no registration, no dependency install). Once enabled, bash checks and
-installs Node deps and the browser engine in the cache dir (`stdpath('cache')/NeoAI/web_fetch`) — **the installation runs
-on the host, outside the sandbox**, so hundreds of MB of artifacts never enter the overlay and get re-captured by every
-`run_command`; with `auto_install=true` this happens in the background and the first call waits for it. Lua only
-orchestrates and never parses dynamic pages itself. Results are cached by URL + args (TTL / entry count / total-size cap default 500MB,
-evicting oldest first). Injection scripts are extensible: built-ins in `assets/web_fetch/scripts/*.js`, overridable by
-same-named scripts in the user dir (`tools.web_fetch.scripts_dir`). See [configuration.md](configuration.md) (`tools.web_fetch`).
+Both tools mirror the DeepSeek Harness model-facing contract and use the DeepSeek Web Search / Fetch API:
+
+- `web_search({ queries = { "q1", "q2" } })`: runs 1–`max_queries` searches concurrently, merges results
+  round-robin by rank, deduplicates by URL and caps at `max_results`. Output is an optional answer plus a
+  `Sources:` markdown list and a citation reminder.
+- `web_fetch({ url = "https://example.com" })`: fetches one page and returns `Fetched <url> (HTTP 200)` +
+  an untrusted-content notice + the body; content beyond `max_output_chars` is UTF-8-safely truncated with a notice.
+
+Both tools are **only exposed to Agents whose provider is DeepSeek** (`deepseek`, or a provider whose
+`base_url` points at `api.deepseek.com`). For other providers, `tools.environment.filter_tools` removes them
+from the request, and the tool executors validate the provider again so a direct call cannot bypass the filter.
+
+**Disabled by default**: `tools.web.search.enabled = false`, `tools.web.fetch.enabled = false`; while off,
+`get_tools()` returns nothing. The API URL and key default to the active DeepSeek provider config; override with
+`tools.web.base_url` / `tools.web.api_key` (tests or a self-hosted DeepSeek-compatible endpoint). There is no
+Node/Playwright dependency, browser-engine install, image extraction or fetch cache.
+See [configuration.md](configuration.md) (`tools.web`).
 
 ## 7. Tool Output to the Model (tool_loop._tool_definitions)
 

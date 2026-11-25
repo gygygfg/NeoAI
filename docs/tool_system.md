@@ -54,7 +54,7 @@
 > **opencode 风格别名（加别名、保持兼容）**：`executor._normalize_arguments` 接受
 > `filePath → file_path`、`oldString/newString → old_text/new_text`、`pattern → query`、
 > `glob → include`、`timeout → timeout_ms`；`registry.resolve_name` 接受 opencode 工具名
-> `bash/glob/grep/webfetch/task/todowrite/todoread`。旧名仍完全可用。
+> `bash/glob/grep/websearch/webfetch/task/todowrite/todoread`。旧名仍完全可用。
 
 ## 3. 工具注册
 
@@ -62,7 +62,7 @@
 （仅注册定义，无 I/O，确保首个 Agent 请求前已就绪）。`tool_helpers.lua` 是工具定义辅助库，不入内置清单。
 
 内置工具模块：`file_ops` / `shell` / `git_ops` / `lsp_ops` / `tree_ops` / `log_ops` / `plan`（子 Agent）/
-`todo` / `plan_mode` / `ask_user` / `read_image` / `web_fetch`（网页抓取，默认不启用）/ `skills`（技能工具 + 系统提示段）。
+`todo` / `plan_mode` / `ask_user` / `read_image` / `web_search` + `web_fetch`（DeepSeek 搜索/抓取，默认不启用）/ `skills`（技能工具 + 系统提示段）。
 （`service` 长驻服务模块已不再注册；后台进程由会话级常驻沙箱实例承载，见 `sandbox/execution/resident.lua`。）
 MCP 远端工具由 `services/mcp/init.lua` 动态注册（`category = "mcp"`，`source = "mcp"`），详见 [mcp.md](mcp.md)。
 
@@ -390,15 +390,24 @@ label 字符串；自由输入覆盖为纯文本。**仅 NORMAL 模式按 `<Esc>
 （连续看图不会被丢最旧），仅受 `ai.attachments.request_image.maxRequestImages`（provider 硬上限）
 与字节预算 `maxRequestBytes` 约束。详见 [configuration.md](configuration.md)（多模态）。
 
-### 🌐 网页抓取（web_fetch.lua，默认不启用）
+### 🌐 网页搜索 / 抓取（web_search / web_fetch，默认不启用）
 
-`web_fetch`：把动态网页（React/Vue/SPA）在无头浏览器中渲染、注入 JS 后取最终 DOM，再用通用转换器
-（turndown）转 Markdown。**默认不启用**（`tools.web_fetch.enabled = false`，关闭时 `get_tools()` 返回空，
-不注册、不装依赖）。启用后在缓存目录（`stdpath('cache')/NeoAI/web_fetch`）用 bash 检查并安装
-Node 依赖与浏览器内核（**安装在宿主直接执行、不经沙箱**，避免数百 MB 产物进入 overlay 被反复捕获；
-`auto_install=true` 时后台异步，首次调用等待完成）。Lua 只做编排，不自行解析动态页面。结果按 URL + 参数缓存（TTL / 条数 / 总容量默认 500MB，最旧优先淘汰）。注入脚本可扩展：
-内置 `assets/web_fetch/scripts/*.js`，用户目录（`tools.web_fetch.scripts_dir`）同名覆盖。
-详见 [configuration.md](configuration.md)（`tools.web_fetch`）。
+两个工具对齐 DeepSeek Harness 的面向模型契约，后端使用 DeepSeek Web Search / Fetch API：
+
+- `web_search({ queries = { "q1", "q2" } })`：1–`max_queries` 个查询并发搜索，结果按排名轮询合并、
+  按 URL 去重并截断到 `max_results`。输出为可选的摘要 + `Sources:` markdown 来源列表 + 引用提示。
+- `web_fetch({ url = "https://example.com" })`：抓取单个页面，输出 `Fetched <url> (HTTP 200)` +
+  不可信内容提示 + 正文；超过 `max_output_chars` 时 UTF-8 安全截断并追加提示。
+
+两者都**只对 DeepSeek provider 的 Agent 暴露**（provider 名为 `deepseek`，或该 provider 的
+`base_url` 指向 `api.deepseek.com`）。其他 provider 的请求中，`tools.environment.filter_tools`
+会直接移除这两个工具；工具执行函数内部也会再次校验，避免绕过工具列表直接调用。
+
+**默认不启用**：`tools.web.search.enabled = false`、`tools.web.fetch.enabled = false`；关闭时
+`get_tools()` 返回空。API 地址与 key 默认复用当前 DeepSeek provider；也可用
+`tools.web.base_url` / `tools.web.api_key` 显式覆盖（测试或自建 DeepSeek 兼容端点）。
+不再依赖 Node/Playwright，也没有浏览器内核安装、图片转存与抓取缓存。
+详见 [configuration.md](configuration.md)（`tools.web`）。
 
 ## 7. 工具输出到模型（tool_loop._tool_definitions）
 

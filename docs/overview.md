@@ -35,7 +35,7 @@ NeoAI 是一款面向 Neovim 的 AI 驱动聊天插件，可将 AI 助手直接�
 
 5. 工具系统
    - 内置工具：file ops、LSP、treesitter、shell、git、logging、todo、
-     plan_mode、ask_user、read_image、web_fetch（默认不启用）、sub-agent、skills
+     plan_mode、ask_user、read_image、web_search/web_fetch（DeepSeek 搜索/抓取，默认不启用）、sub-agent、skills
    - 工具审批工作流：默认 `mode="async"`——工具立即在沙箱内执行并冻结候选，
      真实修改进待审队列（`:NeoAI SandboxReview` 确认应用）；`prompt`/`strict` 才用
      串行单槽队列弹窗确认（自动允许配置、按工具权限覆盖、审批超时）
@@ -140,7 +140,8 @@ lua/NeoAI/
     environment.lua          -- 工具环境探测（禁用不可用的工具）
     builtin/                 -- file_ops、shell、git_ops、lsp_ops、tree_ops、log_ops、
                              -- plan、todo、plan_mode、ask_user、read_image、skills、
-                             -- web_fetch（网页抓取，默认不启用）、tool_helpers
+                             -- web_search/web_fetch（DeepSeek 搜索/抓取，默认不启用）、
+                             -- web_provider（共享后端）、tool_helpers
   utils/                     -- 工具函数（async、json、http、fs、work、timer、image、stringx）
   tests/                     -- 测试套件（:NeoAI Test）
 ```
@@ -160,7 +161,7 @@ lua/NeoAI/
 ## 安装
 
 **前置要求**：Neovim ≥ 0.10（推荐 0.13+，依赖 `vim.uv` 多线程 API）与 `curl`（唯一 HTTP 传输后端，
-缺失则无法发送任何模型请求）。可选依赖按功能启用：`git`、`node`/`npm`（`web_fetch`）与沙箱相关
+缺失则无法发送任何模型请求）。可选依赖按功能启用：`git` 与沙箱相关
 （`bwrap`（bubblewrap 包）或 `unshare` + 非特权 user namespace；seccomp 需 `util-linux` ≥ 2.32 的
 `setpriv --seccomp-filter`；观测用 `bpftrace`/`strace`；容器门面仅 `podman`）。两者都缺失时沙箱
 禁用并退回审批模式。完整清单（含各发行版安装命令与 Android/Termux 限制）见

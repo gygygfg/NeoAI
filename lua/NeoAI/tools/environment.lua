@@ -4,6 +4,8 @@
 --- 无法获取 workspace（cwd）或 git 目录时，禁用依赖对应环境的工具，
 --- 避免向模型暴露必然失败的调用。
 
+local web_provider = require("NeoAI.tools.web_provider")
+
 local M = {}
 
 -- ========== 私有状态 ==========
@@ -45,6 +47,12 @@ local GIT_DEPENDENT_TOOLS = {
 local WORKSPACE_DEPENDENT_TOOLS = {
   "list_files",
   "search_files",
+}
+
+-- 仅 DeepSeek provider 可用的工具（非 DeepSeek 的 Agent 不暴露）
+local DEEPSEEK_ONLY_TOOLS = {
+  "web_search",
+  "web_fetch",
 }
 
 -- ========== 私有函数 ==========
@@ -108,17 +116,22 @@ end
 
 --- 过滤不可用环境的工具（保留可用的子集）
 --- @param tools table name -> tool
+--- @param agent table|nil 当前 Agent（用于 provider 相关工具过滤；nil 时不做 provider 过滤）
 --- @return table name -> tool
-function M.filter_tools(tools)
+function M.filter_tools(tools, agent)
   tools = tools or {}
   local ws = M.workspace_available()
   local git = M.git_available()
+  -- agent 为 nil 时不据此隐藏（直接执行/诊断调用）；真实模型请求总会带 agent。
+  local deepseek = agent == nil or web_provider.is_deepseek(agent)
   local out = {}
   for name, tool in pairs(tools) do
     if _in_set(GIT_DEPENDENT_TOOLS, name) and not git then
       -- 无 git 工作树：禁用 git 工具
     elseif _in_set(WORKSPACE_DEPENDENT_TOOLS, name) and not ws then
       -- 无工作区：禁用 workspace 工具
+    elseif _in_set(DEEPSEEK_ONLY_TOOLS, name) and not deepseek then
+      -- 非 DeepSeek provider：不暴露 DeepSeek Web 工具
     else
       out[name] = tool
     end
