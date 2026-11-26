@@ -575,45 +575,32 @@ function M.classify(_, args, spec, opts)
   }
 end
 
---- 高权限模式：把宿主 docker socket 挂载进沙箱并解除遮蔽。
---- 仅当 socket/测试哨兵文件存在时挂载；路径可由 `tools.privileged_mode.docker_socket` 覆盖。
+--- 会话内 Docker：准备（或复用）rootless runtime 会话，并把 broker socket / boot 片段
+--- 写入档位 privileges。**绝不挂载宿主 docker.sock**；真 socket 始终由遮蔽层覆盖。
 --- @param priv table 档位 privileges（原地修改）
---- @return boolean mounted
-local function _append_host_docker(priv)
-  local cfg = config_store.get("tools.privileged_mode") or {}
-  local candidates = {
-    cfg.docker_socket,
-    "/run/docker.sock",
-    "/var/run/docker.sock",
-  }
-  local xdg = os.getenv("XDG_RUNTIME_DIR")
-  if type(xdg) == "string" and xdg ~= "" then
-    candidates[#candidates + 1] = xdg .. "/docker.sock"
-  end
-  local src = nil
-  for _, p in ipairs(candidates) do
-    if type(p) == "string" and p ~= "" then
-      local st = vim.uv.fs_stat(p)
-      if st and (st.type == "socket" or st.type == "file") then
-        src = p
-        break
-      end
-    end
-  end
-  if not src then return false end
-  local okr, real = pcall(vim.fn.resolve, src)
-  if not okr or type(real) ~= "string" or real == "" then real = src end
-  local dst = "/run/docker.sock"
-  priv.mounts = priv.mounts or {}
-  priv.mounts[#priv.mounts + 1] = { src = real, dst = dst, mode = "rw" }
-  priv.unmask = priv.unmask or {}
-  for _, p in ipairs({ dst, "/var/run/docker.sock", real }) do
-    if not vim.tbl_contains(priv.unmask, p) then
-      priv.unmask[#priv.unmask + 1] = p
-    end
-  end
-  priv.env = priv.env or {}
-  priv.env.DOCKER_HOST = "unix://" .. dst
+--- @param opts table|nil { cwd?: string, workspace_roots?: string[] }
+--- @return boolean applied
+local function _apply_docker_session(priv, opts)
+  local ok, session = pcall(require, "NeoAI.sandbox.docker.session")
+  if not ok or not session then return false end
+  local roots = (opts and opts.workspace_roots) or {}
+  if #roots == 0 and opts and opts.cwd then roots = { opts.cwd } end
+  if #roots == 0 then roots = { vim.fn.getcwd() } end
+  -- 每次 apply 都刷新 broker 的 workspace_roots（cwd 可能随 Agent 会话变化）；
+  -- prepare 幂等，不会重启已运行的 broker。
+  -- 会话 socket/数据必须按 NeoAI 进程实例隔离（多实例共享同一缓存根会抢同一 socket）；
+  -- 重建规格则在 sandbox.init 中放到持久化的 docker/specs。
+  local sroot = require("NeoAI.sandbox.state.store").root()
+    or (vim.fn.stdpath("cache") .. "/NeoAI/sandbox")
+  local okp, desc = pcall(session.prepare, {
+    root = sroot .. "/docker/session",
+    workspace_roots = roots,
+    allow_binds = true,
+    allow_attach = true,
+    allow_pull = true,
+  })
+  if not okp or not desc then return false end
+  session.apply(priv, desc)
   return true
 end
 
@@ -648,9 +635,18 @@ function M.resolve(tier, req, opts)
     userns = t.userns == true,
     env = {},
   }
-  -- 高权限模式：进程命令可直连宿主 docker daemon（仅此模式例外）。
-  if privileged_active and opts and opts.process then
-    _append_host_docker(priv)
+  -- 会话内 Docker：仅当首次 docker 命令或会话已激活时，准备 rootless runtime 会话并挂载
+  -- broker socket。宿主 docker.sock 永不挂载；PRIV 不再获得直连能力。
+  local docker_session_active = false
+  pcall(function()
+    local s = require("NeoAI.sandbox.docker.session")
+    docker_session_active = s.active() == true
+  end)
+  if opts and opts.process and ((req and req.docker) or docker_session_active) then
+    local applied = _apply_docker_session(priv, opts)
+    if applied then
+      priv.privileged = false
+    end
   end
   -- 高权限模式：不遮蔽 SSH 私钥/agent 路径（默认开，可用 unmask_ssh_keys=false 关闭）。
   if privileged_active then

@@ -418,10 +418,58 @@ is only kept for other `approval.mode` values (`prompt`/`strict`).
   - **Benchmark**: `require("NeoAI.sandbox.observe.diag").bench_capture({ files = N })` returns
     materialize cold/warm and capture main-thread timings for regression comparison (resets the
     sandbox; diagnostic only).
-- **Model visibility**: the tool result is returned to the model **unchanged**, with no
-  "staged/awaiting review" note, so the AI believes the change completed. Pending state is
-  surfaced to the user only via a **prominent statusline badge** (the `sandbox` part shows a
-  bold yellow `待审N` only when pending reviews > 0, see [configuration.md](configuration.md)).
+- **Model visibility (tell the AI)**: tool results carry a structured result envelope so the model
+  knows what happened:
+  - `[沙箱] STAGED change_set=… files=N decision=NEEDS_CONFIRMATION`: the change is frozen in the
+    session staging layer and becomes real only after the user confirms it in the review UI. It
+    carries `retryable=false do_not_repeat=true` so the model does not treat "pending" as a failure
+    and retry in a loop. The envelope contains only the change_set / file summary / consequence id —
+    **never** overlay or staging paths (no internal implementation leaks).
+  - `[沙箱] BLOCKED code=… resource=… op=… class=…`: returned when the call hits a protected
+    resource that approval cannot unlock; it carries `reason`/`hint` (only the user can allow it in
+    configuration) and `retryable=false`.
+  - Pending state is still surfaced to the user via a **prominent statusline badge** (the `sandbox`
+    part shows a bold yellow `待审N` only when pending reviews > 0, see
+    [configuration.md](configuration.md)).
+- **Consequence disclosure (user side)**: the approval popup and review items share the same text
+  (`sandbox/review/consequence.lua`: capability / scope / persistence / suggestion), with resource
+  classification in `sandbox/protected/registry.lua`. When a protected resource is involved, the
+  popup inserts the consequence block before the arguments and **does not offer** "allow all (this
+  session)" or "allow and add to workspace" — the former would launder one approval into silent
+  session-wide auto-allow for that tool, the latter would widen the directory scope; only
+  "this call only" and cancel remain. Review items show the same consequence summary by id, so the
+  popup and the list never disagree.
+- **Pre-authorized bindings (`tools.sandbox.protected.preauthorized`)**: let a **specific key** be
+  used by a **specific consumer** (`egress` / `tool:<name>`) toward a **specific target** without a
+  prompt (`sandbox/protected/preauthorize.lua`). Three hard rules:
+  - **Fingerprint is mandatory**: it binds *this key* (`sha256:<hex>`), so a `cp`/rename or a
+    swapped key invalidates it immediately;
+  - **It only removes a prompt, never adds capability**: a binding never grants a new op (SSH
+    private keys still have no `read`) and never relaxes `mask_paths` hard masking;
+  - **It is not exempt from auditing**: every hit writes `observe/audit` (fingerprint prefix,
+    consumer, target, use count); `expires_at` / `max_uses` send it back through approval, and
+    unknown targets (unresolvable host) never match.
+
+  Relation to existing exemptions: coarse allowances (per-directory via
+  `tools.sandbox.git.credentials` exposing `~/.ssh`, per-host via `secrets.trusted_services` and
+  auto-trusted model providers) still exist; pre-authorized bindings are a finer-grained addition
+  and never widen them.
+- **Host-side SSH capability (`tools.sandbox.ssh`, off by default)**: the AI can use host keys, but
+  **keys never enter the sandbox**.
+  - `ssh_run` accepts only `alias + command`; `ssh_tunnel` only `alias + action + ports/target`.
+    host/user/port/key/`-o` all come from the alias config and cannot be substituted by the AI.
+  - The command template is fixed: `ssh -F /dev/null -o IdentitiesOnly=yes -o BatchMode=yes
+    -o PermitLocalCommand=no -o ForwardAgent=no -o StrictHostKeyChecking=… -i <key> … <host> -- <cmd>`.
+    The alias must declare `fingerprint` (as printed by `:NeoAI SandboxKeys`); a swapped/renamed key
+    is rejected.
+  - Tunnels are limited to `-L 127.0.0.1:<lp>:<rh>:<rp>`; `rh` must match the alias `remote_hosts`
+    allowlist and `lp` must fall in `local_ports`. No `-R`/`-D`/`GatewayPorts`. `-f -N` daemonizes
+    and a ControlPath is used to close precisely.
+  - Every call is frozen as a host-op proposal (`hostop`); after the user confirms it in
+    `:NeoAI SandboxReview` it runs **on the host**, and `ssh_result(host_op_id)` reads back status
+    and output. Only the host openssh process reads the key.
+  - Consequence: a self-compiled ssh / hand-written agent client inside the sandbox has no usable
+    target or key — the decision subject is "alias + action", not "which binary called".
 - Async confirmation commands:
   - `:NeoAI SandboxReview` — open the review UI (`ui/components/sandbox_review.lua`)
     (**it opens even with no pending / approval / trace items, showing an empty view — no
@@ -1979,8 +2027,10 @@ defense-in-depth to the bwrap prefix by default (`--cap-drop ALL` plus the tier 
   UUID" contradiction).
   In-process `read`/`fs_write` tools do not go through a namespace, so mount masking does not apply;
   the executor additionally queries `runtime.is_masked_path` for path arguments and **hard-rejects**
-  hits (`路径位于宿主敏感遮蔽路径`, no approval), covering `read_file`/`search_files`/`edit_file`
-  and other tools that read the host directly.
+  hits with a structured result
+  (`[沙箱] BLOCKED code=PROTECTED_RESOURCE resource=… op=… class=…` plus `retryable=false`; approval
+  cannot unlock it), covering `read_file`/`search_files`/`edit_file` and other tools that read the
+  host directly.
 - **Read surface: whole-root writable overlay (`read_all`, on by default)**: by default the host root
   is mounted as an overlay with `/` as the read-only lower and a session-private upper/work as the
   writable layer — the sandbox root filesystem is **writable as-is** (any path, no more
@@ -2009,6 +2059,19 @@ defense-in-depth to the bwrap prefix by default (`--cap-drop ALL` plus the tier 
   > exposed by `delegate_cgroup` (`prepare_delegated`'s `leaf`); limits live on the unwritable
   > `limit_path` and are physically capped by cgroup v2 hierarchy. Host cgroups are neither visible
   > nor writable. With `read_all=false` these paths fall back to read-only.
+  > **Auth / loader paths are an exception (still read-only under the root overlay)**:
+  > `/etc/pam.d`, `/etc/security`, `/etc/ld.so.conf`, `/etc/ld.so.conf.d`, `/root/.bashrc`,
+  > `/root/.profile`, … are re-bound with `--ro-bind` above the overlay (readable, not writable);
+  > `/etc/ld.so.preload` is force-masked to `/dev/null` (creation is blocked even when absent on the
+  > host). This removes the "rewrite auth config or inject a loader in-sandbox → in-session privilege
+  > escalation / code injection" primitive.
+  > `/etc/passwd`, `/etc/group`, `/etc/systemd`, `/etc/profile*` and other users' homes stay
+  > writable: `useradd`/`adduser` must write the account DB into the overlay (an existing sysadmin
+  > capability), and systemd units / package-install artifacts are mediated by the facade/candidate
+  > pipeline; non-root homes may not be traversable (a failing ro-bind source would break bwrap).
+  > Those writes are still frozen as review candidates and **never touch the host disk** (red-team:
+  > root rc/pam/ld.so.conf/ld.so.preload writes were rejected; passwd writes stayed in the overlay and
+  > host hashes were unchanged).
   - **Outside-workspace tracing (non-blocking)**: accessing user working dirs outside `cwd` (under
     home/root) records evidence (kind=observation), emits a `sandbox:outside_access` event, and is
     shown in the `:NeoAI SandboxReview` window under "越界访问留痕"; the read is still allowed, not
@@ -2189,6 +2252,13 @@ commands (SSRF, e.g. host admin panels, internal ports, cloud metadata):
   unified `sandbox:consent_requested` event (`page="network"`; the old `sandbox:net_consent_requested`
   constant is kept). Long-lived services auto-register internal ports declared via
   `PORT`/`--port` etc. (`net_consent.register_from_command`).
+  - **Record-only mode (`network.record_only=true`, default off)**: allow every network request
+    without consent prompts or proxy-evasion interception and only record targets; it overrides
+    `access` and `network.enabled`, and starts the host filtering proxy / injects proxy env vars even
+    when `host_local_block=false` so records keep flowing. Records go to a dedicated ring buffer
+    (not drained by command result summaries); view them with `:NeoAI SandboxAudit network`.
+    `offline=true` still hard-isolates; `network.gateway` takes precedence when enabled; raw TCP/UDP
+    still respects the default `isolation="proxy"` netns boundary.
   - **Per "port + service process" granularity** (`network.consent_process_granularity`, on by
     default): for host-local targets the sandbox resolves the **host listening process** behind the
     port (`net_consent.port_owner`: parse LISTEN inodes from `/proc/net/tcp{,6}`, scan the full pid
@@ -2235,15 +2305,30 @@ commands (SSRF, e.g. host admin panels, internal ports, cloud metadata):
   host `https_proxy`/`http_proxy`/`all_proxy`; `false`/`""` = no chaining (direct); a string = an
   explicit URL (`http://127.0.0.1:7890` / `socks5h://127.0.0.1:1080`). Host-local targets and host
   `no_proxy` matches always connect directly.
-- **Boundary (important)**: this is **application-layer** filtering. **Raw TCP that ignores the
-  proxy** (`nc`/`ssh`/database clients, tools ignoring proxy env) can connect directly to the host
-  under a shared netns and is not covered. Hard-interception of raw TCP requires either root +
-  iptables/nft (destination-based filtering) or rootless `slirp4netns`/`passt` (native userspace
-  network stacks, not installed here) — this plugin does not add those dependencies. So this is a
-  **non-hard boundary**; see the `sandbox/net/host_proxy.lua` module header.
+- **Private netns by default (`network.isolation="proxy"`)**: the payload runs in a dedicated
+  netns with only loopback; external access must go through the host proxy (in-sandbox socat →
+  Unix socket → `host_proxy`). Therefore **raw TCP/UDP and raw sockets have no route**, and the
+  host loopback/NICs/cloud metadata are unreachable; curl/pip/git etc. that honor proxy env still
+  work. As root the host creates the netns via `ip netns` (lo is brought up by the host; the payload
+  needs no CAP_NET_ADMIN); as non-root bwrap creates the userns+netns and the payload holds
+  CAP_NET_ADMIN scoped to that userns/netns. `:NeoAI SandboxCaps` reports `net_isolation`.
+  In-sandbox `127.0.0.1/localhost` connects directly (to sandbox-local services); only external
+  targets go through the proxy.
+  - Deps: `socat` (both host and sandbox) and, as root, `ip` (iproute2). When missing,
+    `isolation_fail_closed` (default true) cuts the network, or an explicit degraded shared netns
+    with warnings.
+  - Exemptions: container sessions (rootless dockerd/podman) and LSP subprocesses are not isolated
+    (they need their own network stack / provider network); non-HTTP protocols (DB/SSH/raw UDP) are
+    unavailable by default.
+- **Only with `network.isolation="off"`** (legacy shared netns) does the following application-layer
+  boundary apply: raw TCP that ignores the proxy (`nc`/`ssh`/DB clients) can reach the host. The
+  default mode blocks it at the kernel (netns) level; if isolation is unavailable,
+  `isolation_fail_closed` (default true) cuts the network, or an explicit degraded shared netns
+  with warnings.
 - **Proxy-evasion confirmation**: explicitly clearing/bypassing the proxy (`unset *proxy`,
-  `env -u *proxy`, `curl --noproxy`, `--proxy ""`/`-x ''`, `export *proxy=`) defeats the filter above;
-  the gate detects it on the **folded effective command** before entering the sandbox
+  `env -u *proxy`, `curl --noproxy`, `--proxy ""`/`-x ''`, `export *proxy=`) defeats the filter above
+  only under a shared netns (`isolation="off"`); under the default private netns it only cuts the
+  network (fail-closed). The gate detects it on the **folded effective command** before entering the sandbox
   (`PROXY_EVASION:*`) and, by default, **pauses the agent and prompts** (`network.block_proxy_evasion=true`:
   allow once / always this session / deny). The prompt is a **sandbox floating window** consistent with
   the network-consent / tool-approval / device-consent ones (`ui/components/policy_consent.lua`, titled
@@ -2251,7 +2336,10 @@ commands (SSRF, e.g. host admin panels, internal ports, cloud metadata):
   `network.consent_timeout_ms` (default 30s auto-block). `"deny"` rejects outright (old hard reject),
   `false` does not intercept. It normalizes shell quoting/ANSI-C/escapes and expands same-command variables before
   matching (defeating `--noprox''y`/`$'--noproxy'`/`$c`), and treats `-x` as `--proxy` only for curl
-  (so `set -x` is not a false positive). Headless (no attached UI) fails closed.
+  (so `set -x` is not a false positive). **Wrapper prefixes** are stripped before evaluation
+  (`timeout`/`nice`/`nohup`/`setsid`/`sudo`/`doas`/`xargs`/`command`/`exec`/`env`/`stdbuf`/`script`/…):
+  red-team testing showed `timeout 8 env -u http_proxy curl …` previously escaped the first-token-only
+  check; it now hits `PROXY_EVASION:env-unset`. Headless (no attached UI) fails closed.
 - **Residual information leak (inherent to a shared netns)**: because T0 shares the host network
   namespace, `/proc/net/tcp`, `/proc/net/unix` (host connection/Unix-socket tables) and
   `ip addr`/`ip route` (netlink, host topology) are visible to the sandbox. `/proc/net` is a
@@ -2419,6 +2507,7 @@ require("NeoAI").setup({
       process_roots = {},            -- run_command writable roots (default cwd only, auto-added; add more explicitly)
       network = {
         host_local_block = true,     -- intercept host-local access (application-layer; raw TCP not covered, see §6.1)
+        record_only = false,         -- record-only: allow all network (no prompts) and keep viewable records; overrides access/network.enabled
         host_local_proxy_port = 0,   -- host filtering proxy port (0 = random loopback port)
         upstream_proxy = nil,        -- host upstream proxy chaining: nil=auto-use host *_PROXY; false/""=no chaining; string=explicit URL
         proxy = "strip",             -- strip | passthrough | { http, https, all, no_proxy }
@@ -3082,20 +3171,23 @@ explicit human confirmation** before publishing.
 - `allowlist` adds further Lua-pattern exclusions. See `tools.sandbox.secrets` in
   [configuration.md](configuration.md).
 
-### 16.6 Env vars: the sandbox process gets real values, the AI only sees fake keys
+### 16.6 Env vars: tokens by default, real values require opt-in
 
-`sanitized_env()` produces the faked overrides (for logs/audit and the AI-visible surface);
-`sandbox_env()` restores real secrets when constructing the sandbox process environment —
-**fake→real replacement is allowed only for sandbox-internal processes**. Therefore:
+`sanitized_env()` produces the token overrides (for logs/audit and the AI-visible surface);
+`sandbox_env()` constructs the sandbox process environment.
 
-- Programs inside the sandbox (`curl`/`pip`/`python` …) use the **real secret** and do not fail
-  (401 / build errors) because of masking.
+- By default (`tools.sandbox.secrets.real_env_values=false`) the payload env contains only
+  format-preserving fake values (tokens) — **real secrets never enter the child process**. Even if the AI enumerates all
+  env vars with `os.environ` and exfiltrates them over a raw socket, it only gets tokens.
+- Tokens explicitly used in command arguments are still restored to real values right before exec
+  (`wrapper` `detokenize`); that path is subject to the `secret_egress` guard (sending a key to a
+  non-whitelisted target prompts, and fails closed headless).
 - Command output is re-faked before it returns to the model, so the AI still only sees
-  format-preserving fake keys; `NEOAI_TOKENIZED_ENV` lists the masked variable names so it is clear
-  which values are fakes in the AI-visible output.
-- To disable env faking entirely (debugging / trusted local runtime), set
-  `tools.sandbox.secrets.tokenize_env = false`; tool results and staged content are still protected.
-  **This weakens isolation — use only temporarily in trusted environments.**
+  format-preserving fake keys; `NEOAI_TOKENIZED_ENV` lists the masked variable names.
+- If a command genuinely must read real keys from env (`gh`, private registries), set
+  `tools.sandbox.secrets.real_env_values = true`. **This restores the risk that any in-sandbox
+  command can exfiltrate real keys — use only for explicitly trusted tasks.**
+- `tokenize_env=false` still disables env tokenization entirely (debugging; weaker isolation).
 
 ### 16.7 Mapping and lifecycle
 
@@ -3268,7 +3360,11 @@ per tier. Core modules: `sandbox/execution/privilege.lua` (classify/resolve/reco
   `auto_escalate=false`.
 - Recording: every tier decision/escalation is recorded (`record=true` by default).
 
-### Containers (podman-only; the host docker daemon is never contacted)
+### Containers (without a session runtime: podman-only; the host docker daemon is never contacted)
+
+> When the auto tier is N1/N2, `docker` no longer uses the rewrite below; it connects to the
+> session-native rootless runtime broker (see "Session-native Docker" above). This section describes
+> the fallback when no session runtime is available / the container facade is enabled.
 
 The sandbox **never binds the host `/var/run/docker.sock`** (always masked). Container commands always
 **really execute** inside the sandbox:
@@ -3322,8 +3418,37 @@ The sandbox **never binds the host `/var/run/docker.sock`** (always masked). Con
   "docker is routed to podman", not "I am in a sandbox".
 - Remote/connection options (`--remote`/`-H`/`--connection`) and host-VM subcommands (`machine`) are
   rejected for safety, also rendered in authentic docker style with no sandbox wording.
-- `tools.sandbox.docker` (`mode`/`socket`) is **deprecated**: no socket is ever mounted/connected
-  regardless of its value; the keys are kept only for backward compatibility.
+- Docker has **no user configuration** now: `tools.sandbox.docker.mode/socket` and
+  `tools.privileged_mode.docker_socket` are removed; the runtime auto-detects the highest safe tier.
+  It never contacts a host docker daemon and never mounts the real `docker.sock`.
+
+### Session-native Docker (auto tier / host broker / rebuild)
+
+- **Auto tier** (`sandbox/docker/probe.lua`): `N0` no session runtime; `N1` rootless podman system
+  service / rootless dockerd inside the session userns; `N2` N1 + microVM/gVisor. No user mode.
+- **Session runtime** (`sandbox/docker/session.lua`) prepares a host-visible socket directory; the
+  resident session boot starts the rootless runtime inside the userns+mnt namespace. Containers are
+  descendants of that namespace and die with it. When NeoAI runs as non-root, RootlessKit maps
+  subuid/subgid, agent commands are dropped to a dedicated uid via `setpriv`, and they cannot open the
+  root-owned `runtime.sock` — only the broker. When started as root, bwrap's single uid map cannot
+  setuid to an unmapped uid, so the agent stays userns root and the broker degrades to a policy layer
+  (tier/status is shown by `:NeoAI SandboxDocker`).
+- **Host broker** (`sandbox/docker/broker.lua`): a self-developed Unix-socket proxy that parses the
+  Docker Engine API and enforces an endpoint allowlist plus `HostConfig`/`Mounts`/`NetworkMode`/
+  `SecurityOpt` body checks. It re-encodes requests instead of forwarding raw bytes. `/exec`, `/build`,
+  `/swarm`, `/volumes` etc. are denied by default. Direct `podman` calls bypass the Docker API broker;
+  their boundary is the session userns. Use `docker`/`podman --remote` to go through the broker when
+  body checks are required.
+- **Container review** (`sandbox/docker/review.lua`): the AI may operate any reviewed container, not
+  only its own. `blocked` cannot be approved; `sensitive` logs/exec/rm require user approval via
+  `:NeoAI SandboxDocker`.
+- **Resource monitor** (`sandbox/docker/monitor.lua`): safe containers are **not network-denied**;
+  sustained CPU/memory/PID/OOM excess auto-kills the container and reports the reason in the next
+  `run_command` result.
+- **Exit rebuild** (`sandbox/docker/specs.lua`): containers die with the userns; specs are saved.
+  **Every** container enters the rebuild flow: safe specs auto-rebuild (start if it was running;
+  create-only if it was stopped, then print the rebuild command and safety summary); unsafe specs
+  become pending and require `:NeoAI SandboxDocker approve`.
 
 ### T2 host-effect proposals
 
@@ -3348,7 +3473,8 @@ The tool call never blocks.
 
 ### Configuration
 
-See `tools.sandbox.privilege` and `tools.sandbox.docker` in [configuration.md](configuration.md).
+See `tools.sandbox.privilege` in [configuration.md](configuration.md). Docker has no user config;
+use `:NeoAI SandboxCaps` / `:NeoAI SandboxDocker` to inspect the auto-resolved state.
 
 ### 17.1 Non-root payload, overlay write probing and write escalation
 
@@ -3569,16 +3695,11 @@ command in the `effect="process"` branch:
   real binary is still the in-sandbox podman, and the shim adds the shared flags for `run`/`create`), so
   they cannot reach the host daemon.
 
-**Explicit exception for privileged mode** (`tools.privileged_mode.enabled=true` and
-`tools.approval.mode="async"` only): after the user manually enters PRIV, the container facade and
-entry shims are bypassed entirely, `docker` mounts the host `/run/docker.sock` (or the configured
-`docker_socket`) and injects `DOCKER_HOST`, `podman/buildah` get container capabilities, the network
-is forced to `access="allow"` with `offline=true` lifted (still recorded through `host_proxy`), and
-SSH key/agent paths (`~/.ssh`, `/home/*/.ssh`, `/run/ssh-agent.socket`, …) are no longer masked
-(`unmask_ssh_keys=true`). Containers are then created by the host daemon outside the sandbox and
-**do not enter the candidate/approval pipeline**; the socket is equivalent to host root capability,
-and reading/using SSH private keys no longer goes through mask approval. Ordinary file I/O still
-goes through the overlay/review flow. The mode is off by default and cannot be entered by the AI.
+**Privileged mode** (`tools.privileged_mode.enabled=true` and `tools.approval.mode="async"` only)
+relaxes only network recording and SSH masking. It **no longer** bypasses to the host docker daemon
+and never mounts `/run/docker.sock`. Docker is served by the auto-detected session rootless runtime
+plus the host-side broker; containers die with the session userns. PRIV does not raise the Docker
+tier. The mode is off by default and cannot be entered by the AI.
 
 **Decision scope and timing**: network allowance is **process-wide** — while any PRIV session exists
 in the process, network traffic is allowed and recorded (the host-side filtering proxy is a shared
@@ -3593,7 +3714,7 @@ A controlled plan is stored as `kind="container"` evidence and emits `SANDBOX_CO
 rejected calls emit `SANDBOX_CONTAINER_UNSUPPORTED` and are audited (the real reason goes only to
 audit/UI, never to the model). Config: `tools.sandbox.container`
 (`enabled`/`share_namespace`/`docker_to_podman`/`runtime_caps`/`seccomp`/`containers_conf`/
-`allow_nonroot`); `tools.sandbox.docker` (`mode`/`socket`) is **deprecated** and no longer read.
+`allow_nonroot`). Docker has no user configuration; its mode is auto-detected.
 
 ### 18.4 Auto-approval for new sessions (default off)
 
@@ -3657,7 +3778,12 @@ freeze time to avoid whole-unit publish conflicts.
   into the approval window. `github.com`/`githubusercontent.com` are silently allowed by default;
   other remotes follow `tools.sandbox.network.access` (consent prompt). Remote auth follows
   `tools.sandbox.git.credentials`: `host_ssh` (default, exposes host `~/.ssh` read-only) | `host`
-  (also `~/.git-credentials`, …) | `isolate`. SSH remotes (`git@host:...`) are bare TCP, so a
+  (also `~/.git-credentials`, …) | `isolate` | `preauth` (exposes only the private keys whose
+  fingerprint matches `protected.preauthorized`, matched by the remote host against
+  `consumers`/`targets`, plus `known_hosts`; exposed as per-file read-only binds while `~/.ssh`
+  stays an empty tmpfs; `GIT_SSH_COMMAND` uses `-F /dev/null -o IdentitiesOnly=yes` to remove the
+  ssh-config execution surface; fails closed when no binding matches). SSH remotes (`git@host:...`)
+  are bare TCP, so a
   `ProxyCommand` through the sandbox SOCKS endpoint is injected by default
   (`tools.sandbox.git.ssh_proxy`; `auto` prefers `socat`, then `ncat`; `false` disables; a string is
   a custom command), so SSH also egresses through the host filtering proxy and is checked.
@@ -3686,22 +3812,46 @@ This section triages audit findings as **fixed / mitigated / design boundary**. 
 trade-off made to avoid new dependencies or breaking normal networking/builds — not a defect; and a
 mitigation can still be bypassed by more elaborate commands.
 
+### 19.0 Isolation backend
+
+- **The unshare backend (no mount namespace) provides no filesystem isolation**: when bwrap is
+  unavailable the runtime falls back to `unshare`; the payload runs as root inside the userns, and
+  when NeoAI itself runs as root that userns root maps to host root, so host paths such as `/etc/**`
+  are directly writable (confirmed by the red-team drill when a temporary bwrap probe failure forced
+  the fallback). **Production must keep bwrap available**; a root environment without bwrap must not
+  treat this backend as a security boundary.
+
+- **Consent prompts hanging under headless (fixed)**: the `secret_alert` / `device_consent` /
+  `net_consent` / `policy_consent` popup UIs are still registered under `--headless`, but there is no
+  window to render. `available()` used to check only "is a UI registered", so `request()` waited
+  forever (tool hung and later commands queued behind the setup lock). Real renderers now register
+  with `requires_ui=true`, and `available()` returns false without an attached UI, failing closed.
+
 ### 19.1 Network
 
 - **Proxy evasion (mitigated)**: `host_local_block` relies on proxy env vars; explicitly clearing or
   bypassing them (`unset *proxy`, `env -u *proxy`, `curl --noproxy`, `--proxy ""`/`-x ''`,
-  `export *proxy=`) defeats the filter and reaches the host directly. The gate detects this on the
+  `export *proxy=`) defeats the filter and reaches the host directly **only in a shared netns**
+  (`isolation="off"`); under the default private netns it just cuts the network (fail-closed). The gate detects this on the
   **folded effective command** before entering the sandbox (`PROXY_EVASION:*`) and by default
   **pauses and prompts** (`tools.sandbox.network.block_proxy_evasion=true`: allow once / always this
   session / deny); `"deny"` rejects outright and `false` allows without asking; headless with no UI
   fails closed. Detection first applies shell normalization (quote concatenation `--noprox''y`,
   ANSI-C quoting `$'--noproxy'`, backslash escapes) and expands simple same-command variables
   (`c=--noproxy; curl $c`) to defeat concatenation/variable bypasses; `-x` is treated as `--proxy`
-  only for curl, so `set -x` etc. are not falsely rejected.
-- **Bare TCP (design boundary)**: tools that ignore the proxy (`nc`/`ssh`/DB clients/raw sockets) can
-  connect to the host directly under a shared netns. Kernel-level destination filtering requires root
-  + iptables/nft or `slirp4netns`/`passt` (not bundled). For a hard boundary enable `network.gateway`
-  (isolated netns).
+  only for curl, so `set -x` etc. are not falsely rejected. **Wrapper prefixes** (`timeout`/`nice`/
+  `nohup`/`setsid`/`sudo`/`xargs`/`command`/`env`, …) are stripped first — the red-team
+  `timeout 8 env -u …` bypass is fixed.
+- **Bare TCP (blocked by default; a design boundary only with `isolation="off"`)**: under the
+  default private netns, raw TCP/UDP has no route (`ENETUNREACH`) and host loopback/NICs are
+  unreachable. With `isolation="off"` (shared netns) tools that ignore the proxy can reach the host;
+  use `isolation="proxy"` or `network.gateway` for a hard boundary. The private netns provides only
+  loopback + the host proxy: non-HTTP protocols (DB/SSH/raw UDP) are unavailable by default.
+- **Real keys in the payload env (mitigated)**: by default `secrets.real_env_values=false`, so the
+  sandbox process only receives format-preserving fake values (tokens) and real values never enter the payload; tokens in
+  command arguments are restored right before exec under the `secret_egress` guard. Even with raw TCP
+  available, enumerating env only yields tokens. Setting `real_env_values=true` restores the old
+  behavior (real values in the payload) and should be reserved for trusted tasks.
 - **Loopback over-blocking (mitigated)**: a shared netns cannot distinguish host vs sandbox loopback by
   address, so unregistered loopback targets default to ask/deny. The filter now identifies ports
   listened on by sandbox processes by **cgroup membership** (LISTEN socket inode held by a `/neoai/`

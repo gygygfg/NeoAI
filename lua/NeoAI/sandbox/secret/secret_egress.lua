@@ -145,6 +145,25 @@ function M.check(dest, payload, meta)
   if M.trusted(host) then return async.resolve(true) end
   local hit = _payload_secret(payload)
   if not hit then return async.resolve(true) end
+  -- 免审批预授权绑定（密钥指纹 × 消费者 × 目标）：命中只跳过弹窗，仍写审计。
+  -- 目标必须可判定（未知目标不放行），避免「绑定不限目标」意外覆盖 `(未知目标)`。
+  if hit ~= "fake" and M.host_of(dest) then
+    local pre = require("NeoAI.sandbox.protected.preauthorize")
+    if pre.has_any() then
+      local consumers = { "egress" }
+      local tool = meta and meta.tool
+      if type(tool) == "string" and tool ~= "" then
+        consumers[#consumers + 1] = "tool:" .. tool
+        -- 子进程工具名内部带 `exec_` 前缀（如 `exec_git_fetch`）：同时接受省略前缀的写法，
+        -- 避免把内部命名泄漏成配置项。
+        local short = tool:gsub("^exec_", "")
+        if short ~= tool then consumers[#consumers + 1] = "tool:" .. short end
+      end
+      if pre.allow({ secret = hit, consumers = consumers, target = M.host_of(dest), op = "egress" }) then
+        return async.resolve(true)
+      end
+    end
+  end
   pcall(function()
     require("NeoAI.kernel.event_bus").emit(require("NeoAI.kernel.events").SANDBOX_SECRET_EGRESS, {
       dest = dest, tool = meta and meta.tool, agent_id = meta and meta.agent and meta.agent.id,
@@ -201,14 +220,23 @@ local NETWORK_BINS = {
   telnet = true, ssh = true, scp = true, sftp = true, rsync = true, ftp = true,
   dig = true, nslookup = true, host = true, ping = true, git = true, pip = true,
   pip3 = true, npm = true, npx = true, python = true, python3 = true, node = true,
-  ruby = true, php = true, go = true, cargo = true, docker = true, kubectl = true,
+  ruby = true, php = true, perl = true, go = true, cargo = true, docker = true,
+  kubectl = true, openssl = true, busybox = true, tcpdump = true, nmap = true,
 }
 
---- 命令是否可能出网
+--- 不依赖网络客户端、但可直接建连/发字节的 shell/语言原语。
+local RAW_EGRESS_MARKERS = {
+  "/dev/tcp/", "/dev/udp/", "socket.socket", "socket(AF_INET", "SOCK_STREAM",
+}
+
+--- 命令是否可能出网（含裸 TCP/自建 socket 原语）
 --- @param command string
 --- @return boolean
 local function _may_egress(command)
   if type(command) ~= "string" then return false end
+  for _, m in ipairs(RAW_EGRESS_MARKERS) do
+    if command:find(m, 1, true) then return true end
+  end
   for tok in command:gmatch("[%w_%./%-]+") do
     local base = tok:match("[^/]+$") or tok
     if NETWORK_BINS[base] then return true end

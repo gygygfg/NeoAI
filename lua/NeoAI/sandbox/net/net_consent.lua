@@ -152,16 +152,12 @@ function M.policy()
   -- 判据为进程级（任一 PRIV 会话存在），不随 UI 焦点/当前 Agent 漂移。
   local ok, privileged = pcall(require, "NeoAI.sandbox.privileged")
   if ok and privileged.network_active() then return "allow" end
-  local p = _cfg().access
+  local cfg = _cfg()
+  -- 仅记录模式：不拦截（外部/本机均放行），仍由 host_proxy 记录目标。
+  if cfg.record_only == true then return "allow" end
+  local p = cfg.access
   if p ~= "allow" and p ~= "deny" then p = "ask" end
   return p
-end
-
---- 是否可弹窗（策略为 ask 且有 UI）
---- @return boolean
-function M.available()
-  if M.policy() ~= "ask" then return false end
-  return state.ui ~= nil and type(state.ui.show) == "function"
 end
 
 --- 是否存在可交互的 Neovim UI（`--headless` 无 attached UI）。
@@ -169,6 +165,16 @@ end
 local function _interactive()
   local ok, uis = pcall(vim.api.nvim_list_uis)
   return ok and type(uis) == "table" and #uis > 0
+end
+
+--- 是否可弹窗（策略为 ask 且有 UI）
+--- @return boolean
+function M.available()
+  if M.policy() ~= "ask" then return false end
+  if state.ui == nil or type(state.ui.show) ~= "function" then return false end
+  -- `requires_ui` 的渲染器在 --headless 下无法展示：若仍视为可用，request 会永久等待。
+  if state.ui.requires_ui and not _interactive() then return false end
+  return true
 end
 
 --- 是否可向用户呈现同意界面（独立弹窗或统一审批窗口任一可用，且确有可交互 UI）。

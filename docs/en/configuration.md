@@ -241,7 +241,7 @@ session = {
 | `todo.enabled` | `true` | Todo tool + system prompt injection |
 | `web` | See below (`search.enabled=false`, `fetch.enabled=false` by default) | DeepSeek Web Search / Fetch (only exposed to DeepSeek providers) |
 | `plan_mode` | `{enabled=true, auto_execute_on_approve=true, distill_on_execute=true, distill_parallel=true, distill_front=true, distill_max_attempts=2, extract_max_tokens=nil, extra_safe_tools={}, mutating_tools=...}` | Plan mode |
-| `privileged_mode` | `{enabled=false, require_async_approval=true, override_offline=true, docker_socket="", unmask_ssh_keys=true, record_network=true, max_records=1000}` | Privileged mode (opt-in): record-only network, direct docker/podman, SSH keys unmasked; async approval only |
+| `privileged_mode` | `{enabled=false, require_async_approval=true, override_offline=true, unmask_ssh_keys=true, record_network=true, max_records=1000}` | Privileged mode (opt-in): record-only network, SSH keys unmasked; async approval only. Docker is no longer direct-connected from PRIV: it auto-detects a session rootless runtime + host-side broker |
 | `sub_agent` | `{final_instruction="summarize your work at the end..."}` | Sub-agents: an instruction auto-appended to a sub-agent's task prompt (asks it to summarize its work); set to `""` to disable. On completion the sub-agent's final body is delivered back to the main agent automatically |
 | `approval` | See below | Tool approval |
 | `sandbox` | See below | Tool execution sandbox (dry-run/commit, isolation backend, policy) |
@@ -433,6 +433,7 @@ sandbox = {
     "/home/*/.ssh", "/home/*/.gnupg", "/home/*/.netrc", "/home/*/.git-credentials",
     "/home/*/.config/git/credentials", "/home/*/.config/gh", "/home/*/.docker/config.json",
     "/etc/shadow", "/etc/gshadow", "/etc/sudoers", "/etc/machine-id", "/etc/ssh",
+    "/etc/ld.so.preload",          -- loader preload hook (blocks creation in-session even if absent on host)
     "/etc/fstab",                  -- host disk layout / root UUID (mount -o remount uses it)
     "/var/log", "/var/spool/cron", "/etc/crontab",
     "/root/.bash_history", "/root/.zsh_history", "/root/.python_history", "/root/.wget-hsts",
@@ -442,6 +443,47 @@ sandbox = {
   mask_dirs_enabled = true,        -- master switch
   mask_dirs = { "/home", "/root" }, -- masked dirs (supports * globs)
   mask_dirs_approval = true,       -- request approval on masked hits (reuses tool approval UI)
+  -- Consequence disclosure text for protected resources (same source as `mask_paths`; it only
+  -- changes what the user sees, never the decision). The approval popup inserts
+  -- capability/scope/persistence/suggestion before the arguments and no longer offers
+  -- "allow all (this session)" or "add to workspace"; review items show the same summary by id.
+  -- Per-resource text can be overridden by id (ids: lua/NeoAI/sandbox/protected/registry.lua):
+  protected = {
+    consequences = {
+      -- ssh_private_key = { suggestion = "Only the deploy key is allowed in this repo" },
+    },
+    -- Pre-authorized bindings (R3): a specific key × specific consumer × specific target,
+    -- used without a prompt. It only skips approval — it never adds capabilities (SSH private
+    -- keys still have no `read`). Every hit is still audited (SandboxReview "behavior" page);
+    -- `expires_at` / `max_uses` send it back through approval. The fingerprint is mandatory:
+    -- it binds *this key*, so a `cp`/rename or a swapped key invalidates it immediately.
+    --   fingerprint: "sha256:<hex>" from `:NeoAI SandboxKeys [file]` (no arg lists ~/.ssh keys);
+    --   consumers:   empty = any; "egress" (any egress) / "tool:<name>" (specific tool, `exec_` prefix optional);
+    --   targets:     empty = any; supports `*.example.com`; unknown targets never match;
+    --   expires_at:  epoch seconds; max_uses: use cap (0/absent = unlimited).
+    preauthorized = {
+      -- { fingerprint = "sha256:…", resource = "~/.ssh/id_deploy",
+      --   consumers = { "tool:git_fetch" }, targets = { "github.com" }, max_uses = 100 },
+    },
+  },
+  -- Host-side SSH capability (off by default): the AI can only use the host's openssh via a
+  -- declared **alias**; keys never enter the sandbox. Calls are frozen as host-op proposals
+  -- (confirmed in :NeoAI SandboxReview, then executed on the host) and read back with ssh_result.
+  -- Each alias pins host/user/port/key and MUST declare the key fingerprint
+  -- (`:NeoAI SandboxKeys <key>`). Tunnels are loopback-only (`-L 127.0.0.1:…`); target hosts and
+  -- the local-port range must be pre-declared (no -R/-D).
+  ssh = {
+    enabled = false,
+    connect_timeout = 10,
+    max_tunnels = 4, -- per-alias concurrent tunnel cap (counted by ControlPath sockets; close_all on shutdown)
+    aliases = {
+      -- prod = { host = "prod.example.com", user = "deploy", port = 22,
+      --          key = "~/.ssh/id_deploy", fingerprint = "sha256:…",
+      --          known_hosts = "~/.ssh/known_hosts", allow = { "exec", "tunnel" },
+      --          tunnel = { local_ports = { 10000, 10099 },
+      --                     remote_hosts = { "db.internal", "*.svc.internal" } } },
+    },
+  },
   -- The masked-dir list and master switch can be hot-edited via `E` on the "Resource Access" page of
   -- `:NeoAI SandboxReview` (session-only).
   -- Kernel-level behavior observation (eBPF/strace/procfs): decides "outside-workspace access" and
@@ -558,10 +600,18 @@ sandbox = {
   },
   network = {
     enabled = false, allowed_endpoints = {}, budget_bytes = 0, -- controlled network gateway
-    -- Intercept access to the host itself (loopback/host NIC IPs/link-local/cloud metadata; on by
-    -- default): injects HTTP(S)_PROXY/ALL_PROXY pointing at the host-side Lua filtering proxy —
-    -- host-local targets are blocked, external targets allowed and recorded. Application-layer
-    -- boundary: raw TCP that ignores the proxy can bypass it (see docs/en/sandbox.md §6.1).
+    -- Private netns network isolation (default "proxy"): the payload only has loopback; external
+    -- access must go through the host filtering proxy (in-sandbox socat → Unix socket → host_proxy).
+    -- Raw TCP/UDP and raw sockets have no route; host loopback/NICs/cloud metadata are unreachable;
+    -- curl/pip/git etc. that honor proxy env still work. Requires socat (host and sandbox); root
+    -- also needs ip (iproute2). "off" = legacy shared netns.
+    isolation = "proxy",
+    -- When isolation is unavailable (missing socat/ip, cannot create netns): true (default) = network
+    -- commands are cut off (fail-closed); false = fall back to shared netns with warning/evidence.
+    isolation_fail_closed = true,
+    -- In shared-netns mode (isolation="off"), intercept access to the host itself (loopback/host NIC
+    -- IPs/link-local/cloud metadata): inject HTTP(S)_PROXY/ALL_PROXY pointing at the host-side Lua
+    -- filtering proxy. Application-layer boundary: raw TCP can bypass it.
     host_local_block = true,
     block_proxy_evasion = true,      -- proxy-evasion handling (when host_local_block is active): true (default) = pause and prompt (allow once / always this session / deny); "deny" = reject outright (old hard reject); false = do not intercept (bypass allowed, filter boundary defeated). Clearing/bypassing includes unset *proxy, env -u, --noproxy, --proxy "", etc.
     host_local_proxy_port = 0,       -- host filtering proxy port (0 = random loopback port)
@@ -575,6 +625,15 @@ sandbox = {
     --   "allow"         = allow directly and record (previous behaviour);
     --   "deny"          = deny directly.
     access = "ask",
+    -- Record-only mode (default off): allow every network request without consent prompts or
+    -- proxy-evasion interception, and only record targets. When enabled it overrides `access`
+    -- (equivalent to "allow") and `network.enabled`, and ignores `block_proxy_evasion`; the host
+    -- filtering proxy starts and proxy env vars are injected even when `host_local_block=false`
+    -- so targets can be recorded. Records go to a dedicated ring buffer (not drained by command
+    -- result summaries); view them with `:NeoAI SandboxAudit network`. `offline=true` still
+    -- applies; `network.gateway` takes precedence when enabled; raw TCP/UDP still respects the
+    -- netns boundary.
+    record_only = false,
     -- Consent granularity for local network access (default on): the prompt shows the **host
     -- listening process** behind the target port (comm / pid / executable / cmdline summary) and
     -- remembers the session approval per "port + service process" — a different process taking over
@@ -662,9 +721,9 @@ sandbox = {
       { tier = 1, name = "package", bins = { "apt", "apt-get", "dnf", "yum", "pacman", "apk", "brew" } }, -- package install: extra rules
     },
   },
-  -- Deprecated: the sandbox never contacts a host docker daemon; no socket is mounted/connected
-  -- regardless of the value (kept only for backward compatibility).
-  docker = { mode = "off", socket = "" },
+  -- Docker has no user configuration: the runtime auto-detects the highest safe tier
+  -- (N0 no session runtime / N1 rootless runtime inside the session namespace / N2 microVM|gVisor).
+  -- It never contacts a host docker daemon and never mounts the real docker.sock; see docs/en/sandbox.md.
   -- Container facade: **off by default** (enabled=false) — no wrapping at all: docker/podman commands
   -- run verbatim (no runtime rewriting, no namespace-share flags, no docker→podman entry shims, no
   -- containers.conf injection, and no disguising docker as "daemon not running"). Whatever runtime the
@@ -815,7 +874,7 @@ sandbox = {
     apt_sandbox_user = "root", -- apt family: injects APT::Sandbox::User (default "root" disables apt's own `_apt` privilege drop, avoiding setgroups EPERM in nested userns/restricted containers that makes apt update/install fail); "_apt" or empty keeps apt defaults
   },
   lsp_overlay = { enabled = true, idle_timeout_ms = 600000 }, -- AI-only sandboxed LSP: servers cloned by the AI lsp_* tools read staged content (on by default, bwrap+overlay only; falls back to editor clients when unavailable). Clones are kept warm for idle_timeout_ms (default 10 min) after the last call, then auto-stopped, so later diagnostics/queries need not wait for a restart; 0/negative disables idle reaping
-  secrets = { enabled = true, min_length = 20, max_length = 200, min_entropy = 3.5, min_distinct = 8, exclude_pure_hex = true, entropy_requires_context = true, entropy_secret_paths_only = true, generated_scan_max_bytes = 2097152, generated_scan_max_files = 200, tokenize_env = true, binary_fake = true, disclose_fakes = false, flow_tracking = true, alert = { enabled = true, timeout_ms = 0 }, trusted_services = {}, auto_trust_providers = true, extra_rules = {}, allowlist = {} }, -- Secret/sensitive guard: entropy + named rules (private-key blocks/AKIA/ghp_/sk-/JWT/Bearer…) + **format-preserving fake keys** (same length / character classes / entropy >= original; in-process map never persisted); env values whose names contain KEY/TOKEN/SECRET/PASSWORD/CREDENTIAL are force-faked; bare entropy runs require a -/_ separator and must not be a code identifier or a sensitive-name context; non-sensitive-named env values containing / are handled by named rules only (never breaking PATH/LD_LIBRARY_PATH); with entropy_secret_paths_only=true the full-text entropy scan runs only on suspected secret files. A **fake key** in tool args/AI context warns the user (non-blocking); a **real key** immediately stops the Agent and pops a confirm dialog, continuing only after user confirmation (fail-closed when headless/no UI). binary_fake=true fakes sensitive binary key files (.p12/.pfx/keystore/raw key) on read/stage with same-length random bytes (base64 marker transport; restored exactly on write/exec). flow_tracking=true records each fake key's origin and every flow sink (tool/command/env/disk); files derived through irreversible command/script transforms are marked "opaque-derived" and force manual confirmation before publish. trusted_services is the egress whitelist (exact host / `*.suffix` / IP / CIDR): sending a key to a whitelisted host never warns or pops; auto_trust_providers=true auto-trusts configured model-provider base_url hosts; disclose_fakes=true tells the AI these are fake (off by default to preserve format fidelity); values generated by the AI itself (first seen in model output/tool arguments, not obtained from env or tool results) are auto-allowed: not faked, not registered as real secrets, and never alerted — if the same value is later registered from env/tool output, protection resumes
+  secrets = { enabled = true, min_length = 20, max_length = 200, min_entropy = 3.5, min_distinct = 8, exclude_pure_hex = true, entropy_requires_context = true, entropy_secret_paths_only = true, generated_scan_max_bytes = 2097152, generated_scan_max_files = 200, tokenize_env = true, real_env_values = false, binary_fake = true, disclose_fakes = false, flow_tracking = true, alert = { enabled = true, timeout_ms = 0 }, trusted_services = {}, auto_trust_providers = true, extra_rules = {}, allowlist = {} }, -- Secret/sensitive guard: entropy + named rules (private-key blocks/AKIA/ghp_/sk-/JWT/Bearer…) + **format-preserving fake keys** (same length / character classes / entropy >= original; in-process map never persisted); env values whose names contain KEY/TOKEN/SECRET/PASSWORD/CREDENTIAL are force-faked; with **real_env_values=false (default) the sandbox process only receives format-preserving fake values (tokens) — real keys never enter the payload env** (tokens explicitly used in command arguments are still restored right before exec, subject to the `secret_egress` guard); bare entropy runs require a -/_ separator and must not be a code identifier or a sensitive-name context; non-sensitive-named env values containing / are handled by named rules only (never breaking PATH/LD_LIBRARY_PATH); with entropy_secret_paths_only=true the full-text entropy scan runs only on suspected secret files. A **fake key** in tool args/AI context warns the user (non-blocking); a **real key** immediately stops the Agent and pops a confirm dialog, continuing only after user confirmation (fail-closed when headless/no UI). binary_fake=true fakes sensitive binary key files (.p12/.pfx/keystore/raw key) on read/stage with same-length random bytes (base64 marker transport; restored exactly on write/exec). flow_tracking=true records each fake key's origin and every flow sink (tool/command/env/disk); files derived through irreversible command/script transforms are marked "opaque-derived" and force manual confirmation before publish. trusted_services is the egress whitelist (exact host / `*.suffix` / IP / CIDR): sending a key to a whitelisted host never warns or pops; auto_trust_providers=true auto-trusts configured model-provider base_url hosts; disclose_fakes=true tells the AI these are fake (off by default to preserve format fidelity); values generated by the AI itself (first seen in model output/tool arguments, not obtained from env or tool results) are auto-allowed: not faked, not registered as real secrets, and never alerted — if the same value is later registered from env/tool output, protection resumes
   retention = { candidate_days = 7, max_pending = 20 },
   retired = { ttl_days = 7 }, -- Deletion = moving aside: a deleted node is moved into the same-device `<parent>/.neoai-retired/` and undo moves the whole tree back. Retired content is reclaimed when the unit leaves the pending/applied lists or on reset; this TTL (days; <=0 means 7) is the fallback sweep
   policy = {
@@ -1147,15 +1206,16 @@ It relaxes exactly these three things:
 1. **Network is not blocked, only recorded**: force `access="allow"`, overriding `ask`/`deny`, `offline=true`
    and the controlled allowlist. The host-side `host_proxy` still records targets (see
    `:NeoAI SandboxAudit network`).
-2. **Direct containers**: bypass the container facade (no `docker→podman` rewrite, no entry stubs, no fake
-   daemon errors); `docker` mounts the host socket (auto-detected or `docker_socket`) and injects `DOCKER_HOST`;
-   `podman/buildah` get container capabilities/vfs storage/seccomp exception even when the facade is disabled.
+2. **Container runtime**: PRIV no longer bypasses to the host daemon and never mounts/connects to
+   `/run/docker.sock`. Docker is served by the auto-detected **session rootless runtime** (podman system
+   service / rootless dockerd) plus a host-side broker, independent of PRIV. `podman/buildah` still get
+   container capabilities/vfs storage/seccomp exception through the facade.
 3. **SSH keys are not masked**: `~/.ssh`, `/root/.ssh`, `/home/*/.ssh` and ssh-agent sockets are excluded from
    masking (`unmask_ssh_keys=true`); `read_file`/`run_command`/`git`/`ssh` can read and use host keys.
 
-**Security boundary**: containers created through docker run outside the sandbox on the host daemon and are
-**not** frozen into candidates/approvals; `/run/docker.sock` is equivalent to host root. Ordinary file
-read/write still uses the sandbox overlay and review pipeline. Writes such as updating AGENTS.md still require
+**Security boundary**: PRIV no longer grants host-root docker access. Docker containers are created by
+the session rootless runtime and die with the session userns; the host-side broker enforces endpoint/body
+policy. Ordinary file read/write still uses the sandbox overlay and review pipeline. Writes such as updating AGENTS.md still require
 approval and are not affected by this mode.
 
 **Decision scope and timing**:

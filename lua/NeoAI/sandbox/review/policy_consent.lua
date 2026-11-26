@@ -36,7 +36,10 @@ end
 --- 是否有可用的浮窗 UI。
 --- @return boolean
 function M.available()
-  return state.ui ~= nil and type(state.ui.show) == "function"
+  if state.ui == nil or type(state.ui.show) ~= "function" then return false end
+  -- `requires_ui` 的渲染器在 --headless 下无法展示：若仍视为可用，request 会永久等待。
+  if state.ui.requires_ui and not _interactive() then return false end
+  return true
 end
 
 --- 本会话是否已对某策略「始终允许」

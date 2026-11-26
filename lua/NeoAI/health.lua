@@ -171,14 +171,17 @@ function M.collect()
     local offline = sandbox_cfg.offline == true
     local gateway_on = ok_gw and gw.enabled() == true
     local hlb = netcfg.host_local_block ~= false
+    local record_only = netcfg.record_only == true
     local proxy = ok_hp and hp.address() or nil
     local avail = ok_nc and nc.available() == true
     local can = ok_nc and nc.can_prompt() == true
     local lines = {
-      ("策略 access=%s；host_local_block=%s；offline=%s；netns 网关=%s"):format(
-        tostring(ok_nc and nc.policy() or "?"), tostring(hlb), tostring(offline), tostring(gateway_on)),
+      ("策略 access=%s；host_local_block=%s；record_only=%s；offline=%s；netns 网关=%s"):format(
+        tostring(ok_nc and nc.policy() or "?"), tostring(hlb), tostring(record_only),
+        tostring(offline), tostring(gateway_on)),
       proxy and ("宿主过滤代理已启动: %s:%s"):format(tostring(proxy.host), tostring(proxy.port))
-        or (hlb and not offline and "宿主过滤代理未启动（沙箱外命令不经过同意门禁）" or "宿主过滤代理未启用"),
+        or ((hlb or record_only) and not offline
+          and "宿主过滤代理未启动（沙箱外命令不经过同意门禁）" or "宿主过滤代理未启用"),
       ("网络同意 UI 可用=%s；可弹窗=%s"):format(tostring(avail), tostring(can)),
     }
     local status = "ok"
@@ -194,8 +197,12 @@ function M.collect()
       status = "warn"
       lines[#lines + 1] = "netns 网关模式不接入网络同意弹窗（仅端口探针）；如需逐目标同意请关闭 gateway。"
     elseif netcfg.host_local_block == false then
-      status = "warn"
-      lines[#lines + 1] = "host_local_block=false：沙箱外命令直连，无同意弹窗。"
+      if record_only then
+        lines[#lines + 1] = "record_only=true：网络请求一律放行并记录（不弹窗；裸 TCP 仍受 netns 边界限制）。"
+      else
+        status = "warn"
+        lines[#lines + 1] = "host_local_block=false：沙箱外命令直连，无同意弹窗。"
+      end
     end
     add("沙箱网络同意", status, lines)
   end

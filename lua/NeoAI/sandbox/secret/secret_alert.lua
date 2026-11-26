@@ -40,11 +40,16 @@ local function _emit_dialog(event_name, id, ctx)
 end
 
 --- 是否可用（未禁用，且有专用弹窗 UI 或可交互 Neovim 供内建确认回退）
+--- `requires_ui` 的渲染器只在有 attached UI 时可用：--headless 下注册了真实弹窗组件
+--- 却没有窗口可渲染，`request` 会永久等待（Deferred 悬挂），必须失败关闭。
 --- @return boolean
 function M.available()
   local cfg = require("NeoAI.kernel.config_store").get("tools.sandbox.secrets.alert")
   if type(cfg) == "table" and cfg.enabled == false then return false end
-  if state.ui ~= nil and type(state.ui.show) == "function" then return true end
+  if state.ui ~= nil and type(state.ui.show) == "function" then
+    if state.ui.requires_ui and not _interactive() then return false end
+    return true
+  end
   return _interactive()
 end
 

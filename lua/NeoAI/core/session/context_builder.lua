@@ -73,8 +73,10 @@ local function _to_api_message(message)
   -- DeepSeek 官方 chat template 会把**最后一条** system 提到最前，历史快照会整体替换顶层
   -- 系统提示，且每次快照变化都改写请求开头 → 前缀缓存全量失效。仅显式开启
   -- `ai.system_in_history`（端点确认按原位渲染 system）时保留 system。
+  -- 工具循环的「后台执行说明 / 后台结果」同样用 system 角色 + system_update 标记：
+  -- 默认端点降级为 user，避免末尾 system 被提到最前、破坏系统提示与前缀缓存。
   local role = message.role
-  if role == "system" and message.runtime_context
+  if role == "system" and (message.runtime_context or message.system_update)
     and config_store.get("ai.system_in_history") ~= true then
     role = "user"
   end
@@ -98,6 +100,10 @@ local function _to_api_message(message)
   if has_tool_calls then
     out.tool_calls = message.tool_calls
   end
+  -- 后台化标记只用于 _balance_tools 构建出站占位结果，绝不能出现在 wire 上。
+  if has_tool_calls and type(message.background_tool_ids) == "table" then
+    out._background_ids = message.background_tool_ids
+  end
   if message.tool_call_id then
     out.tool_call_id = message.tool_call_id
   end
@@ -106,18 +112,28 @@ end
 
 --- 只修复出站副本：中断/循环上限可能留下未完成调用，旧历史也可能有孤立结果。
 --- 结果必须紧跟调用且每个 id 恰好一次；缺失结果不代表工具未执行，不能伪造成功。
+--- 被工具循环标记为「后台化」（assistant.background_tool_ids）的调用，缺失结果时补一条
+--- **稳定**的「后台执行中」占位（文本只含 id，跨请求逐字节一致）——后台完成后的真实
+--- 返回信息会作为末尾 system 消息追加，不会以乱序 tool 消息形式改写历史前缀。
 local function _balance_tools(messages)
-  local out, pending, order = {}, {}, {}
+  local out, pending, order, background = {}, {}, {}, {}
   local function flush()
     for _, id in ipairs(order) do
       if pending[id] then
+        local content
+        if background[id] then
+          content = "工具已在后台执行（ID：" .. tostring(id)
+            .. "）。该工具的返回信息将作为后续消息追加到对话末尾。"
+        else
+          content = "Tool result unavailable: this call has no recorded result. "
+            .. "Execution status is unknown; verify any side effects before retrying."
+        end
         out[#out + 1] = {
-          role = "tool", tool_call_id = id,
-          content = "Tool result unavailable: this call has no recorded result. Execution status is unknown; verify any side effects before retrying.",
+          role = "tool", tool_call_id = id, content = content,
         }
       end
     end
-    pending, order = {}, {}
+    pending, order, background = {}, {}, {}
   end
   for _, m in ipairs(messages) do
     if m.role == "tool" then
@@ -133,6 +149,9 @@ local function _balance_tools(messages)
           if tc.id and not pending[tc.id] then
             pending[tc.id] = true
             order[#order + 1] = tc.id
+            if type(m._background_ids) == "table" and m._background_ids[tc.id] then
+              background[tc.id] = true
+            end
           end
         end
       end

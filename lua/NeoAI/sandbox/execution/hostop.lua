@@ -20,13 +20,17 @@ end
 
 --- 在主机上同步执行命令（用户已批准的主机效果），带超时。
 --- 非 root 运行 NeoAI 时经 `sudo` 提权（`pty` 以支持密码提示）；提案已经用户审批。
+--- `opts.no_sudo=true` 时**不提权**，以 nvim 当前用户执行——供「用当前用户的密钥/凭据」的
+--- 宿主侧能力（如 ssh alias）使用：sudo 会换成 root 的 `~/.ssh`，那不是用户声明的那把钥匙。
 --- @param command string
+--- @param opts table|nil { no_sudo?: boolean }
 --- @return table { code, stdout, stderr }
-local function _run_host(command)
+local function _run_host(command, opts)
+  opts = opts or {}
   local limits = config_store.get("tools.sandbox.limits") or {}
   local timeout_ms = limits.wall_ms or 60000
   local stdout, stderr = {}, {}
-  local use_sudo = vim.uv.getuid ~= nil and vim.uv.getuid() ~= 0
+  local use_sudo = (not opts.no_sudo) and vim.uv.getuid ~= nil and vim.uv.getuid() ~= 0
   local argv = use_sudo and { "sudo", "sh", "-c", command } or { "sh", "-c", command }
   local done, exit_code = false, nil
   local job = vim.fn.jobstart(argv, {
@@ -108,6 +112,42 @@ function M.get(id)
   return require("NeoAI.sandbox.state.store").read_host_op(id)
 end
 
+--- 冻结一条「宿主侧能力」提案。
+--- 与 `freeze` 的区别：这不是「沙箱内执行后产生的主机效果」，而是工具**只在宿主侧**执行
+--- （密钥/凭据不进入沙箱，由宿主 openssh 使用）。仍然必须经用户审批后才 replay。
+--- @param spec table {
+---   tool: string, command: string, reason?: string, no_sudo?: boolean,
+---   command_id?: string, attempt_id?: string }
+--- @return table|nil rec
+--- @return table|nil item
+function M.freeze_capability(spec)
+  spec = spec or {}
+  local command = spec.command
+  if type(command) ~= "string" or command == "" then return nil end
+  local store = require("NeoAI.sandbox.state.store")
+  state.seq = state.seq + 1
+  local id = string.format("ho_%d_%s", state.seq, tostring(os.time()))
+  local rec = {
+    host_op_id = id,
+    command = command,
+    tool = spec.tool or "host_capability",
+    command_id = spec.command_id or ("cap_" .. id),
+    attempt_id = spec.attempt_id,
+    tier = 2,
+    privileges = { cap_add = {}, mounts = {}, unmask = {}, network = true },
+    reason = spec.reason,
+    no_sudo = spec.no_sudo == true,
+    state = "PENDING",
+    created_at = os.time(),
+  }
+  store.write_host_op(rec)
+  local item = require("NeoAI.sandbox.review.review").enqueue_host_op(rec)
+  _emit(require("NeoAI.kernel.events").SANDBOX_HOST_OP_ENQUEUED, {
+    host_op_id = id, change_set_id = item and item.change_set_id, command = command,
+  })
+  return rec, item
+end
+
 --- 列出提案
 --- @param filter table|nil { state? }
 --- @return table 数组
@@ -161,7 +201,7 @@ function M.replay(id)
     })
     return { ok = false, state = "REJECTED", reason = "HOST_OP_PACKAGE_DENIED: 包安装不在宿主机执行" }
   end
-  local result = _run_host(rec.command)
+  local result = _run_host(rec.command, { no_sudo = rec.no_sudo == true })
   rec.state = result.code == 0 and "APPLIED" or "FAILED"
   rec.result = { code = result.code, stdout = result.stdout, stderr = result.stderr }
   rec.applied_at = os.time()

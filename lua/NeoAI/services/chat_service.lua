@@ -33,6 +33,10 @@ local state = {
 -- AI 忙碌（generating / tool_running）期间用户发送的消息先入队，当前 turn 结束
 -- （Agent 回到非忙碌状态）后再逐条发送，而不是直接提示失败。
 local pending_queue = {}
+-- 已经出队、但 `_run_message` 的首个异步链尚未把生成占用令牌置上的 agent：
+-- 这段时间队列已空、state 仍是 idle，若只看两者会误判「已无工作」，导致 UI/测试在
+-- 真正开跑前就认为本轮结束。作为「仍有工作」的一部分参与判定，并在本轮结束/失败时清除。
+local flushing_agents = {}
 local queue_state_sub = nil -- 监听 Agent 状态变化以在 turn 结束时机性刷新的订阅
 
 -- 生成中切换模式：暂存目标模式（"chat"|"plan"），待 Agent 空闲后再应用，
@@ -222,6 +226,16 @@ local function _build_persist_session(agent)
         -- 途中注入标记（AI 忙碌期间发送、由工具循环轮末插入的用户消息）：随会话持久化，
         -- 重开会话后「过程」折叠仍把它当作同一 run 的中途插入（见 message_list._process_meta）。
         mid_turn = msg.mid_turn,
+        -- 后台化工具（工具在途时收到新消息）：assistant 上的 tool_call_id 标记必须持久化，
+        -- 请求构建据此为未返回的调用补「后台执行」占位结果；后台完成/取消消息的标记用于
+        -- 重开会话后仍按「后台工具结果」块渲染，而不是被当作 system 消息跳过。
+        background_tool_ids = msg.background_tool_ids,
+        system_update = msg.system_update,
+        background_note = msg.background_note,
+        background_result = msg.background_result,
+        background_tool_call_id = msg.background_tool_call_id,
+        background_body = msg.background_body,
+        background_cancelled = msg.background_cancelled,
       })
       synced[#synced + 1] = msg
     end
@@ -371,6 +385,9 @@ end
 --- @param opts table|nil
 --- @return Deferred
 local function _run_message(agent, content, opts)
+  if not agent or agent_mod_is_disposed(agent) then
+    return async.reject({ kind = "cancelled", message = "会话已关闭，消息已取消" })
+  end
   return _distill_if_needed(agent):then_(function()
     return _do_run(agent, content, opts)
   end, function()
@@ -399,9 +416,18 @@ local function _flush_pending(agent_id)
   if _is_busy(agent) then return end
   local item = table.remove(q, 1)
   if #q == 0 then pending_queue[agent_id] = nil end
+  -- 出队到真正置上 _turn_claim 之间有一个异步窗口：登记「正在开始」，避免 UI/测试
+  -- 在消息已经离开队列、但本轮尚未开始时误判无工作（也避免 reset/关闭窗口撞上该窗口）。
+  flushing_agents[agent_id] = true
   _run_message(agent, item.content, item.opts):then_(
-    function(resp) item.d:resolve(resp) end,
-    function(err) item.d:reject(err) end
+    function(resp)
+      flushing_agents[agent_id] = nil
+      item.d:resolve(resp)
+    end,
+    function(err)
+      flushing_agents[agent_id] = nil
+      item.d:reject(err)
+    end
   )
 end
 
@@ -413,13 +439,15 @@ end
 --- （聊天渲染据此不在中途重置 Step 编号、也不把它切断的最后一步当成最终回答）。
 --- 该标记随会话持久化（见 _persist_agent 白名单），重开会话后仍按同一语义渲染。
 --- @param agent table
+--- @return number 本次注入的消息条数
 local function _inject_pending(agent)
   local q = pending_queue[agent.id]
   if not q or #q == 0 then
     pending_queue[agent.id] = nil
-    return
+    return 0
   end
   pending_queue[agent.id] = nil
+  local n = 0
   for _, item in ipairs(q) do
     local extra = item.opts and item.opts.message_extra
     extra = extra and vim.deepcopy(extra) or {}
@@ -429,7 +457,9 @@ local function _inject_pending(agent)
     -- 消息已插入对话即视为已发送；resolve 避免 UI await 挂起（UI 主要只关心 reject）。
     -- 若 Agent 中途被销毁，会由 detach_window 走 _flush_pending 的拒绝逻辑，不在此重复。
     item.d:resolve(true)
+    n = n + 1
   end
+  return n
 end
 
 -- 注入器是否已默认注册到 tool_loop（幂等）
@@ -437,12 +467,19 @@ local injector_registered = false
 
 --- 懒加载地把 pending 注入器注册到 tool_loop（幂等）。core 模块不反向依赖服务，
 --- 因此通过 tool_loop.set_inject_user 把「拉取暂存消息」的实现注入进去。
+--- 同时注册「是否有暂存消息」探测器：工具循环在启动一批工具前据此判断是否需要
+--- 立即把工具转为后台（消息不再等工具全部完成）。
 local function _ensure_injector()
   if injector_registered then return end
   injector_registered = true
   local tool_loop = require("NeoAI.core.agent.tool_loop")
   tool_loop.set_inject_user(function(agent)
-    _inject_pending(agent)
+    return _inject_pending(agent)
+  end)
+  tool_loop.set_pending_probe(function(agent)
+    if not agent then return false end
+    local q = pending_queue[agent.id]
+    return q ~= nil and #q > 0
   end)
 end
 
@@ -781,6 +818,8 @@ end
 --- @return boolean
 function M.has_pending_work_for_agent(agent_id)
   if not agent_id then return false end
+  -- 已出队、正在启动的消息也算工作（避免 state 尚未置 busy 的异步窗口被误判为空闲）。
+  if flushing_agents[agent_id] then return true end
   local agent = runtime.get(agent_id)
   if agent and _is_busy(agent) then return true end
   return M.pending_count_for_agent(agent_id) > 0
@@ -1377,9 +1416,21 @@ end
 
 --- 重置（测试用）
 function M.reset()
+  local disposed = {}
   for _, agent_id in pairs(state.windows) do
     local agent = runtime.get(agent_id)
-    if agent then runtime.dispose(agent) end
+    if agent then
+      disposed[agent_id] = true
+      runtime.dispose(agent)
+    end
+  end
+  -- 测试/热重载隔离：没有绑定窗口的 Agent（如 new_session 直接创建、未 attach_window）
+  -- 也必须销毁并中止在途生成，否则其异步链会泄漏到后续套件（污染 recovery/http 桩与计数）。
+  for agent_id in pairs(state.agents) do
+    if not disposed[agent_id] then
+      local agent = runtime.get(agent_id)
+      if agent then runtime.dispose(agent) end
+    end
   end
   state.windows = {}
   state.agents = {}
@@ -1405,6 +1456,8 @@ function M.reset()
   local tool_loop = require("NeoAI.core.agent.tool_loop")
   ---@diagnostic disable-next-line: param-type-mismatch
   tool_loop.set_inject_user(nil)
+  ---@diagnostic disable-next-line: param-type-mismatch
+  tool_loop.set_pending_probe(nil)
   ---@diagnostic disable-next-line: param-type-mismatch
   tool_loop.set_pre_round_refresh(nil)
   ---@diagnostic disable-next-line: param-type-mismatch
@@ -1433,6 +1486,7 @@ function M.reset()
     end
   end
   pending_queue = {}
+  flushing_agents = {}
   -- 恢复 MCP 钩子（幂等）：reset 清空后重新注册，保证工具动态更新仍能被感知与刷新
   _ensure_mcp_hooks()
   -- 恢复子 Agent 集成钩子（幂等）

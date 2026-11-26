@@ -87,6 +87,18 @@ tests.suite("parallel_runner", function(_, it, before_each)
     vim.env.NEOAI_TEST_HEAVY_WORKERS = saved_h
   end)
 
+  it("分道判定：sandbox_view* 走独占通道（宿主全局 /run/netns）", function(t)
+    local cfg = require("NeoAI.tests.runner.config")
+    t.true_(cfg.is_exclusive("sandbox_view"), "sandbox_view 应独占")
+    t.true_(cfg.is_exclusive("sandbox_view_persistence"), "sandbox_view_persistence 应独占")
+    t.false_(cfg.is_exclusive("sandbox_core"), "其它 sandbox 套件不应独占")
+    t.false_(cfg.is_exclusive("flow_tools"), "非沙箱套件不应独占")
+    t.false_(cfg.is_exclusive("sandbox_view", { exclusive_suites = {} }),
+      "opts.exclusive_suites 空表应覆盖默认（不独占）")
+    t.true_(cfg.is_exclusive("x", { exclusive_suites = function(n) return n == "x" end }),
+      "opts.exclusive_suites 判定函数应生效")
+  end)
+
   it("内存许可：内存充足立即启动，不足则等待后放行", function(t)
     local mg = require("NeoAI.tests.runner.memguard")
     local launched = 0
@@ -336,6 +348,40 @@ tests.suite("parallel_runner", function(_, it, before_each)
     t.true_(max_heavy >= 2, "heavy 应实际并发到 2")
     t.true_(max_light >= 1, "light 与 heavy 应重叠执行")
     t.eq(2, r.heavy_workers)
+    vim.fn.delete(tp)
+  end)
+
+  it("run：独占通道串行执行，不与 light/heavy 分片重叠", function(t)
+    local suites = {
+      { name = "sandbox_view", cases = 1 },
+      { name = "sandbox_x", cases = 1 },
+      { name = "l1", cases = 1 },
+    }
+    local inflight, finished, overlap = 0, {}, false
+    parallel._set_spawner(function(req, o)
+      if not req.names then
+        o.on_done({ output = manifest_output(suites), ok = true })
+        return
+      end
+      local name = req.names[1]
+      inflight = inflight + 1
+      if name == "sandbox_view" and inflight ~= 1 then overlap = true end
+      local nm = #req.names
+      vim.defer_fn(function()
+        inflight = inflight - 1
+        finished[#finished + 1] = name
+        o.on_done({
+          output = ("SUMMARY passed=%d failed=0\n"):format(nm),
+          ok = true, passed = nm, failed = 0, errors = {}, exit_code = 0,
+        })
+      end, 10)
+    end)
+    local tp = vim.fn.tempname() .. "_timings.json"
+    local r = parallel.run({ workers = 2, heavy_workers = 2, timings_path = tp })
+    t.eq(0, r.failed)
+    t.eq(1, r.exclusive_workers, "有独占套件时应报告 1 路独占 worker")
+    t.false_(overlap, "独占套件启动时不应有其它分片在飞")
+    t.eq("sandbox_view", finished[#finished], "独占套件应在 light/heavy 全部完成后最后执行")
     vim.fn.delete(tp)
   end)
 

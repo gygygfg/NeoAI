@@ -104,6 +104,7 @@ placeholders. On first trigger (command, keymap or active API), startup is drive
 | `services.agent` | `NeoAI.core.agent.agent` | — |
 | `services.tools` | `NeoAI.tools` | apply approval config |
 | `services.sandbox` | `NeoAI.sandbox` | probe runtime capabilities, prepare staging/candidate storage |
+| `services.deps` | `NeoAI.services.deps` | optional security dependency manager (`:NeoAI Deps`): probe, argv plan, terminal install |
 | `services.model_service` | `NeoAI.services.model_service` | — |
 | `services.chat_service` | `NeoAI.services.chat_service` | — |
 | `services.tool_service` | `NeoAI.services.tool_service` | — |

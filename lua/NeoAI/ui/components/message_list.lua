@@ -1177,7 +1177,8 @@ local function _collect_step_stats(msgs, indices, results, first_step)
     for _, tc in ipairs(m.tool_calls or {}) do
       local r = tc and tc.id and results[tc.id] or nil
       if r then
-        if _tool_result_failed(r.content) then st.tools_fail = st.tools_fail + 1
+        local rc = r.background_result and r.background_body or r.content
+        if _tool_result_failed(rc) then st.tools_fail = st.tools_fail + 1
         else st.tools_ok = st.tools_ok + 1 end
       end
     end
@@ -1242,7 +1243,12 @@ local function _process_meta(msgs, keep_steps, active)
   msgs = msgs or {}
   local results = {}
   for _, m in ipairs(msgs) do
-    if m.role == "tool" and m.tool_call_id then results[m.tool_call_id] = m end
+    if m.role == "tool" and m.tool_call_id then
+      results[m.tool_call_id] = m
+    elseif m.background_result and m.background_tool_call_id then
+      -- 后台工具的真实返回信息以末尾 system 消息形式存在；统计时按原调用 id 归位。
+      results[m.background_tool_call_id] = m
+    end
   end
   local meta = {}
   local n = #msgs
@@ -1617,30 +1623,44 @@ end
 --- 供整块构建与「执行中耗时」轻量刷新共用（避免为更新时间重建整块）。
 --- @param tool_call table
 --- @param result_msg table|nil
---- @param opts table|nil { width?: number } 可用显示宽度；首行超出该宽度且带目的时，
----   把耗时从尾部提到目的之前（窄窗下行尾耗时会被截断而不可见）
+--- @param opts table|nil { width?: number, background?: boolean } 可用显示宽度；首行超出该宽度
+---   且带目的时，把耗时从尾部提到目的之前（窄窗下行尾耗时会被截断而不可见）。
+---   background=true 时在工具名后标注「后台」（工具在途时收到新消息被转为后台执行）。
 --- @return string|nil
 local function _tool_header_text(tool_call, result_msg, opts)
   local fn = tool_call and tool_call["function"]
   if not fn then return nil end
   local name = fn.name or ""
+  local bg_res = opts and opts.bg_result or nil
+  local bg_str = (opts and opts.background and not result_msg) and " · 后台" or ""
   local desc = _tool_description(fn)
   local desc_str = desc and (" · " .. desc) or ""
-  -- 已完成工具优先用结果消息里持久化的总时长；执行中/无持久化时回退 fold 计时
-  local duration = (result_msg and result_msg.duration_ms) or fold.get_duration(tool_call.id)
+  -- 已完成工具优先用结果消息里持久化的总时长；后台结果消息同样提供持久化耗时；
+  -- 执行中/无持久化时回退 fold 计时。
+  local duration = (result_msg and result_msg.duration_ms)
+    or (bg_res and bg_res.duration_ms)
+    or fold.get_duration(tool_call.id)
   local time_str = duration and (" · " .. fold.format_ms(duration)) or ""
   -- 窄窗降级：首行（含缩进）超出可用宽度时把耗时提到目的之前，否则用户看不到耗时。
   local time_first = false
   local width = opts and opts.width
   if width and time_str ~= "" and desc_str ~= "" then
-    time_first = vim.fn.strdisplaywidth("  " .. name .. desc_str .. time_str) + 8 > width
+    time_first = vim.fn.strdisplaywidth("  " .. name .. bg_str .. desc_str .. time_str) + 8 > width
   end
   local function _tail()
-    return time_first and (time_str .. desc_str) or (desc_str .. time_str)
+    return time_first and (time_str .. bg_str .. desc_str) or (bg_str .. desc_str .. time_str)
   end
   if result_msg then
     local failed = _tool_result_failed(result_msg.content)
     return string.format("%s 工具: %s%s", failed and "❌" or "✅", name, _tail())
+  end
+  -- 后台化工具没有同位置的 tool 结果消息，真实结果追加在上下文末尾；用该结果消息刷新
+  -- 原工具块的状态/耗时（内容由末尾的「后台工具结果」块展示，避免重复）。
+  if bg_res then
+    local cancelled = bg_res.background_cancelled == true
+    local failed = (not cancelled) and _tool_result_failed(bg_res.background_body or "") or false
+    local emoji = cancelled and "⏹" or (failed and "❌" or "✅")
+    return string.format("%s 工具: %s%s", emoji, name, _tail())
   end
   -- 结果消息未到达时按各自执行状态渲染（fold 计时记录了每个工具的开始/结束状态）：
   -- 已完成的工具立即显示 ✅/❌ 并锁定总耗时，仍在执行的显示 ⏳ + 实时耗时。
@@ -1749,8 +1769,13 @@ local function _append_tool_block(lines, marks, tool_call, result_msg, opts)
   if has_secret then _with_secret_spans_bulk(rows, true) end
   -- 首行登记工具调用 id：供「执行中耗时」轻量刷新与 foldtext 实时耗时读取，
   -- 避免每秒为更新时间重建整块（大消息时占主线程）与折叠闪烁。
+  -- 同时保留后台标记/后台结果：轻量刷新时首行仍显示「后台」且完成后不再覆盖为运行中。
   _append_fold_block(lines, marks, rows, "tool",
-    { fold_kind = "tool", tool_header = { id = tool_call.id, tc = tool_call, res = result_msg } })
+    { fold_kind = "tool", tool_header = {
+      id = tool_call.id, tc = tool_call, res = result_msg,
+      background = opts and opts.background or nil,
+      bg_result = opts and opts.bg_result or nil,
+    } })
   -- 密钥警告：折叠块外单独若干行（非缩进 → 不并入折叠），逐行施加高亮。
   if secret_lines then
     for _, l in ipairs(secret_lines) do
@@ -1796,6 +1821,45 @@ local function _append_sub_agent_block(lines, marks, message)
     end
   end
   _append_fold_block(lines, marks, rows, "sub_agent", { fold_kind = "sub_agent" })
+end
+
+--- 追加「后台工具结果」折叠块：工具在等待结果期间因收到新消息被转为后台执行，
+--- 完成后其返回信息作为 system 消息追加到上下文末尾（而非乱序 tool 结果）。
+--- 不绘制角色头；正文取持久化的 background_body（模型可见内容含 ID 头，不重复展示）。
+--- @param lines table
+--- @param marks table 与 lines 并行的元数据数组
+--- @param message table
+local function _append_background_result_block(lines, marks, message)
+  local name = message.tool_name or "工具"
+  local cancelled = message.background_cancelled == true
+  local body = message.background_body
+  if type(body) ~= "string" then body = message.content or "" end
+  local decoded, failed
+  if body ~= "" and #body <= RESULT_DECODE_MAX_BYTES then
+    decoded = json.decode_or_nil(body)
+    failed = type(decoded) == "table" and decoded.error ~= nil or false
+  elseif body ~= "" then
+    failed = body:match('^%s*{%s*"error"') ~= nil
+  else
+    failed = false
+  end
+  local emoji = cancelled and "⏹" or (failed and "❌" or "✅")
+  local label = cancelled and "后台工具已取消" or "后台工具结果"
+  local dur = message.duration_ms and (" · " .. fold.format_ms(message.duration_ms)) or ""
+  local rows = { string.format("%s %s · %s%s", emoji, label, name, dur) }
+  if not cancelled then
+    for _, l in ipairs(_result_lines(body, { decoded = decoded, has_decoded = true })) do
+      rows[#rows + 1] = l.text
+    end
+  end
+  if message.notice and message.notice ~= "" then
+    for _, l in ipairs(vim.split(tostring(message.notice), "\n", { plain = true })) do
+      rows[#rows + 1] = l
+    end
+  end
+  -- 与普通工具块一致：对展示行做密钥高亮（_result_lines 默认有界，扫描成本可控）。
+  _with_secret_spans_bulk(rows, true)
+  _append_fold_block(lines, marks, rows, "tool", { fold_kind = "tool" })
 end
 
 --- 追加轮次分割线（仅在轮次边界出现）
@@ -1987,6 +2051,13 @@ local function _blocks(msgs, opts, prev, show)
   if fold_active == nil then fold_active = (streaming == true) end
   local pmeta = fold_mode == "process"
       and _process_meta(msgs, _process_keep_steps(), fold_active == true) or nil
+  -- 后台工具结果（追加在上下文末尾）按原 tool_call_id 归位，供原工具块显示最终状态/耗时。
+  local bg_results = {}
+  for _, m in ipairs(msgs) do
+    if m.background_result and m.background_tool_call_id then
+      bg_results[m.background_tool_call_id] = m
+    end
+  end
   -- 角色头只在**角色发生切换时**显示（如 👤 用户 → 🤖 AI、🤖 AI → 👤 用户）：
   -- Agent loop 内同一用户轮次会连续产生多条 assistant 消息（工具调用 → 结果 → 再调用…），
   -- 它们之间不再重复刷 `🤖 AI`。process 折叠程度下角色头渲染在「过程」折叠**之外**，
@@ -1996,7 +2067,44 @@ local function _blocks(msgs, opts, prev, show)
   while i <= #msgs do
     local idx = i
     local msg = msgs[idx]
-    if msg.runtime_context then
+    if msg.background_result then
+      -- 后台工具结果：工具在等待期间因新消息转为后台，完成后返回信息追加到上下文末尾。
+      -- 渲染为折叠块（无角色头），不当作 system 消息跳过。
+      local snap = msg
+      local eopts = _msg_opts(false, opts)
+      local key = "bg:" .. idx
+      n = n + 1
+      local p = prev and prev[n]
+      local body = type(snap.background_body) == "string" and snap.background_body or ""
+      local cancelled = snap.background_cancelled == true
+      local proc_old = (current_proc_step and current_proc_step.old) and "1" or "0"
+      local in_sig = tostring(#body) .. ":" .. tostring(snap.duration_ms or "") .. ":"
+        .. tostring(cancelled) .. ":" .. tostring(snap.tool_name or "") .. ":"
+        .. tostring(snap.notice or "")
+      if p and p.key == key and p.in_msg == snap and p.in_bg_sig == in_sig
+        and p.in_proc_old == proc_old then
+        blocks[n] = p
+      else
+        local sig = _sig(eopts, false, {
+          "background_result", _fingerprint(body), tostring(cancelled),
+          tostring(snap.tool_name or ""), tostring(snap.duration_ms or ""), "proc", proc_old,
+        }, show)
+        blocks[n] = {
+          key = key,
+          sig = sig,
+          in_msg = snap, in_bg_sig = in_sig, in_proc_old = proc_old,
+          build = function()
+            local lines, marks = {}, {}
+            _append_background_result_block(lines, marks, snap)
+            if current_proc_step and current_proc_step.old then
+              _mark_process_old(marks, #lines)
+            end
+            return { lines = lines, marks = marks }
+          end,
+        }
+      end
+      i = i + 1
+    elseif msg.runtime_context then
       i = i + 1
     elseif msg.role == "system" then
       i = i + 1
@@ -2015,7 +2123,9 @@ local function _blocks(msgs, opts, prev, show)
         if res == nil then
           res = _live_result_msg(tc)
         end
-        paired[#paired + 1] = { tc = tc, res = res }
+        local bg = snap.background_tool_ids and snap.background_tool_ids[tc.id] or nil
+        local bg_res = (res == nil) and bg_results[tc.id] or nil
+        paired[#paired + 1] = { tc = tc, res = res, bg = bg, bg_res = bg_res }
       end
       local consumed_until = ridx - 1
       local turn_end = _is_turn_end(msgs, idx)
@@ -2043,6 +2153,8 @@ local function _blocks(msgs, opts, prev, show)
           if p.in_tc[k] ~= pp.tc or p.in_res[k] ~= res
             or p.in_reslen[k] ~= (res and #(res.content or "") or 0)
             or p.in_resdur[k] ~= (res and res.duration_ms or nil)
+            or p.in_bg[k] ~= pp.bg
+            or p.in_bgr[k] ~= pp.bg_res
             or p.in_status[k] ~= fold.get_status(pp.tc.id) then
             same = false
             break
@@ -2054,7 +2166,7 @@ local function _blocks(msgs, opts, prev, show)
       else
         local extra = { "assistant", _fingerprint(snap.content), _fingerprint(snap.reasoning),
           show_header and "H" or "-", "step", step_sig }
-        local in_tc, in_res, in_status, in_reslen, in_resdur = {}, {}, {}, {}, {}
+        local in_tc, in_res, in_status, in_reslen, in_resdur, in_bg, in_bgr = {}, {}, {}, {}, {}, {}, {}
         for k, pp in ipairs(paired) do
           local fn = pp.tc["function"] or {}
           extra[#extra + 1] = "tc"
@@ -2063,6 +2175,8 @@ local function _blocks(msgs, opts, prev, show)
           extra[#extra + 1] = _fingerprint(fn.arguments)
           local status = fold.get_status(pp.tc.id)
           extra[#extra + 1] = tostring(status)
+          extra[#extra + 1] = pp.bg and "bg" or "-"
+          extra[#extra + 1] = pp.bg_res and "bgr" or "-"
           -- 实时耗时不计入签名：执行中每秒变化会命中缓存失效→重建整块（大消息时占主线程）。
           -- 时间由 `refresh_tool_times` 就地改写首行；状态变化（running→success）仍触发重建。
           extra[#extra + 1] = pp.res and "res" or "nil"
@@ -2075,6 +2189,8 @@ local function _blocks(msgs, opts, prev, show)
           in_status[k] = status
           in_reslen[k] = pp.res and #(pp.res.content or "") or 0
           in_resdur[k] = pp.res and pp.res.duration_ms or nil
+          in_bg[k] = pp.bg
+          in_bgr[k] = pp.bg_res
         end
         local sig = _sig(eopts, turn_end, extra, show)
         blocks[n] = {
@@ -2084,7 +2200,7 @@ local function _blocks(msgs, opts, prev, show)
           in_turn = turn_end, in_stream = is_stream, in_tw = tw, in_show = show,
           in_header = show_header, in_step_sig = step_sig,
           in_tc = in_tc, in_res = in_res, in_status = in_status,
-          in_reslen = in_reslen, in_resdur = in_resdur,
+          in_reslen = in_reslen, in_resdur = in_resdur, in_bg = in_bg, in_bgr = in_bgr,
           build = function()
             local lines, marks = {}, {}
             -- 角色头位于「过程」折叠之外（角色切换提示不被折叠吞掉）。
@@ -2097,7 +2213,8 @@ local function _blocks(msgs, opts, prev, show)
             _append_reasoning(lines, marks, snap, eopts, show)
             _append_content(lines, marks, snap, eopts)
             for _, pp in ipairs(paired) do
-              _append_tool_block(lines, marks, pp.tc, pp.res, { width = tool_width })
+              _append_tool_block(lines, marks, pp.tc, pp.res,
+                { width = tool_width, background = pp.bg, bg_result = pp.bg_res })
             end
             if turn_end then
               _append_turn_sep(lines, marks)
@@ -2245,10 +2362,14 @@ function M.refresh_tool_times(lines, marks, opts)
   for i = 1, #(lines or {}) do
     local th = marks[i] and marks[i].tool_header
     -- 仅刷新「尚无结果消息且未结束」的工具：有结果/已结束的首行由整块构建锁定状态与总耗时。
-    if th and th.tc and not th.res then
+    -- 后台工具完成后的结果在末尾消息里（bg_result），同样不再按运行中刷新。
+    if th and th.tc and not th.res and not th.bg_result then
       local status = fold.get_status(th.id)
       if status ~= "success" and status ~= "failure" then
-        local text = _tool_header_text(th.tc, nil, opts)
+        local text = _tool_header_text(th.tc, nil, {
+          width = opts and opts.width,
+          background = th.background,
+        })
         if text then
           local newline = "  " .. text
           if lines[i] ~= newline then

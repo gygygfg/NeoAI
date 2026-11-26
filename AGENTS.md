@@ -17,7 +17,7 @@ NeoAI 是一个 Neovim AI 编程助手插件（Lua）。分层：
 ## 关键命令
 
 ```bash
-# 运行全部内置测试（并行，双 lane 有界并发，输出 SUMMARY passed/failed）
+# 运行全部内置测试（并行，双 lane 有界并发 + 独占通道，输出 SUMMARY passed/failed）
 # 可选环境变量 NEOAI_TEST_WORKERS 覆盖 light 通道 worker 数（默认按实际核数与可用内存动态分配：
 #                  light=核数-heavy，上限 16；每 heavy 分片预留 1536MB、每 light 分片 512MB）
 #                 NEOAI_TEST_HEAVY_WORKERS 覆盖 heavy 通道并发上限（默认核数/2；总并发硬上限 = 核数-2；=1 回退旧串行通道）
@@ -41,7 +41,10 @@ nvim --headless --clean -u NONE --cmd "set rtp+=$PWD" \
   分派到隔离 headless 子进程，采用**双 lane 有界并发**：light（非资源重套件，LPT 分片成 W 个
   进程）与 heavy（`sandbox*`/`pty`，一套件一进程，上限 H）**重叠执行**、任一子进程结束即回填，
   约束 `#light≤W`、`#heavy≤H`、`W+H≤核数-2`（预留两核给系统/编辑器）。权重优先用实测耗时缓存 `.neoai_test_timings.json`
-  （gitignored），无缓存按用例数。文件级分片保证固定端口（各文件唯一）与文件内固定临时路径
+  （gitignored），无缓存按用例数。另有**独占通道**：会触碰宿主全局 `/run/netns` 的套件（默认
+  `sandbox_view*`）不进 heavy lane，而在两 lane 全部结束后一套件一进程串行执行，绝不与其他分片
+  重叠（并发 `ip netns add/del` 会争用共享的 `/run/netns` 挂载点）；可用 `opts.exclusive_suites` 覆盖。
+  文件级分片保证固定端口（各文件唯一）与文件内固定临时路径
   不跨 worker 冲突；子进程注入独立 `mcp.cache_path`。
 - **主线程卸载（父进程 + worker 子进程）**：每个 worker 把结果写入 **sidecar**（小 JSON）并把
   stdout/stderr 直接落盘为**日志文件**；父进程只读小 sidecar、不缓冲/扫描整段输出、不驻留分片

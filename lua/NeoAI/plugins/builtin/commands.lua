@@ -422,6 +422,68 @@ local SUBCOMMANDS = {
     end,
   },
   {
+    name = "SandboxKeys",
+    phase1 = true,
+    desc = "计算密钥文件指纹（供 protected.preauthorized 免审批绑定使用）",
+    handler = function(opts)
+      local preauto = require("NeoAI.sandbox.protected.preauthorize")
+      local arg = type(opts) == "table" and type(opts.args) == "string" and vim.trim(opts.args) or ""
+      -- `:NeoAI SandboxKeys revoke <n>`：撤销第 n 条免审批绑定（会话内生效 + 审计）。
+      local revoke_index = arg:match("^revoke%s+(%d+)$")
+      if revoke_index then
+        local ok, err = preauto.revoke(tonumber(revoke_index))
+        vim.notify(
+          ok and ("[NeoAI] 已撤销第 " .. revoke_index .. " 条免审批绑定（本会话生效）")
+            or ("[NeoAI] 撤销失败: " .. tostring(err)),
+          ok and vim.log.levels.INFO or vim.log.levels.WARN)
+        return
+      end
+      local files = {}
+      if arg ~= "" then
+        files = { vim.fn.expand(arg) }
+      else
+        -- 无参数：列出本机 SSH 私钥（跳过 .pub），直接可抄进配置。
+        for _, p in ipairs(vim.fn.glob(vim.fn.expand("~/.ssh/id_*"), false, true)) do
+          if not p:match("%.pub$") then files[#files + 1] = p end
+        end
+      end
+      local lines = {}
+      if #files > 0 then
+        lines[#lines + 1] = "密钥指纹（填入 tools.sandbox.protected.preauthorized[].fingerprint）："
+        for _, f in ipairs(files) do
+          local fp, err = preauto.fingerprint_file(f)
+          lines[#lines + 1] = fp and ("  " .. fp .. "  " .. f) or ("  ! " .. tostring(err) .. "  " .. f)
+        end
+      elseif arg ~= "" then
+        vim.notify("[NeoAI] 密钥文件不可读: " .. arg, vim.log.levels.WARN)
+        return
+      end
+      -- 已配置的免审批绑定（审计用：用户应能随时看到「哪些钥匙被预授权给谁」并能撤销）。
+      local binds = preauto.list()
+      if #binds > 0 then
+        local usage = preauto.usage()
+        lines[#lines + 1] = ""
+        lines[#lines + 1] = "已配置的免审批绑定（:NeoAI SandboxKeys revoke <n> 撤销）："
+        for i, b in ipairs(binds) do
+          local expired = type(b.expires_at) == "number" and os.time() > b.expires_at
+          lines[#lines + 1] = ("  [%d] %s…  %s  consumers=%s  targets=%s  used=%d/%s%s"):format(
+            i,
+            tostring(b.fingerprint or ""):sub(1, 20),
+            tostring(b.resource or "-"),
+            (#(b.consumers or {}) > 0 and table.concat(b.consumers, ",") or "*"),
+            (#(b.targets or {}) > 0 and table.concat(b.targets, ",") or "*"),
+            tonumber(usage[i]) or 0,
+            (tonumber(b.max_uses) or 0) > 0 and tostring(b.max_uses) or "∞",
+            expired and "  [已过期]" or "")
+        end
+      end
+      if #lines == 0 then
+        lines[1] = "未找到密钥文件；用法：:NeoAI SandboxKeys <文件路径>  |  :NeoAI SandboxKeys revoke <n>"
+      end
+      vim.notify(table.concat(lines, "\n"), vim.log.levels.INFO)
+    end,
+  },
+  {
     name = "SandboxCaps",
     desc = "显示沙箱运行时能力探测结果",
     handler = function()
@@ -441,6 +503,18 @@ local SUBCOMMANDS = {
       parts[#parts + 1] = "privilege=" .. tostring(pcfg.enabled ~= false)
       parts[#parts + 1] = "max_tier=" .. tostring(pcfg.max_tier or 0)
       parts[#parts + 1] = "container=" .. tostring(cstat)
+      pcall(function()
+        local st = sandbox.docker_status()
+        parts[#parts + 1] = "docker_tier=" .. tostring(st.probe and st.probe.tier)
+        parts[#parts + 1] = "docker_runtime=" .. tostring(st.probe and st.probe.runtime)
+        parts[#parts + 1] = "docker_session=" .. tostring(st.session and st.session.active)
+        parts[#parts + 1] = "docker_broker=" .. tostring(st.broker and st.broker.running)
+      end)
+      pcall(function()
+        local iso = require("NeoAI.sandbox.net.isolate").status()
+        parts[#parts + 1] = "net_isolation=" .. tostring(iso.active
+          and (iso.mode == "netns" and "netns" or "userns") or (iso.enabled and "standby" or "off"))
+      end)
       -- overlay 可用性诊断：不可用时给出原因（默认 fail-closed 会拒绝 process 工具）
       local diag = sandbox.overlay_diagnosis(vim.fn.getcwd())
       parts[#parts + 1] = "overlay=" .. (diag.available and "ready"
@@ -673,11 +747,13 @@ local SUBCOMMANDS = {
       if kind == "network" then
         local ok, hp = pcall(require, "NeoAI.sandbox.net.host_proxy")
         if not ok then return end
-        -- 高权限模式另有一份不会被 host_proxy.summary drain 的环形记录；优先读取它。
-        local recs = {}
-        local okp, sp = pcall(require, "NeoAI.sandbox.privileged")
-        if okp and type(sp.records) == "function" then recs = sp.records(50) end
-        if #recs == 0 then recs = hp.recent(50) end
+        -- host_proxy 的审计环形缓冲持久保留（不被命令结果摘要 drain），优先读取；
+        -- 高权限模式另有独立记录，作为兼容回退。
+        local recs = hp.recent(50)
+        if #recs == 0 then
+          local okp, sp = pcall(require, "NeoAI.sandbox.privileged")
+          if okp and type(sp.records) == "function" then recs = sp.records(50) end
+        end
         if #recs == 0 then
           vim.notify("[NeoAI] 暂无网络访问记录", vim.log.levels.INFO)
           return
@@ -819,6 +895,91 @@ local SUBCOMMANDS = {
         return
       end
       vim.notify("[NeoAI] 用法: :NeoAI HerderConfig [show|install|uninstall]", vim.log.levels.WARN)
+    end,
+  },
+  {
+    name = "Deps",
+    desc = "可选安全依赖管理（可视化选择并调用包管理器安装）",
+    handler = function(sub_opts)
+      local arg = _first_arg(sub_opts)
+      local deps = _svc("services.deps")
+      if not deps then
+        vim.notify("[NeoAI] 依赖服务不可用（尚未完成阶段 2 启动）", vim.log.levels.WARN)
+        return
+      end
+      if arg == "status" then
+        local lines = {}
+        for _, d in ipairs(deps.status()) do
+          lines[#lines + 1] = string.format("%-28s %s%s", d.label,
+            d.installed and "ok" or ("missing: " .. table.concat(d.missing_bins or {}, ",")),
+            d.manual and "（手动安装）" or "")
+        end
+        vim.notify("[NeoAI] 可选安全依赖：\n" .. table.concat(lines, "\n"), vim.log.levels.INFO)
+        return
+      end
+      require("NeoAI.ui.components.deps_panel").open()
+    end,
+  },
+  {
+    name = "SandboxDocker",
+    desc = "会话内 Docker 状态/重建队列/审查（pending、approve、revoke、stop）",
+    handler = function(sub_opts)
+      local sandbox = _svc("services.sandbox")
+      if not sandbox then return end
+      local args = {}
+      for a in (sub_opts.args or ""):gmatch("%S+") do args[#args + 1] = a end
+      local sub = args[1] or "status"
+      if sub == "status" then
+        local st = sandbox.docker_status()
+        local lines = {
+          ("tier=%s runtime=%s"):format(tostring(st.probe and st.probe.tier), tostring(st.probe and st.probe.runtime)),
+          ("session=%s broker=%s"):format(tostring(st.session and st.session.active), tostring(st.broker and st.broker.running)),
+          ("monitor: notices=%s killed=%s"):format(
+            tostring(st.monitor and st.monitor.notices), tostring(st.monitor and st.monitor.killed)),
+        }
+        for _, s in ipairs(st.rebuild_pending or {}) do
+          lines[#lines + 1] = ("rebuild %s %s mode=%s"):format(tostring(s.spec_id), tostring(s.name), tostring(s.mode))
+        end
+        vim.notify("[NeoAI] Docker 状态：\n" .. table.concat(lines, "\n"), vim.log.levels.INFO)
+        return
+      end
+      if sub == "pending" then
+        local list = sandbox.docker_pending()
+        if #list == 0 then
+          vim.notify("[NeoAI] 无待重建容器", vim.log.levels.INFO)
+          return
+        end
+        for _, spec in ipairs(list) do sandbox.docker_print_hint(spec) end
+        return
+      end
+      if sub == "approve" and args[2] then
+        local ok = require("NeoAI.sandbox.docker.specs").approve(args[2])
+        require("NeoAI.sandbox.docker.session").rebuild_one(args[2], function(done, reason)
+          vim.schedule(function()
+            if done then
+              vim.notify("[NeoAI] 已批准并重建：" .. args[2], vim.log.levels.INFO)
+            else
+              vim.notify("[NeoAI] 重建失败：" .. tostring(reason), vim.log.levels.WARN)
+            end
+          end)
+        end)
+        if not ok then
+          vim.notify("[NeoAI] 未找到重建规格：" .. args[2], vim.log.levels.WARN)
+        end
+        return
+      end
+      if sub == "revoke" and args[2] then
+        sandbox.docker_revoke(args[2])
+        require("NeoAI.sandbox.docker.specs").remove(args[2])
+        vim.notify("[NeoAI] 已撤销并删除重建规格：" .. args[2], vim.log.levels.INFO)
+        return
+      end
+      if sub == "stop" then
+        pcall(function() require("NeoAI.sandbox.docker.session").stop() end)
+        vim.notify("[NeoAI] 会话 runtime 已停止；容器随 userns 销毁", vim.log.levels.INFO)
+        return
+      end
+      vim.notify("[NeoAI] 用法: :NeoAI SandboxDocker [status|pending|approve <id> <digest>|revoke <id>|stop]", vim.log.levels.WARN)
     end,
   },
   {

@@ -1011,6 +1011,8 @@ function M.enqueue(cand, meta)
     package_sensitive = meta.package_sensitive,
     -- 冻结时剔除的不可发布文件（遮蔽/易变缓存），供审批界面提示。
     dropped = meta.dropped,
+    -- 受保护资源的后果 id（与审批弹窗同一文案来源，供待审条目头部展示）
+    consequence_id = meta.consequence_id,
     -- 工具调用参数摘要（脱敏/限长）：审批界面「调用参数」区。
     args_preview = meta.args_preview,
     -- 同一安装命令合并的次数：审批界面「调用参数」区标注「已合并 N 次调用」。

@@ -195,6 +195,32 @@ _run() 每轮：
 消息队列（`_execute_single` 不直接写入）。保证 tool 消息顺序与 assistant 的 `tool_calls` 一致，
 API 兼容且前缀缓存确定。
 
+### 4.4.1 工具后台化（等工具期间收到新消息）
+
+工具循环处于「模型生成已完成、正在等工具返回」时，收到新消息（用户 / 系统 / 子 Agent 投递）
+**不再等整批工具完成才注入**：
+
+- 只有**已真正开始执行**（可暂停 timer 处于 running）的工具才转后台；批内若有等待审批 /
+  `ask_user` / 同意窗的工具（timer 未 running 且未 settled），整批先保持前台，消息继续暂存。
+  等交互结束、其余工具开始/恢复执行时，`utils.timer` 的 `on_active` 回调会再次尝试转后台。
+- 转后台时：给 assistant 消息打 `background_tool_ids`，在上下文末尾插入
+  `工具已在后台执行，ID：...` 的 system 说明（`system_update=true`），随后注入新消息
+  （`mid_turn=true`），并**立即发起下一轮**模型请求。
+- 后台工具完成时：把返回信息作为 **system 消息追加到上下文末尾**（`background_result=true`，
+  带原 `tool_call_id` / 工具名 / 耗时）。该追加**不会再次触发后台化**；若当时仍有前台批次 /
+  流式生成，结果先排队，到安全边界（无未配对 tool_calls、无流式写入）再追加。
+- 循环结束条件：无当前工具调用 **且** 无后台工具 **且** 无待注入消息。后台未清空时保持
+  `tool_running`；每次后台完成都会追加结果并发起下一轮，让模型感知。
+- 请求构建：`context_builder._balance_tools` 对 `background_tool_ids` 中尚无真实结果的调用补一条
+  **稳定**的「后台执行中」占位 tool 结果（文本只含 id），保证每个 `tool_call_id` 都有配对结果；
+  后台真实返回信息不走乱序 tool 结果，因此请求保持严格尾部追加、不破坏前缀缓存。
+- system 说明 / 后台结果默认按 `system_update` 降级为 user（`ai.system_in_history=true` 时保留
+  system），避免 DeepSeek 等端点把末尾 system 提到最前、破坏顶层系统提示与前缀缓存。
+- 后台结果与普通工具结果一样参与轻量工具结果裁剪：`tool_result_pruner` 会同步裁剪
+  `background_body` 并重建模型可见 `content`，避免超大后台输出绕过裁剪、顶穿上下文。
+- 模型**流式生成中**收到的消息仍会等当前 assistant 消息生成完（不能插入正在写入的消息中间），
+  流结束后在下一轮边界注入；不会再等工具。
+
 ## 5. 前缀缓存（prefix.lua）
 
 策略对齐 deepseek-harness 的上下文缓存实践：

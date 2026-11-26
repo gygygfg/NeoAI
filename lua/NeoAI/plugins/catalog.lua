@@ -141,6 +141,13 @@ local function _service_specs()
         _safe("sandbox.shutdown", require("NeoAI.sandbox").shutdown)
       end,
     },
+    {
+      id = "services.deps", module = "NeoAI.services.deps", service = "services.deps", phase = 2,
+      stop = function(ctx)
+        local m = ctx and ctx.impl
+        if m and type(m.stop) == "function" then pcall(m.stop) end
+      end,
+    },
     { id = "services.model_service", module = "NeoAI.services.model_service", service = "services.model_service" },
     {
       id = "services.chat_service", module = "NeoAI.services.chat_service", service = "services.chat_service",

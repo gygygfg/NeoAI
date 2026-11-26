@@ -7,6 +7,8 @@
 ---   * 总并发硬上限 = 核数 - 2（预留两核给系统/编辑器，核数很少时至少 2 路）；
 ---   * heavy（一套件一子进程）：目标 核数/2，受总上限与内存约束；
 ---   * light（LPT 分片）：总上限余量（另上限 16）；
+---   * exclusive（宿主全局资源，如 /run/netns）：一套件一子进程，且不与 light/heavy 重叠，
+---     在二者全部结束后串行执行（见 EXCLUSIVE_PATTERNS）。
 ---   * 内存：heavy 每路预留 HEAVY_MEM_BUDGET_MB、light 每路 LIGHT_MEM_BUDGET_MB，
 ---     可用内存不足时从 heavy 让位（heavy 至少 1 路）并压缩 light，保证至少 1 路 light；
 ---   * 自动推导时保证 W+H ≤ 核数。环境变量 NEOAI_TEST_WORKERS / NEOAI_TEST_HEAVY_WORKERS
@@ -39,6 +41,12 @@ M.TIMINGS_FILE = ".neoai_test_timings.json"
 -- bwrap/unshare/cgroup 与常驻进程，无界并发会互相争抢内存/CPU（137/SIGKILL、超时）；
 -- pty 依赖 PTY 交互时序，并发度需受限。这些套件一套件一子进程，受 heavy 并发上限约束。
 M.SERIAL_PATTERNS = { "^sandbox", "^pty$" }
+
+-- 默认视为「独占宿主机全局资源」的套件名模式：这些套件会经 `ip netns add/del` 高频
+-- 改动宿主全局的 `/run/netns`（共享挂载点）。与其他分片并发时会在该挂载点上互相竞争
+-- （bind mount / make-shared 的跨进程竞态），导致全量并行失败。它们一套件一子进程且
+-- **不与 light/heavy 两条 lane 重叠**，在二者全部结束后串行执行（独占通道）。
+M.EXCLUSIVE_PATTERNS = { "^sandbox_view" }
 
 -- ========== 资源探测 ==========
 
@@ -221,6 +229,20 @@ end
 function M.is_serial(name, opts)
   local pats = opts and opts.serial_suites
   if pats == nil then pats = M.SERIAL_PATTERNS end
+  if type(pats) == "function" then return pats(name) == true end
+  for _, pat in ipairs(pats) do
+    if tostring(name):find(pat) then return true end
+  end
+  return false
+end
+
+--- 判断套件是否走「独占通道」（触碰宿主全局资源，如 `/run/netns`，需串行且不与其他分片重叠）。
+--- @param name string
+--- @param opts table
+--- @return boolean
+function M.is_exclusive(name, opts)
+  local pats = opts and opts.exclusive_suites
+  if pats == nil then pats = M.EXCLUSIVE_PATTERNS end
   if type(pats) == "function" then return pats(name) == true end
   for _, pat in ipairs(pats) do
     if tostring(name):find(pat) then return true end

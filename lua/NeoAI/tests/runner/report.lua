@@ -104,6 +104,7 @@ end
 --- @param opts table
 function M.print(agg, opts)
   local heavy = agg.heavy_workers or 0
+  local exclusive = agg.exclusive_workers or 0
   local extra = ""
   if agg.cores then
     extra = (" · %d 核"):format(agg.cores)
@@ -112,8 +113,10 @@ function M.print(agg, opts)
   if (agg.skipped or 0) > 0 then
     extra = extra .. (" · 跳过 %d 例"):format(agg.skipped)
   end
-  print(("\n=== NeoAI 并行测试（%d 分片 / %d light + %d heavy worker%s，%.1fs） ===")
-    :format(#agg.shards, agg.workers, heavy, extra, agg.elapsed_ms / 1000))
+  local lanes = ("%d light + %d heavy worker"):format(agg.workers, heavy)
+  if exclusive > 0 then lanes = lanes .. (" + %d exclusive worker"):format(exclusive) end
+  print(("\n=== NeoAI 并行测试（%d 分片 / %s%s，%.1fs） ===")
+    :format(#agg.shards, lanes, extra, agg.elapsed_ms / 1000))
   for i = 1, #agg.shards do
     local sh = agg.shards[i]
     if sh then

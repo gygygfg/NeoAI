@@ -123,7 +123,8 @@ tests.suite("sandbox_privilege", function(_, it)
           done = true
         end)
       t.true_(vim.wait(5000, function() return done end), "应快速返回")
-      t.matches("宿主敏感遮蔽路径", err or "", "应硬拒绝，实际: " .. tostring(err))
+      t.matches("BLOCKED code=PROTECTED_RESOURCE", err or "", "应硬拒绝（不可审批解除），实际: " .. tostring(err))
+      t.matches("retryable=false", err or "", "硬拒绝应标记不可重试")
     end)
     vim.fn.delete(dir, "rf")
   end)
@@ -275,7 +276,7 @@ tests.suite("sandbox_privilege", function(_, it)
             done = true
           end)
         t.true_(vim.wait(5000, function() return done end), "应快速返回")
-        t.matches("宿主敏感遮蔽路径", err or "", "应硬拒绝: " .. tostring(path))
+        t.matches("BLOCKED code=PROTECTED_RESOURCE", err or "", "应硬拒绝（不可审批解除）: " .. tostring(path))
       end
       must_reject(link)
       must_reject("/proc/self/root" .. file)
@@ -290,7 +291,7 @@ tests.suite("sandbox_privilege", function(_, it)
           done = true
         end)
       t.true_(vim.wait(5000, function() return done end), "应快速返回")
-      t.matches("宿主敏感遮蔽路径", err or "", "read_image 应硬拒绝，实际: " .. tostring(err))
+      t.matches("BLOCKED code=PROTECTED_RESOURCE", err or "", "read_image 应硬拒绝，实际: " .. tostring(err))
     end)
     vim.fn.delete(link_dir, "rf")
     vim.fn.delete(dir, "rf")
@@ -317,7 +318,7 @@ tests.suite("sandbox_privilege", function(_, it)
           done = true
         end)
       t.true_(vim.wait(5000, function() return done end), "应快速返回")
-      t.matches("宿主敏感遮蔽路径", err or "", "mask_paths 应优先硬拒绝，实际: " .. tostring(err))
+      t.matches("BLOCKED code=PROTECTED_RESOURCE", err or "", "mask_paths 应优先硬拒绝，实际: " .. tostring(err))
     end)
     vim.fn.chdir(prev)
     vim.fn.delete(home, "rf")
@@ -1156,8 +1157,15 @@ tests.suite("sandbox_privilege", function(_, it)
     vim.env.NEOAI_TEST_REPL_KEY = fake
     local sanitized = secret.sanitized_env()
     t.true_(secret.has_token(sanitized.NEOAI_TEST_REPL_KEY), "sanitized_env 应为 token")
+    -- 默认：载荷 env 只有 token，真实值不进入子进程环境（防裸 socket 外泄）。
     local env = runtime.sandbox_env(nil)
-    t.eq(fake, env.NEOAI_TEST_REPL_KEY, "sandbox_env 应还原真实密钥")
+    t.true_(secret.has_token(env.NEOAI_TEST_REPL_KEY), "默认 sandbox_env 应保留 token")
+    t.true_(env.NEOAI_TEST_REPL_KEY ~= fake, "默认 sandbox_env 不应注入真实密钥")
+    -- opt-in：显式允许真实 env 值时恢复旧行为。
+    with_config({ tools = { sandbox = { secrets = { real_env_values = true } } } }, function()
+      local env2 = runtime.sandbox_env(nil)
+      t.eq(fake, env2.NEOAI_TEST_REPL_KEY, "real_env_values=true 应还原真实密钥")
+    end)
     vim.env.NEOAI_TEST_REPL_KEY = nil
     if runtime.backend() ~= "bwrap" then secret.reset(); return end
     -- 命令参数中的假密钥：沙箱内应还原为真实密钥（用 sha256 观测，避免长度相同无法区分）

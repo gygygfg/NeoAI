@@ -29,7 +29,8 @@ local state = {
   server = nil,
   host = nil,
   port = nil,
-  records = {},
+  records = {}, -- 命令结果摘要用（summary 会 drain）
+  audit = {},   -- 持久审计环形缓冲（:NeoAI SandboxAudit network 读取，不被 summary 清空）
   host_addrs = nil, -- 宿主本机地址集合（懒加载）
   opts = {},
 }
@@ -205,19 +206,23 @@ local function _allow_local(host, port, ips)
   return _is_loopback(lower)
 end
 
---- 网络访问策略：`ask`（默认）| `allow` | `deny`。`state.opts.access` 优先（测试/内部注入）。
+--- 网络访问策略：`ask`（默认）| `allow` | `deny`。高权限模式与 `network.record_only`
+--- 优先于配置与 `state.opts.access`；其余情况 `state.opts.access` 优先（测试/内部注入）。
 --- @return string
 local function _access_policy()
   -- 高权限模式：一律放行（仍记录目标），优先于配置与测试注入。
   -- 判据为进程级（任一 PRIV 会话存在），不随 UI 焦点/当前 Agent 漂移。
   local okp, privileged = pcall(require, "NeoAI.sandbox.privileged")
   if okp and privileged.network_active() then return "allow" end
+  local ok, cfg = pcall(function()
+    return require("NeoAI.kernel.config_store").get("tools.sandbox.network")
+  end)
+  cfg = (ok and type(cfg) == "table") and cfg or {}
+  -- 仅记录模式：一律放行（仍逐条记录），覆盖 access/deny。
+  if cfg.record_only == true then return "allow" end
   local p = state.opts.access
   if p ~= "allow" and p ~= "deny" and p ~= "ask" then
-    local ok, cfg = pcall(function()
-      return require("NeoAI.kernel.config_store").get("tools.sandbox.network")
-    end)
-    p = (ok and type(cfg) == "table" and cfg.access) or "ask"
+    p = cfg.access or "ask"
   end
   if p ~= "allow" and p ~= "deny" then p = "ask" end
   return p
@@ -509,10 +514,14 @@ end
 -- ========== 记录 ==========
 
 local function _record(host, port, proto, decision)
-  if #state.records >= MAX_RECORDS then table.remove(state.records, 1) end
-  state.records[#state.records + 1] = {
+  local rec = {
     host = host, port = port, proto = proto, decision = decision, at = os.time(),
   }
+  if #state.records >= MAX_RECORDS then table.remove(state.records, 1) end
+  state.records[#state.records + 1] = rec
+  -- 独立审计缓冲：不受命令结果摘要（summary/drain_records）影响，供随时查看。
+  if #state.audit >= MAX_RECORDS then table.remove(state.audit, 1) end
+  state.audit[#state.audit + 1] = rec
   -- 高权限模式：把放行/拦截目标额外写入独立环形缓冲，供 :NeoAI SandboxAudit network
   -- 查看（host_proxy.summary 只回传拦截项，且会在命令结束时 drain）。
   local okp, privileged = pcall(require, "NeoAI.sandbox.privileged")
@@ -969,7 +978,7 @@ function M.start(host, port, opts)
   return { host = state.host, port = state.port }
 end
 
---- 幂等启动（按配置 host_local_block）。未启用返回 nil。
+--- 幂等启动（按 `host_local_block` 或 `record_only`）。未启用返回 nil。
 --- @return table|nil { host, port }
 function M.ensure()
   if state.server then return { host = state.host, port = state.port } end
@@ -977,7 +986,7 @@ function M.ensure()
   -- 高权限模式即使配置关闭 host_local_block 也要启动代理（仅记录放行目标）。
   -- 判据为进程级：任一 PRIV 会话存在即启动，避免焦点切换后记录丢失。
   local okp, privileged = pcall(require, "NeoAI.sandbox.privileged")
-  local recording = okp and privileged.network_active()
+  local recording = (okp and privileged.network_active()) or cfg.record_only == true
   if cfg.host_local_block == false and not recording then return nil end
   local port = tonumber(cfg.host_local_proxy_port) or 0
   local addr, err = M.start("127.0.0.1", port)
@@ -1027,8 +1036,10 @@ function M.recent(limit)
   local n = tonumber(limit) or 50
   if n < 1 then n = 1 end
   local out = {}
-  for i = #state.records, math.max(1, #state.records - n + 1), -1 do
-    out[#out + 1] = vim.deepcopy(state.records[i])
+  -- 审计缓冲是持久副本（summary 只 drain `records`），因此命令结束后仍可查看。
+  local src = state.audit
+  for i = #src, math.max(1, #src - n + 1), -1 do
+    out[#out + 1] = vim.deepcopy(src[i])
   end
   return out
 end
@@ -1110,6 +1121,7 @@ end
 function M.reset()
   M.stop()
   state.records = {}
+  state.audit = {}
   state.host_addrs = nil
   state.opts = {}
   _warned_no_proxy = false

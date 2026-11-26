@@ -97,6 +97,19 @@ Expand/collapse: `zM` (collapse all) / `zo` (expand) / `zR` (expand all).
 > you leave insert mode (`InsertLeave`): it rebuilds `foldexpr` to collapse the new blocks and **restores the folds you
 > had expanded**, with no manual `zx` needed.
 
+### 5.1 Backgrounding Tools (sending a message while waiting for tools)
+
+If the AI is waiting for tool results (model generation finished) and you keep typing, it no longer waits
+for the whole batch:
+
+- Tools that have actually started executing are moved to the background; a
+  `tool is running in the background, IDs: ...` note is inserted and your message is processed
+  immediately;
+- Tools waiting for approval / `ask_user` stay in the foreground, and the message waits until the
+  interaction ends before backgrounding;
+- When a background tool finishes, its return info is appended at the end of the conversation as a
+  "background tool result" fold block, and the loop continues.
+
 ## 6. Plan Mode (PLAN)
 
 `m` or `:NeoAI Plan` toggles plan mode:
@@ -116,7 +129,8 @@ Expand/collapse: `zM` (collapse all) / `zo` (expand) / `zR` (expand all).
 
 When `tools.privileged_mode.enabled=true` and `tools.approval.mode="async"`, `m` enters PRIV after
 PLAN, or use `:NeoAI Privileged`. In PRIV the network is not blocked (targets are recorded) and
-docker/podman can be used directly (docker connects to the host daemon). Network allowance is a
+SSH keys are unmasked. Docker is no longer connected directly to the host daemon; it is served by an
+auto-detected rootless runtime inside the session namespace plus a host-side broker. Network allowance is a
 **process-wide** decision: while any PRIV session exists, network traffic is allowed and recorded —
 switching window focus or creating a new session does not bring the prompt back. Switching modes
 during a generation applies the policy immediately and defers only the model switch to the end of

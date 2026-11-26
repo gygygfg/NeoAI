@@ -104,6 +104,19 @@ function M.create()  local t = {
   return t
 end
 
+--- 通知计时器已进入活跃执行（start/resume 后调用）。
+--- on_active 供工具循环在「交互结束、工具真正开始/恢复执行」时重新评估是否转后台；
+--- 回调异常绝不影响计时与工具执行。
+--- @param t table
+local function _notify_active(t)
+  if type(t.on_active) ~= "function" then return end
+  local ok, err = pcall(t.on_active, t)
+  if not ok then
+    -- 回调来自工具循环；这里只告警，不打断 timer/工具（utils 不反向依赖 kernel）。
+    pcall(vim.notify, "[NeoAI] timer on_active 回调异常: " .. tostring(err), vim.log.levels.WARN)
+  end
+end
+
 --- 开始计时（幂等）。timeout_ms 指定超时预算（nil / <0 = 无超时）。
 --- @param t table
 --- @param timeout_ms number|nil
@@ -116,6 +129,7 @@ function M.start(t, timeout_ms)
   t._last = _now_ms()
   M._register(t)
   t:_arm()
+  _notify_active(t)
   return t
 end
 
@@ -141,6 +155,7 @@ function M.resume(t)
   t.running = true
   t._last = _now_ms()
   t:_arm()
+  _notify_active(t)
   return t
 end
 

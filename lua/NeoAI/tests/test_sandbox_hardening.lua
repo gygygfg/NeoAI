@@ -91,6 +91,17 @@ tests.suite("sandbox_hardening", function(_, it)
       "curl --nop''roxy '*' http://127.0.0.1:8080",
       "c=--noproxy; curl $c '*' http://127.0.0.1:8080",
       "p=''; curl --proxy $p http://127.0.0.1",
+      -- 包装器前缀（红队实测可绕：只看片段首 token 会漏判）
+      "timeout 8 env -u http_proxy curl http://127.0.0.1",
+      "timeout -s KILL 8 env -u HTTPS_PROXY curl http://127.0.0.1",
+      "nice -n 5 env -u http_proxy curl http://127.0.0.1",
+      "sudo -u root env -u all_proxy curl http://127.0.0.1",
+      "xargs -0 -I{} env -u https_proxy curl http://127.0.0.1",
+      "command env --unset=all_proxy curl http://127.0.0.1",
+      "nohup env -u http_proxy curl http://127.0.0.1 &",
+      "setsid env -u http_proxy curl http://127.0.0.1",
+      "timeout 5 bash -c 'env -u http_proxy curl http://127.0.0.1'",
+      "timeout 5 curl --noproxy '*' http://127.0.0.1",
     }) do
       t.not_nil(risk.network_evasion_reason(eff(c)), "应识别代理规避: " .. c)
     end
@@ -110,6 +121,11 @@ tests.suite("sandbox_hardening", function(_, it)
       "bash -x /dev/null",
       -- 未展开的合法代理变量不应被判为空
       "curl --proxy \"$http_proxy\" http://example.com",
+      -- 包装器但未规避代理
+      "timeout 5 curl http://example.com",
+      "nice -n 5 echo hi",
+      "timeout 5 env FOO=1 curl http://example.com",
+      "xargs -0 echo hi",
     }) do
       t.eq(nil, risk.network_evasion_reason(eff(c)), "不应误判: " .. c)
     end
@@ -138,6 +154,19 @@ tests.suite("sandbox_hardening", function(_, it)
     t.eq("deny", pc.ask("other", {}), "其它策略选项3=拒绝")
     vim.api.nvim_list_uis = orig_uis
     vim.fn.confirm = orig_confirm
+    pc.reset()
+  end)
+
+  it("策略确认：requires_ui 渲染器在 headless 下不可用（不悬挂）", function(t)
+    local pc = require("NeoAI.sandbox.review.policy_consent")
+    pc.reset()
+    pc.set_ui({ show = function() end, hide = function() end, requires_ui = true })
+    t.false_(pc.available(), "headless 下 requires_ui 渲染器不可用")
+    local decision, done
+    pc.request("proxy_evasion", { title = "t" }):then_(function(v) decision = v; done = true end)
+    t.true_(vim.wait(2000, function() return done end), "应完成")
+    t.eq("deny", decision, "应失败关闭")
+    pc.set_ui(nil)
     pc.reset()
   end)
 

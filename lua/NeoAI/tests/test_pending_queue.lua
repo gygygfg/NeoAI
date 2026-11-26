@@ -209,16 +209,20 @@ tests.suite("pending_queue", function(_, it)
     local d2 = runtime.run(agent, "second")
     local kind = nil
     d2:catch(function(e) kind = e and e.kind end)
+
+    -- 在首轮仍占用生成槽位时发送消息，确保它真的进入暂存队列（而不是直接开跑）。
+    local d3 = chat.send_message("queued-while-busy")
+    t.true_(d3:is_pending(), "槽位被占用时 send_message 应暂存为 pending")
+    t.eq(1, chat.pending_count_for_agent(agent.id), "消息应进入暂存队列")
+
     vim.wait(50, function() return kind ~= nil end)
     t.eq("busy", kind, "二次 runtime.run 应拒绝 busy")
 
-    -- send_message 在槽位被占用时应收纳为 pending（而不是直接失败/并行运行）
-    local d3 = chat.send_message("queued-while-busy")
-    t.true_(d3:is_pending(), "槽位被占用时 send_message 应暂存为 pending")
-
-    -- 等待首轮（与暂存队列中的消息）自然结束并清掉 claim
-    vim.wait(500, function() return agent._turn_claim == nil end)
+    -- 等待首轮与暂存队列中的消息都自然处理完（含暂存消息触发的下一轮），
+    -- 避免把仍在途的生成留给后续套件（会污染其 recovery/http 桩与调用计数）。
+    vim.wait(3000, function() return not chat.has_pending_work_for_agent(agent.id) end)
     t.nil_(agent._turn_claim, "运行结束后生成占用应被释放")
+    t.eq(0, chat.pending_count_for_agent(agent.id), "暂存队列应已清空")
 
     http.request = original_http
     runtime.reset()

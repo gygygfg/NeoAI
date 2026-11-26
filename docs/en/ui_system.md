@@ -256,6 +256,13 @@ the “final answer” left outside the fold. The run therefore renders as
 message never swallowed by a fold. The marker is persisted with the session; old data without it is recognized by
 “a user message directly following a tool result”.
 
+**Background tool results**: when a tool is moved to the background because a new message arrived while the loop
+was waiting for tool results, the original tool block's header is marked `· 后台` (background); once the result
+arrives it refreshes ✅/❌/⏹ and the duration from the appended `background_result` message. The returned body is
+appended at the end of the conversation as a separate “background tool result” fold block (it is not disguised as
+an out-of-order tool result, nor duplicated under the original tool block). The background markers and result
+messages are persisted, so they render the same way after reopening the session.
+
 **The “process” fold is a two-level structure**: “process” itself is a level 1 fold, while the reasoning blocks
 and each tool block inside it remain level 2 nested folds. So expanding the “process” fold leaves the inner
 thinking/tool content **still collapsed**, revealing them one by one on demand instead of dumping everything at

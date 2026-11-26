@@ -228,6 +228,38 @@ M.SANDBOX_MOUNT_SKIPPED = "sandbox:mount_skipped"
 -- payload={path=..., kind="dest"|"src", stage="init", tool=...}
 M.SANDBOX_MOUNT_FAILED = "sandbox:mount_failed"
 
+-- ========== 会话内 Docker（自动档位 / 审查 / 资源 / 重建） ==========
+-- 自动档位解析（N0=无会话 runtime / N1=rootless 会话 / N2=microVM|gVisor）。
+-- payload={tier=..., reasons={...}, rootless=..., microvm=..., gvisor=...}
+M.SANDBOX_DOCKER_TIER_RESOLVED = "sandbox:docker_tier_resolved"
+-- broker 生命周期（宿主侧 Unix socket 代理 + body 检查）。
+M.SANDBOX_DOCKER_STARTED = "sandbox:docker_started"
+M.SANDBOX_DOCKER_STOPPED = "sandbox:docker_stopped"
+M.SANDBOX_DOCKER_DEGRADED = "sandbox:docker_degraded"
+-- 单次 API 请求决策。payload={method=..., path=..., decision="allow"|"deny", reason=...}
+M.SANDBOX_DOCKER_REQUEST = "sandbox:docker_request"
+M.SANDBOX_DOCKER_DENIED = "sandbox:docker_denied"
+-- 容器审查/批准。payload={id=..., name=..., level="blocked"|"safe"|"sensitive", reasons={...}}
+M.SANDBOX_DOCKER_REVIEWED = "sandbox:docker_reviewed"
+M.SANDBOX_DOCKER_APPROVED = "sandbox:docker_approved"
+M.SANDBOX_DOCKER_REVOKED = "sandbox:docker_revoked"
+-- 资源监测。payload={id=..., name=..., reason=..., peak=..., limit=...}
+M.SANDBOX_DOCKER_RESOURCE_WARN = "sandbox:docker_resource_warn"
+M.SANDBOX_DOCKER_RESOURCE_KILLED = "sandbox:docker_resource_killed"
+-- 容器重建规格。payload={spec_id=..., mode="auto"|"manual"|"never", reasons={...}}
+M.SANDBOX_DOCKER_REBUILD_CAPTURED = "sandbox:docker_rebuild_captured"
+M.SANDBOX_DOCKER_REBUILD_QUEUED = "sandbox:docker_rebuild_queued"
+M.SANDBOX_DOCKER_REBUILD_STARTED = "sandbox:docker_rebuild_started"
+M.SANDBOX_DOCKER_REBUILD_DONE = "sandbox:docker_rebuild_done"
+M.SANDBOX_DOCKER_REBUILD_FAILED = "sandbox:docker_rebuild_failed"
+M.SANDBOX_DOCKER_REBUILD_SUSPENDED = "sandbox:docker_rebuild_suspended"
+
+-- ========== 可选安全依赖管理（:NeoAI Deps） ==========
+M.SANDBOX_DEPS_CHECKED = "sandbox:deps_checked"
+M.SANDBOX_DEPS_INSTALL_STARTED = "sandbox:deps_install_started"
+M.SANDBOX_DEPS_INSTALL_FINISHED = "sandbox:deps_install_finished"
+M.SANDBOX_DEPS_INSTALL_FAILED = "sandbox:deps_install_failed"
+
 -- ========== 交互式终端（run_command PTY） ==========
 -- run_command 以 PTY 运行命令时，轮询 /proc 检测到“阻塞读终端 = 等待输入”触发 waiting_input；
 -- 判官子 agent / 用户手动注入时触发 input_sent；命令退出触发 exited。

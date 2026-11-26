@@ -252,7 +252,11 @@ function M.init()
   if state.unwait then state.unwait() end
   state.unwait = services.wait("services.sandbox", function(sandbox)
     if sandbox and sandbox.set_secret_alert_ui then
-      sandbox.set_secret_alert_ui({ show = M.show, hide = M.hide, is_open = M.is_open })
+      -- requires_ui：该渲染器只能在有 attached UI 时工作。--headless 下若仍视为可用，
+      -- 弹窗会永久等待用户输入（Deferred 永不结算），必须让服务端失败关闭。
+      sandbox.set_secret_alert_ui({
+        show = M.show, hide = M.hide, is_open = M.is_open, requires_ui = true,
+      })
     end
   end)
 end

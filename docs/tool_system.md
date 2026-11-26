@@ -261,6 +261,19 @@ M.execute(agent, name, args, tool_call_id, opts)
 目录并对主仓执行 `git worktree prune`，避免主仓 `.git/worktrees` 残留悬空注册
 （`worktree_guard` + `worktree_cleanup`；`read_all=false` 且未被可写根覆盖时仍 fail-closed 拒绝）。
 
+### 🔐 宿主侧 SSH（ssh.lua，默认关闭）
+
+`ssh_run`（`alias`/`command`）、`ssh_tunnel`（`action=open|close` + `alias`/`local_port`/
+`remote_host?`/`remote_port?`）、`ssh_result`（`host_op_id`）。
+
+三者都**不在沙箱内执行进程**：`ssh_run`/`ssh_tunnel` 只把请求交给
+`sandbox/ssh/broker` 用**别名配置**拼出参数固定的宿主 ssh 命令，并冻结为主机操作提案
+（`hostop`）；用户在 `:NeoAI SandboxReview` 确认后才在宿主执行，`ssh_result` 读回状态与输出。
+密钥不进入沙箱（无文件、无 fd、无 agent socket），AI 也无法替换 host/端口/私钥或传 `-o`。
+隧道仅 `-L 127.0.0.1:…`，对端主机与本地端口范围须在别名里预先声明（不提供 `-R`/`-D`）。
+配置见 `tools.sandbox.ssh`（[configuration.md](configuration.md)），安全模型见
+[sandbox.md](sandbox.md)。
+
 ### 🔧 LSP（lsp_ops.lua，Neovim >= 0.12）
 
 `lsp_hover` / `lsp_definition` / `lsp_references` / `lsp_implementation` / `lsp_declaration` /

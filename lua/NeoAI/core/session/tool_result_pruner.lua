@@ -177,6 +177,34 @@ function M.prune_agent(agent, opts)
           end
         end
       end
+    elseif msg.background_result and type(msg.background_body) == "string"
+      and msg.background_body ~= "" and not msg.pruned
+      and not _is_blob(msg.background_body) then
+      -- 后台工具结果以末尾 system 消息 + background_body 持久化，同样可能超大。
+      -- 裁剪正文并同步重建模型可见 content（保留首行 ID/工具名头），避免它绕过工具结果裁剪、
+      -- 把上下文顶穿后仍无法被摘要前的轻量裁剪收敛。
+      if not content_mod.has_image({ { role = "tool", content = msg.background_body } }) then
+        local before = M.measure_content(msg.background_body)
+        local out = M.prune_content(msg.background_body, cfg)
+        if out ~= nil then
+          local after = M.measure_content(out)
+          if after < before then
+            local header = type(msg.content) == "string" and msg.content:match("^([^\n]*)\n") or nil
+            msg.prune_original_chars = before
+            msg.background_body = out
+            msg.content = header and (header .. "\n" .. out) or out
+            msg.pruned = true
+            pruned = pruned + 1
+            chars_removed = chars_removed + (before - after)
+            event_bus.emit(events.TOOL_RESULT_PRUNED, {
+              agent_id = agent.id,
+              tool_name = msg.tool_name,
+              chars_before = before,
+              chars_after = after,
+            })
+          end
+        end
+      end
     end
   end
   return { pruned = pruned, chars_removed = chars_removed }

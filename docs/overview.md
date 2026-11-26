@@ -316,6 +316,7 @@ require('NeoAI').setup({
 | `:NeoAI SandboxDiscard` | 丢弃沙箱候选 |
 | `:NeoAI SandboxList` / `:NeoAI SandboxShow` | 列出 / 查看待处理沙箱候选 |
 | `:NeoAI SandboxCaps` / `:NeoAI SandboxDiag` | 沙箱运行时能力探测 / 资源域负载诊断（137/OOM 归因） |
+| `:NeoAI SandboxKeys` | 计算密钥文件指纹（供 `protected.preauthorized` 免审批绑定；无参数列出 `~/.ssh` 私钥） |
 | `:NeoAI SandboxApprove` / `:NeoAI SandboxReject` | 批准（不应用）/ 拒绝并丢弃变更单元 |
 | `:NeoAI SandboxApply` / `:NeoAI SandboxApplyAll` | 批准并应用单个 / 全部待审变更单元 |
 | `:NeoAI SandboxGrant` / `:NeoAI SandboxRevoke` | 创建窄范围任务授权 / 撤销授权 |

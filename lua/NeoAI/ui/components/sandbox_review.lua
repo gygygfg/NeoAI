@@ -795,6 +795,13 @@ function M.build_lines(items, traces, audit, saved, rejected, jobs)
     if type(item.risk_reasons) == "table" and #item.risk_reasons > 0 then
       specs[#specs + 1] = { text = "原因   " .. table.concat(_merge_reasons(item.risk_reasons), ", "), level = _risk_hl(lv or 0) }
     end
+    -- 后果告知（R1）：与审批弹窗同一文案来源，保证「待审列表」与「弹窗」说法一致。
+    if item.consequence_id then
+      local summary = require("NeoAI.ui.components.consent_notice").summary(item.consequence_id)
+      if summary then
+        specs[#specs + 1] = { text = "后果   ⚠ " .. _one_line(summary), level = "secret" }
+      end
+    end
     if (tonumber(item.privilege_tier) or 0) > 0 then
       specs[#specs + 1] = { text = ("档位   T%d"):format(tonumber(item.privilege_tier)), level = "section" }
     end
@@ -1946,6 +1953,15 @@ local function _warning_lines(text, pending, width, meta)
   local level = tonumber(meta.level) or 3
   local label = level >= 3 and "L3 严重" or "L2 高危"
   local out = { ("⚠ %s风险操作 — 后果警告"):format(label) }
+  -- 受保护资源：先给出**确定性**后果摘录（与审批弹窗/待审条目同一来源），
+  -- 再显示 AI 生成的后果说明——后者可能措辞漂移，不能作为唯一告知。
+  if meta.consequence_id then
+    local summary = require("NeoAI.ui.components.consent_notice").summary(meta.consequence_id)
+    if summary then
+      for _, l in ipairs(_wrap("⚠ " .. summary, width)) do out[#out + 1] = _sanitize_line(l) end
+      out[#out + 1] = ""
+    end
+  end
   if pending then
     out[#out + 1] = "（正在生成后果警告…）"
     return out
@@ -2070,7 +2086,7 @@ local function _open_diff(target, item, opts)
 
   local warn_start, warn_end, warn_meta
   if is_confirm then
-    warn_meta = { level = level, dropped = item and item.dropped }
+    warn_meta = { level = level, dropped = item and item.dropped, consequence_id = item and item.consequence_id }
     warn_start = #lines -- 0-based 起始（当前已有行数）
     local wl = _warning_lines(opts.warning, opts.pending == true, width - 4, warn_meta)
     for _, l in ipairs(wl) do lines[#lines + 1] = l end

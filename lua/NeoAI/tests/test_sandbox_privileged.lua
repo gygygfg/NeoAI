@@ -187,37 +187,43 @@ tests.suite("sandbox_privileged", function(_, it)
     end)
   end)
 
-  it("docker：高权限进程命令挂载宿主 socket 并解除遮蔽", function(t)
+  it("docker：PRIV 不再挂载宿主 socket；无会话 runtime 时不注入 DOCKER_HOST", function(t)
     local fs = require("NeoAI.utils.fs")
     local dir = vim.fn.tempname()
     fs.ensure_dir(dir)
     local sock = dir .. "/docker.sock"
     fs.write_file(sock, "")
+    local probe = require("NeoAI.sandbox.docker.probe")
+    local session = require("NeoAI.sandbox.docker.session")
+    probe._set_override({
+      tier = "N0", runtime = nil, userns = true, rootless = false,
+      microvm = false, gvisor = false, reasons = { "NO_ROOTLESS_RUNTIME" }, at = os.time(),
+    })
+    session.reset()
     with_config({
       tools = {
         sandbox = { privilege = { max_tier = 2 } },
+        -- 旧键已废弃：即使配置了也不应被读取/挂载
         privileged_mode = { docker_socket = sock },
       },
     }, function()
       reset_privileged()
       local privilege = require("NeoAI.sandbox.execution.privilege")
       local plain = privilege.resolve(1, { tier = 1, docker = true, network = true }, { process = true })
-      t.eq(nil, plain.privileges.env.DOCKER_HOST, "非高权限不注入 DOCKER_HOST")
-      t.false_(plain.privileges.privileged == true, "非高权限不应标记 privileged")
+      t.eq(nil, plain.privileges.env.DOCKER_HOST, "无会话 runtime 不注入 DOCKER_HOST")
+      t.false_(plain.privileges.privileged == true, "不应标记宿主 docker 直连")
       set_privileged(true)
       local res = privilege.resolve(1, { tier = 1, docker = true, network = true },
         { process = true, agent_id = "priv_test_agent" })
       t.true_(res.ok)
-      t.true_(res.privileges.privileged == true, "高权限应标记 privileged（入口桩按执行 Agent 跳过）")
-      t.eq("unix:///run/docker.sock", res.privileges.env.DOCKER_HOST, "应注入 DOCKER_HOST")
-      local mounted = false
-      for _, m in ipairs(res.privileges.mounts) do
-        if m.dst == "/run/docker.sock" and m.src == sock then mounted = true end
+      t.eq(nil, res.privileges.env.DOCKER_HOST, "PRIV 不再直连宿主 daemon")
+      for _, m in ipairs(res.privileges.mounts or {}) do
+        t.false_(m.src == sock, "旧 docker_socket 不应被挂载")
       end
-      t.true_(mounted, "应挂载配置的 docker socket")
-      t.true_(vim.tbl_contains(res.privileges.unmask, "/run/docker.sock"), "应解除遮蔽")
       reset_privileged()
+      session.reset()
     end)
+    probe.reset()
     vim.fn.delete(dir, "rf")
   end)
 

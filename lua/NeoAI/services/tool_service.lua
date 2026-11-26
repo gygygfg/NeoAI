@@ -74,7 +74,8 @@ end
 --- @param tool_name string
 --- @param args table
 --- @param ctx table|nil
---- @return string
+--- @return string text
+--- @return string|nil consequence_id 命中的受保护资源后果 id（供界面抑制「会话放行」）
 local function _approval_text(tool_name, args, ctx)
   local tool = registry.get(tool_name)
   local desc = tool and tool.description or ""
@@ -84,6 +85,22 @@ local function _approval_text(tool_name, args, ctx)
     "工具: %s\n描述: %s\n参数: %s",
     tool_name, desc, args_str
   )
+  -- 后果告知（R1）：命中受保护资源时，把「拿到什么能力 / 影响范围 / 持续多久」放在最前面，
+  -- 而不是让用户在一条裸参数后面自己推断。来源优先级：
+  --   1) 门禁已判定的资源（executor 写入 ctx.sandbox_consequence_id）；
+  --   2) 本次调用的目标路径（如 edit_file 写 ~/.bashrc、read_file 读 ~/.aws/...）。
+  local cid = ctx and ctx.sandbox_consequence_id or nil
+  if not cid then
+    local target = _target_path(tool_name, args)
+    if target then
+      local c = require("NeoAI.sandbox.protected.registry").classify(target)
+      cid = c and c.id or nil
+    end
+  end
+  if cid then
+    local notice = require("NeoAI.ui.components.consent_notice").text({ consequence_id = cid })
+    if notice then text = notice .. "\n\n" .. text end
+  end
   -- 跨挂载点兼容模式说明：工作区在独立挂载点时，命令沙箱默认视图无法投影其内容，
   -- 需用户批准以「整机只读 + 工作区单层 overlay」运行。
   local mount_root = ctx and ctx.sandbox_cross_mount_root
@@ -108,7 +125,7 @@ local function _approval_text(tool_name, args, ctx)
       text = text .. "\n" .. table.concat(lines, "\n")
     end
   end
-  return text
+  return text, cid
 end
 
 --- 结算一条待审批条目的**阻塞账目**：恰好一次发出 TOOL_APPROVED / TOOL_APPROVAL_CANCELLED，
@@ -208,7 +225,10 @@ end
 --- @param ctx table
 --- @param item table|nil 队列条目（用于回填审批中心镜像 id，供后续退出路径清理）
 local function _show_approval(tool_name, args, decision_cb, ctx, item)
-  local text = _approval_text(tool_name, args, ctx)
+  local text, consequence_id = _approval_text(tool_name, args, ctx)
+  local actions = require("NeoAI.ui.components.consent_notice").actions({
+    protected = consequence_id ~= nil,
+  })
   local done = false
   local mirror_id = nil
   -- 归一决策值：allow_once | allow_session | deny（与 net_consent / device_consent 一致）。
@@ -233,6 +253,7 @@ local function _show_approval(tool_name, args, decision_cb, ctx, item)
       text = text,
       tool_name = tool_name,
       args = args,
+      actions = actions,
       on_confirm = function() decide("allow_once") end,
       on_cancel = function(reason) decide("deny", reason) end,
       on_confirm_all = function()

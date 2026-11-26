@@ -227,7 +227,7 @@ session = {
 | `todo.enabled` | `true` | 待办工具 + 系统提示注入 |
 | `web` | 见下（默认 `search.enabled=false`、`fetch.enabled=false`） | DeepSeek Web Search / Fetch（仅 DeepSeek provider 暴露） |
 | `plan_mode` | `{enabled=true, auto_execute_on_approve=true, distill_on_execute=true, distill_parallel=true, distill_front=true, distill_max_attempts=2, extract_max_tokens=nil, extra_safe_tools={}, mutating_tools=...}` | 计划模式 |
-| `privileged_mode` | `{enabled=false, require_async_approval=true, override_offline=true, docker_socket="", unmask_ssh_keys=true, record_network=true, max_records=1000}` | 高权限模式（opt-in）：网络仅记录不拦截、可直连 docker/podman、不遮蔽 SSH 密钥；仅异步审批可进入 |
+| `privileged_mode` | `{enabled=false, require_async_approval=true, override_offline=true, unmask_ssh_keys=true, record_network=true, max_records=1000}` | 高权限模式（opt-in）：网络仅记录不拦截、不遮蔽 SSH 密钥；仅异步审批可进入。Docker 不再由 PRIV 直连，统一走自动探测的会话内 rootless runtime + broker |
 | `sub_agent` | `{final_instruction="最后请总结你的工作：…"}` | 子 Agent：创建时自动追加到其任务提示末尾的收尾指令（要求最后总结工作）；设为 `""` 可关闭。子 Agent 完成后其最终正文会自动回传主 Agent |
 | `approval` | 见下 | 工具审批 |
 | `sandbox` | 见下 | 工具执行沙箱（dry-run/commit、隔离后端、策略） |
@@ -400,6 +400,7 @@ sandbox = {
     "/home/*/.ssh", "/home/*/.gnupg", "/home/*/.netrc", "/home/*/.git-credentials",
     "/home/*/.config/git/credentials", "/home/*/.config/gh", "/home/*/.docker/config.json",
     "/etc/shadow", "/etc/gshadow", "/etc/sudoers", "/etc/machine-id", "/etc/ssh",
+    "/etc/ld.so.preload",          -- 加载器预加载钩子（宿主不存在也阻止会话内创建）
     "/etc/fstab",                  -- 宿主磁盘布局/根 UUID（避免 mount -o remount 按宿主 UUID 解析）
     "/var/log", "/var/spool/cron", "/etc/crontab",
     "/root/.bash_history", "/root/.zsh_history", "/root/.python_history", "/root/.wget-hsts",
@@ -408,6 +409,43 @@ sandbox = {
   mask_dirs_enabled = true,        -- 总开关
   mask_dirs = { "/home", "/root" }, -- 遮蔽目录列表（支持 * 通配）
   mask_dirs_approval = true,       -- 命中遮蔽目录时弹窗审批（复用工具审批 UI）
+  -- 受保护资源的「后果告知」文案（与 mask_paths 同源，只影响用户看到什么，不改变判定）。
+  -- 命中资源的审批弹窗会在参数前插入 能力/范围/持续/建议 四段，并不再提供
+  -- 「允许所有（本会话）」与「加入工作目录」；待审条目用同一 id 展示后果摘要。
+  -- 可按资源 id 覆盖内置文案（id 见 lua/NeoAI/sandbox/protected/registry.lua）：
+  protected = {
+    consequences = {
+      -- ssh_private_key = { suggestion = "本项目只允许使用 deploy key" },
+    },
+    -- 免审批预授权绑定（R3）：特定密钥 × 特定消费者 × 特定目标，命中即免弹窗。
+    -- 只减审批、不加能力（SSH 私钥仍无 read）；命中仍写审计（SandboxReview「行为」页）；
+    -- expires_at / max_uses 任一触发即重新走审批。指纹必填：绑定的是「这把钥匙」，
+    -- `cp` 改名或换钥匙后立即失效。
+    --   fingerprint: "sha256:<hex>"，用 `:NeoAI SandboxKeys [文件]` 生成（无参数列出 ~/.ssh 私钥）；
+    --   consumers:   空 = 任意；"egress"（任意出网）/ "tool:<name>"（指定工具，`exec_` 前缀可省略）；
+    --   targets:     空 = 任意；支持 `*.example.com`；未知目标一律不放行；
+    --   expires_at:  epoch 秒；max_uses: 次数上限（0/缺省 = 不限）。
+    preauthorized = {
+      -- { fingerprint = "sha256:…", resource = "~/.ssh/id_deploy",
+      --   consumers = { "tool:git_fetch" }, targets = { "github.com" }, max_uses = 100 },
+    },
+  },
+  -- 宿主侧 SSH 能力（默认关闭）：AI 只能按**别名**使用宿主 openssh，密钥不进入沙箱。
+  -- 调用冻结为主机操作提案（:NeoAI SandboxReview 确认后由宿主执行），结果用 ssh_result 读回。
+  -- 别名固定主机/用户/端口/私钥，必须声明私钥指纹（`:NeoAI SandboxKeys <key>`）；
+  -- 隧道仅 127.0.0.1 本地转发，对端主机/端口范围必须在别名里预先声明（无 -R/-D）。
+  ssh = {
+    enabled = false,
+    connect_timeout = 10,
+    max_tunnels = 4, -- 每别名并发隧道上限（按 ControlPath 套接字计数；close_all 在关闭时清理）
+    aliases = {
+      -- prod = { host = "prod.example.com", user = "deploy", port = 22,
+      --          key = "~/.ssh/id_deploy", fingerprint = "sha256:…",
+      --          known_hosts = "~/.ssh/known_hosts", allow = { "exec", "tunnel" },
+      --          tunnel = { local_ports = { 10000, 10099 },
+      --                     remote_hosts = { "db.internal", "*.svc.internal" } } },
+    },
+  },
   -- 上述遮蔽目录列表与总开关可在 `:NeoAI SandboxReview`「资源访问」页按 `E` 热编辑（仅当前会话）。
   -- 内核级行为观测（eBPF/strace/procfs）：以实际 syscall 判定「越界访问」与「密钥文件访问」，
   -- 替代/补充命令字符串解析启发式；事件按 attempt cgroup 精确归属。
@@ -505,9 +543,16 @@ sandbox = {
   },
   network = {
     enabled = false, allowed_endpoints = {}, budget_bytes = 0, -- 受控网络网关
-    -- 拦截向宿主本机（回环/宿主网卡 IP/链路本地/云元数据）的访问（默认开）：注入
-    -- HTTP(S)_PROXY/ALL_PROXY 指向宿主侧 Lua 过滤代理，本机目标拦截、外部放行并记录。
-    -- 应用层边界：不认代理的裸 TCP 可绕过（详见 docs/sandbox.md §6.1）。
+    -- 私有 netns 网络隔离（默认 "proxy"）：载荷只有 loopback，外部访问必须经宿主过滤代理
+    -- （沙箱内 socat → Unix socket → host_proxy）。裸 TCP/UDP、裸 socket 无路由，宿主回环/
+    -- 网卡/云元数据不可达；curl/pip/git 等遵守代理变量的工具仍可出网。
+    -- 依赖 socat（宿主与沙箱内均需）；root 还需 ip（iproute2）。"off" = 旧的共享 netns。
+    isolation = "proxy",
+    -- 隔离不可用（缺 socat/ip、无法建 netns）时：true（默认）= 需要网络的命令断网（fail-closed）；
+    -- false = 退回共享 netns，并发告警/降级留痕（绝不静默）。
+    isolation_fail_closed = true,
+    -- 共享 netns（isolation="off"）下拦截向宿主本机（回环/宿主网卡 IP/链路本地/云元数据）：
+    -- 注入 HTTP(S)_PROXY/ALL_PROXY 指向宿主侧 Lua 过滤代理。应用层边界：裸 TCP 可绕过。
     host_local_block = true,
     block_proxy_evasion = true,      -- 代理规避处理（host_local_block 生效时）：true（默认）= 暂停并弹窗询问（仅本次允许/本次会话始终允许/拒绝）；"deny" = 直接拒绝（旧硬拒绝）；false = 不拦截（允许绕过，过滤边界失效）。清除/绕过代理包括 unset *proxy、env -u、--noproxy、--proxy "" 等
     host_local_proxy_port = 0,       -- 宿主过滤代理端口（0 = 自动分配 loopback 随机端口）
@@ -519,6 +564,12 @@ sandbox = {
     --   "allow"       = 直接放行并记录（旧行为）；
     --   "deny"        = 直接拒绝。
     access = "ask",
+    -- 仅记录模式（默认关闭）：网络请求一律放行，不弹同意窗、不拦截代理规避，只记录访问目标。
+    -- 开启后覆盖 access（等同 "allow"）与 network.enabled，并忽略 block_proxy_evasion；
+    -- 即使 host_local_block=false 也启动宿主过滤代理并注入代理变量用于记录。记录写入独立
+    -- 环形缓冲（不被命令结果摘要 drain），用 `:NeoAI SandboxAudit network` 随时查看。
+    -- offline=true 仍生效；network.gateway 启用时以网关为准；裸 TCP/UDP 仍受 netns 边界限制。
+    record_only = false,
     -- 访问本机网络服务的审批颗粒度（默认开）：弹窗展示目标端口背后的**宿主监听进程**
     -- （命令名 / pid / 可执行路径 / 命令行摘要），并按「端口 + 服务进程」记忆本次会话同意——
     -- 同端口换成另一个进程（服务换版本/被抢占）会重新弹窗。关闭则退回纯 host:port 颗粒度。
@@ -593,8 +644,9 @@ sandbox = {
       { tier = 1, name = "package", bins = { "apt", "apt-get", "dnf", "yum", "pacman", "apk", "brew" } }, -- 包安装：额外规则
     },
   },
-  -- 已弃用：沙箱永不连宿主 docker daemon，无论取值都不再挂载/连接任何 socket（保留仅为兼容）。
-  docker = { mode = "off", socket = "" },
+  -- Docker 方向不再提供用户配置：运行时自动探测并选择最高安全档位
+  -- （N0 无会话 runtime / N1 会话内 rootless runtime / N2 microVM|gVisor）。
+  -- 永不连接宿主 docker daemon，也不挂载真实 docker.sock；见 docs/sandbox.md「会话内 Docker」。
   -- 容器门面：**默认关闭**（enabled=false）——不做任何封装：AI 的 docker/podman 命令按原文执行，
   -- 不改写运行时、不注入命名空间共享标志、不生成 docker→podman 入口桩、不注入 containers.conf，
   -- 也不把 docker 伪装成「daemon 未运行」错误；宿主装了什么运行时就用什么。
@@ -718,7 +770,7 @@ sandbox = {
     apt_sandbox_user = "root", -- apt 系列：注入 APT::Sandbox::User（默认 "root" 关闭 apt 自身的 `_apt` 降权，避免嵌套 userns/受限容器中 setgroups EPERM 使 apt update/install 失败）；"_apt" 或空串保留 apt 默认行为
   },
   lsp_overlay = { enabled = true, idle_timeout_ms = 600000 }, -- AI 专用沙箱 LSP：AI 的 lsp_* 工具克隆的 server 读暂存内容（默认开，仅 bwrap+overlay；不可用时回退编辑器客户端）。克隆体在最后一次调用后保活 idle_timeout_ms（默认 10 分钟）再自动关闭，期间后续诊断/查询无需等待 server 重启；设 0/负数则永不空闲回收
-  secrets = { enabled = true, min_length = 20, max_length = 200, min_entropy = 3.5, min_distinct = 8, exclude_pure_hex = true, exclude_uuid = true, entropy_skip_urls = true, entropy_requires_context = true, entropy_secret_paths_only = true, generated_scan_max_bytes = 2097152, generated_scan_max_files = 200, tokenize_env = true, binary_fake = true, disclose_fakes = false, flow_tracking = true, alert = { enabled = true, timeout_ms = 0 }, trusted_services = {}, auto_trust_providers = true, extra_rules = {}, allowlist = {} }, -- 密钥/敏感信息防护：熵检测 + 具名规则（私钥块/AKIA/ghp_/sk-/JWT/Bearer…）+ **格式保真假密钥**（同长度/同字符类/熵不低于原始；进程内映射表不落盘）；env 名含 KEY/TOKEN/SECRET/PASSWORD/CREDENTIAL 的值无视熵强制假化；裸熵串须含 -/_ 且非代码标识符（snake_case 函数/常量名）或处于敏感名上下文；exclude_uuid=true 排除 UUID（请求 ID/webhook 路径段等标识符），entropy_skip_urls=true 让通用熵扫描跳过 URL/域名/IP 片段（网址与 IP 是地址不是凭据，误判会导致后续提到该地址的命令被硬拦截；具名规则/敏感名赋值/已知环境变量密钥仍作用于 URL 内部）；非敏感名且值含 / 的环境变量只按具名规则处理（不破坏 PATH/LD_LIBRARY_PATH 等）；entropy_secret_paths_only=true 时全文熵扫描仅对疑似密钥文件执行。**假密钥**出现在工具参数/AI 上下文时警告用户（不阻断）；**真实密钥**出现时立即停止 Agent 并弹窗，用户确认后才继续（headless 无 UI 时失败关闭）。binary_fake=true 时敏感二进制密钥文件（.p12/.pfx/keystore/raw key）被读取/暂存时用同长度随机字节假化（base64 标记传输，落盘/执行时精确还原）。flow_tracking=true 时记录假密钥来源与所有流经点（工具/命令/环境变量/落盘），命令/脚本加密等不可逆变换产生的派生文件标记「不透明派生」并在发布前强制人工确认。trusted_services 为出网白名单（精确主机/`*.suffix`/IP/CIDR）：向白名单发送密钥不弹窗也不警告；auto_trust_providers=true 时已配置的模型供应商 base_url 主机自动信任；disclose_fakes=true 时向 AI 披露「这是假密钥」（默认不披露以保持格式保真）；**AI 自己生成的值**（首次出现在模型输出/工具参数、不是环境或工具结果取到的）自动放行：不假化、不登记为真密钥、后续出现也不弹窗（同一值若之后由环境/工具登记则恢复保护）
+  secrets = { enabled = true, min_length = 20, max_length = 200, min_entropy = 3.5, min_distinct = 8, exclude_pure_hex = true, exclude_uuid = true, entropy_skip_urls = true, entropy_requires_context = true, entropy_secret_paths_only = true, generated_scan_max_bytes = 2097152, generated_scan_max_files = 200, tokenize_env = true, real_env_values = false, binary_fake = true, disclose_fakes = false, flow_tracking = true, alert = { enabled = true, timeout_ms = 0 }, trusted_services = {}, auto_trust_providers = true, extra_rules = {}, allowlist = {} }, -- 密钥/敏感信息防护：熵检测 + 具名规则（私钥块/AKIA/ghp_/sk-/JWT/Bearer…）+ **格式保真假密钥**（同长度/同字符类/熵不低于原始；进程内映射表不落盘）；env 名含 KEY/TOKEN/SECRET/PASSWORD/CREDENTIAL 的值无视熵强制假化；**real_env_values=false（默认）时沙箱进程只拿到格式保真假值（token），真实密钥不进入载荷 env**（命令参数里显式出现的 token 仍在执行前还原为真实值，并经 `secret_egress` 审批）；裸熵串须含 -/_ 且非代码标识符（snake_case 函数/常量名）或处于敏感名上下文；exclude_uuid=true 排除 UUID（请求 ID/webhook 路径段等标识符），entropy_skip_urls=true 让通用熵扫描跳过 URL/域名/IP 片段（网址与 IP 是地址不是凭据，误判会导致后续提到该地址的命令被硬拦截；具名规则/敏感名赋值/已知环境变量密钥仍作用于 URL 内部）；非敏感名且值含 / 的环境变量只按具名规则处理（不破坏 PATH/LD_LIBRARY_PATH 等）；entropy_secret_paths_only=true 时全文熵扫描仅对疑似密钥文件执行。**假密钥**出现在工具参数/AI 上下文时警告用户（不阻断）；**真实密钥**出现时立即停止 Agent 并弹窗，用户确认后才继续（headless 无 UI 时失败关闭）。binary_fake=true 时敏感二进制密钥文件（.p12/.pfx/keystore/raw key）被读取/暂存时用同长度随机字节假化（base64 标记传输，落盘/执行时精确还原）。flow_tracking=true 时记录假密钥来源与所有流经点（工具/命令/环境变量/落盘），命令/脚本加密等不可逆变换产生的派生文件标记「不透明派生」并在发布前强制人工确认。trusted_services 为出网白名单（精确主机/`*.suffix`/IP/CIDR）：向白名单发送密钥不弹窗也不警告；auto_trust_providers=true 时已配置的模型供应商 base_url 主机自动信任；disclose_fakes=true 时向 AI 披露「这是假密钥」（默认不披露以保持格式保真）；**AI 自己生成的值**（首次出现在模型输出/工具参数、不是环境或工具结果取到的）自动放行：不假化、不登记为真密钥、后续出现也不弹窗（同一值若之后由环境/工具登记则恢复保护）
   retention = { candidate_days = 7, max_pending = 20 },
   retired = { ttl_days = 7 }, -- 删除=搬出：被删节点移到同盘 `<parent>/.neoai-retired/`，撤销时整棵搬回；该单元离开待审/已应用列表或 reset 时回收，另有本 TTL 兜底（天；<=0 按 7 天）
   policy = {
@@ -1023,14 +1075,15 @@ resources = { pressure = { simulate = "critical" } }
 
 1. **网络不拦截，仅记录**：强制 `access="allow"`，覆盖 `ask`/`deny`、`offline=true` 与受控
    白名单；仍启动宿主侧 `host_proxy` 记录目标（`:NeoAI SandboxAudit network` 可查看）。
-2. **容器直用**：旁路容器门面（不改写 `docker→podman`、不生成入口桩、不伪装 daemon 错误）；
-   `docker` 挂载宿主 socket（自动探测或 `docker_socket` 指定）并注入 `DOCKER_HOST`；
-   `podman/buildah` 即使门面关闭也补容器能力/vfs 存储/seccomp 例外。
+2. **容器运行**：PRIV 不再旁路到宿主 daemon，也不再挂载/直连 `/run/docker.sock`。Docker 方向
+   统一由自动探测的**会话内 rootless runtime**（podman system service / rootless dockerd）+
+   宿主侧 broker 提供，与 PRIV 无关；`podman/buildah` 仍按容器门面补能力/vfs 存储/seccomp 例外。
 3. **SSH 密钥不遮蔽**：`~/.ssh`、`/root/.ssh`、`/home/*/.ssh` 以及 ssh-agent socket 不进入
    遮蔽挂载（`unmask_ssh_keys=true`）；`read_file`/`run_command`/`git`/`ssh` 均可读取/使用宿主密钥。
 
-**安全边界**：开启后 docker 容器由宿主 daemon 在沙箱外创建，**不进入候选/审批**；
-`/run/docker.sock` 等价宿主 root 能力。文件的普通读写仍沿用沙箱 overlay 与待审规则。
+**安全边界**：PRIV 不再提供宿主 root docker 能力。Docker 容器由会话内 rootless runtime 创建，
+随会话 userns 销毁；broker 在宿主侧做 endpoint/body 检查。文件的普通读写仍沿用沙箱 overlay 与
+待审规则。
 AI 更新 AGENTS.md 等写入仍需要审批，不受本模式影响。
 
 **判定口径与生效时机**：

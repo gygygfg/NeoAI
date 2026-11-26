@@ -79,6 +79,15 @@
 > 此时新写入的折叠文本不会折叠。NeoAI 会在离开插入模式（`InsertLeave`）后自动补算一次折叠：
 > 重建 `foldexpr` 收起新块，并**恢复你此前展开的折叠**，无需手动 `zx`。
 
+### 5.1 工具后台化（等工具时发消息）
+
+AI 正在等工具返回（模型生成已完成）时你继续发消息，不会等整批工具结束：
+
+- 已真正开始执行的工具自动转为后台，聊天里在上下文末尾插入
+  `工具已在后台执行，ID：...` 说明后立即处理你的消息；
+- 等待审批 / `ask_user` 回答的工具保持前台，消息暂存到交互结束后再转后台；
+- 后台工具完成后，其返回信息以「后台工具结果」折叠块追加到对话末尾，并继续下一轮。
+
 ## 6. 计划模式（PLAN）
 
 `m` 或 `:NeoAI Plan` 切换计划模式：
@@ -94,11 +103,11 @@
 ### 6.1 高权限模式（PRIV，opt-in）
 
 `tools.privileged_mode.enabled=true` 且 `tools.approval.mode="async"` 时，`m` 会在 PLAN 之后
-进入 PRIV，也可用 `:NeoAI Privileged` 切换。PRIV 下网络不拦截、仅记录目标；docker/podman
-可直接使用（docker 连接宿主 daemon）。网络放行为**进程级**口径：进程内存在 PRIV 会话即整体放行
-并记录，切换聊天窗口焦点/新建会话不会重新弹窗；生成过程中切换时策略立即生效，仅模型切换延后到
-本轮结束。该模式默认关闭，容器产生的宿主变更不进入候选/审批，详见
-[configuration.md](configuration.md) 与 [sandbox.md](sandbox.md) 的安全边界说明。
+进入 PRIV，也可用 `:NeoAI Privileged` 切换。PRIV 下网络不拦截、仅记录目标；SSH 密钥不遮蔽。
+**Docker 不再由 PRIV 直连宿主 daemon**：统一由自动探测的会话内 rootless runtime + 宿主 broker
+提供，容器随会话 userns 销毁。网络放行为**进程级**口径：进程内存在 PRIV 会话即整体放行并记录，
+切换聊天窗口焦点/新建会话不会重新弹窗；生成过程中切换时策略立即生效，仅模型切换延后到本轮结束。
+该模式默认关闭，详见 [configuration.md](configuration.md) 与 [sandbox.md](sandbox.md) 的安全边界说明。
 
 ## 7. 向用户提问（ask_user）
 

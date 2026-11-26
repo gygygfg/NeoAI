@@ -159,8 +159,9 @@ function M.evaluate(facts)
       if sb.offline == true then
         -- 显式离线：硬拒绝网络
         results[#results + 1] = { decision = "DENY", reason_codes = { "NETWORK_OFFLINE" } }
-      elseif type(sb.network) == "table" and sb.network.enabled == true then
-        -- 可选更严格模式：受控网关按声明端点校验
+      elseif type(sb.network) == "table" and sb.network.enabled == true
+        and sb.network.record_only ~= true then
+        -- 可选更严格模式：受控网关按声明端点校验（record_only 仅记录模式跳过此层）。
         local url = facts.args and (facts.args.url or facts.args.endpoint)
         local ok, reason = require("NeoAI.sandbox.net.network").authorize(url, {})
         if not ok then

@@ -77,6 +77,9 @@ local DEFAULT_MASK_PATHS = {
   -- 宿主身份与凭据
   "/etc/shadow", "/etc/shadow-", "/etc/gshadow", "/etc/gshadow-",
   "/etc/sudoers", "/etc/sudoers.d", "/etc/machine-id", "/etc/hostid",
+  -- 动态加载器预加载钩子：宿主通常不存在该文件；以 /dev/null 遮蔽可阻止会话内创建
+  -- （否则任何写入都会让后续每个进程加载攻击者库，形成沙箱内代码注入原语）。
+  "/etc/ld.so.preload",
   -- 宿主 fstab 泄露磁盘布局/根文件系统 UUID，且会让 `mount -o remount,rw /` 按宿主 UUID 解析
   -- （沙箱根是 overlay/tmpfs，必然失败并暴露宿主身份）。以空文件遮蔽，得到无条目的容器语义。
   "/etc/fstab",
@@ -89,6 +92,14 @@ local DEFAULT_MASK_PATHS = {
   "/root/.python_history", "/root/.mysql_history", "/root/.psql_history",
   "/root/.sqlite_history", "/root/.node_repl_history", "/root/.wget-hsts",
   "/root/.lesshst", "/root/.viminfo", "/root/.config/gh", "/root/.config/gcloud",
+}
+
+--- 必须遮蔽、但宿主可能**不存在**的路径。
+--- 常规遮蔽只在源存在时生效；`/etc/ld.so.preload` 正常系统没有，但一旦允许会话内创建，
+--- 后续每个动态链接进程都会加载攻击者指定的库（沙箱内代码注入原语）。bwrap 在
+--- `--bind /dev/null <dest>` 时会创建缺失的文件，故这里强制加入遮蔽。
+local ALWAYS_MASK_PATHS = {
+  "/etc/ld.so.preload",
 }
 
 -- 最小只读系统集（白名单）：仅这些宿主根/子树以只读方式暴露给外部命令。
@@ -132,6 +143,27 @@ local DEFAULT_READONLY_PATHS = {
   "/etc/inputrc", "/etc/security", "/etc/pam.d", "/etc/xdg", "/etc/fonts",
   "/etc/gitconfig", "/etc/npmrc", "/etc/apt", "/etc/dpkg",
   "/etc/python3*",
+}
+
+--- read_all（整机 overlay）下仍必须**只读**的关键路径。
+--- 整机 overlay 让 `/etc` 与 `$HOME` 在会话内可写（红队实测：写 `/etc/passwd`、`/etc/systemd`、
+--- `~/.bashrc` 均成功）。这些路径承载身份/加载器/持久化语义，会话内可写等于在沙箱里获得
+--- 代码注入与身份伪造原语。以 `--ro-bind <p> <p>` 覆盖到 overlay 之上：可读、不可写。
+--- 注意：`/etc/ld.so.preload` 若宿主不存在则 `add` 会跳过，必须用 mask（`/dev/null`）阻止创建。
+local READ_ALL_READONLY_PATHS = {
+  -- 注意：不包含 /etc/passwd、/etc/group、/etc/shells、/etc/nsswitch.conf：
+  --   `useradd`/`adduser` 等系统管理命令需要在沙箱内把账户库写入 overlay 暂存
+  --   （`tools.sandbox.privilege.sysadmin` 的既有能力；宿主盘仍由候选审批保护）。
+  -- 动态加载器配置：可改变后续进程的库搜索路径。
+  "/etc/ld.so.conf", "/etc/ld.so.conf.d",
+  "/etc/pam.d", "/etc/security",
+  -- root 的 shell 启动脚本：会话内代码注入原语。
+  "/root/.bashrc", "/root/.bash_profile", "/root/.profile",
+  "/root/.zshrc", "/root/.zshenv", "/root/.zprofile",
+  -- 注意：不包含 /etc/systemd、/etc/init.d、/etc/profile*、/home/*：
+  --   * systemd 单元由 systemd 门面与候选管线托管（`systemctl enable` 需写 /etc/systemd/system）；
+  --   * 包安装会写 /etc/profile.d 等；
+  --   * 其它用户的 home 可能不可被载荷穿越，ro-bind 源解析失败会让 bwrap 整体失败。
 }
 
 -- 每会话私有临时根（tmpfs 语义）：这些根始终以「会话私有目录（mode 1777）」绑定，
@@ -979,26 +1011,32 @@ local function _append_readonly_mounts(argv, cwd, root_overlay)
     end
   end
   local seen = {}
-  local function add(p)
+  local function add(p, skip_link)
     if type(p) ~= "string" or p == "" or p == "/" then return end
     p = p:gsub("/+$", "")
     if p == "" or seen[p] then return end
     if vim.uv.fs_stat(p) then
+      -- bwrap 拒绝挂载到符号链接目标（"Can't mount on symlink destination"）。链接本身不含
+      -- 可写内容，其目标仍在 overlay/只读根约束下；需要跳过时由调用方显式指定。
+      if skip_link then
+        local lst = vim.uv.fs_lstat(p)
+        if lst and lst.type == "link" then return end
+      end
       seen[p] = true
       argv[#argv + 1] = "--ro-bind"
       argv[#argv + 1] = p
       argv[#argv + 1] = p
     end
   end
-  local function add_list(list)
+  local function add_list(list, skip_link)
     for _, p in ipairs(list or {}) do
       if type(p) == "string" and p:find("[*?[]") then
         local ok, matches = pcall(vim.fn.glob, p, false, true)
         if ok and type(matches) == "table" then
-          for _, m in ipairs(matches) do add(m) end
+          for _, m in ipairs(matches) do add(m, skip_link) end
         end
       else
-        add(p)
+        add(p, skip_link)
       end
     end
   end
@@ -1006,6 +1044,10 @@ local function _append_readonly_mounts(argv, cwd, root_overlay)
     add_list(_readonly_list("tools.sandbox.readonly_roots", DEFAULT_READONLY_ROOTS))
     add_list(_readonly_list("tools.sandbox.readonly_paths", DEFAULT_READONLY_PATHS))
     for _, scope in ipairs(_mask_scopes(cwd)) do add(scope) end
+  else
+    -- 整机 overlay 下重新覆盖关键路径为只读（源即 overlay 上的同一路径；绑定后该路径不可写）。
+    -- 跳过符号链接（bwrap 不允许挂载到 symlink 目标）。
+    add_list(READ_ALL_READONLY_PATHS, true)
   end
   -- /etc/resolv.conf：默认净化后暴露（仅 nameserver，剥离 search/domain/options，避免
   -- 泄露宿主内网/Tailscale 域）；"hide" 不暴露；"passthrough" 原样暴露宿主文件。
@@ -2117,7 +2159,8 @@ local function _host_local_block_enabled()
     return true
   end
   local netcfg = config_store.get("tools.sandbox.network") or {}
-  if netcfg.host_local_block == false then return false end
+  -- 仅记录模式：即使关闭 host_local_block 也必须注入代理变量，否则请求不经代理、无法记录。
+  if netcfg.host_local_block == false and netcfg.record_only ~= true then return false end
   local sandbox = config_store.get("tools.sandbox") or {}
   if sandbox.offline == true then return false end
   -- 独立 netns 网关模式已自行提供代理，二者互斥。
@@ -2134,8 +2177,11 @@ end
 local function _proxy_unset_snippet()
   local keys = { "SSH_AUTH_SOCK", "SSH_AGENT_PID" }
   local ok_ng, net_gateway = pcall(require, "NeoAI.sandbox.net.net_gateway")
+  local ok_iso, net_iso = pcall(require, "NeoAI.sandbox.net.isolate")
   local passthrough = _proxy_policy() == "passthrough"
-  local skip_proxy = (ok_ng and net_gateway.enabled()) or _host_local_block_enabled() or passthrough
+  local skip_proxy = (ok_ng and net_gateway.enabled())
+    or (ok_iso and net_iso.enabled() and net_iso.active())
+    or _host_local_block_enabled() or passthrough
   if not skip_proxy then
     local p = _proxy_policy()
     local keep = {}
@@ -2153,17 +2199,22 @@ end
 
 --- 构造沙箱进程环境：密钥 token 化覆盖 + expose_paths 目录前置到 PATH + 代理策略 + 档位 env。
 --- 所有外部进程（run_command / runtime.run）统一经此构造，保证环境一致且可观测。
---- token→真实密钥的还原**仅允许发生在沙箱内部进程环境**：这里对 `sanitized_env` 的 token
---- 覆盖值做 `detokenize`，使沙箱内程序（pip/curl/…）拿到真实值；AI 上下文、日志与待审 UI
---- 仍只看到 token（命令输出回传前会重新 token 化）。
+--- **默认（`secrets.real_env_values=false`）不把真实密钥注入载荷**：`sanitized_env` 的 token
+--- 原样保留，载荷只能看到 `NEOKEY_…`。命令参数中显式出现的 token 仍会在执行前还原为真实值
+--- （由 `secret_egress` 门禁决定是否放行），因此不会破坏「AI 复制 token 去调用 API」的路径。
+--- 设为 true 才恢复旧行为（载荷直接读 env 真实密钥）；这会让沙箱内任意命令都能外发密钥，
+--- 仅在明确信任任务时使用。
 --- @param privileges table|nil { env? = table }
 --- @return table
 function M.sandbox_env(privileges)
   local secret = require("NeoAI.sandbox.secret.secret")
   local env = secret.sanitized_env()
-  for k, v in pairs(env) do
-    if type(v) == "string" and secret.has_token(v) then
-      env[k] = (secret.detokenize(v))
+  local secrets_cfg = config_store.get("tools.sandbox.secrets") or {}
+  if secrets_cfg.real_env_values == true then
+    for k, v in pairs(env) do
+      if type(v) == "string" and secret.has_token(v) then
+        env[k] = (secret.detokenize(v))
+      end
     end
   end
   local expose = _expose_paths()
@@ -2189,9 +2240,26 @@ function M.sandbox_env(privileges)
   if ok_ng and net_gateway.enabled() then
     for k, v in pairs(net_gateway.env()) do env[k] = v end
   end
-  -- 宿主本机访问拦截：注入指向宿主过滤代理（host_proxy）的代理变量。代理拦截本机目标、
-  -- 放行外部并记录；网络整体仍是「放行 + 记录」。裸 TCP 不经代理（应用层边界，见文档）。
-  if _host_local_block_enabled() then
+  -- 网络代理注入：
+  --   * 私有 netns（默认）：指向**沙箱内** socat（127.0.0.1:3128），经 Unix socket 到宿主
+  --     host_proxy；裸 socket/裸 TCP 无路由，天然 fail-closed。
+  --   * 旧共享 netns：指向宿主 host_proxy 端口（应用层拦截，裸 TCP 可绕过）。
+  local ok_iso, net_iso = pcall(require, "NeoAI.sandbox.net.isolate")
+  -- 仅当**本前缀**确实在私有 netns 内时才指向沙箱内 socat；容器会话/LSP 等未隔离的
+  -- 调用（privileges.net_isolated 为 nil/false）仍用宿主 host_proxy，避免指向不存在的 3128。
+  local iso_here = privileges ~= nil and privileges.net_isolated == true
+  if privileges == nil and ok_iso and type(net_iso) == "table" then
+    iso_here = net_iso.active()
+  end
+  if ok_iso and type(net_iso) == "table" and net_iso.enabled() and iso_here then
+    local url = net_iso.proxy_url()
+    env.HTTP_PROXY, env.http_proxy = url, url
+    env.HTTPS_PROXY, env.https_proxy = url, url
+    env.ALL_PROXY, env.all_proxy = url, url
+    -- 私有 netns 内的 loopback 是沙箱自己的：localhost/127.0.0.1 直连（访问沙箱内服务），
+    -- 不经过宿主代理；外部目标仍必须经代理。
+    env.NO_PROXY, env.no_proxy = "127.0.0.1,localhost,::1", "127.0.0.1,localhost,::1"
+  elseif _host_local_block_enabled() then
     local ok_hp, host_proxy = pcall(require, "NeoAI.sandbox.net.host_proxy")
     if ok_hp and host_proxy then
       local addr = host_proxy.ensure()
@@ -3203,6 +3271,10 @@ function M.process_prefix(opts)
   end
   if backend == "bwrap" then
     local overlays = opts.overlays or {}
+    -- 会话内 Docker：podman/dockerd 在 bwrap userns 内无法使用 overlay graph driver，
+    -- 且 overlay 上层需要跨 runtime 生命周期稳定。此处退化为「只读根 + 私有 cwd bind」，
+    -- 与 T2 的 overlay 不可用路径一致；容器写入落会话私有目录，退出随 userns 销毁。
+    if priv and priv.docker_session then overlays = {} end
     -- 整机根 overlay（root="/"）：以可写暂存层替换只读根，必须在 `--dev/--proc` 之前挂载；
     -- 其余可写根在其上继续 overlay/bind。
     local root_overlay = nil
@@ -3227,6 +3299,15 @@ function M.process_prefix(opts)
     local user_drop = nonroot and not _is_root()
     local root_drop = nonroot and _is_root()
     local flags = M.bwrap_flags()
+    -- 会话内 Docker：rootless runtime 必须在会话 userns 内启动（即使 NeoAI 以 root 运行），
+    -- 否则 podman/dockerd 会以宿主 root 身份创建容器。bwrap 的 userns 也是容器/命令的
+    -- 会话边界；仍不挂载宿主 docker.sock。
+    local rootless_session = priv and priv.rootless_session == true and not _is_root()
+    if priv and priv.docker_session then
+      -- 非 root：RootlessKit 提供 userns/mnt/net，bwrap 不再自建 userns（可映射 subuid）。
+      -- root：bwrap 自建 userns（单映射），Agent 保持 userns root。
+      flags = rootless_session and NO_USER_FLAGS or USER_FLAGS
+    end
     -- 档位要求嵌套 userns（如 T2）：改用带 user namespace 的隔离标志，
     -- 使 cap_add 的权限被限制在该 userns 内，够不到宿主。
     if priv and priv.userns then flags = USER_FLAGS end
@@ -3234,7 +3315,7 @@ function M.process_prefix(opts)
     -- 故使用不带 net 的隔离标志（--unshare-pid/ipc/uts/cgroup）。
     if gateway_mode then flags = NO_USER_FLAGS end
     -- 非 root 启动：需要 user namespace 承载 guest root（`--uid/--gid 0`，bwrap 要求）。
-    if user_drop then
+    if user_drop and not rootless_session then
       if gateway_mode then
         flags = { "--unshare-user", "--unshare-pid", "--unshare-ipc", "--unshare-uts", "--unshare-cgroup" }
       else
@@ -3261,6 +3342,52 @@ function M.process_prefix(opts)
     end
     local userns = false
     for _, f in ipairs(flags) do if f == "--unshare-all" or f == "--unshare-user" then userns = true end end
+    -- 私有 netns 网络隔离（默认）：只对需要网络的命令、bwrap 后端、非 LSP/docker 生效。
+    -- 隔离就绪后必须**在** `_append_bwrap_base` 之前把 CAP_NET_ADMIN（仅非 root userns 模式）
+    -- 与 boot 片段写进 priv，才能被 bwrap 能力参数和常驻 server 引导消费。
+    local net_isolation = require("NeoAI.sandbox.net.isolate")
+    local net_isolated = false
+    local want_net
+    if privileged_active then want_net = true
+    elseif offline then want_net = false
+    elseif priv then want_net = priv.network == true
+    else want_net = true end
+    local net_iso_conf = config_store.get("tools.sandbox.network") or {}
+    if backend == "bwrap" and not gateway_mode and want_net and opts.network_isolation ~= false
+      and not (priv and priv.docker_session) and net_isolation.enabled() then
+      local ok_iso, iso_err = net_isolation.ensure()
+      if ok_iso then
+        net_isolated = true
+        if priv then
+          priv.net_isolated = true
+          if net_isolation.needs_cap() then
+            priv.cap_add = priv.cap_add or {}
+            if not vim.tbl_contains(priv.cap_add, "ALL")
+              and not vim.tbl_contains(priv.cap_add, "CAP_NET_ADMIN") then
+              priv.cap_add[#priv.cap_add + 1] = "CAP_NET_ADMIN"
+            end
+          end
+          local iso_boot = net_isolation.boot_snippet()
+          if iso_boot then
+            priv.boot = (type(priv.boot) == "string" and priv.boot ~= "" and (priv.boot .. "\n") or "")
+              .. iso_boot
+          end
+        end
+      else
+        local fail_closed = net_iso_conf.isolation_fail_closed ~= false
+        if fail_closed then want_net = false end
+        pcall(function()
+          require("NeoAI.kernel.event_bus").emit(require("NeoAI.kernel.events").SANDBOX_DEGRADED, {
+            layer = "net_isolation", mode = "none", reason = tostring(iso_err),
+          })
+        end)
+        pcall(function()
+          require("NeoAI.kernel.logger").warn(
+            "[sandbox] 网络隔离不可用（%s），%s", tostring(iso_err),
+            fail_closed and "本次命令按 fail-closed 拒绝网络" or "退回共享 netns（告警留痕）")
+        end)
+      end
+    end
     local argv = {}
     _append_bwrap_base(argv, flags, priv, opts.cwd, root_overlay, no_pid_ns)
     -- root_drop：为让载荷经 setpriv 降 uid，bwrap 需保留 SETUID/SETGID（其余能力仍被
@@ -3275,7 +3402,7 @@ function M.process_prefix(opts)
     end
     -- user_drop：bwrap 在新建 userns 内把当前用户映射为 guest root（uid/gid 0，仅命名空间内
     -- 有效；宿主身份仍是当前非 root 用户）。
-    if user_drop then
+    if user_drop and not rootless_session then
       argv[#argv + 1] = "--uid"; argv[#argv + 1] = "0"
       argv[#argv + 1] = "--gid"; argv[#argv + 1] = "0"
     end
@@ -3283,6 +3410,22 @@ function M.process_prefix(opts)
     -- 覆盖基础参数里的空 tmpfs；绝不把宿主真实 /tmp、/var/tmp 作为 lower/内容暴露，
     -- 退出/轮换会话即销毁，杜绝跨会话残留泄露。
     _append_tmpfs_roots(argv, opts.session_tmp_dir, opts.tmpfs_base)
+    -- 私有 netns：把宿主代理 socket 目录挂进沙箱固定路径。
+    -- 必须位于**会话私有 /run 覆盖之后**（否则会被覆盖）且**遮蔽之前**（源目录在沙箱 store
+    -- 根下，后续 `--tmpfs <store>` 会让 bwrap 解析不到源）。沙箱内 socat 经此 Unix socket
+    -- 连到宿主 host_proxy。
+    if net_isolated then
+      local spec = net_isolation.mount_spec()
+      -- 仅当本次前缀带会话私有临时根（wrapper/resident 都会传）时 `/run` 才可写；
+      -- 只读整机根（H.direct / LSP 只读探测）下没有私有 /run，强制创建会失败。
+      local run_writable = (opts.session_tmp_dir ~= nil and opts.session_tmp_dir ~= "")
+        or (opts.session_dir ~= nil and opts.session_dir ~= "")
+        or (opts.tmpfs_base ~= nil and opts.tmpfs_base ~= "")
+      if spec and run_writable then
+        table.insert(argv, "--dir"); table.insert(argv, spec.dst)
+        table.insert(argv, "--bind"); table.insert(argv, spec.src); table.insert(argv, spec.dst)
+      end
+    end
     -- --new-session：新终端会话；--as-pid-1 已在基础参数中，使载荷成为 PID 1，
     -- 避免进程表出现 `bwrap --unshare-all ...` 这一沙箱指纹。
     table.insert(argv, "--new-session")
@@ -3350,6 +3493,25 @@ function M.process_prefix(opts)
         table.insert(argv, "--tmpfs"); table.insert(argv, mp.path)
       else
         table.insert(argv, "--bind"); table.insert(argv, "/dev/null"); table.insert(argv, mp.path)
+      end
+    end
+    -- 选择性放开（`priv.bind_files`）：在**目录级遮蔽之后**把单个文件只读绑定回来。
+    -- 用于「目录必须遮蔽，但其中特定几个文件需要可用」的场景（如 git preauth 只给绑定的
+    -- 私钥 + known_hosts，而不是整个 `~/.ssh`）。目的路径落在上一步的 tmpfs 内，由 bwrap 创建。
+    -- 顺序很关键：放在遮蔽之后，否则会被 tmpfs/`/dev/null` 覆盖。
+    for _, bf in ipairs((priv and priv.bind_files) or {}) do
+      if type(bf) == "table" and type(bf.src) == "string" and bf.src ~= "" then
+        local dest = type(bf.dest) == "string" and bf.dest ~= "" and bf.dest or bf.src
+        table.insert(argv, "--ro-bind"); table.insert(argv, bf.src); table.insert(argv, dest)
+      end
+    end
+    -- 宿主可能不存在的强制遮蔽项（如 /etc/ld.so.preload）：仅在有**可写整机 overlay** 时需要
+    -- （只读根无法创建该文件，强行在缺失目的上挂载会让 bwrap init 失败）。目的由 bwrap 创建。
+    if root_overlay then
+      for _, p in ipairs(ALWAYS_MASK_PATHS) do
+        if not vim.uv.fs_stat(p) then
+          table.insert(argv, "--bind"); table.insert(argv, "/dev/null"); table.insert(argv, p)
+        end
       end
     end
     -- 整机根视图下命名空间与宿主共享同一套符号链接：bwrap >= 0.12 拒绝挂载到符号链接目的
@@ -3453,7 +3615,12 @@ function M.process_prefix(opts)
     do
       -- 入口桩按**执行 Agent** 判定（`priv.privileged`）：PRIV 会话的命令按宿主真实运行时执行，
       -- 其它窗口的命令仍走 podman 桩，避免「焦点在哪一侧」改变容器语义。
-      local cstubs = (priv and priv.privileged) and nil or _container_stubs()
+      local docker_session = false
+      do
+        local okd, ds = pcall(require, "NeoAI.sandbox.docker.session")
+        docker_session = okd and ds and ds.active() == true
+      end
+      local cstubs = ((priv and priv.privileged) or docker_session) and nil or _container_stubs()
       if cstubs then
         for _, name in ipairs({ "docker", "docker-compose", "nerdctl", "podman-compose" }) do
           local src = cstubs.dir .. "/" .. name
@@ -3520,12 +3687,7 @@ function M.process_prefix(opts)
     --   档位显式指定时以档位为准（T0 默认放行网络，经 host_proxy 拦截本机；T1/T2 允许网络）；
     --   未指定档位时维持旧语义：带 userns 隔离 net 后按需 --share-net，否则 offline 才隔离。
     --   offline=true 为硬隔离，但高权限模式显式解除（网络放行 + host_proxy 记录）。
-    if not gateway_mode then
-      local want_net
-      if privileged_active then want_net = true
-      elseif offline then want_net = false
-      elseif priv then want_net = priv.network == true
-      else want_net = true end
+    if not gateway_mode and not net_isolated then
       if userns then
         if want_net then table.insert(argv, "--share-net") end
       elseif not want_net then
@@ -3535,6 +3697,15 @@ function M.process_prefix(opts)
     -- 网关模式：在 bwrap 之前加 `ip netns exec <ns>`，把载荷放进隔离网络命名空间。
     if gateway_mode then
       local pre = net_gateway.exec_prefix()
+      local full = {}
+      for _, v in ipairs(pre) do full[#full + 1] = v end
+      for _, v in ipairs(argv) do full[#full + 1] = v end
+      argv = full
+    end
+    -- 私有 netns（root 模式）：在 bwrap 之前加 `ip netns exec <ns>`；netns 已由宿主建好并
+    -- 拉起 lo，载荷无需 CAP_NET_ADMIN。非 root 的 userns 模式由 bwrap 自身 unshare net。
+    if net_isolated and net_isolation.mode() == "netns" then
+      local pre = net_isolation.exec_prefix()
       local full = {}
       for _, v in ipairs(pre) do full[#full + 1] = v end
       for _, v in ipairs(argv) do full[#full + 1] = v end
@@ -3590,6 +3761,21 @@ function M.process_prefix(opts)
     argv = finalized
     if skips and #skips > 0 then
       pcall(function() M.note_mount_skip(skips, { stage = "finalize", tool = opts.tool }) end)
+    end
+    if rootless_session then
+      local pre = {
+        "rootlesskit",
+        "--net=" .. ((vim.fn.executable("slirp4netns") == 1 or vim.fn.executable("pasta") == 1)
+          and "slirp4netns" or "host"),
+        "--disable-host-loopback",
+        "--copy-up=/etc",
+        "--copy-up=/run",
+        "--",
+      }
+      local full = {}
+      for _, v in ipairs(pre) do full[#full + 1] = v end
+      for _, v in ipairs(argv) do full[#full + 1] = v end
+      argv = full
     end
     if filter then
       return _wrap_close_fds(_prepend_affinity(argv), "exec 3<'" .. filter .. "'"), nil, opts.cwd

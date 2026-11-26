@@ -18,14 +18,14 @@
 - **丰富的内置工具** — AI 可调用文件操作、代码分析、LSP、Shell 命令等 40+ 工具
 - **工具审批系统** — 细粒度的工具执行权限控制，支持自动允许/手动审批/参数级别白名单
 - **计划模式（PLAN）与计划提取** — 按 `m` 或 `:NeoAI Plan` 切换，工具上下文只保留只读/信息查询 + `run_command`（只读调研）+ `ask_user`（不暴露任何修改类工具，也不向 AI 提供切换模式的工具）；AI 调研澄清后输出格式化修改计划并结束本轮，由用户确认（`:NeoAI ApprovePlan` 或手动切换模式）后转入 CHAT：边界处先做一轮 **XML 计划提取**（`<target>`/`<stepN>`/`<files>` 等，忽略大小写、缺失关键字段重试最多 3 次），据此组装执行上下文并按步骤自动建任务清单（`todo_write`），`<files>` 相关工具消息原样保留以保证缓存命中，再开始执行
-- **高权限模式（PRIV，opt-in）** — 按 `m` 循环或 `:NeoAI Privileged` 切换；网络不拦截仅记录（进程级：存在 PRIV 会话即整体放行+记录，焦点切换不弹窗）、可直接使用 docker/podman（docker 直连宿主 daemon）、不遮蔽 SSH 密钥；生成中切换时策略立即生效、仅模型延后。默认关闭且仅异步审批可用，安全边界见 `docs/configuration.md` 与 `docs/sandbox.md`
+- **高权限模式（PRIV，opt-in）** — 按 `m` 循环或 `:NeoAI Privileged` 切换；网络不拦截仅记录（进程级：存在 PRIV 会话即整体放行+记录，焦点切换不弹窗）、不遮蔽 SSH 密钥；Docker 不再由 PRIV 直连宿主 daemon，统一走自动探测的会话内 rootless runtime + broker；生成中切换时策略立即生效、仅模型延后。默认关闭且仅异步审批可用，安全边界见 `docs/configuration.md` 与 `docs/sandbox.md`
 - **后台上下文压缩** — 接近上下文阈值时**后台异步、非阻塞**地折叠第一轮至倒数第二轮（保留最后一轮），以检查点写入**压缩覆盖层**：后续请求与再次压缩使用压缩后的替换，而聊天渲染与会话持久化仍是原始上下文（覆盖层随会话保存，重开后继续生效）；压缩不弹悬浮窗；除回合边界外，**工具循环每轮发送前也会做压力检查**（工具结果已回写、下一轮请求前），长循环逐轮收敛；**历史条数超过安全上限时先同步压缩再发送（用检查点替换，而不是裸截断改写前缀）**；溢出时自动压缩后重试；计划提取过程仍以悬浮窗实时展示推理与正文
 - **子 Agent 系统** — AI 可创建子 Agent 并行执行子任务，支持边界审核
 - **前后端分离架构** — 事件驱动的异步架构，UI 与业务逻辑解耦
 - **高度可配置** — 完整的键位绑定、UI 布局、日志级别等自定义配置
 - **纯lua编写** — 无需安装额外的依赖
 - **⚠️⚠️⚠️使用curl发送请求** 环境变量内没有curl可能无法发送请求
-- **待发消息队列** — Agent 正忙时发送的消息自动暂存，状态栏出现 `待发N` 徽标提醒，消息真正发送后徽标消失
+- **待发消息队列 / 工具后台化** — Agent 正忙时发送的消息自动暂存，状态栏出现 `待发N` 徽标提醒，消息真正发送后徽标消失；若当前只是在**等工具返回**（模型生成已完成），已真正开始执行的工具会自动转为后台执行，插入 `工具已在后台执行，ID：...` 说明后立即处理新消息；后台工具完成后把返回信息追加到上下文末尾并继续循环。等待审批 / `ask_user` 的工具保持前台，消息暂存到交互结束再转后台。
 - **多模态图像** — `read_image` 工具读入 PNG/JPEG/WebP/GIF 并注入多模态模型（内容寻址附件存储 + 请求期像素/字节预算 offload，模型不支持图像时自动降级为文本）
 - **网页搜索/抓取（web_search / web_fetch）** — 对齐 DeepSeek Harness 的工具契约：`web_search` 并发搜索并合并来源，`web_fetch` 抓取页面正文；后端使用 DeepSeek Web Search/Fetch API，**仅 DeepSeek provider 的 Agent 可见**，默认不启用
 - **lualine 状态栏集成** — 在聊天窗口中用 `nvim-lualine` 实时展示大模型用量、缓存命中率与上下文容量（模型/用量/缓存/容量等段可自定义）
@@ -205,7 +205,7 @@ require("NeoAI").setup({
 | `:NeoAI ReloadDisplay`| 热重载显示模式插件（缺省重载当前模式）            |
 | `:NeoAI ReloadAll`  | 热重载整个 NeoAI 插件（先做隔离预检，失败则取消）  |
 | `:NeoAI Plan`       | 切换计划模式（工具上下文只保留只读/信息查询 + 提问）|
-| `:NeoAI Privileged` | 切换高权限模式（网络仅记录、可直连 docker/podman；需先启用）|
+| `:NeoAI Privileged` | 切换高权限模式（网络仅记录、SSH 不遮蔽；Docker 走自动会话 runtime；需先启用）|
 | `:NeoAI ApprovePlan`| 确认计划并转入 CHAT 模式按任务清单执行             |
 | `:NeoAI SandboxCommit`| 应用沙箱候选到真实工作区（CAS 发布，参数为候选摘要）|
 | `:NeoAI SandboxReview`| 列出待审修改并选择应用（异步审批；「资源访问」页按 `E` 可增删工作目录/遮蔽目录，仅本会话）             |
@@ -219,6 +219,8 @@ require("NeoAI").setup({
 | `:NeoAI SandboxCaps`| 显示沙箱运行时能力探测结果                        |
 | `:NeoAI SandboxDiag`| 显示沙箱资源域/负载诊断（137/OOM 归因）            |
 | `:NeoAI SandboxAudit`| 显示沙箱行为审计与风险评估摘要                     |
+| `:NeoAI SandboxDocker`| 会话内 Docker 状态 / 重建队列（pending、approve、revoke、stop） |
+| `:NeoAI Deps` | 可选安全依赖管理（可视化选择并调用包管理器安装） |
 | `:NeoAI SandboxAutoApprove`| 设置 AI 新会话自动审批（`on`/`off`/`status`，默认关闭）|
 | `:NeoAI Doctor` | 环境诊断（Neovim 版本 / curl / API Key / 沙箱能力 / 可选依赖；等同 `:checkhealth NeoAI` 摘要） |
 | `:NeoAI Statusline` | 预览当前 lualine 状态栏组件内容                    |
@@ -476,10 +478,9 @@ require("NeoAI").setup({
       -- mutating_tools = { ... },       -- 修改类工具（计划模式可见集已覆盖此语义）
     },
     privileged_mode = {
-      enabled = false,                   -- opt-in：高权限模式（网络仅记录、可直连 docker/podman）
+      enabled = false,                   -- opt-in：高权限模式（网络仅记录、SSH 不遮蔽；Docker 走自动会话 runtime）
       require_async_approval = true,     -- 仅 tools.approval.mode="async" 时允许进入
       override_offline = true,           -- 解除 tools.sandbox.offline=true 的硬离线（仍经 host_proxy 记录）
-      docker_socket = "",                -- 宿主 docker socket；空 = 自动探测
       unmask_ssh_keys = true,            -- 不遮蔽 ~/.ssh / ssh-agent 路径
       record_network = true,             -- 记录放行的网络目标（:NeoAI SandboxAudit network）
       max_records = 1000,
@@ -662,6 +663,8 @@ require("lualine").setup({
 
 > `待发N`：Agent 正忙（generating / tool_running / 生成槽被占用）时你发送的消息会先暂存，
 > 状态栏出现该徽标提醒；消息真正发送后徽标自动消失（计数归零不渲染）。
+> 若只是在等工具返回，已开始的工具会自动转后台、消息立即处理（不长期占用待发徽标）；
+> 等待审批 / `ask_user` 的工具除外，消息会等交互结束后再转后台。
 
 各段默认链接到**鲜艳的 nvim 高亮组**（`Title`/`Type`/`Number`/`String`/`Statement`/`Function`/`Keyword`），
 active 与 inactive 一致，杜绝无焦点时整行变灰（虚化）。
@@ -1109,7 +1112,7 @@ NeoAI/
 │       ├── plan.lua           # 子 Agent + 边界审核
 │       ├── todo.lua           # 待办清单（todo_write/read/clear + 提示段）
 │       ├── plan_mode.lua      # 计划模式（enter_plan_mode + 工具过滤/门禁）
-│       ├── privileged_mode.lua# 高权限模式（网络仅记录 + 容器直连）
+│       ├── privileged_mode.lua# 高权限模式（网络仅记录 + SSH 不遮蔽）
 │       ├── ask_user.lua       # 向用户提问
 │       ├── read_image.lua     # 图像读取（多模态）
 │       ├── web_search.lua     # DeepSeek Web 搜索（默认不启用，仅 DeepSeek provider）
@@ -1175,6 +1178,7 @@ NeoAI/
     ├── test_tools.lua         # 工具系统
     ├── test_tool_pending.lua  # 工具待发/暂存
     ├── test_pending_queue.lua # 待发消息队列
+    ├── test_background_tools.lua # 工具后台化（等工具期间新消息）
     ├── test_services.lua      # 服务层（chat/tool/model/status）
     ├── test_status.lua        # 状态栏服务
     ├── test_herder.lua        # Herder 状态上报

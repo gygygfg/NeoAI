@@ -18,14 +18,14 @@
 - **A rich set of built-in tools** — the AI can call 40+ tools for file operations, code analysis, LSP, Shell commands, and more
 - **Tool approval system** — fine-grained control over tool execution permissions, supporting auto-allow / manual approval / argument-level allowlists
 - **Plan mode (PLAN) and plan extraction** — toggle with `m` or `:NeoAI Plan`; the tool context retains only read-only / informational queries plus `run_command` (read-only research) and `ask_user` (no mutating tools are exposed, and no mode-switching tool is given to the AI); after the AI researches and clarifies, it emits a formatted change plan and ends the turn; once the user confirms (`:NeoAI ApprovePlan` or manually toggling the mode), NeoAI switches to CHAT: at the boundary it first runs one **XML plan extraction** (`<target>`/`<stepN>`/`<files>` etc., case-insensitive, retrying up to 3 times when key fields are missing), assembles the execution context, builds the task list automatically per step (`todo_write`), and keeps `<files>`-related tool messages verbatim for cache hits before starting execution
-- **Privileged mode (PRIV, opt-in)** — cycle with `m` or toggle with `:NeoAI Privileged`; network is record-only (process-wide: while a PRIV session exists, traffic is allowed and recorded, and focus switches never prompt), docker/podman can be used directly (docker connects to the host daemon), and SSH keys are not masked; switching during a generation applies the policy immediately and defers only the model. Off by default and async-approval only; see `docs/en/configuration.md` and `docs/sandbox.md` for the security boundary
+- **Privileged mode (PRIV, opt-in)** — cycle with `m` or toggle with `:NeoAI Privileged`; network is record-only (process-wide: while a PRIV session exists, traffic is allowed and recorded, and focus switches never prompt), SSH keys are not masked. Docker is no longer connected directly to the host daemon; it uses an auto-detected session rootless runtime plus a host-side broker. Off by default and async-approval only; see `docs/en/configuration.md` and `docs/sandbox.md` for the security boundary
 - **Background context compaction** — as the context threshold approaches, round 1 through the second-to-last round (keeping the last round intact) is folded **asynchronously in the background, non-blocking**, and a checkpoint is written into a **compaction overlay**: subsequent requests and further compactions use the compacted replacement, while chat rendering and session persistence keep the original context (the overlay is saved with the session and survives a restart); compaction opens no floating window; in addition to turn boundaries, **a pressure check runs before every round of the tool loop** (after tool results are written back and before the next request), so long loops converge round by round; **when the history safety cap is exceeded we compact synchronously before sending (replacing the prefix with a checkpoint instead of truncating it)**; on overflow the request is compacted and retried automatically; plan extraction still shows reasoning and content live in a floating window
 - **Sub-Agent system** — the AI can spawn sub-Agents to run subtasks in parallel, with boundary review
 - **Decoupled frontend/backend architecture** — an event-driven asynchronous architecture that separates the UI from business logic
 - **Highly configurable** — full customization of keymaps, UI layout, log level, and more
 - **Written purely in Lua** — no extra dependencies required
 - **⚠️⚠️⚠️Requests are sent with curl** — if curl is not available in the environment, requests may fail
-- **Pending message queue** — messages sent while the Agent is busy are queued automatically, a `待发N` ("N pending") badge appears in the statusline as a reminder, and the badge disappears once the messages are actually sent
+- **Pending message queue / background tools** — messages sent while the Agent is busy are queued automatically, a `待发N` ("N pending") badge appears in the statusline as a reminder, and the badge disappears once the messages are actually sent; if the Agent is only **waiting for tool results** (model generation finished), tools that have actually started executing are moved to the background, a "tool running in background, ID: ..." note is inserted, and the new message is processed immediately; when a background tool finishes, its return info is appended to the end of the context and the loop continues. Tools waiting for approval / `ask_user` stay in the foreground, and the message waits until the interaction ends before backgrounding.
 - **Multimodal images** — the `read_image` tool loads PNG/JPEG/WebP/GIF and injects them into multimodal models (content-addressed attachment storage + request-time pixel/byte budget offload, automatically degrading to text when the model does not support images)
 - **Web search/fetch (web_search / web_fetch)** — mirror the DeepSeek Harness tool contract: `web_search` runs concurrent searches and merges sources, `web_fetch` retrieves a page body; backed by the DeepSeek Web Search/Fetch API, **visible only to Agents using a DeepSeek provider**, and disabled by default
 - **lualine statusline integration** — show model usage, cache-hit rate, and context capacity in real time inside the chat window via `nvim-lualine` (the model/usage/cache/capacity sections are customizable)
@@ -214,7 +214,7 @@ shown by a floating hint (or by your nvim-cmp + cmp-cmdline setup when installed
 | `:NeoAI ReloadDisplay`| Hot-reload the display mode plugin (reloads the current mode by default) |
 | `:NeoAI ReloadAll`  | Hot-reload the whole NeoAI plugin (isolated pre-check first; cancel on failure) |
 | `:NeoAI Plan`       | Toggle plan mode (the tool context retains only read-only / informational queries + asking the user) |
-| `:NeoAI Privileged` | Toggle privileged mode (record-only network, direct docker/podman; opt-in) |
+| `:NeoAI Privileged` | Toggle privileged mode (record-only network, SSH unmasked; Docker uses the auto session runtime; opt-in) |
 | `:NeoAI ApprovePlan`| Confirm the plan and switch to CHAT mode to execute it per the task list |
 | `:NeoAI SandboxCommit`| Apply a sandbox candidate to the real workspace (CAS publish; arg = candidate digest) |
 | `:NeoAI SandboxReview`| List pending changes and apply the selected one (async review; press `E` on the "Resource Access" page to add/remove workspace/masked dirs, session-only) |
@@ -228,6 +228,8 @@ shown by a floating hint (or by your nvim-cmp + cmp-cmdline setup when installed
 | `:NeoAI SandboxCaps`| Show sandbox runtime capability probe results |
 | `:NeoAI SandboxDiag`| Show sandbox resource-domain / load diagnostics (137/OOM attribution) |
 | `:NeoAI SandboxAudit`| Show the sandbox behavior-audit and risk-assessment summary |
+| `:NeoAI SandboxDocker`| Session-native Docker status / rebuild queue (pending, approve, revoke, stop) |
+| `:NeoAI Deps` | Optional security dependency manager (visual selection + package-manager install) |
 | `:NeoAI SandboxAutoApprove`| Set auto-approval for new AI sessions (`on`/`off`/`status`, off by default) |
 | `:NeoAI Doctor` | Environment diagnostics (Neovim version / curl / API keys / sandbox capability / optional deps; same summary as `:checkhealth NeoAI`) |
 | `:NeoAI Statusline` | Preview the content of the current lualine statusline components |
@@ -487,10 +489,9 @@ require("NeoAI").setup({
       -- mutating_tools = { ... },       -- mutating tools (the visible set in plan mode already covers this semantics)
     },
     privileged_mode = {
-      enabled = false,                   -- opt-in: privileged mode (record-only network, direct docker/podman)
+      enabled = false,                   -- opt-in: privileged mode (record-only network, SSH unmasked; Docker uses the auto session runtime)
       require_async_approval = true,     -- only allowed when tools.approval.mode="async"
       override_offline = true,           -- lift tools.sandbox.offline=true (still recorded through host_proxy)
-      docker_socket = "",                -- host docker socket; empty = auto-detect
       unmask_ssh_keys = true,            -- do not mask ~/.ssh / ssh-agent paths
       record_network = true,             -- record allowed network targets (:NeoAI SandboxAudit network)
       max_records = 1000,
@@ -671,6 +672,9 @@ no truncated blocks:
 > `pending N`: while the Agent is busy (generating / tool_running / the generation slot is occupied), messages you
 > send are queued first and this badge appears in the statusline as a reminder; once the message is actually sent,
 > the badge disappears automatically (a zero count is not rendered).
+> If the Agent is only waiting for tool results, tools that have started are moved to the background and the message
+> is processed immediately (so the badge does not linger); tools waiting for approval / `ask_user` are the exception
+> and the message waits until the interaction ends before backgrounding.
 
 Each segment links by default to a **vivid nvim highlight group**
 (`Title`/`Type`/`Number`/`String`/`Statement`/`Function`/`Keyword`), identical for active and inactive, so an entire
@@ -1202,6 +1206,7 @@ NeoAI/
     ├── test_tools.lua         # Tool system
     ├── test_tool_pending.lua  # Tool pending/staging
     ├── test_pending_queue.lua # Pending message queue
+    ├── test_background_tools.lua # Background tools (new input while tools run)
     ├── test_services.lua      # Service layer (chat/tool/model/status)
     ├── test_status.lua        # Statusline service
     ├── test_herder.lua        # Herder status reporting

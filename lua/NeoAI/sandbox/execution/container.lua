@@ -202,6 +202,9 @@ end
 --- @return boolean
 local function _privileged(opts)
   if type(opts) == "table" and opts.privileged ~= nil then return opts.privileged == true end
+  -- 会话内 Docker 激活时，docker 必须走 broker（不能改写为 podman 入口桩）。
+  local okd, ds = pcall(require, "NeoAI.sandbox.docker.session")
+  if okd and ds and ds.active() then return true end
   local okp, privileged = pcall(require, "NeoAI.sandbox.privileged")
   return (okp and privileged.active()) or false
 end

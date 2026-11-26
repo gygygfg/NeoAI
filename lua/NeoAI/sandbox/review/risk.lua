@@ -445,6 +445,56 @@ end
 -- 让回退成为显式、可见、可通过测试与评审的动作，而不是一个静默的配置项。
 -- 需要形迹信息（分级/提示文案）请用 `M.advisory`。
 
+--- 可出现在真实命令之前的包装器（`timeout 8 env -u http_proxy curl ...`）。
+--- 只用于**还原命令位置**，本身不构成拒绝依据。
+local WRAPPER_BINS = {
+  sudo = true, doas = true, command = true, exec = true, builtin = true,
+  nohup = true, setsid = true, time = true, nice = true, ionice = true,
+  stdbuf = true, timeout = true, xargs = true, strace = true, ltrace = true,
+  script = true, unbuffer = true, chrt = true, taskset = true, flock = true,
+  watch = true, env = true,
+}
+
+--- 包装器中**带值**的选项（值不能被误当作真实命令）。
+local WRAPPER_VALUE_OPTS = {
+  timeout = { ["-s"] = true, ["--signal"] = true, ["-k"] = true, ["--kill-after"] = true },
+  sudo = {
+    ["-u"] = true, ["--user"] = true, ["-g"] = true, ["--group"] = true,
+    ["-p"] = true, ["--prompt"] = true, ["-c"] = true, ["--close-from"] = true,
+    ["-h"] = true, ["--host"] = true, ["-r"] = true, ["--role"] = true,
+    ["-t"] = true, ["--type"] = true, ["-U"] = true, ["--other-user"] = true,
+    ["-C"] = true, ["--close-from"] = true, ["-D"] = true, ["--chdir"] = true,
+  },
+  nice = { ["-n"] = true, ["--adjustment"] = true },
+  ionice = {
+    ["-c"] = true, ["--class"] = true, ["-n"] = true, ["--classdata"] = true,
+    ["-p"] = true, ["--pid"] = true, ["-P"] = true, ["--pgid"] = true,
+    ["-u"] = true, ["--uid"] = true,
+  },
+  xargs = {
+    ["-I"] = true, ["-n"] = true, ["-P"] = true, ["-d"] = true,
+    ["-L"] = true, ["-s"] = true, ["-a"] = true, ["-E"] = true,
+    ["--arg-file"] = true, ["--max-args"] = true, ["--max-procs"] = true,
+    ["--delimiter"] = true, ["--max-lines"] = true, ["--max-chars"] = true,
+    ["--eof"] = true,
+  },
+  chrt = {
+    ["-p"] = true, ["--pid"] = true, ["-T"] = true, ["--sched-runtime"] = true,
+    ["-P"] = true, ["--sched-period"] = true, ["-D"] = true, ["--sched-deadline"] = true,
+  },
+  taskset = { ["-p"] = true, ["--pid"] = true },
+  flock = { ["-w"] = true, ["--timeout"] = true, ["-E"] = true, ["--conflict-exit-code"] = true },
+  stdbuf = {
+    ["-i"] = true, ["-o"] = true, ["-e"] = true,
+    ["--input"] = true, ["--output"] = true, ["--error"] = true,
+  },
+  script = {
+    ["-c"] = true, ["--command"] = true, ["-E"] = true, ["--echo"] = true,
+    ["-t"] = true, ["--timing"] = true, ["-I"] = true, ["--log-in"] = true,
+    ["-O"] = true, ["--log-out"] = true,
+  },
+}
+
 --- 代理规避判定：显式清除/绕过 HTTP(S)_PROXY/ALL_PROXY 的命令。
 --- host_local_block 依赖代理变量生效；`unset *proxy`、`env -u *proxy`、`curl --noproxy`、
 --- `--proxy ""` 等会使其失效而直连宿主本机。仅覆盖**显式**规避；不认代理的裸 TCP
@@ -454,10 +504,14 @@ end
 --- 还原为实际 token，否则可用拼接绕过。另收集简单变量赋值（`c=--noproxy`）以展开 `$c`。
 --- 短选项 `-x` 是 curl 的 `--proxy`，但在 `set -x`/`tar -x`/`grep -x`/`bash -x` 中是常见
 --- 无关开关，故仅在 curl 段上按代理选项判定，避免误报硬拒绝。
+--- **包装器**：真实命令可能位于 `timeout`/`nice`/`sudo`/`env`/`xargs` 等之后；只看片段首个
+--- token 会让 `timeout 8 env -u http_proxy curl …` 逃逸（红队实测）。这里先剥离包装器再判定。
 --- @param command string|nil 折叠后的有效命令文本
+--- @param depth number|nil 嵌套 shell 递归深度（内部使用）
 --- @return string|nil reason 如 "PROXY_EVASION:unset"
-function M.network_evasion_reason(command)
+function M.network_evasion_reason(command, depth)
   if type(command) ~= "string" or command == "" then return nil end
+  depth = tonumber(depth) or 0
   -- 还原 shell 引号拼接 / ANSI-C 引用 / 反斜杠转义（仅用于匹配，不改变实际命令）。
   local function _norm_tok(tok)
     local s = tostring(tok)
@@ -479,55 +533,127 @@ function M.network_evasion_reason(command)
   local function _is_proxy_var(tok)
     return _expand(tok):lower():match("^[%a_]*proxy$") ~= nil
   end
-  for seg in command:gmatch("[^;|&\n]+") do
-    local toks = {}
-    for t in seg:gmatch("%S+") do toks[#toks + 1] = t end
-    if #toks > 0 then
-      local f0 = _expand(toks[1])
-      local first = (f0:match("[^/]+$") or f0):lower()
-      -- `-x` 仅在 curl 上等同 `--proxy`；其它命令（set/tar/grep/bash…）的 `-x` 无关代理。
-      local short_x_proxy = first == "curl" or first:match("^curl") ~= nil
-      if first == "unset" then
-        for i = 2, #toks do
-          if _is_proxy_var(toks[i]) then return "PROXY_EVASION:unset" end
-        end
-      elseif first == "env" then
-        for i = 2, #toks do
-          local t = _expand(toks[i])
-          if (t == "-u" or t == "--unset") and _is_proxy_var(toks[i + 1]) then
-            return "PROXY_EVASION:env-unset"
-          elseif t:match("^%-%-unset=") and _is_proxy_var(t:sub(9)) then
-            return "PROXY_EVASION:env-unset"
+  local function _base(tok)
+    local t = _expand(tok)
+    return (t:match("[^/]+$") or t):lower()
+  end
+
+  --- 跳过包装器，返回真实命令的 token 下标（以及包装器内已发现的规避原因）。
+  --- @param toks table
+  --- @return number index
+  --- @return string|nil reason
+  local function _skip_wrappers(toks)
+    local i = 1
+    local guard = 0
+    while i <= #toks and guard < 24 do
+      guard = guard + 1
+      local base = _base(toks[i])
+      if base == "env" then
+        i = i + 1
+        while i <= #toks do
+          local a = _expand(toks[i])
+          if a == "--" then
+            i = i + 1
+            break
+          elseif a == "-u" or a == "--unset" then
+            if _is_proxy_var(toks[i + 1]) then return i, "PROXY_EVASION:env-unset" end
+            i = i + 2
+          elseif a:match("^%-%-unset=") then
+            if _is_proxy_var(a:sub(9)) then return i, "PROXY_EVASION:env-unset" end
+            i = i + 1
+          elseif a:match("^[%a_][%w_]*=") or a:match("^%-%-?%w") then
+            -- 环境赋值 / 选项（`-i`、`-0`、`--ignore-environment` 等）；`-S` 的值形态
+            -- 无法静态还原，交给调用方的 script_scan 生效文本兜底。
+            i = i + 1
+          else
+            break
           end
         end
-      elseif first == "export" then
-        for i = 2, #toks do
-          local name = _expand(toks[i]):match("^([%a_]+)=$")
-          if name and _is_proxy_var(name) then return "PROXY_EVASION:export-clear" end
+      elseif WRAPPER_BINS[base] then
+        local takes_value = WRAPPER_VALUE_OPTS[base] or {}
+        i = i + 1
+        while i <= #toks do
+          local a = _expand(toks[i])
+          if a == "--" then
+            i = i + 1
+            break
+          elseif a:match("^%-") then
+            if takes_value[a] then i = i + 2 else i = i + 1 end
+          elseif base == "sudo" and a:match("^[%a_][%w_]*=") then
+            i = i + 1
+          else
+            break
+          end
         end
+        -- `timeout [opts] DURATION cmd...`
+        if base == "timeout" and i <= #toks then i = i + 1 end
+      else
+        break
       end
-      for i = 1, #toks do
-        local t = _expand(toks[i])
-        if t == "--noproxy" or t == "--no-proxy"
-          or t:match("^%-%-noproxy=") or t:match("^%-%-no%-proxy=") then
-          return "PROXY_EVASION:noproxy"
+    end
+    return i, nil
+  end
+
+  local function _scan_segment(toks, depth)
+    if #toks == 0 then return nil end
+    local i, wreason = _skip_wrappers(toks)
+    if wreason then return wreason end
+    if i > #toks then return nil end
+    local first = _base(toks[i])
+    local short_x_proxy = first == "curl" or first:match("^curl") ~= nil
+    if first == "unset" then
+      for j = i + 1, #toks do
+        if _is_proxy_var(toks[j]) then return "PROXY_EVASION:unset" end
+      end
+    elseif first == "export" then
+      for j = i + 1, #toks do
+        local name = _expand(toks[j]):match("^([%a_]+)=$")
+        if name and _is_proxy_var(name) then return "PROXY_EVASION:export-clear" end
+      end
+    end
+    -- 整个片段（含包装器参数）里的显式绕过选项。
+    for j = 1, #toks do
+      local t = _expand(toks[j])
+      if t == "--noproxy" or t == "--no-proxy"
+        or t:match("^%-%-noproxy=") or t:match("^%-%-no%-proxy=") then
+        return "PROXY_EVASION:noproxy"
+      end
+      if t == "--proxy" or (short_x_proxy and t == "-x") then
+        -- 仅把「字面空值」或「已知被赋空值的变量」视为清空代理；未展开的 `$var` 不误判
+        -- （可能是合法代理变量）。
+        local raw = toks[j + 1]
+        local empty = raw == nil or _norm_tok(raw) == ""
+        if not empty and raw then
+          local name = _norm_tok(raw):match("^%$?{?([%a_][%w_]*)%}?$")
+          if name and vars[name] == "" then empty = true end
         end
-        if t == "--proxy" or (short_x_proxy and t == "-x") then
-          -- 仅把「字面空值」或「已知被赋空值的变量」视为清空代理；未展开的 `$var` 不误判
-          -- （可能是合法代理变量）。
-          local raw = toks[i + 1]
-          local empty = raw == nil or _norm_tok(raw) == ""
-          if not empty and raw then
-            local name = _norm_tok(raw):match("^%$?{?([%a_][%w_]*)%}?$")
-            if name and vars[name] == "" then empty = true end
-          end
-          if empty then return "PROXY_EVASION:proxy-empty" end
-        elseif t:match("^%-%-proxy=") or (short_x_proxy and t:match("^%-x=")) then
-          local v = t:gsub("^%-%-proxy=", ""):gsub("^%-x=", "")
-          if v == "" then return "PROXY_EVASION:proxy-empty" end
+        if empty then return "PROXY_EVASION:proxy-empty" end
+      elseif t:match("^%-%-proxy=") or (short_x_proxy and t:match("^%-x=")) then
+        local v = t:gsub("^%-%-proxy=", ""):gsub("^%-x=", "")
+        if v == "" then return "PROXY_EVASION:proxy-empty" end
+      end
+    end
+    -- 嵌套 shell：`sh -c '…'` / `bash -lc '…'`（script_scan 通常已展开；这里再兜底一层）。
+    if depth < 3 and (first == "sh" or first == "bash" or first == "dash"
+      or first == "zsh" or first == "ksh" or first == "busybox") then
+      for j = i + 1, #toks - 1 do
+        local a = _norm_tok(toks[j])
+        if a == "-c" or a:match("^%-[%a]*c$") then
+          -- 引号内的命令按 `%S+` 被拆成多个 token，重建后用首尾引号剥离。
+          local inner = table.concat(toks, " ", j + 1)
+          inner = inner:gsub('^[\'"]+', ""):gsub('[\'"]+$', "")
+          return M.network_evasion_reason(inner, depth + 1)
         end
       end
     end
+    return nil
+  end
+
+  for seg in command:gmatch("[^;|&\n]+") do
+    local toks = {}
+    for t in seg:gmatch("%S+") do toks[#toks + 1] = t end
+    local reason = _scan_segment(toks, depth)
+    if reason then return reason end
   end
   return nil
 end

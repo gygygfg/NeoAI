@@ -379,9 +379,20 @@ tests.suite("multimodal", function(_, it, before_each)
     local port = sname.port
     t.true_(type(port) == "number" and port > 0, "取得空闲端口")
 
+    -- 私有 netns 下沙箱的 127.0.0.1 是它自己的 loopback；要访问**宿主** mock 服务需用
+    -- 宿主非回环 IP（经代理）。没有非回环地址时跳过该用例。
+    local host_ip
+    for _, a in ipairs(vim.uv.interface_addresses()) do
+      if (a.family == "inet" or a.family == 2) and not tostring(a.address):match("^127%.") then
+        host_ip = a.address
+        break
+      end
+    end
+    if not host_ip then os.execute("rm -rf /tmp/opencode/neoai_www"); return end
+
     -- 启动服务器（jobstart 传空字典 {} 会触发 Vim E475，故省略 options）
     local server_job = vim.fn.jobstart({
-      "python3", "-m", "http.server", tostring(port), "--bind", "127.0.0.1",
+      "python3", "-m", "http.server", tostring(port), "--bind", "0.0.0.0",
       "--directory", "/tmp/opencode/neoai_www",
     })
     t.true_(server_job > 0, "HTTP 服务器启动")
@@ -389,7 +400,7 @@ tests.suite("multimodal", function(_, it, before_each)
     -- 等待服务器就绪（curl -fs 成功即 2xx）
     local ready = wait_until(function()
       pcall(vim.fn.system,
-        { "curl", "-fs", "-o", "/dev/null", "http://127.0.0.1:" .. port .. "/t.png" })
+        { "curl", "-fs", "-o", "/dev/null", "http://" .. host_ip .. ":" .. port .. "/t.png" })
       return vim.v.shell_error == 0
     end)
     t.true_(ready, "服务器就绪（可下载 2xx）")
@@ -397,7 +408,7 @@ tests.suite("multimodal", function(_, it, before_each)
     -- 记录调用前已有的 /tmp 临时文件数，断言调用后不新增（成功/失败均清理）
     local before_leftover = #vim.fn.glob("/tmp/neoai_img_*", false, true)
 
-    local url = "http://127.0.0.1:" .. port .. "/t.png"
+    local url = "http://" .. host_ip .. ":" .. port .. "/t.png"
     local ok = false
     local result
     -- 子进程统一经沙箱（含 host_local_block 本机拦截）；本测试需访问本地 HTTP 服务，

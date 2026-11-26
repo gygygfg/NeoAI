@@ -154,16 +154,162 @@ local function _git_ssh_proxy_command()
   return nil
 end
 
+--- SSH remote URL → 主机名。只接受 SSH 传输（`ssh://` 与 scp 形态）；其它返回原因。
+--- @param url string|nil
+--- @return string|nil host
+--- @return string|nil err
+local function _ssh_host_of_url(url)
+  if type(url) ~= "string" or url == "" then return nil, "空 URL" end
+  if url:match("^ext::") or url:match("^fd::") then
+    return nil, "拒绝 external/fd 传输（可在远端执行任意命令）"
+  end
+  local scheme, rest = url:match("^(%a[%w+.-]*)://(.*)$")
+  if scheme then
+    if scheme:lower() ~= "ssh" then return nil, "非 SSH 传输（" .. scheme .. "）" end
+    local authority = rest:match("^[^/]*") or ""
+    local host = authority:match("@(.+)$") or authority
+    host = host:gsub(":%d+$", ""):gsub("%[", ""):gsub("%]", "")
+    if host == "" then return nil, "URL 缺少主机" end
+    return host
+  end
+  -- scp 形态 `[user@]host:path`（scheme 已在上面分流，`file:/x` 不会落进来）。
+  local host = url:match("^[^/@:]+@([^/:]+):") or url:match("^([%w%._%-]+):[^/]")
+  if host and host ~= "" then return host end
+  return nil, "无法识别的 remote URL"
+end
+
+--- preauth 找不到可用私钥时的统一错误（fail-closed，不静默退回目录级放开）。
+--- @param host string|nil
+--- @return string
+local function _preauth_no_binding(host)
+  return ("GIT_PREAUTH_NO_BINDING: remote 主机 %s 没有可用的预授权私钥绑定"
+    .. "（tools.sandbox.protected.preauthorized；用 :NeoAI SandboxKeys 取指纹）")
+    :format(tostring(host))
+end
+
+-- preauth 解析结果缓存：unmask 与 GIT_SSH_COMMAND 两处都要用同一批私钥，
+-- 缓存避免重复消费 `max_uses` 配额（每次命中都计数）。
+local git_preauth_cache = { key = nil, value = nil }
+
+--- git `credentials="preauth"`：解析 remote 主机 + 命中绑定的私钥。
+--- 只读宿主**真实**仓库配置（AI 对 `.git/config` 的暂存改动不参与），并且拒绝 `ext::`/`fd::`。
+--- @param args table|nil
+--- @param cwd string|nil
+--- @param attempt table|nil
+--- @return table { ok=true, host?, keys?, not_ssh? } | { ok=false, err=string }
+local function _git_preauth(args, cwd, attempt)
+  local cache_key = (attempt and attempt.attempt_id) or ("cwd:" .. tostring(cwd))
+  if git_preauth_cache.key == cache_key then return git_preauth_cache.value end
+  local function done(v)
+    git_preauth_cache = { key = cache_key, value = v }
+    return v
+  end
+  local cfg = config_store.get("tools.sandbox.git") or {}
+  local remote = type(args) == "table" and args.remote or nil
+  if type(remote) ~= "string" or remote == "" then remote = "origin" end
+  local pat = cfg.remote_pattern or "^[%w%._%-]+$"
+  local ok_pat, matched = pcall(string.match, remote, pat)
+  if not ok_pat or not matched then
+    return done({ ok = false, err = "GIT_REMOTE_INVALID: remote 名含非法字符" })
+  end
+  if vim.fn.executable("git") ~= 1 then
+    return done({ ok = false, err = "GIT_UNAVAILABLE: 找不到 git，无法解析 remote" })
+  end
+  local dir = (type(cwd) == "string" and cwd ~= "") and cwd or vim.fn.getcwd()
+  local out = vim.fn.systemlist({ "git", "-C", dir, "config", "--get", "remote." .. remote .. ".url" })
+  if vim.v.shell_error ~= 0 or type(out) ~= "table" or type(out[1]) ~= "string"
+    or vim.trim(out[1]) == "" then
+    return done({ ok = false, err = "GIT_REMOTE_UNRESOLVED: 无法解析 remote " .. remote .. " 的 URL" })
+  end
+  local host, herr = _ssh_host_of_url(vim.trim(out[1]))
+  if not host then return done({ ok = true, not_ssh = true, reason = herr }) end
+  local pre = require("NeoAI.sandbox.protected.preauthorize")
+  local consumers = { "git", "tool:" .. tostring(attempt and attempt.tool_name or "git_fetch") }
+  local keys = {}
+  for _, b in ipairs(pre.match_all({ consumers = consumers, target = host })) do
+    local p = type(b.resource) == "string" and vim.fn.expand(b.resource) or nil
+    if p and vim.fn.filereadable(p) == 1 and vim.fn.isdirectory(p) == 0 then
+      -- 指纹是权威：路径只是「去哪读」。文件被替换/改名后指纹不符 → 该绑定失效。
+      local fp = pre.fingerprint_file(p)
+      if fp and fp == b.fingerprint
+        and pre.allow({ fingerprint = fp, consumers = consumers, target = host, op = "use" }) then
+        keys[#keys + 1] = p
+      else
+        require("NeoAI.kernel.logger").warn(
+          "[sandbox] git preauth 绑定失效（指纹不符 / 超过 max_uses）：%s", tostring(b.resource))
+      end
+    end
+  end
+  return done({ ok = true, host = host, keys = keys })
+end
+
+--- git preauth 模式的可见面：只把命中的私钥与 known_hosts 以**单文件只读绑定**放回
+--- （`~/.ssh` 目录本身仍是空 tmpfs —— 沙箱看不到同目录的其它密钥/config/agent socket）。
+--- @param args table|nil
+--- @param cwd string|nil
+--- @param attempt table|nil
+--- @return table|nil { unmask: string[], bind_files: {src,dest}[] }
+--- @return string|nil err
+local function _git_preauth_access(args, cwd, attempt)
+  local r = _git_preauth(args, cwd, attempt)
+  if not r.ok then return nil, r.err end
+  if r.not_ssh then return { unmask = {}, bind_files = {} } end
+  if #r.keys == 0 then
+    return nil, _preauth_no_binding(r.host)
+  end
+  local bind_files = {}
+  for _, k in ipairs(r.keys) do bind_files[#bind_files + 1] = { src = k, dest = k } end
+  local home = vim.fn.expand("~")
+  local kh = home .. "/.ssh/known_hosts"
+  if home ~= "" and vim.fn.filereadable(kh) == 1 then
+    bind_files[#bind_files + 1] = { src = kh, dest = kh }
+  end
+  return { unmask = {}, bind_files = bind_files }
+end
+
 --- 为 git 远程工具构造 `GIT_SSH_COMMAND`（使用宿主 ~/.ssh，未知主机按配置 accept-new/严格；
 --- 可选经宿主过滤代理的 SSH ProxyCommand，使 SSH remote 在共享 netns 下也走代理出网）。
+--- `credentials="preauth"` 时只使用绑定命中的私钥（`-F /dev/null` + `IdentitiesOnly=yes`），
+--- 不让仓库/宿主 ssh config 里的 `ProxyCommand`/`LocalCommand` 变成执行面。
+--- @param args table|nil
+--- @param cwd string|nil
+--- @param attempt table|nil
 --- @return string|nil
-local function _git_ssh_command()
+--- @return string|nil err
+local function _git_ssh_command(args, cwd, attempt)
   local cfg = config_store.get("tools.sandbox.git") or {}
   local mode = cfg.credentials
   if mode == "isolate" then return nil end
   local home = vim.fn.expand("~")
   if home == "" then return nil end
   local check = cfg.ssh_accept_new == false and "yes" or "accept-new"
+  if mode == "preauth" then
+    local r = _git_preauth(args, cwd, attempt)
+    if not r.ok then return nil, r.err end
+    if r.not_ssh then return nil end
+    if #r.keys == 0 then return nil, _preauth_no_binding(r.host) end
+    local argv = {
+      "ssh", "-F", "/dev/null",
+      "-o", "IdentitiesOnly=yes",
+      "-o", "BatchMode=yes",
+      "-o", "PermitLocalCommand=no",
+      "-o", "ForwardAgent=no",
+      "-o", "StrictHostKeyChecking=" .. check,
+      "-o", "UserKnownHostsFile=" .. home .. "/.ssh/known_hosts",
+    }
+    for _, k in ipairs(r.keys) do
+      argv[#argv + 1] = "-i"
+      argv[#argv + 1] = k
+    end
+    local pc = _git_ssh_proxy_command()
+    if pc then
+      argv[#argv + 1] = "-o"
+      argv[#argv + 1] = "ProxyCommand=" .. pc
+    end
+    local quoted = {}
+    for _, v in ipairs(argv) do quoted[#quoted + 1] = vim.fn.shellescape(v) end
+    return table.concat(quoted, " ")
+  end
   local cmd = ("ssh -F %s -o StrictHostKeyChecking=%s -o UserKnownHostsFile=%s"):format(
     vim.fn.shellescape(home .. "/.ssh/config"), check,
     vim.fn.shellescape(home .. "/.ssh/known_hosts"))
@@ -373,6 +519,11 @@ end
 M._rewrite_value = _rewrite_value
 M._rewrite_result = _rewrite_result
 M._git_ssh_command = _git_ssh_command
+M._git_preauth_access = _git_preauth_access
+--- 重置 preauth 解析缓存（测试用：同一 cwd 下切换配置/绑定）
+function M._git_preauth_reset()
+  git_preauth_cache = { key = nil, value = nil }
+end
 
 
 --- 包安装命令的宿主状态目录（可写 overlay 暂存）。仅当命令被判定为包安装时加入可写根，
@@ -664,6 +815,17 @@ local function _enqueue_review(cand, attempt, cfg, env, meta)
   local review_cfg = (cfg and cfg.review) or {}
   if review_cfg.enabled == false then return nil end
   local review = require("NeoAI.sandbox.review.review")
+  -- 候选涉及的受保护资源（取首个命中）：供审批界面与证据展示同一份后果文案。
+  local consequence_id = nil
+  do
+    local ok, reg = pcall(require, "NeoAI.sandbox.protected.registry")
+    if ok and reg then
+      for _, f in ipairs((cand and cand.files) or {}) do
+        local c = type(f) == "table" and reg.classify(f.path) or nil
+        if c then consequence_id = c.id; break end
+      end
+    end
+  end
   return review.enqueue(cand, {
     tool = attempt.tool_name,
     command_id = attempt.command_id,
@@ -671,6 +833,7 @@ local function _enqueue_review(cand, attempt, cfg, env, meta)
     base_version = attempt.request_hash,
     evidence = env and env.evidence or nil,
     stats = env and env.stats or nil,
+    consequence_id = consequence_id,
     -- false 表示「已分析且无警告」：避免 review.enqueue 在主线程对候选做一次同步全文扫描。
     secret_warning = meta and meta.secret_warning,
     risk_level = meta and meta.risk_level or nil,
@@ -1040,6 +1203,29 @@ local function _settle_candidate(cand, attempt, ctx, cfg, spec, result, process_
   end
   _lap("settle.enqueue")
   control.transition(attempt, "AWAITING_PUBLICATION_AUTH")
+  -- 告知模型「改动已冻结、等用户确认」（R2）。过去刻意不告知（让模型以为已完成），
+  -- 代价是模型无法理解「为什么文件没变」并会反复重试；这里改为明确 STAGED 状态，
+  -- 并标记 retryable=false 避免重复入队。
+  if item then
+    local staged = require("NeoAI.sandbox.protected.outcome").staged({
+      change_set = item.change_set_id,
+      files = cand and cand.files or nil,
+      consequence_id = item.consequence_id,
+      tool = attempt.tool_name,
+    })
+    result = require("NeoAI.sandbox.protected.outcome").append(result, staged.text)
+  elseif cand and #(cand.files or {}) > 0 then
+    -- 待审队列被配置关闭：候选已冻结但**不会**进入审批。必须告知模型，否则它会认为
+    -- 改动已生效（旧行为），后续基于错误前提继续操作。
+    local staged = require("NeoAI.sandbox.protected.outcome").staged({
+      change_set = cand.candidate_digest,
+      files = cand.files,
+      tool = attempt.tool_name,
+      state = "待审队列已关闭（tools.sandbox.review.enabled=false）：改动仅冻结为候选，"
+        .. "不会自动应用；需要落地时使用 :NeoAI SandboxCommit",
+    })
+    result = require("NeoAI.sandbox.protected.outcome").append(result, staged.text)
+  end
   return { ok = true, value = result }
 end
 
@@ -1571,7 +1757,7 @@ local function _resident_eligible(attempt, spec, args, req)
   -- 故 PRIV 会话存在期间强制走一次性路径，避免复用进入 PRIV 前/后的旧遮蔽视图。
   -- 判据为进程级（任一 PRIV 会话存在）：常驻实例的遮蔽/网络视图是进程级共享的。
   local okp, privileged = pcall(require, "NeoAI.sandbox.privileged")
-  if okp and privileged.network_active() then return false end
+  if okp and privileged.network_active() and not (req and req.docker) then return false end
   if attempt.tool_name ~= "run_command" then return false end
   if spec.long_lived then return false end
   -- 交互式（PTY）run_command 需要一次性路径的沙箱前缀与 stdin/PTY，常驻命令服务器不适用。
@@ -1597,7 +1783,7 @@ local function _resident_eligible(attempt, spec, args, req)
       active_resident = okr and rmod and type(rmod.active) == "function" and rmod.active() ~= nil
     end
     if type(icfg) == "table" and icfg.enabled and (icfg.engine or "auto") ~= "off"
-      and not bg and not active_resident then
+      and not bg and not active_resident and not (req and req.docker) then
       return false
     end
   end
@@ -1605,6 +1791,18 @@ local function _resident_eligible(attempt, spec, args, req)
   -- overlay upper 跨命令**且跨轮次**持久（<sandbox_root>/resident，稳定路径），使属主等元数据
   -- 改动不因一次性路径的独立 overlay 或会话轮换而丢失。包安装（挂载/环境不同）与更高档位仍走一次性。
   local tier = req and req.tier or 0
+  -- 会话内 Docker：docker/podman 命令及会话激活后的所有命令必须进入同一常驻命名空间，
+  -- 否则容器由另一个 ns 的 runtime 创建、Agent 看不到也管不到。
+  local docker_session = false
+  do
+    local okd, dmod = pcall(require, "NeoAI.sandbox.docker.session")
+    docker_session = okd and dmod and dmod.active() == true
+  end
+  if (req and (req.docker or req.container)) or docker_session then
+    if attempt.package then return false end
+    local okr, rmod = pcall(require, "NeoAI.sandbox.execution.resident")
+    return okr and rmod and type(rmod.available) == "function" and rmod.available() or false
+  end
   if tier > 1 then return false end
   if tier == 1 and not (req and req.sysadmin) then return false end
   if attempt.package then return false end
@@ -1798,6 +1996,8 @@ local function _gate_inner(tool, args, ctx, call_original)
     local net = config_store.get("tools.sandbox.network") or {}
     local pmode = net.block_proxy_evasion
     if pmode == false then pmode = "allow" elseif pmode == "deny" then pmode = "deny" else pmode = "ask" end
+    -- 仅记录模式：不做任何代理规避拦截（网络整体已放行，仅记录）。
+    if net.record_only == true then pmode = "allow" end
     -- 高权限模式：不拦截代理规避（网络整体已放行，仅记录）。判据为进程级（任一 PRIV 会话存在）。
     local okp, privileged = pcall(require, "NeoAI.sandbox.privileged")
     if okp and (privileged.active(ctx.agent and ctx.agent.id) or privileged.network_active()) then
@@ -2150,7 +2350,9 @@ local function _gate_inner(tool, args, ctx, call_original)
     local resident_mod = require("NeoAI.sandbox.execution.resident")
     -- 跨挂载点兼容模式：工作区不在 `/` 上，常驻实例的整机根 overlay 会把它投影为空，
     -- 故强制走一次性路径（`--ro-bind / /` + 工作区单层 overlay），避免复用错误视图。
-    local resident_ok = (ctx.sandbox_cross_mount_approved ~= true)
+    -- 会话内 Docker 不使用工作区 overlay（runtime 需要可写的会话私有视图），因此跨挂载点
+    -- 的工作区也可以复用常驻实例；普通命令仍保持原限制。
+    local resident_ok = (ctx.sandbox_cross_mount_approved ~= true or (req and req.docker == true))
       and _resident_eligible(attempt, spec, args, req)
     -- 常驻实例的 overlay/session 基目录**不随会话轮换**（放在沙箱存储根下的稳定目录），
     -- 使实例（连同其中的后台进程）跨轮次保活：agentEnd 轮换只迁移工作区暂存，不再停实例。
@@ -2524,11 +2726,23 @@ local function _gate_inner(tool, args, ctx, call_original)
       for _, p in ipairs(spec.writable_roots or {}) do extra_unmask[#extra_unmask + 1] = p end
       for _, p in ipairs(attempt.package_roots or {}) do extra_unmask[#extra_unmask + 1] = p end
       -- git 远程工具：按策略只读放开宿主凭据（SSH 私钥 / known_hosts / git-credentials）。
+      -- `preauth` 模式只放行**绑定命中的私钥**（单文件只读绑定，`~/.ssh` 目录本身仍是空 tmpfs）；
+      -- 其它模式沿用原有「目录级放开」。
+      local git_bind_files = nil
       if GIT_HOST_CRED_TOOLS[attempt.tool_name] then
-        for _, p in ipairs(_git_cred_unmask()) do extra_unmask[#extra_unmask + 1] = p end
+        local gcfg = config_store.get("tools.sandbox.git") or {}
+        if gcfg.credentials == "preauth" then
+          local acc, gerr = _git_preauth_access(args, real_cwd, attempt)
+          if not acc then return nil, gerr end
+          git_bind_files = acc.bind_files
+        else
+          for _, p in ipairs(_git_cred_unmask()) do extra_unmask[#extra_unmask + 1] = p end
+        end
       end
+      local has_priv_bind = priv and type(priv.bind_files) == "table" and #priv.bind_files > 0
       if (type(approved) == "table" and #approved > 0)
-        or #extra_unmask > 0 then
+        or #extra_unmask > 0 or has_priv_bind
+        or (git_bind_files and #git_bind_files > 0) then
         eff_priv = {}
         for k, v in pairs(priv or {}) do eff_priv[k] = v end
         local merged = {}
@@ -2536,6 +2750,10 @@ local function _gate_inner(tool, args, ctx, call_original)
         for _, p in ipairs(approved or {}) do merged[#merged + 1] = p end
         for _, p in ipairs(extra_unmask or {}) do merged[#merged + 1] = p end
         eff_priv.unmask = merged
+        local bf = {}
+        for _, b in ipairs((priv and priv.bind_files) or {}) do bf[#bf + 1] = b end
+        for _, b in ipairs(git_bind_files or {}) do bf[#bf + 1] = b end
+        if #bf > 0 then eff_priv.bind_files = bf end
       end
       -- 记录本次 attempt 的有效 unmask（档位提权 + 审批放行 + 可写根）：冻结阶段据此
       -- 剔除「运行时实际未被遮蔽」的路径，避免把被放行的写入误判为遮蔽目标而整单元失败。
@@ -2563,9 +2781,16 @@ local function _gate_inner(tool, args, ctx, call_original)
         local okg, ng = pcall(require, "NeoAI.sandbox.net.net_gateway")
         gateway_on = okg and ng and ng.enabled()
       end
-      -- 网关模式经 `ip netns exec` 进入独立 netns：委派 cgroup 的 bind 源在该命名空间下
-      -- 不可解析（bwrap `init: Can't find source path`），故网关模式不注入委派 cgroup。
-      if not deleg_handle and not gateway_on and cgroup.delegation_enabled() then
+      -- 私有 netns（root 模式）与网关模式一样经 `ip netns exec` 进入独立 netns；该命令会
+      -- unshare/重挂载 mount ns，使委派 cgroup 的 bind 源不可解析（bwrap `Can't find source path`）。
+      -- 故两者都不注入委派 cgroup。
+      local netns_on = false
+      do
+        local oki, iso = pcall(require, "NeoAI.sandbox.net.isolate")
+        netns_on = oki and iso and iso.enabled()
+          and not (eff_priv and eff_priv.docker_session)
+      end
+      if not deleg_handle and not gateway_on and not netns_on and cgroup.delegation_enabled() then
         local dh, derr = cgroup.prepare_delegated("cmd_" .. tostring(attempt.attempt_id), cgroup.resolve_limits())
         if dh then
           deleg_handle = dh
@@ -2619,12 +2844,24 @@ local function _gate_inner(tool, args, ctx, call_original)
           ctx._observe_handle = sh
         end
       end
+      -- 私有 netns（一次性路径）：在 bwrap 内先拉起 lo / 启动会话内 socat，再 exec 真实命令。
+      -- 追加到 prefix 末尾：bwrap 的 payload 变成 `sh -c '<boot>; exec "$@"' neoai-net <真实命令>`。
+      if eff_priv and eff_priv.net_isolated then
+        local ok_iso, iso = pcall(require, "NeoAI.sandbox.net.isolate")
+        local boot = ok_iso and iso and iso.active() and iso.boot_snippet() or nil
+        if boot then
+          for _, v in ipairs({ "sh", "-c", boot .. "\nexec \"$@\"", "neoai-net" }) do
+            prefix[#prefix + 1] = v
+          end
+        end
+      end
       ctx.sandbox_prefix = prefix
       ctx.sandbox_cwd = eff_cwd
       ctx.sandbox_env = runtime.sandbox_env(eff_priv)
       -- git 远程工具：注入 GIT_SSH_COMMAND（使用宿主 ~/.ssh；未知主机 accept-new/严格）。
       if GIT_HOST_CRED_TOOLS[attempt.tool_name] then
-        local sshcmd = _git_ssh_command()
+        local sshcmd, gerr = _git_ssh_command(args, real_cwd, attempt)
+        if not sshcmd and gerr then return nil, gerr end
         if sshcmd then
           ctx.sandbox_env = ctx.sandbox_env or {}
           ctx.sandbox_env.GIT_SSH_COMMAND = sshcmd
@@ -2695,7 +2932,7 @@ local function _gate_inner(tool, args, ctx, call_original)
     end
 
     local resolved = privilege.resolve(req.tier, req,
-      { process = true, agent_id = ctx.agent and ctx.agent.id })
+      { process = true, agent_id = ctx.agent and ctx.agent.id, cwd = _effective_cwd(ctx) })
     if not resolved.ok then
       return _fail(resolved.reason)
     end
@@ -3060,13 +3297,14 @@ local function _gate_inner(tool, args, ctx, call_original)
       end
       call_original():then_(function(res)
         if pcfg.auto_escalate ~= false and not attempt.package
+          and not (req and (req.docker or req.container))
           and current_tier < (pcfg.max_tier or 2) then
           local raw = ctx.sandbox_last_result
           local esc = privilege.detect_escalation(raw)
           if esc and esc.tier > current_tier then
             local r2 = privilege.resolve(esc.tier, {
               tier = esc.tier, docker = req.docker, network = req.network, sysadmin = req.sysadmin,
-            }, { process = true, agent_id = ctx.agent and ctx.agent.id })
+            }, { process = true, agent_id = ctx.agent and ctx.agent.id, cwd = _effective_cwd(ctx) })
             if r2.ok then
               local built2 = _build_prefix(r2.privileges)
               if built2 then
@@ -3283,7 +3521,39 @@ function M.gate(tool, args, ctx, call_original)
   local spec = tool and tool.__sandbox_spec or tool_spec.get(tool and tool.name, tool and tool.category)
   local name = tool and tool.name
   if spec and spec.effect == "process" then
-    return _profile_gate(name, _serialize_setup(function() return _gate_inner(tool, args, ctx, call_original) end))
+    local d = _serialize_setup(function() return _gate_inner(tool, args, ctx, call_original) end)
+    -- 容器资源监测的异步通知（自动 kill）在下一条命令结果中回传给 Agent。
+    local oks, mon = pcall(require, "NeoAI.sandbox.docker.monitor")
+    if oks and mon then
+      local out = async.Deferred.new()
+      local agent_id = ctx and ctx.agent and ctx.agent.id
+      local function _append(v)
+        local notices = mon.drain(agent_id)
+        -- 会话 runtime 的容器标签在首次启动时可能还没有具体 Agent：同时取全局队列。
+        local common = mon.drain("")
+        if #common > 0 then
+          for _, n in ipairs(common) do notices[#notices + 1] = n end
+        end
+        if #notices == 0 then return v end
+        local text = table.concat(notices, "\n")
+        if type(v) == "string" then
+          return v .. "\n" .. text
+        elseif type(v) == "table" then
+          if type(v.stdout) == "string" then
+            v.stdout = v.stdout .. "\n" .. text
+          elseif type(v.content) == "string" then
+            v.content = v.content .. "\n" .. text
+          else
+            v.notice = text
+          end
+          return v
+        end
+        return v
+      end
+      d:then_(function(v) out:resolve(_append(v)) end, function(e) out:reject(_append(e)) end)
+      d = out
+    end
+    return _profile_gate(name, d)
   end
   -- 非进程工具（read/fs_write/in_process）：若上一条进程命令的后处理仍在途（异步模式），
   -- 先等待其完成——命令的 overlay 改动经后台合并进会话暂存后，读写工具才能看到一致视图

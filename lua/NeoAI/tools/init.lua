@@ -51,6 +51,7 @@ local BUILTIN_MODULES = {
   "NeoAI.tools.builtin.file_ops",
   "NeoAI.tools.builtin.shell",
   "NeoAI.tools.builtin.git_ops",
+  "NeoAI.tools.builtin.ssh",
   "NeoAI.tools.builtin.lsp_ops",
   "NeoAI.tools.builtin.tree_ops",
   "NeoAI.tools.builtin.log_ops",

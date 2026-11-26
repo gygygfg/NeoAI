@@ -212,4 +212,41 @@ probe("reg", "/tmp/.neoai_mknod_reg", 0o100000 | 0o600)
     local out = H.direct({ cwd = "/tmp" }, "grep -i '^NoNewPrivs' /proc/self/status")
     t.matches("NoNewPrivs:%s+1", out, "载荷应带 NoNewPrivs=1")
   end)
+
+  it("整机 overlay：/etc 身份文件只读、ld.so.preload 强制遮蔽", function(t)
+    if not H.bwrap() then return end
+    local before_pre = vim.uv.fs_stat("/etc/ld.so.preload")
+    local marker = "NEOAI_ETC_PROBE_" .. tostring(math.random(1, 1e9))
+    local cmd = "echo " .. marker .. " >> /etc/passwd; echo P=$?; "
+      .. "sed -i '/" .. marker .. "/d' /etc/passwd; echo C=$?; "
+      .. "echo " .. marker .. " > /etc/ld.so.preload; echo L=$?; "
+      .. "echo " .. marker .. " >> /root/.bashrc; echo B=$?; "
+      .. "echo " .. marker .. " > /etc/pam.d/neoai-probe; echo PAM=$?; "
+      .. "echo " .. marker .. " > /etc/ld.so.conf.d/neoai.conf; echo LDCONF=$?; "
+      .. "ls -l /etc/ld.so.preload 2>&1"
+    local out, done = nil, false
+    require("NeoAI.tools").execute("run_command", { command = cmd, description = "t" }, {})
+      :then_(function(v) out = v; done = true end,
+        function(e) out = "ERR:" .. tostring(e and e.message or e); done = true end)
+    t.true_(vim.wait(90000, function() return done end, 50), "命令应完成")
+    local text = tostring(out)
+    -- 账户库需支持 useradd（写入进 overlay 暂存）；只读/降级视图下则必须被拒。
+    -- 两种结果都可接受，**绝不可落宿主**（下方哈希校验）。
+    t.matches("P=[01]", text, "账户库写入结果应为 overlay 暂存成功或只读拒绝: " .. text)
+    t.matches("L=1", text, "写 /etc/ld.so.preload 必须被拒绝: " .. text)
+    t.matches("B=1", text, "写 /root/.bashrc 必须被拒绝: " .. text)
+    t.matches("PAM=1", text, "写 /etc/pam.d 必须被拒绝: " .. text)
+    t.matches("LDCONF=1", text, "写 /etc/ld.so.conf.d 必须被拒绝: " .. text)
+    -- 宿主侧未被修改
+    local host_passwd = table.concat(vim.fn.readfile("/etc/passwd"), "\n")
+    t.eq(nil, host_passwd:find(marker, 1, true), "宿主 /etc/passwd 不应含测试标记")
+    local after_pre = vim.uv.fs_stat("/etc/ld.so.preload")
+    if before_pre == nil then
+      t.eq(nil, after_pre, "宿主不应出现 /etc/ld.so.preload")
+    else
+      t.eq(before_pre.size, after_pre and after_pre.size, "宿主 /etc/ld.so.preload 大小不应变化")
+    end
+    local host_bashrc = table.concat(vim.fn.readfile("/root/.bashrc"), "\n")
+    t.eq(nil, host_bashrc:find(marker, 1, true), "宿主 /root/.bashrc 不应含测试标记")
+  end)
 end)

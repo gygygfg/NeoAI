@@ -18,7 +18,6 @@ local function main()
     print("SKIP: bwrap 后端不可用")
     return
   end
-
   -- 宿主侧 HTTP/TCP 监听（用于裸 TCP 与代理拦截对比）
   local srv = vim.uv.new_tcp()
   srv:bind("127.0.0.1", 0)
@@ -37,6 +36,12 @@ local function main()
   local workdir = "/tmp"
   local prefix = runtime.process_prefix({ cwd = workdir })
   if not prefix then print("SKIP: 无法构造沙箱前缀"); return end
+  -- 默认私有 netns：本脚本的探针前缀不带会话 boot（不启动 socat），因此
+  -- raw_tcp_host 应为 RAW_BLOCKED，proxy_host 为 000（仅表示“未启动会话代理”，不是放行）。
+  pcall(function()
+    local iso = require("NeoAI.sandbox.net.isolate")
+    print("NET_ISOLATION=" .. tostring(iso.active() and (iso.mode() or "?") or "standby"))
+  end)
   local env = runtime.sandbox_env(nil)
   local store_root = store.root() or ""
 

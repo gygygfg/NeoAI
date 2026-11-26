@@ -207,7 +207,10 @@ function M.init()
   if state.unwait then state.unwait() end
   state.unwait = services.wait("services.sandbox", function(sandbox)
     if sandbox and sandbox.set_device_consent_ui then
-      sandbox.set_device_consent_ui({ show = M.show, hide = M.hide, is_open = M.is_open })
+      -- requires_ui：--headless 下无窗口可渲染，服务端必须失败关闭，避免 Deferred 悬挂。
+      sandbox.set_device_consent_ui({
+        show = M.show, hide = M.hide, is_open = M.is_open, requires_ui = true,
+      })
     end
   end)
 end

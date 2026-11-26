@@ -104,6 +104,7 @@ stop：逆序执行清理 → 注销服务 → stopped
 | `services.agent` | `NeoAI.core.agent.agent` | — |
 | `services.tools` | `NeoAI.tools` | 应用审批配置 |
 | `services.sandbox` | `NeoAI.sandbox` | 探测运行时能力、准备暂存/候选存储 |
+| `services.deps` | `NeoAI.services.deps` | 可选安全依赖管理（`:NeoAI Deps`）：探测、生成 argv、终端安装 |
 | `services.model_service` | `NeoAI.services.model_service` | — |
 | `services.chat_service` | `NeoAI.services.chat_service` | — |
 | `services.tool_service` | `NeoAI.services.tool_service` | — |

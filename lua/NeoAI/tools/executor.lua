@@ -444,6 +444,29 @@ local function _handle_scan_result(scan, tool, tool_name, args, ctx)
       end
       return true
     end
+    -- 免审批预授权绑定：这把钥匙已被用户显式授权给当前工具（绑定需省略 targets——
+    -- 参数阶段的真实目的地未知，带 targets 的绑定不会在此命中）。命中仍写审计与 trace。
+    do
+      local pre = require("NeoAI.sandbox.protected.preauthorize")
+      if pre.has_any() then
+        local short = tool_name:gsub("^exec_", "")
+        local consumers = { "tool:" .. tool_name }
+        if short ~= tool_name then consumers[#consumers + 1] = "tool:" .. short end
+        if pre.allow({ secret = scan.secret, consumers = consumers, op = "use" }) then
+          secret.trace("preauthorized", { tool = tool_name })
+          local spec_pre = require("NeoAI.sandbox.execution.tool_spec").get(tool_name, tool and tool.category)
+          if spec_pre and spec_pre.effect == "fs_write" then
+            secret.tokenize_args(args, { entropy = _entropy_enabled(tool_name, args, ctx), origin = "ai" })
+          end
+          pcall(function()
+            require("NeoAI.kernel.event_bus").emit(require("NeoAI.kernel.events").SANDBOX_SECRET_ALERT, {
+              tool = tool_name, agent_id = agent and agent.id, scope = "tool", decision = "preauthorized",
+            })
+          end)
+          return true
+        end
+      end
+    end
     secret.trace("blocked", { tool = tool_name })
     pcall(function()
       require("NeoAI.kernel.event_bus").emit(require("NeoAI.kernel.events").SANDBOX_SECRET_BLOCKED, {
@@ -704,18 +727,57 @@ local function _execute_after_secret_guard(tool, resolved, args, ctx)
     end
   end
   local needs_approval = false
+  -- 本次调用的操作类型（用于结构化拒绝/后果告知）：read | write | exec
+  local op = spec.effect == "read" and "read"
+    or (spec.effect == "fs_write" and "write")
+    or "exec"
   if masked_hit then
+    local protected = require("NeoAI.sandbox.protected.registry").classify(masked_hit)
     if masked_hard then
-      return async.reject({ kind = "sandbox", message = "路径位于宿主敏感遮蔽路径: " .. masked_hit })
+      -- 不可审批解除的宿主敏感资源：结构化拒绝，告诉模型「被什么挡住 + 下一步怎么办」，
+      -- 而不是一句「路径敏感」——后者会让模型反复重试同一个路径。
+      local o = require("NeoAI.sandbox.protected.outcome").blocked({
+        resource = masked_hit,
+        op = op,
+        class = protected and protected.class or nil,
+        code = "PROTECTED_RESOURCE",
+        reason = "该路径属宿主受保护资源，任何审批都不会解除遮蔽",
+        hint = "只能由用户在配置（tools.sandbox.mask_paths）中显式移除；Agent 无法自助解锁",
+      })
+      return async.reject({
+        kind = "sandbox",
+        message = o.text,
+        code = o.code,
+        resource = masked_hit,
+        reason_codes = { o.code },
+      })
     end
     if agents_md_read then
       -- 约定文件只读：不弹遮蔽审批（读取内容本就由会话首轮自动注入）。
     elseif approval_on and can_approve then
       ctx.sandbox_unmask = ctx.sandbox_unmask or {}
       ctx.sandbox_unmask[#ctx.sandbox_unmask + 1] = masked_hit
+      -- 供审批界面渲染后果告知（tool_service 读取；无对应资源时留空）。
+      ctx.sandbox_consequence_id = protected and protected.id or nil
+      ctx.sandbox_protected_resource = masked_hit
+      ctx.sandbox_protected_op = op
       needs_approval = true
     elseif in_process_fs then
-      return async.reject({ kind = "sandbox", message = "路径位于遮蔽目录且不可审批: " .. masked_hit })
+      local o = require("NeoAI.sandbox.protected.outcome").blocked({
+        resource = masked_hit,
+        op = op,
+        class = protected and protected.class or nil,
+        code = "PROTECTED_NEEDS_APPROVAL",
+        reason = "该路径位于遮蔽目录，但本次调用没有可用的审批界面",
+        hint = "请在 NeoAI 界面内重试，或由用户在配置中放行对应目录",
+      })
+      return async.reject({
+        kind = "sandbox",
+        message = o.text,
+        code = o.code,
+        resource = masked_hit,
+        reason_codes = { o.code },
+      })
     end
   end
   if mode ~= "async" and not agents_md_read

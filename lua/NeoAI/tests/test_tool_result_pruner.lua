@@ -71,6 +71,34 @@ tests.suite("tool_result_pruner", function(_, it)
     t.eq(0, r2.pruned)
   end)
 
+  it("prune_agent 裁剪后台工具结果（保留 ID 头，同步 background_body）", function(t)
+    local body = string.rep("b", 20000)
+    local agent = {
+      id = "p2",
+      messages = {
+        {
+          role = "system",
+          content = "后台工具已完成（ID：c1，工具：slow_tool）。返回结果：\n" .. body,
+          system_update = true,
+          background_result = true,
+          background_tool_call_id = "c1",
+          background_body = body,
+          tool_name = "slow_tool",
+        },
+      },
+    }
+    local opts = { context_cache = { prune_threshold_chars = 1000, prune_head_chars = 400, prune_tail_chars = 100 } }
+    local r = pruner.prune_agent(agent, opts)
+    t.eq(1, r.pruned)
+    local m = agent.messages[1]
+    t.true_(m.pruned)
+    t.true_(#m.background_body < #body)
+    t.matches("后台工具已完成", m.content)
+    t.true_(m.content:find(pruner.PRUNE_MARKER, 1, true) ~= nil)
+    t.true_(m.background_body:find(pruner.PRUNE_MARKER, 1, true) ~= nil)
+    t.eq(0, pruner.prune_agent(agent, opts).pruned, "二次调用应幂等")
+  end)
+
   it("prune_agent 跳过含图像引用的工具结果", function(t)
     local content = vim.json.encode({
       path = "/tmp/a.png",

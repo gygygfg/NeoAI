@@ -16,6 +16,7 @@ local state = {
   on_cancel = nil,
   on_confirm_all = nil,
   on_add_to_workspace = nil,
+  actions = nil, -- 本次审批可用的放行动作（受保护资源只留「仅本次」/取消）
   unwait = nil, -- services.wait 注销句柄（tool_service 未就绪时延迟注册）
 }
 
@@ -32,6 +33,7 @@ local function _close()
   state.on_cancel = nil
   state.on_confirm_all = nil
   state.on_add_to_workspace = nil
+  state.actions = nil
 end
 
 --- 按键显示名（<CR>/<Esc> 等转为可读文本）
@@ -43,23 +45,35 @@ local function _key_label(key)
   return key
 end
 
+--- 某放行动作是否对本次审批可用（缺省全部可用；受保护资源只留「仅本次」）
+--- @param actions table|nil
+--- @param name string "confirm"|"confirm_all"|"add_to_workspace"|"cancel"|"cancel_with_reason"
+--- @return boolean
+local function _action_enabled(actions, name)
+  if type(actions) ~= "table" then return true end
+  return actions[name] ~= false
+end
+
 --- 生成按键提示行（与 _set_keymaps 使用同一套配置与默认值）
+--- @param actions table|nil
 --- @return table 行数组
-local function _hint_lines()
+local function _hint_lines(actions)
   local config = require("NeoAI.kernel.config_store")
   local cfg = (config.get("keymaps.chat.approval") or {})
   local defs = {
-    { conf = cfg.confirm, key = "<CR>", desc = "允许一次" },
-    { conf = cfg.confirm_all, key = "A", desc = "允许所有" },
-    { conf = cfg.add_to_workspace, key = "D", desc = "允许并加入工作目录" },
-    { conf = cfg.cancel, key = "<Esc>", desc = "取消" },
-    { conf = cfg.cancel_with_reason, key = "C", desc = "取消并说明" },
+    { name = "confirm", conf = cfg.confirm, key = "<CR>", desc = "允许一次" },
+    { name = "confirm_all", conf = cfg.confirm_all, key = "A", desc = "允许所有（本会话）" },
+    { name = "add_to_workspace", conf = cfg.add_to_workspace, key = "D", desc = "允许并加入工作目录" },
+    { name = "cancel", conf = cfg.cancel, key = "<Esc>", desc = "取消" },
+    { name = "cancel_with_reason", conf = cfg.cancel_with_reason, key = "C", desc = "取消并说明" },
   }
   local parts = {}
   for _, d in ipairs(defs) do
-    local key = (d.conf and d.conf.key) or d.key
-    local desc = (d.conf and d.conf.desc) or d.desc
-    parts[#parts + 1] = string.format("[%s] %s", _key_label(key), desc)
+    if _action_enabled(actions, d.name) then
+      local key = (d.conf and d.conf.key) or d.key
+      local desc = (d.conf and d.conf.desc) or d.desc
+      parts[#parts + 1] = string.format("[%s] %s", _key_label(key), desc)
+    end
   end
   if #parts == 0 then return {} end
   return { "", "快捷键: " .. table.concat(parts, "    ") }
@@ -69,7 +83,10 @@ end
 --- 普通模式与插入模式都绑定：弹窗打开时若用户正在输入框打字（插入模式），
 --- nvim_open_win(enter=true) 会把插入模式延续到新窗口，仅普通模式映射会全部失效，
 --- 导致 <CR>/A/Esc 按键被当成文本输入，审批永不回调、界面卡住。
-local function _set_keymaps()
+--- `actions` 为 false 的动作**不绑定**（不是仅隐藏提示）：受保护资源不允许会话级
+--- 放行，绑了键就等于留了后门。
+--- @param actions table|nil
+local function _set_keymaps(actions)
   if not state.buf then return end
   local config = require("NeoAI.kernel.config_store")
   local approval_cfg = (config.get("keymaps.chat.approval") or {})
@@ -95,21 +112,31 @@ local function _set_keymaps()
   end
 
   for _, mode in ipairs({ "n", "i" }) do
-    bind(mode, k_confirm, function()
-      close_then(state.on_confirm)
-    end)
-    bind(mode, k_confirm_all, function()
-      close_then(state.on_confirm_all)
-    end)
-    bind(mode, k_add_to_workspace, function()
-      close_then(state.on_add_to_workspace)
-    end)
-    bind(mode, k_cancel, function()
-      close_then(state.on_cancel, "用户取消")
-    end)
-    bind(mode, k_cancel_reason, function()
-      close_then(state.on_cancel, "用户拒绝")
-    end)
+    if _action_enabled(actions, "confirm") then
+      bind(mode, k_confirm, function()
+        close_then(state.on_confirm)
+      end)
+    end
+    if _action_enabled(actions, "confirm_all") then
+      bind(mode, k_confirm_all, function()
+        close_then(state.on_confirm_all)
+      end)
+    end
+    if _action_enabled(actions, "add_to_workspace") then
+      bind(mode, k_add_to_workspace, function()
+        close_then(state.on_add_to_workspace)
+      end)
+    end
+    if _action_enabled(actions, "cancel") then
+      bind(mode, k_cancel, function()
+        close_then(state.on_cancel, "用户取消")
+      end)
+    end
+    if _action_enabled(actions, "cancel_with_reason") then
+      bind(mode, k_cancel_reason, function()
+        close_then(state.on_cancel, "用户拒绝")
+      end)
+    end
   end
 end
 
@@ -125,12 +152,13 @@ local function _present(config)
   state.on_cancel = config.on_cancel
   state.on_confirm_all = config.on_confirm_all
   state.on_add_to_workspace = config.on_add_to_workspace
+  state.actions = config.actions
 
   state.buf = vim.api.nvim_create_buf(false, true)
   vim.bo[state.buf].filetype = "neoai_approval"
   local lines = vim.split(config.text or "", "\n", { plain = true })
   -- 末尾追加按键提示，让用户知道如何允许/拒绝
-  for _, l in ipairs(_hint_lines()) do
+  for _, l in ipairs(_hint_lines(state.actions)) do
     lines[#lines + 1] = l
   end
   vim.api.nvim_buf_set_lines(state.buf, 0, -1, false, lines)
@@ -161,7 +189,7 @@ local function _present(config)
   -- 导致快捷键失效；只读防止误编辑弹窗内容
   pcall(vim.cmd, "stopinsert")
   vim.bo[state.buf].modifiable = false
-  _set_keymaps()
+  _set_keymaps(state.actions)
 end
 
 --- 展示审批弹窗。**聊天界面焦点门控**（`focus.gate`）：当前窗口是 NeoAI 界面时立即弹出；

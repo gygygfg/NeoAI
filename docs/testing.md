@@ -13,13 +13,17 @@
 :NeoAI Test flow_tools   " 顺序运行指定套件（按名字，便于调试）
 ```
 
-- **默认并行（无参数）**：`lua/NeoAI/tests/parallel.lua`（薄门面）按「双 lane 有界并发」把全部
-  套件分派到隔离 headless 子进程：**light lane** 把非资源重套件按实测耗时 LPT 分片成
+- **默认并行（无参数）**：`lua/NeoAI/tests/parallel.lua`（薄门面）分派到隔离 headless 子进程：
+  **light lane** 把非资源重套件按实测耗时 LPT 分片成
   `核数 - heavy` 个进程并发执行（自动推导，上限 16；环境变量 `NEOAI_TEST_WORKERS` 可覆盖）；
   **heavy lane** 对资源重/时序敏感套件（默认 `sandbox*`、`pty`）**一套件一子进程**并发执行
   （自动推导 ≈ `核数/2`，并按可用内存收敛；`NEOAI_TEST_HEAVY_WORKERS` 可覆盖；`=1` 等价旧串行
   通道）。两 lane **重叠执行**、任一子进程结束即回填，约束 `#light≤W`、`#heavy≤H`、
   `W+H≤核数-2`（预留两核给系统/编辑器，核数很少时至少 2 路）。
+  另有**独占通道（exclusive）**：会触碰宿主全局 `/run/netns` 的套件（默认 `sandbox_view*`）
+  不进 heavy lane，而是在 light/heavy 两条 lane **全部结束后**一套件一子进程串行执行，绝不与
+  其他分片重叠——多个进程并发 `ip netns add/del` 会在共享的 `/run/netns` 挂载点上互相竞争。
+  可用 `opts.exclusive_suites`（模式数组或判定函数）覆盖该分组。
   分片权重优先用实测耗时缓存
   `.neoai_test_timings.json`（gitignored，仓库根），无缓存时按用例数做 LPT 贪心均衡。
   职责拆分为 `NeoAI.tests.runner.*` 子模块（config / timings / shard / spawn / scheduler /
@@ -202,6 +206,7 @@ end)
 | `test_max_tokens / test_truncation` | max_tokens 发送策略、输出截断续写 |
 | `test_sub_agent_result` | 子 Agent 工具/管理器/结果回传 |
 | `test_pending_queue` | 待发消息队列 |
+| `test_background_tools` | 工具后台化：等工具期间收到新消息时立即注入并后台化已开始的工具、后台结果追加到末尾且不递归、审批/ask_user 保持前台、请求构建补稳定占位结果与 system_update 角色降级 |
 | `test_services / test_status` | 服务层（chat/tool/model/status）、状态栏 |
 | `test_ask_user / test_herder` | 提问、Herder 上报 |
 | `test_plan_mode / test_plan_distill / test_todo` | 计划模式、计划蒸馏、待办 |
@@ -217,6 +222,8 @@ end)
 | `test_lsp_guard` | NeoAI 界面 buffer 的 LSP 隔离：neoai* 自动关闭 LSP/Copilot、acwrite 保留、安装/卸载幂等 |
 | `test_plugins` | 插件协议：依赖等待、替换、禁用、失败回滚、实际消息请求、重复启动、工具/提示段释放、热重载 |
 | `test_sandbox` | 工具沙箱：加载器附加规格、fail-closed、状态机/幂等/fencing、策略聚合与受限规则、dry-run 不落盘、CAS 发布与冲突、buffer 写盘重定向、运行时能力探测与隔离进程、异步审批入队/应用/拒绝、选择性应用、保存/撤销保存（回滚原文件并回到待审、CAS 冲突拒绝）、run_command overlay 候选捕获、影响模型、证据脱敏分页、任务授权自动应用/范围、约束聚合、裁决信封、保留期与指标、受控网络网关、broker 幂等与对账、依赖图闭包、组合发布与路径冲突、策略回放、证据保留期、cgroup 资源域与 PID 上限、seccomp 基线施加与门禁、内容寻址缓存、故障注入（发布/后端/冻结）、性能基准、revision 派生、密钥原始值（工具参数/AI 上下文）停止并弹窗确认、假密钥操作警告提级不终止、环境变量名引用/环境变量密钥裸值不登记且不终止、暂存后端默认落盘/可切 shm、磁盘上限门禁 |
+| `test_sandbox_docker_*` | 会话内 Docker：自动档位探测、HTTP 解析/规范化、endpoint/HostConfig 策略、容器审查/审批矩阵、重建规格（自动/手动/失败挂起）、host-side broker 拒绝/转发 |
+| `test_deps_catalog` | 可选安全依赖目录与安装计划：apt 等包管理器 argv（不经 shell）、manual 依赖、未知依赖/无包管理器错误 |
 | `test_sandbox_instance` | 沙箱进程实例隔离：实例 store 根互不可见、热重载保留本实例待审、`init` 不阻塞探测运行时能力（懒加载）、过期实例目录回收 |
 | `test_sandbox_service` | 长驻服务/镜像/诊断：service 启动/日志/状态/停止与注册表清理、停止时捕获服务改动回暂存、优雅停止（SIGTERM 优雅退出/超时 SIGKILL/`stop_all`）、`long_lived` 门禁分支、pip/npm/maven 镜像注入（含 settings.xml）、cgroup 事件快照与 OOM 判定 |
 | `test_sandbox_background` | 后台进程/会话级常驻实例：`&`/nohup/setsid 识别（排除 `&&`/重定向/中段 `&`）、开启 `resident` 后 `run_command` 的后台进程跨工具调用存活（同一命名空间内 `ps` 可见）、非后台命令正常返回 |
@@ -267,8 +274,12 @@ nvim --headless --clean -u NONE --cmd "set rtp+=$PWD" -c "luafile scripts/sandbo
 
 判读：所有 `write_*` 应为 `READONLY`；`socket AF_VSOCK`/`AF_PACKET`/`AF_ALG` 应为 `EPERM`、
 `clone_NEWUSER` 应 `EPERM`、`clone3` 应 `ENOSYS`、`sysctl(2)` 应 `ENOSYS`；
-`raw_tcp_host=RAW_REACHED`、`proc_net_*`/`ip_*`/`host_info_leaks` 非零为**已知残余边界**
-（共享 netns/全局 procfs 固有，见 [sandbox.md](sandbox.md) §6.1）。回归由 `test_sandbox` 的
+默认 `network.isolation="proxy"` 下 `raw_tcp_host` 应为 **BLOCKED（ENETUNREACH）**、`ip_*` 只显示
+`lo`、`proc_net_*` 仅含沙箱自身；`isolation="off"`（共享 netns）时 `raw_tcp_host=RAW_REACHED`、
+`proc_net_*`/`ip_*`/`host_info_leaks` 非零才属**已知残余边界**
+（共享 netns/全局 procfs 固有，见 [sandbox.md](sandbox.md) §6.1）。
+> 该脚本的探针前缀**不带会话 boot**（不启动沙箱内 socat），故默认隔离下 `proxy_host` 显示
+> `HTTP=000` 只表示“未启动会话代理”，不是放行；代理出网由 `test_sandbox_boundary_net` 覆盖。回归由 `test_sandbox` 的
 「强制遮蔽危险全局 sysctl」「沙箱内无法写 core_pattern」「clone 命名空间过滤」「socket 地址族
 白名单」「read_file /proc 脱敏」「遮蔽路径符号链接/`/proc/<pid>/root` 解析」用例守护。
 
@@ -290,14 +301,35 @@ nvim --headless --clean -u NONE --cmd "set rtp+=$PWD" -c "luafile scripts/sandbo
   `pivot_root`/`umount` 真实负向、pid namespace 隔离、`/proc/sys` 只读与危险 proc 泄露项为空、
   `mask_paths` 端到端（哨兵/哈希校验宿主未改）、整机 overlay 暂存哨兵、`/run` 私有写、
   `NoNewPrivs=1`；`/proc/net`、`hostname` 等**设计边界**以基线断言固化。
-- `test_sandbox_boundary_net.lua`：宿主过滤代理本机拦截与服务进程身份、裸 TCP 基线（设计边界）、
-  沙箱内监听端口反向暴露、DNS、**端口+服务进程粒度弹窗端到端**（拒绝拦截 / 批准放行）。
+- `test_sandbox_boundary_net.lua`：宿主过滤代理本机拦截与服务进程身份、私有 netns 下裸 TCP
+  无路由（ENETUNREACH）、沙箱内监听端口不再反向暴露、localhost 解析、**端口+服务进程粒度
+  弹窗端到端**（拒绝拦截 / 批准放行）。
 - `test_sandbox_boundary_consistency.lua`：并发写同一文件（无丢失/撕裂）、命令超时被终止后的
   恢复、祖先目录 TOCTOU 符号链接替换不落宿主、read_all 普通命令写系统路径的候选冻结与发布落盘。
 
 共享基建见 `tests/sandbox_boundary_helpers.lua`（配置覆盖、真实 bwrap 前缀直跑 `direct/python`、
 宿主哨兵文件、syscall 探测模板）。**重资源/环境敏感**用例（真实 OOM、双实例）以
 `NEOAI_TEST_HEAVY=1` opt-in，默认跳过。
+
+### 5.4 在线 AI 红队演练（`scripts/sandbox_redteam_ai.lua`）
+
+固定用例与审计脚本之外，提供一个**模型驱动**的演练入口：把项目源码**副本**交给真实模型
+（默认按 `ai.modes.chat`），让它在真实 bwrap 沙箱内自主尝试文件系统/命名空间/能力//proc/
+网络/凭据/容器/持久化等逃逸路径。所有动作仍经正常沙箱门禁；写入冻结为候选。
+
+```bash
+NEOAI_REDTEAM_MAX_TOOLS=36 NEOAI_REDTEAM_TIMEOUT_MS=600000 \
+nvim --headless --clean -u NONE --cmd "set rtp+=$PWD" \
+  -c "luafile scripts/sandbox_redteam_ai.lua" -c "qa!"
+```
+
+- 环境变量：`NEOAI_REDTEAM_MAX_TOOLS`（硬上限，默认 36）、`NEOAI_REDTEAM_TIMEOUT_MS`
+  （默认 600000）、`NEOAI_REDTEAM_MODEL`、`NEOAI_REDTEAM_SRC`、`NEOAI_REDTEAM_OUT`。
+- 产出：`<out>.md`（模型结论 + 工具证据 + 宿主指纹校验）与 `<out>-transcript.md`
+  （完整工具参数/结果原文）；源码副本与宿主哨兵在 `/root/neoai-redteam/<时间戳>/`。
+- 判读：**宿主哨兵与 `/etc/{passwd,shadow,sudoers,crontab}`、`/root/.ssh/*` 指纹未变**
+  才算没有宿主级逃逸。模型自述的 `ESCAPED` 必须复核——沙箱内 overlay 对 `/etc`、`$HOME`
+  可写（仅沙箱会话视图），`/proc/1` 是载荷自身（`--as-pid-1`），都不等于宿主逃逸。
 
 ## 6. 相关文档
 

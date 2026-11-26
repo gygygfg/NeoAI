@@ -14,14 +14,18 @@
 ```
 
 - **Parallel by default (no args)**: `lua/NeoAI/tests/parallel.lua` (thin facade) dispatches every
-  suite across isolated headless child processes via **bounded-concurrency dual lanes**: the
+  suite across isolated headless child processes: the
   **light lane** shards non-heavy suites by measured timing into `cores - heavy` processes (auto,
   capped at 16; override with `NEOAI_TEST_WORKERS`); the **heavy lane** runs resource-heavy /
   timing-sensitive suites (default `sandbox*`, `pty`) **one suite per child process**, auto-tuned to
   about `cores/2` (memory-aware; override with `NEOAI_TEST_HEAVY_WORKERS`; `=1` reproduces
   the old serial channel). Both lanes run **overlapped** and refill as soon as any child exits,
   constrained by `#light<=W`, `#heavy<=H`, `W+H<=cores-2` (two cores reserved for the system/editor;
-  at least two lanes when cores are scarce). Shard weights prefer
+  at least two lanes when cores are scarce). An additional **exclusive lane** runs suites that touch
+  the host-global `/run/netns` (default `sandbox_view*`) **one suite per child process, serialized
+  after both lanes finish**, never overlapping any other shard — concurrent `ip netns add/del` from
+  multiple processes races on the shared `/run/netns` mount. Override this grouping with
+  `opts.exclusive_suites` (pattern list or predicate). Shard weights prefer
   the measured timing cache `.neoai_test_timings.json` (gitignored, repo root); without a cache it
   falls back to case-count LPT balancing. Responsibilities are split into `NeoAI.tests.runner.*`
   submodules (config / timings / shard / spawn / scheduler / memguard / report). The concurrency plan
@@ -216,6 +220,7 @@ ensures there are no leftover subscriptions or state between tests.
 | `test_max_tokens / test_truncation` | max_tokens sending strategy, output truncation and continuation |
 | `test_sub_agent_result` | Sub-agent tools/manager/result delivery |
 | `test_pending_queue` | Pending message queue |
+| `test_background_tools` | Background tools: a message arriving while waiting for tools is injected immediately and started tools are backgrounded; background results are appended to the end without recursing; approval/`ask_user` stay foreground; request building synthesizes stable placeholders with `system_update` role degradation |
 | `test_services / test_status` | Service layer (chat/tool/model/status), status line |
 | `test_ask_user / test_herder` | Asking questions, Herder reporting |
 | `test_plan_mode / test_plan_distill / test_todo` | Plan mode, plan distillation, todos |
@@ -230,6 +235,8 @@ ensures there are no leftover subscriptions or state between tests.
 | `test_lsp_guard` | LSP isolation for NeoAI UI buffers: neoai* disables LSP/Copilot, acwrite preserved, idempotent install/uninstall |
 | `test_plugins` | Plugin protocol: dependency waiting, replacement, disable, failure rollback, real message request, repeated start, tool/prompt-section release, hot reload |
 | `test_sandbox` | Tool sandbox: loader spec attachment, fail-closed, state machine/idempotency/fencing, policy aggregation and restricted rules, dry-run no-write, CAS publish and conflict, buffer write redirection, runtime probe and isolated process, async review enqueue/apply/reject, selective apply, save/undo-save (roll back the file and return it to pending, with CAS conflict refusal), run_command overlay candidate capture, impact model, evidence redaction/paging, task grants auto-apply/scope, constraint aggregation, decision envelope, retention and metrics, controlled network gateway, broker idempotency/reconcile, dependency closure, composed publish and path conflict, policy replay, evidence retention, cgroup resource domain and PID limit, seccomp baseline enforcement and gate, content-addressed cache, fault injection (publish/backend/freeze), performance benchmarks, revision derivation, raw-secret (tool args / AI context) abort and token-operation escalation without abort, env-var name references / bare env-var secret values not registered and not aborting, staging backend on-disk by default / switchable to shm, disk-cap gate |
+| `test_sandbox_docker_*` | Session-native Docker: auto tier probe, HTTP parse/normalize, endpoint/HostConfig policy, container review/approval matrix, rebuild specs (auto/manual/failure suspension), host-side broker deny/forward |
+| `test_deps_catalog` | Optional security dependency catalog and install plans: apt/etc. argv (no shell), manual deps, unknown dep / no package manager errors |
 | `test_sandbox_instance` | Sandbox per-process instance isolation: instance store roots mutually invisible, hot reload keeps this instance's pending queue, `init` does not block on runtime probe (lazy), dead-instance directory reclamation |
 | `test_sandbox_service` | Long-lived services/mirrors/diagnostics: service start/logs/status/stop and registry cleanup, capturing service changes back into staging on stop, graceful stop (SIGTERM graceful exit / SIGKILL on timeout / `stop_all`), `long_lived` gate branch, pip/npm/maven mirror injection (incl. settings.xml), cgroup event snapshot and OOM detection |
 | `test_sandbox_background` | Background processes / session-resident instance: `&`/nohup/setsid detection (excluding `&&`/redirection/mid-command `&`), with `resident` enabled `run_command` background processes survive across tool calls (visible to `ps` in the same namespace), non-background commands return normally |
@@ -279,10 +286,15 @@ nvim --headless --clean -u NONE --cmd "set rtp+=$PWD" -c "luafile scripts/sandbo
 ```
 
 Reading it: every `write_*` must be `READONLY`; `socket AF_VSOCK`/`AF_PACKET`/`AF_ALG` must be
-`EPERM`, `clone_NEWUSER` `EPERM`, `clone3` `ENOSYS`, `sysctl(2)` `ENOSYS`;
-`raw_tcp_host=RAW_REACHED` and non-empty `proc_net_*`/`ip_*`/`host_info_leaks` are **known
+`EPERM`, `clone_NEWUSER` `EPERM`, `clone3` `ENOSYS`, `sysctl(2)` `ENOSYS`.
+With the default `network.isolation="proxy"`, `raw_tcp_host` should be **BLOCKED (ENETUNREACH)**,
+`ip_*` shows only `lo`, and `proc_net_*` contains only sandbox sockets; with `isolation="off"`
+(shared netns), `raw_tcp_host=RAW_REACHED` and non-empty `proc_net_*`/`ip_*`/`host_info_leaks` are **known
 residual boundaries** (inherent to the shared netns / global procfs, see
-[sandbox.md](sandbox.md) §6.1). Regressions are guarded by the `test_sandbox` cases
+[sandbox.md](sandbox.md) §6.1).
+> This script's probe prefix has **no session boot** (it does not start the in-sandbox socat), so
+> `proxy_host=HTTP=000` under the default isolation only means "session proxy not started", not
+> "allowed"; proxy egress is covered by `test_sandbox_boundary_net`. Regressions are guarded by the `test_sandbox` cases
 "mandatory dangerous-sysctl masking", "cannot write core_pattern", "clone namespace filtering",
 "socket address-family allowlist", "read_file /proc redaction" and
 "masked-path symlink / `/proc/<pid>/root` resolution".
@@ -308,8 +320,9 @@ unbounded concurrent bwrap/cgroup contention):
   untouched), whole-root overlay staging sentinels, private `/run` writes, `NoNewPrivs=1`;
   `/proc/net`, `hostname`, etc. are **design boundaries** frozen as baseline assertions.
 - `test_sandbox_boundary_net.lua`: host filtering-proxy local interception and service-process
-  identity, bare-TCP baseline (design boundary), reverse exposure of sandbox listening ports, DNS,
-  and the **port+process granularity consent** end-to-end (deny blocks / approve allows).
+  identity, no route for raw TCP under the private netns (ENETUNREACH), sandbox listeners no longer
+  reverse-exposed, localhost resolution, and the **port+process granularity consent** end-to-end
+  (deny blocks / approve allows).
 - `test_sandbox_boundary_consistency.lua`: concurrent writes to one file (no loss/tearing),
   recovery after a timed-out command is killed, ancestor-dir TOCTOU symlink swap not reaching the
   host, and read_all ordinary-command writes to system paths (candidate freeze + publish).
@@ -317,6 +330,29 @@ unbounded concurrent bwrap/cgroup contention):
 Shared helpers live in `tests/sandbox_boundary_helpers.lua` (config override, real bwrap prefix
 `direct`/`python`, host sentinel files, syscall probe template). **Heavy / environment-sensitive**
 cases (real OOM, dual instances) are opt-in via `NEOAI_TEST_HEAVY=1` and skipped by default.
+
+### 5.4 Model-driven red-team drill (`scripts/sandbox_redteam_ai.lua`)
+
+Besides the fixed suites and the audit script, this entry point hands a **copy** of the project
+source to a real model (default `ai.modes.chat`) and lets it probe filesystem / namespace /
+capability / `/proc` / network / credential / container / persistence escape paths inside a real
+bwrap sandbox. Every action still goes through the normal sandbox gate; writes freeze as candidates.
+
+```bash
+NEOAI_REDTEAM_MAX_TOOLS=36 NEOAI_REDTEAM_TIMEOUT_MS=600000 \
+nvim --headless --clean -u NONE --cmd "set rtp+=$PWD" \
+  -c "luafile scripts/sandbox_redteam_ai.lua" -c "qa!"
+```
+
+- Env: `NEOAI_REDTEAM_MAX_TOOLS` (hard cap, default 36), `NEOAI_REDTEAM_TIMEOUT_MS` (default
+  600000), `NEOAI_REDTEAM_MODEL`, `NEOAI_REDTEAM_SRC`, `NEOAI_REDTEAM_OUT`.
+- Output: `<out>.md` (model verdict + tool evidence + host fingerprint check) and
+  `<out>-transcript.md` (full tool arguments/results); the source copy and host sentinel live under
+  `/root/neoai-redteam/<timestamp>/`.
+- Verdict: only **unchanged host sentinel and fingerprints** (`/etc/{passwd,shadow,sudoers,crontab}`,
+  `/root/.ssh/*`) mean no host-level escape. The model's own `ESCAPED` claims must be re-checked:
+  the in-sandbox overlay makes `/etc` and `$HOME` writable (session view only), and `/proc/1` is the
+  payload itself (`--as-pid-1`) — neither is a host escape.
 
 ## 6. Related Docs
 

@@ -215,6 +215,8 @@ local function _prefix(specs, cwd)
     -- Node 系 LSP server（copilot/pyright 等）在 `--unshare-pid` 下启动后即退出（exit 1）；
     -- 不隔离 PID。文件视图（overlay/遮蔽）与 run_command 保持一致，仅放弃 PID 隔离。
     no_pid_ns = true,
+    -- LSP server 常需 provider 网络（登录/补全），不套用私有 netns 隔离。
+    network_isolation = false,
   })
   if not prefix then return nil, err end
   return prefix

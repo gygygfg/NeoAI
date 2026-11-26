@@ -10,6 +10,10 @@
 ---   * heavy：资源重/时序敏感套件（sandbox*/pty），一套件一子进程，受 heavy 并发上限 H 约束，
 ---     按耗时降序 LPT 排队。约束 #light≤W、#heavy≤H、W+H≤核数-2（预留两核给系统/编辑器）。
 ---
+--- 另有一条**独占通道（exclusive）**：触碰宿主全局资源（`/run/netns`）的套件（默认
+--- `sandbox_view*`）在 light/heavy 两条 lane 全部结束后串行执行，绝不与其他分片重叠——
+--- 否则多个进程并发 `ip netns add/del` 会在共享的 `/run/netns` 挂载点上互相竞争。
+---
 --- 职责拆分到 `NeoAI.tests.runner.*` 子模块：
 ---   config（常量/并发解析）、timings（耗时缓存）、shard（LPT/清单解析）、
 ---   spawn（子进程执行：输出落盘 + sidecar）、scheduler（有界并发池）、
@@ -109,7 +113,7 @@ local function _make_req(unit, timeout_ms)
     names = unit.names,
     index = unit.sid,
     kind = unit.kind,
-    serial = unit.kind == "heavy",
+    serial = unit.kind ~= "light",
     timeout_ms = timeout_ms,
     result_path = result_path,
     log_path = log_path,
@@ -126,11 +130,12 @@ end
 ---   discovery_timeout_ms?: number,
 ---   timings_path?: string,        耗时缓存路径
 ---   serial_suites?: table|function, 覆盖 heavy 判定（模式数组或判定函数）
+---   exclusive_suites?: table|function, 覆盖独占通道判定（触碰宿主全局 /run/netns 的套件）
 ---   wait?: boolean,               是否阻塞等待（默认 true；交互式调用传 false）
 ---   on_done?: fun(result),        完成回调
 ---   verbose?: boolean,            打印所有分片输出
 --- }
---- @return table { passed, failed, errors, shards, workers, heavy_workers, elapsed_ms }
+--- @return table { passed, failed, errors, shards, workers, heavy_workers, exclusive_workers, elapsed_ms }
 function M.run(opts)
   opts = opts or {}
   local timeout_ms = tonumber(opts.timeout_ms) or DEFAULT_TIMEOUT_MS
@@ -146,6 +151,7 @@ function M.run(opts)
     shards = {},
     workers = 0,
     heavy_workers = 0,
+    exclusive_workers = 0,
     elapsed_ms = 0,
   }
   local finished = false
@@ -199,10 +205,12 @@ function M.run(opts)
     return agg
   end
 
-  -- 3) 分道：heavy（资源重）vs light
-  local light, heavy = {}, {}
+  -- 3) 分道：exclusive（宿主全局资源，独占）> heavy（资源重）> light
+  local light, heavy, exclusive = {}, {}, {}
   for _, s in ipairs(suites) do
-    if config.is_serial(s.name, opts) then
+    if config.is_exclusive(s.name, opts) then
+      exclusive[#exclusive + 1] = s
+    elseif config.is_serial(s.name, opts) then
       heavy[#heavy + 1] = s
     else
       light[#light + 1] = s
@@ -218,6 +226,7 @@ function M.run(opts)
   if #heavy == 0 then heavy_workers = 0 end
   agg.workers = light_workers
   agg.heavy_workers = heavy_workers
+  agg.exclusive_workers = #exclusive > 0 and 1 or 0
   agg.cores = plan.cores
   agg.mem_gb = plan.mem_mb and (plan.mem_mb / 1024) or nil
 
@@ -261,8 +270,20 @@ function M.run(opts)
     if wa ~= wb then return wa > wb end
     return a.names[1] < b.names[1]
   end)
+  -- exclusive（宿主全局 /run/netns）：一套件一进程，在 light/heavy 全部结束后串行执行。
+  local exclusive_units = {}
+  for _, s in ipairs(exclusive) do
+    sid = sid + 1
+    exclusive_units[#exclusive_units + 1] = {
+      sid = sid,
+      kind = "exclusive",
+      names = { s.name },
+      modules = s.module and { s.module } or nil,
+    }
+  end
 
-  -- 6) 双 lane 有界并发执行（light 池 W 路 + heavy 池 H 路，重叠，任一结束即回填）
+  -- 6) 执行：双 lane 有界并发（light 池 W 路 + heavy 池 H 路，重叠，任一结束即回填），
+  --    全部结束后再跑独占通道（1 路串行，绝不与其他分片重叠）。
   local function start_unit(unit, done)
     local req = _make_req(unit, timeout_ms)
     local function launch()
@@ -278,15 +299,24 @@ function M.run(opts)
     -- 注入执行器（测试）不走内存门控，保持同步语义。
     if spawn.is_injected() then return launch() end
     -- 运行期动态内存许可：可用内存不足以容纳该分片预算时短暂等待（有界，绝不挂起）。
-    local need = unit.kind == "heavy" and config.HEAVY_MEM_BUDGET_MB or config.LIGHT_MEM_BUDGET_MB
+    -- exclusive 同样跑沙箱/bwrap，按 heavy 预算。
+    local need = unit.kind ~= "light" and config.HEAVY_MEM_BUDGET_MB or config.LIGHT_MEM_BUDGET_MB
     memguard.admit(need, launch)
   end
 
-  scheduler.run_dual(light_units, heavy_units, light_workers, heavy_workers, start_unit, finish)
+  local function after_dual_lanes()
+    if #exclusive_units == 0 then
+      finish()
+      return
+    end
+    scheduler.pool(exclusive_units, 1, start_unit, finish)
+  end
+
+  scheduler.run_dual(light_units, heavy_units, light_workers, heavy_workers, start_unit, after_dual_lanes)
 
   if opts.wait ~= false then
     local total_timeout_ms = tonumber(opts.total_timeout_ms)
-      or (timeout_ms * (heavy_workers + 1) + 120000)
+      or (timeout_ms * (heavy_workers + 1 + #exclusive_units) + 120000)
     vim.wait(total_timeout_ms, function() return finished end, 20)
   end
   return agg

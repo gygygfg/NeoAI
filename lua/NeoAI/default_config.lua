@@ -649,15 +649,13 @@ local DEFAULT_CONFIG = {
       },
     },
     -- 高权限模式（与 CHAT/PLAN 并列的第三种会话模式，按 m 循环切换）。
-    -- **安全提示**：开启后可直连宿主 docker daemon（等价宿主 root 能力），网络不再拦截，
-    -- SSH 私钥/agent 路径也不再遮蔽；仅应在明确信任当前任务时手动启用。默认 opt-in 关闭。
+    -- **安全提示**：开启后网络不再拦截、SSH 私钥/agent 路径也不再遮蔽；仅应在明确信任当前
+    -- 任务时手动启用。Docker 不再由 PRIV 直连宿主 daemon（统一走自动探测的会话内 rootless
+    -- runtime + broker）。默认 opt-in 关闭。
     privileged_mode = {
       enabled = false, -- 总开关；false 时 m 只在 CHAT/PLAN 间循环
       require_async_approval = true, -- 仅 tools.approval.mode="async" 时允许进入
       override_offline = true, -- 解除 tools.sandbox.offline=true 的硬离线（仍经 host_proxy 记录）
-      -- 宿主 docker socket 路径；空 = 自动探测 /run/docker.sock、/var/run/docker.sock、
-      -- $XDG_RUNTIME_DIR/docker.sock。仅高权限模式的进程命令会挂载/解除遮蔽。
-      docker_socket = "",
       -- 不遮蔽 SSH 私钥/agent 路径（~/.ssh、/root/.ssh、ssh-agent socket 等）。
       -- 仅高权限模式生效；默认开。设为 false 可保留默认遮蔽。
       unmask_ssh_keys = true,
@@ -838,6 +836,9 @@ local DEFAULT_CONFIG = {
         -- `privilege.sysadmin.unmask`）按需解除，使其能读写账户库。写入仍进 overlay 暂存。
         "/etc/shadow", "/etc/shadow-", "/etc/gshadow", "/etc/gshadow-",
         "/etc/sudoers", "/etc/sudoers.d", "/etc/machine-id", "/etc/hostid",
+        -- 动态加载器预加载钩子：宿主通常不存在该文件；遮蔽为 /dev/null 可阻止会话内创建
+        -- （否则任何写入都会让后续每个进程加载攻击者库，形成沙箱内代码注入原语）。
+        "/etc/ld.so.preload",
         -- 宿主 fstab 泄露磁盘布局/根文件系统 UUID，并会让 `mount -o remount,rw /` 按宿主 UUID
         -- 解析（沙箱根是 overlay/tmpfs，必然失败并暴露宿主身份）。遮蔽为空，容器语义。
         "/etc/fstab",
@@ -850,6 +851,33 @@ local DEFAULT_CONFIG = {
         "/root/.python_history", "/root/.mysql_history", "/root/.psql_history",
         "/root/.sqlite_history", "/root/.node_repl_history", "/root/.wget-hsts",
         "/root/.lesshst", "/root/.viminfo", "/root/.config/gh", "/root/.config/gcloud",
+      },
+      -- 受保护资源（与 `mask_paths` 同源）：审批界面与待审条目共用的「后果告知」文案。
+      -- 影响的是**用户看到什么**，不改变遮蔽/判定本身：
+      --   * 命中资源时，审批弹窗在参数前插入「能力 / 范围 / 持续 / 建议」四段；
+      --     此时不提供「允许所有（本会话）」与「加入工作目录」——避免把一次同意洗成
+      --     后续静默放行；
+      --   * 进暂存待审的候选会在审批条目上标注同一份后果摘要。
+      -- `consequences` 可按资源 id 覆盖内置文案（只覆盖文案，id 稳定，供审计回放）：
+      --   { ssh_private_key = { suggestion = "本项目只允许用 deploy key" } }
+      -- 内置 id 见 lua/NeoAI/sandbox/protected/registry.lua。
+      protected = {
+        consequences = {},
+        -- 免审批预授权绑定（R3）：让**特定密钥**对**特定消费者**在**特定目标**上免弹窗。
+        -- 过去只有按主机（trusted_services / 模型供应商）或按整个目录（git 远程工具放开
+        -- ~/.ssh）的粗放放行；这里收敛为「密钥指纹 × 消费者 × 目标」的显式绑定。
+        --
+        -- 只减审批、不加能力：命中绑定不会让资源多出 op（SSH 私钥仍无 read）。
+        -- 命中仍写审计（SandboxReview「行为」页可见），且 expires_at / max_uses 任一触发
+        -- 即重新走审批。指纹必填：绑定的是「这把钥匙」，`cp` 改名或换钥匙后立即失效。
+        --
+        --   { fingerprint = "sha256:<hex>",              -- 必填；:NeoAI SandboxKeys [文件] 可直接生成
+        --     resource    = "~/.ssh/id_deploy",          -- 可选，仅审计标注
+        --     consumers   = { "egress", "tool:git_fetch" }, -- 空 = 任意；tool: 前缀，exec_ 可省略
+        --     targets     = { "github.com", "*.example.com" }, -- 空 = 任意目标
+        --     expires_at  = 1730000000,                  -- 可选，epoch 秒
+        --     max_uses    = 100 },                       -- 可选，0/缺省 = 不限
+        preauthorized = {},
       },
       -- 读取面（默认开）：true 时整机根以**可写 overlay** 方式暴露——以 `/` 为只读 lower、
       -- 会话私有 upper/work 为可写层（原样挂载、根内任意路径可写），所有写入进 upper 暂存并
@@ -992,6 +1020,18 @@ local DEFAULT_CONFIG = {
         block_proxy_evasion = true,
         -- 宿主过滤代理监听端口（0 = 自动分配 loopback 随机端口）。
         host_local_proxy_port = 0,
+        -- 私有网络命名空间隔离（默认 "proxy"）：
+        --   "proxy" = 载荷在私有 netns（只有 loopback），外部访问必须经宿主 host_proxy
+        --             （沙箱内 socat → Unix socket → 宿主代理）。裸 TCP/UDP、裸 socket 无路由，
+        --             宿主回环/网卡/云元数据不可达；curl/pip/git/npm 等遵守代理变量的工具仍可出网。
+        --             依赖 socat（宿主与沙箱内均需）；root 还需 ip/CAP_NET_ADMIN。
+        --   "off"   = 旧行为：共享 netns，仅应用层代理过滤（裸 TCP 可绕过）。
+        -- 容器会话（rootless dockerd/podman）与 LSP 子进程不套用隔离。
+        isolation = "proxy",
+        -- 隔离不可用（缺 socat/ip、无法建 netns）时：
+        --   true（默认）= 需要网络的命令按 fail-closed 断网（绝不静默退回共享 netns）；
+        --   false       = 退回共享 netns，并发告警/降级留痕。
+        isolation_fail_closed = true,
         -- 宿主上游代理（链式出网）：沙箱经宿主过滤代理出网时，若宿主本身依赖 HTTP(S)/SOCKS
         -- 代理出网（企业白名单代理、mihomo/clash 等），直连会因环境无直连出口而失败（表现为
         -- `github.com:443` CONNECT 403/挂起，而 `api.github.com`/`codeload.github.com` 等
@@ -1013,6 +1053,16 @@ local DEFAULT_CONFIG = {
         --   "allow"       = 直接放行并记录（旧行为）；
         --   "deny"        = 直接拒绝。
         access = "ask",
+        -- 仅记录模式（默认关闭）：网络请求一律放行，不弹同意窗、不拦截代理规避，只记录访问目标。
+        -- 开启后：
+        --   * 覆盖 access（等同 "allow"），外部与宿主本机目标均直接放行；
+        --   * 忽略 block_proxy_evasion（视为 false，不弹窗/不拒绝）；
+        --   * 忽略 network.enabled（受控端点白名单）；
+        --   * 即使 host_local_block=false 也启动宿主过滤代理并注入代理变量，用于记录目标；
+        --   * 记录写入独立环形缓冲，不被命令结果摘要 drain，可随时 `:NeoAI SandboxAudit network` 查看。
+        -- 注意：offline=true（硬离线）仍然生效；network.gateway 启用时以网关为准（本模式不启动
+        -- host_proxy）；默认 isolation="proxy" 下裸 TCP/UDP 仍不可达（私有 netns 边界）。
+        record_only = false,
         -- 访问本机网络服务的审批颗粒度（默认开）：弹窗展示目标端口背后的**宿主监听进程**
         -- （命令名 / pid / 可执行路径），并按「端口 + 服务进程」记忆本次会话同意——同端口换成
         -- 另一个进程（服务换版本/被抢占）会重新弹窗。关闭则退回纯 `host:port` 颗粒度与展示。
@@ -1455,6 +1505,8 @@ local DEFAULT_CONFIG = {
       --     审批后由候选管线应用回真实盘（无需单独的“替换回来”机制）；
       --   * 沙箱内无 podman 时，docker 命令伪装为真机样式错误（“Cannot connect to the Docker
       --     daemon …”），真实原因仅进用户 UI/审计，不回传模型。
+      -- 注意：会话内 Docker 自动档位激活时，docker 命令改为走 broker（不再被改写为 podman），
+      -- 且不再注入 docker 入口桩；见 docs/sandbox.md「会话内 Docker」。
       container = {
         enabled = false,
         share_namespace = true, -- 对无守护进程运行时注入命名空间共享标志
@@ -1511,6 +1563,12 @@ local DEFAULT_CONFIG = {
       --   "host"   ：另暴露 `~/.git-credentials`、`~/.config/git`、`~/.git-credential-cache`、
       --             `~/.netrc`、`~/.config/gh`（HTTPS/token 认证）。
       --   "isolate"：完全隔离宿主凭据——SSH/凭据类远程将认证失败（改走 HTTPS 公共匿名仓库）。
+      --   "preauth"：只放开 `tools.sandbox.protected.preauthorized` 里**指纹命中**的私钥
+      --             （按 remote 解析出的主机匹配 consumers/targets）。可见面只有这些私钥文件 +
+      --             `known_hosts`（单文件只读绑定），`~/.ssh` 目录本身仍是空 tmpfs——同目录的
+      --             其它密钥 / `config` / agent socket 都不可见；`GIT_SSH_COMMAND` 用
+      --             `-F /dev/null -o IdentitiesOnly=yes`，不让 ssh config 的 ProxyCommand/
+      --             LocalCommand 变成执行面。没有命中绑定时**fail-closed**（报错而不是静默降级）。
       credentials = "host_ssh",
       -- 使用宿主 `~/.ssh` 时对未知主机名（known_hosts 未收录）的处理：
       --   true（默认）= `accept-new`（首次自动信任并写入本次会话的 known_hosts 副本）；
@@ -1528,6 +1586,32 @@ local DEFAULT_CONFIG = {
       -- 防止 `ext::`/URL 等注入形态（git 远程可为外部命令 URL）。默认仅允许安全字符。
       remote_pattern = "^[%w%._%-]+$",
       branch_pattern = "^[%w%._/%-]+$",
+      -- 宿主侧 SSH 能力（`ssh_run` / `ssh_tunnel`）：**默认关闭**。开启后 AI 只能按**别名**
+      -- 使用宿主的 openssh，密钥永不进入沙箱（沙箱内既无密钥文件，也无 agent socket）。
+      -- 调用固定冻结为主机操作提案，用户在 :NeoAI SandboxReview 确认后由宿主执行。
+      --
+      -- 每条别名固定主机/用户/端口/私钥，并**必须**声明私钥指纹（`:NeoAI SandboxKeys <key>`）；
+      -- 指纹不符（换钥匙/改名）即拒绝。命令模板固定为
+      -- `ssh -F /dev/null -o IdentitiesOnly=yes -o BatchMode=yes -o PermitLocalCommand=no
+      --      -o ForwardAgent=no -o StrictHostKeyChecking=yes|accept-new -i <key> … <host> -- <cmd>`
+      -- —— AI 不能传 host/端口/任意 `-o`。
+      -- 隧道只允许 `-L 127.0.0.1:<local_port>:<remote_host>:<remote_port>`，目标主机与端口范围
+      -- 都必须在别名里预先声明；不提供 `-R`/`-D`/`GatewayPorts`。
+      --
+      --   aliases = {
+      --     prod = { host = "prod.example.com", user = "deploy", port = 22,
+      --              key = "~/.ssh/id_deploy", fingerprint = "sha256:…",
+      --              known_hosts = "~/.ssh/known_hosts", accept_new = false,
+      --              allow = { "exec", "tunnel" },
+      --              tunnel = { local_ports = { 10000, 10099 },
+      --                         remote_hosts = { "db.internal", "*.svc.internal" } } },
+      --   }
+      ssh = {
+        enabled = false,
+        connect_timeout = 10,
+        max_tunnels = 4, -- 每别名并发隧道上限（按 ControlPath 套接字计数）
+        aliases = {},
+      },
       -- 无 overlay 播种视图（`true` 时，overlay 不可用的降级/bind 视图会先把可写根的**真实
       -- 内容**复制进会话私有目录，使命令既能看到真实磁盘文件、写入又落私有副本并冻结为候选；
       -- 真实盘保持只读）。仅对配置的可写根（process_roots/包根/cwd）生效，不播种整机 `/`。
@@ -1733,14 +1817,9 @@ local DEFAULT_CONFIG = {
           } },
         },
       },
-      -- 受控 docker（已弃用/无效果）：沙箱**永不连接宿主 docker daemon**——容器由宿主 daemon
-      -- 在沙箱外创建、无法被命名空间约束，挂载路径改写也不是安全边界。docker/docker-compose/
-      -- nerdctl 一律改写为 podman/podman-compose 在沙箱内真执行（见 `container`）。保留键仅为
-      -- 兼容既有配置；socket/mode 均不再被读取。
-      docker = {
-        mode = "off", -- 已弃用；无论取值都不再挂载 socket
-        socket = "", -- 已弃用；不再读取（历史上指向 /run/neoai-docker/docker.sock，勿依赖）
-      },
+      -- Docker 方向不再提供用户配置：运行时自动探测并选择最高安全档位
+      -- （N0 无会话 runtime / N1 会话内 rootless runtime / N2 microVM|gVisor）。
+      -- 永不连接宿主 docker daemon，也不挂载真实 docker.sock；详见 docs/sandbox.md。
       -- AI 专用沙箱 LSP：AI 的 lsp_* 工具按需克隆编辑器同名 server（名称加 @neoai-sandbox
       -- 后缀），把克隆体放进 bwrap + overlay（工作区根 lower=真实只读，upper=沙箱私有层），
       -- 使其磁盘读取看到 AI 尚未发布的暂存内容，与 run_command/git 读工具共享同一暂存视图。
@@ -1778,6 +1857,11 @@ local DEFAULT_CONFIG = {
         generated_scan_max_bytes = 2 * 1024 * 1024,
         generated_scan_max_files = 200,
         tokenize_env = true, -- 是否对沙箱进程环境变量替换为假密钥（false = 原样注入，调试用）
+        -- 沙箱进程是否拿到**真实**密钥值（默认 false = 只给 token）。
+        -- 默认 false 时，载荷只能看到 `NEOKEY_…` token；命令参数中的 token 仍会在执行前还原为
+        -- 真实值（受 secret_egress 门禁）。设为 true 会恢复旧行为（pip/curl/gh 等直接读 env 的
+        -- 真实密钥），代价是沙箱内任意命令都能把真实密钥外发（裸 socket 等）。
+        real_env_values = false,
         -- 二进制密钥文件（.p12/.pfx/keystore/raw key 等）被读取时，用同长度随机字节替换，
         -- 以 base64 标记 `NEOAI_BINARY:<len>:<b64>` 传输，落盘/执行时精确还原真实字节。
         binary_fake = true,

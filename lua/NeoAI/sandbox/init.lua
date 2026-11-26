@@ -173,6 +173,8 @@ function M.init()
   store.init(root)
   cache.init(root)
   candidate.ensure_dirs(root)
+  -- 重建规格必须跨 NeoAI 进程存活（实例目录随进程回收），放在配置的沙箱基根下。
+  pcall(function() require("NeoAI.sandbox.docker.specs").init(_base_root() .. "/docker/specs") end)
   state.initialized = true
   if vim.g.neoai_test then
     -- 测试要求确定性/同步水合；生产走异步预热 + 分帧物化。
@@ -233,6 +235,10 @@ end
 --- 关闭：清理暂存
 function M.shutdown()
   M.unwatch_sessions()
+  -- 先停容器监测/broker/会话 runtime：容器随会话 userns 销毁；重建规格保留。
+  pcall(function() require("NeoAI.sandbox.docker.monitor").reset() end)
+  pcall(function() require("NeoAI.sandbox.docker.session").stop() end)
+  pcall(function() require("NeoAI.sandbox.net.isolate").stop() end)
   pcall(function() require("NeoAI.sandbox.net.net_gateway").teardown() end)
   pcall(function() require("NeoAI.sandbox.net.host_proxy").stop() end)
   -- 停止 systemd 门面 IPC 桥（沙箱内 systemctl/journalctl 入口的宿主服务端）。
@@ -245,6 +251,8 @@ function M.shutdown()
   pcall(function() require("NeoAI.sandbox.execution.wrapper").clear_resident_observe() end)
   -- 回收保活的后台命令资源域（run_command 后台意图命令跨轮次存活，仅在关闭时统一回收）。
   pcall(function() require("NeoAI.sandbox.execution.wrapper").release_persistent_backgrounds() end)
+  -- 关闭宿主侧 SSH 隧道（`-f -N` 后台化进程无 job 句柄，按 ControlPath 逐个 `-O exit`）。
+  pcall(function() require("NeoAI.sandbox.ssh.broker").close_all() end)
   -- 卸载用户态 overlay（fuse-overlayfs）兜底挂载，避免残留挂载点影响后续/清理。
   pcall(function() require("NeoAI.sandbox.execution.runtime").fuse_release_all() end)
   -- 先等后台后处理（异步模式下命令结果已返回、捕获/冻结/结算未完成）与异步写入落盘，
@@ -1175,6 +1183,62 @@ M.container = container
 M.secret = secret
 M.trace = trace
 
+-- ========== 会话内 Docker（自动档位 / 审查 / 资源 / 重建） ==========
+
+--- 只读状态（命令/UI 用；不触发 runtime 启动）。
+--- @return table
+function M.docker_status()
+  local okp, probe = pcall(require, "NeoAI.sandbox.docker.probe")
+  local oks, session = pcall(require, "NeoAI.sandbox.docker.session")
+  local okb, broker = pcall(require, "NeoAI.sandbox.docker.broker")
+  local okm, monitor = pcall(require, "NeoAI.sandbox.docker.monitor")
+  local okr, review = pcall(require, "NeoAI.sandbox.docker.review")
+  local oksp, specs = pcall(require, "NeoAI.sandbox.docker.specs")
+  return {
+    probe = okp and probe.status() or nil,
+    session = oks and session.status() or nil,
+    broker = okb and broker.status() or nil,
+    monitor = okm and monitor.metrics() or nil,
+    approvals = okr and review.approvals() or {},
+    rebuild_pending = oksp and specs.list_pending() or {},
+  }
+end
+
+--- 容器安全审查（供 UI/测试）。
+--- @param insp table
+--- @param ctx table|nil
+--- @return table
+function M.docker_review(insp, ctx)
+  local review = require("NeoAI.sandbox.docker.review")
+  return review.evaluate(insp, ctx)
+end
+
+--- 批准一个容器（绑定 config digest）。
+--- @param id string
+--- @param digest string
+--- @return boolean
+function M.docker_approve(id, digest)
+  return require("NeoAI.sandbox.docker.review").approve(id, digest)
+end
+
+--- 撤销容器批准。
+--- @param id string
+function M.docker_revoke(id)
+  return require("NeoAI.sandbox.docker.review").revoke(id)
+end
+
+--- 重建规格列表 / 打印提示。
+--- @return table
+function M.docker_pending()
+  return require("NeoAI.sandbox.docker.specs").list_pending()
+end
+
+--- 打印关闭容器的重建命令与安全性。
+--- @param spec table
+function M.docker_print_hint(spec)
+  require("NeoAI.sandbox.docker.specs").print_hint(spec)
+end
+
 --- 重置（测试用）
 function M.reset()
   -- 按**当前配置**落位 store 根：用例内可能临时改写 `tools.sandbox.workspace_root`（with_config），
@@ -1188,6 +1252,10 @@ function M.reset()
   pcall(function() require("NeoAI.sandbox.execution.service").reset() end)
   -- 停止会话级常驻沙箱实例（连同其后台进程与资源域）。
   pcall(function() require("NeoAI.sandbox.execution.resident").reset() end)
+  -- 清 git preauth 解析缓存（按 attempt/cwd 缓存；reset 后配置会变，必须失效）。
+  pcall(function() require("NeoAI.sandbox.execution.wrapper")._git_preauth_reset() end)
+  -- 关闭宿主侧 SSH 隧道（避免 reset 后残留后台隧道占端口/连接）。
+  pcall(function() require("NeoAI.sandbox.ssh.broker").close_all() end)
   -- 停止常驻实例的动态设备观测句柄。
   pcall(function() require("NeoAI.sandbox.execution.wrapper").clear_resident_observe() end)
   -- 回收保活的后台命令资源域（先于 `cgroup.reset()`，以便在句柄状态被清空前 kill + 删除）。
@@ -1220,6 +1288,7 @@ function M.reset()
   trace.reset()
   ephemeral.reset()
   pcall(function() require("NeoAI.sandbox.net.net_gateway").reset() end)
+  pcall(function() require("NeoAI.sandbox.net.isolate").reset() end)
   pcall(function() require("NeoAI.sandbox.net.host_proxy").reset() end)
   pcall(function() require("NeoAI.sandbox.execution.disk").reset() end)
   -- 回收观测预热（后台预挂载的 bpftrace 探针 + 预创建 cgroup），避免 reset 后残留。

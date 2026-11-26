@@ -113,7 +113,7 @@ end
 local function _priv_key(priv)
   if type(priv) ~= "table" then return "none" end
   local parts = {}
-  for _, k in ipairs({ "userns", "network", "cap_add", "mounts", "unmask", "apt_sandbox_user", "maintscript_stubs", "systemctl_shim" }) do
+  for _, k in ipairs({ "userns", "network", "cap_add", "mounts", "unmask", "apt_sandbox_user", "maintscript_stubs", "systemctl_shim", "docker_session", "boot", "command_seccomp", "command_uid", "rootless_session" }) do
     local v = priv[k]
     if type(v) == "table" then
       local vs = {}
@@ -141,13 +141,15 @@ end
 --- 命令输出块的内容以 base64 承载（客户端解码）：nvim 的 job 输出层会把 NUL 字节
 --- 改写成换行，且命令输出可能包含与帧定界相同的控制字节（\x1e/\x1f），直接 `cat` 会
 --- 破坏 BEGIN/END 帧定界导致输出丢失/串扰；base64 为纯 ASCII，帧定界安全。
---- @param boot string|nil 服务器进入读取循环前的引导片段（如启动 systemd --user）
+--- @param boot string|nil 服务器进入读取循环前的引导片段（如启动 systemd --user / 会话 runtime）
+--- @param exec_prefix string|nil 每条命令前缀（如 setpriv 施加 per-command seccomp）
 --- @return string
-local function _server_script(boot)
+local function _server_script(boot, exec_prefix)
   local shell = _shell_bin()
   local setsid = _setsid_bin()
-  local launch = setsid and (setsid .. " " .. shell .. " -c \"$__cmd\"")
-    or (shell .. " -c \"$__cmd\"")
+  local pre = (type(exec_prefix) == "string" and exec_prefix ~= "") and (exec_prefix .. " ") or ""
+  local launch = pre .. (setsid and (setsid .. " " .. shell .. " -c \"$__cmd\"")
+    or (shell .. " -c \"$__cmd\""))
   local timeout = _timeout_bin()
   -- 定长载荷读取：`head -c "$__len"`。加 timeout 上限，避免协议失步时永久阻塞读取循环；
   -- 超时/出错即退出服务器（客户端 on_exit 后重建），而不是让后续所有请求排队超时。
@@ -426,6 +428,7 @@ end
 --- @param timeout_ms number|nil jobwait 等待上限（默认 2000）
 local function _kill_instance(inst, timeout_ms)
   if not inst then return end
+
   local wait_ms = math.max(0, tonumber(timeout_ms) or 2000)
   if inst.cg then pcall(cgroup.kill, inst.cg) end
   if inst.job and inst.job > 0 then
@@ -505,7 +508,14 @@ function M.ensure(opts)
       local okg, ng = pcall(require, "NeoAI.sandbox.net.net_gateway")
       gateway_on = okg and ng and ng.enabled()
     end
-    if (sd_ok or cgroup.delegation_enabled()) and not gateway_on then
+    -- 私有 netns（root 模式）同样经 `ip netns exec`，委派 cgroup 的 bind 源不可解析；跳过。
+    local netns_on = false
+    do
+      local oki, iso = pcall(require, "NeoAI.sandbox.net.isolate")
+      netns_on = oki and iso and iso.enabled()
+        and not (opts.privileges and opts.privileges.docker_session)
+    end
+    if (sd_ok or cgroup.delegation_enabled()) and not gateway_on and not netns_on then
       local h, derr = cgroup.prepare_delegated("sess_" .. tostring(session_id), cgroup.resolve_limits())
       if h then
         deleg = h
@@ -556,7 +566,44 @@ function M.ensure(opts)
   for _, v in ipairs(prefix) do argv[#argv + 1] = v end
   argv[#argv + 1] = _shell_bin()
   argv[#argv + 1] = "-c"
-  argv[#argv + 1] = _server_script(sduser_mod and sduser_mod.boot_snippet() or nil)
+  local boot = sduser_mod and sduser_mod.boot_snippet() or nil
+  -- 非 root Agent：把会话私有可写目录交给映射后的 agent uid，否则 setpriv 后无法写入
+  -- fallback cwd / session tmp（真实工作区仍是只读 lower）。
+  local uid = priv and tonumber(priv.command_uid)
+  if uid and uid > 0 then
+    local chown = {}
+    for _, p in ipairs({ opts.fallback_cwd, opts.session_tmp_dir, opts.session_dir }) do
+      if type(p) == "string" and p ~= "" then
+        chown[#chown + 1] = "chown -R " .. uid .. ":" .. uid .. " " .. vim.fn.shellescape(p) .. " 2>/dev/null || true"
+      end
+    end
+    if #chown > 0 then
+      boot = table.concat(chown, "\n") .. "\n" .. (boot or "")
+    end
+  end
+  if priv and type(priv.boot) == "string" and priv.boot ~= "" then
+    boot = (boot and (boot .. "\n") or "") .. priv.boot
+  end
+  local exec_prefix = nil
+  if priv and vim.fn.executable("setpriv") == 1
+    and ((type(priv.command_seccomp) == "string" and priv.command_seccomp ~= "")
+      or tonumber(priv.command_uid)) then
+    local parts = { "setpriv" }
+    local uid = tonumber(priv.command_uid)
+    if uid and uid > 0 then
+      parts[#parts + 1] = "--reuid"; parts[#parts + 1] = tostring(uid)
+      parts[#parts + 1] = "--regid"; parts[#parts + 1] = tostring(uid)
+      parts[#parts + 1] = "--clear-groups"
+    end
+    parts[#parts + 1] = "--no-new-privs"
+    if type(priv.command_seccomp) == "string" and priv.command_seccomp ~= "" then
+      parts[#parts + 1] = "--seccomp-filter"
+      parts[#parts + 1] = vim.fn.shellescape(priv.command_seccomp)
+    end
+    parts[#parts + 1] = "--"
+    exec_prefix = table.concat(parts, " ")
+  end
+  argv[#argv + 1] = _server_script(boot, exec_prefix)
 
   -- 大文件物化收件箱：会话目录已 bind 进命名空间（沙箱内固定路径），宿主把大文件复制进
   -- 其 `.mat` 子目录后，只需向服务器发小帧令其在命名空间内复制，无需经 stdin 传输内容。
@@ -594,7 +641,7 @@ function M.ensure(opts)
       inst.buf = inst.buf .. table.concat(data, "\n")
       _drain(inst)
     end,
-    on_exit = function()
+    on_exit = function(_, code)
       inst.alive = false
       local ps = {}
       for _, p in pairs(inst.pendings or {}) do ps[#ps + 1] = p end
@@ -616,7 +663,9 @@ function M.ensure(opts)
   state.instance = inst
   -- 健康检查：确认命令服务器可用；失败则停止并交回一次性执行（避免命令挂起）。
   -- systemd --user 引导在服务器进入读取循环前执行，可能耗时数秒（含就绪等待），故放宽。
-  local health_ms = sduser_mod and 25000 or 3000
+  -- 私有 netns 首次启动包含 lo/socat 引导与 host bridge 就绪，放宽健康检查窗口，
+  -- 避免首条命令误报「常驻沙箱实例不可用」后依赖重试。
+  local health_ms = sduser_mod and 25000 or ((priv and priv.net_isolated) and 8000 or 3000)
   local healthy = false
   _request(inst, "X", "true", { timeout_ms = health_ms }):then_(
     function(res) healthy = res and res.code == 0 end, function() end)

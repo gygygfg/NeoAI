@@ -196,6 +196,42 @@ Tool calls are **executed in parallel** (`vim.schedule`), but their results are 
 message queue uniformly in the original call order** after `async.all` completes (`_execute_single` does not write directly). This guarantees that the order of the tool messages matches the assistant's `tool_calls`,
 keeping the API compatible and the prefix cache deterministic.
 
+### 4.4.1 Backgrounding Tools (a new message arrives while waiting for tools)
+
+When the tool loop is in the "model generation finished, waiting for tool results" phase and a new
+message arrives (from the user / system / a sub-agent), it **no longer waits for the whole batch**:
+
+- Only tools that have **actually started executing** (the pausable timer is running) are moved to the
+  background. If any tool in the batch is waiting for approval / `ask_user` / a consent window (timer not
+  running and not settled), the whole batch stays in the foreground and the message keeps waiting. When
+  the interaction ends and the remaining tools start/resume, the `utils.timer` `on_active` callback tries
+  to background again.
+- On backgrounding: the assistant message is marked with `background_tool_ids`, a
+  `tool is running in the background, IDs: ...` system note (`system_update=true`) is appended, then the
+  new message is injected (`mid_turn=true`), and the **next model round starts immediately**.
+- When a background tool finishes, its return info is **appended to the end of the context as a system
+  message** (`background_result=true`, carrying the original `tool_call_id` / tool name / duration). This
+  append **never triggers backgrounding again**; if a foreground batch / streaming generation is still in
+  progress, the result is queued and appended at the next safe boundary (no unpaired `tool_calls`, no
+  streaming write).
+- The loop ends only when there are no current tool calls, no background tools, and no pending messages.
+  While background tools remain, the state stays `tool_running`; every background completion appends its
+  result and starts another round so the model can react.
+- Request building: `context_builder._balance_tools` synthesizes a **stable** "running in the background"
+  placeholder tool result for `background_tool_ids` entries that have no real result yet (the text only
+  contains the id), so every `tool_call_id` has a paired result. The real background result does not
+  appear as an out-of-order tool message, so requests remain strictly append-only and the prefix cache is
+  preserved.
+- The system note / background result use `system_update` and degrade to the `user` role by default
+  (`ai.system_in_history=true` keeps `system`), avoiding DeepSeek-style endpoints hoisting the trailing
+  system message to the front and breaking the top-level system prompt / prefix cache.
+- Background results participate in lightweight tool-result pruning like normal tool results:
+  `tool_result_pruner` prunes `background_body` and rebuilds the model-visible `content`, so an oversized
+  background output cannot bypass pruning and blow the context.
+- Messages received while the model **is streaming** still wait for the current assistant message to
+  finish (they cannot be inserted into an in-progress write), then are injected at the next round
+  boundary; they no longer wait for tools.
+
 ## 5. Prefix Cache (prefix.lua)
 
 The strategy aligns with the context caching practices of deepseek-harness:

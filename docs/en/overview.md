@@ -330,6 +330,7 @@ require('NeoAI').setup({
 | `:NeoAI SandboxDiscard` | Discard a sandbox candidate |
 | `:NeoAI SandboxList` / `:NeoAI SandboxShow` | List / inspect pending sandbox candidates |
 | `:NeoAI SandboxCaps` / `:NeoAI SandboxDiag` | Sandbox runtime capability probe / resource-domain load diagnostics (137/OOM attribution) |
+| `:NeoAI SandboxKeys` | Compute key-file fingerprints (for `protected.preauthorized` bindings; no arg lists `~/.ssh` keys) |
 | `:NeoAI SandboxApprove` / `:NeoAI SandboxReject` | Approve (no apply) / reject & discard a change set |
 | `:NeoAI SandboxApply` / `:NeoAI SandboxApplyAll` | Approve and apply one / all pending change sets |
 | `:NeoAI SandboxGrant` / `:NeoAI SandboxRevoke` | Create a narrow task grant / revoke a grant |

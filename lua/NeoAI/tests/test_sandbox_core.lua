@@ -135,7 +135,13 @@ tests.suite("sandbox_core", function(_, it)
       require("NeoAI.tools").execute("edit_file", {
         file_path = p, mode = "write", content = "next\n", description = "t",
       }, {}):then_(function(r)
-        t.true_(not tostring(r):find("沙箱", 1, true), "结果不应向模型暴露沙箱暂存")
+        local s = tostring(r)
+        -- 反向契约（docs/sandbox.md「告知 AI」）：模型必须知道改动仍在暂存待审，
+        -- 但不能看到沙箱内部实现（overlay/暂存路径）。
+        t.true_(s:find("STAGED", 1, true) ~= nil, "结果应告知模型已暂存待审")
+        t.true_(s:find("change_set=", 1, true) ~= nil, "应带 change_set 供模型引用")
+        t.true_(s:find("retryable=false", 1, true) ~= nil, "待审不可通过重试解决")
+        t.true_(s:find("overlay", 1, true) == nil, "不应向模型暴露沙箱内部实现")
         t.eq("base", trim(fs.read_file(p)), "dry_run 不应改真实工作区")
         local list = sandbox.list()
         t.eq(1, #list, "应有一个待处理候选")

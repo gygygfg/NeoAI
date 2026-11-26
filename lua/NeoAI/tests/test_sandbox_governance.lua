@@ -854,7 +854,8 @@ tests.suite("sandbox_governance", function(_, it)
     local runtime = require("NeoAI.sandbox.execution.runtime")
     -- 关闭本机拦截（host_local_block）后，代理策略按 strip/passthrough/显式生效
     local function cfg(net)
-      return { tools = { sandbox = { network = vim.tbl_extend("force", { host_local_block = false }, net or {}) } } }
+      return { tools = { sandbox = { network = vim.tbl_extend("force",
+        { host_local_block = false, isolation = "off" }, net or {}) } } }
     end
     with_config(cfg(), function()
       local snippet = runtime.proxy_unset_snippet()
@@ -904,7 +905,7 @@ tests.suite("sandbox_governance", function(_, it)
     local function run(net_cfg, check)
       with_config({ tools = { approval = { mode = "async" }, sandbox = {
         mode = "dry_run", review = { enabled = true },
-        network = vim.tbl_extend("force", { proxy = "strip" }, net_cfg or {}),
+        network = vim.tbl_extend("force", { proxy = "strip", isolation = "off" }, net_cfg or {}),
       } } }, function()
         sandbox.reset()
         local done = false

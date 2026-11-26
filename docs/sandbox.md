@@ -470,9 +470,44 @@ token（`NEOKEY_…`）或格式保真假密钥时**拒绝写盘**（`SECRET_TOK
   打开两个会话时**不会看到对方的审批**；关闭任一实例只清理自己的暂存，不影响其它实例
   运行中的 agent。同一进程内热重载保持实例 id 不变，本实例的待审队列与暂存候选得以保留；
   已死进程遗留的实例目录在下次启动后由 `sandbox.instance.gc` 异步回收（不阻塞启动）。
-- **模型可见性**：工具结果**原样返回给模型**，不附加「已暂存/待审」说明，让 AI 认为
-  修改已完成；待审状态只通过**醒目的状态栏徽标**提示用户（`statusline` 的 `sandbox`
-  段，仅在待审数 > 0 时显示黄底加粗的 `待审N`，见 [configuration.md](configuration.md)）。
+- **模型可见性（告知 AI）**：工具结果会附加结构化结果信封，让模型知道发生了什么：
+  - `[沙箱] STAGED change_set=… files=N decision=NEEDS_CONFIRMATION`：改动已冻结在会话暂存层，
+    等用户在审批界面确认后写入真实文件；附 `retryable=false do_not_repeat=true`，
+    避免模型把「待审」当失败而反复重试。信封只含 change_set / 文件摘要 / 后果 id，
+    **不含** overlay/暂存路径等内部实现。
+  - `[沙箱] BLOCKED code=… resource=… op=… class=…`：命中不可审批解除的受保护资源时返回，
+    附 `reason`/`hint`（说明只能由用户在配置中放行）与 `retryable=false`。
+  - 待审状态仍通过**醒目的状态栏徽标**提示用户（`statusline` 的 `sandbox` 段，仅在待审数 > 0
+    时显示黄底加粗的 `待审N`，见 [configuration.md](configuration.md)）。
+- **后果告知（用户侧）**：审批弹窗与待审条目共用 `sandbox/review/consequence.lua` 的同一份文案
+  （能力 / 范围 / 持续 / 建议），资源分类见 `sandbox/protected/registry.lua`。命中受保护资源时：
+  弹窗在参数前插入后果块，并且**不提供**「允许所有（本会话）」与「允许并加入工作目录」——
+  前者会把一次同意洗成后续同一工具的静默放行，后者会把目录范围整体扩大；只留「仅本次」与取消。
+  待审条目头部以同一 id 展示后果摘要，保证「弹窗」与「列表」说法一致。
+- **免审批预授权绑定（`tools.sandbox.protected.preauthorized`）**：让**特定密钥**对**特定消费者**
+  （`egress` / `tool:<name>`）在**特定目标**上免弹窗（`sandbox/protected/preauthorize.lua`）。
+  三条硬约束：
+  - **指纹必填**：绑定的是「这把钥匙」（`sha256:<hex>`），`cp` 改名或换钥匙后立即失效；
+  - **只减审批、不加能力**：命中绑定不会让资源多出 op（SSH 私钥仍无 `read`），也不会放宽
+    `mask_paths` 的硬遮蔽；
+  - **不免审计**：每次命中写 `observe/audit`（含指纹前缀、消费者、目标、第几次）；
+    `expires_at` / `max_uses` 任一触发即重新走审批。未知目标（无法解析主机）一律不匹配。
+
+  与既有放行的关系：按目录（`tools.sandbox.git.credentials` 放开 `~/.ssh`）与按主机
+  （`secrets.trusted_services` / 模型供应商自动信任）的粗放放行仍然存在；预授权绑定是更细的
+  补充，不能反过来放宽它们。
+- **宿主侧 SSH 能力（`tools.sandbox.ssh`，默认关闭）**：让 AI 能用本机密钥，但**密钥不进入沙箱**。
+  - `ssh_run` 只接受 `alias + command`；`ssh_tunnel` 只接受 `alias + action + 端口/对端`；
+    host/user/port/私钥/`-o` 全部来自别名配置，AI 无法替换。
+  - 命令模板固定：`ssh -F /dev/null -o IdentitiesOnly=yes -o BatchMode=yes
+    -o PermitLocalCommand=no -o ForwardAgent=no -o StrictHostKeyChecking=… -i <key> … <host> -- <cmd>`；
+    别名必须声明 `fingerprint`（与 `:NeoAI SandboxKeys` 一致），密钥被替换/改名即拒绝。
+  - 隧道只允许 `-L 127.0.0.1:<lp>:<rh>:<rp>`；`rh` 命中别名 `remote_hosts` 白名单、`lp` 落在
+    `local_ports` 范围；不提供 `-R`/`-D`/`GatewayPorts`。`-f -N` 后台化后用 ControlPath 精确关闭。
+  - 每次调用都冻结为主机操作提案（`hostop`），用户在 `:NeoAI SandboxReview` 确认后由**宿主**
+    执行；`ssh_result(host_op_id)` 读回状态与输出。密钥只被宿主 openssh 进程读取。
+  - 因此「沙箱内自己编译 ssh / 自建 agent 客户端」拿不到任何可用的目标或密钥：被判定的对象是
+    「别名 + 动作」，而不是「哪个二进制在调用」。
 - 异步确认命令：
   - `:NeoAI SandboxReview` — 打开待审审批界面（`ui/components/sandbox_review.lua`）
     （**无待审/审批/留痕事项时同样打开窗口并展示空界面，不弹「无事项」提示、不自动关闭**；
@@ -1654,8 +1689,9 @@ seccomp（含设备节点屏障）**——沙箱内进程看到的是一份「�
   故 `mount`/`/proc/mounts`/`findmnt` 在沙箱内一致显示 **overlay/tmpfs** 根，`mount -o
   remount,rw /` 返回内核 `EPERM`（不再出现「ext4 根/宿主 UUID」这一源自宿主 fstab 的矛盾）。
   进程内 `read`/`fs_write` 工具不经 namespace，mount 遮蔽对其无效；执行器对路径参数额外
-  查询 `runtime.is_masked_path`，命中即**硬拒绝**（`路径位于宿主敏感遮蔽路径`，不可审批放行），
-  覆盖 `read_file`/`search_files`/`edit_file` 等直接读宿主的路径。
+  查询 `runtime.is_masked_path`，命中即**硬拒绝**并返回结构化结果
+  （`[沙箱] BLOCKED code=PROTECTED_RESOURCE resource=… op=… class=…`，附 `retryable=false`；
+  不可审批放行），覆盖 `read_file`/`search_files`/`edit_file` 等直接读宿主的路径。
 - **读取面：整机可写 overlay（`read_all`，默认开启）**：默认以 `/` 为只读 lower、会话私有
   upper/work 为可写层挂载整机根 overlay——沙箱内根文件系统**原样可写**（任意路径可写，不再有
   `Read-only file system`），所有写入进 upper 暂存并在命令结束后冻结为候选，宿主盘不受影响。
@@ -1675,6 +1711,16 @@ seccomp（含设备节点屏障）**——沙箱内进程看到的是一份「�
   > `/sys/fs/cgroup` 可写亦仅限于 `delegate_cgroup` 暴露的**委派子树**（`prepare_delegated`
   > 的 `leaf`），限额写在不可写的 `limit_path` 上并按 cgroup v2 层级物理封顶；宿主其它 cgroup
   > 不可见、不可写。`read_all=false` 时这些路径退回只读。
+  > **认证/加载器路径例外（整机 overlay 下仍只读）**：`/etc/pam.d`、`/etc/security`、
+  > `/etc/ld.so.conf`、`/etc/ld.so.conf.d`、`/root/.bashrc`、`/root/.profile` 等以 `--ro-bind`
+  > 覆盖到 overlay 之上（可读不可写）；`/etc/ld.so.preload` 强制遮蔽为 `/dev/null`
+  > （宿主不存在时也阻止创建）。目的是消除「沙箱内改写认证配置或注入加载器 → 会话内提权/
+  > 代码注入」的原语。
+  > `/etc/passwd`、`/etc/group`、`/etc/systemd`、`/etc/profile*`、其它用户 home **保持可写**：
+  > `useradd`/`adduser` 需要在沙箱内把账户库写入 overlay（既有系统管理能力），systemd 单元与
+  > 包安装产物也由门面/候选管线托管；非 root home 可能不可穿越（ro-bind 源解析失败会让 bwrap
+  > 整体失败）。这些写入仍会被冻结为待审候选，**宿主真实盘不变**（红队实测：root rc/pam/
+  > ld.so.conf/ld.so.preload 写入被拒；passwd 写入仅进 overlay，宿主哈希不变）。
   - **越界访问留痕（非阻塞）**：访问 `cwd` 之外的用户工作目录（home/root 之下）时记录
     证据（`evidence` kind=observation）并发出 `sandbox:outside_access` 事件，同时在审批悬浮窗
     `:NeoAI SandboxReview` 的「越界访问留痕」区展示；仍直接放行读取，不阻断。展示时**按文件
@@ -1811,6 +1857,12 @@ seccomp（含设备节点屏障）**——沙箱内进程看到的是一份「�
   `"allow"` 直接放行并记录（旧行为），`"deny"` 直接拒绝。弹窗由
    `ui/components/net_consent.lua` 提供（`<CR>` 仅本次 / `S` 本次会话始终 / `Esc` 拒绝），
    决策经 `sandbox/net/net_consent` 的服务端会话白名单记忆。headless/无 UI 时失败关闭（拒绝）。
+   - **仅记录模式（`network.record_only=true`，默认关）**：网络请求一律放行、不弹同意窗、
+     不拦截代理规避，只记录目标；覆盖 `access` 与 `network.enabled`，并在
+     `host_local_block=false` 时也启动宿主过滤代理/注入代理变量以保留记录。记录写入独立环形
+     缓冲（不被命令结果摘要 drain），用 `:NeoAI SandboxAudit network` 查看。`offline=true` 仍
+     硬隔离；`network.gateway` 启用时以网关为准；裸 TCP/UDP 仍受默认 `isolation="proxy"` 的
+     netns 边界限制。
    发起请求时经统一事件 `sandbox:consent_requested` 广播（`page="network"`；旧的
    `sandbox:net_consent_requested` 保留常量）。长驻服务启动时按 `PORT`/`--port` 等
    声明自动登记内部端口（`net_consent.register_from_command`）。
@@ -1851,13 +1903,23 @@ seccomp（含设备节点屏障）**——沙箱内进程看到的是一份「�
   `nil`（默认）= 自动沿用宿主 `https_proxy`/`http_proxy`/`all_proxy`；`false`/`""` = 不链
   （直连）；字符串 = 显式 URL（`http://127.0.0.1:7890` / `socks5h://127.0.0.1:1080`）。
   本机目标与宿主 `no_proxy` 命中者始终直连。
-- **边界（重要）**：这是**应用层**过滤。**不认代理的裸 TCP**（`nc`/`ssh`/数据库客户端、
-  忽略代理变量的工具）在共享 netns 下可直连宿主本机，不受此层约束。要硬拦截裸 TCP 只能：
-  root + iptables/nft（按目的地过滤），或无 root 的 `slirp4netns`/`passt`（原生用户态
-  网络栈，本机未安装）——本插件不引入这些依赖。故本机拦截为「非硬边界」，见
-  `sandbox/net/host_proxy.lua` 模块头。
+- **默认私有 netns（`network.isolation="proxy"`）**：载荷运行在只有 loopback 的独立
+  netns，外部访问必须经宿主代理（沙箱内 socat → Unix socket → `host_proxy`）。因此
+  **裸 TCP/UDP、裸 socket 无路由**，宿主回环/网卡/云元数据不可达；curl/pip/git 等遵守
+  代理变量的工具仍可出网。root 用宿主 `ip netns`（lo 由宿主拉起，载荷不持 CAP_NET_ADMIN）；
+  非 root 用 bwrap userns+netns（载荷临时持有仅作用于该 userns/netns 的 CAP_NET_ADMIN）。
+  `:NeoAI SandboxCaps` 显示 `net_isolation` 状态。沙箱内 `127.0.0.1/localhost` 直连（访问沙箱
+  自己的服务），外部目标才走代理。
+  - 依赖：`socat`（宿主与沙箱内均需）、root 下的 `ip`（iproute2）。缺失时按
+    `isolation_fail_closed`（默认 true）断网，或显式降级共享 netns 并告警。
+  - 例外：容器会话（rootless dockerd/podman）与 LSP 子进程不套用隔离（前者需要自身网络栈，
+    后者常需 provider 网络）；非 HTTP 协议（数据库/SSH/裸 UDP）默认不可用。
+- **仅 `network.isolation="off"`（旧共享 netns）时**下列应用层边界才成立：不认代理的裸 TCP
+  （`nc`/`ssh`/数据库客户端）可直连宿主本机。默认模式已用私有 netns 从内核层阻断；
+  隔离不可用时按 `isolation_fail_closed`（默认 true）断网，或显式降级共享 netns 并告警。
 - **代理规避确认**：显式清除/绕过代理（`unset *proxy`、`env -u *proxy`、`curl --noproxy`、
-  `--proxy ""`/`-x ''`、`export *proxy=`）会使上述过滤失效，门禁在进入沙箱前对**折叠后的
+  `--proxy ""`/`-x ''`、`export *proxy=`）在共享 netns（`isolation="off"`）下会使上述过滤失效；
+  默认私有 netns 下清除代理只会断网（fail-closed）。门禁在进入沙箱前对**折叠后的
   有效命令**识别（`PROXY_EVASION:*`），默认**暂停 Agent 并弹窗询问**（`network.block_proxy_evasion=true`：
   仅本次允许 / 本次会话始终允许 / 拒绝）。弹窗为与网络同意/工具审批/设备同意一致的**沙箱浮窗**
   （`ui/components/policy_consent.lua`，标题「⚠ 沙箱策略确认」，`<CR>` 仅本次 / `S` 本次会话始终 /
@@ -1866,7 +1928,10 @@ seccomp（含设备节点屏障）**——沙箱内进程看到的是一份「�
   判定前先做 shell 规范化：还原引号拼接（`--noprox''y`）、ANSI-C 引用（`$'--noproxy'`）与
   反斜杠转义，并展开同一命令内 `NAME=value` 的简单变量（`c=--noproxy; curl $c`），防止静态
   扫描被拼接/变量绕过。`-x` 仅在 curl 段上等同 `--proxy`（`set -x`/`tar -x`/`grep -x`/
-  `bash -x` 等非代理开关不再误报）。headless（无 attached UI）无法弹窗时失败关闭（拒绝）。
+  `bash -x` 等非代理开关不再误报）。**包装器前缀**会被先剥离再判定（`timeout`/`nice`/`nohup`/
+  `setsid`/`sudo`/`doas`/`xargs`/`command`/`exec`/`env`/`stdbuf`/`script`/…）——红队实测
+  `timeout 8 env -u http_proxy curl …` 曾因只看片段首 token 而绕过，现已命中
+  `PROXY_EVASION:env-unset`。headless（无 attached UI）无法弹窗时失败关闭（拒绝）。
   - **性质（核心不变量 6）**：这是**启发式文本判定**，规范化只能提高命中率、不能保证完备
     （`f() { unset https_proxy; }; f`、脚本内动态拼接仍可绕过）。它的正当用途是**在很可能
     降低安全档位时强制人工复核**，而不是充当边界；真正的边界是 netns + `host_local_block`
@@ -2017,6 +2082,7 @@ require("NeoAI").setup({
       process_roots = {},            -- run_command 可写根（默认仅 cwd，自动补入；按需加回更多）
       network = {
         host_local_block = true,     -- 拦截向宿主本机的访问（应用层；裸 TCP 不覆盖，见 §6.1）
+        record_only = false,         -- 仅记录模式：网络一律放行（不弹窗）并记录可查；覆盖 access/network.enabled
         host_local_proxy_port = 0,   -- 宿主过滤代理端口（0 = 自动分配 loopback 随机端口）
         upstream_proxy = nil,        -- 宿主上游代理链式出网：nil=自动沿用宿主 *_PROXY；false/""=不链；字符串=显式 URL
         proxy = "strip",             -- strip | passthrough | { http, https, all, no_proxy }
@@ -2606,18 +2672,22 @@ UI 未注册但为**交互式 Neovim** 时，回退到内建 `confirm` **暂停�
 - `allowlist` 可再加 Lua pattern 排除。参数见
   [configuration.md](configuration.md) 的 `tools.sandbox.secrets`。
 
-### 16.6 环境变量：沙箱进程拿到真实值，AI 只见假密钥
+### 16.6 环境变量：默认只给 token，真实值需显式开启
 
-`sanitized_env()` 生成假化覆盖（供日志/审计与 AI 可见面）；`sandbox_env()` 在构造沙箱
-进程环境时会把假密钥还原为真实密钥——**假→真实的替换仅允许发生在沙箱内部进程**。
-因此：
+`sanitized_env()` 生成 token 覆盖（供日志/审计与 AI 可见面）；`sandbox_env()` 构造沙箱
+进程环境。
 
-- 沙箱内程序（`curl`/`pip`/`python` 等）使用**真实密钥**，不会因遮蔽而 401 / 构建失败。
-- 命令输出回传模型前会重新假化，AI 仍只看到格式保真的假密钥；`NEOAI_TOKENIZED_ENV`
-  列出被遮蔽的变量名，便于判断哪些值在 AI 可见输出中是假密钥。
-- 需要整体关闭环境变量假化（调试 / 本地可信运行时）时，设
-  `tools.sandbox.secrets.tokenize_env = false`；工具结果与暂存内容仍按密钥防护处理。
-  **注意这会降低隔离强度，仅建议在可信环境临时使用。**
+- 默认（`tools.sandbox.secrets.real_env_values=false`）：载荷 env 里只有格式保真假值（token），
+  **真实密钥不进入子进程**。这样即便 AI 用 `os.environ` 枚举全部变量、再用裸 socket 外发，
+  拿到的也只是 token。
+- 命令参数中显式出现的 token 仍会在执行前还原为真实值（`wrapper` 的 `detokenize`）；该路径
+  受 `secret_egress` 门禁约束（携带密钥访问非白名单目标 → 弹窗 / headless 拒绝）。
+- 命令输出回传模型前会假化，AI 仍只看到格式保真假密钥；`NEOAI_TOKENIZED_ENV`
+  列出被遮蔽的变量名。
+- 若确有命令必须直接读取 env 中的真实密钥（如 `gh`、私有 registry），设
+  `tools.sandbox.secrets.real_env_values = true`。**这会恢复「沙箱内任意命令都能外发真实密钥」
+  的风险，仅在明确信任任务时使用。**
+- `tokenize_env=false` 仍可整体关闭 env token 化（调试用，隔离更弱）。
 
 ### 16.7 加密映射与生命周期
 
@@ -2747,7 +2817,10 @@ UI 未注册但为**交互式 Neovim** 时，回退到内建 `confirm` **暂停�
   `auto_escalate=false` 关闭。
 - 留痕：每次档位裁决/升级记录证据（`record=true` 默认开）与事件。
 
-### 容器（方案：只走 podman，永不连宿主 docker daemon）
+### 容器（无会话 runtime 时：只走 podman，永不连宿主 docker daemon）
+
+> 自动档位为 N1/N2 时，`docker` 不再走本节改写，而是连接会话内 rootless runtime 的 broker
+> （见上节「会话内 Docker」）。本节描述无会话 runtime / 容器门面启用时的回退行为。
 
 沙箱**永不绑定宿主 `/var/run/docker.sock`**（始终遮蔽）。容器命令一律在沙箱内**真执行**：
 
@@ -2791,8 +2864,31 @@ UI 未注册但为**交互式 Neovim** 时，回退到内建 `confirm` **暂停�
   也只会以为「本机没跑 docker daemon」或「docker 被路由到了 podman」，而非「我在沙箱里」。
 - 远程/连接型（`--remote`/`-H`/`--connection`）与宿主 VM 子命令（`machine`）：出于安全拒绝，同样以
   真机样式文本呈现，不含沙箱字样。
-- `tools.sandbox.docker`（`mode`/`socket`）**已弃用**：无论取值都不再挂载/连接任何 socket，保留仅为
-  兼容既有配置。
+- Docker 方向**不再有用户配置**：`tools.sandbox.docker.mode/socket` 与
+  `tools.privileged_mode.docker_socket` 已删除；运行时自动探测最高安全档位。永不连接宿主
+  docker daemon，也不挂载真实 `docker.sock`。
+
+### 会话内 Docker（自动档位 / 宿主 broker / 重建）
+
+- **自动档位**（`sandbox/docker/probe.lua`）：`N0` 无会话 runtime；`N1` userns 内
+  rootless podman system service / rootless dockerd；`N2` N1 + microVM/gVisor。无用户 mode。
+- **会话 runtime**：`sandbox/docker/session.lua` 准备宿主可见 socket 目录；常驻会话的 boot
+  片段在 userns+mnt ns 内启动 rootless runtime，容器天然是该 ns 的后代，退出随 ns 销毁。
+  非 root 启动时用 RootlessKit 映射 subuid，Agent 命令经 `setpriv` 降为专用 uid，无法直接打开
+  root-owned 的 runtime.sock，只能走 broker；root 启动的 bwrap 单映射无法 setuid 到未映射 uid，
+  保持 userns root（broker 退化为策略层，档位与状态会在 `:NeoAI SandboxDocker` 标注）。
+- **宿主 broker**（`sandbox/docker/broker.lua`）：自研 Unix socket 代理，解析 Docker Engine API
+  并做 endpoint 白名单 + `HostConfig`/`Mounts`/`NetworkMode`/`SecurityOpt` 等 body 检查；
+  **不直接转发原始字节**，而是重新编码后转发。默认拒绝 `/exec`、`/build`、`/swarm`、`/volumes` 等。
+  直接调用 `podman`（不经 Docker API）不经过 broker，其边界是会话 userns；需要 body 检查时走
+  `docker`/`podman --remote` 到 broker。
+- **容器审查**（`sandbox/docker/review.lua`）：AI 可操作任何审查通过的容器，不再要求“自己创建”；
+  `blocked` 不可批准，`sensitive` 的 logs/exec/rm 需用户批准（`:NeoAI SandboxDocker`）。
+- **资源监测**（`sandbox/docker/monitor.lua`）：安全容器**不拒绝网络**；CPU/内存/PIDs/OOM
+  持续超限时自动 kill，并把原因追加到下一条 `run_command` 结果回报 Agent。
+- **退出重建**（`sandbox/docker/specs.lua`）：容器随 userns 销毁；保存重建规格。**所有**容器
+  都进入重建流程：安全规格自动重建（原运行中则启动；原已关闭则只 create、不 start，并在终端
+  打印重建命令与安全性）；非安全规格进入 pending，需 `:NeoAI SandboxDocker approve`。
 
 ### T2 主机效果提案
 
@@ -2811,7 +2907,8 @@ T2 命令在嵌套 userns 内执行（`--unshare-all` + 可选 `--cap-add`，cap
 
 ### 配置
 
-见 [configuration.md](configuration.md) 的 `tools.sandbox.privilege` 与 `tools.sandbox.docker`。
+见 [configuration.md](configuration.md) 的 `tools.sandbox.privilege`。Docker 方向无用户配置，
+由运行时自动探测（见 `:NeoAI SandboxCaps` / `:NeoAI SandboxDocker`）。
 
 ### 17.1 载荷运行身份、overlay 可写实测与写入提权
 
@@ -3015,16 +3112,12 @@ containers.conf，也不把 docker 伪装成「daemon 未运行」错误——�
 受控计划写入 `kind="container"` 证据并发出 `SANDBOX_CONTAINER_PLANNED`；被拒绝的调用发出
 `SANDBOX_CONTAINER_UNSUPPORTED` 并写入审计（真实原因仅进审计/UI，不回传模型）。配置：
 `tools.sandbox.container`（`enabled`/`share_namespace`/`docker_to_podman`/`runtime_caps`/`seccomp`/
-`containers_conf`/`allow_nonroot`）；`tools.sandbox.docker`（`mode`/`socket`）**已弃用**、不再读取。
+`containers_conf`/`allow_nonroot`）。Docker 方向无用户配置。
 
-**高权限模式的显式例外**（`tools.privileged_mode.enabled=true` + 仅 `tools.approval.mode="async"`）：
-用户手动进入 PRIV 模式后，容器门面与入口桩完全旁路，`docker` 挂载宿主
-`/run/docker.sock`（或配置的 `docker_socket`）并注入 `DOCKER_HOST`，`podman/buildah` 补容器能力；
-网络强制 `access="allow"`、解除 `offline=true`，但仍经 `host_proxy` 记录目标；SSH 密钥/agent 路径
-（`~/.ssh`、`/home/*/.ssh`、`/run/ssh-agent.socket` 等）不进入遮蔽挂载（`unmask_ssh_keys=true`）。
-此时容器由宿主 daemon 在沙箱外创建、**不进入候选/审批**，socket 等价宿主 root 能力；SSH 私钥的
-读取/使用也不再经过遮蔽审批。文件的普通读写仍走 overlay/待审。该模式默认关闭，不能由 AI 自行
-切换到 PRIV。
+**高权限模式**（`tools.privileged_mode.enabled=true` + 仅 `tools.approval.mode="async"`）：
+PRIV 只放宽网络（仅记录）与 SSH 遮蔽；**不再**旁路到宿主 docker daemon，也不挂载
+`/run/docker.sock`。Docker 统一由自动探测的会话内 rootless runtime + 宿主 broker 提供，
+容器随会话 userns 销毁；PRIV 不会提升 Docker 档位。该模式默认关闭，不能由 AI 自行切换到 PRIV。
 
 **判定口径与生效时机**：网络放行是**进程级**的——只要进程内仍存在一个 PRIV 会话，网络即整体放行
 并记录（宿主侧过滤代理是共享单例，连接回调里没有 Agent 上下文）。UI 焦点在多个聊天窗口 / 子 Agent
@@ -3085,7 +3178,10 @@ L2+ 与包/密钥仍进入待审。目的是即便仅靠本地模型的智能水
   `git_fetch`/`git_pull` 在沙箱内经宿主过滤代理访问远程，`.`git` 对象/跟踪 refs（`pull` 另含
   工作区改动）原子暂存进审批悬浮窗；`github.com`/`githubusercontent.com` 默认静默放行，其余远程
   按 `tools.sandbox.network.access` 弹窗同意。远程认证按 `tools.sandbox.git.credentials`：
-  `host_ssh`（默认，只读放开宿主 `~/.ssh`）| `host`（另含 `~/.git-credentials` 等）| `isolate`。
+  `host_ssh`（默认，只读放开宿主 `~/.ssh`）| `host`（另含 `~/.git-credentials` 等）| `isolate` |
+  `preauth`（只放开 `protected.preauthorized` 指纹命中的私钥 + `known_hosts`，按 remote 主机匹配
+  `consumers`/`targets`；单文件只读绑定，`~/.ssh` 目录仍是空 tmpfs；`GIT_SSH_COMMAND` 用
+  `-F /dev/null -o IdentitiesOnly=yes` 消除 ssh config 的执行面；无命中绑定则 fail-closed）。
   SSH remote（`git@host:...`）为裸 TCP，默认注入经沙箱 SOCKS 入口的 `ProxyCommand`
   （`tools.sandbox.git.ssh_proxy`，auto 时优先 `socat` 其次 `ncat`；`false` 关闭；字符串自定义），
   使 SSH 也经宿主过滤代理出网/受检查。
@@ -3110,19 +3206,38 @@ L2+ 与包/密钥仍进入待审。目的是即便仅靠本地模型的智能水
 本节按审计发现分级记录：**已修复 / 已缓解 / 设计边界**。设计边界是「不引入新依赖或
 不破坏正常联网/构建」的取舍结果，不是缺陷；缓解手段也可能被更复杂的命令绕过。
 
+### 19.0 隔离后端
+
+- **unshare 后端（无 mount 命名空间）不提供文件系统隔离**：bwrap 不可用时回退 `unshare`，
+  载荷在 userns 内以 root 运行；root 启动时该 userns root 映射到宿主 root，可直接写宿主
+  `/etc/**` 等路径（红队演练中因 bwrap 探测临时失败而回退时实测确认）。**生产环境必须保证
+  bwrap 可用**；无 bwrap 的 root 环境不应把该后端当作安全边界。
+
 ### 19.1 网络
 
 - **代理规避（已缓解）**：`host_local_block` 依赖代理变量生效，显式清除/绕过代理
   （`unset *proxy`、`env -u *proxy`、`curl --noproxy`、`--proxy ""`/`-x ''`、`export *proxy=`）
-  会让过滤失效、直达宿主本机。门禁在命令进入沙箱前识别**脚本折叠后的有效命令**
+  在**共享 netns**（`isolation="off"`）下会让过滤失效、直达宿主本机；默认私有 netns 下
+  清除代理只会断网（fail-closed），不会直达宿主。门禁在命令进入沙箱前识别**脚本折叠后的有效命令**
   （`PROXY_EVASION:*`），默认**暂停并弹窗询问**（`tools.sandbox.network.block_proxy_evasion=true`）；
   `"deny"` 直接拒绝，`false` 放行且不询问；headless 无 UI 时失败关闭。
   判定前先做 shell 规范化（引号拼接 `--noprox''y`、ANSI-C 引用 `$'--noproxy'`、反斜杠转义）
   并展开同命令内简单变量（`c=--noproxy; curl $c`），避免拼接/变量绕过；`-x` 仅对 curl 视为
-  `--proxy`，避免 `set -x` 等被误报。
-- **裸 TCP（设计边界）**：不认代理的工具（`nc`/`ssh`/数据库客户端/自建 socket）在共享 netns
-  下不经代理即可直连宿主本机。内核层按目的地过滤需要 root + iptables/nft 或
-  `slirp4netns`/`passt`（本插件不引入）。要硬边界请启用 `network.gateway`（独立 netns）。
+  `--proxy`，避免 `set -x` 等被误报。**包装器前缀**（`timeout`/`nice`/`nohup`/`setsid`/`sudo`/
+  `xargs`/`command`/`env` 等）会先剥离再判定——红队实测的 `timeout 8 env -u …` 已修复。
+- **裸 TCP（默认已阻断；仅 `isolation="off"` 时为设计边界）**：默认私有 netns 下裸 TCP/UDP
+  无路由（`ENETUNREACH`），宿主回环/网卡不可达。`isolation="off"` 退回共享 netns 时，
+  不认代理的工具可直连宿主本机；此时要硬边界请启用 `isolation="proxy"` 或 `network.gateway`。
+  私有 netns 只提供 loopback + 宿主代理：非 HTTP 协议（数据库/SSH/裸 UDP）默认不可用。
+- **载荷 env 中的真实密钥（已缓解）**：默认 `secrets.real_env_values=false`，沙箱进程只拿到
+  格式保真假值（token），真实值不进入载荷；命令参数里的 token 在执行前还原且受 `secret_egress`
+  约束。即使裸 TCP 可用，枚举 env 也只能拿到 token。显式开启 `real_env_values=true` 会恢复
+  旧行为（真实值进入载荷），仅在信任任务时使用。
+- **同意弹窗在 headless 悬挂（已修复）**：`secret_alert` / `device_consent` / `net_consent` /
+  `policy_consent` 的弹窗 UI 在 `--headless` 下仍会被注册，但无窗口可渲染；此前 `available()`
+  只判断「是否注册了 UI」，导致 `request()` 永久等待（工具悬挂、后续命令被 setup 锁阻塞）。
+  现在真实渲染器以 `requires_ui=true` 注册，`available()` 在无 attached UI 时返回 false，
+  统一失败关闭。
 - **回环过度拦截（已缓解）**：共享 netns 下无法按地址区分宿主/沙箱回环，故默认对未登记的回环
   目标走 ask/deny。现按 **cgroup 归属**自动识别沙箱内进程监听的端口（LISTEN socket inode 属于
   `/neoai/` 域）并登记为内部端口免权限——沙箱内命令启动的临时服务（未走 service 模块、未声明

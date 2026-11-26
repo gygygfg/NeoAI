@@ -295,6 +295,20 @@ hook) — the worktree directory is deleted and `git worktree prune` runs on the
 dangling entry is left in `.git/worktrees` (`worktree_guard` + `worktree_cleanup`; still fail-closed
 when `read_all=false` and the target is not covered by a writable root).
 
+### 🔐 Host-side SSH (ssh.lua, off by default)
+
+`ssh_run` (`alias`/`command`), `ssh_tunnel` (`action=open|close` + `alias`/`local_port`/
+`remote_host?`/`remote_port?`) and `ssh_result` (`host_op_id`).
+
+None of them run a process inside the sandbox: `ssh_run`/`ssh_tunnel` hand the request to
+`sandbox/ssh/broker`, which builds a fixed host `ssh` command from the **alias config** and freezes
+it as a host-op proposal (`hostop`). Only after the user confirms it in `:NeoAI SandboxReview` does
+it run on the host, and `ssh_result` reads back status/output. Keys never enter the sandbox (no
+file, no fd, no agent socket), and the AI cannot substitute host/port/key or pass `-o`. Tunnels are
+loopback-only (`-L 127.0.0.1:…`) with target hosts and the local-port range pre-declared (no
+`-R`/`-D`). Config: `tools.sandbox.ssh` ([configuration.md](configuration.md)); security model:
+[sandbox.md](sandbox.md).
+
 ### 🔧 LSP (lsp_ops.lua, Neovim >= 0.12)
 
 `lsp_hover` / `lsp_definition` / `lsp_references` / `lsp_implementation` / `lsp_declaration` /

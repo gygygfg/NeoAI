@@ -1,7 +1,8 @@
 --- 沙箱网络边界（沙箱外视角 + 真实 bwrap）
 --- @module 'NeoAI.tests.test_sandbox_boundary_net'
---- 覆盖：宿主过滤代理本机拦截与服务进程身份；裸 TCP 基线（设计边界）；沙箱内监听端口反向
---- 暴露；DNS；端口+服务进程粒度弹窗端到端（批准放行 / 拒绝拦截）。全部使用本地 mock，离线。
+--- 覆盖：宿主过滤代理本机拦截与服务进程身份；私有 netns 下裸 TCP 无路由；沙箱内监听端口
+--- 不再反向暴露；localhost 解析；端口+服务进程粒度弹窗端到端（批准放行 / 拒绝拦截）。
+--- 全部使用本地 mock，离线。
 
 local tests = require("NeoAI.tests")
 local H = require("NeoAI.tests.sandbox_boundary_helpers")
@@ -64,19 +65,24 @@ tests.suite("sandbox_boundary_net", function(_, it)
     hp.stop(); close_srv(); hp.reset(); nc.reset()
   end)
 
-  it("[设计边界基线] 裸 TCP 不经代理可直连宿主本机端口", function(t)
+  it("私有 netns：裸 TCP 无路由，无法绕过代理直连宿主本机", function(t)
     if not H.bwrap() or not H.has("python3") then return end
     local port, close_srv = host_echo()
     with_config({ tools = { approval = { mode = "auto_allow" },
       sandbox = { enabled = true, fail_closed = true, mode = "dry_run", resident = { enabled = true } } } }, function()
-      local out = run_in_sandbox(("python3 -c \"import socket;s=socket.create_connection(('127.0.0.1',%d),3);s.sendall(b'ping');print('RAW_OK',s.recv(16));s.close()\""):format(port))
-      -- 固化基线：裸 TCP（不认代理）在共享 netns 下可直达宿主本机——应用层过滤无法覆盖。
-      t.matches("RAW_OK", out, "基线：裸 TCP 应可达宿主本机（设计边界），实际: " .. out)
+      local out = run_in_sandbox(([[python3 -c "import socket
+try:
+  s=socket.create_connection(('127.0.0.1',%d),3); s.sendall(b'ping'); print('RAW_OK',s.recv(16)); s.close()
+except OSError as e:
+  print('RAW_BLOCKED', e.errno)"]]):format(port))
+      -- 私有 netns 下 127.0.0.1 是沙箱自己的 loopback：宿主监听端口不可达。
+      t.matches("RAW_BLOCKED", out, "裸 TCP 应被私有 netns 阻断，实际: " .. out)
+      t.true_(out:find("RAW_OK", 1, true) == nil, "不得出现 RAW_OK")
     end)
     close_srv()
   end)
 
-  it("反向暴露：沙箱内监听的端口宿主可连接（共享 netns）", function(t)
+  it("私有 netns：沙箱内监听端口不再反向暴露给宿主", function(t)
     if not H.bwrap() or not H.has("python3") then return end
     local resident = require("NeoAI.sandbox.execution.resident")
     if not resident.available() then return end
@@ -91,15 +97,15 @@ tests.suite("sandbox_boundary_net", function(_, it)
       cli:connect("127.0.0.1", port, function(err)
         connected = (err == nil); done = true
       end)
-      vim.wait(5000, function() return done end, 20)
-      t.true_(connected, "宿主应能连入沙箱内监听端口（共享 netns 基线）")
+      vim.wait(3000, function() return done end, 20)
+      t.false_(connected, "私有 netns 下宿主不应能连入沙箱监听端口")
       pcall(function() cli:close() end)
       run_in_sandbox("pkill -f 'http.server " .. port .. "' >/dev/null 2>&1; true")
       resident.stop({ timeout_ms = 5000 })
     end)
   end)
 
-  it("DNS：沙箱内可解析 localhost（resolv.conf 净化后仍可用）", function(t)
+  it("localhost 解析：/etc/hosts 仍可用（不依赖宿主 DNS）", function(t)
     if not H.bwrap() or not H.has("python3") then return end
     with_config({ tools = { approval = { mode = "auto_allow" },
       sandbox = { enabled = true, fail_closed = true, mode = "dry_run", resident = { enabled = true } } } }, function()
@@ -114,9 +120,18 @@ tests.suite("sandbox_boundary_net", function(_, it)
     if not resident.available() then return end
     local hp = require("NeoAI.sandbox.net.host_proxy")
     local nc = require("NeoAI.sandbox.net.net_consent")
-    -- 宿主侧 HTTP 服务（python3），comm 可识别
+    -- 私有 netns 下 127.0.0.1 是沙箱自身 loopback（NO_PROXY 直连），要触达**宿主**服务
+    -- 必须用宿主非回环 IP（经代理 → host_local_block → 同意门禁）。
+    local host_ip
+    for _, a in ipairs(vim.uv.interface_addresses()) do
+      if (a.family == "inet" or a.family == 2) and not tostring(a.address):match("^127%.") then
+        host_ip = a.address
+        break
+      end
+    end
+    if not host_ip then return end
     local port = 38992
-    local srv = vim.fn.jobstart({ "python3", "-m", "http.server", tostring(port), "--bind", "127.0.0.1" },
+    local srv = vim.fn.jobstart({ "python3", "-m", "http.server", tostring(port), "--bind", "0.0.0.0" },
       { detach = false })
     t.true_(srv > 0, "应能启动宿主 mock 服务")
     vim.wait(1200)
@@ -127,12 +142,12 @@ tests.suite("sandbox_boundary_net", function(_, it)
       local owner_comm
       -- 1) 拒绝：应拦截
       nc.set_ui({ show = function(ctx, decide) owner_comm = ctx.service and ctx.service.comm; decide("deny") end })
-      local denied = run_in_sandbox(("curl -s -m 5 -o /dev/null -w '%%{http_code}' http://127.0.0.1:%d/"):format(port))
+      local denied = run_in_sandbox(("curl -s -m 5 -o /dev/null -w '%%{http_code}' http://%s:%d/"):format(host_ip, port))
       t.matches("403", denied, "拒绝时经代理应返回 403，实际: " .. denied)
       t.not_nil(owner_comm, "弹窗应携带宿主服务进程身份")
       -- 2) 批准：应放行
       nc.set_ui({ show = function(_, decide) decide("allow_once") end })
-      local ok = run_in_sandbox(("curl -s -m 5 -o /dev/null -w '%%{http_code}' http://127.0.0.1:%d/"):format(port))
+      local ok = run_in_sandbox(("curl -s -m 5 -o /dev/null -w '%%{http_code}' http://%s:%d/"):format(host_ip, port))
       t.matches("200", ok, "批准后应放行（200），实际: " .. ok)
       resident.stop({ timeout_ms = 5000 })
     end)

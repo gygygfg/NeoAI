@@ -240,7 +240,10 @@ end
 --- @return boolean
 function M.available()
   if not M.enabled() then return false end
-  return state.ui ~= nil and type(state.ui.show) == "function"
+  if state.ui == nil or type(state.ui.show) ~= "function" then return false end
+  -- `requires_ui` 的渲染器在 --headless 下无法展示：若仍视为可用，request 会永久等待。
+  if state.ui.requires_ui and not _interactive() then return false end
+  return true
 end
 
 --- 是否可向用户呈现同意界面（独立弹窗或统一审批窗口任一可用，且确有可交互 UI）。

@@ -54,6 +54,10 @@ local SPECS = {
   -- `.git` 文件，均为 pointer，由候选管线原子化捕获/发布）。落点经 `worktree_guard` 校验。
   git_worktree = { effect = "process" },
   git_auto_commit_config = { effect = "in_process" },
+  -- 宿主侧 SSH 能力（密钥不进沙箱）：工具本身不启动进程，只把命令冻结为主机操作提案。
+  ssh_run = { effect = "in_process" },
+  ssh_tunnel = { effect = "in_process" },
+  ssh_result = { effect = "read" },
   -- 日志
   log_message = { effect = "fs_write" },
   get_log_levels = { effect = "in_process" },
