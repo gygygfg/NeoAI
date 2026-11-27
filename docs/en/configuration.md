@@ -613,6 +613,7 @@ sandbox = {
     -- IPs/link-local/cloud metadata): inject HTTP(S)_PROXY/ALL_PROXY pointing at the host-side Lua
     -- filtering proxy. Application-layer boundary: raw TCP can bypass it.
     host_local_block = true,
+    java_proxy = true,               -- JVM tools (Gradle/Maven/Java) ignore HTTP(S)_PROXY and only honor -Dhttp(s).proxyHost; with no DNS in the private netns `./gradlew` fails with UnknownHostException. When on (default), the injected proxy is mirrored into JAVA_TOOL_OPTIONS/MAVEN_OPTS
     block_proxy_evasion = true,      -- proxy-evasion handling (when host_local_block is active): true (default) = pause and prompt (allow once / always this session / deny); "deny" = reject outright (old hard reject); false = do not intercept (bypass allowed, filter boundary defeated). Clearing/bypassing includes unset *proxy, env -u, --noproxy, --proxy "", etc.
     host_local_proxy_port = 0,       -- host filtering proxy port (0 = random loopback port)
     upstream_proxy = nil,            -- host upstream proxy (chained egress): nil (default) = auto-use the host's https_proxy/http_proxy/all_proxy; false or "" = no chaining (direct); string = explicit URL (http://127.0.0.1:7890 / socks5h://127.0.0.1:1080). When the host itself egresses via an allowlisting proxy, sandbox traffic goes through the filtering proxy and is chained to this upstream, following the host's network policy; host-local targets and no_proxy matches still connect directly
@@ -752,6 +753,23 @@ sandbox = {
   --   "disk" (default) = a hidden featureless dir on disk (prefers /var/tmp, falls back to the nvim cache dir);
   --   "shm" = /dev/shm (RAM, faster but memory-hungry); an absolute path = use that dir as the base.
   staging_backend = "disk",
+  -- Single-view model (default on, three views): real disk (read-only lower) / sandbox merge view
+  -- (= staging = overlay upper) / candidates (delta metadata only). No per-command materialize/capture
+  -- round-trips; the view base is `<sandbox staging base>/view`, agentEnd does not migrate staging, so
+  -- per-round usage no longer accumulates. false = fall back to the old two-store model.
+  single_view = true,
+  -- Per-candidate inline budget (total bytes / file entries; 0 = unlimited). Over the budget switches
+  -- to per-file blobs or skips, so one `cargo build`/`npm install` cannot read GBs into the editor
+  -- (previously pushed nvim RSS to 27.7GB and got it OOM-killed).
+  capture_max_bytes = 256 * 1024 * 1024,
+  capture_max_files = 20000,
+  -- Build output directories (basename under a workspace root; whole subtree never captured as
+  -- candidates; expanded 0-2 levels down).
+  generated_dirs = {
+    "target", "node_modules", "build", "out", ".venv", "venv",
+    "__pycache__", ".next", ".nuxt", ".svelte-kit", ".turbo", ".pytest_cache",
+    ".mypy_cache", ".ruff_cache", ".gradle", ".cargo", ".kotlin", "coverage",
+  },
   session_shell = true,            -- persist shell state (export/cd) across run_command within a session (bwrap only)
   process_roots = {},              -- extra writable roots (only when read_all=false or the whole-root overlay is unavailable; overlaid, default cwd only, auto-added). With read_all=true (default) the whole root is already a writable overlay, so this is unnecessary. /tmp, /var/tmp belong to tmpfs_roots; add explicitly if needed
   staging_uncovered = "reject",    -- when unpublished staged changes exist but the command has no writable overlay layer: "reject" (default, fail-closed) | "warn" (run degraded with a notice, to bypass transient failures). Staged changes inside seeded roots do not count as a split

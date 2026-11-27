@@ -2206,6 +2206,29 @@ end
 --- 仅在明确信任任务时使用。
 --- @param privileges table|nil { env? = table }
 --- @return table
+--- 把注入的显式 HTTP 代理同步成 JVM 系统属性（Gradle/Maven/Java 只认 -D 属性）。
+--- 私有 netns 里没有 DNS，Java 直连会 UnknownHostException；经代理则按主机名 CONNECT。
+--- @param env table
+--- @param url string|nil 形如 "http://127.0.0.1:3128"
+local function _apply_java_proxy(env, url)
+  if type(url) ~= "string" or url == "" then return end
+  if config_store.get("tools.sandbox.network.java_proxy") == false then return end
+  local host, port = url:match("^https?://([^/:]+):(%d+)")
+  if not host then return end
+  local opts = table.concat({
+    "-Dhttp.proxyHost=" .. host, "-Dhttp.proxyPort=" .. tostring(port),
+    "-Dhttps.proxyHost=" .. host, "-Dhttps.proxyPort=" .. tostring(port),
+    "-Dhttp.nonProxyHosts=127.0.0.1|localhost|[::1]",
+  }, " ")
+  local function append(key)
+    local prev = env[key]
+    env[key] = (type(prev) == "string" and prev ~= "" and (prev .. " ") or "") .. opts
+  end
+  -- `JAVA_TOOL_OPTIONS` 被所有 JVM（含 Gradle wrapper 与其 daemon）读取。
+  append("JAVA_TOOL_OPTIONS")
+  append("MAVEN_OPTS")
+end
+
 function M.sandbox_env(privileges)
   local secret = require("NeoAI.sandbox.secret.secret")
   local env = secret.sanitized_env()
@@ -2259,6 +2282,7 @@ function M.sandbox_env(privileges)
     -- 私有 netns 内的 loopback 是沙箱自己的：localhost/127.0.0.1 直连（访问沙箱内服务），
     -- 不经过宿主代理；外部目标仍必须经代理。
     env.NO_PROXY, env.no_proxy = "127.0.0.1,localhost,::1", "127.0.0.1,localhost,::1"
+    _apply_java_proxy(env, url)
   elseif _host_local_block_enabled() then
     local ok_hp, host_proxy = pcall(require, "NeoAI.sandbox.net.host_proxy")
     if ok_hp and host_proxy then
@@ -2270,6 +2294,7 @@ function M.sandbox_env(privileges)
         local socks = ("socks5h://127.0.0.1:%d"):format(addr.port)
         env.ALL_PROXY, env.all_proxy = socks, socks
         env.NO_PROXY, env.no_proxy = "", ""
+        _apply_java_proxy(env, url)
       end
     end
   end
@@ -2698,22 +2723,95 @@ local function _non_capture_matcher()
   return fn
 end
 
+--- 构建产物目录根（`tools.sandbox.generated_dirs`）：由构建工具随时重建的目录，纳入候选只会
+--- 制造基线冲突与爆炸式 delta（`target/` 可达数十 GB、数万文件）。在「工作区根」下按 basename
+--- 展开：cwd 及其祖先 + `process_roots` + 已登记视图根，使子目录工作区也能命中。
+--- 结果按（cwd, 配置表, process_roots）缓存：这是按文件判定的热路径。
+--- @return string[]
+local function _generated_roots()
+  local cfg = config_store.get("tools.sandbox.generated_dirs")
+  local names = type(cfg) == "table" and cfg or {}
+  local cwd = vim.fn.getcwd()
+  local proots = config_store.get("tools.sandbox.process_roots") or {}
+  local cached = state.generated_cache
+  if cached and cached.cwd == cwd and cached.names == cfg and cached.proots == proots then
+    return cached.roots
+  end
+  local roots, raw = {}, {}
+  local seen = {}
+  local function add_root(r)
+    r = tostring(r or ""):gsub("/+$", "")
+    if r == "" or r == "/" then return end
+    if r ~= "" and not seen[r] then
+      seen[r] = true
+      raw[#raw + 1] = r
+    end
+    for _, name in ipairs(names) do
+      if type(name) == "string" and name ~= "" and not name:find("[/\\]") then
+        roots[#roots + 1] = r .. "/" .. name
+      end
+    end
+  end
+  if cwd ~= "" then
+    local p = cwd:gsub("/+$", "")
+    while p ~= "" and p ~= "/" do
+      add_root(p)
+      p = vim.fn.fnamemodify(p, ":h")
+    end
+  end
+  for _, r in ipairs(proots) do add_root(r) end
+  -- 嵌套构建目录（如 `android/app/build`、`crates/*/target`）：直接位于根下的名字已在上面展开，
+  -- 这里再向下补 1~2 层通配展开（只在目录存在时命中，结果按 cwd 缓存，不做逐文件 glob）。
+  for _, r in ipairs(raw) do
+    for _, pat in ipairs({ "/*/", "/*/*/" }) do
+      for _, name in ipairs(names) do
+        if type(name) == "string" and name ~= "" and not name:find("[/\\]") then
+          local okm, matches = pcall(vim.fn.glob, r .. pat .. name, false, true)
+          if okm and type(matches) == "table" then
+            for _, m in ipairs(matches) do
+              if vim.fn.isdirectory(m) == 1 then roots[#roots + 1] = (m:gsub("/+$", "")) end
+            end
+          end
+        end
+      end
+    end
+  end
+  state.generated_cache = { cwd = cwd, names = cfg, proots = proots, roots = roots }
+  return roots
+end
+
+--- 路径是否位于构建产物目录（`generated_dirs`，按工作区根展开）。
+--- @param path string|nil
+--- @return boolean
+function M.is_generated_path(path)
+  if type(path) ~= "string" or path == "" then return false end
+  for _, r in ipairs(_generated_roots()) do
+    if path == r or path:sub(1, #r + 1) == r .. "/" then return true end
+  end
+  return false
+end
+
 --- 配置的不可捕获运行时根（展开后，供捕获 worker 整棵子树跳过）。
 --- @return string[]
 function M.non_capture_roots()
   _non_capture_matcher()
   local cached = state.non_capture_cache
-  return (cached and cached.roots) or {}
+  local roots = {}
+  for _, r in ipairs((cached and cached.roots) or {}) do roots[#roots + 1] = r end
+  for _, r in ipairs(_generated_roots()) do roots[#roots + 1] = r end
+  return roots
 end
 
 --- 路径是否「不可捕获」：NeoAI 自身运行时/搬出层（`is_self_runtime_path`）+ 用户配置的
---- `tools.sandbox.non_capture_paths`。这些路径不进候选、不进待审、不发布。
+--- `tools.sandbox.non_capture_paths` + 构建产物目录（`tools.sandbox.generated_dirs`）。
+--- 这些路径不进候选、不进待审、不发布。
 --- @param path string|nil 绝对路径
 --- @return boolean
 function M.is_non_capture_path(path)
   if type(path) ~= "string" or path == "" then return false end
   if M.is_self_runtime_path(path) then return true end
-  return _non_capture_matcher()(path)
+  if _non_capture_matcher()(path) then return true end
+  return M.is_generated_path(path)
 end
 
 --- 目标路径是否命中宿主敏感遮蔽路径（`tools.sandbox.mask_paths` + 沙箱自身存储）。

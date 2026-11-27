@@ -87,6 +87,10 @@ function M.gc(base)
       if vim.fn.delete(dir .. "/" .. name, "rf") == 0 then removed = removed + 1 end
     end
   end
+  -- 崩溃回收：上次进程被 SIGKILL/OOM 杀时来不及 shutdown，会留下孤儿 bpftrace/socat/bwrap
+  -- 与陈旧临时目录（后者也是「同一 overlay upper 被并行挂载」的来源）。有界、只动明确归属
+  -- 本沙箱且父进程已死的进程 + 超过 24h 的临时目录。
+  pcall(function() require("NeoAI.sandbox.execution.reclaim").run() end)
   return removed
 end
 

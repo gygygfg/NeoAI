@@ -729,6 +729,17 @@ local SUBCOMMANDS = {
     end,
   },
   {
+    name = "SandboxGC",
+    desc = "回收崩溃残留（孤儿 bpftrace/socat/bwrap）与陈旧沙箱临时目录",
+    handler = function()
+      local ok, reclaim = pcall(require, "NeoAI.sandbox.execution.reclaim")
+      if not ok then return end
+      local res = reclaim.run()
+      vim.notify(("[NeoAI] 回收完成：孤儿进程 %d，陈旧临时目录 %d")
+        :format(#res.orphans.killed, #res.dirs.removed), vim.log.levels.INFO)
+    end,
+  },
+  {
     name = "SandboxMetrics",
     desc = "显示沙箱运行指标",
     handler = function()

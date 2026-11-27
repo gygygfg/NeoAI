@@ -33,6 +33,7 @@ tests.suite("sandbox_session", function(_, it)
     local candidate = require("NeoAI.sandbox.execution.candidate")
     local control = require("NeoAI.sandbox.execution.control")
     local store = require("NeoAI.sandbox.state.store")
+    local view = require("NeoAI.sandbox.execution.view")
     with_config({ tools = { sandbox = { workspace_root = vim.fn.tempname() .. "/sb" } } }, function()
       sandbox.reset()
       local a = control.new_attempt("edit_file", {}, {}, { effect = "fs_write" })
@@ -42,10 +43,17 @@ tests.suite("sandbox_session", function(_, it)
       candidate.rotate_session()
       -- 仍有在途尝试：旧目录不得被删除（否则运行中命令的 bind 源突然消失）
       t.true_(vim.fn.isdirectory(old_proc) == 1, "有在途尝试时旧目录不应被删")
-      candidate.cleanup(a.attempt_id)
-      -- 尝试结束后异步清理（线程池）
-      local ok = vim.wait(5000, function() return vim.fn.isdirectory(old_proc) ~= 1 end)
-      t.true_(ok, "尝试结束后旧目录应被异步清理")
+      if view.enabled() then
+        -- 单视图：视图目录跨轮次**稳定复用**（不再迁移/轮换），始终存在。
+        candidate.cleanup(a.attempt_id)
+        t.eq(old_proc, candidate.process_dir(), "单视图下进程目录应保持稳定")
+        t.true_(vim.fn.isdirectory(old_proc) == 1, "单视图下视图目录不应被删除")
+      else
+        candidate.cleanup(a.attempt_id)
+        -- 尝试结束后异步清理（线程池）
+        local ok = vim.wait(5000, function() return vim.fn.isdirectory(old_proc) ~= 1 end)
+        t.true_(ok, "尝试结束后旧目录应被异步清理")
+      end
     end)
   end)
 

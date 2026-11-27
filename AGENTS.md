@@ -109,6 +109,11 @@ nvim --headless --clean -u NONE --cmd "set rtp+=$PWD" \
    （`tools.approval.mode="async"`）：效果类工具立即在沙箱内
    执行并冻结候选，真实修改进入待审队列，用户经 `:NeoAI SandboxReview` 异步确认后应用。
    详见 `docs/sandbox.md`。
+   **单视图（三视图）不变量**：`tools.sandbox.single_view`（默认开）下暂存目录**就是** overlay
+   upper，不得再为每条命令叠加 overlay / 物化 / 捕获回写（旧模型两份可写数据会把编辑器内存吃穿，
+   实测 nvim RSS 27.7GB 被 OOM 杀死）。视图基目录稳定（agentEnd 不迁移），常驻与一次性命令不得
+   同时挂载同一 upper；任一进程不得把沙箱写入**直接落盘**（包括包管理器缓存：缓存目录只作为只读
+   lower，沙箱内下载落在会话视图里），唯一落盘点仍是审批发布的 `writer`/`publish`。
 
 10. **命令入口单一**：全部用户命令收敛为一条 `:NeoAI <子命令>`（`plugins/builtin/commands.lua` 的
     `M.SUBCOMMANDS` 为唯一来源）。Neovim 命令名不允许 `.`/`_`/`-`，`complete=customlist` 只接受纯字符串

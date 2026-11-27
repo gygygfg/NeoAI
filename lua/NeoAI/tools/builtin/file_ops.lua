@@ -284,7 +284,10 @@ local function _sandbox_overrides()
   if not ok or not cand or type(cand.workspace_overrides) ~= "function" then
     return {}
   end
-  local ok2, ov = pcall(cand.workspace_overrides)
+  -- 读视图用 read_overrides：包含单视图里已在 overlay 层的条目（命令刚写入/删除的内容），
+  -- 否则 host 侧的 list/search/read 会落回真实盘、看不到命令改动。
+  local fn = (type(cand.read_overrides) == "function") and cand.read_overrides or cand.workspace_overrides
+  local ok2, ov = pcall(fn)
   if not ok2 or type(ov) ~= "table" then
     return {}
   end
@@ -585,7 +588,11 @@ local function _merge_search(base_text, dir, query, include, max)
       if under and fs.exists(o.staged) then
         local name = vim.fn.fnamemodify(abs, ":t")
         if inc_pat == "" or name:match(inc_pat) then
-          local content = fs.read_file(o.staged)
+          -- 超大条目（大文件/blob）不做整读：避免单次 grep 把数百 MB 读进内存。
+          local cap = require("NeoAI.kernel.config_store").get("tools.sandbox.max_file_bytes")
+          local sst = vim.uv.fs_stat(o.staged)
+          local content = (type(cap) == "number" and cap > 0 and sst and (sst.size or 0) > cap)
+            and nil or fs.read_file(o.staged)
           if content and not content:find("\0", 1, true) then
             local pos = content:find(query, 1, true)
             if pos then

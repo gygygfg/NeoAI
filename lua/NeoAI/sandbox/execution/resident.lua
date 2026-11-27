@@ -657,7 +657,7 @@ function M.ensure(opts)
   inst.job = job
   inst.argv = argv
   -- 首次物化已在挂载前完成：登记当前暂存签名，避免重复下发。
-  for _, o in ipairs(candidate.workspace_overrides()) do
+  for _, o in ipairs(candidate.materialize_overrides()) do
     inst.materialized[o.real] = _sig(o)
   end
   state.instance = inst
@@ -734,7 +734,7 @@ function M.materialize()
 
   -- 主线程只做签名比较收集待物化条目；内容读取/base64 分块进行，批间让出。
   local pending = {}
-  for _, o in ipairs(candidate.workspace_overrides()) do
+  for _, o in ipairs(candidate.materialize_overrides()) do
     local sig = _sig(o)
     if inst.materialized[o.real] ~= sig then
       inst.materialized[o.real] = sig

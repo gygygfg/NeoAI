@@ -976,6 +976,16 @@ local DEFAULT_CONFIG = {
         "~/.cache/chromium-headless", "~/.config/chromium-headless",
         "~/.cache/google-chrome-headless", "~/.config/google-chrome-headless",
         "~/.cache/ms-playwright", "~/.cache/puppeteer",
+        -- 包管理器缓存/索引：由工具随时重建、体量可达数百 MB~数 GB。纳入候选只会制造
+        -- 基线冲突与爆炸式 delta（曾把编辑器内存吃穿）；这里整棵子树不捕获。
+        -- 注意只列「缓存」子目录，不列 `~/.cargo`、`~/.gradle` 根（其中的 config/bin 仍需审批）。
+        "~/.gradle/caches", "~/.gradle/wrapper", "~/.gradle/daemon", "~/.gradle/native",
+        "~/.m2/repository",
+        "~/.cargo/registry", "~/.cargo/git", "~/.cargo/.package-cache",
+        "~/.npm/_cacache", "~/.npm/_logs", "~/.cache/yarn", "~/.cache/node-gyp",
+        "~/.local/share/pnpm/store",
+        "~/.cache/pip", "~/.cache/uv", "~/.cache/go-build", "~/go/pkg/mod",
+        "~/.cache/bazel", "~/.cache/sccache", "~/.cache/ccache",
       },
       -- 临时根私有目录位置：host（默认）= 建在宿主根之下的隐藏临时子目录
       -- （如 /tmp/.cache-<tag>/<session>），命名空间映射回该根，AI 只见自己的私有子目录
@@ -1046,6 +1056,11 @@ local DEFAULT_CONFIG = {
         -- 本机访问，供沙箱内启动的服务自测（如 DB/Redis：5432/6379）。宿主网卡 IP、链路本地、
         -- 云元数据（169.254.169.254）永不放行。例：{ 5432, 6379 }。
         allow_localhost_ports = {},
+        -- JVM 类工具（Gradle/Maven/Java/sbt）不读 `HTTP(S)_PROXY` 环境变量，只认
+        -- `-Dhttps.proxyHost/-Dhttps.proxyPort` 系统属性；而私有 netns 里没有 DNS。
+        -- 开启（默认）时把注入的代理同步为 `JAVA_TOOL_OPTIONS`/`MAVEN_OPTS` 里的系统属性，
+        -- 否则沙箱内 `./gradlew` 会直接 `UnknownHostException`（表现为「DNS 不解析」）。
+        java_proxy = true,
         -- 沙箱网络访问策略：沙箱内部创建的进程/端口（回环 + allow_localhost_ports +
         -- 内部端口登记表）在沙箱内访问**免权限**；访问沙箱外部（宿主本机其他端口、宿主网卡、
         -- 外部主机）按此策略处理：
@@ -1543,6 +1558,29 @@ local DEFAULT_CONFIG = {
       --   绝对路径 = 以该目录为基（其下建无特征隐藏目录）。
       -- 默认落盘，避免「好多文件暂存在内存里」把内存占满（暂存内容随会话结束/重置清理）。
       staging_backend = "disk",
+      -- 单视图模型（默认开，三视图）：真实盘（只读 lower） / 沙箱合并视图（= 暂存 = overlay
+      -- upper） / 候选（只记 delta 元数据）。开启后：
+      --   * 不再为每条命令把工作区暂存物化进 overlay、命令后再捕获拷回暂存（旧模型两份可写
+      --     数据，轮次越多拷贝越多，实测能把编辑器内存吃穿被 OOM 杀死）；
+      --   * 视图基目录固定为 `<沙箱暂存基>/view`，agentEnd 轮换不再迁移暂存，轮次占用不叠加；
+      --   * 候选/发布只处理本轮 delta（日志 + mtime 窗口），不再整树遍历会话 upper。
+      -- 关闭即回退旧版「工作区暂存副本 + overlay upper 双向拷贝」模型（兼容/回滚用）。
+      single_view = true,
+      -- 单个候选允许内联的总字节数（所有文件内容之和；0 = 不限制）。超过即改为逐文件 blob
+      -- 并在审批窗提示，避免一条 `cargo build`/`npm install` 把数 GB 产物读进编辑器内存
+      -- （曾导致 nvim RSS 27.7GB 被内核 OOM 杀死）。与单文件上限 `max_file_bytes` 正交。
+      capture_max_bytes = 256 * 1024 * 1024,
+      -- 单个候选允许的文件条目数上限（0 = 不限制）。超过则按 blob/跳过分批处理，绝不一次性
+      -- 在 Lua 里持有整棵树的条目（target/ 之类构建产物通常数万文件）。
+      capture_max_files = 20000,
+      -- 构建产物目录（相对仓库根的 basename，命中即整棵子树不捕获为候选）：这些目录由构建
+      -- 工具随时重建，纳入候选只会制造基线冲突、爆炸式 delta 与内存占用。可按需增删；
+      -- 与 `non_capture_paths`（绝对/通配路径，对所有候选生效）互补。
+      generated_dirs = {
+        "target", "node_modules", "build", "out", ".venv", "venv",
+        "__pycache__", ".next", ".nuxt", ".svelte-kit", ".turbo", ".pytest_cache",
+        ".mypy_cache", ".ruff_cache", ".gradle", ".cargo", ".kotlin", "coverage",
+      },
       session_shell = true, -- run_command 会话内保留 shell 状态（export/cd 跨命令生效，仅 bwrap 后端）
       -- 额外可写根（仅 `read_all=false` 或整机 overlay 不可用时生效）：这些根以独立 overlay
       -- 覆盖（真实内容只读 lower，写入进会话 upper），使命令能修改这些根下的任意路径并冻结为

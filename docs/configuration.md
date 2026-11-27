@@ -554,6 +554,7 @@ sandbox = {
     -- 共享 netns（isolation="off"）下拦截向宿主本机（回环/宿主网卡 IP/链路本地/云元数据）：
     -- 注入 HTTP(S)_PROXY/ALL_PROXY 指向宿主侧 Lua 过滤代理。应用层边界：裸 TCP 可绕过。
     host_local_block = true,
+    java_proxy = true,               -- JVM 工具（Gradle/Maven/Java）不读 HTTP(S)_PROXY，只认 -Dhttp(s).proxyHost；私有 netns 无 DNS 时 `./gradlew` 会 UnknownHostException。开启（默认）把注入代理同步为 JAVA_TOOL_OPTIONS/MAVEN_OPTS 系统属性
     block_proxy_evasion = true,      -- 代理规避处理（host_local_block 生效时）：true（默认）= 暂停并弹窗询问（仅本次允许/本次会话始终允许/拒绝）；"deny" = 直接拒绝（旧硬拒绝）；false = 不拦截（允许绕过，过滤边界失效）。清除/绕过代理包括 unset *proxy、env -u、--noproxy、--proxy "" 等
     host_local_proxy_port = 0,       -- 宿主过滤代理端口（0 = 自动分配 loopback 随机端口）
     upstream_proxy = nil,            -- 宿主上游代理（链式出网）：nil（默认）= 自动沿用宿主 https_proxy/http_proxy/all_proxy；false 或 "" = 不链（直连）；字符串 = 显式 URL（http://127.0.0.1:7890 / socks5h://127.0.0.1:1080）。宿主依赖白名单代理出网时，沙箱经过滤代理出网会链到该上游，遵循宿主网络策略；本机目标与 no_proxy 命中者仍直连
@@ -671,6 +672,21 @@ sandbox = {
   --   "disk"（默认）= 磁盘（优先 /var/tmp，退回 nvim 缓存目录）下的无特征隐藏目录；
   --   "shm" = /dev/shm（内存，更快但占内存）；绝对路径 = 以该目录为基。
   staging_backend = "disk",
+  -- 单视图模型（默认开，三视图）：真实盘（只读 lower） / 沙箱合并视图（= 暂存 = overlay upper）
+  -- / 候选（只记 delta 元数据）。开启后不再为每条命令把暂存物化进 overlay、命令后再捕获拷回暂存；
+  -- 视图基目录固定为 `<沙箱暂存基>/view`，agentEnd 不迁移暂存，轮次占用不叠加。
+  -- false = 回退旧版「工作区暂存副本 + overlay upper 双向拷贝」模型（兼容/回滚用）。
+  single_view = true,
+  -- 单个候选允许内联的总字节数 / 文件条目数（0 = 不限制）：超过即改为逐文件 blob 或跳过，
+  -- 避免一条 `cargo build`/`npm install` 把数 GB 产物读进编辑器内存（曾导致 nvim RSS 27.7GB OOM）。
+  capture_max_bytes = 256 * 1024 * 1024,
+  capture_max_files = 20000,
+  -- 构建产物目录（相对仓库根的 basename，整棵子树不捕获为候选）：按工作区根向下 0~2 层展开。
+  generated_dirs = {
+    "target", "node_modules", "build", "out", ".venv", "venv",
+    "__pycache__", ".next", ".nuxt", ".svelte-kit", ".turbo", ".pytest_cache",
+    ".mypy_cache", ".ruff_cache", ".gradle", ".cargo", ".kotlin", "coverage",
+  },
   session_shell = true,            -- run_command 会话内保留 shell 状态（export/cd 跨命令生效；仅 bwrap）
   process_roots = {},              -- 额外可写根（仅 read_all=false 或整机 overlay 不可用时生效；overlay 覆盖，默认仅 cwd 自动补入）。read_all=true（默认）时整机根已是可写 overlay，本项不再需要。/tmp、/var/tmp 属 tmpfs_roots；按需显式加回
   staging_uncovered = "reject",    -- 有未发布暂存但本次命令无 overlay 可写层时："reject"（默认，fail-closed）| "warn"（降级执行并在结果附提示，便于临时绕过偶发失败）。播种覆盖到的根内暂存不算分裂

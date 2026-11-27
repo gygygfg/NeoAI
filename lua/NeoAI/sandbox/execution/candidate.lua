@@ -7,6 +7,7 @@ local fs = require("NeoAI.utils.fs")
 local async = require("NeoAI.utils.async")
 local candidate_util = require("NeoAI.sandbox.execution.candidate_util")
 local trace_log = require("NeoAI.sandbox.execution.trace_log")
+local view = require("NeoAI.sandbox.execution.view")
 -- 纯工具函数（自 candidate_util 引入，保持原局部名以零改调用点）
 local _perm, _sha, _stat_sig, _read, _candidate_content, _is_text_content =
   candidate_util.perm, candidate_util.sha, candidate_util.stat_sig,
@@ -55,6 +56,9 @@ local state = {
   volatile_cache = nil, -- { cfg = <配置引用>, fn = function } 易变包缓存匹配器缓存
   cand_levels = nil, -- { digest = <候选人 digest>, map = { [path] = level } }：工作线程分类结果接力
 }
+
+--- 单文件纳入候选的大小上限（前向声明：合并且/冻结/发布多处使用，定义见后文）。
+local _max_file_bytes
 
 --- 递增暂存版本（每次暂存内容变化时调用）
 --- @return number
@@ -134,6 +138,9 @@ end
 --- @return string
 local function _workspace_dir()
   local root = state.workspace_root or (vim.fn.stdpath("cache") .. "/NeoAI/sandbox")
+  -- 单视图：未覆盖的根（如会话私有 tmpfs 根）的暂存副本也放在稳定目录，不随会话轮换，
+  -- 避免 agentEnd 后这些副本被留在旧目录里「看似丢失」。
+  if view.enabled() then return root .. "/sessions/single" end
   return root .. "/sessions/" .. (state.session_id or "default")
 end
 
@@ -371,13 +378,27 @@ local function _await_rotation(timeout_ms)
 end
 
 --- 工作区暂存文件路径（每个真实路径一个稳定副本）。
+--- 单视图模型下**暂存就是 overlay upper**：命中视图可写根时直接返回视图路径（命令与工具
+--- 共用同一份数据，无需再做「暂存 → upper / upper → 暂存」的双向拷贝）。不覆盖时回退旧
+--- 的 `sessions/<id>/<hash>/<basename>` 布局。
 --- 目录名用真实路径 hash 保证唯一，文件名保留真实 basename（含扩展名），
 --- 使 treesitter / LSP 等依赖 filetype 的工具能正确识别暂存副本。
 --- @param real string
 --- @return string
-local function _workspace_path(real)
+local function _session_path(real)
   local base = vim.fn.fnamemodify(real, ":t")
   return _workspace_dir() .. "/" .. _hash_key(real) .. "/" .. base
+end
+
+local function _workspace_path(real)
+  if view.enabled() then
+    local p = view.path_for(real)
+    if p then
+      state.staged_to_real[p] = real
+      return p
+    end
+  end
+  return _session_path(real)
 end
 
 --- 记录路径基线（首次）并返回其沙箱暂存路径。
@@ -429,23 +450,31 @@ local function _base_entry(attempt, real)
   -- view_base_hash 记录 token 化后的基线，用于「是否发生改动」判定；
   -- base_hash 仍是真实文件基线，用于 commit 的 CAS 冲突检测。
   local view_base_hash
+  -- 单视图：暂存**就是**命令可见层，必须保留真实内容——绝不能把 token 化后的假值写进去
+  -- （否则 run_command/build 读到假密钥）。AI 侧的遮蔽由读取层（ns_fs 读后 tokenize）负责。
+  local native_view = view.enabled() and view.is_native(staged)
   if stat and stat.type == "file" and fs.exists(staged) then
     local c = _read(staged)
     if c ~= nil then
       local secret = require("NeoAI.sandbox.secret.secret")
+      -- 单视图：暂存**就是**命令可见层，必须保留真实内容——不做 token 化落盘（否则
+      -- run_command/build 读到假密钥）。AI 侧的遮蔽由读取层（ns_fs 读后 tokenize）负责。
+      -- 注意仍要走下面的哈希/登记逻辑（ws_ent.real_hash 等），只是不写 token。
       -- 高熵扫描仅对疑似密钥文件启用，避免对普通文件全文做熵计算（具名规则仍始终生效）。
       -- 二进制内容（keyring 等）通常跳过文本 token 化；但**敏感二进制密钥文件**（.p12/.pfx/
       -- keystore/raw key 等）用同长度随机字节假化（整块映射），物化/发布时精确还原真实字节。
       local tok = c
-      if _is_text_content(c) then
-        tok = _tokenize_ok(secret, real) and secret.tokenize(c, { entropy = secret.is_secret_path(real) }) or c
-        if tok ~= c then fs.write_file(staged, tok) end
-      else
-        local cfg = require("NeoAI.kernel.config_store").get("tools.sandbox.secrets") or {}
-        if cfg.binary_fake ~= false and secret.is_sensitive_path(real) then
-          local fake = secret.fake_binary(c)
-          if fake ~= c then fs.write_file(staged, fake) end
-          tok = fake
+      if not native_view then
+        if _is_text_content(c) then
+          tok = _tokenize_ok(secret, real) and secret.tokenize(c, { entropy = secret.is_secret_path(real) }) or c
+          if tok ~= c then fs.write_file(staged, tok) end
+        else
+          local cfg = require("NeoAI.kernel.config_store").get("tools.sandbox.secrets") or {}
+          if cfg.binary_fake ~= false and secret.is_sensitive_path(real) then
+            local fake = secret.fake_binary(c)
+            if fake ~= c then fs.write_file(staged, fake) end
+            tok = fake
+          end
         end
       end
       view_base_hash = _sha(tok)
@@ -508,14 +537,43 @@ local function _process_base_host()
 end
 
 --- 当前会话的进程 overlay 基目录（按可写根分片存放 upper/work），不存在时创建。
+--- 单视图模型下返回**稳定的视图基目录**（不随 agentEnd 轮换）：同一进程内所有命令复用同一
+--- upper，既不再每条命令新建 overlay，也不会与常驻实例互相抢占同一 upper 的挂载。
 --- @return string
 function M.process_dir()
+  if view.enabled() then
+    local dir = view.base()
+    pcall(vim.fn.mkdir, dir, "p")
+    _chown_payload(dir)
+    state.process_dir_cache = dir
+    return dir
+  end
   M.begin_session()
   local dir = _process_base_host() .. "/" .. state.session_id
   fs.ensure_dir(dir)
   _chown_payload(dir)
   state.process_dir_cache = dir
   return dir
+end
+
+--- 单视图模型的稳定基目录（未启用时返回 nil）。供 wrapper/resident 选择同一 upper。
+--- @return string|nil
+function M.view_base()
+  if not view.enabled() then return nil end
+  return view.base()
+end
+
+--- 登记本次构建的视图可写根（单视图）。
+--- @param specs table|nil
+function M.register_view(specs)
+  if view.enabled() then view.register(specs) end
+end
+
+--- 路径是否已经落在视图层（= 暂存与命令共用的同一份数据）。
+--- @param path string|nil
+--- @return boolean
+function M.is_view_native(path)
+  return view.is_native(path)
 end
 
 --- 开始（或返回已有的）沙箱会话。同一 agent 循环内复用同一会话。
@@ -547,6 +605,19 @@ function M.rotate_session()
       if timeout < 0 then timeout = 0 end
       pcall(wrapper.await_postprocess, timeout)
     end
+  end
+  -- 单视图模型：暂存就是稳定的 overlay upper，**不轮换、不迁移**。agentEnd 只清理「已物化/已漂移」
+  -- 的签名缓存下账（让下一次捕获重新做一次廉价 stat 比对），未发布改动原地保留。
+  -- 旧模型每条轮换都把整棵暂存目录 rename/逐文件复制一遍，长会话下这是纯叠加开销。
+  if view.enabled() then
+    -- 会话 id 仍按轮次推进（状态/日志/诊断的语义不变），但**不迁移任何数据**：暂存就是稳定的
+    -- 视图 upper，agentEnd 不产生拷贝、不生成新 overlay。
+    state.session_seq = state.session_seq + 1
+    state.session_id = string.format("s%d_%d", os.time(), state.session_seq)
+    state.materialized = {}
+    state.seeded = {}
+    state.rotation = nil
+    return state.session_id
   end
   local old_dir = state.session_id and _workspace_dir() or nil
   local old_proc = state.process_dir_cache
@@ -716,6 +787,23 @@ function M.stage_path(attempt_id, real_path)
   if not attempt then return nil end
   local real = _abs(real_path)
   local entry = _base_entry(attempt, real)
+  -- 删除类工具 + 无命名空间桥：视图层里的「删除」只会 unlink upper 文件，真实盘文件会重新
+  -- 显现（overlay 语义）。此时改用会话暂存副本，由物化阶段在 upper 里生成 whiteout。
+  if attempt.tool_name == "delete_file" and entry.staged and view.is_native(entry.staged) then
+    local resident_ok = false
+    pcall(function()
+      local r = require("NeoAI.sandbox.execution.resident")
+      resident_ok = r.active() ~= nil
+    end)
+    if not resident_ok then
+      local alt = _session_path(real)
+      fs.ensure_dir(vim.fn.fnamemodify(alt, ":h"))
+      if fs.copy_file(entry.staged, alt) then
+        entry.staged = alt
+        state.staged_to_real[alt] = real
+      end
+    end
+  end
   return entry.staged
 end
 
@@ -836,6 +924,8 @@ end
 --- 需该路径已有暂存条目（由 `stage_path` 建立基线）；缺失时按新建登记。
 --- @param real_path string
 function M.mirror_overlay(real_path)
+  -- 单视图：命名空间内写入的直接就是视图 upper（= 暂存），无需再镜像回第二份暂存副本。
+  if view.enabled() then return end
   local ok, bridge = pcall(require, "NeoAI.sandbox.execution.file_bridge")
   if not ok or not bridge or type(bridge.available) ~= "function" or not bridge.available() then
     return
@@ -920,9 +1010,29 @@ function M.view_is_dir(real_path)
   return false
 end
 
---- 当前工作区暂存覆盖快照（供 list_files/search_files 等目录级只读工具做一致性视图）。
+--- 当前工作区暂存覆盖快照（读视图）：**包含**单视图里已在视图层的条目——read_file/list_files/
+--- search_files/审批需要看到命令刚写入/删除的内容（否则会落回真实盘）。
 --- @return table 数组 { real, staged, deleted }
 function M.workspace_overrides()
+  return M._overrides(true)
+end
+
+--- 读视图覆盖快照（`workspace_overrides` 的显式别名，供只读工具使用）。
+--- @return table 数组 { real, staged, deleted }
+function M.read_overrides()
+  return M._overrides(true)
+end
+
+--- 物化覆盖快照：单视图下已存在于视图层的非删除条目跳过（无需回写，避免把整棵视图重发进
+--- overlay）；删除态仍保留（whiteout 幂等写入）。
+--- @return table 数组 { real, staged, deleted }
+function M.materialize_overrides()
+  return M._overrides(false)
+end
+
+--- @param include_native boolean
+--- @return table
+function M._overrides(include_native)
   _await_rotation()
   local out = {}
   for real, entry in pairs(state.workspace) do
@@ -934,23 +1044,32 @@ function M.workspace_overrides()
     local lst = entry.staged and vim.uv.fs_lstat(entry.staged) or nil
     local stype = lst and lst.type or nil
     local exists = stype == "link" or stype == "directory" or (entry.staged and fs.exists(entry.staged))
-    out[#out + 1] = {
-      real = real,
-      staged = entry.staged,
-      deleted = entry.deleted == true or not exists,
-      -- 符号链接暂存：物化方必须**重建链接**而不是复制目标内容。
-      link = entry.link or (stype == "link" and vim.uv.fs_readlink(entry.staged)) or nil,
-      -- 超大文件（内容以 blob 承载）：物化方据此后走「按文件复制」而非内嵌内容，
-      -- 避免把数百 MB 内容经常驻命令服务器 stdin（bash 逐字节 read）传输。
-      large = entry.large == true,
-      -- 命令产物（run_command 捕获并合并）：常驻 overlay 已有其输出，暂存副本未再被编辑时
-      -- 物化方可跳过回写（避免每次命令后把上千个包产物重发一遍）。
-      fresh = entry.fresh == true,
-      fresh_ssig = entry.fresh_ssig,
-      -- 命令确在常驻 overlay 内执行：产物已存在于该 overlay，常驻物化可安全跳过。
-      fresh_resident = entry.fresh_resident == true,
-      tokenized = entry.tokenized == true,
-    }
+    -- 单视图：暂存已在常驻实例的 overlay upper 内，命令本就看得见，无需再物化回写。
+    -- **但删除态必须保留**：读工具（read_file/list/search）靠 overrides 的 deleted 标记隐藏
+    -- 已暂存删除的文件/目录；跳过它会让真实盘内容重新出现（overlay 只在新命令里生效）。
+    local native = entry.staged and view.is_native(entry.staged)
+    local skip = (not native) and false or (not include_native)
+    -- 删除态在**物化列表**里也要保留（resident 需要 whiteout 幂等写入；读工具更需要它隐藏文件）。
+    if entry.deleted == true then skip = false end
+    if not skip then
+      out[#out + 1] = {
+        real = real,
+        staged = entry.staged,
+        deleted = entry.deleted == true or not exists,
+        -- 符号链接暂存：物化方必须**重建链接**而不是复制目标内容。
+        link = entry.link or (stype == "link" and vim.uv.fs_readlink(entry.staged)) or nil,
+        -- 超大文件（内容以 blob 承载）：物化方据此后走「按文件复制」而非内嵌内容，
+        -- 避免把数百 MB 内容经常驻命令服务器 stdin（bash 逐字节 read）传输。
+        large = entry.large == true,
+        -- 命令产物（run_command 捕获并合并）：常驻 overlay 已有其输出，暂存副本未再被编辑时
+        -- 物化方可跳过回写（避免每次命令后把上千个包产物重发一遍）。
+        fresh = entry.fresh == true,
+        fresh_ssig = entry.fresh_ssig,
+        -- 命令确在常驻 overlay 内执行：产物已存在于该 overlay，常驻物化可安全跳过。
+        fresh_resident = entry.fresh_resident == true,
+        tokenized = entry.tokenized == true,
+      }
+    end
   end
   return out
 end
@@ -1141,6 +1260,7 @@ end
 ---   （用于 overlay upper 被清空后重新填充，如 LSP overlay 刷新）。
 function M.materialize_overlay(specs, opts)
   if not specs or #specs == 0 then return {} end
+  if view.enabled() then view.register(specs) end
   local force = opts and opts.force == true
   -- 类型冲突（文件暂存物化到真实/overlay 中的目录，或反之）是视图损坏源：静默跳过会让
   -- 命令/只读工具看到真实目录、而暂存视图认为它是文件，二者分裂。此处收集并返回，
@@ -1167,6 +1287,34 @@ function M.materialize_overlay(specs, opts)
           -- 已物化且未改动：无需处理
         else
         local dest = base .. "/" .. rel
+        -- 单视图：暂存就是 overlay upper，dest 与暂存同路径时**不再拷贝**（命令/工具共用同一层）。
+        -- 旧布局的暂存（视图登记完成前的编辑、跨版本残留）首轮搬进视图（rename/复制一次），
+        -- 之后所有写入都原地生效，轮次越多不会产生第二份副本。
+        local native = view.enabled() and view.is_native(dest)
+        -- 暂存还是旧布局（会话副本）时不能直接搬进视图：副本可能是 token 化视图，必须走下面的
+        -- 拷贝路径（内含 detokenize）。拷贝完成后再把暂存切到视图路径（下文的 view_copy）。
+        local view_copy = native and entry.staged ~= nil and entry.staged ~= dest
+        if view_copy then native = false end
+        if native then
+          -- 删除态：视图层必须有一个 whiteout 才能遮住真实盘文件。暂存副本是旧布局（会话副本）
+          -- 或视图里还没有该条目时，这里补建；已有则幂等覆盖。
+          if entry.deleted and (spec.mode == "overlay" or spec.mode == "fuse") then
+            pcall(vim.fn.delete, dest, "rf")
+            fs.ensure_dir(vim.fn.fnamemodify(dest, ":h"))
+            pcall(vim.fn.system, { "mknod", dest, "c", "0", "0" })
+          end
+          local mat = state.materialized[base]
+          if not mat then mat = {}; state.materialized[base] = mat end
+          local st = vim.uv.fs_lstat(dest)
+          local sig = (st and st.type == "file" and st.mtime) and string.format("%s:%s:%s:%s",
+            tostring(st.mtime.sec), tostring(st.mtime.nsec), tostring(st.size),
+            tostring(st.mode % 4096)) or nil
+          mat[real] = {
+            dest = dest, version = entry.version, dsig = sig,
+            deleted = entry.deleted == true or nil,
+            hash = "sha256:view",
+          }
+        else
         if entry.deleted then
           if spec.mode == "overlay" or spec.mode == "fuse" then
             pcall(vim.fn.delete, dest, "rf")
@@ -1360,6 +1508,15 @@ function M.materialize_overlay(specs, opts)
           end
         end
         end
+        end
+        -- 旧布局暂存已按真实内容写入视图：切到视图路径，后续编辑/捕获直接原地读写。
+        if view_copy and view.is_native(dest) then
+          local old_staged = entry.staged
+          if old_staged and old_staged ~= dest then state.staged_to_real[old_staged] = nil end
+          state.staged_to_real[dest] = real
+          entry.staged = dest
+          entry.version = _bump_version()
+        end
       end
     end
   end
@@ -1453,6 +1610,45 @@ local function _apply_view_files(view_files, opts)
   end
 end
 
+--- 读视图写入辅助：单视图里暂存=overlay upper，**常驻实例已挂载时绝不能从宿主侧写该 upper**
+--- （overlayfs 对「挂载期间由宿主写 upper」属未定义行为，实测会阻塞）。此时改经命名空间桥在
+--- 挂载点内写入；实例未运行时才走宿主写。
+--- @param real string
+--- @param staged string
+--- @param content string
+--- @param mode number|nil
+--- @return boolean
+local function _write_view_file(real, staged, content, mode)
+  local ok_b, bridge = pcall(require, "NeoAI.sandbox.execution.file_bridge")
+  local ok_r, resident = pcall(require, "NeoAI.sandbox.execution.resident")
+  if ok_b and bridge and type(bridge.available) == "function" and bridge.available()
+    and ok_r and resident and resident.active() then
+    return bridge.write(real, content) == true
+  end
+  local ok = fs.write_file(staged, content)
+  if ok and mode then pcall(vim.uv.fs_chmod, staged, mode) end
+  return ok
+end
+
+--- 单视图：目标视图文件是否已经是候选内容（内容哈希一致）。
+--- 一致 = 命令/工具本就写在视图层内 → 合并时只登记台账，绝不重复写盘；
+--- 不一致 = 改动来自一次性 attempt overlay（独立 upper）或旧布局 → 需把候选内容写回视图。
+--- @param f table 候选文件条目
+--- @param staged string 视图路径
+--- @return boolean
+local function _view_matches(f, staged)
+  local st = vim.uv.fs_stat(staged)
+  if not st then return false end
+  if type(f.after_hash) == "string" and f.after_hash ~= "" and f.after_hash:sub(1, 4) ~= "sig:" then
+    if st.type ~= "file" then return false end
+    if (st.size or 0) > _max_file_bytes() then return true end
+    local c = _read(staged)
+    return c ~= nil and ("sha256:" .. _sha(c)) == f.after_hash
+  end
+  -- 无内容哈希（大文件/目录/链接）：状态以视图层为准（发布走 blob/CAS）。
+  return true
+end
+
 -- 把已冻结候选的改动合并进工作区暂存映射（见 M.merge_candidate）：使 read_file/edit_file 能看到
 -- run_command 产生的改动（双向互通）。
 function M.merge_candidate(cand, opts)
@@ -1470,7 +1666,51 @@ function M.merge_candidate(cand, opts)
   for _, f in ipairs(cand.files or {}) do
     local staged = _workspace_path(f.path)
     state.staged_to_real[staged] = f.path
-    if f.link then
+    -- 单视图：内容已在视图层内，只登记台账（绝不回写覆盖命令产物）。
+    if view.enabled() and view.is_native(staged) then
+      local st = vim.uv.fs_stat(staged)
+      -- 一次性 attempt（独立 upper）或旧布局的改动：内容还没进视图，一次性写回。
+      if (f.action == "create" or f.action == "modify") and not _view_matches(f, staged) then
+        fs.ensure_dir(vim.fn.fnamemodify(staged, ":h"))
+        if f.blob then
+          fs.copy_file(f.blob, staged)
+        else
+          -- 视图是**命令可见层**：写入真实内容（候选内容是 AI 视图的 token 化文本）；
+          -- 读取时的遮蔽由命名空间桥（ns_fs 读后 tokenize）负责，落盘绝不带假密钥。
+          local content = f.content or ""
+          if _is_text_content(content) then
+            local detok, unresolved = require("NeoAI.sandbox.secret.secret").detokenize(content)
+            if (unresolved or 0) == 0 then content = detok end
+          end
+          _write_view_file(f.path, staged, content, f.mode)
+        end
+      end
+      if f.link then
+        state.workspace[f.path] = {
+          staged = staged, link = f.link, base_hash = f.before_hash,
+          deleted = false, version = _bump_version(),
+        }
+      elseif f.action == "create" or f.action == "modify" then
+        state.workspace[f.path] = {
+          staged = staged, base_hash = f.before_hash, deleted = false, mode = f.mode,
+          large = (f.blob ~= nil or (st and st.type == "file"
+            and (st.size or 0) > _max_file_bytes())) or nil,
+          fresh = opts.from_command == true,
+          fresh_resident = opts.from_command == true and opts.resident == true,
+          version = _bump_version(),
+        }
+      elseif _is_delete_action(f.action) then
+        state.workspace[f.path] = {
+          staged = staged, base_hash = f.before_hash, deleted = true,
+          version = _bump_version(),
+        }
+      elseif f.action == "mkdir" then
+        state.workspace[f.path] = {
+          staged = staged, base_hash = f.before_hash, deleted = false, mode = f.mode,
+          version = _bump_version(),
+        }
+      end
+    elseif f.link then
       -- 符号链接：暂存副本为链接本身；工作区登记 link 目标（read/materialize 据 link 处理）。
       fs.ensure_dir(vim.fn.fnamemodify(staged, ":h"))
       pcall(vim.uv.fs_unlink, staged)
@@ -1581,7 +1821,51 @@ function M.merge_candidate_async(cand, opts)
       _diag("merge action=%s real=%s", tostring(f.action), tostring(f.path))
       local staged = _workspace_path(f.path)
       state.staged_to_real[staged] = f.path
-      if f.link then
+      -- 单视图：命令/工具已经直接写在视图层内（暂存 = overlay upper），这里**只登记台账**，
+      -- 绝不再写第二份内容——否则会用候选内容（可能已 token 化/陈旧）覆盖视图，甚至把
+      -- 命令产物改坏。也不做 token 化落盘：AI 侧读取由命名空间桥按需 token 化。
+      if view.enabled() and view.is_native(staged) then
+        local st = vim.uv.fs_stat(staged)
+        -- 一次性 attempt（独立 upper）或旧布局的改动：内容还没进视图，一次性写回（真实内容）。
+        if (f.action == "create" or f.action == "modify") and not _view_matches(f, staged) then
+          fs.ensure_dir(vim.fn.fnamemodify(staged, ":h"))
+          if f.blob then
+            fs.copy_file(f.blob, staged)
+          else
+            local content = f.content or ""
+            if _is_text_content(content) then
+              local detok, unresolved = require("NeoAI.sandbox.secret.secret").detokenize(content)
+              if (unresolved or 0) == 0 then content = detok end
+            end
+            _write_view_file(f.path, staged, content, f.mode)
+          end
+        end
+        if f.link then
+          state.workspace[f.path] = {
+            staged = staged, link = f.link, base_hash = f.before_hash,
+            deleted = false, version = _bump_version(),
+          }
+        elseif f.action == "create" or f.action == "modify" then
+          state.workspace[f.path] = {
+            staged = staged, base_hash = f.before_hash, deleted = false, mode = f.mode,
+            large = (f.blob ~= nil or (st and st.type == "file"
+              and (st.size or 0) > _max_file_bytes())) or nil,
+            fresh = opts.from_command == true,
+            fresh_resident = opts.from_command == true and opts.resident == true,
+            version = _bump_version(),
+          }
+        elseif _is_delete_action(f.action) then
+          state.workspace[f.path] = {
+            staged = staged, base_hash = f.before_hash, deleted = true,
+            version = _bump_version(),
+          }
+        elseif f.action == "mkdir" then
+          state.workspace[f.path] = {
+            staged = staged, base_hash = f.before_hash, deleted = false, mode = f.mode,
+            version = _bump_version(),
+          }
+        end
+      elseif f.link then
         -- 符号链接：暂存副本为链接本身；工作区登记 link 目标。
         fs.ensure_dir(vim.fn.fnamemodify(staged, ":h"))
         pcall(vim.uv.fs_unlink, staged)
@@ -1665,17 +1949,19 @@ function M.merge_candidate_async(cand, opts)
       for _, f in ipairs(cand.view_files or {}) do
         local ws = state.workspace[f.path]
         if ws and ws.staged and not ws.deleted then
-          local content = tok_of[f] or (f.content or "")
-          fs.ensure_dir(vim.fn.fnamemodify(ws.staged, ":h"))
-          fs.write_file(ws.staged, content)
-          if f.mode then fs.chmod(ws.staged, f.mode) end
-          local real_content = content
-          if _is_text_content(content) then
-            local detok, unresolved = secret.detokenize(content)
-            if (unresolved or 0) == 0 then real_content = detok end
+          if not view.is_native(ws.staged) then
+            local content = tok_of[f] or (f.content or "")
+            fs.ensure_dir(vim.fn.fnamemodify(ws.staged, ":h"))
+            fs.write_file(ws.staged, content)
+            if f.mode then fs.chmod(ws.staged, f.mode) end
+            local real_content = content
+            if _is_text_content(content) then
+              local detok, unresolved = secret.detokenize(content)
+              if (unresolved or 0) == 0 then real_content = detok end
+            end
+            ws.real_hash = _sha(real_content)
+            ws.tokenized = (content ~= real_content)
           end
-          ws.real_hash = _sha(real_content)
-          ws.tokenized = (content ~= real_content)
           ws.version = _bump_version()
           view_paths[#view_paths + 1] = f.path
         end
@@ -1928,12 +2214,21 @@ end
 --- @param paths string|table
 function M.invalidate(paths)
   if type(paths) == "string" then paths = { paths } end
+  -- 常驻实例挂载期间，宿主侧删改 overlay upper 属未定义行为：视图原生条目交给
+  -- `resident.invalidate_paths`（`sync_real` 在命名空间内写回/删除）。
+  local resident_mounted = false
+  if view.enabled() then
+    pcall(function()
+      resident_mounted = require("NeoAI.sandbox.execution.resident").active() ~= nil
+    end)
+  end
   local reals = {}
   for _, p in ipairs(paths or {}) do
     local real = _abs(p)
     local ws = state.workspace[real]
     if ws then
-      pcall(vim.fn.delete, ws.staged, "rf")
+      local native_mounted = resident_mounted and ws.staged and view.is_native(ws.staged)
+      if not native_mounted then pcall(vim.fn.delete, ws.staged, "rf") end
       state.staged_to_real[ws.staged] = nil
       state.workspace[real] = nil
     end
@@ -1945,6 +2240,24 @@ function M.invalidate(paths)
       pcall(resident.invalidate_paths, reals)
     else
       M._invalidate_overlay_host(reals)
+    end
+    -- 单视图：发布/拒绝后真实盘与视图内容一致，记录其 dsig 作为「已处理基线」，
+    -- 使后续捕获的全量遍历可以跳过这些文件（否则每次都会把已发布的旧条目再判为改动）。
+    if view.enabled() then
+      for _, real in ipairs(reals) do
+        local spec = view.match(real)
+        local st = vim.uv.fs_stat(real)
+        if spec and spec.upper and st and st.type == "file" and st.mtime then
+          local mat = state.materialized[spec.upper]
+          if not mat then mat = {}; state.materialized[spec.upper] = mat end
+          mat[real] = {
+            dest = view.path_for(real) or real, hash = "sha256:view",
+            dsig = string.format("%s:%s:%s:%s", tostring(st.mtime.sec), tostring(st.mtime.nsec),
+              tostring(st.size), tostring(st.mode % 4096)),
+            version = _bump_version(),
+          }
+        end
+      end
     end
   end
 end
@@ -1980,7 +2293,7 @@ end
 --- 单文件纳入候选的大小上限（字节）：超过则不纳入候选，避免把 apt/pkgcache.bin、
 --- 缓存归档、镜像层等超大文件嵌入候选 JSON 而阻塞主线程 / 撑爆磁盘。0 = 不限制。
 --- @return number
-local function _max_file_bytes()
+_max_file_bytes = function()
   local n = tonumber(require("NeoAI.kernel.config_store").get("tools.sandbox.max_file_bytes"))
   if n == nil then return 8 * 1024 * 1024 end
   return n
@@ -2183,7 +2496,9 @@ local function _capture_entry(attempt, real_root, staged, child_rel, prefetch, c
   -- `prefetch.ws_checked`：异步路径已在线程内完成该判定（含内容读取），主线程不再读盘。
   if not (prefetch and prefetch.ws_checked) then
     local ws = state.workspace[real]
-    if ws then
+    -- 单视图：staged 与 dest 是同一个文件（都在视图 upper），无「命令改动是否只是暂存复现」
+    -- 可言——命令写到哪就是哪，跳过该判定，否则所有改动都会被判为「未改动」而丢失。
+    if ws and ws.staged ~= staged then
       if ws.deleted then
         -- 之前标记删除：仅当命令**重新创建**了普通文件时才视为改动（whiteout 设备节点仍跳过）。
         local sstat = vim.uv.fs_stat(staged)
@@ -2192,8 +2507,13 @@ local function _capture_entry(attempt, real_root, staged, child_rel, prefetch, c
           return
         end
       elseif ws.staged and fs.exists(ws.staged) then
-        local before = _read(ws.staged)
-        local after = _read(staged)
+        -- 超限（含旧 mapping 未标 large）不做内容比较：读取大文件是 OOM 的主要来源。
+        local cap_ws = _max_file_bytes()
+        local wst = cap_ws > 0 and vim.uv.fs_stat(ws.staged) or nil
+        local dst_st = cap_ws > 0 and vim.uv.fs_stat(staged) or nil
+        local too_big = (wst and (wst.size or 0) > cap_ws) or (dst_st and (dst_st.size or 0) > cap_ws)
+        local before = too_big and nil or _read(ws.staged)
+        local after = too_big and nil or _read(staged)
         local same = before ~= nil and before == after
         if not same and ws.real_hash and after ~= nil then
           -- 暂存副本可能是 token 化视图：用真实内容哈希比较，避免误判为命令改动。
@@ -2756,11 +3076,15 @@ local function _encode_ws(ws_map, root, paths)
   local prefix = root and (root .. "/") or nil
   for real, ws in pairs(ws_map or {}) do
     if not prefix or real == root or real:sub(1, #prefix) == prefix then
-      if paths == nil or paths[real] == true then
-        local staged = ws.deleted and "D" or (ws.staged or "")
-        out[#out + 1] = f(real) .. f(staged) .. f(tostring(ws.mode or ""))
-          .. f(ws.real_hash or "")
-        n = n + 1
+      -- 单视图的暂存条目（staged 就在 upper 内）不参与「命令改动是否只是暂存复现」判定：
+      -- dest 与 staged 是同一文件，比较恒等，会把命令真实改动全部误判为未改动而跳过捕获。
+      if not (ws.staged and view.is_native(ws.staged)) then
+        if paths == nil or paths[real] == true then
+          local staged = ws.deleted and "D" or (ws.staged or "")
+          out[#out + 1] = f(real) .. f(staged) .. f(tostring(ws.mode or ""))
+            .. f(ws.real_hash or "")
+          n = n + 1
+        end
       end
     end
   end
@@ -3533,13 +3857,39 @@ function M.finish(attempt_id, prefetch, classify, skip_base_blobs)
   -- 但必须同步暂存视图，否则下次物化会用旧暂存内容覆盖命令结果（表现为「命令写入被回滚」）。
   local view_files = {}
   local cap = _max_file_bytes()
-  for real, entry in pairs(attempt.mapping) do
+  -- 单候选总预算（防「一条 cargo build 把数 GB 产物读进编辑器内存」→ 内核 OOM 杀 nvim）：
+  -- 累计内联内容字节数 + 条目数超过上限后，余下文件一律转为 blob（按文件复制，不入 Lua），
+  -- 条目数再超上限则跳过并留一条告警。0 = 不限制。
+  local total_cap = tonumber(require("NeoAI.kernel.config_store").get("tools.sandbox.capture_max_bytes")) or 0
+  local count_cap = tonumber(require("NeoAI.kernel.config_store").get("tools.sandbox.capture_max_files")) or 0
+  local total_bytes, budget_dropped = 0, 0
+  -- 条目数上限：超出部分不进入候选（其余文件改动仍在视图层，可手动复核）。
+  -- 在遍历前裁剪映射，避免逐条分支都要判「跳过」（否则会把删除类误判成 retire）。
+  local mapping_iter = attempt.mapping
+  if count_cap > 0 then
+    local keys = {}
+    for real in pairs(attempt.mapping) do keys[#keys + 1] = real end
+    if #keys > count_cap then
+      table.sort(keys)
+      local keep = {}
+      for i = 1, count_cap do keep[keys[i]] = true end
+      mapping_iter = {}
+      for k in pairs(keep) do mapping_iter[k] = attempt.mapping[k] end
+      budget_dropped = #keys - count_cap
+    end
+  end
+  for real, entry in pairs(mapping_iter) do
     local pf = prefetch and prefetch[entry.staged]
     local staged_stat
     if pf then
       staged_stat = pf.exists and { type = pf.type, size = pf.size } or nil
     else
       staged_stat = vim.uv.fs_stat(entry.staged)
+    end
+    local over_budget = total_cap > 0 and staged_stat and staged_stat.type == "file"
+      and (total_bytes + (staged_stat.size or 0)) > total_cap
+    if staged_stat and staged_stat.type == "file" then
+      total_bytes = total_bytes + (staged_stat.size or 0)
     end
     if entry.link then
       -- 符号链接候选（systemd enable/disable 等）：以目标字符串为「内容」发布/应用。
@@ -3554,6 +3904,7 @@ function M.finish(attempt_id, prefetch, classify, skip_base_blobs)
       end
     else
     local is_large = entry.large == true
+      or over_budget
       or (cap > 0 and staged_stat and staged_stat.type == "file" and (staged_stat.size or 0) > cap)
     if is_large then
       -- 超大文件：内容以 blob 承载（不在候选 JSON 内嵌），发布/物化按文件复制。
@@ -3598,6 +3949,7 @@ function M.finish(attempt_id, prefetch, classify, skip_base_blobs)
             base_exists = entry.base_exists,
             base_type = entry.base_type,
             mode = (action == "create" or action == "modify") and entry.mode or nil,
+            base_mode = (action == "create" or action == "modify") and entry.base_mode or nil,
             blob = (action == "create" or action == "modify") and blob or nil,
             large = true,
           }        end
@@ -3694,10 +4046,16 @@ function M.finish(attempt_id, prefetch, classify, skip_base_blobs)
           base_exists = entry.base_exists,
           base_type = entry.base_type,
           mode = (action == "create" or action == "modify") and entry.mode or nil,
+          base_mode = (action == "create" or action == "modify") and entry.base_mode or nil,
           content = ((action == "create" or action == "modify") and not blob) and content or nil,
           blob = ((action == "create" or action == "modify") and blob) or nil,
         }
       elseif after_hash and not entry.base_sig then
+        -- 单视图：暂存就是视图层，命令把内容还原成真实基线时视图本身已是最新（无需回写），
+        -- 但必须**撤销该路径的待审候选**——否则审批窗里会残留一条「已被命令还原」的旧改动。
+        if view.enabled() and view.is_native(entry.staged) then
+          view_files[#view_files + 1] = { path = real, action = "modify" }
+        else
         -- 对真实盘无净改动；但若工作区暂存仍是旧内容，说明命令还原了暂存编辑，需同步视图。
         -- 包/生成内容（base_sig）不做该比对：其 after_hash 是 stat 签名而非内容哈希，且内容为生成物。
         local ws = state.workspace[real]
@@ -3721,11 +4079,24 @@ function M.finish(attempt_id, prefetch, classify, skip_base_blobs)
             }
           end
         end
+        end
       end
     end
     end
   end
   table.sort(files, function(a, b) return a.path < b.path end)
+  if budget_dropped > 0 then
+    pcall(function()
+      require("NeoAI.kernel.logger").warn(
+        "[sandbox] 候选条目数超过上限 %d，已跳过 %d 个（改动仍在视图层，可用 :NeoAI SandboxReview 查看）",
+        count_cap, budget_dropped)
+    end)
+    pcall(function()
+      require("NeoAI.sandbox.review.evidence").add("capture_budget", {
+        dropped = budget_dropped, limit = count_cap, bytes = total_bytes, byte_limit = total_cap,
+      })
+    end)
+  end
   -- `.git` 内部整目录删除按原子组逐文件展开（git 语义），工作区目录仍只记节点。
   files = _expand_git_retire(files)
   -- 删除只记节点：祖先已是 `retire` 节点时丢弃后代删除条目（审批视图一条、发布一次 rename）。
@@ -4771,12 +5142,14 @@ function M.publish(candidate, opts)
           allow_root = opts.allow_root == true,
           prefer_sudo = opts.prefer_sudo == true,
           mode = f.mode,
+          base_mode = f.base_mode,
         })
       else
         res = writer.apply(action, f.path, content, {
           allow_root = opts.allow_root == true,
           prefer_sudo = opts.prefer_sudo == true,
           mode = f.mode,
+          base_mode = f.base_mode,
           change_set_id = change_set,
         })
       end
@@ -5018,6 +5391,15 @@ local function _publish_worker(payload, sha_src)
         end
       elseif action == "write" or action == "create" or action == "modify" then
         local mode = nn(op.mode)
+        local base_mode = nn(op.base_mode)
+        local target_st = uv.fs_stat(path)
+        local target_mode = target_st and (target_st.mode % 4096) or nil
+        -- 权限位：只有候选**显式改动**了权限（mode ≠ 基线 mode）才用候选 mode；否则沿用目标
+        -- 现有权限位。避免「用 0644 的编辑视图发布，把真实文件 0755 的可执行位抹掉」
+        -- （实测 `chmod +x` 后再次编辑/发布，脚本执行位被回滚）。
+        if mode ~= nil and (base_mode == nil or mode == base_mode) and target_mode ~= nil then
+          mode = target_mode
+        end
         -- git 对象库：目标已存在即内容相同（幂等），跳过写入。
         if gc == "object" and uv.fs_stat(path) then
           -- skip
@@ -5119,6 +5501,7 @@ function M.publish_async(candidate, opts)
   for i, f in ipairs(files) do
     local spec = {
       path = f.path, action = f.action, mode = f.mode, link = f.link,
+      base_mode = f.base_mode,
       blob = f.blob, large = f.large, content = (not f.blob) and f.content or nil,
       git_class = _file_git_class(f),
       base_type = f.base_type, before_hash = f.before_hash, before_sig = f.before_sig,
@@ -5201,8 +5584,8 @@ function M.publish_async(candidate, opts)
   --- @return table { op? , error? }
   local function materialize(spec, phase)
     local op = {
-      path = spec.path, action = spec.action, mode = spec.mode, link = spec.link,
-      git_class = spec.git_class, base_type = spec.base_type,
+      path = spec.path, action = spec.action, mode = spec.mode, base_mode = spec.base_mode,
+      link = spec.link, git_class = spec.git_class, base_type = spec.base_type,
       before_hash = spec.before_hash, before_sig = spec.before_sig,
     }
     if spec._skip then
@@ -5462,6 +5845,8 @@ function M.reset(timeout_ms)
   state.version = 0
   state.rotation = nil
   state.cand_levels = nil
+  -- 单视图：清空可写根登记（视图目录已随 `base_host` 一起删除，下次按需重建）。
+  pcall(function() view.reset() end)
 end
 
 return M

@@ -438,10 +438,20 @@ function M.apply(action, path, content, opts)
   local uid, gid = runtime.payload_ids()
   local cur = vim.uv.getuid()
   local mode = opts.mode
+  local base_mode = opts.base_mode
   -- 未记录权限时：保留目标已有权限；新建文件用常规 0644（避免 mkstemp 的 0600）。
-  if mode == nil and action == "write" then
+  if mode == nil and (action == "write" or action == "modify") then
     local st = vim.uv.fs_stat(path)
     mode = st and (st.mode % 4096) or 420
+  end
+  -- 候选没有显式改权限（候选 mode == 基线 mode）时，沿用在位目标的权限位：
+  -- 否则「编辑视图默认 0644」会把真实文件的 0755 执行位抹掉（`chmod +x` 被回滚）。
+  if (action == "write" or action == "modify" or action == "create") and mode ~= nil then
+    local st = vim.uv.fs_stat(path)
+    local cur_mode = st and (st.mode % 4096) or nil
+    if cur_mode ~= nil and (base_mode == nil or mode == base_mode) then
+      mode = cur_mode
+    end
   end
 
   -- NeoAI 本身非 root：先以当前身份写入；权限不足 → NEEDS_ROOT，用户批准后经 sudo 写入。

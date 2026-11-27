@@ -528,7 +528,16 @@ local function _start_ebpf(opts)
     handle.queue[#handle.queue + 1] = text
     pump()
   end
-  local job = vim.fn.jobstart({ "bpftrace", "-e", BTRACE_SCRIPT, tostring(cg_id) }, {
+  -- 在探针脚本首行打上本进程沙箱存储根的标记：崩溃（如被 OOM 杀）后进程被 init 收养，
+  -- 启动时的回收器据 cmdline 里的这个路径识别并清理孤儿 bpftrace（不会误杀他人进程）。
+  local marker = "// neoai-observer\n"
+  pcall(function()
+    local sroot = require("NeoAI.sandbox.state.store").root()
+    if type(sroot) == "string" and sroot ~= "" then
+      marker = "// neoai-observer " .. sroot .. "\n"
+    end
+  end)
+  local job = vim.fn.jobstart({ "bpftrace", "-e", marker .. BTRACE_SCRIPT, tostring(cg_id) }, {
     stdout_buffered = false,
     stderr_buffered = false,
     on_stdout = function(_, data)

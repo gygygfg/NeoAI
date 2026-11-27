@@ -2154,15 +2154,9 @@ function M.supersede_by_paths(paths, except_id, roots)
       end
     end
   end
-  local candidates = {}
-  if next(candidate_ids) ~= nil then
-    for id in pairs(candidate_ids) do
-      local item = state.items[id]
-      if item then candidates[#candidates + 1] = item end
-    end
-  else
-    candidates = _pending_items()
-  end
+  -- 始终遍历「全部 pending」：`path_index` 只是加速索引，可能因持久化/重载/并发写入而滞后；
+  -- 用滞后的索引会把真正命中的待审项漏掉（表现为「命令撤销了暂存编辑，但审批窗仍显示旧条目」）。
+  local candidates = _pending_items()
   for _, item in ipairs(candidates) do
     if item.review_state == M.REVIEW.PENDING
       and item.change_set_id ~= except_id and type(item.files) == "table" and #item.files > 0 then
@@ -2180,6 +2174,9 @@ function M.supersede_by_paths(paths, except_id, roots)
           item.superseded_by = except_id
           item.superseded_at = os.time()
           state.items[item.change_set_id] = item
+          -- 待审集合已变化：失效缓存（与部分取代分支一致），否则摘要/索引会继续显示旧条目。
+          state.pending_cache = nil
+          state.pending_items = nil
           if item.candidate_digest then to_discard[item.candidate_digest] = true end
           _persist(item)
           logger.try("delete_review_removed", store.delete_review_removed, item.change_set_id)

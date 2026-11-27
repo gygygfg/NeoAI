@@ -1550,7 +1550,12 @@ tests.suite("sandbox_core", function(_, it)
       candidate.begin(a2, assert(store.root()))
       local staged2 = assert(candidate.stage_path(a2.attempt_id, p))
       t.eq("edit1\n", fs.read_file(staged2), "轮换后应保留未发布的修改")
-      t.true_(staged2 ~= staged1, "轮换后应使用新的暂存路径")
+      if require("NeoAI.sandbox.execution.view").enabled() then
+        -- 单视图：暂存就是稳定的视图层，轮换不迁移，路径保持不变（这正是「每轮不叠加」的关键）。
+        t.eq(staged1, staged2, "单视图下轮换不应改变暂存路径（不迁移数据）")
+      else
+        t.true_(staged2 ~= staged1, "轮换后应使用新的暂存路径")
+      end
 
       candidate.cleanup(a1.attempt_id)
       candidate.cleanup(a2.attempt_id)

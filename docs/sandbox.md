@@ -163,6 +163,40 @@ LSP/treesitter 的写盘仍走各自既有的暂存路径（`persist_target` →
 > 命令前镜像已并入命令改动，故 AI 各读路径（`read_file` overlay / `list_files` 镜像）在同一
 > 工具边界一致。会话轮换的 whiteout 竞态见 `candidate.rotate_session`（`rotate_when_idle`）。
 
+### 2.2 单视图模型（三视图，`tools.sandbox.single_view`，默认开）
+
+旧模型有**两份可写数据**（工作区暂存副本 + overlay upper），每条命令前把暂存物化进 upper、
+命令后再把 upper 捕获/拷回暂存；agentEnd 还要迁移整棵暂存。长会话里拷贝量逐轮叠加，实测把
+编辑器内存吃到 27.7GB 被内核 OOM 杀死，并产生「同一 upper 被并行挂载」的 overlayfs 未定义行为。
+
+单视图把**暂存目录本身**作为 overlay upper，只保留三个视图：
+
+| 视图 | 存储 | 角色 |
+| --- | --- | --- |
+| 真实盘 | 宿主文件（只读 lower） | 发布的唯一落点 |
+| 沙箱合并视图 | `<沙箱暂存基>/view/<root>/upper`（= 暂存） | 命令/只读工具/LSP 共用同一份；AI 未发布改动即视图内容 |
+| 候选 | 只存 `{path, action, hash, mode, base_hash}` | 审批展示/发布时按需从视图读取内容 |
+
+不变量：
+
+- **每个沙箱会话只挂载一次**：视图基目录稳定（不随 agentEnd 轮换），常驻实例与一次性命令
+  共用同一 upper；不属于常驻实例的命令（T1/T2、包安装、跨挂载、fuse）改用独立
+  `<view>/attempt_<id>` upper，结束后按 delta 合并回视图并删除，绝不与视图 upper 并挂。
+- **不再物化/镜像/迁移**：`_workspace_path` 直接返回视图路径；`materialize_overlay` 对视图条目
+  只登记签名（不拷贝）；`merge_candidate(_async)` 对视图条目只登记台账（内容已在视图里）；
+  `rotate_session` 只推进会话 id，不迁数据。
+- **候选只处理 delta**：捕获仍用写日志（eBPF）优先，全量遍历仅对「未登记签名」的条目做元数据
+  比较；单候选受 `capture_max_bytes` / `capture_max_files` 预算约束，超限转 blob 或跳过。
+- **构建产物不入候选**：`tools.sandbox.generated_dirs`（`target`、`node_modules`、`build`、
+  `.gradle` 等，按工作区根向下 0~2 层展开）整棵子树不捕获，避免 `cargo build`/`npm install`
+  动辄数万文件把冻结/JSON 编码拖爆。
+- **写盘仍由审批控制**：视图内写入不是真实盘；发布（`publish`）才写真实文件，并保留原权限位
+  与 mtime（修「`chmod +x` 后发布被抹成 0644」「构建工具认为源文件未变」）。
+
+缓存目录（`~/.gradle/caches`、`~/.m2/repository`、`~/.cargo/registry`、`~/.npm/_cacache` 等）
+默认不捕获；沙箱内对它们的写入仍落在会话视图里（**绝不直接写宿主**）。离线构建依赖宿主已
+预热的缓存（只读 lower），会话内新下载的缓存随会话结束丢弃——这是隔离语义，不是缺陷。
+
 另外，`persist_buffer` 回写**真实盘**（无沙箱激活时）前做 fail-closed 检查：buffer 内容含密钥
 token（`NEOKEY_…`）或格式保真假密钥时**拒绝写盘**（`SECRET_TOKEN_SKIP`），避免把密钥层假化后的
 内容写回真实文件（曾发生把含 PEM 样式文字的源码文件内容替换为随机假值的静默损坏）。

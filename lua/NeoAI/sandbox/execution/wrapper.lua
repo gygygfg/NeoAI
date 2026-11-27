@@ -1848,7 +1848,9 @@ local function _ensure_fileop_resident(ctx, tool_name, args, spec)
     if not (resolved and resolved.ok and resolved.privileges) then return end
     local priv = resolved.privileges
     local sroot = store.root() or (vim.fn.stdpath("cache") .. "/NeoAI/sandbox")
-    local resident_base = (sroot:gsub("/+$", "")) .. "/resident"
+    -- 单视图：常驻实例与一次性命令共用**同一个**稳定视图（upper = 暂存），不再各自一套。
+    local resident_base = candidate.view_base()
+      or ((sroot:gsub("/+$", "")) .. "/resident")
     local extra_roots = {}
     for _, r in ipairs(candidate.staged_roots()) do extra_roots[#extra_roots + 1] = r end
     do
@@ -1870,14 +1872,23 @@ local function _ensure_fileop_resident(ctx, tool_name, args, spec)
         s.mode = "bind"
       end
     end
+    -- 单视图：先登记视图根，使紧随其后的首次 edit_file 直接写进 overlay upper（= 暂存），
+    -- 不必先写一份 sessions/ 副本再在命令前搬进视图。
+    candidate.register_view(specs)
     local resident_session_dir = resident_base .. "/shell"
     fs.ensure_dir(resident_session_dir)
     runtime.chown_payload(resident_session_dir)
-    resident_mod.ensure({
+    local inst, rerr = resident_mod.ensure({
       specs = specs, cwd = real_cwd, privileges = priv,
       session_dir = resident_session_dir, session_tmp_dir = tmp_base, tmpfs_base = tmp_base,
       fallback_cwd = staging, env = runtime.sandbox_env(priv),
     })
+    if not inst then
+      -- 不再静默：常驻实例起不来时文件工具会回退到暂存副本（安全但少一层视图一致性），
+      -- 失败原因必须留在日志里，便于定位（bwrap/挂载/档位/overlay 不可用等）。
+      require("NeoAI.kernel.logger").warn(
+        "[sandbox] 常驻实例启动失败（文件工具回退暂存副本）：%s", tostring(rerr))
+    end
   end)
   local ok_a, active = pcall(resident_mod.active)
   if ok_a and active ~= nil then return true end
@@ -1906,6 +1917,24 @@ local function _gate_inner(tool, args, ctx, call_original)
   end
 
   local spec = tool and tool.__sandbox_spec or tool_spec.get(tool and tool.name, tool and tool.category)
+
+  -- 读视图一致性：上一条命令的后台捕获/合并（`postprocess="async"`）尚未完成时，进程内读工具
+  -- （read_file/search_files/list_files/file_exists）会看到旧视图。这里做**有界短等待**，
+  -- 保证「命令写入 → 立即读取」一致；只在确实有待处理链时阻塞（上限 `tools.sandbox.attach_await_ms`，默认 3s）。
+  do
+    local is_read = spec and spec.effect == "read"
+    if is_read and postprocess.pending then
+      local wait_ms = tonumber(config_store.get("tools.sandbox.attach_await_ms"))
+      if wait_ms == nil then wait_ms = 3000 end
+      wait_ms = math.max(0, wait_ms)
+      if wait_ms > 0 then
+        local settled = M.await_postprocess(wait_ms)
+        if not settled then
+          logger.debug("[sandbox] 读工具等待后台后处理超时（%dms），本次读取可能看到较旧视图", wait_ms)
+        end
+      end
+    end
+  end
 
   -- 危险设备访问门禁（/dev/kvm、/dev/net/tun 等内核逃逸面）：默认弹窗询问用户（30s 无应答自动
   -- 阻止）；批准后由 `_build_prefix` 把该设备 `--dev-bind` 进本次命令的沙箱命名空间。检测用命令
@@ -2360,7 +2389,17 @@ local function _gate_inner(tool, args, ctx, call_original)
     if resident_ok then
       local sroot = require("NeoAI.sandbox.state.store").root()
         or (vim.fn.stdpath("cache") .. "/NeoAI/sandbox")
-      resident_base = (sroot:gsub("/+$", "")) .. "/resident"
+      -- 单视图：常驻与一次性命令共用同一稳定视图（upper = 暂存）；否则沿用旧 resident 目录。
+      resident_base = candidate.view_base() or ((sroot:gsub("/+$", "")) .. "/resident")
+    end
+    -- 单视图下不属于常驻实例的命令（T1/T2、包安装、跨挂载等）：使用一次性独立 attempt 目录，
+    -- 绝不与常驻实例/其它命令并挂同一个 upper（内核 overlayfs 明确不支持，实测会损坏视图）。
+    -- 其改动在命令结束后按 delta 写回视图（见 candidate.merge_candidate_async）。
+    local one_shot_base = proc_dir
+    if candidate.view_base() and not resident_ok then
+      one_shot_base = candidate.view_base() .. "/attempt_" .. tostring(attempt.attempt_id)
+      fs.ensure_dir(one_shot_base)
+      runtime.chown_payload(one_shot_base)
     end
     -- 可写根 = 工具声明（spec.writable_roots）+（包安装时）包管理器状态目录。
     -- 包安装写入的索引/缓存/元数据同样进入 overlay，冻结为候选（不直接落盘）。
@@ -2390,22 +2429,45 @@ local function _gate_inner(tool, args, ctx, call_original)
       end
     end
     local specs = M.build_overlay_specs(real_cwd,
-      resident_base or proc_dir, extra_roots,
+      resident_base or one_shot_base, extra_roots,
       { no_root_overlay = ctx.sandbox_cross_mount_approved == true })
     -- 选定每个可写根实际使用的层（overlay / fuse / bind），供物化/捕获/前缀构造一致使用
-    for _, sp in ipairs(specs) do
-      if sp.mode == "fuse" then
-        -- 已由 fuse-overlayfs 建立的用户态合并视图，保持不动。
-      elseif runtime.overlay_writable(sp.root, sp.upper, sp.work) then
-        sp.mode = "overlay"
-      else
-        sp.mode = "bind"
-        -- 记录降级原因，供 run_command 结果中说明（便于排查 overlay 为何不可用）
-        sp.overlay_reason = runtime.overlay_reason(sp.root, sp.upper, sp.work)
+    local function _resolve_layer_modes(list)
+      for _, sp in ipairs(list) do
+        if sp.mode == "fuse" then
+          -- 已由 fuse-overlayfs 建立的用户态合并视图，保持不动。
+        elseif runtime.overlay_writable(sp.root, sp.upper, sp.work) then
+          sp.mode = "overlay"
+        else
+          sp.mode = "bind"
+          -- 记录降级原因，供 run_command 结果中说明（便于排查 overlay 为何不可用）
+          sp.overlay_reason = runtime.overlay_reason(sp.root, sp.upper, sp.work)
+        end
       end
     end
+    _resolve_layer_modes(specs)
     -- 用户态 overlay（fuse）与常驻沙箱不兼容：强制走一次性路径（其物化/捕获已支持 fuse）。
-    for _, s in ipairs(specs) do if s.mode == "fuse" then resident_ok = false end end
+    -- 单视图下若因此改走一次性，必须**换到独立 attempt 目录重建规格**，绝不能仍以视图 upper
+    -- 并行挂载（内核 overlayfs 明确不支持同一 upper/work 双挂）。
+    do
+      local has_fuse = false
+      for _, s in ipairs(specs) do if s.mode == "fuse" then has_fuse = true end end
+      if has_fuse and resident_ok then
+        resident_ok = false
+        one_shot_base = proc_dir
+        if candidate.view_base() then
+          one_shot_base = candidate.view_base() .. "/attempt_" .. tostring(attempt.attempt_id)
+          fs.ensure_dir(one_shot_base)
+          runtime.chown_payload(one_shot_base)
+        end
+        specs = M.build_overlay_specs(real_cwd, one_shot_base, extra_roots,
+          { no_root_overlay = ctx.sandbox_cross_mount_approved == true })
+        _resolve_layer_modes(specs)
+      end
+    end
+    -- 单视图：只有常驻实例的规格才登记（其 upper 即稳定视图）；一次性 attempt 不登记，
+    -- 避免把「编辑应写入视图」的映射改指到临时 attempt 目录。
+    if resident_ok and candidate.view_base() then candidate.register_view(specs) end
     -- 取证（默认关闭）：本条命令的视图来源与后处理在途状态（跨命令丢文件的首要嫌疑面）。
     if trace_log.enabled() then
       local parts = {}
@@ -3238,10 +3300,19 @@ local function _gate_inner(tool, args, ctx, call_original)
         end)
       end)
       -- 后台任务状态：只用于 UI「执行中」高亮，不改变结算语义。
+      local function _cleanup_oneshot()
+        -- 单视图：一次性 attempt 的独立 upper 只服务本条命令；候选已合并回视图后即可删除，
+        -- 避免每个 T1/T2/包安装命令都在视图下留一份 overlay 副本（轮次占用叠加）。
+        if candidate.view_base() and not resident_ok and one_shot_base then
+          pcall(vim.fn.delete, one_shot_base, "rf")
+        end
+      end
       chain:then_(function(settled)
+        _cleanup_oneshot()
         require("NeoAI.sandbox.execution.jobs").finish(
           _job, not (settled and settled.ok == false), settled and settled.err and settled.err.message or nil)
       end, function(e)
+        _cleanup_oneshot()
         require("NeoAI.sandbox.execution.jobs").finish(_job, false, tostring(e and (e.message or e) or e))
       end)
       if (cfg.postprocess or "async") == "sync" then
