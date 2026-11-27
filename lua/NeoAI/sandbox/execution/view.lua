@@ -52,6 +52,9 @@ end
 --- @return boolean
 local function _under(p, root)
   if type(p) ~= "string" or type(root) ~= "string" then return false end
+  -- 整机根 overlay（root="/"）：`root .. "/"` 会变成 "//"，前缀判定恒假，
+  -- 使 root="/" 视图永远无法映射（所有路径都回退旧暂存副本）。根做特判。
+  if root == "/" then return p:sub(1, 1) == "/" end
   return p == root or p:sub(1, #root + 1) == root .. "/"
 end
 
@@ -146,6 +149,21 @@ function M.match(real)
   for _, s in ipairs(state.roots) do
     if _under(real, s.root) then
       if not best or #s.root > #best.root then best = s end
+    end
+  end
+  if not best then return nil end
+  -- 私有 tmpfs 根（/tmp、/var/tmp 等）在沙箱内由会话私有目录覆盖：**整机根 overlay** 下
+  -- 这些路径与宿主不一致，绝不映射（保持「tmpfs 根回退旧暂存」不变量）。若 cwd 等根本身
+  -- 位于 tmpfs 并为它建立了独立 overlay，则按更长的具体根映射（best 不是 "/"）。
+  if best.root == "/" then
+    local okr, runtime = pcall(require, "NeoAI.sandbox.execution.runtime")
+    if okr and runtime and type(runtime.tmpfs_roots) == "function" then
+      local ok, roots = pcall(runtime.tmpfs_roots)
+      if ok and type(roots) == "table" then
+        for _, r in ipairs(roots) do
+          if _under(real, r) then return nil end
+        end
+      end
     end
   end
   return best

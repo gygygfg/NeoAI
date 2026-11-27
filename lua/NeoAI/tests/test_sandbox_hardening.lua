@@ -355,6 +355,9 @@ tests.suite("sandbox_hardening", function(_, it)
     with_config({
       tools = {
         approval = { mode = "auto_allow" },
+        -- with_config 以默认配置为底（不是 tests/init 的测试默认值）：显式关闭交互式 PTY，
+        -- 否则 run_command 走一次性 PTY 路径，后台进程无法跨调用存活。
+        run_command = { interactive = { enabled = false } },
         sandbox = {
           enabled = true, fail_closed = true, mode = "dry_run",
           ephemeral_roots = {}, resident = { enabled = true },
@@ -370,9 +373,11 @@ tests.suite("sandbox_hardening", function(_, it)
         vim.wait(20000, function() return done end, 50)
         return tostring(out)
       end
-      -- 沙箱内后台启动临时 HTTP 服务（未声明 PORT，未走 service 模块）
-      run("python3 -m http.server " .. port .. " --bind 127.0.0.1 >/tmp/.neoai_h.log 2>&1 & echo started")
-      vim.wait(1500)
+      -- 沙箱内后台启动临时 HTTP 服务（未声明 PORT，未走 service 模块）。
+      -- 命令必须以 `&` 结尾：门禁的 background.parse 只识别「终止 &/前导 nohup/setsid」，
+      -- 中段 `& echo ...` 会被视为普通命令、后台进程随命令结束被 cgroup 回收。
+      run("python3 -m http.server " .. port .. " --bind 127.0.0.1 >/tmp/.neoai_h.log 2>&1 &")
+      vim.wait(3000)
       -- 沙箱内经代理访问该回环端口：应按 cgroup 归属自动识别为内部端口放行
       local code = run("curl -s -m 4 -o /dev/null -w '%{http_code}' http://127.0.0.1:" .. port .. "/")
       t.matches("200", code, "沙箱内临时服务应被自动放行（实际: " .. code .. "）")

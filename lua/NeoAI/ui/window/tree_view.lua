@@ -124,7 +124,7 @@ end
 --- @return boolean
 local function _is_sub_agent_message(message)
   if not message then return false end
-  if message.sub_agent then return true end
+  if message.sub_agent or message.sub_agent_question then return true end
   if message.role ~= "user" then return false end
   return type(message.content) == "string" and message.content:match("^%s*【子 Agent") ~= nil
 end
@@ -1313,6 +1313,15 @@ end
 --- @return Deferred
 function M._build_worker(input)
   return work.run_codec(_build_runner, input, TREE_BUILD_SRC)
+end
+
+--- 释放纯展示缓存（内存看门狗 soft/hard 时调用；不影响树内容正确性）。
+--- 摘要缓存会在下次渲染时按会话内容重新计算。
+function M.reclaim_memory()
+  state.digest_cache = {}
+  state.lines = {}
+  state.meta = {}
+  state.depths = ""
 end
 
 return M

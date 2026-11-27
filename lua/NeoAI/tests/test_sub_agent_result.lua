@@ -79,6 +79,126 @@ tests.suite("sub_agent_result", function(_, it)
     manager.reset()
   end)
 
+  it("子 Agent 工具集包含 ask_user（问题转交主 Agent）", function(t)
+    local plan = require("NeoAI.tools.builtin.plan")
+    local tools = plan._allowed_tools(nil)
+    t.not_nil(tools.ask_user, "子 Agent 应能用 ask_user 提问（由主 Agent 决定回答方式）")
+    t.nil_(tools.send_sub_agent_message, "不得直接向父 Agent 发消息")
+  end)
+
+  it("ask_parent：问题转交主 Agent，send 作为回答（同子 Agent 同时只投递一个）", function(t)
+    local manager = require("NeoAI.core.agent.sub_agent")
+    local runtime = require("NeoAI.core.agent.runtime")
+    manager.reset()
+    local parent = { id = "p_q" }
+    local child = { id = "child_q" }
+    local orig_get = runtime.get
+    ---@diagnostic disable-next-line: duplicate-set-field
+    runtime.get = function(id)
+      if id == "p_q" then return parent end
+      if id == "child_q" then return child end
+      return nil
+    end
+    local dispatched = {}
+    manager.set_dispatch(function(_, text, _, meta)
+      dispatched[#dispatched + 1] = { text = text, meta = meta }
+    end)
+    manager._inject_for_test("sub_q", { agent_id = "child_q", parent_agent_id = "p_q", name = "提问者" })
+
+    local answers, errors = {}, {}
+    local q1 = manager.ask_parent("sub_q", {
+      question = "第一个问题",
+      on_success = function(v) answers[#answers + 1] = v end,
+      on_error = function(e) errors[#errors + 1] = e end,
+    })
+    t.not_nil(q1)
+    t.eq(1, #dispatched, "第一个问题应立即转交主 Agent")
+    t.matches("第一个问题", dispatched[1].text)
+    t.eq(q1, dispatched[1].meta.sub_agent_question.id)
+
+    -- 第二个问题排队，不立即投递（同一子 Agent 同时一个在途问题）
+    manager.ask_parent("sub_q", {
+      question = "第二个问题",
+      on_success = function(v) answers[#answers + 1] = v end,
+      on_error = function(e) errors[#errors + 1] = e end,
+    })
+    t.eq(1, #dispatched, "第二个问题应排队")
+
+    local ok, _, answered = manager.send("sub_q", "答案一")
+    t.true_(ok)
+    t.true_(answered, "有在途提问时 send 视为回答")
+    t.eq("主 Agent 回答: 答案一", answers[1])
+    t.eq(2, #dispatched, "回答后应投递下一个排队问题")
+    t.matches("第二个问题", dispatched[2].text)
+
+    ok, _, answered = manager.send("sub_q", "答案二")
+    t.true_(ok)
+    t.true_(answered)
+    t.eq("主 Agent 回答: 答案二", answers[2])
+    t.eq(0, #errors)
+    t.eq(0, #manager.pending_questions_for("sub_q"))
+
+    runtime.get = orig_get
+    manager.reset()
+  end)
+
+  it("子 Agent 取消/父销毁时未回答提问被结算", function(t)
+    local manager = require("NeoAI.core.agent.sub_agent")
+    local runtime = require("NeoAI.core.agent.runtime")
+    local event_bus = require("NeoAI.kernel.event_bus")
+    local events = require("NeoAI.kernel.events")
+    manager.reset()
+    local orig_get, orig_abort = runtime.get, runtime.abort
+    ---@diagnostic disable-next-line: duplicate-set-field
+    runtime.get = function(id)
+      if id == "p_q2" then return { id = "p_q2" } end
+      if id == "child_q2" then return { id = "child_q2" } end
+      return nil
+    end
+    ---@diagnostic disable-next-line: duplicate-set-field
+    runtime.abort = function() end
+    manager.set_dispatch(function() end)
+    manager._inject_for_test("sub_q2", { agent_id = "child_q2", parent_agent_id = "p_q2", name = "Q2" })
+    local errors = {}
+    manager.ask_parent("sub_q2", {
+      question = "会作废的问题",
+      on_success = function() end,
+      on_error = function(e) errors[#errors + 1] = e end,
+    })
+    t.eq(1, #manager.pending_questions_for("sub_q2"))
+    -- 父 Agent 销毁
+    event_bus.emit(events.AGENT_DISPOSED, { agent_id = "p_q2" })
+    t.eq(1, #errors)
+    t.matches("已关闭", errors[1] and errors[1].message or "")
+    t.eq(0, #manager.pending_questions_for("sub_q2"))
+    runtime.get, runtime.abort = orig_get, orig_abort
+    manager.reset()
+  end)
+
+  it("子 Agent 提问消息渲染为折叠块而非用户消息", function(t)
+    local ml = require("NeoAI.ui.components.message_list")
+    local buf = vim.api.nvim_create_buf(false, true)
+    ml.render_chat(buf, {
+      { role = "assistant", content = "派发任务" },
+      {
+        role = "user",
+        content = '【子 Agent "提问者" 提问（question_id=sq_1）】\n问题: 选哪个方案？',
+        sub_agent_question = { id = "sq_1", sub_agent_id = "s1", name = "提问者" },
+      },
+    }, nil)
+    local text = table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n")
+    t.matches("子 Agent 提问: 提问者", text)
+    t.matches("选哪个方案", text)
+    t.false_(text:find("👤 用户", 1, true) ~= nil, "提问不应渲染为用户消息")
+    t.false_(text:find("【子 Agent", 1, true) ~= nil, "投递包装行应被剥离")
+    local fold = require("NeoAI.ui.components.fold")
+    local kind, _, name = fold.detect("❓ 子 Agent 提问: 提问者")
+    t.eq("sub_agent_question", kind)
+    t.eq("提问者", name)
+    vim.api.nvim_buf_delete(buf, { force = true })
+    ml.reset()
+  end)
+
   it("子 Agent 自然结束回传正文给主 Agent", function(t)
     local manager = require("NeoAI.core.agent.sub_agent")
     local runtime = require("NeoAI.core.agent.runtime")

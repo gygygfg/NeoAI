@@ -27,8 +27,9 @@
 2. `runtime.spawn(parent, { session_id, model, cwd, tools })` 创建全新子 Agent（独立信号、零继承）。
 3. 工具子集由 `tools/builtin/plan.lua` 构建：**默认主 Agent 的全部工具，仅排除「Agent 类」工具**
    （`category == "agent"`：调度类 `create_sub_agent`/`get_sub_agent_status`/`cancel_sub_agent`/
-   `send_sub_agent_message`、`enter_plan_mode`、`ask_user`、`todo_*`）。
-   显式指定 `boundaries.allowed_tools` 时以其为准（同样排除 Agent 类工具）。
+   `send_sub_agent_message`、`enter_plan_mode`、`todo_*`）。**例外：`ask_user` 放行**——
+   子 Agent 提问会转交主 Agent（见 §2.5）。
+   显式指定 `boundaries.allowed_tools` 时以其为准（同样排除 Agent 类工具，`ask_user` 需显式列入）。
 4. 发射 `SUB_AGENT_CREATED`；`chat_service` 登记子会话 → Agent 映射（供切换复用运行中的 Agent）。
 5. `runtime.run(child, task .. "\n\n" .. final_instruction)` 开始执行。
    `final_instruction` 取 `tools.sub_agent.final_instruction`（默认要求「最后总结你的工作」）。
@@ -63,26 +64,53 @@
 
 ### 2.4 终止 / 发送消息
 
-- `cancel_sub_agent` → `sub_agent.cancel`：`runtime.abort(child)`，置 `cancelled`，发射 `SUB_AGENT_UPDATED`，持久化。
-- `send_sub_agent_message` → `sub_agent.send`：运行中消息在其下一轮注入；已完成的子 Agent 据此续跑一轮。
+- `cancel_sub_agent` → `sub_agent.cancel`：`runtime.abort(child)`，置 `cancelled`，发射 `SUB_AGENT_UPDATED`，持久化；
+  其未回答的提问一并作废。
+- `send_sub_agent_message` → `sub_agent.send`，是 **agent 之间来回对话的唯一通道**：
+  - 子 Agent 有**在途提问** → 本条消息即回答（FIFO 取当前问题），子 Agent 的 `ask_user` 工具结果变为
+    `主 Agent 回答: …`，不再额外注入下一轮；
+  - 运行中、无在途提问 → 在其下一轮注入；
+  - 已完成 → 据此续跑一轮。
+
+### 2.5 子 Agent 提问（ask_user 转交主 Agent）
+
+子 Agent **可以**调用 `ask_user`（`_build_tools` 对 `ask_user` 特例放行），但不会弹窗：
+
+1. `ask_user` 检测到 `ctx.is_sub_agent` → `sub_agent.ask_parent(sub_id, req)`：
+   暂停子 Agent 的活跃计时器（**不设超时**）、登记问题、发射 `SUB_AGENT_QUESTION`。
+2. 问题被包装成一条 `role=user` 消息（标记 `sub_agent_question`，含 `question_id`/任务/问题/选项）投递给主 Agent：
+   主 Agent 空闲则起一轮，忙碌则入 pending（轮末注入）。同一子 Agent **同时只投递一个问题**，其余排队。
+3. 主 Agent 决定：
+   - 直接回答：`send_sub_agent_message(sub_agent_id, …)`；
+   - 需要用户决定：先 `ask_user` 询问用户，拿到回答后再 `send_sub_agent_message` 回复。
+4. 管理器结算问题，子 Agent 的 `ask_user` 工具结果 = `主 Agent 回答: …`；若还有排队问题，立即投递下一条。
+5. 生命周期：子 Agent 取消/结束、父 Agent 销毁、会话删除、管理器重置时，未回答/排队问题全部作废并回传错误，
+   子 Agent 不会永久挂起。
+
+> 子 Agent 的工具子集**不包含** `send/cancel/get_status/create`（只有主 Agent 能调度）；
+> 主 Agent 之外的 Agent 不能回答别人的问题（`send` 校验 `parent_agent_id`）。
+> `ask_user` 的 UI 只服务于主 Agent；子 Agent 提问不占用弹窗。
 
 ## 3. 工具列表（主 Agent）
 
 | 工具 | 描述 | 参数说明 |
 | --- | --- | --- |
 | `create_sub_agent` | 创建子 Agent（后台运行，立即返回；**创建后无需轮询等待**，完成后最终正文自动回传） | `task`（必填）；`name`（可选，简短显示名）；`model`（可选）；`boundaries`（可选）`{allowed_tools, allowed_directories, allowed_commands, max_tool_calls, max_iterations}`；`context`（可选） |
-| `get_sub_agent_status` | 查询状态、任务与结果（**正常流程无需调用**，仅用于确认是否仍在运行/是否卡住） | `sub_agent_id`（必填） |
+| `get_sub_agent_status` | 查询状态、任务与结果（**正常流程无需调用**，仅用于确认是否仍在运行/是否卡住；含待回答提问摘要） | `sub_agent_id`（必填） |
 | `cancel_sub_agent` | 终止子 Agent | `sub_agent_id`（必填） |
-| `send_sub_agent_message` | 向子 Agent 发送消息（补充指令/追问） | `sub_agent_id`、`message`（均必填） |
+| `send_sub_agent_message` | 向子 Agent 发送消息 / **回答其提问**（agent 对话唯一通道） | `sub_agent_id`、`message`（均必填） |
 
 > 已移除 `wait_sub_agent`：不再提供等待工具，结果自动回传。
-> 子 Agent **不会获得**以上任何调度类工具。
+> 子 Agent **不会获得**以上任何调度类工具；它只获得 `ask_user` 作为向上通道。
 > 默认异步审批（`tools.approval.mode = "async"`）下 `create_sub_agent` 立即在沙箱内执行。
+
+> **计划模式**：异步沙箱草稿模式下派生的子 Agent 继承父 Agent 的 plan scope，其文件写入同样只暂存、
+> 退出计划模式时随父 scope 丢弃；能力上限（SSH/主机提权/长驻服务/未受信 MCP 或外部工具）同样生效。
 
 ## 4. 状态与事件
 
 `state.subs[sub_id]` 记录 `{ id, name, task, agent_id, session_id, parent_agent_id,
-parent_session_id, boundaries, status, result_text, error, started_at, tool_calls }`，
+parent_session_id, boundaries, status, result_text, error, started_at, tool_calls, pending_questions }`，
 `status` 取值：`running` / `completed` / `error` / `cancelled`。
 
 | 事件 | 触发 |
@@ -92,12 +120,17 @@ parent_session_id, boundaries, status, result_text, error, started_at, tool_call
 | `SUB_AGENT_COMPLETED` | 完成 |
 | `SUB_AGENT_ERROR` | 出错 |
 | `SUB_AGENT_RESULT_READY` | 结果就绪（供回传） |
+| `SUB_AGENT_QUESTION` | 子 Agent 提问已转交主 Agent |
+| `SUB_AGENT_QUESTION_ANSWERED` | 子 Agent 提问已结算（回答/作废） |
 
 ## 5. UI：状态栏与切换
 
 - **winbar**（聊天主窗口顶部）：身份行渲染为 `[CHAT] <model> <state> <子 Agent 名字>`。
   子 Agent 名字平铺；若拼接后**超出聊天窗口宽度**，自动折叠为 `N个子agent正在运行`
   （`services/status.sub_agents_segment`，按窗口宽度自适应）。
+- **状态栏用量**：`↑`/`↓` 与括号内的累计命中率统计**主会话 + 全部直接子 Agent 会话**
+  （运行中取实时 usage，已完成/重开会话后取子会话持久化 usage；fork 分支下的子 Agent 不计入）。
+  累计命中率按 token 加权；单次命中率取主/子 Agent 中最近一次请求。
 - **快捷键** `keymaps.chat.switch_sub_agent`（默认 `<leader>as`）：循环切换并**在新窗口**打开
   一个子 Agent 会话（运行中的子 Agent 会复用活动 Agent，实时查看）。
 - **列表弹出窗** `keymaps.chat.sub_agent_list`（默认 `<leader>al`）：在聊天窗口顶部（winbar 显示

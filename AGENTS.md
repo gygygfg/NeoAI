@@ -42,7 +42,8 @@ nvim --headless --clean -u NONE --cmd "set rtp+=$PWD" \
   进程）与 heavy（`sandbox*`/`pty`，一套件一进程，上限 H）**重叠执行**、任一子进程结束即回填，
   约束 `#light≤W`、`#heavy≤H`、`W+H≤核数-2`（预留两核给系统/编辑器）。权重优先用实测耗时缓存 `.neoai_test_timings.json`
   （gitignored），无缓存按用例数。另有**独占通道**：会触碰宿主全局 `/run/netns` 的套件（默认
-  `sandbox_view*`）不进 heavy lane，而在两 lane 全部结束后一套件一进程串行执行，绝不与其他分片
+  `sandbox_view*`、`sandbox_boundary_net`、`sandbox_boundary_escape`、`sandbox_docker_policy`、
+  `gateway`）不进 heavy lane，而在两 lane 全部结束后一套件一进程串行执行，绝不与其他分片
   重叠（并发 `ip netns add/del` 会争用共享的 `/run/netns` 挂载点）；可用 `opts.exclusive_suites` 覆盖。
   文件级分片保证固定端口（各文件唯一）与文件内固定临时路径
   不跨 worker 冲突；子进程注入独立 `mcp.cache_path`。
@@ -108,12 +109,7 @@ nvim --headless --clean -u NONE --cmd "set rtp+=$PWD" \
    `approval_mode="prompt"`（同步事前审批），**禁止** `async` 的「先执行后审批」。默认异步审批
    （`tools.approval.mode="async"`）：效果类工具立即在沙箱内
    执行并冻结候选，真实修改进入待审队列，用户经 `:NeoAI SandboxReview` 异步确认后应用。
-   详见 `docs/sandbox.md`。
-   **单视图（三视图）不变量**：`tools.sandbox.single_view`（默认开）下暂存目录**就是** overlay
-   upper，不得再为每条命令叠加 overlay / 物化 / 捕获回写（旧模型两份可写数据会把编辑器内存吃穿，
-   实测 nvim RSS 27.7GB 被 OOM 杀死）。视图基目录稳定（agentEnd 不迁移），常驻与一次性命令不得
-   同时挂载同一 upper；任一进程不得把沙箱写入**直接落盘**（包括包管理器缓存：缓存目录只作为只读
-   lower，沙箱内下载落在会话视图里），唯一落盘点仍是审批发布的 `writer`/`publish`。
+   详见 `docs/sandbox.md` 与下方「沙箱视图模型（三视图 / 不叠加 / 不直写）」。
 
 10. **命令入口单一**：全部用户命令收敛为一条 `:NeoAI <子命令>`（`plugins/builtin/commands.lua` 的
     `M.SUBCOMMANDS` 为唯一来源）。Neovim 命令名不允许 `.`/`_`/`-`，`complete=customlist` 只接受纯字符串
@@ -134,6 +130,131 @@ nvim --headless --clean -u NONE --cmd "set rtp+=$PWD" \
 13. **并发工具各自出结果**：工具结果按原始调用顺序落库（保证 `tool` 消息与 `assistant.tool_calls` 对齐），
     但界面**不得**等整批完成才渲染：`tool_loop` 每完成一个工具即经 `kernel/live_metrics.set_result` 发布
     运行期结果，UI 对尚未配对的结果消息用它渲染（落库后清除）。
+
+## 沙箱视图模型（三视图 / 不叠加 / 不直写）
+
+`tools.sandbox.single_view`（默认开；`NEOAI_SINGLE_VIEW=0` 或配置 `false` 可回退旧模型）下，
+沙箱只有**三个视图**，任何改动都必须维持这三层语义：
+
+| 视图 | 存储 | 角色 |
+| --- | --- | --- |
+| ① 真实盘 | 宿主文件（只读 lower） | **唯一**落盘点：只有审批发布（`writer.apply`/`apply_file`）能写真实文件 |
+| ② 沙箱合并视图 | `<沙箱暂存基>/view/<root>/upper`（= 暂存） | 命令 / 只读工具 / LSP 共用同一份；AI 未发布改动**就是**视图内容 |
+| ③ 候选 | 只存 delta 元数据 `{path, action, hash, mode, base_hash}` | 审批展示/发布时按需从视图②取内容 |
+
+### 不叠加（每轮占用恒定，禁止逐命令叠加 overlay）
+
+1. **暂存目录就是 overlay upper**：`candidate.process_dir()` 返回稳定视图目录；`_workspace_path`
+   对视图覆盖根直接返回 upper 路径。不得再引入第二份"工作区暂存副本"作为可写数据。
+2. **禁止每条命令物化/捕获回写**：`materialize_overlay` 对视图原生条目只登记签名、不拷贝；
+   `merge_candidate(_async)` 只登记台账、不写第二份内容。旧模型（每条命令前暂存→upper、
+   命令后 upper→暂存）实测会把 nvim RSS 吃到 27.7GB 被内核 OOM 杀死，**禁止恢复**。
+3. **视图基目录稳定**：`rotate_session`（agentEnd）只推进会话 id，**不迁移/不复制**暂存；
+   视图目录只随进程结束/`reset` 清理。
+4. **同一 upper 只挂一次**：常驻实例与一次性命令不得同时挂载同一 `<view>/<root>/upper`；
+   不属于常驻实例的命令（T1/T2、包安装、跨挂载、fuse）使用独立 `<view>/attempt_<id>`，
+   结束后按 delta 合并回视图并删除。`bwrap` 报 `upperdir is in-use ... undefined behavior`
+   即为违规（`dmesg` 可见），必须修成串行/独立 upper，不得忽略。
+5. **常驻实例挂载期间不得从宿主侧写 upper**：写入必须经命名空间桥（`file_bridge`/`ns_fs`）
+   在挂载点内完成；`invalidate` 对视图原生条目交给 `resident.sync_real`（宿主侧 `delete` 属于
+   未定义行为，实测会阻塞）。
+6. **捕获只处理 delta 且必须有预算**：优先用写日志（eBPF）路径集；全量遍历只做元数据比对。
+   `capture_max_bytes` / `capture_max_files` 超限转 blob 或跳过；`generated_dirs`（`target`、
+   `node_modules`、`build`、`.gradle` 等，按工作区根向下 0~2 层）整棵子树**不捕获**。
+   `non_capture_paths` 中的包管理器缓存同理。
+7. **候选内容按需**：冻结/发布不得把整个工作区或构建产物读进 Lua；单文件受
+   `max_file_bytes`、整体受 `capture_max_*` 约束，大文件一律走 blob（内核 copyfile，不读内存）。
+
+### 不直写（沙箱任何写入都不得直接落真实盘）
+
+1. **唯一落盘点**：`writer.apply` / `writer.apply_file`（审批发布）。其余任何模块
+   （candidate/merge/materialize/capture/ns_fs/LSP/reclaim）**禁止**直接写真实工作区文件。
+2. **缓存也不直写**：`~/.gradle`、`~/.m2`、`~/.cargo/registry`、`~/.npm/_cacache`、pip/uv/go
+   缓存等只作为**只读 lower**；沙箱内下载落在当前会话视图里（进程结束即丢弃）。**禁止**用
+   读写 bind 把宿主缓存目录直接暴露给沙箱（曾实现过 `persist_caches`，已按"禁止直写"移除）。
+3. **卸载/删除同规则**：删除 = 视图内 whiteout 或 `retire`（同盘 rename 到搬出层），
+   发布时才作用于真实盘；不得为了"省事"直接 `unlink`/`rm -rf` 真实文件。
+4. **沙箱自身存储也算"非真实盘"**：视图/候选/blob/证据都写在沙箱存储根，
+   可以清理（`reclaim`、`:NeoAI SandboxGC`），但不属于用户数据。
+5. **回退开关不是许可**：`NEOAI_SINGLE_VIEW=0` 只用于兼容/排查；旧模型的两份可写数据
+   与逐命令叠加同样受本约束（尤其"不直写"）。
+
+### 不驻留内存（候选内容只存元数据，文件留在同盘）
+
+> **教训（2026-11-27）**：宿主 nvim 以 `anon-rss 27.2 GB + swap 4.4 GB` 被内核 OOM
+> `SIGKILL`，整个交互面消失、连错误日志都来不及写。现场：单条工具循环 65 轮，每轮把
+> 8k+ 个暂存文件（其中 5 GB 来自工作区外的 `~/.cache/sdw-cargo-target` 构建产物）的内容
+> 读进 Lua 组装候选；沙箱实例目录残留 7.6 GB，直到手动 `:NeoAI SandboxGC`。**结论**：
+> 文件内容绝不能随候选/物化常驻 nvim 内存——它属于磁盘，用同盘复制与命名空间视图传递。
+
+1. **候选只存 delta 元数据**：`files[]` 只有 `path/action/hash/blob/mode` 等元数据，
+   `content` 恒为 `nil`（`tools.sandbox.inline_candidate_bytes` 默认 0 = 从不内联）。
+   任何新增字段不得携带文件正文。
+2. **内容用同盘复制**：暂存 → 候选 blob 一律 `uv.fs_copyfile`（内核复制，不读 Lua）；
+   哈希在 worker 线程内读一次（≤ `max_file_bytes`）后即释放，**不得把内容回传主进程**。
+3. **物化不读内容**：`materialize_overlay` 对未 token 化的视图条目走 `copy_file` + 原子
+   `rename`；只有被密钥 token 化的文本（`entry.tokenized`）才允许读出还原真实内容。
+4. **发布按需读**：审批/发布时才从 blob 读（受单文件上限约束），读完即释放；大文件走
+   `writer.apply_file` 复制。
+5. **禁止以"方便"为由回退**：不要为了做三方合并、日志、UI 展示把整份内容塞进 `state.*`、
+   `candidate.files`、证据或事件 payload；需要摘要就存哈希/大小/签名。
+6. **宿主自身也要有上限**：常驻命令输出（`resident`）的块缓冲、未解析帧缓冲、服务器噪声
+   都必须有硬上限（超限截断并终止命令）；`kernel/self_guard` 的 RSS 看门狗是最后一道
+   保命线（soft 回收 → hard 中止当前回合），**不得**靠内核 OOM 兜底。
+7. **沙箱存储是缓存**：全部位于 `stdpath("cache")/NeoAI/sandbox`；启动回收死进程实例
+   （`instance.gc`），进程退出（`VimLeavePre`，非热重载）删除本进程实例目录
+   （`sandbox.cleanup({phase="exit"})`）。
+
+### 计划模式草稿（异步沙箱）
+
+1. **草稿不是候选**：`tools.approval.mode="async"` 且沙箱隔离可用时，计划模式允许写类工具，
+   但写入只进视图/暂存；`wrapper._settle_candidate` 在计划 scope 下直接走
+   `sandbox/execution/plan_draft`：**不写候选 JSON、不入 review、强制 auto=false**。
+2. **退出即丢弃**：`plan_mode.exit` / scope owner 的 `cleanup` / `sandbox.reset` 调
+   `plan_draft.discard`；只撤销计划模式自身改动（登记视图签名比对），路径若原本有待审项则
+   恢复旧待审内容，不得误删用户改动。
+3. **能力上限**：草稿模式不是"全部工具"——`filter_capabilities` 按类别白名单 + 名称拒绝
+   （SSH/长驻服务）+ MCP `plan_safe` + `extra_safe_tools` 显式放行；命令 tier≥2 在执行前拒绝。
+4. **子 Agent 继承**：`runtime.spawn` 继承父 `_plan_scope_id`，子 Agent 写入同样是草稿；
+   同 scope 丢弃。非 async/无隔离后端时退回只读白名单。
+5. **Agent 对话规范**：子 Agent 用 `ask_user` 向上提问（不弹窗，转交主 Agent），主 Agent 统一用
+   `send_sub_agent_message` 回复；有在途提问时 send 即回答，否则注入下一轮/续跑。
+
+### 责任落点（改这些代码前先读本节）
+
+- 视图/路径映射：`lua/NeoAI/sandbox/execution/view.lua`
+- 暂存与候选：`lua/NeoAI/sandbox/execution/candidate.lua`
+- 门禁与挂载：`lua/NeoAI/sandbox/execution/wrapper.lua`、`runtime.lua`、`resident.lua`
+- 落盘：`lua/NeoAI/sandbox/execution/writer.lua`
+- 崩溃回收：`lua/NeoAI/sandbox/execution/reclaim.lua`（`:NeoAI SandboxGC`）
+- 计划模式草稿：`lua/NeoAI/sandbox/execution/plan_draft.lua`、`lua/NeoAI/tools/builtin/plan_mode.lua`
+  （能力上限/提示词/scope）、`lua/NeoAI/core/agent/sub_agent.lua`（ask_user 转交与 send 对话）
+- 回归：`lua/NeoAI/tests/test_sandbox_single_view.lua`（视图映射/轮换不迁移/零拷贝/预算/权限位/回收/JVM 代理）
+  以及 `docs/sandbox.md` §2.2「单视图模型（三视图）」。
+- 配置与文档：`default_config.lua` 的 `single_view`、`capture_max_bytes`、`capture_max_files`、
+  `inline_candidate_bytes`、`generated_dirs`、`non_capture_paths`、`cleanup`、
+  `network.java_proxy`；同步 `docs/configuration.md` 与英文版。
+
+## 进程与任务隔离（崩溃不向上传导）
+
+1. **总管理**：`kernel/supervisor.lua` 是子进程（后台 worker / 常驻沙箱命令服务器 / 后台服务）
+   的唯一状态源与重启策略：`register` → 崩溃 `report_crash`（退避重启）→ 熔断（`failed` 并提示）
+   → `:NeoAI Recover` 复位。新增子进程**必须登记**，禁止自建"无限重启循环"。子进程内存上限
+   **按剩余内存动态刷新**（`memory_auto`，心跳周期重算并在线写 cgroup `memory.max`；收紧立即、
+   放宽需 >20%），超限由内核回收子进程。
+2. **任务分发**：`kernel/task_dispatch.lua` 双通道（interactive / background）+ 超时/重试/
+   取消/排队上限；压力 warn 暂停后台通道、critical 拒绝新任务；失败一律以结构化错误返回
+   （工具结果报错），**禁止**把异常抛回 nvim 主循环。
+3. **失败语义**：子进程死亡 = 任务失败 + 自动重启（退避/熔断），**不是** nvim 崩溃。重活
+   （捕获/冻结/哈希/编码/大文件 IO）必须在 worker 进程，主线程只做 UI 与状态机。
+4. **自身看门狗**：`kernel/self_guard.lua` 只看本进程 RSS/Lua 堆；soft 回收可释放缓存 + GC；
+   hard 回收后仍超限才经注册的 abort handler（`chat_service.abort_all`）中止当前回合并进入
+   cooldown。绝不主动退出 nvim，探测不到 `/proc` 时视为 ok。
+5. **崩溃恢复**：`core/session/recovery.lua` 干净退出标记（`state/alive-<pid>.json`）+ 启动
+   检测 + 回收死进程沙箱存储 + 重开被中断会话（`:NeoAI Recover`）。**会话按轮落盘是恢复的
+   前提**——任何改动不得破坏 `tool_loop` 轮末持久化（`set_round_persist`）。
+6. **回归**：`test_supervisor.lua` / `test_task_dispatch.lua` / `test_self_guard.lua` /
+   `test_crash_recovery.lua`；新增配置同步 `docs/configuration.md`（中英）。
 
 ## 代码风格
 

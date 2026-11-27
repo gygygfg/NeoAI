@@ -137,6 +137,10 @@
 
 Agent 完成/出错/取消后，仅当**当前窗口就是聊天主消息区、其显示的仍是聊天 buffer、且处于 Normal 模式**（应用本身也有焦点）时，才自动聚焦输入框并进入插入模式。光标在审批/伪终端/ask_user 等浮窗、其他聊天实例或普通文件窗口，或已经位于输入框/非 Normal 模式时，不抢焦点、不重复进入插入。
 
+**仍在等待异步结果时不回输入框**：主 Agent 本轮已结束、但仍在**等待子 Agent**（`create_sub_agent`/`send_sub_agent_message` 立即返回，子 Agent 在后台运行）或**等待后台工具结果**（工具批量因新消息转后台）时，不把光标移回输入框、也不自动进入插入模式——结果一到就会回传并续跑主 Agent，此时抢焦点只会让「刚进入插入模式就被下一波输出冲屏」。判定见 `chat_service.has_pending_work_for_agent`（本轮在跑/暂存消息）与 `chat_service.awaiting_async_results_for_agent`（子 Agent 在跑 / 后台工具未回），两者都为假才执行焦点动作。
+
+**任意方式进入插入模式都跳输入框**：聊天主消息区 buffer 绑定了 `InsertEnter` 守卫——用户按 `i/a/I/A/o/O/c/C/s/S` 等（或插件 `feedkeys`）进入插入模式时，自动把焦点切到输入框并进入插入模式，避免把内容写进只读消息 buffer。输入框自己的 `InsertEnter` 不会命中该守卫（buffer 不同），不会递归。
+
 ### 4.1 布局
 
 主消息区（上，`expr` 折叠）+ 输入区（下）。`tab`/`split` 模式下输入区是从主窗口 `belowright split`
@@ -476,9 +480,9 @@ already exists`，并**中断整个会话恢复**（`:restart` 表现为 `UIEnte
 
 | 占位符 | 展开内容 |
 | --- | --- |
-| `#{buffers}` | 当前全部 buffer 列表（编号 / 加载状态 / 类型 / 路径） |
-| `#{buffer:NAME}` | 指定 buffer 的内容（按名称或文件名匹配，多命中全部拼接） |
-| `#{lsp}` | 上下文 buffer 的 LSP 诊断（`文件:行:列 [级别] 消息`）；上下文 buffer 由 `chat_view` 在聚焦输入框前记录（排除 NeoAI 内部 buffer） |
+| `#{buffers}` | 当前全部 buffer 列表（编号 / 加载状态 / 类型 / 路径，`[+]` = 有未保存修改） |
+| `#{buffer}` / `#{buffer:NAME}` | **buffer 对象引用**（bufnr/路径/filetype/loaded/modified/行数/changedtick/光标），**不内联内容**；AI 调用 `nvim` 工具并传 `buffer_ids=[id]` 时，把该对象原样加载进沙箱镜像 Neovim 再读取 |
+| `#{lsp}` / `#{lsp:NAME}` | 对应 buffer 的**用户 LSP 信息**：用户自己的客户端（排除 AI 沙箱克隆/plain 回退）、关键能力、诊断计数 + 前 N 条消息（`ui.input_box.hash_completion.lsp_max_messages`，默认 30）；不附 buffer 对象、不内联内容 |
 | `#{message}` / `#{notify}` | Neovim 启动至今的消息历史（等价 `:messages`），上限 `ui.input_box.hash_completion.max_chars`（**按字符计**，CJK 不会被切半） |
 | `#{tool}` / `#{tool:NAME}` | 工具清单 / 单个工具定义（名称、说明、参数 schema） |
 | `#{skills}` / `#{skills:NAME}` | 技能清单 / 单个技能正文 |
@@ -491,13 +495,31 @@ already exists`，并**中断整个会话恢复**（`:restart` 表现为 `UIEnte
 - **高亮**：`TextChangedI`/`TextChanged`/`InsertLeave` 时用固定 extmark 命名空间重算；`reset`/`destroy` 清理。
 - **降级安全**：未知键、找不到的 buffer/skill/tool 一律**原样保留**占位符（不抛错、不产生空串），发送不会因解析失败中断；
   所有展开结果统一经 `utils/stringx.safe_truncate` 做 UTF-8 安全截断。
-- **配置**：`ui.input_box.hash_completion = { enabled=true, max_chars=2000, max_bytes=20000 }`，
+- **配置**：`ui.input_box.hash_completion = { enabled=true, max_chars=2000, max_bytes=20000, lsp_max_messages=30 }`，
   `enabled=false` 时零副作用（不装 completefunc / cmp 源 / 自动命令）。
+- **内容不内联**：`#{buffer}`/`#{lsp}` 只给对象与元信息；实时内容/语义查询由 AI 调用 `nvim`
+  （沙箱镜像里执行 Lua/Ex）与 `lsp_*` 工具自行获取，避免上下文里塞入过期/超大快照。
+
+### 4.9.2 沙箱待审改动 → 打开文件 buffer 的行内 diff
+
+`ui/components/pending_diff.lua`（默认开启，`ui.pending_diff`）在用户打开的文件 buffer 上以
+**只读装饰**显示沙箱待审改动：
+
+- 判定：`candidate.pending_content(path)` 只返回**真实 AI/命令增量**。用户自己未保存的输入
+  （save-all 基线）不会误报为 diff；沙箱新建/删除的文件分别显示为新增行与「待审删除」。
+- 展示：修改行 `DiffChange` + sign `~`；删除行 `DiffDelete` + sign `-`；纯新增行以
+  `virt_lines` 预览（`virtual_added_lines`，默认 20 行）；超过 `max_bytes` 只提示不计算。
+- 刷新：`BufReadPost`/`BufNewFile`/`BufEnter`/`BufWinEnter` + `TextChanged*`/`BufWritePost`
+  （debounce `debounce_ms`，默认 200ms）+ 沙箱工具/审批事件；`auto=false` 时不自动绘制，
+  仍可用 `:NeoAI diff` 手动打开完整对比（只读分屏 + `diffthis`）。
+- 生命周期：`install()` 注册 augroup/事件订阅，`uninstall()` 统一清理；不修改 buffer、不写盘。
+- 配置：`ui.pending_diff = { enabled=true, max_bytes=1048576, debounce_ms=200, virtual_added_lines=20, auto=true }`。
+
 
 缓存与刷新：`#{lsp}` 依赖的「当前文件」不能是输入 buffer 自身，因此 `chat_view` 在创建输入区与
 每次聚焦输入框前都会重新记录 `context_buf`（`:ls` 里 lastused 最新的非 NeoAI 内部 buffer）。
 
-### 4.9.2 命令说明提示（ui/command_hint.lua）
+### 4.9.3 命令说明提示（ui/command_hint.lua）
 
 `:NeoAI` 是单条聚合命令（子命令以空格分隔，如 `:NeoAI Open`、`:NeoAI SandboxReview`）。
 Neovim 用户命令的 `complete=customlist` **只接受纯字符串候选**（候选 dict 的 menu 字段被忽略），
@@ -538,7 +560,7 @@ Neovim 用户命令的 `complete=customlist` **只接受纯字符串候选**（�
 | `model_picker` | 模型选择器（异步加载模型列表）。`open(callback)`。 |
 | `tool_approval` | 工具审批弹窗。`init()`；串行单槽位展示。**聊天界面焦点门控**（`focus.gate`）：当前窗口是 NeoAI 界面时**立即弹出**；否则**暂存**，待切回 NeoAI 界面再弹。审批分流中心（多级审批悬浮窗）始终**直接新建条目**，故暂存期间不会丢请求、可在窗口内决策；审批超时/经中心决策会 `hide()` 取消暂存。`net_consent`（网络同意）/`device_consent`（设备同意）/`policy_consent`（策略确认）/`secret_alert`（密钥告警）同理，且这四类**阻塞**浮窗共用 `ui/consent_slot` 的**单槽位**：跨组件互斥、任一时刻只展示一个、其余排队；每次请求持**票据**（`show` 返回，`hide(ticket)`/`is_open(ticket)` 按票据作用域），一个请求超时只关自己的窗；窗口被外部关闭（`WinClosed` / `:q` / `<C-w>c`）时按**安全默认**结算（密钥 → 停止 Agent，其余 → 拒绝）并清审批中心镜像条目——否则该请求的决策回调会永久丢失、条目残留 pending，使 Herder pane 一直停在 `blocked`。`sandbox_review` 多级页面的**页标签采用 Mason 风格高亮**（存在 mason.nvim 高亮组时链接复用，见 `ui/mason_hl.lua`）。 |
 | `ask_user` | 向用户提问弹窗。`init()`；经 `ask_user.set_ui` 注入。同轮多次提问聚合为单窗口多 Tab（Tab 栏 `✓/○` 标记已答、当前标签反显、最右「确认」标签，**Tab 高亮采用 Mason 风格**：存在 mason.nvim 高亮组时链接复用，见 `ui/mason_hl.lua`），`multi_select` 题以复选框展示；**单题单选选中即提交**、**多题单选作答后自动跳到下一 Tab（最后一题到确认标签；多选不跳转）**，多选/多题在最右确认标签二次确认（`y`/`<CR>` 提交、`h`/`←` 返回编辑、`Esc` 取消整批，见 `ui.ask_user.*` 配置）。**焦点门控为应用级**（`focus.gate_app`）：只要 nvim 有 OS 焦点即**立即弹出**，不因当前窗口不是 NeoAI 界面而延迟（ask_user 是 agent 阻塞等待回答的交互）；仅 nvim 失焦（`FocusLost`）时暂存，`FocusGained`/`VimResume` 回焦再弹。**收起联动**：光标离开弹窗（`WinLeave`/`BufLeave`/`TabLeave`）或应用失焦即缩为右上角小窗，光标回来/回焦展开；自动命令组可重装（被外部清理后下次渲染自动重建），并在应用几何前按实际焦点自愈，避免「跳出弹窗未收起」。 |
-| `sub_agent_dock` | 子 Agent 状态监控。`init()`。winbar 身份行同时展示子 Agent 名字（超出窗口宽度折叠为 `N个子agent正在运行`，见 `services/status.sub_agents_segment`）；`keymaps.chat.switch_sub_agent`（默认 `<leader>as`）在新窗口打开子 Agent 会话。 |
+| `sub_agent_dock` | 子 Agent 状态监控。`init()`。winbar 身份行同时展示子 Agent 名字（超出窗口宽度折叠为 `N个子agent正在运行`，见 `services/status.sub_agents_segment`）；`keymaps.chat.switch_sub_agent`（默认 `<leader>as`）在新窗口打开子 Agent 会话。子 Agent 提问（`sub_agent_question`）在主会话渲染为 `❓ 子 Agent 提问: <名字>` 折叠块，不算用户轮次。 |
 | `sub_agent_list` | 子 Agent 列表弹出窗（无边框悬浮窗，相对聊天主窗口顶部居中、`<leader>al` 切换）。`↑/↓`(k/j) 移动、`<CR>` 进入会话、`q`/`<Esc>` 关闭；窗口尺寸变化时重算几何跟随。`open`/`close`/`toggle`/`is_open`/`reset`。 |
 | `terminal_window` | 交互式命令的悬浮**可交互**终端（`nvim_open_term` 渲染，焦点在内时可手动键入转发给命令）。按会话 id 开窗；**仅在聊天光标跟随时弹出**（`show_window` 控制时机：always=会话启动即弹 / on_wait=命令运行超过 `show_window_delay_ms`（默认 2000ms）仍未结束才弹，短命令不弹），跟随跳变时随 `UI_FOLLOW_CHANGED` 隐藏 / 重弹（见 `services.pty`；每次开窗都用新的 `nvim_open_term` 通道，开窗时重放累计输出，避免空白窗口）；headless 下为 no-op。由 `services.pty` 驱动。 |
 | `sandbox_review` | 沙箱待审审批界面。`open()`（**无待审/审批/留痕事项时同样打开窗口并展示空界面，不弹提示、不自动关闭**；刷新到空队列也保持窗口，待新事项到达由事件订阅自动刷新）；按路径级别高亮（工作区绿/用户目录黄/系统红）、按安全级别显示高危/中危/低危风险档与原因；界面按「未应用（待审）/ 已应用（含快照，可撤销）」分区；审批单位为单个文件：`<CR>` 仅应用该文件、`A` 一键同意全部工作区内修改（工作区外文件与主机操作保留待审；逐项让出主循环、标题显示进度、进行中防重入）、`d` 仅拒绝该文件（其余文件保留待审）、`i` 临时关闭审批窗并打开该条目的修改 diff 预览（关闭后自动返回并恢复光标），头行仅作信息展示，`q` 关闭；在**越界访问留痕**行按 `i` 打开访问详情（汇总涉及工具/来源/涉及命令数/首末时间，逐条列出工具/类型/命令/时间），在**越界命令**行按 `i` 打开命令详情（列出该命令越界访问的文件）；**临时写入留痕**行仅只读展示（会话私有临时根 /tmp、/var/tmp 等写入，按文件含工具/命令，不入待审/不发布）；**窗口打开期间订阅沙箱广播事件自动刷新**（待审/已应用/越界留痕/主机操作变化即时重绘，同一 tick 内事件合并），无需手动刷新。**「已应用」区默认折叠**：整区收起（`za`/`zo` 展开），展开后每条再各自收起（两级折叠），刷新后重新收起；**待审条目「头行显示、其余折叠」、`za`/`zo` 可展开**（头行保留整组审批入口与高亮，其后文件/风险列表默认收起），越界留痕区不折叠。**高危条目**（L3 critical，以及 `package_confirm` 开启时的 L2 包/敏感安装）首次 `<CR>` 不直接应用：调用模型生成一条后果警告并自动打开 diff（顶部展示警告，生成中显示占位；标题按级别区分 `⚠ L2 高危 · 确认应用` / `⚠ L3 严重 · 确认应用`，按键提示行高亮，若冻结时剔除了遮蔽/易变缓存文件会追加「将跳过 N 个」说明），用户在 diff 内再次 `<CR>` 才真正应用、`q`/`<Esc>` 取消；模型不可用时回退规则警告（见 `sandbox/review/l3_warning.lua`）。**网络请求页**除待批准外含「本会话已允许（可撤销，`d` 撤销）」与「历史（按目标合并，含次数/最近时间）」两段；同一目标的并发待批准请求合并为一条（附「×N 个请求」，一次决策全部生效），因**超时自动拒绝**（用户未应答）的历史条目标为「已拒绝(超时)」并可按 `S` 重新允许（补救后显示「已允许(补救)」）。**已应用区不可撤销标记**：原文件超过撤销快照上限（`tools.sandbox.review.snapshot_max_bytes`，默认 64MB）的条目标行事前显示 `⚠ 不可撤销：<file> <size> 超过快照上限`，按 `u` 只给一条 WARN（同条目同原因 10s 内去重），不再逐次刷 ERROR。**会话允许即时可见**：网络允许在决策内同步记账并广播 `sandbox:approval_changed{page="network"}`，窗口重绘不会读到空的「本会话已允许」。 |

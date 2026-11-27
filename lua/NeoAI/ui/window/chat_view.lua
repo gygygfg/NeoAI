@@ -1117,23 +1117,24 @@ end
 --- @param payload table
 local function _on_agent_end(payload)
   _on_generation_finished(payload)
-  -- 仅主 Agent 结束才把光标移回输入框：子 Agent 完成/失败/取消也会携带
-  -- 自己的 agent_id 发射 GENERATION_COMPLETED 等事件，不能触发主界面的焦点动作。
-  -- 且仅在本实例 Agent 真正完成（空闲且暂存队列为空）时才移回输入框；
-  -- 若仍有工作（正忙/暂存消息正逐条刷新、继续生成），保持光标在主窗口观看流式输出，
-  -- 避免每个刷新 turn 都触发一次进入插入模式。
+  if not (payload and payload.agent_id == state.agent_id) then return end
+  -- 收尾清理与本实例 Agent 是否还会续跑无关：停定时器、回收已完成工具的计时记录，
+  -- 避免残留 running 记录让耗时空转 / 长会话 fold 表膨胀。
+  _stop_tool_tick()
+  fold.prune_finished()
+  -- 是否还有后续工作：正忙/暂存消息待发，或仍在等异步结果回传（子 Agent 在后台跑 /
+  -- 后台工具未回）——后者结果一到就会续跑主 Agent，此时把光标拽回输入框并自动进入插入
+  -- 模式只会打断用户输入（刚进入插入模式就被下一波输出冲屏），因此焦点保持不动。
   local has_pending_work = chat_service.has_pending_work_for_agent
   local pending = type(has_pending_work) == "function" and has_pending_work(state.agent_id) or false
-  if payload and payload.agent_id == state.agent_id and not pending then
-    -- 生成真正结束：立即停掉工具耗时刷新定时器，避免残留的 running 记录让它空转。
-    _stop_tool_tick()
-    -- 回收已完成工具的计时记录：耗时已落库到结果消息，fold 表无需继续持有（避免长会话膨胀）。
-    fold.prune_finished()
-    -- 仅当本实例是当前聚焦实例、且光标确实停在聊天主消息区的 Normal 模式时才把光标
-    -- 移回输入框：后台实例结束、审批/伪终端浮窗聚焦、光标已在输入框或非 Normal 模式时
-    -- 都不应抢焦点/重复进入插入模式。
-    if _focused() and _can_auto_focus_input() then _focus_input_insert() end
+  if not pending then
+    local awaiting = chat_service.awaiting_async_results_for_agent
+    pending = type(awaiting) == "function" and awaiting(state.agent_id) or false
   end
+  -- 仅在本实例 Agent 真正完成（无待发消息、无在途异步结果）时才移回输入框。
+  -- 且仅当本实例是当前聚焦实例、光标确实停在聊天主消息区的 Normal 模式时才移动：
+  -- 后台实例结束、审批/伪终端浮窗聚焦、光标已在输入框或非 Normal 模式时都不抢焦点。
+  if not pending and _focused() and _can_auto_focus_input() then _focus_input_insert() end
 end
 
 --- Agent 状态归位（离开 generating/tool_running）：补一次渲染，让「过程」折叠回到已结束轮的
@@ -2092,6 +2093,21 @@ local function _register_focus_tracking()
       vim.schedule(_recompute_folds)
     end,
   })
+  -- 聊天主界面（消息区）**任何方式进入插入模式**（i/a/I/A/o/O/c/…、插件 feedkeys 等）
+  -- 都自动把光标跳到输入框并进入插入模式，避免用户把内容写进只读消息 buffer。
+  -- 仅绑定到聊天 buffer；输入框自己的 InsertEnter 不会命中本 autocmd（buffer 不同），不会递归。
+  vim.api.nvim_create_autocmd("InsertEnter", {
+    group = state.focus_augroup,
+    buffer = state.buf,
+    callback = function()
+      if vim.api.nvim_get_current_buf() ~= state.buf then return end
+      vim.schedule(function()
+        if not state.win_id or not vim.api.nvim_win_is_valid(state.win_id) then return end
+        if vim.api.nvim_get_current_buf() ~= state.buf then return end
+        _focus_input_insert()
+      end)
+    end,
+  })
 end
 
 --- 清理焦点追踪自动命令
@@ -2197,6 +2213,12 @@ local function _set_keymaps()
   -- 主窗口 j/k 滚动（按行移动光标）
   vim.keymap.set("n", "j", function() _scroll(1) end, { buffer = state.buf })
   vim.keymap.set("n", "k", function() _scroll(-1) end, { buffer = state.buf })
+  -- 任意常见「进入插入模式」的 normal 键都直接聚焦输入框（InsertEnter 守卫兜底 c/s/gi/插件等）。
+  for _, key in ipairs({ "i", "a", "I", "A", "o", "O", "c", "C", "s", "S" }) do
+    vim.keymap.set("n", key, function() input_box.focus() end, {
+      buffer = state.buf, desc = "NeoAI: 聚焦输入框",
+    })
+  end
   -- 鼠标滚轮：走 _wheel_scroll 原生平滑滚动视口（保留滚轮手感），
   -- 并把滚到底部时末行下方的空白限制在 ui.chat.mousescroll_max_blank 行内。
   vim.keymap.set("n", "<ScrollWheelUp>", function() _wheel_scroll(-_wheel_step()) end, { buffer = state.buf })

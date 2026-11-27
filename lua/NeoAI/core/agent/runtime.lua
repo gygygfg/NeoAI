@@ -232,10 +232,12 @@ function M.spawn(parent, override)
     model = override.model or parent.model,
     tools = override.tools or {},
   })
-  -- 子 Agent 拥有独立信号（不继承父信号）
+  -- 子 Agent 持有独立信号（不继承父信号）
   child.signal = async.create_signal()
   -- 子 Agent 继承父 Agent 的会话工作目录（子任务与父任务同一工作区）。
   child.cwd = override.cwd or parent.cwd
+  -- 计划模式草稿范围：子 Agent 的写入同样按草稿结算，随父 scope 一起丢弃。
+  if parent._plan_scope_id then child._plan_scope_id = parent._plan_scope_id end
   state.agents[child.id] = child
   -- 子 Agent 可拥有独立子会话（由 sub_agent 管理器创建并传入）：登记以便按会话反查。
   if override.session_id then

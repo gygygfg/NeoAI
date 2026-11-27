@@ -12,6 +12,7 @@
 ---   * 解析失败（未找到 buffer / 未知键）时原样保留占位符，绝不抛错中断发送。
 
 local stringx = require("NeoAI.utils.stringx")
+local buffer_ref = require("NeoAI.utils.buffer")
 
 local M = {}
 
@@ -26,9 +27,17 @@ local DEFAULT_MAX_CHARS = 2000
 --- 占位符规格表（order 即补全展示顺序）
 --- arg 为 nil 表示标量键（`#{key}`）；否则为参数化键（`#{key:NAME}`）。
 M.KEYS = {
-  { name = "buffers", desc = "当前打开的全部 buffer 列表", info = "列出所有 buffer 的名称/编号/类型" },
-  { name = "buffer", arg = "buffer", desc = "指定 buffer 的内容（按名称/路径匹配）", info = "#{buffer:NAME}" },
-  { name = "lsp", desc = "当前文件的 LSP 诊断", info = "上下文 buffer 的诊断列表（文件:行:列 [级别] 消息）" },
+  { name = "buffers", desc = "当前打开的全部 buffer 列表", info = "列出所有 buffer 的名称/编号/类型/未保存标记" },
+  {
+    name = "buffer", arg = "buffer",
+    desc = "buffer 对象引用（元数据，不含内容；AI 用 nvim 工具读取）",
+    info = "#{buffer} 当前 buffer；#{buffer:NAME} 按名称/路径/bufnr 匹配",
+  },
+  {
+    name = "lsp", arg = "lsp", arg_optional = true,
+    desc = "对应 buffer 的用户 LSP 信息（客户端/能力/诊断摘要）",
+    info = "#{lsp} 上下文 buffer；#{lsp:NAME} 指定 buffer",
+  },
   { name = "message", desc = "Neovim 消息历史（启动至今）", info = "等价 :messages 输出，上限 2000 字符" },
   { name = "notify", desc = "Neovim 消息历史（启动至今）", info = "等价 :messages 输出，上限 2000 字符" },
   { name = "tool", arg = "tool", desc = "工具清单 / 指定工具定义", info = "#{tool} 全部工具；#{tool:NAME} 单个工具定义" },
@@ -94,23 +103,9 @@ local function _svc(name)
 end
 
 --- 当前全部 buffer 的简要信息
---- @return table 数组 { bufnr, name, basename, loaded, buftype, filetype }
+--- @return table 数组 { bufnr, name, basename, loaded, buftype, filetype, modified }
 local function _buffers()
-  local out = {}
-  for _, buf in ipairs(vim.api.nvim_list_bufs()) do
-    if vim.api.nvim_buf_is_valid(buf) then
-      local name = vim.api.nvim_buf_get_name(buf)
-      out[#out + 1] = {
-        bufnr = buf,
-        name = name,
-        basename = name ~= "" and vim.fn.fnamemodify(name, ":t") or "",
-        loaded = vim.api.nvim_buf_is_loaded(buf),
-        buftype = vim.bo[buf].buftype,
-        filetype = vim.bo[buf].filetype,
-      }
-    end
-  end
-  return out
+  return buffer_ref.list()
 end
 
 --- 读取 buffer 内容（未加载时回退读文件）
@@ -176,10 +171,12 @@ local function _arg_names(key)
       end
     end
     return {}
-  elseif key == "buffer" then
+  elseif key == "buffer" or key == "lsp" then
     local names = {}
     for _, b in ipairs(_buffers()) do
-      if b.name ~= "" then names[#names + 1] = b.basename ~= "" and b.basename or b.name end
+      if b.name ~= "" and not buffer_ref.is_ui(b.bufnr) then
+        names[#names + 1] = b.basename ~= "" and b.basename or b.name
+      end
     end
     return names
   end
@@ -194,11 +191,12 @@ local function _key_items(prefix)
   local out = {}
   for _, spec in ipairs(M.KEYS) do
     if prefix == "" or spec.name:sub(1, #prefix) == prefix then
+      local needs_arg = spec.arg ~= nil and spec.arg_optional ~= true
       out[#out + 1] = {
-        word = "#{" .. spec.name .. (spec.arg and ":" or "}"),
+        word = "#{" .. spec.name .. (needs_arg and ":" or "}"),
         menu = spec.desc,
         info = spec.info or ("#" .. "{" .. spec.name .. "}"),
-        kind = spec.arg and "参数" or "上下文",
+        kind = needs_arg and "参数" or "上下文",
       }
     end
   end
@@ -324,63 +322,156 @@ end
 local function _resolve_buffers()
   local lines = {}
   for _, b in ipairs(_buffers()) do
-    lines[#lines + 1] = ("%3d  %-8s %-12s %s"):format(
+    lines[#lines + 1] = ("%3d  %-8s %-12s %s%s"):format(
       b.bufnr,
       b.loaded and "loaded" or "unloaded",
       (b.filetype ~= "" and b.filetype or b.buftype ~= "" and b.buftype or "-"),
+      b.modified and "[+] " or "",
       b.name ~= "" and b.name or "[无名称]")
   end
   if #lines == 0 then return "（无 buffer）" end
-  return "当前 buffer 列表（编号 / 状态 / 类型 / 路径）：\n" .. table.concat(lines, "\n")
+  return "当前 buffer 列表（编号 / 状态 / 类型 / 路径，[+] = 有未保存修改）：\n"
+    .. table.concat(lines, "\n")
 end
 
---- `#{buffer:NAME}` → 该 buffer 内容（按名称 / 文件名 / 路径模糊匹配，多命中全部拼接）
---- @param name string
---- @return string|nil nil 表示未匹配（调用方原样保留占位符）
-local function _resolve_buffer(name)
-  if type(name) ~= "string" or name == "" then return nil end
-  local needle = name:lower()
-  local hits = {}
-  for _, b in ipairs(_buffers()) do
-    local full = b.name:lower()
-    if full ~= "" and (full == needle or full:sub(-#needle) == needle or b.basename:lower() == needle) then
-      hits[#hits + 1] = b
-    end
+--- 用户自己的 LSP 客户端（排除 AI 沙箱克隆与 plain 回退客户端）。
+--- @param buf number
+--- @return table[]
+local function _user_lsp_clients(buf)
+  local ok, sandbox = pcall(require, "NeoAI.sandbox.execution.lsp")
+  if ok and sandbox and type(sandbox.user_clients) == "function" then
+    local ok2, list = pcall(sandbox.user_clients, buf)
+    if ok2 and type(list) == "table" then return list end
   end
-  if #hits == 0 then return nil end
+  local out = {}
+  local ok3, list = pcall(vim.lsp.get_clients, { bufnr = buf })
+  if not ok3 or type(list) ~= "table" then return out end
+  for _, c in ipairs(list) do
+    local name = type(c and c.name) == "string" and c.name or ""
+    if name:sub(-#("@neoai-sandbox")) ~= "@neoai-sandbox" then out[#out + 1] = c end
+  end
+  return out
+end
+
+--- 预览客户端关键能力（只列 true 的项）。
+--- @param c table LSP 客户端
+--- @return string[]
+local function _client_caps(c)
+  local caps = (type(c) == "table" and type(c.server_capabilities) == "table")
+    and c.server_capabilities or {}
+  local fields = {
+    { "hover", "hoverProvider" },
+    { "completion", "completionProvider" },
+    { "signatureHelp", "signatureHelpProvider" },
+    { "definition", "definitionProvider" },
+    { "declaration", "declarationProvider" },
+    { "implementation", "implementationProvider" },
+    { "typeDefinition", "typeDefinitionProvider" },
+    { "references", "referencesProvider" },
+    { "documentSymbol", "documentSymbolProvider" },
+    { "workspaceSymbol", "workspaceSymbolProvider" },
+    { "rename", "renameProvider" },
+    { "formatting", "documentFormattingProvider" },
+    { "rangeFormatting", "documentRangeFormattingProvider" },
+    { "codeAction", "codeActionProvider" },
+    { "diagnostic(pull)", "diagnosticProvider" },
+    { "inlayHint", "inlayHintProvider" },
+    { "semanticTokens", "semanticTokensProvider" },
+    { "foldingRange", "foldingRangeProvider" },
+  }
+  local out = {}
+  for _, f in ipairs(fields) do
+    local v = caps[f[2]]
+    if v ~= nil and v ~= false then out[#out + 1] = f[1] end
+  end
+  return out
+end
+
+--- `#{buffer}` / `#{buffer:NAME}` → buffer 对象（只含元数据，不含内容）
+--- @param arg string|nil
+--- @param ctx table|nil { bufnr? }
+--- @return string|nil nil 表示未匹配（调用方原样保留占位符）
+local function _resolve_buffer(arg, ctx)
+  local bufs
+  if type(arg) ~= "string" or arg == "" then
+    local cur = (ctx and tonumber(ctx.bufnr)) or vim.api.nvim_get_current_buf()
+    if cur and vim.api.nvim_buf_is_valid(cur) then bufs = { cur } else bufs = {} end
+  else
+    bufs = buffer_ref.find(arg)
+  end
+  if #bufs == 0 then return nil end
   local parts = {}
-  for _, b in ipairs(hits) do
-    local content = _read_buf(b.bufnr)
-    if content then
-      parts[#parts + 1] = ("--- %s（buf %d）---\n%s"):format(b.name ~= "" and b.name or "[无名称]", b.bufnr, content)
-    end
+  for _, buf in ipairs(bufs) do
+    local obj = buffer_ref.object(buf)
+    if obj then parts[#parts + 1] = buffer_ref.describe(obj) end
   end
   if #parts == 0 then return nil end
   return table.concat(parts, "\n\n")
 end
 
---- `#{lsp}` → 上下文 buffer 的诊断
+--- `#{lsp}` / `#{lsp:NAME}` → 用户自己的 LSP 信息（客户端/能力/诊断摘要）
+--- @param arg string|nil
 --- @param ctx table|nil { bufnr? }
---- @return string
-local function _resolve_lsp(ctx)
-  local buf = (ctx and tonumber(ctx.bufnr)) or vim.api.nvim_get_current_buf()
-  if not buf or not vim.api.nvim_buf_is_valid(buf) then return "（无诊断）" end
+--- @return string|nil nil 表示指定 buffer 未匹配（调用方原样保留占位符）
+local function _resolve_lsp(arg, ctx)
+  local buf
+  if type(arg) == "string" and arg ~= "" then
+    local hits = buffer_ref.find(arg)
+    if #hits == 0 then return nil end
+    buf = hits[1]
+  else
+    buf = (ctx and tonumber(ctx.bufnr)) or vim.api.nvim_get_current_buf()
+  end
+  if not buf or not vim.api.nvim_buf_is_valid(buf) then return "（无 LSP 信息）" end
+  local lines = {}
+  local clients = _user_lsp_clients(buf)
+  if #clients == 0 then
+    lines[#lines + 1] = "【用户 LSP】（该 buffer 未附加用户 LSP 客户端）"
+  else
+    lines[#lines + 1] = "【用户 LSP】"
+    for _, c in ipairs(clients) do
+      local root = c.root_dir or (c.config and c.config.root_dir) or ""
+      local caps = _client_caps(c)
+      local state = (c.initialized == false) and "初始化中" or "已初始化"
+      lines[#lines + 1] = ("- %s（id=%d, root=%s, %s）"):format(
+        tostring(c.name or "?"), tonumber(c.id) or 0,
+        root ~= "" and root or "-", state)
+      if #caps > 0 then lines[#lines + 1] = "  能力：" .. table.concat(caps, ", ") end
+    end
+  end
   -- `vim.diagnostic` 在极简/裁剪构建（缺 vim.lsp）下取用即抛错，因此整个取用都要 pcall 包住。
   local ok, diags = pcall(function() return vim.diagnostic.get(buf) end)
-  if not ok or type(diags) ~= "table" or #diags == 0 then return "（无诊断）" end
-  local levels = { "ERROR", "WARN", "INFO", "HINT" }
-  local name = vim.api.nvim_buf_get_name(buf)
-  name = name ~= "" and vim.fn.fnamemodify(name, ":.") or "[无名称]"
-  local lines = {}
+  if not ok or type(diags) ~= "table" then diags = {} end
+  local counts = { 0, 0, 0, 0 }
   for _, d in ipairs(diags) do
-    lines[#lines + 1] = ("%s:%d:%d [%s] %s"):format(
-      name,
-      (d.lnum or 0) + 1,
-      (d.col or 0) + 1,
-      levels[(d.severity or 1)] or "INFO",
-      (d.message or ""):gsub("%s+", " "))
+    local sev = tonumber(d.severity) or 1
+    if sev < 1 or sev > 4 then sev = 1 end
+    counts[sev] = counts[sev] + 1
   end
-  return "LSP 诊断：\n" .. table.concat(lines, "\n")
+  lines[#lines + 1] = ("【诊断】%d error / %d warning / %d info / %d hint（用户 LSP 当前发布）")
+    :format(counts[1], counts[2], counts[3], counts[4])
+  local max_msgs = tonumber(_cfg().lsp_max_messages) or 30
+  if #diags > 0 and max_msgs > 0 then
+    local levels = { "ERROR", "WARN", "INFO", "HINT" }
+    local name = vim.api.nvim_buf_get_name(buf)
+    name = name ~= "" and vim.fn.fnamemodify(name, ":.") or "[无名称]"
+    local shown = 0
+    for _, d in ipairs(diags) do
+      if shown >= max_msgs then break end
+      shown = shown + 1
+      lines[#lines + 1] = ("  %s:%d:%d [%s] %s"):format(
+        name,
+        (d.lnum or 0) + 1,
+        (d.col or 0) + 1,
+        levels[(d.severity or 1)] or "INFO",
+        (d.message or ""):gsub("%s+", " "))
+    end
+    if #diags > shown then
+      lines[#lines + 1] = ("  …（其余 %d 条省略；可用 lsp_diagnostics 查询）"):format(#diags - shown)
+    end
+  end
+  lines[#lines + 1] = "（实时内容用 nvim 工具读取；语义查询用 lsp_* 工具）"
+  return table.concat(lines, "\n")
 end
 
 --- `#{tool}` → 工具清单
@@ -464,10 +555,13 @@ end
 local function _eval(key, arg, ctx)
   if key == "buffers" then return _cap(_resolve_buffers()) end
   if key == "buffer" then
-    local body = _resolve_buffer(arg)
+    local body = _resolve_buffer(arg, ctx)
     return body and _cap(body) or nil
   end
-  if key == "lsp" then return _cap(_resolve_lsp(ctx)) end
+  if key == "lsp" then
+    local body = _resolve_lsp(arg, ctx)
+    return body and _cap(body) or nil
+  end
   if key == "message" or key == "notify" then return _cap(_messages()) end
   if key == "tool" then
     if arg and arg ~= "" then

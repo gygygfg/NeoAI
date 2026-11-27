@@ -406,6 +406,37 @@ tests.suite("chat_ui", function(_, it)
     chat_service.reset()
   end)
 
+  it("聊天主界面任意方式进入插入模式都跳到输入框", function(t)
+    local chat_view = require("NeoAI.ui.window.chat_view")
+    local chat_service = require("NeoAI.services.chat_service")
+    local input_box = require("NeoAI.ui.components.input_box")
+    chat_view.reset()
+    chat_service.reset()
+
+    local opened = chat_view.open()
+    local input_win = input_box.get_win()
+    local inst_ib = assert(input_box._instance())
+    local focus_calls = 0
+    local orig_focus = inst_ib.focus
+    ---@diagnostic disable-next-line: duplicate-set-field
+    inst_ib.focus = function()
+      focus_calls = focus_calls + 1
+      return orig_focus()
+    end
+
+    -- 在聊天消息区触发 InsertEnter（等价于用户按 a/I/o 等任意进入插入模式的方式）
+    vim.api.nvim_set_current_win(opened.win_id)
+    vim.api.nvim_exec_autocmds("InsertEnter", { buffer = opened.buf })
+    -- 守卫经 `vim.schedule` 切到下一圈主循环再聚焦：并行测试/负载高时 500ms 可能不够。
+    t.true_(vim.wait(3000, function() return focus_calls > 0 end, 10), "应自动跳到输入框")
+    t.eq(1, focus_calls, "进入插入模式只需聚焦输入框一次")
+    t.eq(input_win, vim.api.nvim_get_current_win(), "焦点应位于输入框窗口")
+
+    inst_ib.focus = orig_focus
+    chat_view.reset()
+    chat_service.reset()
+  end)
+
   it("子 Agent 完成不触发主界面光标回输入框（仅主 Agent 生效）", function(t)
     local chat_view = require("NeoAI.ui.window.chat_view")
     local chat_service = require("NeoAI.services.chat_service")
@@ -441,6 +472,56 @@ tests.suite("chat_ui", function(_, it)
     event_bus.emit(events.GENERATION_COMPLETED, { agent_id = agent.id })
     t.eq(1, focus_calls, "仅主 Agent 完成且光标在主消息区时应调用输入框 focus")
 
+    inst_ib.focus = orig_focus
+    chat_view.reset()
+    chat_service.reset()
+  end)
+
+  it("等待子 Agent / 后台工具结果时主 Agent 结束不抢焦点、不自动插入", function(t)
+    local chat_view = require("NeoAI.ui.window.chat_view")
+    local chat_service = require("NeoAI.services.chat_service")
+    local input_box = require("NeoAI.ui.components.input_box")
+    local event_bus = require("NeoAI.kernel.event_bus")
+    local events = require("NeoAI.kernel.events")
+    chat_view.reset()
+    chat_service.reset()
+
+    local opened = chat_view.open()
+    local agent = assert(chat_service.get_current_agent())
+    local inst_ib = assert(input_box._instance())
+    local focus_calls = 0
+    local orig_focus = inst_ib.focus
+    inst_ib.focus = function()
+      focus_calls = focus_calls + 1
+      return orig_focus()
+    end
+
+    -- 子 Agent / 后台工具的在途状态由 core 提供，这里直接替换查询函数模拟。
+    local sa = require("NeoAI.core.agent.sub_agent")
+    local tl = require("NeoAI.core.agent.tool_loop")
+    local orig_count, orig_bg = sa.count_for, tl.background_pending_for
+    vim.api.nvim_set_current_win(opened.win_id)
+    vim.cmd("stopinsert")
+    local function emit() event_bus.emit(events.GENERATION_COMPLETED, { agent_id = agent.id }) end
+
+    -- 仍有子 Agent 在跑：结果会回传并续跑主 Agent → 不抢焦点
+    sa.count_for = function() return 1, 1 end
+    tl.background_pending_for = function() return 0 end
+    emit()
+    t.eq(0, focus_calls, "等待子 Agent 时不应把光标移回输入框")
+
+    -- 子 Agent 已结束、但后台工具结果未回 → 同样不抢焦点
+    sa.count_for = function() return 0, 1 end
+    tl.background_pending_for = function() return 1 end
+    emit()
+    t.eq(0, focus_calls, "等待后台工具结果时不应把光标移回输入框")
+
+    -- 异步结果全部收齐（真正收尾）→ 恢复正常自动聚焦
+    tl.background_pending_for = function() return 0 end
+    emit()
+    t.eq(1, focus_calls, "无在途异步结果时应回到输入框")
+
+    sa.count_for, tl.background_pending_for = orig_count, orig_bg
     inst_ib.focus = orig_focus
     chat_view.reset()
     chat_service.reset()

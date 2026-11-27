@@ -227,6 +227,8 @@ vim.api.nvim_create_autocmd("User", {
 | `SUB_AGENT_COMPLETED` | `sub_agent:completed` | 子 Agent 完成 | `{ sub_agent_id, name, status }` |
 | `SUB_AGENT_ERROR` | `sub_agent:error` | 子 Agent 出错 | `{ sub_agent_id, name, error }` |
 | `SUB_AGENT_RESULT_READY` | `sub_agent:result_ready` | 子 Agent 结果就绪 | `{ sub_agent_id }` |
+| `SUB_AGENT_QUESTION` | `sub_agent:question` | 子 Agent 的 ask_user 提问已转交主 Agent | `{ sub_agent_id, question_id, name }` |
+| `SUB_AGENT_QUESTION_ANSWERED` | `sub_agent:question_answered` | 子 Agent 提问已结算（回答/作废） | `{ sub_agent_id, question_id, ok }` |
 
 ### 配置 / 生命周期
 
@@ -270,6 +272,10 @@ vim.api.nvim_create_autocmd("User", {
 | 常量 | 值 | 触发时机 | payload 关键字段 |
 | --- | --- | --- | --- |
 | `RESOURCE_PRESSURE` | `resource:pressure` | 资源压力等级变化（`ok` ↔ `warn` ↔ `critical`） | `{ level, prev, mem_total_bytes, mem_available_bytes, psi_memory_avg10, load1, cores }` |
+| `SELF_GUARD` | `resource:self_guard` | 本进程内存等级变化（`ok` ↔ `soft` ↔ `hard`） | `{ level, prev, rss_bytes, peak_bytes, lua_bytes, mem_total_bytes, actions }` |
+| `PROCESS_STATE` | `process:state` | 受管子进程状态变化（supervisor） | `{ id, kind, state, prev, restarts, crashes, reason, breaker_open, pid }` |
+| `TASK_STATE` | `task:state` | 任务分发状态变化 | `{ id, kind, lane, state, error }` |
+| `SESSION_RECOVERED` | `session:recovered` | 不干净退出后的自动恢复 | `{ unclean, markers, sessions, reclaimed }` |
 
 > 等级只影响**非必要开销**（观测探针是否启动、沙箱单任务内存上限、工作线程并行度、
 > UI 渲染节流与 PTY 轮询频率），**绝不影响安全强制层**——seccomp 基线、eBPF 行为兜底

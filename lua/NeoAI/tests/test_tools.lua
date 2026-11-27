@@ -213,9 +213,11 @@ tests.suite("tools", function(_, it)
     t.ok(grouped.system)
     t.ok(grouped.lsp)
     t.eq(1, #grouped.file)
-    t.eq(10, #packer.get_all_packs())
+    -- 新增「编辑器」（nvim 镜像工具）分组。
+    t.eq(11, #packer.get_all_packs())
     t.not_nil(packer.pack_display_name("file"))
     t.eq("网页抓取", packer.pack_display_name("web"))
+    t.eq("编辑器", packer.pack_display_name("editor"))
   end)
 
   it("executor 执行 file_ops", function(t)

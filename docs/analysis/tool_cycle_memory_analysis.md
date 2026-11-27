@@ -107,7 +107,7 @@ end
 - 按名称**字典序**输出（确定性，前缀缓存友好）。
 - 空 `properties` 不输出该字段（DeepSeek 拒绝 `[]` schema）。
 - 先环境探测（`tools.environment.filter_tools`），禁用依赖不可用环境的工具。
-- 计划模式只保留只读/信息查询 + `ask_user`（`plan_mode.apply_tool_filter`）。
+- 计划模式：草稿模式按能力上限过滤（写类可用、拒绝宿主级/未受信工具）；无异步暂存时只保留只读/信息查询 + `run_command` + `ask_user`（`plan_mode.apply_tool_filter`）。
 
 ---
 

@@ -73,6 +73,56 @@ tests.suite("plan_mode", function(_, it)
     t.not_nil(restored.edit_file, "退出计划模式后恢复完整工具上下文")
   end)
 
+  it("草稿模式：写类工具可用，宿主级/未受信能力不可用", function(t)
+    local pm = require("NeoAI.tools.builtin.plan_mode")
+    local registry = require("NeoAI.tools.registry")
+    local tools = registry.list_as_map()
+    if not tools.edit_file then
+      t.true_(true)
+      return
+    end
+    local agent = { id = "p_staging" }
+    pm._set_staging_active_for_test(true)
+    pm.enter(agent)
+    local filtered = pm.apply_tool_filter(agent, tools)
+    t.not_nil(filtered.edit_file, "草稿模式允许写类工具（仅暂存）")
+    t.not_nil(filtered.run_command, "草稿模式保留 run_command")
+    t.not_nil(filtered.send_sub_agent_message, "保留子 Agent 对话通道")
+    t.nil_(filtered.ssh_run, "不提供宿主 SSH 操作")
+    t.nil_(filtered.service_start, "不提供长驻服务启动")
+    t.nil_(filtered.nvim, "编辑器控制默认不在计划模式放行")
+    t.true_(pm.check_tool(agent, "edit_file"), "执行期同样放行写类工具")
+    t.false_(pm.check_tool(agent, "ssh_run"), "执行期拒绝宿主能力")
+    t.matches("不要修复", pm.policy_text())
+    t.matches("自动丢弃", pm.policy_text())
+    pm.exit(agent)
+    pm._set_staging_active_for_test(nil)
+    pm.reset()
+  end)
+
+  it("子 Agent 继承计划 scope 时同样受能力上限约束", function(t)
+    local pm = require("NeoAI.tools.builtin.plan_mode")
+    local registry = require("NeoAI.tools.registry")
+    local tools = registry.list_as_map()
+    if not tools.edit_file then
+      t.true_(true)
+      return
+    end
+    local parent = { id = "p_child_scope", messages = {} }
+    pm._set_staging_active_for_test(true)
+    pm.enter(parent)
+    local child = { id = "c_child_scope", _plan_scope_id = parent._plan_scope_id }
+    local filtered = pm.apply_tool_filter(child, tools)
+    t.not_nil(filtered.edit_file, "子 Agent 写入同样只进暂存（允许写类工具）")
+    t.nil_(filtered.ssh_run, "子 Agent 同样不得使用宿主能力")
+    t.nil_(filtered.nvim, "子 Agent 同样不得控制编辑器")
+    t.true_(pm.check_tool(child, "edit_file"))
+    t.false_(pm.check_tool(child, "service_start"))
+    pm.exit(parent)
+    pm._set_staging_active_for_test(nil)
+    pm.reset()
+  end)
+
   it("restore 还原计划模式状态", function(t)
     local pm = require("NeoAI.tools.builtin.plan_mode")
     local agent = { id = "p3" }

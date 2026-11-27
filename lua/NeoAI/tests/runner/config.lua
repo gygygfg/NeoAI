@@ -46,7 +46,17 @@ M.SERIAL_PATTERNS = { "^sandbox", "^pty$" }
 -- 改动宿主全局的 `/run/netns`（共享挂载点）。与其他分片并发时会在该挂载点上互相竞争
 -- （bind mount / make-shared 的跨进程竞态），导致全量并行失败。它们一套件一子进程且
 -- **不与 light/heavy 两条 lane 重叠**，在二者全部结束后串行执行（独占通道）。
-M.EXCLUSIVE_PATTERNS = { "^sandbox_view" }
+-- 除视图/挂载类套件外，**直接操作宿主 netns** 的边界/网关套件也必须独占：
+-- 它们会 `ip netns add/del`（`/run/netns` 是宿主共享挂载点），与并行的其它沙箱套件同时
+-- add/del 会互相让对方的 bind 失效（实测 `bwrap: ... remount "/newroot/run/netns/..." :
+-- No such file or directory` 间歇性失败）。
+M.EXCLUSIVE_PATTERNS = {
+  "^sandbox_view",
+  "^sandbox_boundary_net$",
+  "^sandbox_boundary_escape$",
+  "^sandbox_docker_policy$",
+  "^gateway$",
+}
 
 -- ========== 资源探测 ==========
 

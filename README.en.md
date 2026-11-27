@@ -17,8 +17,9 @@
 - **Multiple chat instances** — `<leader>ac` / `:NeoAI Chat` opens an **independent chat instance in a new tab** (unique buffer name); run several chats at once, each with its own session, streaming output, **its own reasoning / tool-args floats, and its own reasoning-visibility toggle**, while existing instances stay alive
 - **A rich set of built-in tools** — the AI can call 40+ tools for file operations, code analysis, LSP, Shell commands, and more
 - **Tool approval system** — fine-grained control over tool execution permissions, supporting auto-allow / manual approval / argument-level allowlists
-- **Plan mode (PLAN) and plan extraction** — toggle with `m` or `:NeoAI Plan`; the tool context retains only read-only / informational queries plus `run_command` (read-only research) and `ask_user` (no mutating tools are exposed, and no mode-switching tool is given to the AI); after the AI researches and clarifies, it emits a formatted change plan and ends the turn; once the user confirms (`:NeoAI ApprovePlan` or manually toggling the mode), NeoAI switches to CHAT: at the boundary it first runs one **XML plan extraction** (`<target>`/`<stepN>`/`<files>` etc., case-insensitive, retrying up to 3 times when key fields are missing), assembles the execution context, builds the task list automatically per step (`todo_write`), and keeps `<files>`-related tool messages verbatim for cache hits before starting execution
-- **Privileged mode (PRIV, opt-in)** — cycle with `m` or toggle with `:NeoAI Privileged`; network is record-only (process-wide: while a PRIV session exists, traffic is allowed and recorded, and focus switches never prompt), SSH keys are not masked. Docker is no longer connected directly to the host daemon; it uses an auto-detected session rootless runtime plus a host-side broker. Off by default and async-approval only; see `docs/en/configuration.md` and `docs/sandbox.md` for the security boundary
+- **Plan mode (PLAN) and plan extraction** — toggle with `m` or `:NeoAI Plan`. With an async sandbox it is a **draft mode**: investigate only, do not fix; write tools are available but their file changes only enter the sandbox staging view — never the real workspace, never the review queue, not committable via SandboxCommit — and are discarded on leaving plan mode (a path with pending review changes gets its previous pending content restored). A **capability ceiling** still rejects SSH/host privilege/long-lived services/`nvim` editor control/MCP without `plan_safe`/unknown-category external tools. Without async staging it falls back to the read-only tool set. Neither mode gives the AI a mode-switching tool; after the AI reports its conclusion/evidence, the user confirms (`:NeoAI ApprovePlan` or manually toggling), NeoAI switches to CHAT: at the boundary it first runs one **XML plan extraction** (`<target>`/`<stepN>`/`<files>` etc., case-insensitive, retrying up to 3 times when key fields are missing), assembles the execution context, builds the task list automatically per step (`todo_write`), and keeps `<files>`-related tool messages verbatim for cache hits before starting execution
+- **Privileged mode (PRIV, opt-in)** — cycle with `m` or toggle with `:NeoAI Privileged`; network is record-only (process-wide: while a PRIV session exists, traffic is allowed and recorded, and focus switches never prompt), SSH keys are not masked. Docker is no longer connected directly to the host daemon; it uses an auto-detected session rootless runtime plus a host-side broker. Off by default and async-approval only; see `docs/en/configuration.md` and `docs/sandbox.md` for the security boundary- **Host protection and crash recovery** — heavy work (capture/freeze/hashing/encoding/large-file IO) runs in a background worker process; child processes are managed by `kernel/supervisor` (heartbeat, backoff restart, circuit breaker, cgroup limits), so a child crash only fails a task and never takes nvim down. `kernel/self_guard` watches this process's RSS (soft: reclaim caches; hard: abort the current turn) instead of relying on the kernel OOM killer, and tasks go through two dispatch lanes (interactive/background) with timeouts, cancellation and queue limits. If the host is still SIGKILLed, the next start detects the unclean shutdown, reclaims the dead process's sandbox storage and reopens the most recent interrupted sessions (`:NeoAI Recover` runs the same flow on demand). Sandbox files always stay on disk (candidates keep metadata + blobs only), and sandbox storage lives in the cache dir with automatic cleanup on start and exit
+
 - **Background context compaction** — as the context threshold approaches, round 1 through the second-to-last round (keeping the last round intact) is folded **asynchronously in the background, non-blocking**, and a checkpoint is written into a **compaction overlay**: subsequent requests and further compactions use the compacted replacement, while chat rendering and session persistence keep the original context (the overlay is saved with the session and survives a restart); compaction opens no floating window; in addition to turn boundaries, **a pressure check runs before every round of the tool loop** (after tool results are written back and before the next request), so long loops converge round by round; **when the history safety cap is exceeded we compact synchronously before sending (replacing the prefix with a checkpoint instead of truncating it)**; on overflow the request is compacted and retried automatically; plan extraction still shows reasoning and content live in a floating window
 - **Sub-Agent system** — the AI can spawn sub-Agents to run subtasks in parallel, with boundary review
 - **Decoupled frontend/backend architecture** — an event-driven asynchronous architecture that separates the UI from business logic
@@ -213,7 +214,7 @@ shown by a floating hint (or by your nvim-cmp + cmp-cmdline setup when installed
 | `:NeoAI Compact`   | Manually compact the current session context (ignores the pressure threshold, keeps the latest round) |
 | `:NeoAI ReloadDisplay`| Hot-reload the display mode plugin (reloads the current mode by default) |
 | `:NeoAI ReloadAll`  | Hot-reload the whole NeoAI plugin (isolated pre-check first; cancel on failure) |
-| `:NeoAI Plan`       | Toggle plan mode (the tool context retains only read-only / informational queries + asking the user) |
+| `:NeoAI Plan`       | Toggle plan mode (async-sandbox drafts: investigate without touching disk; read-only tool set without staging) |
 | `:NeoAI Privileged` | Toggle privileged mode (record-only network, SSH unmasked; Docker uses the auto session runtime; opt-in) |
 | `:NeoAI ApprovePlan`| Confirm the plan and switch to CHAT mode to execute it per the task list |
 | `:NeoAI SandboxCommit`| Apply a sandbox candidate to the real workspace (CAS publish; arg = candidate digest) |
@@ -242,9 +243,9 @@ edit or delete it:
 
 | Placeholder | Expands to |
 | --- | --- |
-| `#{buffers}` | All buffers (number / state / type / path) |
-| `#{buffer:NAME}` | Content of the named buffer |
-| `#{lsp}` | LSP diagnostics of the file you are editing |
+| `#{buffers}` | All buffers (number / state / type / path, `[+]` = unsaved) |
+| `#{buffer}` / `#{buffer:NAME}` | **Buffer object reference** (no content); the AI reads it on demand with the sandboxed `nvim` mirror tool |
+| `#{lsp}` / `#{lsp:NAME}` | The user's own LSP info for that buffer (clients/capabilities/diagnostics summary, no content) |
 | `#{message}` / `#{notify}` | Neovim message history since startup (max 2000 characters, counted in characters) |
 | `#{tool}` / `#{tool:NAME}` | Tool list / a single tool definition |
 | `#{skills}` / `#{skills:NAME}` | Skill list / a single skill body |
@@ -252,7 +253,7 @@ edit or delete it:
 
 With nvim-cmp installed the candidates pop up automatically; otherwise use `<C-x><C-u>` in insert mode.
 Unresolvable targets (missing buffer/skill) keep the placeholder **as-is** — sending never fails.
-Config: `ui.input_box.hash_completion = { enabled=true, max_chars=2000, max_bytes=20000 }`.
+Config: `ui.input_box.hash_completion = { enabled=true, max_chars=2000, max_bytes=20000, lsp_max_messages=30 }`.
 
 ### 3.2 AGENTS.md auto-load
 
@@ -485,7 +486,7 @@ require("NeoAI").setup({
       distill_parallel = true,           -- multi-round parallel extraction: R1 3 lanes (target/steps/files) + R2 4 lanes (optional sections replaying the R1 echo) + front compaction in parallel; false = single request
       distill_front = true,              -- distill the pre-plan "front" context into one checkpoint message using the compactor's 8-section instruction (falls back to verbatim front)
       distill_max_attempts = 2,          -- per-lane max attempts on the parallel path (only target/steps retry when missing)
-      extra_safe_tools = {},             -- extensions to the plan mode allowlist
+      extra_safe_tools = {},             -- explicit allowlist for plan mode (tools beyond the capability ceiling)
       -- mutating_tools = { ... },       -- mutating tools (the visible set in plan mode already covers this semantics)
     },
     privileged_mode = {
@@ -624,7 +625,7 @@ ai = {
 > When a model does not support images, NeoAI degrades gracefully without blocking the call.
 ### lualine statusline integration
 
-NeoAI exposes information such as the current Agent's LLM usage, cache hit rate, and context capacity to `nvim-lualine`.
+NeoAI exposes the usage, cache hit rate, and context capacity of the current session (main session + all direct sub-agent sessions) to `nvim-lualine`.
 Two approaches are supported:
 
 **Approach 1: automatic (recommended)** — no configuration needed. As long as nvim-lualine is detected, NeoAI
@@ -667,7 +668,13 @@ your own lualine and are left untouched. The display is deliberately concise: cl
 no truncated blocks:
 
 - **Line 1 (winbar)** identity: `[mode] model state`
-- **Line 2 (statusline)** metrics: `↑prompt ↓completion hit99.5%(session94.5%) usage y% pending N`
+- **Line 2 (statusline)** metrics: `↑prompt ↓completion hit99.5%(total94.5%) usage y% pending N`
+
+> `↑`/`↓` and the parenthesized cumulative hit rate cover the **main session + all direct
+> sub-agent sessions**: live sub-agents are read in real time, completed sub-agents (or after
+> reopening the session) come from the persisted sub-session usage, and sub-agents under forked
+> branches are excluded. The cumulative hit rate is token-weighted, not an average of per-agent
+> ratios; the single-request value is the most recent request across the main and sub agents.
 
 > `pending N`: while the Agent is busy (generating / tool_running / the generation slot is occupied), messages you
 > send are queued first and this badge appears in the statusline as a reminder; once the message is actually sent,
@@ -705,7 +712,7 @@ require("NeoAI").setup({
 
 Related public APIs:
 
-- `NeoAI.get_statusline_info()` — returns structured usage/cache/capacity data for the current Agent
+- `NeoAI.get_statusline_info()` — returns structured usage/cache/capacity data for the current session (including direct sub-agent sessions)
 - `NeoAI.get_statusline()` — returns the statusline text
 - `require("NeoAI.services.status").segment(name)` — text of a single segment (mode/model/usage/cache/capacity/state/display/pending)
 - `require("NeoAI.services.chat_service").pending_count()` — number of queued messages held while the current Agent is busy
@@ -942,21 +949,24 @@ one does). For risk levels and allowlists see the `approval` config and [docs/en
 | `todo_write`      | Replace the whole task list (with an auto-injected system prompt)           | `todos` (required) full list; each item is `{content, status}` with `status` ∈ `pending`/`in_progress`/`completed`/`cancelled` (at most one `in_progress`) |
 | `todo_read`       | Read the current task list                               | no parameters |
 | `todo_clear`      | Clear the task list                                   | no parameters |
-| `enter_plan_mode` | Enter plan mode (the tool context switches to read-only/informational + questions)| no parameters |
+| `enter_plan_mode` | Enter plan mode (investigate only, do not fix; with async sandbox writes are staged and discarded on exit) | no parameters |
 
 ### 💬 Asking the User
 
 | Tool name     | Description                                     | Parameters |
 | ---------- | ---------------------------------------- | -------- |
-| `ask_user` | Pause generation and ask the user a question; the answer is returned as the tool result | `question` (required); `options` (optional) array of choices for quick selection (strings, or `{label, description}` objects) |
+| `ask_user` | Pause generation and ask the user a question; the answer is returned as the tool result. When a sub-agent calls it, no popup appears: the question is relayed to the main agent, which answers with `send_sub_agent_message` or asks the user first | `question` (required); `options` (optional) array of choices for quick selection (strings, or `{label, description}` objects) |
 
-> **PLAN MODE**: while active, the tool context **contains only read-only/informational query tools, `run_command` (read-only research), and `ask_user`**,
-> and exposes no mutating tools whatsoever (edit/delete/create/git rollback, etc.), **nor any mode-switching tool to the AI**; execution-time
-> gating is tightened accordingly, and any tool outside the visible set is rejected. In this mode the AI investigates,
-> asks clarifying questions,
-> and produces a **clear, well-formatted change plan** (goals and background / list of changes / implementation steps / verification and rollback).
+> **PLAN MODE**: with an async sandbox it is a **draft mode** — write tools remain available, but file changes only
+> enter the sandbox staging view and are **never written to the real workspace, never queued for review, and cannot be
+> committed via SandboxCommit**; they are discarded on leaving plan mode (a path with pending review changes gets its
+> previous pending content restored). A capability ceiling still rejects SSH/host privilege/long-lived services/`nvim`
+> editor control/MCP without `plan_safe`/unknown-category external tools. Without async staging it falls back to the read-only tool set
+> (read-only/informational + `run_command` + `ask_user`), with execution-time gating tightened accordingly.
+> Neither mode **gives the AI a mode-switching tool**. The AI investigates, asks clarifying questions, and reports
+> the conclusion/evidence concisely (optionally with a short change list for a later fix).
 > After the plan is emitted the turn ends and **the user confirms** (run `:NeoAI ApprovePlan` or toggle the mode manually);
-> after confirmation it **switches directly to CHAT mode**, the system parses the plan into a task list (todos),
+> after confirmation it **switches directly to CHAT mode** (drafts discarded), the system parses the plan into a task list (todos),
 > and execution starts automatically according to `tools.plan_mode.auto_execute_on_approve` (on by default).
 > During generation, switching modes via `m` / `:NeoAI Plan` is **deferred until the current turn ends**,
 > so an in-progress generation is never interrupted by a mid-flight change to the toolset / system policy / model.

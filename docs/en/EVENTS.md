@@ -227,6 +227,8 @@ All event constants are defined in `NeoAI.kernel.events`. They are listed below 
 | `SUB_AGENT_COMPLETED` | `sub_agent:completed` | Sub-agent completed | `{ sub_agent_id, name, status }` |
 | `SUB_AGENT_ERROR` | `sub_agent:error` | Sub-agent errored | `{ sub_agent_id, name, error }` |
 | `SUB_AGENT_RESULT_READY` | `sub_agent:result_ready` | Sub-agent result ready | `{ sub_agent_id }` |
+| `SUB_AGENT_QUESTION` | `sub_agent:question` | A sub-agent `ask_user` question was relayed to the main agent | `{ sub_agent_id, question_id, name }` |
+| `SUB_AGENT_QUESTION_ANSWERED` | `sub_agent:question_answered` | A sub-agent question was settled (answered/voided) | `{ sub_agent_id, question_id, ok }` |
 
 ### Config / Lifecycle
 
@@ -270,6 +272,10 @@ All event constants are defined in `NeoAI.kernel.events`. They are listed below 
 | Constant | Value | When emitted | Key payload fields |
 | --- | --- | --- | --- |
 | `RESOURCE_PRESSURE` | `resource:pressure` | Pressure level changed (`ok` <-> `warn` <-> `critical`) | `{ level, prev, mem_total_bytes, mem_available_bytes, psi_memory_avg10, load1, cores }` |
+| `SELF_GUARD` | `resource:self_guard` | This process's memory level changed (`ok` <-> `soft` <-> `hard`) | `{ level, prev, rss_bytes, peak_bytes, lua_bytes, mem_total_bytes, actions }` |
+| `PROCESS_STATE` | `process:state` | Supervised child process state changed | `{ id, kind, state, prev, restarts, crashes, reason, breaker_open, pid }` |
+| `TASK_STATE` | `task:state` | Dispatched task state changed | `{ id, kind, lane, state, error }` |
+| `SESSION_RECOVERED` | `session:recovered` | Automatic recovery after an unclean shutdown | `{ unclean, markers, sessions, reclaimed }` |
 
 > The level only affects **non-essential work** (whether observation probes start, the
 > sandbox per-task memory cap, worker parallelism, UI render throttling and PTY polling

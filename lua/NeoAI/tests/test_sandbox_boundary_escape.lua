@@ -213,6 +213,37 @@ probe("reg", "/tmp/.neoai_mknod_reg", 0o100000 | 0o600)
     t.matches("NoNewPrivs:%s+1", out, "载荷应带 NoNewPrivs=1")
   end)
 
+  it("次级可写根（包安装 /etc overlay）：ld.so.preload 缺失也强制遮蔽且不落 upper", function(t)
+    if not H.bwrap() then return end
+    if vim.uv.fs_stat("/etc/ld.so.preload") then return end -- 宿主已存在时由常规遮蔽覆盖
+    local fs = require("NeoAI.utils.fs")
+    local base = fs.canonical(vim.fn.tempname())
+    fs.ensure_dir(base .. "/upper")
+    fs.ensure_dir(base .. "/work")
+    -- 只给 `/etc` 一个**可写 overlay 根**（等价包安装的 writable root），不启用整机根 overlay：
+    -- 父目录可写 => 载荷能创建该文件，必须强制以 /dev/null 遮蔽（否则后续动态链接进程
+    -- 会加载任意库，形成沙箱内代码注入原语）。
+    local prefix = require("NeoAI.sandbox.execution.runtime").process_prefix({
+      overlays = { { root = "/etc", upper = base .. "/upper", work = base .. "/work", mode = "overlay" } },
+      cwd = "/tmp",
+    })
+    t.not_nil(prefix, "应可构造 bwrap 前缀")
+    local argv = table.concat(prefix, " ")
+    t.true_(argv:find("--bind /dev/null /etc/ld.so.preload", 1, true) ~= nil,
+      "可写 /etc 下应强制遮蔽 /etc/ld.so.preload")
+    local out, code = H.direct({
+      overlays = { { root = "/etc", upper = base .. "/upper", work = base .. "/work", mode = "overlay" } },
+      cwd = "/tmp",
+    }, "echo NEOAI > /etc/ld.so.preload; echo rc=$?; test -s /etc/ld.so.preload && echo NONEMPTY || echo EMPTY")
+    t.eq(0, code, "命令应可运行（挂载点由 bwrap 创建，不得 init 失败）: " .. tostring(out))
+    t.matches("rc=[12]", tostring(out), "写 ld.so.preload 应被拒绝: " .. tostring(out))
+    t.matches("EMPTY", tostring(out), "遮蔽后内容应为空（/dev/null）: " .. tostring(out))
+    t.eq(nil, vim.uv.fs_stat(base .. "/upper/etc/ld.so.preload"),
+      "遮蔽不应在 upper 留下空挂载点文件（否则会被捕获为候选）")
+    fs.delete_file(base .. "/upper/etc/ld.so.preload")
+    vim.fn.delete(base, "rf")
+  end)
+
   it("整机 overlay：/etc 身份文件只读、ld.so.preload 强制遮蔽", function(t)
     if not H.bwrap() then return end
     local before_pre = vim.uv.fs_stat("/etc/ld.so.preload")

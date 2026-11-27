@@ -176,6 +176,8 @@ function M.init()
   -- 重建规格必须跨 NeoAI 进程存活（实例目录随进程回收），放在配置的沙箱基根下。
   pcall(function() require("NeoAI.sandbox.docker.specs").init(_base_root() .. "/docker/specs") end)
   state.initialized = true
+  -- 未保存 buffer → 沙箱视图基线：注册 BufWritePost/BufUnload（副作用随 shutdown 卸载）。
+  pcall(function() require("NeoAI.sandbox.execution.buffer_view").install() end)
   if vim.g.neoai_test then
     -- 测试要求确定性/同步水合；生产走异步预热 + 分帧物化。
     _rehydrate_pending()
@@ -192,8 +194,7 @@ function M.init()
   end)
   if not state.gc_scheduled then
     state.gc_scheduled = true
-    local base = _base_root()
-    vim.schedule(function() pcall(instance.gc, base) end)
+    vim.schedule(function() pcall(M.cleanup, { phase = "start" }) end)
   end
   -- 预热运行时能力与 overlay 可写性探测：把首条进程命令开始处的同步功能实测（bwrap/
   -- overlay，约百 ms）提前到启动空闲时机完成并写入缓存，避免 run_command 开始时卡主线程。
@@ -223,6 +224,64 @@ function M.base_root()
   return _base_root()
 end
 
+--- 沙箱存储清理（全部位于 `stdpath("cache")/NeoAI/sandbox` 下，属可重建缓存）。
+---
+---   phase="start"：回收**死进程**遗留的实例目录（候选/blob/视图/证据随进程失效）+
+---                 孤儿进程 + 陈旧临时目录；并清掉旧布局直接放在基根下的目录（超时后）。
+---   phase="exit" ：删除**本进程实例目录**。只在进程退出（VimLeavePre）时调用——
+---                 插件热重载会保留实例，使待审队列与暂存继续可用。
+---
+--- 待审队列/候选是进程实例作用域的：进程退出后已无法再应用，删除不会造成静默丢失。
+--- @param opts table|nil { phase?: "start"|"exit" }
+--- @return number 删除的目录数
+function M.cleanup(opts)
+  opts = opts or {}
+  local ok_cfg, cfg = pcall(function()
+    return require("NeoAI.kernel.config_store").get("tools.sandbox.cleanup") or {}
+  end)
+  if not ok_cfg or type(cfg) ~= "table" then cfg = {} end
+  local phase = opts.phase or "start"
+  local removed = 0
+  if phase == "start" then
+    if cfg.on_start == false then return 0 end
+    local ok_inst, inst = pcall(require, "NeoAI.sandbox.execution.instance")
+    if ok_inst and type(inst.gc) == "function" then
+      pcall(function() removed = removed + (tonumber(inst.gc(_base_root())) or 0) end)
+    end
+    -- 旧布局（进程实例化之前）：基根下直接放 candidates/reviews/blobs 等。超过保留期即清，
+    -- 避免升级后这些目录永久占盘（曾累积到数 GB）。
+    local age = tonumber(cfg.legacy_max_age) or 3600
+    local now = os.time()
+    local legacy = {
+      "candidates", "reviews", "reviews_removed", "rejected", "receipts", "evidence",
+      "blobs", "snapshots", "snapshots_meta", "sessions", "attempts", "tmp",
+    }
+    for _, name in ipairs(legacy) do
+      local dir = _base_root() .. "/" .. name
+      local st = vim.uv.fs_stat(dir)
+      if st and st.type == "directory" and st.mtime and (now - (tonumber(st.mtime.sec) or now)) > age then
+        if pcall(vim.fn.delete, dir, "rf") and vim.fn.isdirectory(dir) == 0 then
+          removed = removed + 1
+        end
+      end
+    end
+  else
+    if cfg.on_exit == false then return 0 end
+    local root = _root()
+    if type(root) == "string" and root ~= "" and vim.fn.isdirectory(root) == 1 then
+      pcall(vim.fn.delete, root, "rf")
+      if vim.fn.isdirectory(root) == 0 then removed = 1 end
+    end
+  end
+  if removed > 0 then
+    pcall(function()
+      require("NeoAI.kernel.logger").info(
+        "[sandbox] 存储清理（%s）：删除 %d 个目录", tostring(phase), removed)
+    end)
+  end
+  return removed
+end
+
 --- 探测运行时能力（含 cgroup / seccomp）
 --- @return table
 function M.probe()
@@ -235,6 +294,7 @@ end
 --- 关闭：清理暂存
 function M.shutdown()
   M.unwatch_sessions()
+  pcall(function() require("NeoAI.sandbox.execution.buffer_view").stop() end)
   -- 先停容器监测/broker/会话 runtime：容器随会话 userns 销毁；重建规格保留。
   pcall(function() require("NeoAI.sandbox.docker.monitor").reset() end)
   pcall(function() require("NeoAI.sandbox.docker.session").stop() end)
@@ -266,6 +326,14 @@ function M.shutdown()
   candidate.reset(timeout)
   state.active = nil
   state.initialized = false
+  -- 进程退出（而不是插件热重载）时清掉本进程实例目录：沙箱存储是可重建缓存，
+  -- 而实例也随之失效（下次启动是新实例 id，旧候选已无法再应用）。
+  pcall(function()
+    local lifecycle = require("NeoAI.kernel.lifecycle")
+    if type(lifecycle.is_shutting_down) == "function" and lifecycle.is_shutting_down() then
+      M.cleanup({ phase = "exit" })
+    end
+  end)
 end
 
 --- 订阅 agent 生命周期，在 agentEnd（生成结束/错误/取消/中止）时轮换沙箱会话。
@@ -363,6 +431,31 @@ end
 --- @return table|nil
 function M.active_attempt()
   return state.active
+end
+
+-- ---------- 计划模式草稿（退出即丢弃，不进审批） ----------
+
+--- 开启计划草稿作用域（plan_mode.enter 调用）。
+--- @param scope string
+--- @param owner_agent_id string|nil
+--- @return boolean
+function M.plan_scope_begin(scope, owner_agent_id)
+  return require("NeoAI.sandbox.execution.plan_draft").begin(scope, owner_agent_id)
+end
+
+--- 作用域是否仍在收集草稿（tool ctx 用它决定写入是否按草稿结算）。
+--- @param scope string|nil
+--- @return boolean
+function M.plan_scope_active(scope)
+  return require("NeoAI.sandbox.execution.plan_draft").is_active(scope)
+end
+
+--- 丢弃计划草稿（退出计划模式 / Agent 销毁）。
+--- @param scope string|nil
+--- @param reason string|nil
+--- @return table { discarded: number, restored: number, skipped: number }
+function M.plan_scope_discard(scope, reason)
+  return require("NeoAI.sandbox.execution.plan_draft").discard(scope, reason)
 end
 
 --- 设置当前暂存尝试（返回旧值）
@@ -1262,6 +1355,7 @@ function M.reset()
   pcall(function() require("NeoAI.sandbox.execution.wrapper").release_persistent_backgrounds() end)
   candidate.reset()
   require("NeoAI.sandbox.execution.jobs").reset()
+  require("NeoAI.sandbox.execution.plan_draft").reset()
   control.reset()
   -- 重置前先回收搬出层内容（登记表在 store 内，store.reset 会删掉它 → 之后无法再追踪）。
   pcall(retired_layer.purge_all)

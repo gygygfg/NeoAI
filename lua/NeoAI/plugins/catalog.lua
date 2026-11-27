@@ -190,6 +190,15 @@ end
 local function _side_effect_specs()
   return {
     {
+      -- 子进程总管理：**必须最先启动**——后台 worker 可能被其它插件的启动期任务拉起
+      -- （模型列表刷新、技能扫描、MCP 预热…），晚于它们启动会错过 spawn 回调，
+      -- 导致限额与状态只能等下一次心跳补齐。
+      id = "supervisor", phase = 2,
+      start = function()
+        return require("NeoAI.kernel.supervisor").start()
+      end,
+    },
+    {
       id = "ui", module = "NeoAI.ui", service = "services.ui",
       deps = { "services.chat_service" },
       start = function() require("NeoAI.ui").init() end,
@@ -273,6 +282,50 @@ local function _side_effect_specs()
         -- shutdown（而非 reset）：卸载前主动 release-agent，避免退出/重启/热重载后
         -- Herdr 侧残留 NeoAI 的 working/blocked 状态。
         if herder then herder.shutdown() end
+      end,
+    },
+    {
+      -- 崩溃自动恢复：干净退出标记 → 不干净退出检测 → 回收死进程沙箱存储 → 重开被中断会话。
+      -- 只重开最近 N 个（session.recovery.auto_open），不自动续跑（避免自动消耗 token）。
+      id = "session.recovery", deps = { "services.session", "ui" }, phase = 2,
+      start = function(ctx)
+        local rec = require("NeoAI.core.session.recovery")
+        local res, stop = rec.start()
+        local auto = tonumber(res and res.auto_open) or 0
+        if res and res.unclean and auto > 0 and type(res.sessions) == "table" then
+          vim.defer_fn(function()
+            local ui = ctx and ctx.services and ctx.services.use("services.ui")
+            if not ui then return end
+            for i = 1, math.min(auto, #res.sessions) do
+              local s = res.sessions[i]
+              if s and s.id then pcall(ui.open_chat, { session_id = s.id }) end
+            end
+          end, 300)
+        end
+        return stop
+      end,
+    },
+    {
+      -- 自身内存看门狗（保命层）：定时巡检本进程 RSS；超硬阈值先释放缓存 + GC，
+      -- 仍超限则中止当前回合（会话已按轮落盘），绝不让内核 OOM 杀掉整个 nvim。
+      id = "self_guard", deps = { "services.chat_service" }, phase = 2,
+      start = function(ctx)
+        local guard = require("NeoAI.kernel.self_guard")
+        local chat = ctx and ctx.services and ctx.services.use("services.chat_service")
+        local un_abort = function() end
+        if chat and type(chat.abort_all) == "function" then
+          un_abort = guard.set_abort_handler(function(reason) return chat.abort_all(reason) end)
+        end
+        -- 只回收纯展示缓存（正确性无关）：树摘要、Markdown 渲染、实时指标缓存。
+        local un_cache = guard.register_reclaimer("ui_cache", function()
+          pcall(function() require("NeoAI.ui").reclaim_memory() end)
+        end)
+        local stop = guard.start()
+        return function()
+          pcall(un_abort)
+          pcall(un_cache)
+          pcall(stop)
+        end
       end,
     },
   }

@@ -1,6 +1,6 @@
 --- NeoAI 状态栏服务
 --- @module 'NeoAI.services.status'
---- 汇总当前 Agent 的大模型用量、缓存命中、上下文容量等信息，供 nvim-lualine 等
+--- 汇总当前会话（主 Agent + 全部直接子 Agent 会话）的大模型用量、缓存命中、上下文容量等信息，供 nvim-lualine 等
 --- 状态栏组件消费。纯读取，无副作用；component() 返回字符串，事件驱动刷新。
 --- 集成方式（二选一）：
 ---   1. lualine 扩展：config.lualine = { extensions = { 'neoai' } }，在 neoai 聊天 window 自动生效；
@@ -112,6 +112,140 @@ local function _fmt_model(model)
   return model:match("[^/:]+$") or model
 end
 
+-- ========== 用量聚合（主会话 + 全部直接子 Agent 会话） ==========
+-- 「↑输入 ↓输出」与「命中(总计…)」统一按当前会话 + 全部直接子 Agent 会话统计：
+--   * 运行中的子 Agent 取进程内实时 usage；
+--   * 已完成 / 重开会话后的子 Agent 取其子会话持久化的 metadata.usage；
+--   * 只统计挂在当前会话下的直接子 Agent 会话（子 Agent 不能再派生，故无嵌套），
+--     用户 fork 分支下的子 Agent 不计入；
+--   * capacity 不聚合（上下文窗口属于单个 Agent）。
+
+local USAGE_FIELDS = { "prompt", "completion", "cache_read", "cache_write", "cache_miss", "requests" }
+
+--- 夹取命中率到 [0, 1]
+--- @param x number|nil
+--- @return number|nil
+local function _clamp_ratio(x)
+  if not x then return nil end
+  return math.max(0, math.min(1, x))
+end
+
+--- 把一份 usage 累加到聚合快照
+--- @param acc table 聚合累加器
+--- @param u table|nil Agent.usage / 子会话 metadata.usage
+local function _usage_accumulate(acc, u)
+  u = type(u) == "table" and u or {}
+  for _, k in ipairs(USAGE_FIELDS) do
+    acc[k] = (acc[k] or 0) + (tonumber(u[k]) or 0)
+  end
+  local prompt_total = tonumber(u.prompt_total)
+  local cache_total = tonumber(u.prompt_cache_total)
+  if prompt_total then
+    acc.prompt_total = acc.prompt_total + prompt_total
+    acc.prompt_cache_total = acc.prompt_cache_total + (cache_total or 0)
+  else
+    -- 兼容旧持久化数据（无 prompt_total）：用「未缓存输入 + 缓存命中」近似
+    local cached = tonumber(u.cache_read) or 0
+    acc.prompt_total = acc.prompt_total + cached + (tonumber(u.prompt) or 0)
+    acc.prompt_cache_total = acc.prompt_cache_total + cached
+  end
+end
+
+--- 选取「最近一次请求」候选（用于命中率单次值）。
+--- 有 `_last_usage_at`（进程内请求序号）者优先于没有者；都没有时保留先加入的（主 Agent）。
+--- @param u table|nil
+--- @param at number|nil
+--- @param latest table|nil 当前候选
+--- @return table|nil
+local function _usage_latest(u, at, latest)
+  u = type(u) == "table" and u or nil
+  if not u then return latest end
+  local last_prompt = tonumber(u.last_prompt)
+  if not last_prompt or last_prompt <= 0 then return latest end
+  -- 与旧口径一致：缺少 last_cache_read 时按 0 命中处理（仍可展示单次值）
+  local last_read = tonumber(u.last_cache_read) or 0
+  local rank = tonumber(at)
+  if latest then
+    if latest.rank ~= nil and (rank == nil or rank <= latest.rank) then return latest end
+    if latest.rank == nil and rank == nil then return latest end
+  end
+  return {
+    rank = rank,
+    last_prompt = last_prompt,
+    last_completion = tonumber(u.last_completion),
+    last_cache_read = last_read,
+    last_cache_ratio = _clamp_ratio(last_read / last_prompt),
+  }
+end
+
+--- 聚合当前 Agent + 全部直接子 Agent 会话的用量
+--- @param agent table
+--- @return table usage 聚合快照
+local function _aggregate_usage(agent)
+  local acc = {
+    prompt = 0, completion = 0, cache_read = 0, cache_write = 0,
+    cache_miss = 0, requests = 0, prompt_total = 0, prompt_cache_total = 0,
+    cache_ratio = 0, last_prompt = nil, last_completion = nil,
+    last_cache_read = nil, last_cache_ratio = nil,
+    sub_agent_sessions = 0, -- 参与聚合的子 Agent / 子会话数（诊断/测试）
+  }
+  _usage_accumulate(acc, agent.usage)
+  local latest = _usage_latest(agent.usage, agent._last_usage_at, nil)
+
+  -- 已计入的子会话（避免实时子 Agent 与持久化 usage 重复累加）
+  local counted = {}
+
+  -- 运行中的子 Agent：取实时 usage
+  local ok_sa, sa = pcall(require, "NeoAI.core.agent.sub_agent")
+  local ok_rt, runtime = pcall(require, "NeoAI.core.agent.runtime")
+  if ok_sa and ok_rt and sa and sa.list_for then
+    local ok_list, list = pcall(sa.list_for, agent.id)
+    if ok_list and type(list) == "table" then
+      for _, entry in ipairs(list) do
+        local child = entry.agent_id and runtime.get(entry.agent_id) or nil
+        if child then
+          _usage_accumulate(acc, child.usage)
+          latest = _usage_latest(child.usage, child._last_usage_at, latest)
+          acc.sub_agent_sessions = acc.sub_agent_sessions + 1
+          if entry.session_id then counted[entry.session_id] = true end
+        end
+      end
+    end
+  end
+
+  -- 已持久化（已完成 / 重开会话后）的子会话：取 metadata.usage
+  if agent.session_id then
+    local ok_ss, session_store = pcall(require, "NeoAI.core.session.session_store")
+    local ok_sm, session_mod = pcall(require, "NeoAI.core.session.session")
+    if ok_ss and ok_sm and session_store and session_mod then
+      local ok_children, children = pcall(session_store.get_children, agent.session_id)
+      if ok_children and type(children) == "table" then
+        for _, s in ipairs(children) do
+          if s and s.id and not counted[s.id] and session_mod.is_sub_agent(s) then
+            _usage_accumulate(acc, s.metadata and s.metadata.usage)
+            acc.sub_agent_sessions = acc.sub_agent_sessions + 1
+            counted[s.id] = true
+          end
+        end
+      end
+    end
+  end
+
+  if acc.prompt_total > 0 then
+    acc.cache_ratio = acc.prompt_cache_total / acc.prompt_total
+  else
+    -- 仅测试/旧数据提供 cache_ratio 时保留主 Agent 口径
+    acc.cache_ratio = tonumber(agent.usage and agent.usage.cache_ratio) or 0
+  end
+  if latest then
+    acc.last_prompt = latest.last_prompt
+    acc.last_completion = latest.last_completion
+    acc.last_cache_read = latest.last_cache_read
+    acc.last_cache_ratio = latest.last_cache_ratio
+  end
+  return acc
+end
+
 --- 确保沙箱待审徽标的高亮组存在（幂等、用户已自定义时不覆盖）。
 --- 采用 default=true 语义：只在未定义时写入，配色方案重载后被清空会再次补回。
 local function _ensure_sandbox_hl()
@@ -135,7 +269,7 @@ local function _build_part(info, part)
     return _fmt_model(info.model)
   elseif part == "usage" then
     if not info.usage then return nil end
-    -- 累计用量：会话内所有请求的输入/输出 token 之和（合计口径，非最近一次）
+    -- 累计用量：主会话 + 全部直接子 Agent 会话所有请求的输入/输出 token 之和
     local p = info.usage.prompt or 0
     local c = info.usage.completion or 0
     return "↑" .. _fmt_tokens(p) .. " ↓" .. _fmt_tokens(c)
@@ -147,8 +281,9 @@ local function _build_part(info, part)
     if mode == "latest" then
       return "命中" .. _fmt_pct2(last or cum)
     elseif mode == "both" and last then
-      -- 单次命中率反映当前前缀缓存质量；括号内为会话累计（provider 账单口径）。
-      return "命中" .. _fmt_pct2(last) .. "(会话" .. _fmt_pct2(cum) .. ")"
+      -- 单次命中率反映主/子 Agent 中最近一次请求的前缀缓存质量；括号内为整棵会话树累计
+      -- （主会话 + 全部直接子 Agent 会话，provider 账单口径）。
+      return "命中" .. _fmt_pct2(last) .. "(总计" .. _fmt_pct2(cum) .. ")"
     end
     return "命中" .. _fmt_pct2(cum)
   elseif part == "capacity" then
@@ -364,7 +499,8 @@ function M.check_pressure(agent)
   return cap.level
 end
 
---- 获取当前 Agent 的状态信息（不格式化，供自定义组件使用）
+--- 获取当前 Agent 的状态信息（不格式化，供自定义组件使用）。
+--- usage 聚合主会话 + 全部直接子 Agent 会话；capacity 仅针对当前 Agent。
 --- @return table { available, mode, display, model, state, usage, capacity }
 function M.get_info()
   local chat_service = services.use("services.chat_service")
@@ -403,25 +539,24 @@ function M.get_info()
     if ok and tonumber(n) and tonumber(n) > 0 then info.sandbox_traces = tonumber(n) end
   end
   if agent then
-    local u = agent.usage or {}
-    local last_prompt = tonumber(u.last_prompt)
-    local last_read = tonumber(u.last_cache_read) or 0
+    -- 用量/缓存：聚合主会话 + 全部直接子 Agent 会话（运行中实时 / 已完成取持久化数据）
+    local agg = _aggregate_usage(agent)
     info.usage = {
-      prompt = u.prompt or 0,
-      completion = u.completion or 0,
-      last_prompt = u.last_prompt,
-      last_completion = u.last_completion,
-      requests = u.requests or 0,
-      cache_read = u.cache_read or 0,
-      cache_write = u.cache_write or 0,
-      cache_miss = u.cache_miss or 0,
-      cache_ratio = u.cache_ratio or 0,
-      last_cache_read = last_read,
-      -- 最近一次请求的命中率（provider 返回的 cache_read/last_prompt）。
-      -- 与累计口径区分：短会话累计值会被冷启动与早期小上下文摊薄。
-      last_cache_ratio = (last_prompt and last_prompt > 0)
-        and math.max(0, math.min(1, last_read / last_prompt))
-        or nil,
+      prompt = agg.prompt,
+      completion = agg.completion,
+      last_prompt = agg.last_prompt,
+      last_completion = agg.last_completion,
+      requests = agg.requests,
+      cache_read = agg.cache_read,
+      cache_write = agg.cache_write,
+      cache_miss = agg.cache_miss,
+      prompt_total = agg.prompt_total,
+      prompt_cache_total = agg.prompt_cache_total,
+      cache_ratio = agg.cache_ratio,
+      last_cache_read = agg.last_cache_read or 0,
+      -- 最近一次请求的命中率（主/子 Agent 中请求序号最新者），与累计口径区分。
+      last_cache_ratio = agg.last_cache_ratio,
+      sub_agent_sessions = agg.sub_agent_sessions,
     }
     -- 上下文容量：优先 API 最近一次请求的真实输入 token，缺失回退完整请求估算
     info.capacity = M.capacity_for(agent)

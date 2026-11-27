@@ -381,6 +381,12 @@ function M.detect(first)
     if tool_name then kind, name = "tool_result", tool_name end
   end
   if not kind then
+    -- 子 Agent 提问块：首行 "❓ 子 Agent 提问: <名字>"
+    local saq = head:match("子 Agent 提问[:：]%s*(.+)$")
+    if saq then
+      local saq_time, saq_rest = _strip_time(saq)
+      return "sub_agent_question", "question", vim.trim(saq_rest or saq), nil, saq_time
+    end
     -- 子 Agent 结果块：首行 "✅ 子 Agent: <名字>"（可能带 " · 1.2s"）
     local sa = head:match("子 Agent[:：]%s*(.+)$")
     if sa then
@@ -437,6 +443,9 @@ function M.label(first, count, is_reasoning, step_txt, opts)
       return string.format("  🤖 子 Agent %s %s %s", name or "", status_emoji, time)
     end
     return string.format("  🤖 子 Agent %s %s", name or "", status_emoji)
+  end
+  if kind == "sub_agent_question" then
+    return string.format("  ❓ 子 Agent 提问 %s", name or "")
   end
   if kind == "tool_call" or kind == "tool_result" then
     local status_emoji = STATUS_EMOJI[status] or "⏳"
@@ -496,7 +505,8 @@ function M.foldtext()
   local kind = M.detect(first)
   -- 当前窗口可用宽度：折叠文本超出时把耗时提到目的之前（窄窗下行尾耗时会被截断）
   local width_opts = { width = _usable_width() }
-  if kind == "tool_call" or kind == "tool_result" or kind == "sub_agent" then
+  if kind == "tool_call" or kind == "tool_result" or kind == "sub_agent"
+    or kind == "sub_agent_question" then
     return M.label(first, count, true, step_txt, width_opts)
   end
   local buf = vim.api.nvim_get_current_buf()

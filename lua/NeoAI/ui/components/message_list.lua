@@ -945,7 +945,7 @@ end
 --- @return boolean
 local function _is_sub_agent_result(msg)
   if not msg then return false end
-  if msg.sub_agent then return true end
+  if msg.sub_agent or msg.sub_agent_question then return true end
   if msg.role ~= "user" then return false end
   local c = msg.content
   return type(c) == "string" and c:match("^%s*【子 Agent ") ~= nil
@@ -1796,6 +1796,21 @@ end
 --- @param marks table 与 lines 并行的元数据数组
 --- @param message table
 local function _append_sub_agent_block(lines, marks, message)
+  -- 子 Agent 提问（ask_user 转交主 Agent）：同样折叠展示，但用 ❓ 并提示「等待回答」。
+  local q = message.sub_agent_question
+  if q then
+    local qname = q.name or q.sub_agent_id or "子 Agent"
+    local rows = { string.format("❓ 子 Agent 提问: %s", qname) }
+    for _, l in ipairs(_split_lines(message.content or "")) do
+      if not l:match("^【子 Agent") and not l:match("^请决定：") and not l:match("^同一子 Agent") then
+        rows[#rows + 1] = l
+      end
+    end
+    if #rows == 1 then rows[#rows + 1] = "提问: " .. tostring(q.question or "") end
+    rows[#rows + 1] = "状态: 等待主 Agent 回答"
+    _append_fold_block(lines, marks, rows, "sub_agent_question", { fold_kind = "sub_agent_question" })
+    return
+  end
   local sa = message.sub_agent
   local name, status, task
   if sa then
@@ -2541,6 +2556,12 @@ function M.reset()
   state.default_show = true
   state.show_by_buf = {}
   incremental.reset()
+end
+
+--- 释放纯展示缓存（内存看门狗回收用；运行期结果引用仍由 live_metrics 持有）。
+function M.reclaim_memory()
+  _live_msg_cache = {}
+  pcall(function() require("NeoAI.ui.components.incremental").reset() end)
 end
 
 return M

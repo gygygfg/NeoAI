@@ -106,7 +106,7 @@ When a `tools/call` fails due to a parameter/schema mismatch (`isError` and the 
 - Execution always goes through the sandbox (`sandbox.gate`); MCP tool calls enter the **review queue** by default per risk level
   (`sandbox.approval.default = "review"`) and are applied after async confirmation via `:NeoAI SandboxReview` (only in non-async modes does
   the pre-execution approval dialog in `tool_service` apply).
-- In plan mode, MCP tools are rejected by default (not in the read-only/information-query allowlist); servers with `plan_safe=true` are allowed.
+- In plan mode, MCP tools: draft mode allows only `plan_safe=true` (others rejected by the capability ceiling); read-only mode also allows only `plan_safe=true` (others are not in the read-only allowlist).
 - Timeouts use a pausable timer (time waiting for approval is not counted); a request cancellation sends `notifications/cancelled`.
 - On plugin shutdown (`PLUGIN_SHUTDOWN`), stdio servers: close stdin → SIGTERM → SIGKILL as a fallback.
 

@@ -39,6 +39,9 @@ local function _build_tools(allowed_tools)
   local manager = _manager()
   local dispatch = (manager and manager.agent_tool_names and manager.agent_tool_names()) or AGENT_TOOLS
   local function _excluded(name, tool)
+    -- 子 Agent 可以 ask_user：问题不会弹窗，而是包装后交给主 Agent，由主 Agent 决定
+    -- 直接回答还是继续询问用户（经 send_sub_agent_message 回复）。
+    if name == "ask_user" then return false end
     if dispatch[name] then return true end
     return tool ~= nil and tool.category == "agent"
   end
@@ -66,6 +69,8 @@ plan_tools.create_sub_agent = helpers.define_tool(
   "创建子 Agent 执行独立子任务（后台运行，立即返回）。"
     .. "创建后**无需等待或轮询**：子 Agent 循环结束后会把最终正文自动作为一条新消息回传给你，"
     .. "请直接结束本轮或继续其它工作，切勿反复调用 get_sub_agent_status 查询进度。"
+    .. "子 Agent 可用 ask_user 提问：问题会以消息形式转交给你，你用 send_sub_agent_message 回复。"
+    .. "若主 Agent 处于计划模式（异步沙箱），子 Agent 同样只读草稿：写入只暂存、退出计划模式丢弃。"
     .. "参数：task 必填；name 可选（简短显示名）；model 可选；boundaries 可选（allowed_tools/allowed_directories/max_tool_calls 等约束）。",
   {
     type = "object",
@@ -137,6 +142,14 @@ plan_tools.get_sub_agent_status = helpers.define_tool(
       ("任务: %s"):format(entry.task),
       ("工具调用: %d"):format(entry.tool_calls or 0),
     }
+    if manager.pending_questions_for then
+      local qs = manager.pending_questions_for(args.sub_agent_id)
+      if #qs > 0 then
+        local q = qs[1]
+        lines[#lines + 1] = ("待回答提问: %d（当前: %s）"):format(
+          #qs, require("NeoAI.utils.stringx").safe_truncate(tostring(q.question or ""), 200, "…"))
+      end
+    end
     if entry.result_text and entry.result_text ~= "" then
       lines[#lines + 1] = ("结果:\n%s"):format(entry.result_text)
     end
@@ -171,7 +184,8 @@ plan_tools.cancel_sub_agent = helpers.define_tool(
 
 plan_tools.send_sub_agent_message = helpers.define_tool(
   "send_sub_agent_message",
-  "向子 Agent 发送一条消息（补充指令/追问）。运行中会在其下一轮注入；已完成会据此续跑一轮。"
+  "向子 Agent 发送消息（agent 之间来回对话的唯一通道）。"
+    .. "若子 Agent 正在等待提问回答，本条消息即作为回答；否则运行中在其下一轮注入，已完成则据此续跑一轮。"
     .. "sub_agent_id 与 message 必填。",
   {
     type = "object",
@@ -187,12 +201,14 @@ plan_tools.send_sub_agent_message = helpers.define_tool(
       on_error("子 Agent 运行时不可用")
       return
     end
-    local ok, err = manager.send(args.sub_agent_id, args.message)
+    local ok, err, answered = manager.send(args.sub_agent_id, args.message)
     if not ok then
       on_error(tostring(err))
       return
     end
-    on_success("已向子 Agent " .. args.sub_agent_id .. " 发送消息。")
+    on_success(answered
+      and ("已回复子 Agent " .. args.sub_agent_id .. " 的提问。")
+      or ("已向子 Agent " .. args.sub_agent_id .. " 发送消息。"))
   end,
   { category = "agent" }
 )

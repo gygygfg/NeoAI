@@ -223,6 +223,8 @@ local function _build_persist_session(agent)
         -- 子 Agent 结果标记（UI 折叠渲染用，不进入模型上下文）：随会话持久化，
         -- 重开会话时仍按折叠块渲染而非用户消息。
         sub_agent = msg.sub_agent,
+        -- 子 Agent 提问标记（ask_user 转交主 Agent）：同样按折叠块渲染、不算用户轮次。
+        sub_agent_question = msg.sub_agent_question,
         -- 途中注入标记（AI 忙碌期间发送、由工具循环轮末插入的用户消息）：随会话持久化，
         -- 重开会话后「过程」折叠仍把它当作同一 run 的中途插入（见 message_list._process_meta）。
         mid_turn = msg.mid_turn,
@@ -638,7 +640,12 @@ end
 --- @param fallback_session_id string|nil
 --- @param meta table|nil { sub_agent? = { id, name, status, task } } 子 Agent 结果标记
 local function _dispatch_agent(agent, content, fallback_session_id, meta)
-  local extra = meta and meta.sub_agent and { sub_agent = meta.sub_agent } or nil
+  local extra = nil
+  if meta and meta.sub_agent then extra = { sub_agent = meta.sub_agent } end
+  if meta and meta.sub_agent_question then
+    extra = extra or {}
+    extra.sub_agent_question = meta.sub_agent_question
+  end
   if agent and not agent_mod_is_disposed(agent) then
     local d
     if _is_busy(agent) then
@@ -646,15 +653,30 @@ local function _dispatch_agent(agent, content, fallback_session_id, meta)
     else
       d = _run_message(agent, content, { message_extra = extra })
     end
-    -- 投递失败不应变成未处理拒绝（父会话可能刚被关闭）。
-    if d and type(d.catch) == "function" then pcall(function() d:catch(function() end) end) end
+    -- 投递失败不应变成未处理拒绝（父会话可能刚被关闭）；若只是「同一 tick 抢占导致 busy」，
+    -- 退回 pending 队列，避免子 Agent 结果/提问被静默丢弃。
+    if d and type(d.catch) == "function" then
+      pcall(function()
+        d:catch(function(err)
+          if err and err.kind == "busy" and not agent_mod_is_disposed(agent) then
+            local q = _enqueue_message(agent, content, { message_extra = extra })
+            if q and type(q.catch) == "function" then pcall(function() q:catch(function() end) end) end
+          end
+        end)
+      end)
+    end
     return
   end
   if fallback_session_id then
+    -- 父 Agent 已销毁时子 Agent 也已被取消：提问不再写回归档（避免留下永远无法回答的问题块）。
+    if extra and extra.sub_agent_question then return end
     local s = session_store.get(fallback_session_id)
     if s then
       local msg = { role = "user", content = content }
-      if extra then msg.sub_agent = extra.sub_agent end
+      if extra then
+        msg.sub_agent = extra.sub_agent
+        msg.sub_agent_question = extra.sub_agent_question
+      end
       session_mod.add_message(s, msg)
       session_store.persist(s)
     end
@@ -832,6 +854,40 @@ end
 --- @return boolean
 function M.has_pending_work()
   return M.has_pending_work_for_agent(state.current_agent_id)
+end
+
+--- 指定 Agent 是否仍在等待**异步结果回传**（子 Agent 在跑 / 后台工具未回）。
+--- 与 has_pending_work_for_agent 的区别：那一个看「本轮是否还在跑 + 暂存队列」；
+--- 这里看的是「本轮虽已结束，但后续一定还有结果回传并续跑」：
+---   * create_sub_agent / send_sub_agent_message 立即返回，子 Agent 继续在后台运行，
+---     结束后把正文投递回主 Agent 并触发续跑；
+---   * 工具批量转后台后，结果以末尾 system 消息回传，工具循环据此续跑。
+--- 供 UI 在 GENERATION_COMPLETED / GENERATION_ERROR / AGENT_ABORTED 时判断是否把光标
+--- 移回输入框并自动进入插入模式：仍在等结果时**不移**（否则刚进入插入模式就被下一波结果
+--- 冲屏、用户输入被反复打断；也让光标留在主界面观看后续输出）。
+--- @param agent_id string|nil
+--- @return boolean
+function M.awaiting_async_results_for_agent(agent_id)
+  if not agent_id then return false end
+  -- 子 Agent：仍在运行即有回传
+  local ok_sa, sa = pcall(require, "NeoAI.core.agent.sub_agent")
+  if ok_sa and sa and type(sa.count_for) == "function" then
+    local ok_c, running = pcall(sa.count_for, agent_id)
+    if ok_c and type(running) == "number" and running > 0 then return true end
+  end
+  -- 后台工具：批量转后台后结果未回
+  local ok_tl, tl = pcall(require, "NeoAI.core.agent.tool_loop")
+  if ok_tl and tl and type(tl.background_pending_for) == "function" then
+    local ok_b, n = pcall(tl.background_pending_for, agent_id)
+    if ok_b and type(n) == "number" and n > 0 then return true end
+  end
+  return false
+end
+
+--- 当前 Agent 是否仍在等待异步结果回传（子 Agent / 后台工具）。
+--- @return boolean
+function M.awaiting_async_results()
+  return M.awaiting_async_results_for_agent(state.current_agent_id)
 end
 
 --- 指定 Agent 是否**正在处理本轮的生成**（generating / tool_running / 生成槽位占用）。
@@ -1404,6 +1460,29 @@ function M.persist_active_sessions()
     end
   end
   return n
+end
+
+--- 中止全部在途回合（自身内存看门狗 hard 阈值的中止器）。
+---
+--- 语义：只中止**正在工作**的 Agent（生成中 / 工具执行中 / 已占用回合槽位）。会话已按轮
+--- 落盘，中止不丢历史；用户随后可继续对话。返回是否有 Agent 被中止，供看门狗决定是否
+--- 记录「已中止」还是「仅进入冷静期」。
+--- @param reason string|nil
+--- @return boolean aborted
+function M.abort_all(reason)
+  local n = 0
+  for agent_id in pairs(state.agents) do
+    local agent = runtime.get(agent_id)
+    if agent and type(agent.signal) == "table" and type(agent.signal.abort) == "function" then
+      local busy = agent.state == "generating" or agent.state == "tool_running"
+        or agent._turn_claim ~= nil
+      if busy and not agent.signal:aborted() then
+        n = n + 1
+        pcall(function() runtime.abort(agent, reason or "self_guard") end)
+      end
+    end
+  end
+  return n > 0
 end
 
 --- 测试辅助：当前登记的会话持久化链数量

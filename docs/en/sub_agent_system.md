@@ -28,8 +28,10 @@
 2. `runtime.spawn(parent, { session_id, model, cwd, tools })` creates a brand-new sub-agent (independent signal, zero inheritance).
 3. The tool subset is built by `tools/builtin/plan.lua`: **all main-agent tools by default, excluding only "Agent-class"
    tools** (`category == "agent"`: dispatch tools `create_sub_agent`/`get_sub_agent_status`/`cancel_sub_agent`/
-   `send_sub_agent_message`, `enter_plan_mode`, `ask_user`, `todo_*`).
-   When `boundaries.allowed_tools` is given it takes precedence (also excluding Agent-class tools).
+   `send_sub_agent_message`, `enter_plan_mode`, `todo_*`). **`ask_user` is the exception** — a sub-agent's question
+   is relayed to the main agent (see §2.5).
+   When `boundaries.allowed_tools` is given it takes precedence (also excluding Agent-class tools; list `ask_user`
+   explicitly if the sub-agent should be able to ask).
 4. Emit `SUB_AGENT_CREATED`; `chat_service` registers the child-session → agent mapping (so switching reuses a running agent).
 5. `runtime.run(child, task .. "\n\n" .. final_instruction)` starts execution.
    `final_instruction` comes from `tools.sub_agent.final_instruction` (defaults to a "summarize your work at the end" instruction).
@@ -65,26 +67,56 @@ Every sub-agent tool call goes through `tool_service._review_sub_agent` → `sub
 
 ### 2.4 Cancel / Send Message
 
-- `cancel_sub_agent` → `sub_agent.cancel`: `runtime.abort(child)`, set `cancelled`, emit `SUB_AGENT_UPDATED`, persist.
-- `send_sub_agent_message` → `sub_agent.send`: a running sub-agent receives it in its next round; a completed sub-agent resumes for one more round.
+- `cancel_sub_agent` → `sub_agent.cancel`: `runtime.abort(child)`, set `cancelled`, emit `SUB_AGENT_UPDATED`, persist;
+  pending questions are voided too.
+- `send_sub_agent_message` → `sub_agent.send` is the **only agent-to-agent conversation channel**:
+  - sub-agent has a **pending question** → this message is the answer (FIFO, current question); the sub-agent's
+    `ask_user` tool result becomes `主 Agent 回答: …` and no extra round is injected;
+  - running with no pending question → injected into its next round;
+  - completed → resumes it for one more round.
+
+### 2.5 Sub-agent Questions (ask_user relayed to the main agent)
+
+Sub-agents **can** call `ask_user` (`_build_tools` special-cases it), but it never shows a popup:
+
+1. `ask_user` detects `ctx.is_sub_agent` → `sub_agent.ask_parent(sub_id, req)`: pauses the sub-agent's active timer
+   (**no timeout**), registers the question, emits `SUB_AGENT_QUESTION`.
+2. The question is wrapped as a `role=user` message (marker `sub_agent_question`, with `question_id`/task/question/options)
+   and delivered to the main agent: idle → starts a turn; busy → queued for the next round boundary. Only **one question
+   per sub-agent** is in flight; further questions queue in order.
+3. The main agent decides:
+   - answer directly: `send_sub_agent_message(sub_agent_id, …)`;
+   - ask the user first: `ask_user`, then reply with `send_sub_agent_message`.
+4. The manager settles the question; the sub-agent's `ask_user` tool result is `主 Agent 回答: …`; if another question is
+   queued it is delivered immediately.
+5. Lifecycle: cancel/finish of the sub-agent, parent disposal, session deletion, or manager reset voids all
+   pending/queued questions with an error — the sub-agent never hangs forever.
+
+> The sub-agent tool subset **excludes** `send/cancel/get_status/create` (only the main agent dispatches);
+> an agent cannot answer another agent's question (`send` validates `parent_agent_id`).
+> The `ask_user` popup only serves the main agent; sub-agent questions never occupy it.
 
 ## 3. Tool List (main agent)
 
 | Tool | Description | Parameters |
 | --- | --- | --- |
 | `create_sub_agent` | Creates a sub-agent (runs in background, returns immediately; **no polling/waiting needed** — the final body is delivered automatically) | `task` (required); `name` (optional short label); `model` (optional); `boundaries` (optional) `{allowed_tools, allowed_directories, allowed_commands, max_tool_calls, max_iterations}`; `context` (optional) |
-| `get_sub_agent_status` | Queries status, task and result (**normally not needed**; only to confirm whether it is still running / stuck) | `sub_agent_id` (required) |
+| `get_sub_agent_status` | Queries status, task and result (**normally not needed**; only to confirm whether it is still running / stuck; includes a pending-question summary) | `sub_agent_id` (required) |
 | `cancel_sub_agent` | Cancels the sub-agent | `sub_agent_id` (required) |
-| `send_sub_agent_message` | Sends a message to a sub-agent (extra instruction/follow-up) | `sub_agent_id`, `message` (both required) |
+| `send_sub_agent_message` | Sends a message to a sub-agent / **answers its question** (the only agent conversation channel) | `sub_agent_id`, `message` (both required) |
 
 > `wait_sub_agent` has been removed: there is no wait tool; results are delivered automatically.
-> Sub-agents **never receive** any of the above dispatch tools.
+> Sub-agents **never receive** any of the above dispatch tools; they only get `ask_user` as the upward channel.
 > With the default asynchronous approval (`tools.approval.mode = "async"`), `create_sub_agent` executes immediately in the sandbox.
+
+> **Plan mode**: in async-sandbox draft mode a spawned sub-agent inherits the parent's plan scope, so its file writes are
+> drafts too and are discarded with the parent scope; the same capability ceiling applies (SSH/host privilege/long-lived
+> services/untrusted MCP or external tools).
 
 ## 4. State and Events
 
 `state.subs[sub_id]` records `{ id, name, task, agent_id, session_id, parent_agent_id,
-parent_session_id, boundaries, status, result_text, error, started_at, tool_calls }`,
+parent_session_id, boundaries, status, result_text, error, started_at, tool_calls, pending_questions }`,
 where `status` is one of: `running` / `completed` / `error` / `cancelled`.
 
 | Event | Trigger |
@@ -94,12 +126,19 @@ where `status` is one of: `running` / `completed` / `error` / `cancelled`.
 | `SUB_AGENT_COMPLETED` | Completed |
 | `SUB_AGENT_ERROR` | Errored |
 | `SUB_AGENT_RESULT_READY` | Result ready (for delivery) |
+| `SUB_AGENT_QUESTION` | Sub-agent question relayed to the main agent |
+| `SUB_AGENT_QUESTION_ANSWERED` | Sub-agent question settled (answered/voided) |
 
 ## 5. UI: Statusline and Switching
 
 - **winbar** (top of the main chat window): the identity row renders `[CHAT] <model> <state> <sub-agent names>`.
   Names are laid out flat; if the joined text **exceeds the chat window width**, it collapses to
   `N个子agent正在运行` (`services/status.sub_agents_segment`, width-adaptive).
+- **Statusline usage**: `↑`/`↓` and the parenthesized cumulative hit rate cover the **main session +
+  all direct sub-agent sessions** (live sub-agents in real time; completed ones, or after reopening
+  the session, from their persisted sub-session usage; sub-agents under forked branches are excluded).
+  The cumulative hit rate is token-weighted; the single-request value is the most recent request
+  across the main and sub agents.
 - **Keybinding** `keymaps.chat.switch_sub_agent` (default `<leader>as`): cycles and opens a sub-agent session
   **in a new window** (a running sub-agent reuses the live agent, so you watch it in real time).
 - **List popup** `keymaps.chat.sub_agent_list` (default `<leader>al`): opens a **borderless** floating list at

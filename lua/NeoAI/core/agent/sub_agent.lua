@@ -40,6 +40,7 @@ local state = {
   subs = {}, -- sub_id -> entry
   order = {}, -- 插入顺序的 sub_id
   by_agent = {}, -- agent_id -> sub_id（快速反查）
+  questions = {}, -- qid -> 待回答提问记录（子 Agent ask_user 转交主 Agent）
   dispatch = nil, -- fn(agent, content, fallback_session_id)：结果/消息投递（chat_service 注入）
   persist = nil, -- fn(agent)：把子 Agent 消息落盘到其子会话（chat_service 注入）
   inited = false,
@@ -118,8 +119,215 @@ local function _final_text(entry)
   return ""
 end
 
+-- ========== 子 Agent 提问（ask_user 转交主 Agent） ==========
+
+local _init
+
+local function _new_qid()
+  return string.format("sq_%x_%x", os.time(), math.random(1, 2 ^ 31))
+end
+
+-- 前向声明：结算一个问题后要投递下一个（FIFO）。
+local _deliver_question
+local _settle_question
+
+--- 构造交给主 Agent 的提问消息（role=user + sub_agent_question 标记）。
+--- @param rec table
+--- @param entry table
+--- @return string
+local function _question_text(rec, entry)
+  local stringx = require("NeoAI.utils.stringx")
+  local task = stringx.safe_truncate(tostring(entry.task or ""), 400, "…")
+  local question = stringx.safe_truncate(tostring(rec.question or ""), 4000, "…")
+  local lines = {
+    ("【子 Agent \"%s\" 提问（question_id=%s）】"):format(entry.name or rec.sub_id, rec.id),
+  }
+  if task ~= "" then lines[#lines + 1] = "任务: " .. task end
+  lines[#lines + 1] = "问题: " .. question
+  local opts = rec.options or {}
+  if #opts > 0 then
+    local parts = {}
+    for i, o in ipairs(opts) do
+      local label = type(o) == "table" and tostring(o.label or o.name or "") or tostring(o)
+      local desc = type(o) == "table" and tostring(o.description or "") or ""
+      parts[#parts + 1] = ("%d) %s%s"):format(i, label, desc ~= "" and (" — " .. desc) or "")
+    end
+    lines[#lines + 1] = "选项: " .. stringx.safe_truncate(table.concat(parts, "；"), 2000, "…")
+  end
+  lines[#lines + 1] =
+    ("请决定：能直接回答就调用 send_sub_agent_message(sub_agent_id=\"%s\", message=\"...\")；"
+      .. "若需要用户决定，先用 ask_user 询问用户，拿到回答后再用 send_sub_agent_message 回复。"):format(rec.sub_id)
+  lines[#lines + 1] = "同一子 Agent 同时只投递一个问题：本条消息就是当前待回答的问题，回复即作为它的工具结果。"
+  return table.concat(lines, "\n")
+end
+
+--- 把一个问题投递给主 Agent（子 Agent 同时最多一个在途问题，其余排队）。
+--- @param rec table
+_deliver_question = function(rec)
+  if not rec or rec.settled or rec.delivered then return end
+  local entry = state.subs[rec.sub_id]
+  if not entry then
+    _settle_question(rec, false, { kind = "cancelled", message = "子 Agent 已结束" })
+    return
+  end
+  local parent = rec.parent_agent_id and runtime.get(rec.parent_agent_id) or nil
+  if not parent then
+    _settle_question(rec, false, { kind = "cancelled", message = "主 Agent 已关闭，无法提问" })
+    return
+  end
+  rec.delivered = true
+  local marker = {
+    id = rec.id, sub_agent_id = rec.sub_id, name = entry.name,
+    question = rec.question, options = rec.options,
+  }
+  local text = _question_text(rec, entry)
+  event_bus.emit(events.SUB_AGENT_QUESTION, {
+    sub_agent_id = rec.sub_id, question_id = rec.id, name = entry.name,
+  })
+  if state.dispatch then
+    pcall(state.dispatch, parent, text, rec.parent_session_id, { sub_agent_question = marker })
+  else
+    -- 未注入 dispatch（测试/未启动）：退化为直接驱动父 Agent 生成。
+    pcall(function()
+      local d = runtime.run(parent, text, { message_extra = { sub_agent_question = marker } })
+      if d and type(d.catch) == "function" then pcall(function() d:catch(function() end) end) end
+    end)
+  end
+end
+
+--- 结算一个问题（回答/取消/失败）。回答成功后立即投递同子 Agent 的下一个排队问题。
+--- @param rec table
+--- @param ok boolean
+--- @param value any 成功为工具结果字符串；失败为错误表
+_settle_question = function(rec, ok, value)
+  if not rec or rec.settled then return end
+  rec.settled = true
+  state.questions[rec.id] = nil
+  local entry = state.subs[rec.sub_id]
+  if entry and entry.pending_questions then
+    for i = #entry.pending_questions, 1, -1 do
+      if entry.pending_questions[i] == rec.id then table.remove(entry.pending_questions, i) end
+    end
+  end
+  if rec.delivered then
+    event_bus.emit(events.SUB_AGENT_QUESTION_ANSWERED, {
+      sub_agent_id = rec.sub_id, question_id = rec.id, ok = ok == true,
+    })
+  end
+  if ok then
+    pcall(rec.on_success, value)
+  else
+    pcall(rec.on_error, value)
+  end
+  -- 同一子 Agent 只保留一个在途问题：回答后投递下一个。
+  if ok and entry and entry.pending_questions and #entry.pending_questions > 0 then
+    local next_id = entry.pending_questions[1]
+    local next_rec = state.questions[next_id]
+    if next_rec and not next_rec.delivered then _deliver_question(next_rec) end
+  end
+end
+
+--- 子 Agent 的 ask_user 代理：登记问题并转交主 Agent。
+--- @param sub_id string
+--- @param req table { question, options?, multi_select?, agent_id?, on_success, on_error }
+--- @return string|nil qid
+--- @return string|nil err
+function M.ask_parent(sub_id, req)
+  req = req or {}
+  _init()
+  local entry = state.subs[sub_id]
+  if not entry then return nil, "子 Agent 不存在: " .. tostring(sub_id) end
+  if entry.status ~= "running" then return nil, "子 Agent 已结束，无法提问" end
+  local parent = entry.parent_agent_id and runtime.get(entry.parent_agent_id) or nil
+  if not parent then return nil, "主 Agent 不可用，无法提问" end
+  if type(req.question) ~= "string" or req.question == "" then return nil, "question 必填" end
+  local rec = {
+    id = _new_qid(),
+    sub_id = sub_id,
+    parent_agent_id = entry.parent_agent_id,
+    parent_session_id = entry.parent_session_id,
+    question = req.question,
+    options = req.options or {},
+    multi_select = req.multi_select == true,
+    on_success = req.on_success,
+    on_error = req.on_error,
+    delivered = false,
+    settled = false,
+  }
+  state.questions[rec.id] = rec
+  entry.pending_questions = entry.pending_questions or {}
+  entry.pending_questions[#entry.pending_questions + 1] = rec.id
+  entry.question_count = (entry.question_count or 0) + 1
+  -- 同时只投递一个：已有在途问题则排队。
+  if #entry.pending_questions == 1 then _deliver_question(rec) end
+  return rec.id
+end
+
+--- 回答一个问题（供 send_sub_agent_message 统一通道调用）。
+--- @param qid string
+--- @param answer string
+--- @param parent_agent_id string|nil 校验调用者必须是该子 Agent 的父 Agent
+--- @return boolean ok
+--- @return string|nil err
+function M.answer_question(qid, answer, parent_agent_id)
+  local rec = state.questions[qid]
+  if not rec then return false, "该提问已失效（可能已回答/子 Agent 已结束）" end
+  if parent_agent_id and rec.parent_agent_id ~= parent_agent_id then
+    return false, "该提问不属于当前 Agent"
+  end
+  if type(answer) ~= "string" or answer == "" then return false, "answer 必填" end
+  local stringx = require("NeoAI.utils.stringx")
+  _settle_question(rec, true,
+    ("主 Agent 回答: %s"):format(stringx.safe_truncate(answer, 8000, "…")))
+  return true
+end
+
+--- 取消一个问题（子 Agent 中止/父关闭/会话删除）。
+--- @param qid string
+--- @param reason string|nil
+--- @return boolean
+function M.cancel_question(qid, reason)
+  local rec = state.questions[qid]
+  if not rec then return false end
+  _settle_question(rec, false, { kind = "cancelled", message = tostring(reason or "提问已取消") })
+  return true
+end
+
+--- 列出某子 Agent 当前待回答/排队的问题（测试/状态展示）。
+--- @param sub_id string
+--- @return table 数组 { id, question, delivered }
+function M.pending_questions_for(sub_id)
+  local entry = state.subs[sub_id]
+  if not entry or not entry.pending_questions then return {} end
+  local out = {}
+  for _, qid in ipairs(entry.pending_questions) do
+    local rec = state.questions[qid]
+    if rec then
+      out[#out + 1] = { id = rec.id, question = rec.question, delivered = rec.delivered == true }
+    end
+  end
+  return out
+end
+
+local function _settle_all_questions(reason)
+  local ids = {}
+  for qid in pairs(state.questions) do ids[#ids + 1] = qid end
+  for _, qid in ipairs(ids) do M.cancel_question(qid, reason) end
+end
+
 local function _settle(entry, status, body)
   if not entry or entry.status ~= "running" then return end
+  -- 子 Agent 结束时其未回答提问必须结算，避免主 Agent 已经看不到、子 Agent 工具调用永久挂起。
+  local pending = entry.pending_questions
+  entry.pending_questions = {}
+  if pending then
+    for _, qid in ipairs(pending) do
+      local rec = state.questions[qid]
+      if rec then
+        _settle_question(rec, false, { kind = "cancelled", message = "子 Agent 已结束，提问作废" })
+      end
+    end
+  end
   entry.status = status
   entry.result_text = body or ""
   _persist_child(entry)
@@ -143,6 +351,18 @@ end
 local function _on_parent_disposed(data)
   local pid = data and data.agent_id
   if not pid then return end
+  -- 被销毁的 Agent 本身可能就是子 Agent：先作废它自己的待回答提问，避免主 Agent 回答到
+  -- 一个已销毁 Agent 的工具调用上（Deferred 已无人接收）。
+  local own = _entry_by_agent(pid)
+  if own and own.pending_questions then
+    for _, qid in ipairs(own.pending_questions) do
+      local rec = state.questions[qid]
+      if rec then
+        _settle_question(rec, false, { kind = "cancelled", message = "子 Agent 已销毁，提问作废" })
+      end
+    end
+    own.pending_questions = {}
+  end
   local keep = {}
   for _, id in ipairs(state.order) do
     local entry = state.subs[id]
@@ -150,6 +370,15 @@ local function _on_parent_disposed(data)
       -- 父已销毁：静默取消（不回传给已不存在的父，也不写回父会话存档）
       entry.parent_agent_id = nil
       entry.parent_session_id = nil
+      if entry.pending_questions then
+        for _, qid in ipairs(entry.pending_questions) do
+          local rec = state.questions[qid]
+          if rec then
+            _settle_question(rec, false, { kind = "cancelled", message = "主 Agent 已关闭，提问作废" })
+          end
+        end
+        entry.pending_questions = {}
+      end
       if entry.status == "running" then M.cancel(id) end
       local child = entry.agent_id and runtime.get(entry.agent_id) or nil
       if child then pcall(runtime.dispose, child) end
@@ -188,6 +417,15 @@ local function _on_session_deleted(data)
       -- 先摘除登记：abort/dispose 触发的生成事件因查不到条目而自动静默。
       state.subs[id] = nil
       if entry.agent_id then state.by_agent[entry.agent_id] = nil end
+      if entry.pending_questions then
+        for _, qid in ipairs(entry.pending_questions) do
+          local rec = state.questions[qid]
+          if rec then
+            _settle_question(rec, false, { kind = "cancelled", message = "会话已删除，提问作废" })
+          end
+        end
+        entry.pending_questions = {}
+      end
       entry.parent_agent_id = nil
       entry.parent_session_id = nil
       local was_running = entry.status == "running"
@@ -211,7 +449,7 @@ local function _on_session_deleted(data)
   state.order = keep
 end
 
-local function _init()
+_init = function()
   if state.inited then return end
   state.inited = true
   state.unsubs[#state.unsubs + 1] = event_bus.on(events.AGENT_DISPOSED, _on_parent_disposed)
@@ -274,6 +512,13 @@ function M.create(parent_agent, opts)
   child._sub_agent_id = id
   child._external_owner = "sub_agent"
   child.tools = _sanitize_tools(opts.tools)
+  -- 计划模式草稿：子 Agent 同样遵守能力上限（不因继承而拿到宿主级/长驻服务工具）。
+  if child._plan_scope_id then
+    local ok_pm, plan_mode = pcall(require, "NeoAI.tools.builtin.plan_mode")
+    if ok_pm and plan_mode and type(plan_mode.filter_capabilities) == "function" then
+      child.tools = plan_mode.filter_capabilities(child.tools)
+    end
+  end
 
   local entry = {
     id = id,
@@ -301,6 +546,10 @@ function M.create(parent_agent, opts)
   -- 提示自动追加收尾指令
   local instr = _final_instruction()
   local prompt = opts.task
+  if child._plan_scope_id then
+    prompt = prompt .. "\n\n（计划模式：只做调研，不要修改文件；任何写入只会进入沙箱暂存，"
+      .. "退出计划模式时自动丢弃。）"
+  end
   if instr ~= "" then prompt = prompt .. "\n\n" .. instr end
 
   -- 完成/失败的状态流转与回传由 GENERATION_COMPLETED/ERROR 事件驱动（见 _init）。
@@ -372,7 +621,22 @@ function M.send(id, content)
   if not entry then return false, "子 Agent 不存在: " .. tostring(id) end
   if type(content) ~= "string" or content == "" then return false, "message 必填" end
   local child = entry.agent_id and runtime.get(entry.agent_id) or nil
-  if not child then return false, "子 Agent 已销毁，无法发送消息" end
+  if not child then
+    if entry.pending_questions then
+      for _, qid in ipairs(entry.pending_questions) do
+        M.cancel_question(qid, "子 Agent 已销毁，提问作废")
+      end
+      entry.pending_questions = {}
+    end
+    return false, "子 Agent 已销毁，无法发送消息"
+  end
+  -- 统一对话通道：子 Agent 有在途提问时，本条消息就是回答（FIFO 取当前在途问题）。
+  local pq = entry.pending_questions
+  if pq and #pq > 0 then
+    local ok, err = M.answer_question(pq[1], content, entry.parent_agent_id)
+    if not ok then return false, err end
+    return true, nil, true
+  end
   -- 续跑：状态回到 running，便于状态栏/winbar 反映；完成由生成事件驱动。
   entry.status = "running"
   event_bus.emit(events.SUB_AGENT_UPDATED, { sub_agent_id = id, status = "running" })
@@ -450,6 +714,7 @@ end
 
 --- 复位（测试/插件卸载）
 function M.reset()
+  _settle_all_questions("子 Agent 管理器重置，提问作废")
   for _, u in ipairs(state.unsubs) do
     if u then pcall(u) end
   end
@@ -458,6 +723,7 @@ function M.reset()
   state.subs = {}
   state.order = {}
   state.by_agent = {}
+  state.questions = {}
   state.dispatch = nil
   state.persist = nil
 end

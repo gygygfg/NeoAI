@@ -99,7 +99,7 @@ tests.suite("status", function(_, it)
     t.eq("命中95.32%%", status.segment("cache"), "缓存命中率应为累计且两位小数")
   end)
 
-  it("命中段默认同时展示单次与会话累计", function(t)
+  it("命中段默认同时展示单次与总计累计", function(t)
     local chat = init_chat()
     local status = require("NeoAI.services.status")
     local agent = chat.new_session({})
@@ -109,7 +109,7 @@ tests.suite("status", function(_, it)
       last_prompt = 36143,
       last_cache_read = 35968,
     }
-    t.eq("命中99.52%%(会话94.55%%)", status.segment("cache"))
+    t.eq("命中99.52%%(总计94.55%%)", status.segment("cache"))
   end)
 
   it("缓存段 cache_mode 可控：latest 只显示单次，cumulative 只显示累计", function(t)
@@ -134,6 +134,124 @@ tests.suite("status", function(_, it)
     local agent = chat.new_session({})
     agent.usage = { requests = 3, cache_ratio = 0.9532 }
     t.eq("命中95.32%%", status.segment("cache"))
+  end)
+
+  it("usage/cache 聚合主会话与全部直接子 Agent 会话（实时 + 持久化）", function(t)
+    local chat = init_chat()
+    local status = require("NeoAI.services.status")
+    local store = require("NeoAI.core.session.session_store")
+    local runtime = require("NeoAI.core.agent.runtime")
+    local manager = require("NeoAI.core.agent.sub_agent")
+    manager.reset()
+
+    local main = chat.new_session({})
+    main.usage = {
+      prompt = 1000, completion = 100, requests = 1,
+      cache_read = 1000, prompt_total = 6000, prompt_cache_total = 1000,
+      cache_ratio = 1000 / 6000,
+      last_prompt = 1000, last_cache_read = 999, last_completion = 10,
+    }
+    main._last_usage_at = 1
+
+    -- 运行中的子 Agent（实时 usage，最新一次请求应压过主 Agent）
+    local live_sess = store.create({
+      parent_id = main.session_id,
+      name = "sub-live",
+      metadata = { tags = { "sub_agent" }, name = "sub-live" },
+    })
+    local child = runtime.spawn(main, { session_id = live_sess.id })
+    child.usage = {
+      prompt = 500, completion = 50, requests = 1,
+      cache_read = 1500, prompt_total = 2000, prompt_cache_total = 1500,
+      cache_ratio = 1500 / 2000,
+      last_prompt = 1000, last_cache_read = 500, last_completion = 5,
+    }
+    child._last_usage_at = 2
+    manager._inject_for_test("s-live", {
+      parent_agent_id = main.id, agent_id = child.id, session_id = live_sess.id,
+    })
+    -- 同一子会话的持久化数据不得与实时 usage 重复累加
+    live_sess.metadata.usage = {
+      prompt = 99999, completion = 99999, requests = 999,
+      cache_read = 99999, prompt_total = 99999, prompt_cache_total = 99999,
+    }
+
+    -- 已完成（或重开会话后）的子 Agent：取子会话持久化 metadata.usage
+    store.create({
+      parent_id = main.session_id,
+      name = "sub-hist",
+      metadata = {
+        tags = { "sub_agent" }, name = "sub-hist",
+        usage = {
+          prompt = 300, completion = 30, requests = 1,
+          cache_read = 500, prompt_total = 2000, prompt_cache_total = 500,
+          cache_ratio = 500 / 2000,
+        },
+      },
+    })
+    -- 用户 fork 分支下的子 Agent 不属于当前会话树，不得计入
+    local fork = store.create({ parent_id = main.session_id, name = "fork" })
+    store.create({
+      parent_id = fork.id,
+      name = "fork-sub",
+      metadata = {
+        tags = { "sub_agent" }, name = "fork-sub",
+        usage = { prompt = 77777, completion = 77777, requests = 99, prompt_total = 77777 },
+      },
+    })
+
+    local info = status.get_info()
+    t.eq(1800, info.usage.prompt, "输入应为主会话 + 运行中子 Agent + 历史子会话之和")
+    t.eq(180, info.usage.completion, "输出应聚合")
+    t.eq(3, info.usage.requests, "请求数应聚合")
+    t.eq(2, info.usage.sub_agent_sessions, "仅计入直接子 Agent 会话（实时 + 历史各一）")
+    -- 加权命中率 = (1000+1500+500)/(6000+2000+2000) = 30%，不是各 Agent 比率的平均
+    local ratio_ok = math.abs(info.usage.cache_ratio - 0.30) < 1e-6
+    t.true_(ratio_ok, "累计命中率应按 token 加权")
+    t.eq("↑1.8k ↓180", status.segment("usage"))
+    t.eq("命中50.00%%(总计30.00%%)", status.segment("cache"),
+      "单次取主/子中最新的请求，累计按整棵会话树加权")
+    manager.reset()
+  end)
+
+  it("单次命中率无请求序号时回退主 Agent；capacity 不随子 Agent 聚合", function(t)
+    local chat = init_chat()
+    local status = require("NeoAI.services.status")
+    local store = require("NeoAI.core.session.session_store")
+    local runtime = require("NeoAI.core.agent.runtime")
+    local manager = require("NeoAI.core.agent.sub_agent")
+    manager.reset()
+
+    local main = chat.new_session({})
+    main.model = "deepseek-v4-flash"
+    main.messages = {}
+    main.usage = {
+      prompt = 100, completion = 10, requests = 1,
+      cache_read = 400, prompt_total = 500, prompt_cache_total = 400,
+      cache_ratio = 400 / 500,
+      last_prompt = 1000, last_cache_read = 800,
+    }
+    local live_sess = store.create({
+      parent_id = main.session_id,
+      metadata = { tags = { "sub_agent" }, name = "sub" },
+    })
+    local child = runtime.spawn(main, { session_id = live_sess.id })
+    child.usage = {
+      prompt = 50, completion = 5, requests = 1,
+      cache_read = 50, prompt_total = 100, prompt_cache_total = 50,
+      cache_ratio = 0.5,
+      last_prompt = 1000, last_cache_read = 100,
+    }
+    manager._inject_for_test("s-noat", {
+      parent_agent_id = main.id, agent_id = child.id, session_id = live_sess.id,
+    })
+
+    -- 无 _last_usage_at：保留先加入的主 Agent 口径（80%），不被子 Agent 的 10% 覆盖
+    t.eq("命中80.00%%(总计75.00%%)", status.segment("cache"))
+    -- capacity 仍按主 Agent 的 last_prompt 计算（1000），不因聚合而改变
+    local cap = assert(status.capacity_for(main))
+    t.eq(1000, cap.used)
+    manager.reset()
   end)
 
   it("ui.statusline.enabled=false 时 component 为空", function(t)

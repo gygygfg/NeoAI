@@ -51,6 +51,40 @@ tests.suite("ask_user", function(_, it)
     ask.reset()
   end)
 
+  it("子 Agent 提问不弹窗：转交 manager.ask_parent，等待期间暂停计时器", function(t)
+    local ask = require("NeoAI.tools.builtin.ask_user")
+    local manager = require("NeoAI.core.agent.sub_agent")
+    ask.reset()
+    local orig = manager.ask_parent
+    local asked, timer_paused, timer_resumed = nil, 0, 0
+    ---@diagnostic disable-next-line: duplicate-set-field
+    manager.ask_parent = function(sub_id, req)
+      asked = { sub_id = sub_id, question = req.question, options = req.options }
+      -- 模拟主 Agent 直接回答
+      req.on_success("主 Agent 回答: 直接答")
+      return "sq_fake"
+    end
+    local tl = assert(find_tool("ask_user"))
+    local out = {}
+    local timer = {
+      pause = function() timer_paused = timer_paused + 1 end,
+      resume = function() timer_resumed = timer_resumed + 1 end,
+    }
+    tl.func(
+      { question = "子 Agent 的问题", options = { "A", "B" } },
+      function(m) out.msg = m end,
+      function(e) out.err = e end,
+      { agent = { id = "child" }, is_sub_agent = true, sub_agent_id = "sub_x", timer = timer })
+    t.not_nil(asked, "应转交 manager.ask_parent")
+    t.eq("sub_x", asked.sub_id)
+    t.eq("子 Agent 的问题", asked.question)
+    t.eq("主 Agent 回答: 直接答", out.msg, "主 Agent 的回答应作为工具结果")
+    t.eq(1, timer_paused)
+    t.eq(1, timer_resumed)
+    manager.ask_parent = orig
+    ask.reset()
+  end)
+
   it("同一轮多次 ask_user 合并为多 Tab，提交后各自回传答案", function(t)
     local ask = require("NeoAI.tools.builtin.ask_user")
     local async = require("NeoAI.utils.async")

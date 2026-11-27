@@ -335,6 +335,20 @@ local function _install_test_defaults()
     if uc.resources.pressure.enabled == nil then
       uc.resources.pressure.enabled = false
     end
+    -- 同上：自身内存看门狗只看**运行测试的宿主**当前 RSS，高占用机器上会在用例中途触发
+    -- 缓存回收/中止回合，产生不可复现的失败。专项用例（test_self_guard）显式开启并注入伪采样。
+    uc.resources.self_guard = uc.resources.self_guard or {}
+    if uc.resources.self_guard.enabled == nil then
+      uc.resources.self_guard.enabled = false
+    end
+    -- 启动时模型列表刷新会发起真实网络请求（curl），在没有外网的 CI 上会阻塞事件循环数秒，
+    -- 使依赖「短超时内完成」的异步用例随机超时（实测 edit_file 5s 窗口被打满）。测试必须
+    -- 离线可复现：默认关闭，专门用例可显式覆盖。
+    uc.ai = uc.ai or {}
+    uc.ai.model_refresh = uc.ai.model_refresh or {}
+    if uc.ai.model_refresh.on_startup == nil then
+      uc.ai.model_refresh.on_startup = false
+    end
     -- 测试默认同步后处理（进程命令结果在捕获/冻结/结算完成后返回），保持既有断言确定性；
     -- 异步后处理专项用例显式覆盖 tools.sandbox.postprocess="async" 并用 wrapper.await_postprocess 等待。
     if uc.tools.sandbox.postprocess == nil then

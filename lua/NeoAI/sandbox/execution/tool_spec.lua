@@ -90,6 +90,8 @@ local SPECS = {
   lsp_check = { effect = "process", read_only = true },
   lsp_rename = { effect = "fs_write" },
   lsp_format = { effect = "fs_write" },
+  -- 镜像 Neovim：在沙箱内起 headless 镜像执行 Lua/Ex；写入落 overlay 候选。
+  nvim = { effect = "process" },
   -- 长驻服务（service_*）：start/stop 为进程效果（门禁预检+脚本扫描+硬拒绝），但隔离与候选
   -- 结算由 sandbox.service 自建（见 wrapper 的 long_lived 分支）；logs/status 为只读。
   service_start = { effect = "process" },

@@ -38,6 +38,8 @@ function M.init()
   require("NeoAI.ui.lsp_guard").install()
   -- 焦点信号：跟踪「用户是否在看 NeoAI 界面」，供 pty/ask_user 延迟弹窗与审批窗刷新。
   _try_init("focus", function() require("NeoAI.ui.focus").install() end)
+  -- 沙箱待审改动 → 打开文件 buffer 的行内 diff（只读装饰）。
+  _try_init("pending_diff", function() require("NeoAI.ui.components.pending_diff").install() end)
   -- 注册审批 UI
   local approval_ui = require("NeoAI.ui.components.tool_approval")
   approval_ui.init()
@@ -110,6 +112,15 @@ end
 --- 聊天窗口状态
 function M.chat_status()
   chat_view.show_status()
+end
+
+--- 释放纯展示缓存（内存看门狗 soft/hard 时调用）。只回收**可重建**的渲染数据
+--- （树摘要、Markdown 记忆化、运行期结果伪消息缓存），绝不触碰会话/沙箱状态。
+function M.reclaim_memory()
+  pcall(function() require("NeoAI.ui.window.tree_view").reclaim_memory() end)
+  pcall(function() require("NeoAI.ui.components.markdown_view").reclaim_cache() end)
+  pcall(function() require("NeoAI.ui.components.message_list").reclaim_memory() end)
+  pcall(collectgarbage, "collect")
 end
 
 --- 打开沙箱待审审批界面（供 :NeoAI SandboxReview 命令经 services.ui 调用）
@@ -202,6 +213,7 @@ function M.reset()
   pcall(function() require("NeoAI.ui.geometry").reset() end)
   pcall(function() require("NeoAI.ui.lsp_guard").uninstall() end)
   pcall(function() require("NeoAI.ui.focus").uninstall() end)
+  pcall(function() require("NeoAI.ui.components.pending_diff").uninstall() end)
   pcall(function() require("NeoAI.ui.components.tool_approval").reset() end)
   pcall(function() require("NeoAI.ui.components.ask_user").reset() end)
   pcall(function() require("NeoAI.ui.components.secret_alert").reset() end)

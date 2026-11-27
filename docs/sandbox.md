@@ -163,6 +163,23 @@ LSP/treesitter 的写盘仍走各自既有的暂存路径（`persist_target` →
 > 命令前镜像已并入命令改动，故 AI 各读路径（`read_file` overlay / `list_files` 镜像）在同一
 > 工具边界一致。会话轮换的 whiteout 竞态见 `candidate.rotate_session`（`rotate_when_idle`）。
 
+#### 2.2.1 未保存 buffer → 视图基线（save-all 语义）
+
+AI 看到的世界 = **用户此刻对全部 buffer 执行 `:wall` 之后的世界**。`sandbox/execution/buffer_view.lua`
+在每个工具门禁入口（`wrapper._gate_inner`）同步当前 loaded+modified 的普通 buffer：
+
+- 内容写入沙箱视图（单视图 upper；旧布局回退暂存副本），登记 `view_base_hash` 为**基线**；
+- 基线一致的视图文件**不产生候选**（`candidate.finish` 跳过，含真实盘上不存在的新建未保存文件）；
+- 条目已有 AI/命令改动（`staged != seed_hash`）时绝不覆盖，只标记 `buffer_diverged`；
+- 用户 `:w` 后按基线规则撤销种子或前移 CAS 基线；发布成功后未再改动的 buffer 自动重载，
+  用户有新改动则告警不覆盖；
+- overlay 不可用时跳过（避免读工具看到 buffer、命令看到磁盘的分裂）。过滤 UI/后台 buffer、二进制、
+  非 UTF-8、conceal 路径与超限文件；`tools.sandbox.buffer_view` 控制开关与上限。
+
+读取侧无需特殊逻辑：`candidate.read_path`/`read_overrides`/`materialize_overlay` 天然包含这些条目，
+`run_command`/git/LSP 克隆因此看到同一份内容。用户编辑器 buffer 上由 `ui/components/pending_diff.lua`
+（`ui.pending_diff`、`:NeoAI diff`）显示 AI 待审增量。
+
 ### 2.2 单视图模型（三视图，`tools.sandbox.single_view`，默认开）
 
 旧模型有**两份可写数据**（工作区暂存副本 + overlay upper），每条命令前把暂存物化进 upper、
@@ -175,7 +192,7 @@ LSP/treesitter 的写盘仍走各自既有的暂存路径（`persist_target` →
 | --- | --- | --- |
 | 真实盘 | 宿主文件（只读 lower） | 发布的唯一落点 |
 | 沙箱合并视图 | `<沙箱暂存基>/view/<root>/upper`（= 暂存） | 命令/只读工具/LSP 共用同一份；AI 未发布改动即视图内容 |
-| 候选 | 只存 `{path, action, hash, mode, base_hash}` | 审批展示/发布时按需从视图读取内容 |
+| 候选 | 只存 `{path, action, hash, blob, mode, base_hash}` | 审批展示/发布时按需从 blob 读取内容 |
 
 不变量：
 
@@ -192,6 +209,21 @@ LSP/treesitter 的写盘仍走各自既有的暂存路径（`persist_target` →
   动辄数万文件把冻结/JSON 编码拖爆。
 - **写盘仍由审批控制**：视图内写入不是真实盘；发布（`publish`）才写真实文件，并保留原权限位
   与 mtime（修「`chmod +x` 后发布被抹成 0644」「构建工具认为源文件未变」）。
+- **候选内容不驻留内存**（`tools.sandbox.inline_candidate_bytes = 0`，默认）：暂存文件按
+  「同盘复制」写成候选 blob（`uv.fs_copyfile`，内核复制，不读 Lua），候选 JSON 只存元数据；
+  哈希在 worker 线程内读一次（≤ `max_file_bytes`）后即释放，不回传主进程。物化对未 token 化
+  的条目走 `copy_file` + 原子 `rename`，只有被密钥 token 化的文本才读出还原真实内容。发布
+  时才从 blob 读（受单文件上限约束），大文件走 `writer.apply_file` 复制。
+  > 教训：2026-11-27 宿主 nvim 以 `anon-rss 27.2 GB + swap 4.4 GB` 被内核 OOM `SIGKILL`。
+  > 现场是 65 轮工具循环，每轮把 8k+ 个暂存文件（其中 5 GB 来自工作区外的
+  > `~/.cache/sdw-cargo-target` 构建产物）的内容读进 Lua 组装候选。此后 `non_capture_paths`
+  > 默认含 `~/.cache`，且 `generated_dirs` 额外按**任意层** `*target` 分量命中。
+- **输出与自身内存有硬上限**：常驻命令（`resident`）的单命令输出块、未解析帧缓冲、服务器
+  噪声都有上限（超限截断并终止命令）；`kernel/self_guard` 的 RSS 看门狗 soft 回收 / hard
+  中止当前回合，是「不被内核 OOM 杀」的最后一道保命线。
+- **沙箱存储是缓存**：全部位于 `stdpath("cache")/NeoAI/sandbox`；启动回收死进程实例
+  （候选/blob/视图随进程失效），进程退出（`VimLeavePre`，非热重载）删除本进程实例目录；
+  `:NeoAI SandboxGC` 仍可手动清理。
 
 缓存目录（`~/.gradle/caches`、`~/.m2/repository`、`~/.cargo/registry`、`~/.npm/_cacache` 等）
 默认不捕获；沙箱内对它们的写入仍落在会话视图里（**绝不直接写宿主**）。离线构建依赖宿主已
@@ -770,7 +802,10 @@ token（`NEOKEY_…`）或格式保真假密钥时**拒绝写盘**（`SECRET_TOK
     `merge_conflict`；审批界面标注「⚠ 合并冲突」，按 **`R`** 把冲突交给 AI
     （`review.notify_conflict_ai` 注入一条说明消息），AI 重新读取已含外部改动的真实文件后重做，
     新候选经 `supersede_by_paths` 取代旧单元后正常应用；
-  - 外部内容已是候选结果 → 幂等跳过；
+  - 外部内容已是候选结果 → 幂等跳过。判定同时看 `after_hash` 与**候选内容本身**（`ours == theirs`），
+    因此 `after_hash` 为 stat 签名/缺失（大文件、包内容、历史候选）时同样收敛：同一改动已由另一
+    单元落盘不会再被误报成「三方合并失败」；
+  - 空基线（冻结时真实文件为空）同样捕获 merge base——空内容是合法基线，不等于「读取失败」；
   - 仅普通文本 `modify` 文件参与（`merge_max_bytes` 上限，默认沿用 `max_file_bytes`）；
     二进制/大文件/软链/目录创建删除/git 原子组仍走严格 CAS。`merge=false` 回退「基线变了即整体拒绝」。
 - **发布前重校验（纵深防御）**：`candidate.publish` 对每个文件重新规范化路径——**解析祖先**符号
@@ -779,10 +814,18 @@ token（`NEOKEY_…`）或格式保真假密钥时**拒绝写盘**（`SECRET_TOK
   （如 `uv sync` 生成的 `.venv/bin/python`）不会因解析到 uv 的 Python 安装目录而误报整个变更单元。
   命中宿主敏感遮蔽路径（`is_masked_path`，仍完整解析并跟随叶子软链）→ `FAILED/SANDBOX_MASKED_TARGET`。
   候选内容即便被本地进程改写也无法写出到未经验证的真实位置。
+  **永久性拒绝不自动重试**：上述硬闸门（`SANDBOX_MASKED_TARGET` / `SANDBOX_SELF_TARGET` /
+  `SANDBOX_RETIRED_TARGET` / `SANDBOX_RETIRE_UNSAFE_ROOT` / `INVALID_PATH` / `PATH_CHANGED` /
+  `GIT_REFERENTIAL_INTEGRITY`）一旦命中，自动批准的瞬时状态**不回退**为待审——条目保持
+  `FAILED` + 原因可见，用户可显式拒绝；否则下一次自动/批量应用会立刻重试同一个必然失败的门禁，
+  表现为「应用失败(FAILED): SANDBOX_MASKED_TARGET: …」反复刷屏（实测每次 retry 都会再弹一次）。
 - **冻结时剔除不可发布文件**：`candidate.finish` 在生成候选前剔除多类文件，避免个别文件
   让**整个**变更单元发布失败（如包安装因 apt 索引基线变化而整体回滚）：
-  1. **有效遮蔽路径**——按本次 attempt 的 `effective_unmask`（档位提权 + 审批放行 + 可写根）
-     判定 `is_masked_path`，命中即剔除（与运行时挂载遮蔽一致；被 unmask 放行的路径保留）；
+  1. **有效遮蔽路径**——按 `is_masked_path`（**不带 unmask**）判定，命中即剔除。执行期的解除遮蔽
+     （`effective_unmask`：档位提权 + 审批放行 + 可写根）只决定「沙箱内能否写」，**不等于可发布**：
+     发布阶段对遮蔽目标一律硬拒绝。二者若不区分，包安装把 `/etc` 列为可写根时会放行
+     `/etc/shadow`、`/etc/ld.so.preload` 一类文件进入候选，而发布阶段必然拒绝 → 整单元反复
+     「应用失败」。硬遮蔽的 unmask 只认**同一路径**的精确条目（见下条「遮蔽语义」）；
   2. **易变包索引/缓存**——`tools.sandbox.packages.volatile_paths`（默认含 `/var/lib/apt/lists`、
      `/var/cache/apt` 等），仅对包安装候选生效。这些文件由包管理器随时重新生成，应用时基线
      往往已变化，会触发 `CONFLICT/BASELINE_CHANGED`；剔除不影响安装效果
@@ -1720,6 +1763,15 @@ seccomp（含设备节点屏障）**——沙箱内进程看到的是一份「�
   `/etc/fstab`（宿主磁盘布局/根文件系统 UUID，且会让 `mount -o remount,rw /` 按宿主 UUID
   解析并失败，见下）、`/var/log`、`/var/spool/cron` 及 root 命令历史等读取面泄露项。
   遮蔽挂载置于各可写根 overlay 之后，确保覆盖生效。
+  **遮蔽语义（硬遮蔽 vs 目录遮蔽）**：`mask_paths` 属**硬遮蔽**，只接受**同一路径**的精确
+  `unmask`（如档位对 `/etc/shadow` 的逐条放行）；**父目录级放行不连带解除**——可写根（包安装的
+  `/etc`）或审批放行某个父目录，都不会让 `/etc/shadow`、`/etc/sudoers`、`/etc/ld.so.preload`
+  一并失去遮蔽（既避免放宽读取面，也避免产出发布阶段必被拒的候选）。`mask_dirs`（遮蔽目录）仍按
+  **祖先语义**解除：批准/放行某目录即放行其子树。
+  **强制遮蔽项**（`ALWAYS_MASK_PATHS`，如 `/etc/ld.so.preload`）：宿主通常不存在，但**只要其父目录
+  在本次挂载中可写**（整机根 overlay 或任一次级可写根，如包安装把 `/etc` 作为可写 overlay），
+  就以 `--bind /dev/null` 强制遮蔽——否则载荷能在会话内创建它，使后续每个动态链接进程加载任意
+  库（沙箱内代码注入原语）。只读父目录下不添加（bwrap 无法创建挂载点）。
   故 `mount`/`/proc/mounts`/`findmnt` 在沙箱内一致显示 **overlay/tmpfs** 根，`mount -o
   remount,rw /` 返回内核 `EPERM`（不再出现「ext4 根/宿主 UUID」这一源自宿主 fstab 的矛盾）。
   进程内 `read`/`fs_write` 工具不经 namespace，mount 遮蔽对其无效；执行器对路径参数额外
@@ -1948,6 +2000,9 @@ seccomp（含设备节点屏障）**——沙箱内进程看到的是一份「�
     `isolation_fail_closed`（默认 true）断网，或显式降级共享 netns 并告警。
   - 例外：容器会话（rootless dockerd/podman）与 LSP 子进程不套用隔离（前者需要自身网络栈，
     后者常需 provider 网络）；非 HTTP 协议（数据库/SSH/裸 UDP）默认不可用。
+  - **常驻实例（resident）的代理变量必须指向沙箱内 `127.0.0.1:3128`**（会话内 socat），
+    不能指向宿主 `host_proxy` 端口：私有 netns 内宿主回环不可达，第二个命令会 `curl: (7)`。
+    `_resident_env` 在启动常驻实例前确保 netns 就绪并按 `net_isolated=true` 生成 env；容器/离线档案除外。
 - **仅 `network.isolation="off"`（旧共享 netns）时**下列应用层边界才成立：不认代理的裸 TCP
   （`nc`/`ssh`/数据库客户端）可直连宿主本机。默认模式已用私有 netns 从内核层阻断；
   隔离不可用时按 `isolation_fail_closed`（默认 true）断网，或显式降级共享 netns 并告警。
@@ -3234,6 +3289,24 @@ L2+ 与包/密钥仍进入待审。目的是即便仅靠本地模型的智能水
 - **定位固定开销**：`tools.sandbox.diagnostics.enabled = true` 后，日志记录
   `[sandbox-profile] gate:<tool>` 端到端耗时与 `settle`（风险分级/入队/发布）耗时，用于区分
   执行慢还是冻结/结算慢。
+
+### 18.9 计划模式草稿（不进审批、退出丢弃）
+
+`tools.approval.mode="async"` 且隔离可用时，计划模式不再靠工具白名单做只读，而是把写入结算为
+**草稿**（`sandbox/execution/plan_draft.lua`）：
+
+- 草稿**不写候选 JSON、不入 review 队列、强制 auto=false**（即使会话自动审批/包安装放行也不发布）；
+  `:NeoAI SandboxCommit` 无法提交草稿，状态栏与审批界面不显示草稿条目。
+- 目标路径写入视图/暂存；退出计划模式（或 scope owner 销毁 / 沙箱重置）时 `plan_draft.discard`：
+  按登记时的视图签名比对，**只撤销计划模式自己的改动**；路径若原本已有待审项，则把旧待审内容
+  恢复回视图（不丢用户改动），原本干净的路径恢复真实盘。
+- 子 Agent 继承父 `_plan_scope_id`，写入同样是草稿，随父 scope 一起丢弃。
+- **能力上限**：草稿模式不提供 SSH/主机提权/长驻服务/`nvim` 编辑器控制/未标记 `plan_safe` 的 MCP 与未知类别外部工具；
+  命令提权到 tier≥2 在执行前硬拒绝（`PLAN_MODE_CAPABILITY_DENIED`）。
+- 已知瞬态：草稿期间同一路径的审批界面仍显示旧待审内容，而 buffer diff 显示草稿；退出后恢复一致。
+- `generated_dirs` / `non_capture_paths` 中的路径不进入捕获，也不在 `attempt.mapping` 中；
+  计划模式若执行了构建类命令，其视图残留可能保留到进程结束/`sandbox.reset`（策略要求计划模式不执行修复，
+  通常不会触发）。
 
 ## 19. 已知边界与残余风险（审计分级）
 

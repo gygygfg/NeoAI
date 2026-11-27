@@ -152,6 +152,10 @@ instance); the module table at the end is the **instance manager**:
 
 After the agent completes/errors/aborts, the input box is auto-focused and insert mode entered **only when the current window is the chat message area, still shows the chat buffer, and is in Normal mode** (and the editor itself has focus). When the cursor is in an approval/pty/ask_user float, another chat instance, or an ordinary file window — or already in the input box / a non-Normal mode — focus is not stolen and insert mode is not forced.
 
+**No jump while asynchronous results are still awaited**: when the main agent's turn has ended but it is still **waiting for sub-agents** (`create_sub_agent`/`send_sub_agent_message` return immediately while the child keeps running) or **waiting for background tool results** (a tool batch was detached to the background because a new message arrived), the cursor is not moved back to the input box and insert mode is not entered — those results arrive and resume the main agent, so stealing focus would just drop the user into insert mode right before the next wave of output. The check is `chat_service.has_pending_work_for_agent` (turn still running / queued messages) plus `chat_service.awaiting_async_results_for_agent` (running sub-agents / outstanding background tools); the focus action only runs when both are false.
+
+**Any way of entering insert mode jumps to the input box**: the chat message buffer has an `InsertEnter` guard — pressing `i/a/I/A/o/O/c/C/s/S` etc. (or plugin `feedkeys`) in the message area automatically focuses the input box and enters insert mode there, so nothing is written into the read-only message buffer. The input box's own `InsertEnter` does not hit this guard (different buffer), so there is no recursion.
+
 ### 4.1 Layout
 
 Main message area (top, `expr` folds) + input area (bottom). In `tab`/`split` modes the input area is a
@@ -544,9 +548,9 @@ so the user can still read/edit/remove a reference instead of having a wall of t
 
 | Placeholder | Expands to |
 | --- | --- |
-| `#{buffers}` | All buffers (number / loaded state / type / path) |
-| `#{buffer:NAME}` | Content of the named buffer (matched by name or file name; all matches concatenated) |
-| `#{lsp}` | LSP diagnostics of the context buffer (`file:line:col [level] message`); the context buffer is recorded by `chat_view` before focusing the input box (NeoAI-internal buffers excluded) |
+| `#{buffers}` | All buffers (number / loaded state / type / path, `[+]` = unsaved changes) |
+| `#{buffer}` / `#{buffer:NAME}` | **Buffer object reference** (bufnr/path/filetype/loaded/modified/line count/changedtick/cursor), **content is never inlined**; when the AI calls the `nvim` tool with `buffer_ids=[id]`, that object is loaded verbatim into the sandboxed mirror Neovim and read there |
+| `#{lsp}` / `#{lsp:NAME}` | **The user's own LSP info** for that buffer: user clients (AI sandbox clones / plain fallback excluded), key capabilities, diagnostic counts + the first N messages (`ui.input_box.hash_completion.lsp_max_messages`, default 30); no buffer object, no content |
 | `#{message}` / `#{notify}` | Neovim message history since startup (same as `:messages`), capped at `ui.input_box.hash_completion.max_chars` (**counted in characters**, CJK never cut in half) |
 | `#{tool}` / `#{tool:NAME}` | Tool list / a single tool definition (name, description, parameter schema) |
 | `#{skills}` / `#{skills:NAME}` | Skill list / a single skill body |
@@ -561,10 +565,30 @@ Implementation notes:
 - **Safe degradation**: unknown keys or missing buffers/skills/tools keep the placeholder **as-is** (never throws,
   never yields an empty string), so sending is never interrupted; every expansion goes through
   `utils/stringx.safe_truncate` for UTF-8 safe truncation.
-- **Config**: `ui.input_box.hash_completion = { enabled=true, max_chars=2000, max_bytes=20000 }`; `enabled=false`
-  is a no-op (no completefunc / cmp source / autocmds).
+- **Config**: `ui.input_box.hash_completion = { enabled=true, max_chars=2000, max_bytes=20000, lsp_max_messages=30 }`;
+  `enabled=false` is a no-op (no completefunc / cmp source / autocmds).
+- **No inlined content**: `#{buffer}`/`#{lsp}` only hand over objects and metadata; live content and semantic
+  queries are fetched by the AI through the `nvim` tool (Lua/Ex inside the sandbox mirror) and `lsp_*` tools,
+  so context never carries stale or oversized snapshots.
 
-### 4.9.2 Command hints (ui/command_hint.lua)
+### 4.9.2 Pending sandbox changes → in-buffer diff
+
+`ui/components/pending_diff.lua` (enabled by default, `ui.pending_diff`) decorates a user-opened file buffer with
+the sandbox's pending changes, **read-only**:
+
+- Detection: `candidate.pending_content(path)` only reports real AI/command deltas. The user's own unsaved input
+  (the save-all baseline) is never shown as a diff; sandbox-created files appear as added lines and sandbox
+  deletions show a "pending delete" banner.
+- Rendering: changed lines get `DiffChange` + sign `~`; deleted lines get `DiffDelete` + sign `-`; pure additions
+  are previewed with `virt_lines` (`virtual_added_lines`, default 20). Files over `max_bytes` only get a notice.
+- Refresh: `BufReadPost`/`BufNewFile`/`BufEnter`/`BufWinEnter` plus `TextChanged*`/`BufWritePost`
+  (debounced by `debounce_ms`, default 200ms) and sandbox tool/review events. `auto=false` disables automatic
+  decoration; `:NeoAI diff` still opens the full comparison (read-only split + `diffthis`).
+- Lifecycle: `install()` registers the augroup/subscriptions; `uninstall()` removes everything. It never edits
+  the buffer or writes to disk.
+- Config: `ui.pending_diff = { enabled=true, max_bytes=1048576, debounce_ms=200, virtual_added_lines=20, auto=true }`.
+
+### 4.9.3 Command hints (ui/command_hint.lua)
 
 `:NeoAI` is a single aggregated command (sub-commands are space separated, e.g. `:NeoAI Open`,
 `:NeoAI SandboxReview`). Neovim's `complete=customlist` **only accepts plain string candidates** (the `menu` field of
@@ -606,7 +630,7 @@ Following deepseek-harness's Cordis plugin model, the chat view's "display modes
 | `model_picker` | Model picker (asynchronously loads the model list). `open(callback)`. |
 | `tool_approval` | Tool approval popup. `init()`; serial single-slot display. **Focus gating is app-level** (`focus.gate_app`): it pops **immediately** whenever nvim has OS focus, not deferring because the current window is not a NeoAI UI (approval / net consent / questions are interactions the agent blocks on; deferring leads to a silent deny on timeout); it stages only while nvim is unfocused and pops again on refocus. Same for `net_consent`. The four **blocking** popups (`net_consent` / `device_consent` / `policy_consent` / `secret_alert`) additionally share the **single slot** of `ui/consent_slot`: mutually exclusive across components, at most one shown at a time, the rest queueing; every request holds a **ticket** (returned by `show`; `hide(ticket)`/`is_open(ticket)` are ticket-scoped), so one request timing out only closes its own window. When a window is closed externally (`WinClosed` / `:q` / `<C-w>c`) the request is settled with a **safe default** (secret → stop the agent, others → deny) and its approval-center mirror entry is cleared — otherwise that request's decision callback would be lost forever and the entry would stay pending, pinning the Herder pane at `blocked`. |
 | `ask_user` | User questioning popup. `init()`; injected via `ask_user.set_ui`. Multiple questions in the same round are aggregated into a single multi-tab window (tab bar marks answered with `✓/○`, current tab reverse-highlighted, rightmost "Confirm" tab), `multi_select` questions render as checkboxes; **a single single-select question submits on selection** and **a single-select answer in a multi-question batch auto-advances to the next tab (last question → confirm tab; multi-select does not advance)**, multi-select/multi-question batches confirm on the rightmost confirm tab (`y`/`<CR>` submits, `h`/`←` returns to editing, `Esc` cancels the whole batch; see `ui.ask_user.*` config). **Focus gating is app-level** (`focus.gate_app`): it pops **immediately** whenever nvim has OS focus, not deferring because the current window is not a NeoAI UI (ask_user is the interaction the agent is blocking on); it stages only while nvim is unfocused (`FocusLost`) and pops again on `FocusGained`/`VimResume`. |
-| `sub_agent_dock` | Sub-agent status monitoring. `init()`. The winbar identity row also shows sub-agent names (collapsed to `N个子agent正在运行` when wider than the window, see `services/status.sub_agents_segment`); `keymaps.chat.switch_sub_agent` (default `<leader>as`) opens a sub-agent session in a new window. |
+| `sub_agent_dock` | Sub-agent status monitoring. `init()`. The winbar identity row also shows sub-agent names (collapsed to `N个子agent正在运行` when wider than the window, see `services/status.sub_agents_segment`); `keymaps.chat.switch_sub_agent` (default `<leader>as`) opens a sub-agent session in a new window. Sub-agent questions (`sub_agent_question`) render in the main chat as a `❓ 子 Agent 提问: <name>` fold block and are not counted as a user turn. |
 | `sub_agent_list` | Sub-agent list popup (borderless float, top-centered relative to the chat main window, toggled by `<leader>al`). `↑/↓`(k/j) move, `<CR>` enters the session, `q`/`<Esc>` closes; recomputes geometry on window resize. `open`/`close`/`toggle`/`is_open`/`reset`. |
 | `terminal_window` | Floating **interactive** terminal for interactive commands (`nvim_open_term` rendering; typing when focused is forwarded to the command). Opens per session id; **pops only when the chat cursor is following** (`show_window` controls timing: always = at session start / on_wait = only after the command has been running longer than `show_window_delay_ms` (default 2000ms) without finishing, so a fast command never flashes a window), and hides / re-pops on follow flips via `UI_FOLLOW_CHANGED` (see `services.pty`; each open renders a fresh `nvim_open_term` channel, so accumulated output is replayed on open to avoid a blank window); no-op in headless. Driven by `services.pty`. |
 | `sandbox_review` | Sandbox pending-review UI. `open()` (**opens even with no pending / approval / trace items, showing an empty view — no notice and no auto-close**; refreshing into an empty queue keeps the window open and new items are picked up by the event subscription); highlights by path level (workspace green / user yellow / system red) and shows high/medium/low risk grades; items are sectioned into **unapplied (pending)** and **applied (snapshotted, revertible)**. Per-file approval: `<CR>` applies the file under the cursor, `A` approves every workspace change in one key (files outside the workspace and host-operation proposals stay pending; yields to the main loop between items, shows progress in the title, and refuses re-entry while running), `d` rejects only that file, `i` opens that item's diff preview (returns with cursor restored), `u` undoes/redoes the save, `q` closes; on an **outside-access trace** row `i` opens the access detail (summary of tools/source/command count/first-last time, then per-access tool/kind/command/time), and on an **outside-command** row `i` opens the command detail (files that command accessed out of bounds); while open the window subscribes to sandbox broadcast events and refreshes automatically (multiple events in the same tick are coalesced). The applied section is collapsed by default (two-level fold); **a pending item shows its header line with the rest folded and can be expanded with `za`/`zo`** (header keeps the whole-unit approval entry and highlight), while the trace section does not fold. High-risk items (L3, and L2 package/sensitive installs when `package_confirm` is on) require an AI consequence warning plus a second `<CR>` in the diff. The **Network Requests** page additionally shows a **session-allowed (revocable, `d`)** section and a **history (record only: once / denied / revoked)** section. A session allowance is recorded synchronously inside the decision and broadcasts `sandbox:approval_changed{page="network"}`, so a redraw never sees an empty allowance list. Applied rows whose original file exceeds the undo-snapshot cap (`tools.sandbox.review.snapshot_max_bytes`, default 64MB) are marked up front with `⚠ cannot undo: <file> <size> exceeds the snapshot cap`, and `u` emits a single deduplicated WARN instead of repeated ERRORs. |

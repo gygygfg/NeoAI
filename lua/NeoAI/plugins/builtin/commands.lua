@@ -384,6 +384,13 @@ local SUBCOMMANDS = {
     end,
   },
   {
+    name = "Diff",
+    desc = "查看当前 buffer 与沙箱待审内容的完整 diff",
+    handler = function()
+      require("NeoAI.ui.components.pending_diff").open()
+    end,
+  },
+  {
     name = "SandboxList",
     desc = "列出沙箱待处理候选",
     handler = function()
@@ -998,6 +1005,40 @@ local SUBCOMMANDS = {
     desc = "NeoAI 环境诊断（等同 :checkhealth NeoAI 的摘要）",
     handler = function()
       require("NeoAI.health").doctor()
+    end,
+  },
+  {
+    name = "Recover",
+    desc = "崩溃恢复：重置进程熔断、回收残留沙箱存储、重开被中断的会话",
+    handler = function()
+      local lines = {}
+      -- 1) 复位熔断并尝试拉起受管子进程（worker / 常驻沙箱服务器）
+      pcall(function()
+        local sup = require("NeoAI.kernel.supervisor")
+        sup.reset_breaker()
+        local st = sup.status()
+        sup.ensure("worker")
+        lines[#lines + 1] = "进程: " .. sup.describe()
+        local _ = st
+      end)
+      -- 2) 恢复检测 + 回收死进程沙箱存储
+      local ok_rec, rec = pcall(require, "NeoAI.core.session.recovery")
+      if not ok_rec then
+        vim.notify("[NeoAI] 恢复模块不可用", vim.log.levels.WARN)
+        return
+      end
+      local res = rec.recover({ reclaim = true, notify = false })
+      local sessions = (res and res.sessions) or {}
+      if #sessions == 0 then sessions = rec.interrupted_sessions(nil, {}) end
+      lines[#lines + 1] = ("不干净退出=%s，中断会话=%d，沙箱回收=%s"):format(
+        tostring(res and res.unclean == true), #sessions, tostring(res and res.reclaimed == true))
+      -- 3) 重开最近一个被中断的会话（其余可在 :NeoAI Tree 中查看）
+      local ui = _svc("services.ui")
+      if ui and #sessions > 0 and sessions[1] and sessions[1].id then
+        pcall(ui.open_chat, { session_id = sessions[1].id })
+        lines[#lines + 1] = "已重开会话: " .. tostring(sessions[1].title or sessions[1].id)
+      end
+      vim.notify("[NeoAI] 崩溃恢复:\n" .. table.concat(lines, "\n"), vim.log.levels.INFO)
     end,
   },
 }

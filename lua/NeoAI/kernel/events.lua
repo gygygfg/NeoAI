@@ -105,6 +105,8 @@ M.SUB_AGENT_UPDATED = "sub_agent:updated"
 M.SUB_AGENT_COMPLETED = "sub_agent:completed"
 M.SUB_AGENT_ERROR = "sub_agent:error"
 M.SUB_AGENT_RESULT_READY = "sub_agent:result_ready"
+M.SUB_AGENT_QUESTION = "sub_agent:question"
+M.SUB_AGENT_QUESTION_ANSWERED = "sub_agent:question_answered"
 
 -- ========== 配置 / 生命周期 ==========
 M.CONFIG_LOADED = "config:loaded"
@@ -280,5 +282,27 @@ M.PLAN_DISTILLED = "plan_distilled"
 -- 语义：等级只影响「非必要开销」（观测探针、预热、并行度、渲染/轮询节流），
 -- **绝不影响安全强制层**（seccomp 基线 / eBPF 行为兜底 / 权限档位）。
 M.RESOURCE_PRESSURE = "resource:pressure"
+
+-- ========== 自身内存看门狗 / 进程总管理 / 任务分发 ==========
+-- 本 nvim 进程自身内存等级变化（ok → soft → hard 及回落）。
+-- payload={level="ok"|"soft"|"hard", prev=..., rss_bytes=..., peak_bytes=..., lua_kb=...,
+--          actions={"reclaim","gc","abort"}}。
+-- 语义：hard 表示「回收 + GC 后仍超限」，已注册的中止器会结束当前回合；
+-- 绝不主动退出 nvim，也不影响沙箱安全强制层。
+M.SELF_GUARD = "resource:self_guard"
+
+-- 受管子进程状态变化（supervisor）。
+-- payload={id=..., kind=..., state="stopped"|"starting"|"running"|"crashed"|"restarting"|"failed",
+--          prev=..., restarts=..., crashes=..., reason=..., breaker_open=bool}。
+M.PROCESS_STATE = "process:state"
+
+-- 任务分发状态变化（dispatch）。
+-- payload={id=..., kind=..., lane="interactive"|"background", state="queued"|"running"|
+--          "completed"|"failed"|"timeout"|"cancelled", error=...}。
+M.TASK_STATE = "task:state"
+
+-- 会话崩溃恢复（不干净退出后的自动补救）。
+-- payload={sessions={...}, auto_opened=n, reclaimed=bool, unclean=true, prev_pid=...}。
+M.SESSION_RECOVERED = "session:recovered"
 
 return M

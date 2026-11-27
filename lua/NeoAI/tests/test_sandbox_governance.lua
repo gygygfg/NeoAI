@@ -832,7 +832,8 @@ tests.suite("sandbox_governance", function(_, it)
         t.true_(false, "不应失败: " .. tostring(e and e.message or e))
         done = true
       end)
-      t.true_(vim.wait(5000, function() return done end), "edit_file 应完成")
+      -- 首次文件写入可能触发常驻沙箱启动（本机/容器环境下可 >5s），等待只用于断言完成。
+      t.true_(vim.wait(20000, function() return done end), "edit_file 应完成")
     end)
     vim.fn.chdir(prev)
     vim.fn.delete(dir, "rf")
@@ -960,6 +961,41 @@ tests.suite("sandbox_governance", function(_, it)
       t.true_(vim.wait(15000, function() return done end), "run_command 应完成")
     end)
     pcall(vim.uv.fs_close, fd)
+    vim.fn.delete(dir, "rf")
+  end)
+
+  it("冻结：可写根解除遮蔽不得把遮蔽目标放进候选（发布必被拒）", function(t)
+    local fs = require("NeoAI.utils.fs")
+    local sandbox = require("NeoAI.sandbox")
+    local candidate = require("NeoAI.sandbox.execution.candidate")
+    local control = require("NeoAI.sandbox.execution.control")
+    local store = require("NeoAI.sandbox.state.store")
+    local dir = fs.canonical(vim.fn.tempname())
+    fs.ensure_dir(dir)
+    local masked = dir .. "/ld.so.preload"
+    fs.write_file(masked, "")
+    with_config({ tools = { sandbox = {
+      workspace_root = vim.fn.tempname() .. "/sb",
+      mask_paths = { masked },
+    } } }, function()
+      sandbox.reset()
+      local a = control.new_attempt("run_command", {}, {}, { effect = "process" })
+      -- 等价于包安装把 `/etc` 级别目录列为可写根（父目录），外加档位对单文件的精确放行：
+      -- 两者都只影响「沙箱内能否写」，**不**影响可发布性。
+      a.effective_unmask = { dir, masked }
+      candidate.begin(a, assert(store.root()))
+      local staged = candidate.stage_path(a.attempt_id, masked)
+      t.not_nil(staged, "应有暂存路径")
+      fs.write_file(staged, "PRELOAD=/tmp/evil.so\n")
+      local cand = candidate.finish(a.attempt_id)
+      t.not_nil(cand, "应冻结出候选")
+      for _, f in ipairs(cand.files or {}) do
+        t.ne(masked, f.path, "遮蔽目标不应进入候选（否则发布阶段永远失败）")
+      end
+      t.true_((cand.dropped and (cand.dropped.masked or 0) > 0) == true, "应计入遮蔽剔除")
+      candidate.cleanup(a.attempt_id)
+    end)
+    sandbox.reset()
     vim.fn.delete(dir, "rf")
   end)
 end)

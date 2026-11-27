@@ -872,7 +872,30 @@ local function _canonical(path)
   return fs.canonical(path)
 end
 
+--- 某遮蔽条目是否被 `unmask` **精确**解除（同一路径，含规范形式）。
+--- 硬遮蔽（`tools.sandbox.mask_paths`）只认这种「逐条」解除：可写根/父目录放行（如包安装把
+--- `/etc` 列为可写根、审批放行某个父目录）绝不连带解除其下的遮蔽条目——否则
+--- `/etc/shadow`、`/etc/sudoers`、`/etc/ld.so.preload` 会被一并放开，既违背「敏感条目仍遮蔽」，
+--- 也会产出发布阶段必然被拒（`SANDBOX_MASKED_TARGET`）的候选，表现为反复「应用失败」。
+--- @param unmask table|nil
+--- @param path string 遮蔽条目
+--- @param canon string|nil 遮蔽条目的规范形式
+--- @return boolean
+local function _unmasked_exact(unmask, path, canon)
+  if type(unmask) ~= "table" or type(path) ~= "string" or path == "" then return false end
+  for _, u in ipairs(unmask) do
+    if type(u) == "string" and u ~= "" then
+      u = u:gsub("/+$", "")
+      if u ~= "" and (path == u or (type(canon) == "string" and canon ~= "" and canon == u)) then
+        return true
+      end
+    end
+  end
+  return false
+end
+
 --- 某路径是否被 unmask 条目覆盖（精确或祖先命中），与 `_masked_paths` 的 `unmasked()` 语义一致。
+--- **仅用于目录遮蔽（mask_dirs）**：批准/放行某个目录即放行其子树。硬遮蔽用 `_unmasked_exact`。
 --- @param unmask table|nil 解除遮蔽的路径数组（档位提权 / 审批放行）
 --- @param path string 待判定的路径（通常是遮蔽条目本身）
 --- @return boolean
@@ -1947,16 +1970,28 @@ local function _masked_paths(unmask, cwd, dac_override)
       end
     end
   end
-  --- 是否被 unmask 覆盖（精确或祖先命中）
+  --- 是否被 unmask 覆盖（祖先命中）：仅用于目录遮蔽（mask_dirs）。
   local function unmasked(p)
     if skip[p] then return true end
     for _, u in ipairs(skip_list) do if _under(p, u) then return true end end
     return false
   end
-  local function add(p, force)
+  --- 硬遮蔽只认「同一路径」的精确解除（可写根/父目录放行不连带解除）。
+  local function unmasked_exact(p)
+    local canon = _canonical(p)
+    for _, u in ipairs(skip_list) do
+      if p == u or (type(canon) == "string" and canon ~= "" and canon == u) then return true end
+    end
+    return false
+  end
+  local function add(p, force, exact)
     if type(p) ~= "string" or p == "" or p == "/" then return end
     p = p:gsub("/+$", "")
-    if seen[p] or (not force and unmasked(p)) then return end
+    if seen[p] then return end
+    if not force then
+      if exact and unmasked_exact(p) then return end
+      if not exact and unmasked(p) then return end
+    end
     if skip_unreachable and not _payload_can_traverse(p, dac_override) then return end
     local st = vim.uv.fs_stat(p)
     if not st then return end
@@ -1976,8 +2011,13 @@ local function _masked_paths(unmask, cwd, dac_override)
       if base then add(base, true) end
     end
   end
-  for _, p in ipairs(_config_mask_paths()) do add(p) end
-  for _, p in ipairs(_dir_masks(cwd)) do add(p) end
+  -- 硬遮蔽（mask_paths）：只按「同一路径」的显式 unmask 解除。可写根/父目录放行（例如包安装把
+  -- `/etc` 列为可写根）**不得**连带解除其下的遮蔽条目——否则 `/etc/shadow`、`/etc/sudoers`、
+  -- `/etc/ld.so.preload` 会被一并放开（与「敏感条目仍遮蔽」的设计相悖），并产出发布阶段
+  -- 必然被拒（`SANDBOX_MASKED_TARGET`）的候选。
+  for _, p in ipairs(_config_mask_paths()) do add(p, false, true) end
+  -- 目录遮蔽（mask_dirs）：批准/放行某目录即放行其子树（祖先语义）。
+  for _, p in ipairs(_dir_masks(cwd)) do add(p, false, false) end
   return out
 end
 
@@ -2781,12 +2821,23 @@ local function _generated_roots()
 end
 
 --- 路径是否位于构建产物目录（`generated_dirs`，按工作区根展开）。
+--- 额外按**路径分量**兜底：工作区之外的构建目录（`CARGO_TARGET_DIR` 指向
+--- `~/.cache/xxx-target`、`--target-dir`、`-o build` 等）不在工作区根展开范围内，
+--- 但其分量名以 `target` 结尾（`target`/`cargo-target`/`sdw_cargo_target`/`cargo.target`），
+--- 仍应视为构建产物——否则整棵产物树会进入候选（实测 8k+ 文件、每轮数 GB）。
 --- @param path string|nil
 --- @return boolean
 function M.is_generated_path(path)
   if type(path) ~= "string" or path == "" then return false end
   for _, r in ipairs(_generated_roots()) do
     if path == r or path:sub(1, #r + 1) == r .. "/" then return true end
+  end
+  -- 分量兜底（有界扫描，避免超长路径的额外开销）
+  local n = 0
+  for seg in path:gmatch("[^/]+") do
+    n = n + 1
+    if n > 16 then break end
+    if seg:match("^[%w_%.%-]*target$") then return true end
   end
   return false
 end
@@ -2847,7 +2898,9 @@ function M.is_masked_path(path, unmask)
   for i, p in ipairs(paths) do
     -- 同时比对原始与规范化后的遮蔽条目：条目自身可能含符号链接（如 /var/run → /run）。
     if _under(path, p) or _under(path, canon[i]) then
-      if not _unmasked_by(unmask, p) then return p end
+      -- 硬遮蔽只认「同一路径」的精确解除（与挂载侧 `_masked_paths` 一致）：
+      -- 父目录级放行（可写根 `/etc`、审批放行某目录）不连带解除其下的敏感条目。
+      if not _unmasked_exact(unmask, p, canon[i]) then return p end
     end
   end
   return nil
@@ -3603,11 +3656,25 @@ function M.process_prefix(opts)
         table.insert(argv, "--ro-bind"); table.insert(argv, bf.src); table.insert(argv, dest)
       end
     end
-    -- 宿主可能不存在的强制遮蔽项（如 /etc/ld.so.preload）：仅在有**可写整机 overlay** 时需要
-    -- （只读根无法创建该文件，强行在缺失目的上挂载会让 bwrap init 失败）。目的由 bwrap 创建。
-    if root_overlay then
+    -- 宿主可能不存在的强制遮蔽项（如 /etc/ld.so.preload）：只要该路径的父目录会被**可写覆盖**
+    -- （整机根 overlay，或任一次级可写根如包安装的 `/etc`），就必须强制遮蔽——否则载荷可在会话内
+    -- 创建它，使后续每个动态链接进程加载任意库（沙箱内代码注入原语）。bwrap 用
+    -- `--bind /dev/null <dest>` 创建缺失目的；父目录只读时创建会让 bwrap init 失败，
+    -- 故仅在父目录确属可写根时添加（只读根无法创建该文件，无需遮蔽）。
+    do
+      local function _parent_writable(p)
+        if root_overlay then return true end
+        local parent = p:match("^(.*)/[^/]+$")
+        if not parent or parent == "" then return false end
+        for _, ov in ipairs(rest_overlays) do
+          if type(ov.root) == "string" and ov.root ~= "" and _under(parent, ov.root) then
+            return true
+          end
+        end
+        return false
+      end
       for _, p in ipairs(ALWAYS_MASK_PATHS) do
-        if not vim.uv.fs_stat(p) then
+        if not vim.uv.fs_stat(p) and _parent_writable(p) then
           table.insert(argv, "--bind"); table.insert(argv, "/dev/null"); table.insert(argv, p)
         end
       end

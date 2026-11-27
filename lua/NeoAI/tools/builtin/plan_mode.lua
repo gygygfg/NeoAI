@@ -1,12 +1,13 @@
 --- 计划模式
 --- @module 'NeoAI.tools.builtin.plan_mode'
---- 计划模式作为 per-agent 状态（logged），激活时：
---- 1. 注入 plan-policy 系统提示段（要求输出清晰、格式化的修改计划）；
---- 2. 工具上下文只保留「只读/信息查询工具 + ask_user（向用户提问）」，不暴露任何修改类工具；
---- 3. 执行期门禁同步收紧：计划模式下调用可见集之外的任何工具都会被驳回（纵深防御）。
---- 计划经用户确认（chat_service.approve_plan）后直接转入 CHAT 模式，
---- 并把计划解析为任务清单（todo）供执行阶段使用。
---- 状态持久化在 session.metadata.plan（chat_service 同步），恢复会话时还原。
+--- 计划模式作为 per-agent 状态（logged）：
+--- 1. 异步沙箱草稿模式（默认）：只调研/查明原因、不修复；写类工具可用，但写入只进沙箱暂存、
+---    不进审批、退出计划模式自动丢弃；同时按能力上限拒绝宿主级/未受信工具（见 filter_capabilities）。
+--- 2. 无异步暂存（非 async / 无隔离后端）：工具上下文收敛为只读/信息查询 + run_command + ask_user，
+---    执行期门禁同步收紧（visible_names/check_tool）。
+--- 3. 策略文本经运行时上下文快照注入历史（系统提示保持稳定）。
+--- 计划经用户确认（chat_service.approve_plan）后转入 CHAT 模式（草稿丢弃），
+--- 并把计划解析为任务清单（todo）供执行阶段使用。状态持久化在 session.metadata.plan。
 
 local config_store = require("NeoAI.kernel.config_store")
 local event_bus = require("NeoAI.kernel.event_bus")
@@ -18,27 +19,48 @@ local M = {}
 
 -- ========== 私有常量 ==========
 
---- 计划模式策略段（注入系统提示，order=100 工具指引区）
-local PLAN_POLICY_TEXT = table.concat({
-  "## 计划模式（PLAN MODE）",
-  "当前处于计划模式。你的工具上下文只包含只读/信息查询类工具、run_command 与 ask_user（向用户提问），",
-  "没有任何修改类工具（编辑/删除/创建文件、git 回滚、重命名/格式化等均不可用）。",
-  "run_command 仅可用于**只读调研**（如 ls/cat/rg/git log/查看版本与依赖等），不得用于执行会修改",
-  "文件或系统状态的写命令（沙箱会把改动冻结为待审候选，但仍应避免）。",
-  "任务流程：",
-  "1. 充分调研：读取相关文件、搜索、查看 git 状态 / diff / 诊断信息，必要时用 run_command 执行只读命令，理解现状；",
-  "2. 若有歧义或缺少关键信息，用 ask_user 向用户澄清（一次调用只问一个问题，多个问题分多次调用）；",
-  "3. 最终输出一份清晰、格式化的修改计划，必须包含：",
-  "   - 目标与背景（为什么改）",
-  "   - 改动清单（涉及的文件 + 每处改动的内容/操作）",
-  "   - 实施步骤（先后顺序）",
-  "   - 验证方式与回滚方案",
-  "4. 输出计划后即结束本轮：不要尝试切换模式或开始执行修改。是否按计划执行由用户决定，",
-  "   用户确认（:NeoAI ApprovePlan 或手动切换模式）后系统会把计划转为任务清单（todo）并转入执行。",
+--- 计划模式策略段：异步沙箱草稿模式（写入暂存、退出丢弃）。
+local PLAN_POLICY_STAGING = table.concat({
+  "## 计划模式（诊断）",
+  "用户要求：尽快查明原因/现状，**不要修复**。",
+  "- 文件改动只会进入沙箱暂存：不会写入真实工作区、不会进入审批队列，退出计划模式时自动丢弃。",
+  "- 计划模式不提供宿主级操作（SSH/主机提权/长驻服务）与未标记 plan-safe 的 MCP/外部工具。",
+  "- 结束时用简洁正文给出结论、证据（文件:行）；如需后续修复，可附一份简短改动清单。",
 }, "\n")
 
+--- 计划模式策略段：无异步暂存时保持只读工具集（与真实能力一致）。
+local PLAN_POLICY_READONLY = table.concat({
+  "## 计划模式（只读）",
+  "当前无异步沙箱暂存，工具集已收敛为只读/信息查询类（含 run_command 做只读调研）。",
+  "用户要求：尽快查明原因/现状，**不要修复**。",
+  "- 结束时用简洁正文给出结论、证据（文件:行）；如需后续修复，可附一份简短改动清单。",
+}, "\n")
+
+--- 草稿模式（异步沙箱）下的能力上限：显式拒绝「无法被沙箱暂存/丢弃」的宿主级工具。
+local PLAN_STAGING_DENY = {
+  ssh_run = true,
+  ssh_tunnel = true,
+  service_start = true,
+  service_stop = true,
+}
+
+--- 草稿模式允许的工具类别（未知类别默认拒绝；外部/自定义工具需显式加入 extra_safe_tools）。
+--- 注：`editor`（nvim 镜像控制）默认不放行——计划模式只做调研，不需要控制编辑器；
+--- 确需时用 `tools.plan_mode.extra_safe_tools = { "nvim" }` 显式加入。
+local PLAN_STAGING_CATEGORIES = {
+  file = true,
+  system = true, -- run_command / git_* 之外的 system 工具（ssh/service 已按名拒绝）
+  git = true,
+  treesitter = true,
+  lsp = true,
+  log = true,
+  agent = true, -- ask_user / todo_* / 子 Agent 调度
+  web = true,
+  skill = true,
+}
+
 --- 计划模式下可见的只读/信息查询工具白名单
---- （修改类、系统命令、子 Agent 调度、待办写入等均不在此列）
+--- （无异步暂存时使用；修改类、系统命令、子 Agent 派生等均不在此列）
 local PLAN_SAFE_TOOLS = {
   -- 文件读取 / 搜索
   "read_file", "list_files", "search_files", "file_exists",
@@ -61,6 +83,9 @@ local PLAN_SAFE_TOOLS = {
   "log_message", "get_log_levels",
   -- 子 Agent 状态查询（只读）
   "get_sub_agent_status",
+  -- 子 Agent 控制 / 对话（回答子 Agent 提问统一用 send_sub_agent_message）
+  "cancel_sub_agent",
+  "send_sub_agent_message",
 }
 
 --- 计划模式下附加可见工具（非只读类，需显式加入）
@@ -68,8 +93,8 @@ local PLAN_SAFE_TOOLS = {
 --- 避免 AI 自行调用工具退出计划模式并立即开始改动。
 local PLAN_EXTRA_TOOLS = {
   "ask_user", -- 向用户提问
-  -- 外部命令：用于只读调研（查看版本/依赖/构建配置/git 等）。写命令的改动仍会被沙箱冻结为
-  -- 待审候选，但计划模式策略要求仅执行只读命令。
+  -- 外部命令：用于只读调研（查看版本/依赖/构建配置/git 等）。写命令在草稿模式下只进暂存，
+  -- 计划模式策略要求仅执行只读命令；只读模式（无异步暂存）下可见集之外的工具会被驳回。
   "run_command",
 }
 
@@ -89,10 +114,62 @@ local function _apply_section(_, _)
   -- no-op：系统提示段已废弃，改用运行时上下文快照
 end
 
---- 计划模式策略段文本（供运行时上下文快照复用）
+--- 测试钩子：强制草稿模式开关（nil = 按真实配置探测）。
+local _staging_override = nil
+
+--- 暂存探测缓存：`_staging_active` 会在每次请求/工具调用被查询，而 effective_approval_mode
+--- 在无强制层时会写 WARN 日志；短 TTL 避免重复探测与刷屏（配置/环境变化在 1s 内生效）。
+local _staging_cache = { at = 0, value = false }
+
+--- 当前是否「异步沙箱暂存」生效：此时计划模式不再靠工具白名单做只读，
+--- 写入只进暂存、退出丢弃。只要有一项不成立就退回只读白名单（绝不假装有暂存）。
+--- @return boolean
+local function _compute_staging_active()
+  local cfg = config_store.get("tools.sandbox") or {}
+  if cfg.enabled == false then return false end
+  if (config_store.get("tools.approval.mode") or "async") ~= "async" then return false end
+  local ok_svc, services = pcall(require, "NeoAI.kernel.services")
+  if not ok_svc or not services or not services.use("services.sandbox") then return false end
+  local ok_rt, rt = pcall(require, "NeoAI.sandbox.execution.runtime")
+  if not ok_rt or not rt or type(rt.isolation_available) ~= "function" then return false end
+  local ok_iso, iso = pcall(rt.isolation_available)
+  if not ok_iso or not iso then return false end
+  -- 无动态强制层 / 无后端时 executor 会把 async 强制退回 prompt：此时仍按只读处理。
+  local ok_ex, executor = pcall(require, "NeoAI.tools.executor")
+  if ok_ex and executor and type(executor.effective_approval_mode) == "function" then
+    local ok_eff, eff = pcall(executor.effective_approval_mode, "async")
+    if ok_eff and eff and eff.mode ~= "async" then return false end
+  end
+  return true
+end
+
+--- @return boolean
+local function _staging_active()
+  if _staging_override ~= nil then return _staging_override == true end
+  local now = vim.uv.now()
+  if now - _staging_cache.at < 1000 then return _staging_cache.value end
+  local v = _compute_staging_active()
+  _staging_cache.at = now
+  _staging_cache.value = v
+  return v
+end
+
+--- 计划模式策略段文本（供运行时上下文快照复用；随暂存是否生效变化）。
 --- @return string
 function M.policy_text()
-  return PLAN_POLICY_TEXT
+  return _staging_active() and PLAN_POLICY_STAGING or PLAN_POLICY_READONLY
+end
+
+--- 是否处于「异步沙箱草稿」模式（供测试/诊断）。
+--- @return boolean
+function M.staging_active()
+  return _staging_active()
+end
+
+--- 测试钩子：覆盖暂存探测（nil 恢复真实探测）。
+--- @param v boolean|nil
+function M._set_staging_active_for_test(v)
+  _staging_override = v
 end
 
 -- ========== 公开 API ==========
@@ -104,11 +181,103 @@ function M.is_active(agent)
   return agent and agent.plan_mode == true
 end
 
+--- 计划模式草稿作用域 id（无暂存/未激活返回 nil）
+--- @param agent table|nil
+--- @return string|nil
+function M.plan_scope(agent)
+  return agent and agent._plan_scope_id or nil
+end
+
+--- 计划模式草稿的能力上限过滤（子 Agent 也复用：它们继承父 scope）。
+--- 与只读白名单不同：这里**允许写类工具**（写入由沙箱暂存并在退出时丢弃），
+--- 只拒绝无法被暂存/丢弃的宿主级能力与未受信工具。
+--- @param tools table name -> def
+--- @return table name -> def
+function M.filter_capabilities(tools)
+  local extra = {}
+  for _, name in ipairs(_cfg().extra_safe_tools or {}) do
+    if type(name) == "string" and name ~= "" then extra[name] = true end
+  end
+  local out = {}
+  for name, tool in pairs(tools or {}) do
+    local keep = false
+    if extra[name] then
+      keep = true
+    elseif PLAN_STAGING_DENY[name] then
+      keep = false
+    elseif tool and tool.source == "mcp" then
+      keep = tool.mcp_plan_safe == true
+    elseif tool and PLAN_STAGING_CATEGORIES[tool.category or "other"] then
+      keep = true
+    end
+    if keep then out[name] = tool end
+  end
+  return out
+end
+
+--- 在当前 scope 内开始记录草稿（仅暂存生效时）。
+--- @param agent table
+local function _begin_scope(agent)
+  if not _staging_active() then return end
+  local scope = "plan:" .. tostring(agent.id)
+  agent._plan_scope_id = scope
+  local ok_svc, services = pcall(require, "NeoAI.kernel.services")
+  local sb = ok_svc and services and services.use("services.sandbox") or nil
+  if sb and type(sb.plan_scope_begin) == "function" then
+    pcall(sb.plan_scope_begin, scope, agent.id)
+  end
+  -- 进入计划模式前已存在的子 Agent 也纳入 scope：防止 send 指令驱动老 child 产生「正常待审」写入。
+  pcall(function()
+    local bridge = require("NeoAI.kernel.core_bridge")
+    local mgr = bridge.sub_agent and bridge.sub_agent()
+    if not (mgr and mgr.list_for and bridge.agent_get) then return end
+    for _, entry in ipairs(mgr.list_for(agent.id) or {}) do
+      local child = entry.agent_id and bridge.agent_get(entry.agent_id)
+      if child then child._plan_scope_id = scope end
+    end
+  end)
+end
+
+--- 结束 scope 并丢弃草稿（仅 scope owner 生效）。
+--- @param agent table
+local function _end_scope(agent)
+  local scope = agent and agent._plan_scope_id or nil
+  if agent then agent._plan_scope_id = nil end
+  if not scope then return end
+  local ok_svc, services = pcall(require, "NeoAI.kernel.services")
+  local sb = ok_svc and services and services.use("services.sandbox") or nil
+  if not (sb and type(sb.plan_scope_discard) == "function") then return end
+  local ok, stats = pcall(sb.plan_scope_discard, scope, "plan_exit")
+  if ok and stats then
+    local n = (stats.discarded or 0) + (stats.restored or 0)
+    if n > 0 or (stats.skipped or 0) > 0 then
+      pcall(vim.notify, ("[NeoAI] 计划模式暂存的 %d 处改动已丢弃%s"):format(
+        n,
+        (stats.skipped or 0) > 0 and ("（%d 处因已被其它操作改动而跳过）"):format(stats.skipped) or ""),
+        vim.log.levels.INFO)
+    end
+  end
+end
+
+--- 确保活跃的计划草稿 scope 存在（懒启动/session 恢复时 sandbox 可能晚于 plan_mode 启动）。
+--- @param agent table|nil
+function M.ensure_scope(agent)
+  if not agent or not M.is_active(agent) then return end
+  if not _staging_active() then return end
+  if agent._plan_scope_id and _scope_active(agent) then return end
+  _begin_scope(agent)
+end
+
 --- 进入计划模式
 --- @param agent table
 --- @return boolean 是否成功
 function M.enter(agent)
   if not agent then return false end
+  -- 幂等：已在计划模式时不要重建 scope（会丢掉已登记的草稿且无法恢复旧待审内容）。
+  if agent.plan_mode == true then
+    M.ensure_scope(agent)
+    return true
+  end
   -- 互斥：进入计划模式时退出高权限模式（会触发 PRIVILEGED_MODE_CHANGED）。
   local privileged_mode = require("NeoAI.tools.builtin.privileged_mode")
   if privileged_mode.is_active(agent) then privileged_mode.exit(agent) end
@@ -117,16 +286,18 @@ function M.enter(agent)
   agent._plan_enter_index = #(agent.messages or {})
   -- 新一轮计划：重置「本次 plan 已蒸馏」标记，允许从 plan 切到其它模式时再次蒸馏。
   agent._plan_distilled = false
+  _begin_scope(agent)
   _apply_section(agent, true)
   event_bus.emit(events.PLAN_MODE_CHANGED, { agent_id = agent.id, active = true })
   return true
 end
 
---- 退出计划模式（转入 CHAT 模式）
+--- 退出计划模式（转入 CHAT 模式；草稿自动丢弃）
 --- @param agent table
 --- @return boolean
 function M.exit(agent)
   if not agent then return false end
+  _end_scope(agent)
   agent.plan_mode = false
   _apply_section(agent, false)
   event_bus.emit(events.PLAN_MODE_CHANGED, { agent_id = agent.id, active = false })
@@ -156,15 +327,38 @@ function M.restore(agent, state)
     local privileged_mode = require("NeoAI.tools.builtin.privileged_mode")
     if privileged_mode.is_active(agent) then privileged_mode.exit(agent) end
     agent.plan_mode = true
+    M.ensure_scope(agent)
     _apply_section(agent, true)
   end
+end
+
+--- 该 Agent 是否处于某个**活跃**计划草稿作用域（本体在计划模式，或作为子 Agent 继承父 scope）。
+--- @param agent table|nil
+--- @return boolean
+local function _scope_active(agent)
+  local scope = agent and agent._plan_scope_id or nil
+  if not scope then return false end
+  local ok, services = pcall(require, "NeoAI.kernel.services")
+  local sb = ok and services and services.use("services.sandbox") or nil
+  if not (sb and type(sb.plan_scope_active) == "function") then return false end
+  local ok_a, active = pcall(sb.plan_scope_active, scope)
+  return ok_a and active == true
 end
 
 --- 计划模式下可见的工具名集合（含配置扩展）
 --- @param agent table
 --- @return table|nil 可见工具名集合（非计划模式返回 nil = 不限制）
 function M.visible_names(agent)
-  if not M.is_active(agent) then return nil end
+  local in_scope = _scope_active(agent)
+  if not M.is_active(agent) and not in_scope then return nil end
+  -- 异步沙箱草稿：能力上限（允许写类工具，拒绝宿主级/未受信能力），不再强制只读。
+  if _staging_active() and (M.is_active(agent) or in_scope) then
+    local set = {}
+    for name in pairs(M.filter_capabilities(require("NeoAI.tools.registry").list_as_map())) do
+      set[name] = true
+    end
+    return set
+  end
   local cfg = _cfg()
   local extra = cfg.extra_safe_tools or {}
   local set = {}
@@ -226,17 +420,27 @@ end
 --- @param tool_name string
 --- @return boolean allowed, string|nil reason
 function M.check_tool(agent, tool_name)
-  if not M.is_active(agent) then return true end
+  if not M.is_active(agent) and not _scope_active(agent) then return true end
   if not M.is_visible(agent, tool_name) then
-    return false, ("[计划模式] 工具 '%s' 不在计划模式可用工具集内（只允许只读/信息查询工具、run_command 与 ask_user）。请输出格式化修改计划并等待用户确认执行。"):format(tool_name)
+    local why = _staging_active()
+      and "计划模式不提供该能力（宿主级操作/长驻服务/未受信 MCP 或外部工具）"
+      or "计划模式当前为只读工具集"
+    return false, ("[计划模式] 工具 '%s' 不可用：%s。请只做调研与诊断，必要时用 ask_user 澄清。"):format(
+      tool_name, why)
   end
   return true
 end
 
---- 清理 agent 级状态（销毁时）
+--- 清理 agent 级状态（销毁时；草稿由 scope owner 丢弃）
 --- @param agent table
 function M.cleanup(agent)
-  if agent and agent._plan_section then
+  if not agent then return end
+  if agent.plan_mode == true and agent._plan_scope_id and agent._plan_scope_id == ("plan:" .. tostring(agent.id)) then
+    _end_scope(agent)
+  else
+    agent._plan_scope_id = nil
+  end
+  if agent._plan_section then
     pcall(agent._plan_section)
     agent._plan_section = nil
   end
@@ -310,7 +514,8 @@ local plan_mode_tools = {}
 
 plan_mode_tools.enter_plan_mode = helpers.define_tool(
   "enter_plan_mode",
-  "进入计划模式：工具集切换为只读/信息查询 + ask_user（不能改文件），用于调研并制定格式化修改计划。多步骤/涉及改动的任务应先调用本工具。",
+  "进入计划模式：只做调研/查明原因，不修复。异步沙箱下仍可用全部调研与写类工具，"
+    .. "但改动只进沙箱暂存、不进审批、退出计划模式自动丢弃；无异步沙箱时工具集收敛为只读。",
   {
     type = "object",
     properties = {},
@@ -335,7 +540,9 @@ plan_mode_tools.enter_plan_mode = helpers.define_tool(
 
 --- 重置（测试用）
 function M.reset()
-  -- 无模块级状态；状态挂在 agent 上
+  -- 状态挂在 agent 上；仅清测试钩子与探测缓存。
+  _staging_override = nil
+  _staging_cache = { at = 0, value = false }
 end
 
 --- 获取工具列表

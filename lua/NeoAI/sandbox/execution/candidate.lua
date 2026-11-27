@@ -84,8 +84,25 @@ end
 
 -- ========== 私有函数 ==========
 
+--- 候选内容是否允许**内联进 Lua 内存**（`tools.sandbox.inline_candidate_bytes`；默认 0 = 不内联）。
+--- 不内联时：暂存文件按「同盘复制」写成候选 blob（`uv.fs_copyfile`，不读内存），候选只存
+--- 元数据（path/action/hash/blob）；发布与审批按需从 blob 读取，且读取上限为单文件上限。
+--- 这样「沙箱内文件」始终留在磁盘（视图层 / blob），nvim 不再按轮持有数百 MB 候选内容。
+--- @return boolean
+local function _inline_enabled()
+  local ok, v = pcall(function()
+    return require("NeoAI.kernel.config_store").get("tools.sandbox.inline_candidate_bytes")
+  end)
+  if not ok then return true end -- 配置不可读：保持旧行为（绝不因探测失败改变语义）
+  local n = tonumber(v)
+  if n == nil then return false end
+  return n > 0
+end
 
 
+--- 视图层写入辅助（前向声明：`_base_entry` 在常驻实例挂载期间也需要经命名空间桥写 upper）。
+--- @type fun(real: string, staged: string, content: string, mode: number|nil): boolean
+local _write_view_file
 
 --- 规范化真实路径：展开 ~/$VAR、绝对化、解析符号链接并折叠 `..`。
 --- 必须与内核打开文件时的解析一致，否则「风险分级/审批展示」与「实际写入」会分裂
@@ -436,9 +453,25 @@ local function _base_entry(attempt, real)
     fs.ensure_dir(vim.fn.fnamemodify(staged, ":h"))
     _chown_payload(vim.fn.fnamemodify(staged, ":h"))
     if stat and stat.type == "file" then
-      fs.copy_file(real, staged)
-      -- 保留原权限位（copyfile 不保证权限；后续 materialize 会据此恢复可执行位）。
-      if stat.mode then fs.chmod(staged, assert(_perm(stat.mode))) end
+      -- 单视图 + 常驻实例已挂载时，**不得从宿主侧写 upper**（overlayfs 未定义行为）：
+      -- 经命名空间桥把真实内容写进挂载点内的 upper，再继续登记基线。
+      local native = view.enabled() and view.is_native(staged)
+      local resident_active = false
+      if native then
+        pcall(function()
+          resident_active = require("NeoAI.sandbox.execution.resident").active() ~= nil
+        end)
+      end
+      if native and resident_active and _write_view_file then
+        local content = _read(real)
+        if content ~= nil then
+          pcall(_write_view_file, real, staged, content, _perm(stat.mode))
+        end
+      else
+        fs.copy_file(real, staged)
+        -- 保留原权限位（copyfile 不保证权限；后续 materialize 会据此恢复可执行位）。
+        if stat.mode then fs.chmod(staged, assert(_perm(stat.mode))) end
+      end
     end
     state.workspace[real] = {
       staged = staged, base_hash = base_hash, real_hash = base_hash,
@@ -1433,8 +1466,12 @@ function M.materialize_overlay(specs, opts)
                 end
               end
               local is_large = entry.large == true
+              -- 内容不读进内存：视图层/暂存文件已经在同一块盘上（overlay upper / 暂存目录），
+              -- 物化只需**按文件复制**。唯一必须读出内容的情形是「该条目被密钥 token 化」：
+              -- 命令侧要拿到真实内容（否则程序读到 NEOKEY_* 会失败）。
+              local copy_only = is_large or entry.tokenized ~= true
               local content
-              if not is_large then
+              if not copy_only then
                 content = fs.read_file(entry.staged)
                 if content ~= nil then
                   -- 暂存视图对 AI 遮蔽了密钥（token 化），但命令执行层必须拿到**真实内容**：
@@ -1452,12 +1489,12 @@ function M.materialize_overlay(specs, opts)
                   end
                 end
               end
-              if is_large or content ~= nil then
+              if copy_only or content ~= nil then
                 fs.ensure_dir(vim.fn.fnamemodify(dest, ":h"))
                 local mode = entry.mode or 420 -- 0644：保留原权限位，新建文件用常规默认（不强制 0600）
                 local ok
-                if is_large then
-                  -- 大文件：直接文件复制（不读入 Lua 内存），临时文件 + rename 原子替换。
+                if copy_only then
+                  -- 同盘复制（内核 copyfile，不读入 Lua 内存）：临时文件 + rename 原子替换。
                   local tmp = dest .. ".neoai.tmp"
                   ok = fs.copy_file(entry.staged, tmp)
                   if ok then
@@ -1485,11 +1522,11 @@ function M.materialize_overlay(specs, opts)
                 end
                 local ndstat = vim.uv.fs_stat(dest)
                 -- 记录写入内容哈希与两侧签名：capture 时工作线程据此判断命令是否改动
-                -- （签名未变即跳过读取/哈希）；下次物化据此跳过未变文件。大文件用占位哈希
-                -- （capture 未变判定只比较 dsig，不比较 hash 值）。
+                -- （签名未变即跳过读取/哈希）；下次物化据此跳过未变文件。按文件复制/超大文件
+                -- 用占位哈希（capture 未变判定只比较 dsig，不比较 hash 值）。
                 mat[real] = {
                   dest = dest,
-                  hash = is_large and "sha256:large" or ("sha256:" .. vim.fn.sha256(content)),
+                  hash = copy_only and "sha256:file" or ("sha256:" .. vim.fn.sha256(content)),
                   ssig = (sstat and sstat.mtime) and string.format("%s:%s:%s:%s",
                     tostring(sstat.mtime.sec), tostring(sstat.mtime.nsec), tostring(sstat.size), tostring(sstat.mode)) or nil,
                   dsig = (ndstat and ndstat.mtime) and string.format("%s:%s:%s:%s",
@@ -1605,7 +1642,7 @@ local function _apply_view_files(view_files, opts)
       paths[#paths + 1] = f.path
     end
   end
-  if #paths > 0 then
+  if #paths > 0 and not opts.no_supersede then
     pcall(function() require("NeoAI.sandbox.review.review").supersede_by_paths(paths) end)
   end
 end
@@ -1618,7 +1655,7 @@ end
 --- @param content string
 --- @param mode number|nil
 --- @return boolean
-local function _write_view_file(real, staged, content, mode)
+_write_view_file = function(real, staged, content, mode)
   local ok_b, bridge = pcall(require, "NeoAI.sandbox.execution.file_bridge")
   local ok_r, resident = pcall(require, "NeoAI.sandbox.execution.resident")
   if ok_b and bridge and type(bridge.available) == "function" and bridge.available()
@@ -1628,6 +1665,246 @@ local function _write_view_file(real, staged, content, mode)
   local ok = fs.write_file(staged, content)
   if ok and mode then pcall(vim.uv.fs_chmod, staged, mode) end
   return ok
+end
+
+--- 删除视图层文件（常驻实例已挂载时经命名空间桥，避免宿主侧写挂载中的 upper）。
+--- @param real string
+--- @param staged string
+--- @return boolean
+local function _delete_view_file(real, staged)
+  local ok_b, bridge = pcall(require, "NeoAI.sandbox.execution.file_bridge")
+  local ok_r, resident = pcall(require, "NeoAI.sandbox.execution.resident")
+  if ok_b and bridge and type(bridge.available) == "function" and bridge.available()
+    and ok_r and resident and resident.active() then
+    return bridge.unlink(real) == true
+  end
+  if not staged or staged == "" then return false end
+  return pcall(vim.fn.delete, staged, "rf")
+end
+
+--- 把未保存 buffer 的实时内容登记为沙箱视图**基线**（save-all 语义）。
+---
+--- 语义：
+---   * 视图内容 = 用户此刻对全部 buffer 执行 `:wall` 之后的世界；
+---   * 该基线记录在 `view_base_hash`，**不产生 AI 候选**（捕获时与基线一致即跳过）；
+---   * AI 之后的改动叠加在该基线之上（候选 diff = AI 改动）；
+---   * 若条目已有 AI/命令改动（staged != seed_hash），绝不覆盖，只标记 buffer 已分叉。
+---
+--- @param real_path string 真实路径
+--- @param content string 实时 buffer 文本（真实内容，含 fileformat 换行）
+--- @param opts table|nil { tick?: number, bufnr?: number, disk_hash?: string|nil }
+--- @return boolean ok
+--- @return string reason seeded|diverged|clean|write_failed|invalid
+function M.seed_buffer(real_path, content, opts)
+  opts = opts or {}
+  if type(content) ~= "string" or real_path == nil then return false, "invalid" end
+  _await_rotation()
+  local real = _abs(real_path)
+  local st = vim.uv.fs_lstat(real)
+  if st and st.type == "directory" then return false, "invalid" end
+  local ws = state.workspace[real]
+  local staged = (ws and ws.staged) or _workspace_path(real)
+  local native = view.enabled() and view.is_native(staged)
+  local payload = content
+  if not native and _is_text_content(content) then
+    local secret = require("NeoAI.sandbox.secret.secret")
+    local ok_tok, tok = pcall(secret.tokenize, content, {
+      entropy = type(secret.is_secret_path) == "function" and secret.is_secret_path(real) or false,
+    })
+    if ok_tok and type(tok) == "string" then payload = tok end
+  end
+  local view_hash = _sha(payload)
+  local real_hash = _sha(content)
+  local disk_hash = opts.disk_hash
+  if type(disk_hash) == "string" and disk_hash:sub(1, 7) ~= "sha256:" then
+    disk_hash = "sha256:" .. disk_hash
+  end
+  -- buffer 与磁盘一致：没有 save-all 增量，撤销纯种子条目即可。
+  if disk_hash and disk_hash == real_hash then
+    M.clear_buffer_seed(real)
+    return true, "clean"
+  end
+  if ws then
+    if ws.deleted then
+      -- 视图中该文件已被（AI）删除，用户 buffer 仍有内容：冲突，不复活视图。
+      ws.buffer_diverged = true
+      ws.buffer_hash = real_hash
+      return true, "diverged"
+    end
+    if ws.buffer_seeded and ws.seed_hash then
+      local cur = ws.staged and _read(ws.staged)
+      if cur == nil or _sha(cur) ~= ws.seed_hash then
+        -- AI/命令改动已在视图中：不覆盖基线，只记录 buffer 是否已分叉。
+        ws.seed_tick = opts.tick or ws.seed_tick
+        ws.seed_bufnr = opts.bufnr or ws.seed_bufnr
+        ws.buffer_hash = real_hash
+        ws.buffer_diverged = (real_hash ~= (ws.seed_real_hash or ""))
+        return true, "diverged"
+      end
+    else
+      -- AI 新建/编辑的条目（无 buffer 基线）：不把用户内容覆盖上去。
+      ws.buffer_hash = real_hash
+      ws.buffer_diverged = true
+      return true, "diverged"
+    end
+  end
+  fs.ensure_dir(vim.fn.fnamemodify(staged, ":h"))
+  _chown_payload(vim.fn.fnamemodify(staged, ":h"))
+  local okw = _write_view_file(real, staged, payload, st and _perm(st.mode) or nil)
+  if not okw then return false, "write_failed" end
+  local entry = ws or {}
+  entry.staged = staged
+  entry.deleted = false
+  entry.base_hash = disk_hash -- nil = 真实盘不存在（新建未保存文件）
+  entry.real_hash = disk_hash
+  entry.view_base_hash = view_hash
+  entry.seed_hash = view_hash
+  entry.seed_real_hash = real_hash
+  entry.seed_tick = opts.tick or 0
+  entry.seed_bufnr = opts.bufnr
+  entry.buffer_seeded = true
+  entry.buffer_diverged = false
+  entry.buffer_hash = real_hash
+  entry.mode = st and _perm(st.mode) or nil
+  entry.tokenized = (payload ~= content) or nil
+  entry.version = _bump_version()
+  state.workspace[real] = entry
+  state.staged_to_real[staged] = real
+  return true, "seeded"
+end
+
+--- 撤销某路径的纯 buffer 种子（仅在没有 AI/命令改动时）。发布/保存/回退后调用。
+--- @param real_path string
+--- @return boolean removed
+function M.clear_buffer_seed(real_path)
+  if real_path == nil then return false end
+  _await_rotation()
+  local real = _abs(real_path)
+  local ws = state.workspace[real]
+  if not ws or not ws.buffer_seeded then return false end
+  local cur = ws.staged and _read(ws.staged)
+  if cur ~= nil and ws.seed_hash and _sha(cur) ~= ws.seed_hash then
+    -- AI/命令改动存在：保留条目（基线仍用于候选 diff）。
+    ws.seed_tick = nil
+    return false
+  end
+  state.workspace[real] = nil
+  if ws.staged then
+    state.staged_to_real[ws.staged] = nil
+    _delete_view_file(real, ws.staged)
+    for _, mat in pairs(state.materialized) do mat[real] = nil end
+  end
+  return true
+end
+
+--- 用户保存 buffer 后的基线维护：磁盘与视图同步时撤销种子；AI 改动仍在时刷新 CAS 基线。
+--- @param real_path string
+--- @param saved_hash string 保存后磁盘内容哈希（`sha256:...`）
+function M.on_buffer_saved(real_path, saved_hash)
+  if real_path == nil then return false end
+  _await_rotation()
+  local real = _abs(real_path)
+  local ws = state.workspace[real]
+  if not ws or not ws.buffer_seeded then return false end
+  if type(saved_hash) == "string" and saved_hash:sub(1, 7) ~= "sha256:" then
+    saved_hash = "sha256:" .. saved_hash
+  end
+  local cur = ws.staged and _read(ws.staged)
+  if cur ~= nil and ws.seed_hash and _sha(cur) == ws.seed_hash then
+    -- 没有 AI 改动：磁盘现在就是视图内容，撤销种子即可。
+    M.clear_buffer_seed(real)
+    return true
+  end
+  -- 有 AI 改动：只有当保存内容恰好等于 save-all 基线时，CAS 基线可安全前移；
+  -- 否则保留旧基线，让发布走既有 CONFLICT（绝不静默覆盖用户更新）。
+  if type(saved_hash) == "string" and ws.seed_real_hash and saved_hash == ws.seed_real_hash then
+    ws.base_hash = saved_hash
+    ws.real_hash = saved_hash
+    ws.buffer_diverged = false
+    ws.buffer_conflict = nil
+    ws.version = _bump_version()
+    return true
+  end
+  ws.buffer_conflict = true
+  ws.version = _bump_version()
+  return false
+end
+
+--- 供 UI/只读工具查询 buffer 种子状态与待审内容。
+--- @param real_path string
+--- @return table|nil { staged, seeded, delta, diverged, deleted, seed_hash }
+function M.buffer_seed_info(real_path)
+  if real_path == nil then return nil end
+  _await_rotation()
+  local real = _abs(real_path)
+  local ws = state.workspace[real]
+  if not ws then return nil end
+  if ws.deleted then
+    return { deleted = true, seeded = ws.buffer_seeded == true }
+  end
+  if not ws.staged or not fs.exists(ws.staged) then return nil end
+  local cur = _read(ws.staged)
+  if cur == nil then return nil end
+  local delta = true
+  if ws.buffer_seeded and ws.seed_hash and _sha(cur) == ws.seed_hash then delta = false end
+  return {
+    staged = ws.staged,
+    seeded = ws.buffer_seeded == true,
+    delta = delta,
+    diverged = ws.buffer_diverged == true,
+    seed_hash = ws.seed_hash,
+    seed_real_hash = ws.seed_real_hash,
+    buffer_conflict = ws.buffer_conflict == true,
+  }
+end
+
+--- 真实路径当前的沙箱暂存位置（无暂存返回 nil）。
+--- 计划模式草稿丢弃需要按「真实路径」定位暂存视图条目并比对签名。
+--- @param real_path string
+--- @return string|nil staged
+--- @return string real 规范化真实路径
+function M.staged_path(real_path)
+  local real = _abs(real_path)
+  local ws = state.workspace[real]
+  if not ws or type(ws.staged) ~= "string" then return nil, real end
+  return ws.staged, real
+end
+
+--- 暂存条目当前签名（mtime.sec:mtime.nsec:size:mode）；条目不存在返回 "absent"；
+--- 无暂存登记返回 nil。用于「只撤销自己改的」判定：与登记时签名不一致即视为被他人改过。
+--- @param real_path string
+--- @return string|nil
+function M.staged_sig(real_path)
+  local staged = M.staged_path(real_path)
+  if not staged then return nil end
+  local st = vim.uv.fs_lstat(staged)
+  if not st then return "absent" end
+  -- 小文件用内容哈希：仅比 mtime/size 在同秒同尺寸写入时会误判「未被改动」。
+  if st.type == "file" and (st.size or 0) <= 1048576 then
+    local c = _read(staged)
+    if c ~= nil then return "h:" .. _sha(c) end
+  end
+  return string.format("%s:%s:%s:%s",
+    tostring(st.mtime and st.mtime.sec or ""),
+    tostring(st.mtime and st.mtime.nsec or ""),
+    tostring(st.size or ""),
+    tostring(st.mode or ""))
+end
+
+--- 沙箱待审内容（供 in-buffer diff；旧布局 token 化内容先 detokenize）。
+--- @param real_path string
+--- @return table|nil { content?, deleted?, seeded?, diverged? }
+function M.pending_content(real_path)
+  local info = M.buffer_seed_info(real_path)
+  if not info then return nil end
+  if info.deleted then return { deleted = true, seeded = info.seeded } end
+  if not info.delta then return nil end
+  local content = _read(info.staged)
+  if content == nil then return nil end
+  local secret = require("NeoAI.sandbox.secret.secret")
+  local detok, unresolved = secret.detokenize(content)
+  if (unresolved or 0) > 0 then detok = content end
+  return { content = detok, seeded = info.seeded, diverged = info.diverged }
 end
 
 --- 单视图：目标视图文件是否已经是候选内容（内容哈希一致）。
@@ -1643,7 +1920,10 @@ local function _view_matches(f, staged)
     if st.type ~= "file" then return false end
     if (st.size or 0) > _max_file_bytes() then return true end
     local c = _read(staged)
-    return c ~= nil and ("sha256:" .. _sha(c)) == f.after_hash
+    -- `_sha` 自带 `sha256:` 前缀，直接与候选 `after_hash` 比较；再拼一次前缀会得到
+    -- `sha256:sha256:...`，使「内容已在视图层内」永远判定为不一致 → 每次结算都多写一遍
+    -- 视图 upper（叠加写盘、常驻实例挂载期从宿主侧写 upper）。
+    return c ~= nil and _sha(c) == f.after_hash
   end
   -- 无内容哈希（大文件/目录/链接）：状态以视图层为准（发布走 blob/CAS）。
   return true
@@ -1722,12 +2002,16 @@ function M.merge_candidate(cand, opts)
     elseif f.action == "create" or f.action == "modify" then
       fs.ensure_dir(vim.fn.fnamemodify(staged, ":h"))
       if f.blob then
-        -- 大文件：从 blob 复制到暂存副本（不读入内存），登记 large 供物化按文件复制。
+        -- 大文件 / 内容不内联（默认）：从 blob 复制到暂存副本（不读入内存），登记 large 供物化
+        -- 按文件复制。`fresh`/`fresh_resident` 必须与内联分支一致——物化据此跳过陈旧回写。
         fs.copy_file(f.blob, staged)
         if f.mode then fs.chmod(staged, f.mode) end
         state.workspace[f.path] = {
           staged = staged, base_hash = f.before_hash, deleted = false, mode = f.mode,
           large = true, version = _bump_version(),
+          fresh = opts.from_command == true,
+          fresh_ssig = opts.from_command and _file_sig(staged) or nil,
+          fresh_resident = opts.from_command == true and opts.resident == true,
         }
       else
         -- 保持沙箱视图一致：命令产生的改动也以 token 形式进入暂存映射。
@@ -1881,6 +2165,8 @@ function M.merge_candidate_async(cand, opts)
           state.workspace[f.path] = {
             staged = staged, base_hash = f.before_hash, deleted = false, mode = f.mode,
             large = true, version = _bump_version(),
+            fresh = opts.from_command == true,
+            fresh_resident = opts.from_command == true and opts.resident == true,
           }
         else
           local view_content = tok_of[f] or (f.content or "")
@@ -1917,6 +2203,12 @@ function M.merge_candidate_async(cand, opts)
         local ws = real and state.workspace[real]
         -- 优先用工作线程写后回传的签名，避免主线程对每个暂存文件再 fs_stat。
         if ws then ws.fresh_ssig = (sigs and sigs[w.path]) or _file_sig(w.path) end
+      end
+      -- blob 复制（内容不内联/大文件）：复制完成后才能取暂存副本签名。
+      for _, j in ipairs(blob_jobs) do
+        local real = state.staged_to_real[j.dst]
+        local ws = real and state.workspace[real]
+        if ws then ws.fresh_ssig = _file_sig(j.dst) end
       end
     end
     --- 解析 `_stage_write_worker` 回传的 path->sig 记录。
@@ -2070,7 +2362,14 @@ local function _entry_is_staged(entry)
     return false
   end
   -- base_hash 为 nil 表示真实盘原不存在（新建文件/符号链接）。
-  if entry.base_hash == nil then return true end
+  -- 未保存 buffer 的 save-all 基线（新建未保存文件）不算「AI 暂存改动」：内容与基线一致即跳过。
+  if entry.base_hash == nil then
+    if entry.buffer_seeded and entry.staged and fs.exists(entry.staged) then
+      local c = _read(entry.staged)
+      if c ~= nil and entry.view_base_hash and _sha(c) == entry.view_base_hash then return false end
+    end
+    return true
+  end
   if entry.staged and fs.exists(entry.staged) then
     local c = _read(entry.staged)
     if c == nil then return true end
@@ -2338,13 +2637,18 @@ local function _capture_base_blobs(files)
   end
 end
 
---- 工作线程：读取真实基线（超限/不可读返回空串）。
+--- 工作线程读取基线的失败标记：用不可出现在文本基线里的 NUL 前缀与「空文件」区分
+--- （空文件是合法基线：候选把空文件改成有内容时仍应三方合并，而不是回退 CAS 冲突）。
+local BASE_READ_FAILED = "\0read-failed"
+local BASE_TOO_LARGE = "\0too-large"
+
+--- 工作线程：读取真实基线（不可读/超限返回失败标记，空文件返回空串）。
 local function _read_base_worker(payload)
   local cap = tonumber(payload.cap) or 0
   local f = io.open(payload.path, "rb")
-  if not f then return "" end
+  if not f then return BASE_READ_FAILED end
   local size = f:seek("end") or 0
-  if cap > 0 and size > cap then f:close(); return "" end
+  if cap > 0 and size > cap then f:close(); return BASE_TOO_LARGE end
   f:seek("set", 0)
   local raw = f:read("*a") or ""
   f:close()
@@ -2394,8 +2698,11 @@ local function _capture_base_blobs_async(files)
     local active, texts, flags, text_idx = {}, {}, {}, {}
     for i, f in ipairs(eligible) do
       local raw = raws[i]
-      if type(raw) == "string" and raw ~= "" and (cap <= 0 or #raw <= cap) and _is_text_content(raw) then
-        local entry = { file = f, raw = raw, tokenize = _tokenize_ok(secret, f.path) }
+      -- 空基线是合法内容（空文件）：只有读取失败/超限（NUL 标记）才跳过。
+      if type(raw) == "string" and raw ~= BASE_READ_FAILED and raw ~= BASE_TOO_LARGE
+        and (cap <= 0 or #raw <= cap) and _is_text_content(raw) then
+        -- 空内容无需 token 化，直接写 blob（`tokenize_many_async` 对空串无意义）。
+        local entry = { file = f, raw = raw, tokenize = raw ~= "" and _tokenize_ok(secret, f.path) }
         active[#active + 1] = entry
         if entry.tokenize then
           texts[#texts + 1] = raw
@@ -2564,6 +2871,7 @@ local function _capture_entry(attempt, real_root, staged, child_rel, prefetch, c
     base_sig = base_hash
     base_hash = nil
   end
+  local ws_entry = state.workspace[real]
   attempt.mapping[real] = {
     real = real,
     staged = staged,
@@ -2575,6 +2883,9 @@ local function _capture_entry(attempt, real_root, staged, child_rel, prefetch, c
     mode = staged_is_file and _perm(staged_mode) or nil,
     -- 基线（真实盘）权限位：内容未变但权限变化（如仅 `chmod +x`）时也需产生候选。
     base_mode = (base_type == "file") and _perm(base_mode) or nil,
+    -- 未保存 buffer 的 save-all 基线（视图基线）：内容与它一致 = 不是本次命令/AI 的改动。
+    view_base_hash = (ws_entry and ws_entry.view_base_hash) or nil,
+    buffer_seeded = (ws_entry and ws_entry.buffer_seeded) or nil,
   }
 end
 
@@ -3223,7 +3534,6 @@ local function _classify_paths_worker(payload)
   end
   local masks = payload.masks or {}
   local canon = payload.mask_canon or {}
-  local unmask = payload.unmask or {}
   local sr, src = payload.store_root, payload.store_root_canon
   local cwd, home = payload.cwd or "", payload.home or ""
   local out = {}
@@ -3235,11 +3545,8 @@ local function _classify_paths_worker(payload)
     else
       for k = 1, #masks do
         if under(abs, masks[k]) or (canon[k] and under(abs, canon[k])) then
-          local u = false
-          for _, x in ipairs(unmask) do
-            if under(masks[k], x) or (canon[k] and under(canon[k], x)) then u = true break end
-          end
-          if not u then masked = masks[k] end
+          -- 遮蔽目标一律不可发布（硬遮蔽不随可写根/父目录放行而解除），故不参与 unmask。
+          masked = masks[k]
           break
         end
       end
@@ -3277,10 +3584,10 @@ end
 
 --- 异步批量分类真实路径（仅包/生成内容候选）：返回 Deferred resolve(结果数组，与 paths 对齐)。
 --- 线程池不可用时 resolve(nil)，调用方回退同步判定。
+--- 遮蔽判定**不带 unmask**（见 `_filter_unpublishable`：执行期解除遮蔽不等于可发布）。
 --- @param paths table 真实路径数组
---- @param unmask table|nil 本次 attempt 解除遮蔽的路径数组
 --- @return Deferred
-local function _classify_paths_async(paths, unmask)
+local function _classify_paths_async(paths)
   local work = require("NeoAI.utils.work")
   if not work.available() or #paths == 0 then return async.resolve(nil) end
   local runtime = require("NeoAI.sandbox.execution.runtime")
@@ -3308,7 +3615,6 @@ local function _classify_paths_async(paths, unmask)
     mask_canon = ctx.canon,
     store_root = ctx.store_root,
     store_root_canon = ctx.store_root_canon,
-    unmask = unmask or {},
     cwd = cwd,
     home = home,
   })
@@ -3703,7 +4009,6 @@ end
 --- @return table dropped { masked=number, volatile=number, git=number, self=number, *_paths=table }
 local function _filter_unpublishable(files, attempt, classify)
   local runtime = require("NeoAI.sandbox.execution.runtime")
-  local unmask = attempt and attempt.effective_unmask or nil
   local is_pkg = _is_package_candidate(files, attempt)
   local volatile = is_pkg and _volatile_matcher() or nil
   local out = {}
@@ -3717,8 +4022,11 @@ local function _filter_unpublishable(files, attempt, classify)
       masked = c.masked or false
     else
       -- 无预分类（非包候选/线程池不可用/路径缺失）时回退主线程完整解析。
+      -- **不带 unmask**：执行期解除遮蔽（包安装可写根 `/etc`、审批放行目录）只允许沙箱内写入，
+      -- 发布阶段对遮蔽目标一律硬拒绝（`publish` 的 `SANDBOX_MASKED_TARGET`）。若在此按 unmask
+      -- 保留，候选会永远无法发布 → 整单元反复「应用失败」（实测 `/etc/ld.so.preload`）。
       gc = runtime.git_path_class(f.path)
-      masked = runtime.is_masked_path(f.path, unmask) or false
+      masked = runtime.is_masked_path(f.path) or false
     end
     local is_obj_del = gc == "object" and _is_delete_action(f.action)
     local is_node_retire = (f.action == "retire")
@@ -3862,6 +4170,8 @@ function M.finish(attempt_id, prefetch, classify, skip_base_blobs)
   -- 条目数再超上限则跳过并留一条告警。0 = 不限制。
   local total_cap = tonumber(require("NeoAI.kernel.config_store").get("tools.sandbox.capture_max_bytes")) or 0
   local count_cap = tonumber(require("NeoAI.kernel.config_store").get("tools.sandbox.capture_max_files")) or 0
+  -- 内容是否允许内联（`inline_candidate_bytes`）；每次冻结只读一次配置（逐文件读会放大开销）。
+  local inline_enabled = _inline_enabled()
   local total_bytes, budget_dropped = 0, 0
   -- 条目数上限：超出部分不进入候选（其余文件改动仍在视图层，可手动复核）。
   -- 在遍历前裁剪映射，避免逐条分支都要判「跳过」（否则会把删除类误判成 retire）。
@@ -3919,7 +4229,15 @@ function M.finish(attempt_id, prefetch, classify, skip_base_blobs)
           after_hash = _stat_sig(full)
           blob = require("NeoAI.sandbox.state.store").copy_to_blob(entry.staged, entry.staged)
         end
-        if not entry.base_exists then
+        -- 未保存 buffer 的 save-all 基线（超大/预算转 blob 路径）：内容与基线一致则跳过。
+        local seeded_clean = false
+        if entry.buffer_seeded and entry.view_base_hash and not entry.base_exists then
+          local c = (pf and pf.content) or _read(entry.staged)
+          seeded_clean = c ~= nil and _sha(c) == entry.view_base_hash
+        end
+        if seeded_clean then
+          action = nil
+        elseif not entry.base_exists then
           action = "create"
         elseif entry.base_type == "file" then
           if entry.base_sig ~= after_hash then action = "modify"
@@ -3962,6 +4280,7 @@ function M.finish(attempt_id, prefetch, classify, skip_base_blobs)
       end)
     else
       local action, after_hash, content, blob, recursive, dir_sig
+      local buffered_clean = false
       if entry.base_type == "directory" then
         if staged_stat and staged_stat.type == "directory" then
           if not entry.base_exists then action = "mkdir" end
@@ -3984,14 +4303,27 @@ function M.finish(attempt_id, prefetch, classify, skip_base_blobs)
       else
         if staged_stat and staged_stat.type == "file" then
           if pf and pf.blob then
-            -- 包/生成内容：冻结阶段已磁盘化为 blob，不内嵌内容（发布时按文件解密/复制）。
+            -- worker 已在磁盘上写好 blob（内容从未回到 nvim）：只取元数据。
             blob = pf.blob
             after_hash = pf.after_hash
-          else
+          elseif inline_enabled then
             content = pf and pf.content or _read(entry.staged)
             after_hash = pf and pf.after_hash or _sha(content)
+          else
+            -- 内容不内联：worker 不可用（极少见）时在这里读一次（≤ cap）只为算哈希，
+            -- 随即同盘复制成 blob 并丢弃内容——不随候选常驻内存。
+            local raw = pf and pf.content or _read(entry.staged)
+            after_hash = pf and pf.after_hash or (raw ~= nil and _sha(raw) or nil)
+            blob = require("NeoAI.sandbox.state.store").copy_to_blob(entry.staged, entry.staged)
+            if not blob then content = raw end -- blob 复制失败：回退内联，绝不丢候选
           end
-          if not entry.base_exists then
+          -- 未保存 buffer 的 save-all 基线：内容与视图基线一致 = 命令/AI 都没改过它，
+          -- 不产生候选（含真实盘上不存在的新文件）。否则读取命令会把种子捕获成 AI 改动。
+          buffered_clean = entry.buffer_seeded and entry.view_base_hash
+            and after_hash == entry.view_base_hash or false
+          if buffered_clean then
+            action = nil
+          elseif not entry.base_exists then
             action = "create"
           else
             -- 包/生成内容用 `base_sig`（stat 签名）与 after_hash（同为 sig）比较；
@@ -4028,6 +4360,12 @@ function M.finish(attempt_id, prefetch, classify, skip_base_blobs)
               ws.real_hash = _sha(detok)
               ws.tokenized = (content ~= detok)
             end
+          elseif entry.tokenized ~= true and type(after_hash) == "string"
+            and after_hash:sub(1, 7) == "sha256:" then
+            -- 内容不内联（默认）：未 token 化的视图内容即真实内容，可直接复用候选哈希——
+            -- 否则 ws.real_hash 会停留旧值，让后续捕获把未改动文件当改动处理（候选膨胀）。
+            -- token 化的少数条目无法在此恢复真实内容，保持旧值（只影响改动判定，不影响正确性）。
+            ws.real_hash = after_hash
           end
         end
         files[#files + 1] = {
@@ -4050,7 +4388,7 @@ function M.finish(attempt_id, prefetch, classify, skip_base_blobs)
           content = ((action == "create" or action == "modify") and not blob) and content or nil,
           blob = ((action == "create" or action == "modify") and blob) or nil,
         }
-      elseif after_hash and not entry.base_sig then
+      elseif after_hash and not entry.base_sig and not buffered_clean then
         -- 单视图：暂存就是视图层，命令把内容还原成真实基线时视图本身已是最新（无需回写），
         -- 但必须**撤销该路径的待审候选**——否则审批窗里会残留一条「已被命令还原」的旧改动。
         if view.enabled() and view.is_native(entry.staged) then
@@ -4113,7 +4451,9 @@ function M.finish(attempt_id, prefetch, classify, skip_base_blobs)
   end
   -- 三方合并基线捕获（发布时间检测到外部改动时使用），须在过滤后避免为被剔除文件做无用读取。
   -- 异步冻结路径由调用方在 worker 线程完成（skip_base_blobs=true），不在这里阻塞主线程。
-  if not skip_base_blobs then _capture_base_blobs(files) end
+  -- 内容不内联模式（inline_candidate_bytes=0）：基线内容读进 nvim 就违背「沙箱文件不驻留
+  -- 内存」，故不捕获基线 blob，发布时按内容哈希做 CAS（外部改动 → 冲突提示，而非自动三方合并）。
+  if not skip_base_blobs and inline_enabled then _capture_base_blobs(files) end
   local manifest = {}
   for _, f in ipairs(files) do
     manifest[#manifest + 1] = { path = f.path, action = f.action, after_hash = f.after_hash }
@@ -4195,14 +4535,14 @@ local function _finish_worker(input, cap, sha_src, blob_dir, force_blob)
     local blob = ""
     if stat and stat.type == "file" then
       local within = cap <= 0 or (stat.size or 0) <= cap
-      if within and force_blob ~= "1" then
+      if within and force_blob ~= "1" and force_blob ~= "2" then
         -- 普通内容（小文件）：读入内容并哈希，供候选内嵌/变更判定。
         local f = io.open(assert(staged), "rb")
         if f then content = f:read("*a") or ""; f:close() end
         after_hash = "sha256:" .. sha(content)
       else
-        -- 超大文件 / 包生成内容（force_blob）：内容按文件复制为 blob（不读入 Lua 内存），
-        -- after_hash 用 stat 签名——避免对 venv/site-packages 等数千文件做纯 Lua SHA（CPU 热点）。
+        -- 超大文件 / 包生成内容（force_blob=1，stat 签名）/ 元数据模式（force_blob=2，
+        -- 内容只在 worker 内读取计算哈希、**不回传 nvim**）：内容按文件复制为 blob。
         local target = blob_dir ~= "" and (blob_dir .. "/" .. sha(staged)) or ""
         if target ~= "" then
           local ok = pcall(vim.uv.fs_copyfile, staged, target)
@@ -4212,15 +4552,28 @@ local function _finish_worker(input, cap, sha_src, blob_dir, force_blob)
             if stat.mode then pcall(vim.uv.fs_chmod, target, stat.mode % 4096) end
           end
         end
-        if within and force_blob == "1" and blob == "" then
-          -- 包内容 blob 复制不可用/失败：回退读取内容，绝不产生「无内容且无 blob」的候选。
+        if within and force_blob == "2" and blob ~= "" then
+          -- 元数据模式：在 worker 内读一次（≤ cap）只为内容哈希；raw 是本线程局部变量，
+          -- 函数返回即释放，绝不进入 nvim 主进程。
           local f = io.open(assert(staged), "rb")
-          if f then content = f:read("*a") or ""; f:close() end
-          after_hash = "sha256:" .. sha(content)
-        else
-          after_hash = (stat.mtime and string.format("sig:%s:%s:%s",
-            tostring(stat.mtime.sec), tostring(stat.mtime.nsec), tostring(stat.size)))
-            or ("sig:" .. tostring(stat.size or 0))
+          if f then
+            local raw = f:read("*a") or ""
+            f:close()
+            after_hash = "sha256:" .. sha(raw)
+            raw = nil
+          end
+        end
+        if after_hash == "" then
+          if within and (force_blob == "1" or force_blob == "2") and blob == "" then
+            -- blob 复制不可用/失败：回退读取内容，绝不产生「无内容且无 blob」的候选。
+            local f = io.open(assert(staged), "rb")
+            if f then content = f:read("*a") or ""; f:close() end
+            after_hash = "sha256:" .. sha(content)
+          else
+            after_hash = (stat.mtime and string.format("sig:%s:%s:%s",
+              tostring(stat.mtime.sec), tostring(stat.mtime.nsec), tostring(stat.size)))
+              or ("sig:" .. tostring(stat.size or 0))
+          end
         end
       end
     end
@@ -4271,7 +4624,9 @@ function M.finish_async(attempt_id, opts)
   local sha_src = require("NeoAI.utils.sha256").source
   local cap = _max_file_bytes()
   local blob_dir = require("NeoAI.sandbox.state.store").blobs_dir() or ""
-  local force_blob = opts.blob and "1" or "0"
+  -- force_blob：1 = 包/生成内容（stat 签名，省 SHA 成本）；2 = 内容不内联模式
+  -- （blob + 内容哈希，内容只在 worker 内读一次算哈希，绝不回传 nvim）。
+  local force_blob = opts.blob and "1" or (_inline_enabled() and "0" or "2")
   local function run_finish(classify)
     return work.batched(_chunk_list(entries, _work_chunk_files()), _work_parallelism(), function(chunk)
       return work.run(_finish_worker, _encode_entries(chunk), cap, sha_src, blob_dir, force_blob)
@@ -4291,6 +4646,8 @@ function M.finish_async(attempt_id, opts)
       end
       local cand = M.finish(attempt_id, prefetch, classify, true)
       if not cand then return cand end
+      -- 内容不内联模式：基线内容同样不读进 nvim（放弃自动三方合并，发布退回 CAS 冲突提示）。
+      if not _inline_enabled() then return cand end
       return _capture_base_blobs_async(cand.files):then_(function()
         return cand
       end)
@@ -4305,10 +4662,11 @@ function M.finish_async(attempt_id, opts)
   local need_classify = opts.classify == true or #entries >= classify_min
   if not need_classify then return run_finish(nil) end
   -- 分类（遮蔽/git/级别）在工作线程用原生 realpath 完成，主线程只消费结果。
+  -- **不传 unmask**：发布阶段对遮蔽目标一律硬拒绝（`SANDBOX_MASKED_TARGET`），执行期的
+  -- unmask 只影响「沙箱内能否写」，不该把文件留在候选里（否则整单元反复应用失败）。
   local paths = {}
   for i, entry in ipairs(entries) do paths[i] = entry.real end
-  local unmask = attempt.attempt and attempt.attempt.effective_unmask or nil
-  return _classify_paths_async(paths, unmask):then_(function(cls)
+  return _classify_paths_async(paths, nil):then_(function(cls)
     if not cls then return run_finish(nil) end
     local map = {}
     for i, entry in ipairs(entries) do
@@ -4955,17 +5313,25 @@ function M.publish(candidate, opts)
           if base_raw == nil or ours == nil then
             return { ok = false, state = "CONFLICT", reason = "BASELINE_CHANGED: " .. f.path }
           end
-          local res = merge_mod.merge(base_raw, ours, assert(cur))
-          if res.ok then
-            merged_paths[f.path] = res.merged
-          elseif res.too_large then
-            -- 文件过大无法合并：回退 CAS 拒绝（保持整单元不部分写入）。
-            return { ok = false, state = "CONFLICT", reason = "BASELINE_CHANGED: " .. f.path }
+          if ours == cur then
+            -- 幂等（内容口径）：真实内容**就是**候选结果。典型来源是同一改动已经由另一变更
+            -- 单元（或本单元的部分应用）落盘——例如同一轮里 edit_file 与命令捕获各产生一条
+            -- 同名候选。此时既不该写盘，更不该报「三方合并失败」（外部改动未被覆盖）；
+            -- 不依赖 `after_hash` 的形式（内容哈希/stat 签名/缺失）也能收敛。
+            skip_paths[f.path] = true
           else
-            return {
-              ok = false, state = "CONFLICT", reason = "MERGE_CONFLICT: " .. f.path,
-              conflicts = { { path = f.path, base = base_raw, ours = ours, theirs = cur } },
-            }
+            local res = merge_mod.merge(base_raw, ours, assert(cur))
+            if res.ok then
+              merged_paths[f.path] = res.merged
+            elseif res.too_large then
+              -- 文件过大无法合并：回退 CAS 拒绝（保持整单元不部分写入）。
+              return { ok = false, state = "CONFLICT", reason = "BASELINE_CHANGED: " .. f.path }
+            else
+              return {
+                ok = false, state = "CONFLICT", reason = "MERGE_CONFLICT: " .. f.path,
+                conflicts = { { path = f.path, base = base_raw, ours = ours, theirs = cur } },
+              }
+            end
           end
         end
       elseif f.link then

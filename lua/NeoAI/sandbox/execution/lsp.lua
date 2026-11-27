@@ -27,6 +27,10 @@ local M = {}
 local clones = {}
 -- 空闲保活：每个克隆最后一次取用的单调时刻（ms）。超过 idle_timeout_ms 未再取用即回收。
 local last_used = {}
+-- NeoAI 自主启动的 plain 回退客户端 id（非编辑器客户端，不得作为克隆母体）。
+-- 注意：必须在此声明为 local——`_editor_clients` 在定义前即引用它，缺失会抛
+-- `attempt to index nil`（历史缺陷）。
+local plain_started = {}
 
 -- ========== 私有函数 ==========
 
@@ -286,6 +290,16 @@ local function _editor_clients(bufnr)
     if not _is_clone(c.name) and not plain_started[c.id] then out[#out + 1] = c end
   end
   return out
+end
+
+--- 用户自己的编辑器 LSP 客户端（排除 AI 沙箱克隆与 plain 回退客户端）。
+--- 供 `#{lsp}` 上下文引用展示「用户的 LSP 信息」（不暴露 AI 克隆）。
+--- @param bufnr number
+--- @return table[]
+function M.user_clients(bufnr)
+  if type(bufnr) ~= "number" or not vim.api.nvim_buf_is_valid(bufnr) then return {} end
+  local ok, list = pcall(_editor_clients, bufnr)
+  return ok and list or {}
 end
 
 --- 基于编辑器客户端构造沙箱克隆配置；cmd 无法包装（函数式 / overlay 不可用）时返回 nil。

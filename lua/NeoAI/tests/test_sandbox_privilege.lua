@@ -129,7 +129,7 @@ tests.suite("sandbox_privilege", function(_, it)
     vim.fn.delete(dir, "rf")
   end)
 
-  it("加固：is_masked_path 支持本次 attempt 的 unmask（档位/审批放行）", function(t)
+  it("加固：is_masked_path 支持本次 attempt 的 unmask（档位/审批放行，仅精确命中）", function(t)
     local runtime = require("NeoAI.sandbox.execution.runtime")
     local fs = require("NeoAI.utils.fs")
     local dir = vim.fn.tempname()
@@ -139,8 +139,32 @@ tests.suite("sandbox_privilege", function(_, it)
     with_config({ tools = { sandbox = { mask_paths = { file } } } }, function()
       t.eq(file, runtime.is_masked_path(file), "默认应命中")
       t.nil_(runtime.is_masked_path(file, { file }), "unmask 精确命中应放行")
-      t.nil_(runtime.is_masked_path(file, { dir }), "unmask 祖先命中应放行")
+      -- 父目录级放行（可写根/包安装的 `/etc`、审批放行某个目录）**不**连带解除其下的硬遮蔽：
+      -- 否则 `/etc/shadow`、`/etc/ld.so.preload` 会被一并放开，并产出发布阶段必然被拒的候选
+      -- （`SANDBOX_MASKED_TARGET` → 反复「应用失败」）。
+      t.eq(file, runtime.is_masked_path(file, { dir }), "unmask 祖先命中不应解除硬遮蔽")
       t.eq(file, runtime.is_masked_path(file, { "/tmp/neoai_other" }), "无关 unmask 不应放行")
+    end)
+    vim.fn.delete(dir, "rf")
+  end)
+
+  it("加固：可写根（包安装 /etc）不解除其下的硬遮蔽条目", function(t)
+    local runtime = require("NeoAI.sandbox.execution.runtime")
+    local fs = require("NeoAI.utils.fs")
+    local dir = vim.fn.tempname()
+    fs.ensure_dir(dir)
+    local shadow = dir .. "/shadow"
+    local preload = dir .. "/ld.so.preload"
+    fs.write_file(shadow, "root:x:0:0")
+    fs.write_file(preload, "")
+    with_config({ tools = { sandbox = { mask_paths = { shadow, preload } } } }, function()
+      -- 包安装把整个目录列为可写根（等价于 unmask = { dir }）：
+      -- 包管理器能写进去（由 `_masked_paths` 的 writable-root 处理），但遮蔽条目本身仍在，
+      -- 冻结阶段据此剔除、发布阶段据此硬拒绝——不会产出无法发布的候选。
+      t.eq(shadow, runtime.is_masked_path(shadow, { dir }), "可写根不应解除 shadow 遮蔽")
+      t.eq(preload, runtime.is_masked_path(preload, { dir }), "可写根不应解除 ld.so.preload 遮蔽")
+      -- 显式逐条放行仍然有效（privilege.sysadmin/package 的 unmask 就是这种形态）。
+      t.nil_(runtime.is_masked_path(shadow, { shadow }), "逐条放行应解除 shadow 遮蔽")
     end)
     vim.fn.delete(dir, "rf")
   end)
@@ -1093,28 +1117,33 @@ tests.suite("sandbox_privilege", function(_, it)
     local p = dir .. "/cfg.env"
     with_config({ tools = { approval = { mode = "async" }, sandbox = { mode = "dry_run", review = { enabled = true } } } }, function()
       sandbox.reset()
-      local done = false
+      local done, failure = false, nil
       require("NeoAI.tools").execute("edit_file", {
         file_path = p, mode = "write", content = "KEY=" .. fake .. "\n", description = "t",
       }, {}):then_(function()
-        local items = sandbox.list_reviews({ review_state = "PENDING" })
-        local found
-        for _, rev_item in ipairs(items) do
-          for _, f in ipairs(rev_item.files or {}) do if f.path == p then found = rev_item end end
-        end
-        t.not_nil(found, "应产生待审变更单元")
-        t.true_(found.secret_warning and found.secret_warning.count > 0, "应带密钥操作警告")
-        local res = sandbox.apply(found.change_set_id, { auto_approve = true })
-        t.true_(res.ok, tostring(res.reason))
-        local content = fs.read_file(p) or ""
-        t.true_(content:find(fake, 1, true) ~= nil, "真实文件应还原为原始密钥")
-        t.true_(not secret.has_token(content), "真实文件不应残留 token")
+        local oks, cerr = pcall(function()
+          local items = sandbox.list_reviews({ review_state = "PENDING" })
+          local found
+          for _, rev_item in ipairs(items) do
+            for _, f in ipairs(rev_item.files or {}) do if f.path == p then found = rev_item end end
+          end
+          t.not_nil(found, "应产生待审变更单元")
+          t.true_(found.secret_warning and found.secret_warning.count > 0, "应带密钥操作警告")
+          local res = sandbox.apply(found.change_set_id, { auto_approve = true })
+          t.true_(res.ok, tostring(res.reason))
+          local content = fs.read_file(p) or ""
+          t.true_(content:find(fake, 1, true) ~= nil, "真实文件应还原为原始密钥")
+          t.true_(not secret.has_token(content), "真实文件不应残留 token")
+        end)
+        if not oks then failure = type(cerr) == 'table' and tostring(cerr.message) or tostring(cerr) end
         done = true
       end, function(e)
-        t.true_(false, "不应失败: " .. tostring(e and e.message or e))
+        -- 先记录再断言：在异步回调里断言抛错会被 Deferred 的 pcall 吞掉，只表现为超时。
+        failure = tostring(e and (e.message or e) or e)
         done = true
       end)
-      t.true_(vim.wait(5000, function() return done end), "edit_file 应完成")
+      t.true_(vim.wait(15000, function() return done end), "edit_file 应完成")
+      t.nil_(failure, "edit_file 不应失败")
     end)
     vim.fn.delete(dir, "rf")
     secret.reset()

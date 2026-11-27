@@ -376,7 +376,8 @@ tests.suite("sandbox_session", function(_, it)
         require("NeoAI.tools").execute("run_command", { command = "id -u", description = "t" }, {})
           :then_(function(r) out = tostring(r); done = true end,
             function(e) out = "ERR:" .. tostring(e and e.message or e); done = true end)
-      t.true_(vim.wait(10000, function() return done end), "命令应完成")
+      -- 首次常驻/setpriv 启动在容器/重负载下可能 >10s；等待只用于断言完成。
+      t.true_(vim.wait(30000, function() return done end), "命令应完成")
       t.matches("65534", out, "载荷应以 uid 65534 运行（实际: " .. tostring(out) .. "）")
       -- 会话 shell 状态目录须可被非 root 载荷写入（cwd/env），否则命令会报
       -- `cannot create .../cwd: Permission denied`。

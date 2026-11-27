@@ -12,11 +12,12 @@ local PACK_ORDER = {
   git = 3,
   treesitter = 4,
   lsp = 5,
-  log = 6,
-  agent = 7,
-  mcp = 8,
-  skill = 9,
-  web = 10,
+  editor = 6,
+  log = 7,
+  agent = 8,
+  mcp = 9,
+  skill = 10,
+  web = 11,
 }
 
 -- ========== 公开 API ==========
@@ -62,6 +63,7 @@ function M.get_pack_for_tool(tool_name)
     lsp_diagnostics = "lsp", lsp_client_info = "lsp",
     lsp_signature_help = "lsp", lsp_completion = "lsp",
     lsp_type_definition = "lsp", lsp_service_info = "lsp", lsp_check = "lsp",
+    nvim = "editor",
     log_message = "log", get_log_levels = "log",
     create_sub_agent = "agent", get_sub_agent_status = "agent",
     cancel_sub_agent = "agent", send_sub_agent_message = "agent",
@@ -98,6 +100,7 @@ function M.pack_display_name(category)
     git = "Git",
     treesitter = "语法树",
     lsp = "LSP",
+    editor = "编辑器",
     log = "日志",
     agent = "子 Agent",
     mcp = "MCP",

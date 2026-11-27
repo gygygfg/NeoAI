@@ -311,6 +311,8 @@ local ask_user_tools = {}
 ask_user_tools.ask_user = helpers.define_tool(
   "ask_user",
   "向用户提问并等待回答（澄清需求/确认意图/缺关键信息时）。question 必填；options 可选（供快速选择）。"
+    .. "子 Agent 调用时不会直接弹窗：问题会包装成消息转交主 Agent，由主 Agent 决定直接回答"
+    .. "（send_sub_agent_message）还是继续询问用户。"
     .. "**一次调用只问一个问题**：question 必须是单一问题，options 全部属于该问题；"
     .. "需要问多个问题时，请分多次调用本工具（每个问题一次调用，可同轮并行发起），"
     .. "同轮的多次调用会聚合为一个多 Tab 弹窗、逐题作答；"
@@ -374,6 +376,54 @@ ask_user_tools.ask_user = helpers.define_tool(
     end
 
     local agent = ctx and ctx.agent
+    -- 子 Agent：不直接弹窗。问题经系统包装转交主 Agent，由主 Agent 决定直接回答
+    -- （send_sub_agent_message）还是先 ask_user 询问用户。等待期间暂停活跃计时器（无超时）。
+    if ctx and ctx.is_sub_agent and ctx.sub_agent_id then
+      local bridge = require("NeoAI.kernel.core_bridge")
+      local manager = bridge.sub_agent and bridge.sub_agent()
+      if not (manager and type(manager.ask_parent) == "function") then
+        on_error({ kind = "sub_agent", message = "子 Agent 提问不可用（管理器未就绪）" })
+        return
+      end
+      local settled = false
+      local unsub = nil
+      local function settle(ok, value)
+        if settled then return end
+        settled = true
+        if unsub then pcall(unsub); unsub = nil end
+        if ctx.timer and ctx.timer.resume then pcall(ctx.timer.resume, ctx.timer) end
+        event_bus.emit(events.ASK_USER_ANSWERED, { agent_id = agent and agent.id })
+        if ok then on_success(value) else on_error(value) end
+      end
+      -- 等待主 Agent 回答期间不累计活跃耗时、不消耗超时预算（先暂停，失败再恢复）。
+      if ctx.timer and ctx.timer.pause then pcall(ctx.timer.pause, ctx.timer) end
+      local qid, qerr = manager.ask_parent(ctx.sub_agent_id, {
+        question = question,
+        options = options,
+        multi_select = args.multi_select == true,
+        agent_id = agent and agent.id,
+        on_success = function(v) settle(true, v) end,
+        on_error = function(e) settle(false, e) end,
+      })
+      if not qid then
+        if not settled then
+          if ctx.timer and ctx.timer.resume then pcall(ctx.timer.resume, ctx.timer) end
+          on_error({ kind = "sub_agent", message = tostring(qerr or "无法向主 Agent 提问") })
+        end
+        return
+      end
+      -- 极端情况：ask_parent 同步失败/回答（测试注入），已结算则不再登记等待。
+      if settled then return end
+      event_bus.emit(events.ASK_USER_WAITING, { agent_id = agent and agent.id })
+      local signal = ctx.signal
+      if signal and signal.subscribe then
+        unsub = signal:subscribe(function(reason)
+          manager.cancel_question(qid, "子 Agent 已中止（" .. tostring(reason or "aborted") .. "）")
+        end)
+      end
+      return
+    end
+
     local inv = {
       question = question,
       options = options,

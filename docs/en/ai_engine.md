@@ -179,7 +179,7 @@ a round is automatically resent with a continuation nudge (`ai.truncation.nudge`
 - Tools are output in lexicographic order by name: deterministic → an identical tool set is byte-for-byte identical across requests, which is prefix-cache friendly.
 - An empty `properties` omits that field (DeepSeek rejects `[]` schemas).
 - Environment probing comes first (`tools.environment.filter_tools`): related tools are disabled when the workspace/git directory cannot be obtained.
-- Plan mode (`plan_mode.apply_tool_filter`): keep only read-only/information-query tools + `run_command` (read-only research) + `ask_user`.
+- Plan mode (`plan_mode.apply_tool_filter`): draft mode filters by capability ceiling (write tools available; host-level/untrusted tools rejected); without async staging keep only read-only/information-query tools + `run_command` (read-only research) + `ask_user`.
 
 ### 4.3 Single Tool Execution (_execute_single)
 

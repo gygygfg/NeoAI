@@ -116,6 +116,34 @@ tests.suite("sandbox_merge", function(_, it)
     vim.fn.delete(dir, "rf")
   end)
 
+  it("幂等按内容判定：after_hash 为 stat 签名/缺失时也不写盘、不报合并冲突", function(t)
+    local store, fs, dir = setup()
+    local base = "a\nb\nc\n"
+    local ours = "a\nB\nc\n"
+    local p = dir .. "/idem_sig.txt"
+    fs.write_file(p, ours) -- 同一改动已由另一单元落盘
+    local writer = require("NeoAI.sandbox.execution.writer")
+    for _, after in ipairs({ "sig:1:2:6", nil }) do
+      local apply_calls = 0
+      local orig_apply = writer.apply
+      writer.apply = function(...)
+        apply_calls = apply_calls + 1
+        return orig_apply(...)
+      end
+      local cand = build_modify(fs, dir, "idem_sig.txt", base, ours)
+      cand.files[1].after_hash = after
+      local ok, res = pcall(require("NeoAI.sandbox.execution.candidate").publish, cand)
+      writer.apply = orig_apply
+      t.true_(ok, "发布不应报错: " .. tostring(res))
+      t.true_(res.ok, ("after_hash=%s 时内容已落盘应幂等成功: %s"):format(
+        tostring(after), tostring(res.reason)))
+      t.eq(0, apply_calls, "内容已是候选结果时不应再走写入")
+      t.eq(ours, fs.read_file(p), "真实内容不得改动")
+    end
+    store.reset()
+    vim.fn.delete(dir, "rf")
+  end)
+
   it("无 base_blob：仍走严格 CAS（基线变了即冲突）", function(t)
     local store, fs, dir = setup()
     local base = "a\nb\nc\n"
@@ -225,6 +253,92 @@ tests.suite("sandbox_merge", function(_, it)
     t.true_(got:find("A=10\n", 1, true) ~= nil, "应保留外部改动 A=10")
     t.true_(got:find("C=30\n", 1, true) ~= nil, "应保留我方改动 C=30")
     secret.reset()
+    store.reset()
+    vim.fn.delete(dir, "rf")
+  end)
+
+  it("异步冻结：空文件基线也捕获 base（空内容不是读取失败）", function(t)
+    local store = require("NeoAI.sandbox.state.store")
+    local fs = require("NeoAI.utils.fs")
+    local config_store = require("NeoAI.kernel.config_store")
+    local store_root = fs.canonical(vim.fn.tempname())
+    fs.ensure_dir(store_root)
+    store.init(store_root)
+    local prev_ws = config_store.get("tools.sandbox.workspace_root")
+    config_store.set("tools.sandbox.workspace_root", store_root .. "/sb")
+    -- 三方合并基线内容需要「内容内联」模式才捕获（默认 inline_candidate_bytes=0 时
+    -- 基线内容不读进内存，发布退回 CAS 冲突提示）。本用例专门验证 base blob 捕获。
+    local prev_inline = config_store.get("tools.sandbox.inline_candidate_bytes")
+    config_store.set("tools.sandbox.inline_candidate_bytes", 8 * 1024 * 1024)
+    local sandbox = require("NeoAI.sandbox")
+    local candidate = require("NeoAI.sandbox.execution.candidate")
+    local control = require("NeoAI.sandbox.execution.control")
+    sandbox.reset()
+    local dir = fs.canonical(vim.fn.tempname())
+    fs.ensure_dir(dir)
+    local p = dir .. "/empty.txt"
+    fs.write_file(p, "") -- 冻结时基线是空文件
+    local a = control.new_attempt("run_command", {}, {}, { effect = "process" })
+    candidate.begin(a, assert(store.root()))
+    local staged = candidate.stage_path(a.attempt_id, p)
+    t.not_nil(staged, "应有暂存路径")
+    fs.write_file(staged, "new\n")
+    local cand = t.await(candidate.finish_async(a.attempt_id), 20000)
+    t.not_nil(cand, "应冻结出候选")
+    local entry = cand and cand.files and cand.files[1]
+    t.not_nil(entry, "应有文件条目")
+    t.eq("modify", entry and entry.action, "应判定为 modify")
+    -- 空基线必须落成 merge base：否则发布阶段只能静默回退 CAS（BASELINE_CHANGED），
+    -- 外部一并改动时无冲突详情可交给 AI 重做。
+    t.not_nil(entry and entry.base_blob, "空文件基线也应捕获 merge base")
+    t.eq("", entry and (entry.base_blob and fs.read_file(entry.base_blob) or nil) or nil,
+      "base blob 内容应为空串")
+    candidate.cleanup(a.attempt_id)
+    config_store.set("tools.sandbox.workspace_root", prev_ws)
+    config_store.set("tools.sandbox.inline_candidate_bytes", prev_inline)
+    sandbox.reset()
+    store.reset()
+    vim.fn.delete(dir, "rf")
+  end)
+
+  it("默认（不内联）：候选只带元数据 + blob，不捕获 merge base（回退 CAS）", function(t)
+    local store = require("NeoAI.sandbox.state.store")
+    local fs = require("NeoAI.utils.fs")
+    local config_store = require("NeoAI.kernel.config_store")
+    local store_root = fs.canonical(vim.fn.tempname())
+    fs.ensure_dir(store_root)
+    store.init(store_root)
+    local prev_ws = config_store.get("tools.sandbox.workspace_root")
+    local prev_inline = config_store.get("tools.sandbox.inline_candidate_bytes")
+    config_store.set("tools.sandbox.workspace_root", store_root .. "/sb")
+    config_store.set("tools.sandbox.inline_candidate_bytes", 0)
+    local sandbox = require("NeoAI.sandbox")
+    local candidate = require("NeoAI.sandbox.execution.candidate")
+    local control = require("NeoAI.sandbox.execution.control")
+    sandbox.reset()
+    local dir = fs.canonical(vim.fn.tempname())
+    fs.ensure_dir(dir)
+    local p = dir .. "/f.txt"
+    fs.write_file(p, "old\n")
+    local a = control.new_attempt("run_command", {}, {}, { effect = "process" })
+    candidate.begin(a, assert(store.root()))
+    local staged = candidate.stage_path(a.attempt_id, p)
+    t.not_nil(staged, "应有暂存路径")
+    fs.write_file(staged, "new\n")
+    local cand = t.await(candidate.finish_async(a.attempt_id), 20000)
+    t.not_nil(cand, "应冻结出候选")
+    local entry = cand and cand.files and cand.files[1]
+    t.not_nil(entry, "应有文件条目")
+    t.eq("modify", entry and entry.action)
+    t.nil_(entry and entry.content, "内容不得内联进内存")
+    t.not_nil(entry and entry.blob, "内容应磁盘化为 blob")
+    t.eq("new\n", entry and entry.blob and (fs.read_file(entry.blob) or "") or "",
+      "blob 应为视图内容（同盘复制）")
+    t.nil_(entry and entry.base_blob, "不内联模式不捕获 base blob（发布回退 CAS 冲突提示）")
+    candidate.cleanup(a.attempt_id)
+    config_store.set("tools.sandbox.workspace_root", prev_ws)
+    config_store.set("tools.sandbox.inline_candidate_bytes", prev_inline)
+    sandbox.reset()
     store.reset()
     vim.fn.delete(dir, "rf")
   end)

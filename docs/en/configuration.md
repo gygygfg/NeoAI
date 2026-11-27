@@ -161,12 +161,13 @@ context_cache = {
 | `split` | `{size=80, direction="right", max_ratio=0.5, min_rest=20}` | split window: `direction` is `right`/`left`/`top`/`bottom`; `size` is the desired size (columns for left/right, rows for top/bottom), clamped to `min(floor(screen cols\|rows × max_ratio), screen cols\|rows - min_rest - 1)` and then by `size`, so it never fills the screen and squeezes the original window away. Default `max_ratio=0.5`: the NeoAI window takes at most half the screen while the original window keeps at least 20 columns/rows |
 | `colors` | Per-segment highlights | User/AI/reasoning/title colors |
 | `tree` | `{foldenable=false, ...auto_close_on_select=true}` | Session tree folding/auto-close |
-| `input_box` | `{idle_height=1, min_height=5, max_ratio=0.8, hash_completion={enabled=true, max_chars=2000, max_bytes=20000}}` | Input box height (idle/focused/growth cap). `hash_completion` enables `#` context placeholders in the input box: typing `#` offers candidates (`#{buffers}` / `#{tool}` / `#{lsp}` …), inserted placeholders are highlighted with `NeoAIHashPlaceholder`, and they are only expanded **right before sending**; `max_chars` caps `#{message}`/`#{notify}` by **character count** (CJK safe), `max_bytes` caps other expansions (UTF-8 safe truncation); `enabled=false` disables everything (no completefunc / cmp source / highlight autocmds) |
+| `input_box` | `{idle_height=1, min_height=5, max_ratio=0.8, hash_completion={enabled=true, max_chars=2000, max_bytes=20000, lsp_max_messages=30}}` | Input box height (idle/focused/growth cap). `hash_completion` enables `#` context placeholders in the input box: typing `#` offers candidates, inserted placeholders are highlighted with `NeoAIHashPlaceholder`, and they are only expanded **right before sending**. `#{buffer}`/`#{lsp}` now hand over only a buffer object and the user's LSP info (no content, no object for `lsp`); the AI queries live data via the `nvim`/`lsp_*` tools. `lsp_max_messages` caps inlined `#{lsp}` diagnostics. `max_chars` caps `#{message}`/`#{notify}` by **character count** (CJK safe), `max_bytes` caps other expansions (UTF-8 safe truncation); `enabled=false` disables everything |
+| `pending_diff` | `{enabled=true, max_bytes=1048576, debounce_ms=200, virtual_added_lines=20, auto=true}` | Read-only in-buffer decoration of pending sandbox changes when a file is opened (line highlight + sign + `virt_lines` for pure additions); only real AI/command deltas are shown, the user's own unsaved input (save-all baseline) is never reported. `auto=false` disables automatic decoration; `:NeoAI diff` still opens the full comparison; files over `max_bytes` get a notice instead of a diff. See [ui_system.md](ui_system.md) |
 | `command_hint` | `{enabled=true}` | Sub-command hints for `:NeoAI <subcommand>`: reuses nvim-cmp + cmp-cmdline when installed (registers the `neoai_cmd` source with detail/documentation), otherwise falls back to a built-in float listing `name — description`; `enabled=false` is a no-op. No third-party dependency is introduced |
 | `chat` | `{mousescroll_max_blank=3, incremental=true, fold="reasoning_tools", process_keep_steps=3}` | Same scrolling/incremental options as above; `fold` selects the folding level: `none` (no folds) / `reasoning_tools` (current behavior: reasoning and tool blocks fold) / `process` (additionally folds the AI intermediate steps of each turn into a “process” fold whose text shows folded rounds, tool success/failure counts, input/output tokens, and cache hit rate; the Step marker is appended to the reasoning/tool fold text as `· Step N` while the role header appears only on role switches as a plain `🤖 AI`; the “process” fold is level 1 while the reasoning/tool blocks inside it are level 2 nested folds, so they stay collapsed when it is expanded; a user message inserted while the AI is running does not start a new turn — Step numbering continues and the segment before the insertion is folded entirely); user and AI messages are both left-aligned (fixed behavior, no config switch); `process_keep_steps` keeps the most recent N intermediate steps expanded **while the current turn is running** (decided only by whether the agent is still working on this turn; a non-empty pending queue does not count; once the turn ends all intermediate steps are folded and only the final step stays expanded) |
 | `ask_user` | `{batch_debounce_ms=25, require_confirm=true}` | User-question popup: `batch_debounce_ms` is the debounce window (ms) for aggregating multiple questions within the same round (covers sibling-call arrival timing; larger aggregates more but delays the first popup); `require_confirm` controls whether a summary page is shown for a second confirmation after all questions are answered (`false` submits directly). The popup collapses to a small top-right window when focus leaves and expands when focused again |
 | `trajectory` | `{log_dir=".../NeoAI/logs"}` | Log directory for the trajectory display mode |
-| `statusline` | `{enabled=true, winbar=true, parts={mode,model,usage,cache,capacity,sandbox}, separator=" ", colors=...}` | lualine statusline; the `sandbox` part shows `待审N` when pending reviews > 0 (`N` is the total number of pending **files**, since the approval unit is a single file), linked to the prominent `NeoAISandboxPending` highlight group by default (bold yellow, override via `colors.sandbox`); when the pending queue contains an **L3 (high-risk)** item, the part appends `⚠危险` and switches to the red `NeoAISandboxDanger` group (override via `colors.sandbox_danger`); when **outside-workspace traces** exist, the part appends `越界N` (`N` = distinct file count; both shown side by side, e.g. `待审2 越界3`); the `usage` part shows **session-cumulative** input/output tokens (`↑` total input, `↓` total output; it no longer jumps with a single request); the `cache` part follows `cache_mode` with **two decimals**: `both` (default) renders `hit latest(cumulative)` (e.g. `命中99.52%(会话94.55%)`, where the first value reflects current prefix-cache quality and the parenthesized one is the provider billing aggregate), `latest` shows only the most recent request, and `cumulative` keeps the legacy session-cumulative value (e.g. `命中95.32%`; also used as fallback when no per-request data exists); the `capacity` part shows the context **usage ratio** (used / window, starting at `0%` and growing as it fills, e.g. `占用42%`), tinted by level (`capacity_warn` / `capacity_over`) and rendered as `上下文超限` once over the limit |
+| `statusline` | `{enabled=true, winbar=true, parts={mode,model,usage,cache,capacity,sandbox}, separator=" ", colors=...}` | lualine statusline; the `sandbox` part shows `待审N` when pending reviews > 0 (`N` is the total number of pending **files**, since the approval unit is a single file), linked to the prominent `NeoAISandboxPending` highlight group by default (bold yellow, override via `colors.sandbox`); when the pending queue contains an **L3 (high-risk)** item, the part appends `⚠危险` and switches to the red `NeoAISandboxDanger` group (override via `colors.sandbox_danger`); when **outside-workspace traces** exist, the part appends `越界N` (`N` = distinct file count; both shown side by side, e.g. `待审2 越界3`); the `usage` part shows the **main session + all direct sub-agent sessions** cumulative input/output tokens (`↑` total input, `↓` total output; it no longer jumps with a single request — live sub-agents are read in real time, completed sub-agents after a session reload come from the persisted sub-session usage, and sub-agents under forked branches are excluded); the `cache` part follows `cache_mode` with **two decimals**: `both` (default) renders `hit latest(total cumulative)` (e.g. `命中99.52%(总计94.55%)`, where the first value is the most recent request across the main/sub agents and reflects current prefix-cache quality, while the parenthesized value is the provider billing aggregate for the whole session tree, **token-weighted** rather than an average of per-agent ratios), `latest` shows only the most recent request, and `cumulative` keeps the legacy total-cumulative value (e.g. `命中95.32%`; also used as fallback when no per-request data exists); the `capacity` part shows the context **usage ratio** (used / window, starting at `0%` and growing as it fills, e.g. `占用42%`), tinted by level (`capacity_warn` / `capacity_over`) and rendered as `上下文超限` once over the limit |
 
 > **Narrow-screen padding (no config)**: based on the chat main window width, a floating window fills that window
 > when width `< 40`, keeps 5 cols on each side when `40 ≤ width < 100`, and stays screen-ratio centered when
@@ -222,8 +223,21 @@ session = {
   --   file: file name; max_bytes: injection cap (UTF-8 safe truncation with a marker)
   -- Note: AI updates to AGENTS.md still go through the usual sandbox approval.
   agents_md = { enabled = true, file = "AGENTS.md", max_bytes = 64 * 1024, auto_allow_read = true },
+  -- Crash auto-recovery: after the host is OOM-killed/SIGKILLed, the next start detects an
+  -- "unclean shutdown", reclaims the dead process's sandbox instance (candidates/blob/view) and
+  -- reopens the most recent interrupted sessions. Messages are persisted per tool-loop round, so
+  -- at worst the round in flight is lost.
+  --   auto_open: how many interrupted sessions to reopen at startup (0 = notify only); never
+  --              auto-continues a turn (no surprise token spend).
+  --   reclaim_sandbox: equivalent to running :NeoAI SandboxGC at startup.
+  recovery = { enabled = true, auto_open = 1, reclaim_sandbox = true, notify = true },
 }
 ```
+
+> Detection: a clean nvim exit removes `state/alive-<pid>.json`; SIGKILL/OOM leaves it behind.
+> At startup a leftover marker whose pid is dead (or whose `boot_id` changed) marks a crash; stale
+> markers under `~/.cache/nvim/NeoAI/state` are cleaned up. `:NeoAI Recover` runs the same flow
+> on demand (and resets the sub-process circuit breakers).
 
 ### 2.5 `tools`
 
@@ -236,13 +250,14 @@ session = {
 | `output_guard` | `{enabled=true, max_chars=20000, head_chars=14000, tail_chars=4000, spill=true, spill_dir="neoai-out"}` | Tool-output **AI-context cap**: when the text returned by `run_command` + read-only `git_*` + `read_file` exceeds `max_chars` (characters), only the head `head_chars` + a truncation marker + the tail `tail_chars` are returned, and the full output is written to the sandbox-private `/tmp/<spill_dir>/` (default `/tmp/neoai-out/…`; the marker gives the path, readable back in segments via `read_file` `start_line`/`end_line`). `head_chars+tail_chars` must be `< max_chars` (otherwise auto-rescaled). `spill=false` truncates without spilling; with no sandbox (no `/tmp` mapping) it degrades to truncation only. `enabled=false` disables the cap (only hard limits such as `run_command.max_output_bytes` remain). Separate from `max_output_bytes` (the 16 MiB anti-freeze hard kill protecting the main thread) |
 | `search_files` | `{max_file_bytes=8388608}` | Per-file scan cap (bytes) during search; larger files and binaries (containing NUL) are skipped to avoid OOM |
 | `run_command` | `{max_output_bytes=16777216, max_wall_ms=0, interactive={enabled=true, engine="auto", poll_ms=80, show_window="on_wait", show_window_delay_ms=2000, judge={enabled=true, model=nil, max_rounds=12, timeout_ms=120000, output_tail_lines=80}}}` | Combined stdout/stderr cap (bytes): beyond it the command is truncated and terminated, so huge outputs cannot freeze the main thread with line-by-line processing; 0 = unlimited. `max_wall_ms>0` is a wall-clock safety net: the command may run at most that many milliseconds (also bounding `timeout_ms=-1` "unlimited" commands) and is then truly killed via the sandbox resource domain; 0 = unlimited. `interactive` (**on by default**): `run_command` runs under a **PTY** and polls `/proc` to detect "process blocked reading the terminal = waiting for input" (an OS-level signal, not text matching; consecutive reads are distinguished via `/proc/<pid>/io` `rchar` growth). Each wait is answered by a **judge** (**a single-turn LLM request**: the model returns `{"action":"text"|"keys"|"kill"|"none",...}` JSON, which directly injects text/keys or ends the process; no sub-agent, no tool loop) or by the user (manual input in the floating terminal); `poll_ms` is the poll interval, `show_window` controls when the terminal window pops up (always = at session start / on_wait = only after the command has been running longer than `show_window_delay_ms` (default 2000ms) and has not yet finished, so a fast command never flashes a window / never = no window; **both always/on_wait require the chat cursor to be following — nothing pops while the user is scrolled up**), and `engine="off"` disables it. The floating terminal opens in a **collapsed** state (a small window in the top-right corner) and auto-expands to full size when focus enters the terminal window, collapsing again when focus leaves. Plain foreground commands use the **one-shot** sandbox path (the resident command server's stdin is /dev/null and cannot be interactive); however commands with background intent (`&`/nohup/setsid) and subsequent commands **while a resident instance is already active** still use the resident instance, so background processes survive across calls and stay visible/manageable (`ps`/`kill`/logs) in the same namespace. Setting `enabled=false` sends all commands through the resident instance |
+| `nvim` | `{enabled=true, timeout_ms=30000, max_buffer_bytes=1048576, max_total_bytes=8388608, allow_unisolated=false}` | Mirror Neovim tool (`nvim`): the AI's `:lua`/Ex commands run in a **separate headless mirror process inside the sandbox**, reading live buffer content (including unsaved changes). Writes land in the sandbox staging view (the real disk is untouched until publish); mirror buffer edits are never written back to the main editor. `max_buffer_bytes`/`max_total_bytes` cap how much content is loaded into the mirror; with `allow_unisolated=false` (default) the tool refuses to run when no sandbox is available (tests may opt in). See [tool_system.md](tool_system.md) "Mirror Neovim" |
 | `lsp` | `{timeout_ms=10000, start_timeout_ms=15000, auto_start=true, attach_timeout_ms=3000, check={...}}` | LSP request timeout (fail fast when the server does not respond); `start_timeout_ms` is how long to wait for a client to **finish initializing** (used only when a server start is genuinely in flight: with no client, `auto_start` derives and starts a server from the editor LSP config, preferring an `@neoai-sandbox` clone subject to keep-alive/reclamation when the sandbox is available, and falling back to a non-sandbox client when it is not and the file has no unpublished staged changes); `attach_timeout_ms` bounds the wait / fast-fail when there is a fully absent candidate (when a file is not in any buffer and is auto-opened in the background, or a starting/restarting server has no client yet, LSP tools wait for it to be ready before requesting — still issuing one request on timeout to return an accurate error — instead of failing immediately with "no LSP client"). `check` configures the `lsp_check` tool (project-wide diagnostics): `enabled`/`timeout_ms`/`servers` (per-server CLI check command mapping, argv placeholders `{path}`/`{root}`/`{level}`/`{server}`/`{out}`, `format=lua-ls|pyright|clangd|text`, optional `extensions` (used to auto-select a default server by target extension), `bin` (executable override), `requires_file` (single-file only, e.g. clangd), optional `root_files`, optional `auto_config`/`auto_config_file`: run the check with built-in defaults when the root lacks project config (inside the sandbox, never written to the workspace)); it ships built-in `lua-language-server`/`pyright`/`clangd`, and without an explicit `server` only **PATH-installed** servers are chosen. Executed inside the sandbox, fully recomputed, with directory/glob, severity filtering and baseline diff (`{out}` points to a sandbox-writable/host-readable result file, because lua-language-server writes JSON to a file rather than stdout) |
 | `guard.repeat_tool` | `{enabled=true, thresholds={3,5,8}, messages=...}` | Reminder for consecutive repeated tool calls |
 | `todo.enabled` | `true` | Todo tool + system prompt injection |
 | `web` | See below (`search.enabled=false`, `fetch.enabled=false` by default) | DeepSeek Web Search / Fetch (only exposed to DeepSeek providers) |
-| `plan_mode` | `{enabled=true, auto_execute_on_approve=true, distill_on_execute=true, distill_parallel=true, distill_front=true, distill_max_attempts=2, extract_max_tokens=nil, extra_safe_tools={}, mutating_tools=...}` | Plan mode |
+| `plan_mode` | `{enabled=true, auto_execute_on_approve=true, distill_on_execute=true, distill_parallel=true, distill_front=true, distill_max_attempts=2, extract_max_tokens=nil, extra_safe_tools={}, mutating_tools=...}` | Plan mode. In **async-sandbox draft mode** (`tools.approval.mode="async"` + isolation available) it no longer forces read-only: write tools are available but their changes only enter the sandbox staging view, never the review queue, and are discarded on leaving plan mode; a capability ceiling still rejects SSH/host privilege/long-lived services/`nvim` editor control/untrusted MCP or external tools. `extra_safe_tools` is an explicit allowlist (applies in both modes). Without async staging it falls back to the read-only tool set |
 | `privileged_mode` | `{enabled=false, require_async_approval=true, override_offline=true, unmask_ssh_keys=true, record_network=true, max_records=1000}` | Privileged mode (opt-in): record-only network, SSH keys unmasked; async approval only. Docker is no longer direct-connected from PRIV: it auto-detects a session rootless runtime + host-side broker |
-| `sub_agent` | `{final_instruction="summarize your work at the end..."}` | Sub-agents: an instruction auto-appended to a sub-agent's task prompt (asks it to summarize its work); set to `""` to disable. On completion the sub-agent's final body is delivered back to the main agent automatically |
+| `sub_agent` | `{final_instruction="summarize your work at the end..."}` | Sub-agents: an instruction auto-appended to a sub-agent's task prompt (asks it to summarize its work); set to `""` to disable. On completion the sub-agent's final body is delivered back to the main agent automatically. Sub-agents may call `ask_user`; the question is relayed to the main agent, which answers with `send_sub_agent_message` (the only agent conversation channel) |
 | `approval` | See below | Tool approval |
 | `sandbox` | See below | Tool execution sandbox (dry-run/commit, isolation backend, policy) |
 
@@ -758,13 +773,30 @@ sandbox = {
   -- round-trips; the view base is `<sandbox staging base>/view`, agentEnd does not migrate staging, so
   -- per-round usage no longer accumulates. false = fall back to the old two-store model.
   single_view = true,
+  -- Unsaved buffers → sandbox view baseline (save-all semantics): at every tool boundary,
+  -- loaded+modified normal buffers are written into the view so read_file/run_command/git/LSP
+  -- see "as if the user had just run :wall". Files whose content equals the baseline never
+  -- produce candidates; entries with AI/command deltas are never overwritten. Skipped when the
+  -- overlay is unavailable.
+  buffer_view = { enabled = true, max_bytes = 2 * 1024 * 1024, max_files = 64 },
   -- Per-candidate inline budget (total bytes / file entries; 0 = unlimited). Over the budget switches
   -- to per-file blobs or skips, so one `cargo build`/`npm install` cannot read GBs into the editor
   -- (previously pushed nvim RSS to 27.7GB and got it OOM-killed).
   capture_max_bytes = 256 * 1024 * 1024,
   capture_max_files = 20000,
+  -- Upper bound for inlining candidate content into Lua memory (>0 enables it; default 0 = never).
+  -- Sandbox files always stay on disk (view layer / candidate blob); the candidate JSON only holds
+  -- delta metadata, and publish/review read from the blob on demand (bounded by max_file_bytes).
+  inline_candidate_bytes = 0,
+  -- Sandbox storage auto-cleanup (everything under `stdpath("cache")/NeoAI/sandbox`, fully
+  -- rebuildable): on_start reclaims instances of dead processes + orphan processes + stale temp
+  -- dirs; on_exit removes this process's instance dir on real exit (VimLeavePre, not hot reload);
+  -- legacy_max_age purges old-layout dirs (candidates/reviews/blobs...) directly under the base.
+  cleanup = { on_start = true, on_exit = true, legacy_max_age = 3600 },
   -- Build output directories (basename under a workspace root; whole subtree never captured as
-  -- candidates; expanded 0-2 levels down).
+  -- candidates; expanded 0-2 levels down). Any path component ending with `target`
+  -- (target / cargo-target / cargo.target) also matches, covering out-of-workspace
+  -- CARGO_TARGET_DIR-style build dirs.
   generated_dirs = {
     "target", "node_modules", "build", "out", ".venv", "venv",
     "__pycache__", ".next", ".nuxt", ".svelte-kit", ".turbo", ".pytest_cache",
@@ -1164,17 +1196,103 @@ Per-item isolation: set `degrade.<item> = false` (e.g. disable only the render t
 `simulate = "ok"` to pin the lowest level. Setting `enabled = false` restores the pre-change
 behaviour entirely.
 
+#### `resources.self_guard` (in-process memory watchdog)
+
+Unlike "host resource pressure" above, this only watches **this nvim process** (RSS + Lua heap)
+and converges before the kernel red line, degrading "process killed by OOM" into "this turn failed".
+
+```lua
+resources = {
+  self_guard = {
+    enabled = true, sample_ttl_ms = 1000,
+    soft_mb = 2048, soft_ratio = 0.25,     -- soft = min(soft_mb, ratio x MemTotal)
+    hard_mb = 4096, hard_ratio = 0.40,     -- hard: still over after reclaim -> abort the turn
+    lua_heap_mb = 1024, cooldown_ms = 15000, notify = true,
+  },
+}
+```
+
+- `soft`: runs registered reclaimers (display-only caches: tree digest, markdown memoization,
+  live tool-result cache) and forces GC.
+- `hard`: re-samples after reclaiming; if still over, calls the registered abort handler
+  (`chat_service.abort_all`) to end the current turn (messages are persisted per round) and enters
+  `cooldown_ms`, during which `allow_start()` is false.
+- When `/proc` is unavailable everything is treated as `ok` (never a false positive).
+- Sampling points: a background timer (`sample_ttl_ms`) plus every tool-loop round boundary.
+
+#### `resources.supervisor` (sub-process supervisor)
+
+Single source of truth for child processes (background worker, resident sandbox command server):
+a crash fails the task, never propagates into nvim.
+
+```lua
+resources = {
+  supervisor = {
+    enabled = true, heartbeat_ms = 5000,
+    max_restarts = 5, backoff_ms = 200, max_backoff_ms = 30000,
+    breaker_threshold = 5, breaker_window_ms = 120000,  -- circuit breaker window
+    -- The memory limit is **recomputed from remaining memory** every heartbeat and pushed
+    -- to the child's cgroup memory.max live:
+    --   effective = min( MemAvailable x memory_ratio, memory_max_bytes (if > 0),
+    --                    MemAvailable - memory_reserve_bytes )
+    -- clamped to [memory_min_bytes, available]; pressure warn x0.75 / critical x0.5;
+    -- lowering applies immediately, raising requires >20% headroom (no cgroup churn).
+    memory_auto = true, memory_ratio = 0.5,
+    memory_min_bytes = 256 * 1024 * 1024, memory_reserve_bytes = 256 * 1024 * 1024,
+    memory_max_bytes = 0,          -- absolute cap (0 = none, dynamic only)
+    pids_max = 0,                  -- child pids.max (0 = unlimited)
+    notify = true,
+  },
+}
+```
+
+Adapters report `report_crash` on a confirmed abnormal exit; the supervisor counts crashes in a
+sliding window, opens the breaker (state `failed`, explicit notification) and stops auto-restarting
+until `:NeoAI Recover` resets it. `memory_max_bytes`/`pids_max` place children in a delegated
+cgroup so the kernel reclaims the **child**, not nvim. With `memory_auto=true` (default) the limit
+is recomputed from **remaining memory** on every heartbeat, tightening immediately when memory gets
+scarce (a 64 MB floor keeps a child from being reclaimed the instant it starts).
+
+#### `resources.dispatch` (task dispatch)
+
+Interactive and background lanes, each task with timeout/retry/cancel/queue limits; failures are
+returned as structured errors.
+
+```lua
+resources = {
+  dispatch = {
+    enabled = true, queue_max = 64,
+    interactive_parallel = 4, background_parallel = 2,
+    task_timeout_ms = 120000, retries = 0,
+    pause_background_on_warn = true, pause_all_on_critical = true,
+  },
+}
+```
+
 ## 3. Plan Mode (tools/plan_mode)
 
-Plan mode is a **per-agent state** (`agent.plan_mode`); when active:
+Plan mode is a **per-agent state** (`agent.plan_mode`) with two shapes:
 
-1. **Injects the plan-policy system prompt section** (`deployment:plan_policy`, order=100): requires a clear, formatted modification plan as output.
-2. **Keeps only read-only/informational tools in the tool context, plus `run_command` (read-only research) + `ask_user`** (the `PLAN_SAFE_TOOLS` allowlist + `PLAN_EXTRA_TOOLS`), exposing no mutating tools and **no mode-switching tool to the AI**.
-3. **Tightens the execution-time gate accordingly** (`plan_mode.check_tool`): in plan mode, any tool outside the visible set is rejected.
+1. **Async-sandbox draft mode (default)**: when `tools.approval.mode="async"` and isolation is available, it applies a
+   **capability ceiling** instead of a read-only allowlist:
+   - Write tools (edit/delete/run_command) are available, but file changes only enter the sandbox staging view —
+     **never the real workspace, never the review queue, not committable via SandboxCommit** — and are discarded on
+     leaving plan mode (a path with pending review changes gets its previous pending content restored).
+   - SSH/host privilege/long-lived services/`nvim` editor control/MCP without `plan_safe`/unknown-category external tools are rejected;
+     command escalation to tier>=2 is rejected before execution.
+   - The policy text (runtime-context snapshot) requires "find the cause quickly, do not fix" and explains that changes
+     are discarded.
+2. **Read-only tool set** (non-async / no isolation backend): only read-only/informational queries + `run_command` +
+   `ask_user` (`PLAN_SAFE_TOOLS` + `PLAN_EXTRA_TOOLS`), with the execution-time gate tightened
+   (`plan_mode.check_tool`).
 
-**Plan confirmation**: after the AI emits the plan the turn ends; the user confirms by running `:NeoAI ApprovePlan` (or toggling the mode manually);
-`chat_service.approve_plan` then parses the plan into a task list (todo) → exits plan mode (switching to CHAT)
-→ automatically starts execution according to `auto_execute_on_approve` (enabled by default).
+Neither shape **gives the AI a mode-switching tool**. In draft mode a sub-agent inherits the parent scope, so its writes
+are drafts too and are discarded with the parent.
+
+**Plan confirmation**: after the AI reports its conclusion the turn ends; the user confirms by running
+`:NeoAI ApprovePlan` (or toggling the mode manually); `chat_service.approve_plan` exits plan mode (drafts discarded),
+parses the plan into a task list (todo), and automatically starts execution according to `auto_execute_on_approve`
+(enabled by default).
 
 **XML plan extraction (`distill_on_execute`)**: before sending in a non-plan mode after the plan is confirmed,
 one "XML structured extraction" round runs first — it replays the history (reusing the prefix cache) and appends an

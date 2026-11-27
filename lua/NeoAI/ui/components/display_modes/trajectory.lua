@@ -57,7 +57,7 @@ end
 --- @return boolean
 local function _is_sub_agent(msg)
   if not msg then return false end
-  if msg.sub_agent then return true end
+  if msg.sub_agent or msg.sub_agent_question then return true end
   if msg.role ~= "user" then return false end
   local c = msg.content
   return type(c) == "string" and c:match("^%s*【子 Agent ") ~= nil
@@ -323,7 +323,14 @@ local function _append_turn(lines, marks, turn, full, show)
       -- wire 级细节：请求参数 + 原始请求体 + 原始响应（层级 3 子块）
       _append_request_meta(lines, msg, full)
     elseif _is_sub_agent(msg) then
-      -- 子 Agent 结果：渲染为专属小节（不并入用户请求、不计入请求序号）
+      -- 子 Agent 结果/提问：渲染为专属小节（不并入用户请求、不计入请求序号）
+      local q = msg.sub_agent_question
+      if q then
+        lines[#lines + 1] = "  ▸ ❓ 子 Agent 提问 · " .. tostring(q.name or q.sub_agent_id or "子 Agent")
+        local body = tostring(msg.content or ""):gsub("^%s*【子 Agent[^\n]*】\n?", "")
+        if body ~= "" then _append_raw(lines, body, 2) end
+        i = i + 1
+      else
       local sa = msg.sub_agent
       local name, status
       if sa then
@@ -343,6 +350,7 @@ local function _append_turn(lines, marks, turn, full, show)
       local body = tostring(msg.content or ""):gsub("^%s*【子 Agent[^\n]*】\n?", "")
       if body ~= "" then _append_raw(lines, body, 2) end
       i = i + 1
+      end
     else
       i = i + 1
     end
@@ -476,6 +484,7 @@ local function _turn_sig(turn, full, show)
     -- 子 Agent 结果标记（有无/名字/状态）纳入签名：user 与 sub_agent 结果都可能是 role=user，
     -- 若签名只含 role+content，标记变化时可能命中陈旧块而不重渲染。
     p[#p + 1] = m.sub_agent and ("sa:" .. tostring(m.sub_agent.name or "") .. ":" .. tostring(m.sub_agent.status or "")) or "-"
+    p[#p + 1] = m.sub_agent_question and ("sq:" .. tostring(m.sub_agent_question.id or "")) or "-"
     p[#p + 1] = _fingerprint(m.content)
     p[#p + 1] = _fingerprint(m.reasoning)
     p[#p + 1] = tostring(m.duration_ms)

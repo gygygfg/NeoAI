@@ -20,7 +20,8 @@
   （自动推导 ≈ `核数/2`，并按可用内存收敛；`NEOAI_TEST_HEAVY_WORKERS` 可覆盖；`=1` 等价旧串行
   通道）。两 lane **重叠执行**、任一子进程结束即回填，约束 `#light≤W`、`#heavy≤H`、
   `W+H≤核数-2`（预留两核给系统/编辑器，核数很少时至少 2 路）。
-  另有**独占通道（exclusive）**：会触碰宿主全局 `/run/netns` 的套件（默认 `sandbox_view*`）
+  另有**独占通道（exclusive）**：会触碰宿主全局 `/run/netns` 的套件（默认 `sandbox_view*`、
+  `sandbox_boundary_net`、`sandbox_boundary_escape`、`sandbox_docker_policy`、`gateway`）
   不进 heavy lane，而是在 light/heavy 两条 lane **全部结束后**一套件一子进程串行执行，绝不与
   其他分片重叠——多个进程并发 `ip netns add/del` 会在共享的 `/run/netns` 挂载点上互相竞争。
   可用 `opts.exclusive_suites`（模式数组或判定函数）覆盖该分组。
@@ -204,7 +205,8 @@ end)
 | `test_tools / test_tool_pending` | 工具执行、工具待发/暂存 |
 | `test_pty` | 交互式 PTY：按键映射、/proc 阻塞读检测、判官注入、经门禁的 run_command 自动应答 |
 | `test_max_tokens / test_truncation` | max_tokens 发送策略、输出截断续写 |
-| `test_sub_agent_result` | 子 Agent 工具/管理器/结果回传 |
+| `test_sub_agent_result` | 子 Agent 工具/管理器/结果回传、ask_user 转交/message 对话、提问折叠渲染 |
+| `test_sandbox_plan_draft` | 计划模式草稿：不入审批/不可提交、退出丢弃、恢复旧待审内容、晚到结算、冲突跳过 |
 | `test_pending_queue` | 待发消息队列 |
 | `test_background_tools` | 工具后台化：等工具期间收到新消息时立即注入并后台化已开始的工具、后台结果追加到末尾且不递归、审批/ask_user 保持前台、请求构建补稳定占位结果与 system_update 角色降级 |
 | `test_services / test_status` | 服务层（chat/tool/model/status）、状态栏 |
@@ -259,6 +261,11 @@ end)
 | `test_ui_components` | UI 组件：net_consent/device_consent/policy_consent 弹窗与决策回调、sub_agent_dock 事件渲染、terminal_window headless no-op、`display_modes.chat` 注册/load/unload/render |
 | `test_sandbox_shims` | `fault`/`bench` 兼容 shim 转发到 `diag` |
 | `test_parallel_runner` | 并行运行器：LPT 分片均衡/可复现/空档、SUITE/LOADFAIL 解析、聚合 passed/failed 与耗时缓存、过滤套件、分片异常、发现失败（注入假 spawner，不启动真实子进程） |
+| `test_sandbox_cleanup` | 沙箱存储自动清理：启动回收死进程实例目录与超龄旧布局目录（未超龄保留）、`on_start/on_exit` 开关、退出删除本进程实例、插件热重载不删（待审/暂存保留） |
+| `test_self_guard` | 自身内存看门狗：软/硬阈值边界、Lua 堆软阈值、探测不可用视为 ok、回收器执行与失败隔离、hard 触发中止器 + cooldown、`allow_start` 门禁、注册/注销可逆（伪采样，不依赖宿主机内存） |
+| `test_supervisor` | 子进程总管理：登记/注销与状态迁移、崩溃上报的退避计数与熔断（含阈值边界与复位）、未登记 id 不干预、心跳对自报进程只观测/对外部进程计崩溃、启动/停止适配器异常隔离、无上限时不写 cgroup、`process:state` 事件 |
+| `test_task_dispatch` | 任务分发：同步/异步任务、抛错转结构化错误、超时 + `on_cancel`、并发上限与排队、排队上限拒绝、取消、压力准入（warn 暂停后台 / critical 全停）、关闭时直通 |
+| `test_crash_recovery` | 崩溃恢复：干净退出标记写入/删除、不干净退出检测（死 pid / 自身 pid 跳过）、尾部缺口识别（user/tool/tool_calls 三种）、recover 回收开关与事件、start/stop 幂等与自动命令清理、`enabled=false` 为 no-op（标记目录与会话来源均注入） |
 
 > 上述 `test_grant`…`test_sandbox_shims` 为补齐既有盲区新增（此前这些模块零覆盖）。
 

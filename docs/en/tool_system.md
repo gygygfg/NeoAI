@@ -388,6 +388,30 @@ loopback-only (`-L 127.0.0.1:…`) with target hosts and the local-port range pr
 > root is flagged with "cross-file/type resolution will produce heavy false positives (e.g.
 > undefined-global)" plus a fix suggestion.
 
+### 🧪 Mirror Neovim (nvim_ops.lua)
+
+The `nvim` tool lets the AI run `lua` (Lua code) or `ex` (Ex commands), but **never in the main Neovim
+process**:
+
+- Each call starts a separate headless **mirror Neovim** inside the sandbox (posix_spawn/jobstart) and loads
+  the current normal buffers' objects (name/content/key options/cursor; `buffer_ids` force-loads the objects
+  referenced by `#{buffer}`), then runs the code. The mirror uses `-u NONE --noplugin` by default (no user
+  init/plugins/LSP).
+- **Content source**: the sandbox view first (= user save-all baseline + AI staged changes), falling back to
+  the live parent buffer content (including unsaved changes). The AI sees the same content as
+  `read_file`/`run_command`/LSP.
+- **Writes**: `:write`/`vim.fn.writefile` inside the mirror land in the sandbox overlay → candidate capture →
+  review/publish; mirror buffer edits are discarded when the process exits and are **never written back to the
+  main editor**.
+- **Results**: return values/`messages`/stdout/stderr are written to a result file and returned after
+  `conceal.redact` + `secret.tokenize` + `output_guard`. `tools.nvim.timeout_ms` bounds execution.
+- **Security**: `effect="process"` (sandbox enforcement point), `auto_allow=false` (async mode runs inside the
+  sandbox and sends writes to review); it refuses to run when no sandbox is available (`allow_unisolated` is
+  test-only). If the mirror binary is an AppImage/custom path, its mount point and `VIMRUNTIME` are read-only
+  bound into the sandbox (otherwise the private `/tmp` hides it and it exits 127).
+- **Limits**: no user LSP clients in the mirror (use `lsp_*` for semantics); window layout/registers/marks are
+  not mirrored.
+
 ### 🌳 Tree-sitter (tree_ops.lua)
 
 `parse_file` / `query_tree` / `get_node_at_position` / `get_node_type` / `get_node_range` /
@@ -404,7 +428,10 @@ loopback-only (`-L 127.0.0.1:…`) with target hosts and the local-port range pr
 
 ### 🤖 Sub-agent (plan.lua)
 
-`create_sub_agent` / `get_sub_agent_status` / `cancel_sub_agent` / `send_sub_agent_message` (no wait tool; results are delivered automatically). See
+`create_sub_agent` / `get_sub_agent_status` / `cancel_sub_agent` / `send_sub_agent_message` (no wait tool; results are delivered automatically).
+`send_sub_agent_message` is also the **only agent-to-agent conversation channel**: when a sub-agent has a pending
+question, the message is the answer. Sub-agents may call `ask_user`; the question is wrapped and relayed to the
+main agent, which decides whether to answer directly or ask the user. See
 [sub_agent_system.md](sub_agent_system.md) for details.
 
 ### 📋 Todo (todo.lua)
@@ -414,7 +441,19 @@ loopback-only (`-L 127.0.0.1:…`) with target hosts and the local-port range pr
 
 ### 📐 Plan Mode (plan_mode.lua)
 
-`enter_plan_mode` (enter plan mode: the tool context switches to read-only/informational + asking questions). Plan mode **does not give the AI any mode-switching tool**; after the plan is emitted the user runs `:NeoAI ApprovePlan` (or toggles the mode manually) to confirm execution. See [configuration.md](configuration.md) and [chat_enhanced_usage.md](chat_enhanced_usage.md) for details.
+`enter_plan_mode` (enter plan mode: investigate only, do not fix). Plan mode **does not give the AI any mode-switching tool**;
+after the plan is emitted the user runs `:NeoAI ApprovePlan` (or toggles the mode manually) to confirm execution.
+
+**Async-sandbox draft mode (default)**: when `tools.approval.mode="async"` and sandbox isolation is available, plan mode
+no longer forces a read-only tool set. Instead it applies a **capability ceiling**: write tools (edit/delete/run_command)
+are available, but their file changes only go to the sandbox staging view — **never the real workspace, never the review
+queue, not committable via SandboxCommit** — and are discarded on leaving plan mode (if a path already had pending review
+changes, the previous pending content is restored). Host-level/control capabilities stay unavailable: `ssh_run`/`ssh_tunnel`,
+`service_start`/`service_stop`, tier>=2 privileged commands, `nvim` (editor mirror control), MCP tools not marked `plan_safe`,
+and unknown-category external tools are rejected (`tools.plan_mode.extra_safe_tools` can explicitly allow them).
+
+Without async staging (non-async / no isolation backend) plan mode falls back to the read-only tool set. See
+[configuration.md](configuration.md) and [chat_enhanced_usage.md](chat_enhanced_usage.md) for details.
 
 ### 💬 Asking the User (ask_user.lua)
 
@@ -422,6 +461,12 @@ loopback-only (`-L 127.0.0.1:…`) with target hosts and the local-port range pr
 `ASK_USER_WAITING`/`ASK_USER_ANSWERED`, and pauses the pausable timer while waiting. Options can be either strings
 or `{ label, description }` (label is a short option summary, description is the option description; the two are
 displayed separately in the popup and highlighted).
+
+**Sub-agent questions**: when a sub-agent calls `ask_user` it **does not show a popup**; the question is wrapped into a
+message and relayed to the main agent (`SUB_AGENT_QUESTION`). The main agent decides whether to answer directly
+(`send_sub_agent_message`) or to ask the user first with `ask_user`. Only one question per sub-agent is in flight at a
+time; further questions queue in order. There is no timeout — the question is voided when the sub-agent is cancelled or
+the parent session closes.
 
 **Prompt constraints (aligned with the popup shape)**: both the tool description and the system-prompt section
 `tools:conventions` require **one question per call** (`question` is a single question and `options` belong only to
@@ -494,7 +539,7 @@ When tool definitions are output into the request (`core.agent.tool_loop._tool_d
 - Empty `properties` omits that field (DeepSeek rejects `[]` schemas).
 - Environment detection runs first (`tools.environment.filter_tools`), disabling tools that depend on unavailable
   environments (workspace/git).
-- In plan mode, only read-only/informational queries + `run_command` (read-only research) + `ask_user` are kept (`plan_mode.apply_tool_filter`).
+- In plan mode: draft mode filters by capability ceiling (write tools available; host-level/untrusted tools rejected); without async staging only read-only/informational queries + `run_command` + `ask_user` are kept (`plan_mode.apply_tool_filter`).
 
 ## 8. Environment Detection (tools/environment.lua)
 

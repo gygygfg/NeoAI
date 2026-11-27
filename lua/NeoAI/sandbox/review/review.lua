@@ -1194,6 +1194,34 @@ function M.pending_count()
   return M.pending_summary().count
 end
 
+--- 给定路径集合中当前 PENDING 的待审项（path -> change_set_id，同路径取最新创建）。
+--- 计划模式草稿丢弃时据此恢复「草稿覆盖前本来就有待审改动」的路径，避免丢掉用户未审改动。
+--- @param paths table 真实路径数组
+--- @return table<string, string> path -> change_set_id
+function M.pending_for_paths(paths)
+  local want = {}
+  for _, p in ipairs(paths or {}) do
+    if type(p) == "string" and p ~= "" then want[p] = true end
+  end
+  if next(want) == nil then return {} end
+  local out, newest = {}, {}
+  for _, item in ipairs(_pending_items()) do
+    if item.kind ~= "host_op" then
+      for _, f in ipairs(item.files or {}) do
+        local p = type(f) == "table" and f.path or nil
+        if p and want[p] then
+          local t = item.created_at or 0
+          if not newest[p] or t >= newest[p] then
+            newest[p] = t
+            out[p] = item.change_set_id
+          end
+        end
+      end
+    end
+  end
+  return out
+end
+
 --- 会话级自动审批是否开启（默认关闭；仅靠本地模型时由用户显式开启以管理 agent 行为）
 --- @return boolean
 function M.session_auto()
@@ -1598,6 +1626,28 @@ local function _release_paths(ctx)
   end
 end
 
+--- 发布阶段的**永久性**拒绝（重试必然同样失败）：命中后不再把自动批准回退为待审，
+--- 否则下一次自动/批量应用会立刻重试并再次失败（用户看到「应用失败」反复刷屏）。
+--- 这些代码都来自候选发布前的硬闸门（纵深防御）：重试只会重复同样的结论。
+local PERMANENT_FAILURES = {
+  SANDBOX_MASKED_TARGET = true, -- 宿主敏感遮蔽路径（mask_paths / 沙箱存储）
+  SANDBOX_SELF_TARGET = true, -- NeoAI 自身运行时/状态
+  SANDBOX_RETIRED_TARGET = true, -- 搬出层内部
+  SANDBOX_RETIRE_UNSAFE_ROOT = true, -- 整棵搬出根/家目录
+  INVALID_PATH = true, -- 候选路径非法
+  PATH_CHANGED = true, -- 路径规范化结果变化（`..`/祖先软链被替换）
+  GIT_REFERENTIAL_INTEGRITY = true, -- `.git` 指针引用缺失对象
+}
+
+--- 发布失败原因是否为永久性拒绝。
+--- @param reason string|nil
+--- @return boolean
+local function _permanent_failure(reason)
+  if type(reason) ~= "string" then return false end
+  local code = reason:match("^([%u_]+)")
+  return code ~= nil and PERMANENT_FAILURES[code] == true
+end
+
 --- 应用收尾：根据发布结果更新条目状态、落盘快照、删除候选、回执与事件。
 --- @param ctx table _apply_begin 返回值
 --- @param pub table candidate.publish(_async) 结果
@@ -1668,6 +1718,22 @@ local function _apply_settle(ctx, pub)
     end
     _store_snapshot(item, ctx.snapshot_entries, pub.receipt and pub.receipt.operation_id, pub.retired)
     _persist(item)
+    -- 发布成功后：未再改动的 buffer 重载为发布内容；用户有新改动时告警不覆盖。
+    pcall(function()
+      local bv = require("NeoAI.sandbox.execution.buffer_view")
+      if type(bv.after_publish) ~= "function" then return end
+      local files = {}
+      if partial then
+        local applied = {}
+        for _, p in ipairs(pub.applied or {}) do applied[p] = true end
+        for _, f in ipairs(ctx.cand.files or {}) do
+          if applied[f.path] then files[#files + 1] = f end
+        end
+      else
+        files = ctx.cand.files or {}
+      end
+      bv.after_publish(files, ctx.publish_buffer_state)
+    end)
     logger.try("delete_review_removed", store.delete_review_removed, item.change_set_id)
     -- 仅应用了部分文件：其余文件（未选中 + 写入失败）保留待审，供用户逐个确认/重试。
     if #ctx.remaining > 0 then
@@ -1708,10 +1774,39 @@ local function _apply_settle(ctx, pub)
     item.merge_conflict = (#conflict_paths > 0)
       and { paths = conflict_paths, at = os.time(), reason = pub.reason }
       or nil
+    -- 诊断留痕：冲突的三方内容不进日志（可能含密钥），只记大小与基线/结果摘要，
+    -- 便于事后区分「真的双方改了同一处」与「同一内容重复应用/基线捕获异常」。
+    if #conflict_paths > 0 then
+      local detail = {}
+      for _, c in ipairs(pub.conflicts or {}) do
+        if type(c) == "table" then
+          detail[#detail + 1] = ("%s(base=%dB ours=%dB theirs=%dB)"):format(
+            tostring(c.path), #(c.base or ""), #(c.ours or ""), #(c.theirs or ""))
+        end
+      end
+      require("NeoAI.kernel.logger").warn(
+        "[sandbox] 三方合并冲突（未写入真实文件，change_set=%s）: %s",
+        tostring(id), table.concat(detail, ", "))
+    end
     _persist(item)
-    ctx.restore_pending()
+    -- 永久性拒绝（遮蔽目标/自身运行时/搬出层/路径非法等硬闸门）：**不回退待审**。
+    -- 回退会让下一次自动或批量应用立即重试同一个必然失败的门禁，表现为
+    -- 「应用失败(FAILED): SANDBOX_MASKED_TARGET: …」反复刷屏；条目保持 FAILED + 原因可见，
+    -- 用户可显式拒绝，或在配置/内容变化后重新生成候选。
+    local permanent = _permanent_failure(pub.reason)
+    if permanent then
+      require("NeoAI.kernel.logger").warn(
+        "[sandbox] 应用被硬闸门拒绝且不再自动重试（change_set=%s）: %s", tostring(id), tostring(pub.reason))
+      pcall(function()
+        require("NeoAI.sandbox.review.evidence").add("publish_rejected_permanent", {
+          change_set_id = id, reason = tostring(pub.reason),
+        }, { change_set_id = id, tool = item.tool })
+      end)
+    else
+      ctx.restore_pending()
+    end
     _emit(require("NeoAI.kernel.events").SANDBOX_CONFLICT, {
-      change_set_id = id, reason = pub.reason, paths = conflict_paths,
+      change_set_id = id, reason = pub.reason, paths = conflict_paths, permanent = permanent or nil,
     })
   end
   return pub
@@ -1725,6 +1820,14 @@ local function _apply_publish_mark(ctx)
   local item = ctx.item
   item.apply_state = M.APPLY.APPLYING
   _persist(item)
+  -- 发布前记录「buffer 是否仍停留在 save-all 基线」，发布成功后据此安全重载/告警。
+  do
+    local ok, bv = pcall(require, "NeoAI.sandbox.execution.buffer_view")
+    if ok and bv and type(bv.capture_publish_state) == "function" then
+      local ok2, captured = pcall(bv.capture_publish_state, ctx.cand and ctx.cand.files)
+      if ok2 then ctx.publish_buffer_state = captured end
+    end
+  end
   _emit(require("NeoAI.kernel.events").SANDBOX_PUBLISH_STARTED, {
     change_set_id = ctx.id, candidate_digest = item.candidate_digest,
   })
@@ -2375,6 +2478,11 @@ function M.derive_revision(parent_id, opts)
         local copy = vim.deepcopy(f)
         copy.content = new_content
         copy.after_hash = _sha(new_content)
+        -- 内容不内联（默认）时父候选只带 blob：覆盖内容必须**清掉旧 blob**，否则发布/物化
+        -- 仍按 blob 取到旧内容（表现为「派生 revision 写了旧版本」）。large 一并清掉，
+        -- 让发布走内联内容（新内容已在内存里，大小受单文件上限约束）。
+        copy.blob = nil
+        copy.large = nil
         files[#files + 1] = copy
       end
     end

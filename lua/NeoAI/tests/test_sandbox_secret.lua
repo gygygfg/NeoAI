@@ -4,6 +4,25 @@
 
 local tests = require("NeoAI.tests")
 
+--- 统计一次物化触发的「overlay 写入」次数。
+--- 物化对未 token 化的条目走同盘复制（`copy_file`），只有 token 化条目才读内容后
+--- `write_file_atomic`——两者都算一次写入，故一起统计。
+--- @param fn function
+--- @return number
+local function count_writes(fn)
+  local fs = require("NeoAI.utils.fs")
+  local orig_atomic, orig_copy = fs.write_file_atomic, fs.copy_file
+  local n = 0
+  ---@diagnostic disable-next-line: duplicate-set-field
+  fs.write_file_atomic = function(...) n = n + 1; return orig_atomic(...) end
+  ---@diagnostic disable-next-line: duplicate-set-field
+  fs.copy_file = function(...) n = n + 1; return orig_copy(...) end
+  local ok, err = pcall(fn)
+  fs.write_file_atomic, fs.copy_file = orig_atomic, orig_copy
+  if not ok then error(err, 0) end
+  return n
+end
+
 --- 保存/恢复全局配置
 --- 测试普遍把 /tmp（vim.fn.tempname）当作工作区使用：默认关闭「临时根不产生候选」
 --- （`ephemeral_roots = {}`），需要验证该行为的用例可显式传入 ephemeral_roots。
@@ -870,9 +889,11 @@ tests.suite("sandbox_secret", function(_, it)
       t.nil_(paths[loose_pyc], "散落的 .pyc 应被剔除")
       t.not_nil(paths[module_py], "同一目录下的 .py 源码应保留")
       t.not_nil(paths[normal], "普通文件应保留")
-      t.not_nil(paths[unmasked], "被 unmask 放行的遮蔽文件应保留")
+      -- 执行期 unmask（档位提权/审批放行/可写根）只决定「沙箱内能否写」，**不**使遮蔽目标可发布：
+      -- 发布阶段对遮蔽目标一律硬拒绝，若冻结阶段按 unmask 保留，整单元会反复「应用失败」。
+      t.nil_(paths[unmasked], "被 unmask 放行的遮蔽文件也不应进入候选")
       t.not_nil(cand.dropped, "应记录剔除信息")
-      t.eq(1, cand.dropped.masked, "应记录剔除的遮蔽文件数")
+      t.eq(2, cand.dropped.masked, "应记录剔除的遮蔽文件数（含被 unmask 放行的）")
       t.eq(4, cand.dropped.volatile, "应记录剔除的易变/字节码缓存数")
       candidate.cleanup(a.attempt_id)
     end)
@@ -906,22 +927,12 @@ tests.suite("sandbox_secret", function(_, it)
       fs.ensure_dir(upper); fs.ensure_dir(work)
       local specs = { { root = dir, upper = upper, work = work, mode = "overlay" } }
       candidate.materialize_overlay(specs)
-      local orig = fs.write_file_atomic
-      local calls = 0
-      ---@diagnostic disable-next-line: duplicate-set-field
-      fs.write_file_atomic = function(...) calls = calls + 1; return orig(...) end
-      candidate.materialize_overlay(specs)
-      fs.write_file_atomic = orig
+      local calls = count_writes(function() candidate.materialize_overlay(specs) end)
       t.eq(0, calls, "未改动文件重复物化不应重写")
       -- 改动一个暂存文件后应只重写该文件（经 stage_path 模拟真实编辑：递增暂存版本）
       local staged = candidate.stage_path(a.attempt_id, dir .. "/f1.txt")
       fs.write_file(staged, "staged 1 v2\n")
-      local orig2 = fs.write_file_atomic
-      local calls2 = 0
-      ---@diagnostic disable-next-line: duplicate-set-field
-      fs.write_file_atomic = function(...) calls2 = calls2 + 1; return orig2(...) end
-      candidate.materialize_overlay(specs)
-      fs.write_file_atomic = orig2
+      local calls2 = count_writes(function() candidate.materialize_overlay(specs) end)
       t.eq(1, calls2, "仅改动的暂存文件应重写")
       candidate.cleanup(a.attempt_id)
     end)
@@ -994,23 +1005,15 @@ tests.suite("sandbox_secret", function(_, it)
       }
       candidate.merge_candidate(cand, { from_command = true })
       local specs = { { root = dir, upper = upper, work = work, mode = "overlay" } }
-      local orig = fs.write_file_atomic
-      local calls = 0
-      ---@diagnostic disable-next-line: duplicate-set-field
-      fs.write_file_atomic = function(...) calls = calls + 1; return orig(...) end
-      candidate.materialize_overlay(specs)
-      candidate.materialize_overlay(specs)
-      fs.write_file_atomic = orig
+      local calls = count_writes(function()
+        candidate.materialize_overlay(specs)
+        candidate.materialize_overlay(specs)
+      end)
       t.eq(0, calls, "fresh 条目不应被 detokenize 回写 overlay")
       -- 暂存副本被编辑（经 stage_path，版本变化）后应恢复回写
       local staged = candidate.stage_path(a.attempt_id, dir .. "/f.txt")
       fs.write_file(staged, "edited\n")
-      local orig2 = fs.write_file_atomic
-      local calls2 = 0
-      ---@diagnostic disable-next-line: duplicate-set-field
-      fs.write_file_atomic = function(...) calls2 = calls2 + 1; return orig2(...) end
-      candidate.materialize_overlay(specs)
-      fs.write_file_atomic = orig2
+      local calls2 = count_writes(function() candidate.materialize_overlay(specs) end)
       t.eq(1, calls2, "暂存副本被编辑后应回写 overlay")
       candidate.cleanup(a.attempt_id)
     end)

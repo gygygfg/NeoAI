@@ -310,6 +310,52 @@ tests.suite("sandbox_view", function(_, it)
     vim.fn.delete(dir, "rf")
   end)
 
+  it("单视图合并：视图内容已是候选结果时零拷贝（不重复写 upper）", function(t)
+    local fs = require("NeoAI.utils.fs")
+    local sandbox = require("NeoAI.sandbox")
+    local candidate = require("NeoAI.sandbox.execution.candidate")
+    local control = require("NeoAI.sandbox.execution.control")
+    local store = require("NeoAI.sandbox.state.store")
+    local view = require("NeoAI.sandbox.execution.view")
+    local dir = fs.canonical(vim.fn.tempname())
+    fs.ensure_dir(dir)
+    with_config({ tools = { sandbox = { workspace_root = vim.fn.tempname() .. "/sb" } } }, function()
+      sandbox.reset()
+      -- 把临时工作区登记为单视图可写根：只有登记过，「暂存」才等于视图 upper。
+      local vbase = view.base()
+      local upper = vbase .. "/testroot/upper"
+      fs.ensure_dir(upper)
+      view.register({ { root = dir, upper = upper, work = upper, mode = "overlay" } })
+      local a = control.new_attempt("run_command", {}, {}, { effect = "process" })
+      candidate.begin(a, assert(store.root()))
+      local p = dir .. "/same.txt"
+      fs.write_file(p, "real\n")
+      local staged = candidate.stage_path(a.attempt_id, p)
+      if not (staged and view.is_native(staged)) then
+        candidate.cleanup(a.attempt_id)
+        return -- 视图关闭（NEOAI_SINGLE_VIEW=0）时走旧布局，不适用
+      end
+      fs.write_file(staged, "changed\n") -- 命令产物已在视图层内
+      local cand = candidate.finish(a.attempt_id)
+      t.not_nil(cand, "应有候选")
+      local writes = 0
+      local orig = fs.write_file
+      fs.write_file = function(path, content, opts)
+        if path == staged then writes = writes + 1 end
+        return orig(path, content, opts)
+      end
+      local ok, err = pcall(candidate.merge_candidate, cand)
+      fs.write_file = orig
+      t.true_(ok, "合并不应报错: " .. tostring(err))
+      -- `_view_matches` 必须用同一哈希口径（`_sha` 已带 `sha256:` 前缀）：否则永远判为
+      -- 「不一致」，每条命令的每个文件都重复写一遍视图 upper（叠加写盘、违反零拷贝/不叠加）。
+      t.eq(0, writes, "视图内容已是候选结果时不应再写一遍")
+      candidate.cleanup(a.attempt_id)
+    end)
+    sandbox.reset()
+    vim.fn.delete(dir, "rf")
+  end)
+
   it("异步捕获：未变文件第二次捕获不重复处理（不进入 mapping）", function(t)
     local fs = require("NeoAI.utils.fs")
     local sandbox = require("NeoAI.sandbox")

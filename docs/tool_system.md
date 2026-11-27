@@ -340,6 +340,24 @@ M.execute(agent, name, args, tool_call_id, opts)
 > `lsp_service_info`/`lsp_client_info` 会显示每个客户端的**工作区根与启动命令**；工作区根为空时明确
 > 警示「跨文件/类型解析会大量误报（如 undefined-global）」并给出修复建议。
 
+### 🧪 镜像 Neovim（nvim_ops.lua）
+
+`nvim` 工具让 AI 执行 `lua`（Lua 代码）或 `ex`（Ex 命令），但**绝不在主 Neovim 进程执行**：
+
+- 每次调用在沙箱内用 `posix_spawn`/jobstart 起一个独立的 headless **镜像 Neovim**，把当前普通
+  buffer 的对象（名字/内容/关键选项/光标；`buffer_ids` 可强制加载 `#{buffer}` 引用的对象）载入，
+  再执行代码。镜像默认 `-u NONE --noplugin`（不加载用户 init/插件/LSP）。
+- **内容来源**：优先沙箱视图（= 用户 save-all 基线 + AI 暂存改动），没有视图条目时回退父 buffer
+  实时内容（含未保存修改）。AI 与 `read_file`/`run_command`/LSP 看到同一份内容。
+- **写入**：镜像里的 `:write`/`vim.fn.writefile` 落在沙箱 overlay → 候选捕获 → 审批发布；
+  镜像 buffer 修改随进程退出丢弃，**绝不回写主编辑器**。
+- **结果**：返回值/`messages`/stdout/stderr 写入结果文件；父进程 `conceal.redact` +
+  `secret.tokenize` + `output_guard` 后回传。超时由 `tools.nvim.timeout_ms` 控制。
+- **安全**：`effect="process"`（沙箱强制点），审批 `auto_allow=false`（async 下先沙箱执行、
+  写入进待审）；沙箱不可用时拒绝执行（`allow_unisolated` 仅测试）。镜像二进制是 AppImage/自定义
+  路径时自动把挂载点与 `VIMRUNTIME` 以只读方式绑进沙箱（否则 `/tmp` 被私有 tmpfs 覆盖后 exit 127）。
+- **边界**：镜像内没有用户 LSP 客户端（语义查询用 `lsp_*`）；不镜像窗口布局/寄存器/marks。
+
 ### 🌳 Tree-sitter（tree_ops.lua）
 
 `parse_file` / `query_tree` / `get_node_at_position` / `get_node_type` / `get_node_range` /
@@ -355,8 +373,10 @@ M.execute(agent, name, args, tool_call_id, opts)
 
 ### 🤖 子 Agent（plan.lua）
 
-`create_sub_agent` / `get_sub_agent_status` / `cancel_sub_agent` / `send_sub_agent_message`（无等待工具，结果自动回传）。详见
-[sub_agent_system.md](sub_agent_system.md)。
+`create_sub_agent` / `get_sub_agent_status` / `cancel_sub_agent` / `send_sub_agent_message`（无等待工具，结果自动回传）。
+`send_sub_agent_message` 同时是 **agent 之间来回对话的唯一通道**：子 Agent 有在途提问时它就是回答。
+子 Agent 可用 `ask_user` 提问，问题包装后转交主 Agent，由主 Agent 决定直接回答还是先问用户。
+详见 [sub_agent_system.md](sub_agent_system.md)。
 
 ### 📋 待办（todo.lua）
 
@@ -365,13 +385,28 @@ M.execute(agent, name, args, tool_call_id, opts)
 
 ### 📐 计划模式（plan_mode.lua）
 
-`enter_plan_mode`（进入计划模式：工具上下文切换为只读/信息 + 提问）。计划模式**不向 AI 提供切换模式的工具**，计划输出后由用户执行 `:NeoAI ApprovePlan`（或手动切换模式）确认执行。详见 [configuration.md](configuration.md) 与 [chat_enhanced_usage.md](chat_enhanced_usage.md)。
+`enter_plan_mode`（进入计划模式：只做调研/查明原因，不修复）。计划模式**不向 AI 提供切换模式的工具**，
+计划输出后由用户执行 `:NeoAI ApprovePlan`（或手动切换模式）确认执行。
+
+**异步沙箱草稿模式（默认）**：当 `tools.approval.mode="async"` 且沙箱隔离可用时，计划模式不再强制只读工具集，
+而是采用**能力上限**：写类工具（edit/delete/run_command）可用，但其文件改动只进入沙箱暂存，
+**不写入真实工作区、不进入审批队列、无法被 SandboxCommit**，退出计划模式时自动丢弃（若路径原本有待审改动，
+则恢复旧待审内容）。同时不提供宿主级/控制类能力：`ssh_run`/`ssh_tunnel`、`service_start`/`service_stop`、
+tier≥2 提权命令、`nvim`（编辑器镜像控制）、未标记 `plan_safe` 的 MCP 与未知类别的外部工具一律拒绝
+（可用 `tools.plan_mode.extra_safe_tools` 显式放行）。
+
+无异步暂存（非 async / 无隔离后端）时退回只读工具集。详见 [configuration.md](configuration.md) 与
+[chat_enhanced_usage.md](chat_enhanced_usage.md)。
 
 ### 💬 向用户提问（ask_user.lua）
 
 `ask_user`：暂停生成向用户提问，回答回传为工具结果。发射 `ASK_USER_WAITING`/`ASK_USER_ANSWERED`，
 等待期间暂停可暂停计时器。选项既可以是字符串，也可以是 `{ label, description }`（label 为选项简介，
 description 为选项描述，二者在弹窗中分别展示并高亮）。
+
+**子 Agent 提问**：子 Agent 调用 `ask_user` 时**不会弹窗**，问题被包装成一条消息转交主 Agent
+（`SUB_AGENT_QUESTION`），由主 Agent 决定直接回答（`send_sub_agent_message`）还是先用 `ask_user` 询问用户。
+同一子 Agent 同时只投递一个问题，其余按提问顺序排队；不设超时，取消子 Agent / 关闭父会话时作废。
 
 **提示词约束（与弹窗形态对齐）**：工具描述与系统提示段 `tools:conventions` 都明确要求 **一次调用只问一个问题**
 （`question` 为单一问题、`options` 只属于该问题）；需要问多个问题时请**多次调用** `ask_user`（每个问题一次调用，
@@ -429,7 +464,7 @@ label 字符串；自由输入覆盖为纯文本。**仅 NORMAL 模式按 `<Esc>
 - 按名称字典序输出（确定性，前缀缓存友好）。
 - 空 `properties` 不输出该字段（DeepSeek 拒绝 `[]` schema）。
 - 先环境探测（`tools.environment.filter_tools`），禁用依赖不可用环境（workspace/git）的工具。
-- 计划模式下只保留只读/信息查询 + `run_command`（只读调研）+ `ask_user`（`plan_mode.apply_tool_filter`）。
+- 计划模式：草稿模式下按能力上限过滤（写类工具可用，拒绝宿主级/未受信工具）；无异步暂存时只保留只读/信息查询 + `run_command` + `ask_user`（`plan_mode.apply_tool_filter`）。
 
 ## 8. 环境探测（tools/environment.lua）
 

@@ -25,6 +25,7 @@ local replay = require("NeoAI.sandbox.review.replay")
 local fs = require("NeoAI.utils.fs")
 local wrapper_util = require("NeoAI.sandbox.execution.wrapper_util")
 local trace_log = require("NeoAI.sandbox.execution.trace_log")
+local plan_draft = require("NeoAI.sandbox.execution.plan_draft")
 
 -- 纯助手（自 wrapper_util 引入，保持原局部名以零改调用点）
 local _rewrite_value, _enc_root, _is_sudo_bin, _split_shell, _cand_paths, _package_manager_of, _limits_key =
@@ -895,6 +896,9 @@ end
 ---   nil 时在此同步计算（小候选/线程池不可用）。
 --- @return table { ok, value?, err? }
 local function _settle_candidate(cand, attempt, ctx, cfg, spec, result, process_info, pre)
+  -- 计划模式草稿：只登记、不发布、不入审批（兜底；正常调用点已提前分流）。
+  local draft = plan_draft.settle(ctx and ctx.plan_scope, cand, attempt, ctx, result)
+  if draft then return draft end
   -- 分段埋点：把结算拆成 ephemeral/impact/secret/risk/enqueue，定位大量文件时的主线程热点。
   -- 由 `_profile` 内部按 `tools.sandbox.diagnostics.enabled` 决定是否记录。
   local _t_prev = vim.uv.hrtime()
@@ -1251,6 +1255,9 @@ end
 --- @param process_info table|nil
 --- @return Deferred resolve({ ok, value?, err? })
 local function _persist_and_settle(cand, attempt, ctx, cfg, spec, result, process_info)
+  -- 计划模式草稿：不落候选、不做密钥/风险分析、不入审批，直接登记并返回。
+  local draft = plan_draft.settle(ctx and ctx.plan_scope, cand, attempt, ctx, result)
+  if draft then return async.resolve(draft) end
   local pre
   local _t_persist = vim.uv.hrtime()
   return _analyze_secrets_async(cand, attempt):then_(function(p)
@@ -1290,10 +1297,19 @@ end
 --- @return table { ok, value?, err? }
 function M.settle_exec_candidate(attempt, cand, ctx, spec, result, process_info)
   local cfg = config_store.get("tools.sandbox") or {}
-  if cand and #cand.files > 0 then
+  if cand and (#cand.files > 0 or #(cand.view_files or {}) > 0) then
     cand.command_id = attempt.command_id
-    store.write_candidate_async(cand)
     candidate.merge_candidate(cand, { from_command = true })
+    local draft = plan_draft.settle(ctx and ctx.plan_scope, cand, attempt, ctx, result)
+    if draft then
+      candidate.cleanup(attempt.attempt_id)
+      return draft
+    end
+    if #cand.files == 0 then
+      candidate.cleanup(attempt.attempt_id)
+      return { ok = true, value = result }
+    end
+    store.write_candidate_async(cand)
     local settled = _settle_candidate(cand, attempt, ctx, cfg, spec, result, process_info)
     candidate.cleanup(attempt.attempt_id)
     return settled
@@ -1820,6 +1836,27 @@ end
 -- 常驻实例启动失败的负缓存到期时刻（hrtime ns）：失败后短时间内不再重试。
 local _fileop_resident_neg_until = 0
 
+--- 常驻实例的环境变量：先确保私有 netns 隔离就绪，再按 `net_isolated=true` 生成 env，
+--- 使 HTTP(S)_PROXY 指向沙箱内 3128（经 Unix socket 到 host_proxy），而不是宿主 host_proxy
+--- 端口（第二个命令在私有 netns 内会连接被拒）。
+--- @param priv table|nil
+--- @return table env
+local function _resident_env(priv)
+  -- 容器/离线/显式声明未隔离的档案不强行指向 3128（它们没有会话内 relay）。
+  if priv and (priv.docker_session or priv.network == false or priv.net_isolated == false) then
+    return runtime.sandbox_env(priv)
+  end
+  local env_priv = priv
+  local ok_iso, iso = pcall(require, "NeoAI.sandbox.net.isolate")
+  if ok_iso and iso and type(iso.enabled) == "function" and iso.enabled() then
+    pcall(iso.ensure)
+    if iso.active() then
+      env_priv = vim.tbl_extend("force", {}, priv or {}, { net_isolated = true })
+    end
+  end
+  return runtime.sandbox_env(env_priv)
+end
+
 --- 在进程内文件写入工具执行前，确保常驻沙箱实例已建立（`tools.sandbox.inproc_namespace` 开启时）。
 --- 复用命令路径的规格/档位构建（T0 最小档 + 工作区暂存根），使 overlay 尽早成为权威暂存层，
 --- 不再依赖「先有一条命令建立常驻实例」。失败静默返回 false——调用方回退既有暂存副本改写，不阻断工具。
@@ -1836,6 +1873,22 @@ local function _ensure_fileop_resident(ctx, tool_name, args, spec)
   if type(resident_mod.active) == "function" and resident_mod.active() then return true end
   -- 已存在常驻实例（由命令建立）时直接复用；否则负缓存期内不重试启动。
   if vim.uv.hrtime() < _fileop_resident_neg_until then return false end
+  -- cwd 位于私有 tmpfs 根（/tmp、/var/tmp、/run）时，常驻实例内该路径是会话私有目录，
+  -- 文件工具必须回退既有暂存副本（overlay 视图与宿主路径不一致）。不为它启动文件常驻实例：
+  -- 否则探针/写入会在错误的私有 /tmp 视图里执行并拖满上层工具超时。
+  do
+    local rtcwd = _effective_cwd(ctx)
+    local okr, roots = pcall(runtime.tmpfs_roots)
+    if okr and type(roots) == "table" then
+      for _, r in ipairs(roots) do
+        if type(r) == "string" and r ~= ""
+          and (rtcwd == r or rtcwd:sub(1, #r + 1) == r .. "/") then
+          return false
+        end
+      end
+    end
+  end
+  local probe_failed = false
   pcall(function()
     local real_cwd = _effective_cwd(ctx)
     local proc_dir = candidate.process_dir()
@@ -1863,7 +1916,13 @@ local function _ensure_fileop_resident(ctx, tool_name, args, spec)
         extra_roots[#extra_roots + 1] = r
       end
     end
-    local specs = M.build_overlay_specs(real_cwd, resident_base, extra_roots, {})
+    -- 跨挂载点工作区（如容器卷 /mnt/<uuid>，或本机 /root 独立挂载）：整机根 overlay 不跨挂载点，
+    -- 文件工具常驻实例必须与命令的兼容模式一致改用 cwd 独立 overlay，否则 overlay 只覆盖 `/`
+    -- 而 cwd 所在挂载点仍是只读 lower → 进程内写入全部 WRITE_FAILED。
+    local no_root = false
+    pcall(function() no_root = runtime.cross_mount_root(real_cwd) ~= nil end)
+    local specs = M.build_overlay_specs(real_cwd, resident_base, extra_roots,
+      { no_root_overlay = no_root })
     for _, s in ipairs(specs) do
       if s.mode == "fuse" then return end -- fuse 与常驻不兼容
       if runtime.overlay_writable(s.root, s.upper, s.work) then
@@ -1881,19 +1940,42 @@ local function _ensure_fileop_resident(ctx, tool_name, args, spec)
     local inst, rerr = resident_mod.ensure({
       specs = specs, cwd = real_cwd, privileges = priv,
       session_dir = resident_session_dir, session_tmp_dir = tmp_base, tmpfs_base = tmp_base,
-      fallback_cwd = staging, env = runtime.sandbox_env(priv),
+      fallback_cwd = staging, env = _resident_env(priv),
     })
     if not inst then
       -- 不再静默：常驻实例起不来时文件工具会回退到暂存副本（安全但少一层视图一致性），
       -- 失败原因必须留在日志里，便于定位（bwrap/挂载/档位/overlay 不可用等）。
       require("NeoAI.kernel.logger").warn(
         "[sandbox] 常驻实例启动失败（文件工具回退暂存副本）：%s", tostring(rerr))
+    else
+      -- 实测探针：常驻实例已启动不代表工作区在它的 overlay 中可写（跨挂载点 cwd、root 独立
+      -- 挂载、upper 权限异常等会让 F 帧写入返回 code≠0）。不可写时立即回收并回退既有暂存
+      -- 副本路径，否则后续所有进程内文件写入都会 WRITE_FAILED。
+      local probe = real_cwd .. "/.neoai_fsprobe_" .. tostring(vim.fn.getpid())
+      local writable = false
+      pcall(function()
+        -- 短超时：探针只用于判定可写性，绝不能让主线程等满默认 15s（会让上层工具超时）。
+        local res = resident_mod.file_op("w", probe, "x", { timeout_ms = 500, wait_ms = 900 })
+        writable = res ~= nil and res.code == 0
+        resident_mod.file_op("u", probe, nil, { timeout_ms = 300, wait_ms = 500 })
+      end)
+      if not writable then
+        require("NeoAI.kernel.logger").warn(
+          "[sandbox] 常驻实例文件视图不可写（overlay/跨挂载），文件工具回退暂存副本")
+        pcall(function() resident_mod.stop({ timeout_ms = 1000 }) end)
+        inst = nil
+        probe_failed = true
+      end
     end
   end)
   local ok_a, active = pcall(resident_mod.active)
   if ok_a and active ~= nil then return true end
   -- 启动失败：短时间内不再重试（避免每次文件操作都尝试 spawn 常驻实例）。
-  _fileop_resident_neg_until = vim.uv.hrtime() + 60e9
+  -- 探针不可写是「该 cwd 的 overlay 视图不可用」，不是启动失败：不做全局负缓存，
+  -- 否则会毒化其它工作区/后续用例（同一进程内切 cwd）的常驻实例启动。
+  if not probe_failed then
+    _fileop_resident_neg_until = vim.uv.hrtime() + 60e9
+  end
   return false
 end
 
@@ -1917,6 +1999,18 @@ local function _gate_inner(tool, args, ctx, call_original)
   end
 
   local spec = tool and tool.__sandbox_spec or tool_spec.get(tool and tool.name, tool and tool.category)
+
+  -- 未保存 buffer → 沙箱视图基线（save-all 语义）：在每次工具边界把 loaded+modified 的
+  -- 普通 buffer 写进视图，使读工具/进程工具/LSP 克隆看到同一份「假设已 :wall」的内容。
+  -- 基线一致的文件不产生候选（candidate.finish 跳过），绝不把用户未保存内容当作 AI 改动。
+  do
+    local eff = spec and spec.effect
+    if eff == "read" or eff == "fs_write" or eff == "process" then
+      pcall(function()
+        require("NeoAI.sandbox.execution.buffer_view").sync()
+      end)
+    end
+  end
 
   -- 读视图一致性：上一条命令的后台捕获/合并（`postprocess="async"`）尚未完成时，进程内读工具
   -- （read_file/search_files/list_files/file_exists）会看到旧视图。这里做**有界短等待**，
@@ -2700,7 +2794,7 @@ local function _gate_inner(tool, args, ctx, call_original)
           specs = specs, cwd = real_cwd, privileges = priv,
           session_dir = resident_session_dir, session_tmp_dir = tmp_base,
           tmpfs_base = tmp_base,
-          fallback_cwd = staging, env = runtime.sandbox_env(priv),
+          fallback_cwd = staging, env = _resident_env(priv),
         })
         if inst then
           active_specs = specs
@@ -2998,6 +3092,12 @@ local function _gate_inner(tool, args, ctx, call_original)
     if not resolved.ok then
       return _fail(resolved.reason)
     end
+    -- 计划模式草稿：不允许宿主级能力（tier>=2 → hostop replay / 宿主门面）。直接拒绝，
+    -- 比「执行后丢弃提案」更诚实（命令可能已通过宿主门面产生不可收缩影响）。
+    if plan_draft.is_active(ctx.plan_scope) and (req.tier or 0) >= 2 then
+      return _fail("PLAN_MODE_CAPABILITY_DENIED: 计划模式不允许宿主级提权命令（tier="
+        .. tostring(req.tier) .. "）；请退出计划模式后执行")
+    end
     attempt.privilege_tier = req.tier
     if pcfg.record ~= false and req.tier > 0 then
       privilege.record({
@@ -3167,7 +3267,8 @@ local function _gate_inner(tool, args, ctx, call_original)
         -- T2 特权档：命令已在嵌套 userns 内执行（够不到宿主），其主机效果冻结为提案，
         -- 异步审批后在主机上 replay（不阻塞工具调用）。
         local hostop_frozen = false
-        if (attempt.privilege_tier or 0) >= 2 and (cfg.review or {}).enabled ~= false then
+        if (attempt.privilege_tier or 0) >= 2 and (cfg.review or {}).enabled ~= false
+          and not (ctx._plan_draft_active or plan_draft.is_active(ctx.plan_scope)) then
           pcall(function()
             hostop_frozen = require("NeoAI.sandbox.execution.hostop").freeze(attempt, args,
               { tier = attempt.privilege_tier, network = true }, { reason = "PRIVILEGED_TIER" }) ~= nil
@@ -3177,6 +3278,7 @@ local function _gate_inner(tool, args, ctx, call_original)
         -- （审批后以 root/sudo 在宿主 replay）。不静默失败，也不静默提权。包安装不在此列
         -- （hostop 拒绝包安装，绝不在宿主机安装）。
         if not hostop_frozen and (cfg.review or {}).enabled ~= false
+          and not (ctx._plan_draft_active or plan_draft.is_active(ctx.plan_scope))
           and runtime.payload_nonroot() and not attempt.package then
           local denied = false
           for _, sig in ipairs((attempt.result_risk and attempt.result_risk.signals) or {}) do
@@ -3210,6 +3312,11 @@ local function _gate_inner(tool, args, ctx, call_original)
           end
           local merged = pre and pre:then_(do_merge) or do_merge()
           return merged:then_(function()
+            -- 计划模式草稿：即使没有发布候选（仅视图同步），也要登记以便退出时丢弃。
+            if (#cand.files > 0 or #(cand.view_files or {}) > 0) then
+              local draft = plan_draft.settle(ctx.plan_scope, cand, attempt, ctx, res)
+              if draft then return draft end
+            end
             if #cand.files == 0 then
               -- 仅有视图同步（无发布候选）：直接完成，不入待审。
               control.transition(attempt, "COMPLETED_READ_ONLY")
@@ -3367,12 +3474,17 @@ local function _gate_inner(tool, args, ctx, call_original)
         attempt.started_at = (ok_t and sec and (sec + (usec or 0) / 1e6)) or os.time()
       end
       call_original():then_(function(res)
+        -- 计划模式草稿：禁止自动提权到宿主机（tier>=2）。
+        local max_tier = pcfg.max_tier or 2
+        if ctx._plan_draft_active or plan_draft.is_active(ctx.plan_scope) then
+          max_tier = math.min(max_tier, 1)
+        end
         if pcfg.auto_escalate ~= false and not attempt.package
           and not (req and (req.docker or req.container))
-          and current_tier < (pcfg.max_tier or 2) then
+          and current_tier < max_tier then
           local raw = ctx.sandbox_last_result
           local esc = privilege.detect_escalation(raw)
-          if esc and esc.tier > current_tier then
+          if esc and esc.tier > current_tier and esc.tier <= max_tier then
             local r2 = privilege.resolve(esc.tier, {
               tier = esc.tier, docker = req.docker, network = req.network, sysadmin = req.sysadmin,
             }, { process = true, agent_id = ctx.agent and ctx.agent.id, cwd = _effective_cwd(ctx) })
@@ -3523,6 +3635,14 @@ local function _gate_inner(tool, args, ctx, call_original)
     control.transition(attempt, "CANDIDATE_READY")
     if cand and #cand.files > 0 then
       cand.command_id = attempt.command_id
+      -- 计划模式草稿：不落候选、不入审批，只登记（退出计划模式丢弃）。
+      local draft = plan_draft.settle(ctx.plan_scope, cand, attempt, ctx, result)
+      if draft then
+        local value = _rewrite_result(candidate.mapping(attempt.attempt_id), draft.value)
+        candidate.cleanup(attempt.attempt_id)
+        d:resolve(value)
+        return
+      end
       store.write_candidate(cand)
       local settled = _settle_candidate(cand, attempt, ctx, cfg, spec, result)
       local value = _rewrite_result(candidate.mapping(attempt.attempt_id), settled.value)
@@ -3534,6 +3654,16 @@ local function _gate_inner(tool, args, ctx, call_original)
       d:reject({ kind = "sandbox", message = "候选冻结失败", command_id = attempt.command_id })
     else
       -- 无实际文件改动（如写入内容与基线一致）：不产生候选、不入待审队列。
+      -- 但仍可能有「视图同步」条目（命令/写入还原了暂存编辑），计划模式下也必须登记以便退出时丢弃。
+      if cand and #(cand.view_files or {}) > 0 then
+        local draft = plan_draft.settle(ctx.plan_scope, cand, attempt, ctx, result)
+        if draft then
+          local value = _rewrite_result(candidate.mapping(attempt.attempt_id), draft.value)
+          candidate.cleanup(attempt.attempt_id)
+          d:resolve(value)
+          return
+        end
+      end
       control.transition(attempt, "COMPLETED_READ_ONLY")
       local value = _rewrite_result(candidate.mapping(attempt.attempt_id), result)
       candidate.cleanup(attempt.attempt_id)
@@ -3561,6 +3691,12 @@ end
 --- @return Deferred
 function M.gate(tool, args, ctx, call_original)
   local cfg = config_store.get("tools.sandbox") or {}
+  -- 记录「本次调用开始时是否处于计划草稿 scope」：异步后处理可能在用户退出计划模式后才结算，
+  -- 结算时 scope 已 inactive，仍必须按草稿丢弃而不是补入审批队列。
+  if type(ctx) == "table" then
+    local scope = ctx.plan_scope
+    ctx._plan_draft_active = (scope ~= nil) and plan_draft.is_active(scope) or false
+  end
   if cfg.enabled == false then
     -- 沙箱关闭：允许降级则直跑；否则交给 _gate_inner 按其 fail_closed 语义硬拒（不静默放行）。
     if cfg.fail_closed == false then

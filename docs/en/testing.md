@@ -218,7 +218,8 @@ ensures there are no leftover subscriptions or state between tests.
 | `test_tools / test_tool_pending` | Tool execution, pending/staged tools |
 | `test_pty` | Interactive PTY: key mapping, /proc blocked-read detection, judge injection, sandboxed run_command auto-answer |
 | `test_max_tokens / test_truncation` | max_tokens sending strategy, output truncation and continuation |
-| `test_sub_agent_result` | Sub-agent tools/manager/result delivery |
+| `test_sub_agent_result` | Sub-agent tools/manager/result delivery, ask_user relay/message protocol, question fold rendering |
+| `test_sandbox_plan_draft` | Plan-mode drafts: not queued/not committable, discarded on exit, previous pending restored, late settle, conflict skip |
 | `test_pending_queue` | Pending message queue |
 | `test_background_tools` | Background tools: a message arriving while waiting for tools is injected immediately and started tools are backgrounded; background results are appended to the end without recursing; approval/`ask_user` stay foreground; request building synthesizes stable placeholders with `system_update` role degradation |
 | `test_services / test_status` | Service layer (chat/tool/model/status), status line |

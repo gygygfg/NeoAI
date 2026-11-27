@@ -275,7 +275,22 @@ local DEFAULT_CONFIG = {
       -- 插入后高亮显示，**发送前**才替换为真实内容。
       --   max_chars：`#{message}` / `#{notify}` 的字符数上限（按字符计，CJK 不会切半）
       --   max_bytes：其他占位符解析结果的字节数上限（UTF-8 安全截断）
-      hash_completion = { enabled = true, max_chars = 2000, max_bytes = 20000 },
+      hash_completion = {
+        enabled = true,
+        max_chars = 2000,
+        max_bytes = 20000,
+        -- `#{lsp}` 内联的诊断消息条数上限（只影响提示；AI 可用 lsp_diagnostics 查全量）。
+        lsp_max_messages = 30,
+      },
+    },
+    -- 打开文件时在 buffer 内显示沙箱待审改动（只读装饰，不改 buffer 内容）：
+    -- 行高亮 + sign + 纯新增 virt_lines；`:NeoAI diff` 打开完整对比。
+    pending_diff = {
+      enabled = true,
+      max_bytes = 1024 * 1024, -- 超过该大小的文件不计算 diff（只提示）
+      debounce_ms = 200,
+      virtual_added_lines = 20, -- 纯新增行在 buffer 内联预览的最大行数
+      auto = true,              -- 打开/切换 buffer 时自动显示
     },
     -- `:NeoAI <子命令>` 的说明提示：已装 nvim-cmp + cmp-cmdline 时注册 neoai_cmd 源，
     -- 否则用内置浮窗展示「子命令 — 说明」。false 则完全关闭（无任何自动命令）。
@@ -306,8 +321,8 @@ local DEFAULT_CONFIG = {
       winbar = true, -- 是否在聊天主窗口顶部渲染第二行（模式/显示模式/模型/状态）；false 只保留一行
       parts = { "mode", "model", "usage", "cache", "capacity" }, -- component() 拼接的段顺序
       separator = " ", -- 段间分隔符
-      -- cache 段口径：both=单次请求命中率(会话累计)（缺省）；latest=只显示最近一次请求；
-      -- cumulative=只显示会话累计（旧行为）。provider 账单口径对应累计值。
+      -- cache 段口径：both=单次请求命中率(总计累计)（缺省）；latest=只显示最近一次请求；
+      -- cumulative=只显示总计累计（旧行为）。provider 账单口径对应累计值。
       cache_mode = "both",
       colors = { -- 各段链接的 nvim 高亮组（避免默认灰暗配色）
         mode = "Title",
@@ -417,6 +432,15 @@ local DEFAULT_CONFIG = {
       "composer.json", "Gemfile", "mix.exs",
       "project.godot", ".project",
     },
+    -- 崩溃自动恢复（宿主被内核 OOM 杀 / SIGKILL 后，下一次启动的补救）。
+    -- 消息按轮落盘（tool_loop 轮末持久化），故最坏只丢「正在执行的那一轮」；
+    -- 本项负责：检测不干净退出 → 回收死进程的沙箱实例 → 重开被中断的会话。
+    recovery = {
+      enabled = true,
+      auto_open = 1, -- 启动时自动重开几个被中断会话（0 = 只提示，不自动打开）
+      reclaim_sandbox = true, -- 自动回收死 pid 的沙箱实例与孤儿进程（等价 SandboxGC）
+      notify = true, -- 恢复时提示（不静默）
+    },
     log_compaction = {
       enabled = true,
       max_redundant_records = 64, -- 旧快照达到此条数时原子合并
@@ -508,6 +532,19 @@ local DEFAULT_CONFIG = {
           output_tail_lines = 80, -- 提供给判官的近期输出行数
         },
       },
+    },
+    nvim = {
+      -- 镜像 Neovim 工具：AI 的 :lua / Ex 命令在沙箱内独立的 headless 镜像进程执行。
+      -- 读取当前 buffer 的实时内容；写入落沙箱暂存（发布前不改真实盘），镜像 buffer 修改
+      -- 随进程退出丢弃、绝不回写主编辑器。沙箱不可用时拒绝执行（无法保证写入落沙箱）。
+      enabled = true,
+      timeout_ms = 30000,
+      -- 单个 buffer 载入镜像的内容上限 / 全部 buffer 总上限（字节）：超限只保留元数据，
+      -- 避免把超大 buffer 整体复制进镜像进程。
+      max_buffer_bytes = 1024 * 1024,
+      max_total_bytes = 8 * 1024 * 1024,
+      -- 仅测试/明确知情时允许无沙箱直跑（默认 false：修改必须落沙箱）。
+      allow_unisolated = false,
     },
     lsp = {
       timeout_ms = 10000, -- LSP 请求超时（ms）：服务器无响应时快速失败，避免工具循环挂到 executor 超时
@@ -606,12 +643,18 @@ local DEFAULT_CONFIG = {
       },
     },
     -- 子 Agent：每个子 Agent 独立持久化会话，完成后把最终正文自动回传给主 Agent。
+    -- 子 Agent 可用 ask_user 提问：问题包装成消息转交主 Agent，由主 Agent 决定直接回答还是先问用户；
+    -- 主 Agent 统一用 send_sub_agent_message 回复（agent 之间来回对话的唯一通道，有在途提问即视作回答）。
     sub_agent = {
       -- 创建子 Agent 时自动追加到其任务提示末尾的收尾指令（要求最后总结工作）。
       -- 设为 "" 可关闭该追加。
       final_instruction = "最后请总结你的工作：用简洁的正文汇总你做了什么、得到的关键结论与证据（文件:行），以及任何未完成或需要注意的点。",
     },
     plan_mode = {
+      -- 计划模式（诊断）：异步沙箱下不强制只读——写类工具可用，但改动只进沙箱暂存、
+      -- 不进审批、退出计划模式时自动丢弃（若路径原本有待审项则恢复旧待审内容）。
+      -- 同时按能力上限拒绝 SSH/主机提权/长驻服务/`nvim` 编辑器控制/未标记 plan_safe 的 MCP 与未知类别外部工具；
+      -- 无异步暂存（非 async/无隔离后端）时退回只读工具集。
       enabled = true, -- 计划模式
       auto_execute_on_approve = true, -- 计划经用户确认后自动转入 CHAT 并按任务清单开始执行
       distill_on_execute = true, -- 计划完成、用户以任何非计划模式确认开始时，先做一轮 XML 计划提取（组装执行上下文 + 按步骤调用 todo_write），再开始执行
@@ -635,7 +678,7 @@ local DEFAULT_CONFIG = {
       -- 并行路径单通道最大尝试次数（仅 target / steps 两个必需通道缺失时按此重试；files 与
       --   第 2 轮各可选通道缺失即忽略、不重试）。默认 2（首跑 + 一次带「请补齐」提示的重试）。
       distill_max_attempts = 2,
-      extra_safe_tools = {}, -- 计划模式白名单扩展（只读/信息查询类之外的工具需显式加入）
+      extra_safe_tools = {}, -- 计划模式显式放行名单：只读白名单/能力上限之外的工具（含未知类别外部工具）需在此加入
       mutating_tools = { -- 兼容保留（计划模式可见集已覆盖此语义）
         "edit_file",
         "delete_file",
@@ -683,6 +726,8 @@ local DEFAULT_CONFIG = {
         list_files = { auto_allow = true },
         search_files = { auto_allow = true },
         file_exists = { auto_allow = true },
+        -- 镜像 Neovim：执行任意 Lua/Ex（沙箱内），默认不自动放行；写入仍走候选审批。
+        nvim = { auto_allow = false },
         create_directory = { auto_allow = false },
         ensure_dir = { auto_allow = false },
         delete_file = { auto_allow = false },
@@ -986,6 +1031,10 @@ local DEFAULT_CONFIG = {
         "~/.local/share/pnpm/store",
         "~/.cache/pip", "~/.cache/uv", "~/.cache/go-build", "~/go/pkg/mod",
         "~/.cache/bazel", "~/.cache/sccache", "~/.cache/ccache",
+        -- 注意：**不要**整棵排除 `~/.cache`/`$XDG_CACHE_HOME`——真实浏览器 profile
+        -- （`~/.cache/chromium/...`）等用户数据也在其中，排除会让越界访问留痕与待审一并消失。
+        -- 工作区之外的构建产物目录改由 `generated_dirs` 的「任意层 `*target` 分量」兜底
+        -- （覆盖 `CARGO_TARGET_DIR=~/.cache/sdw-cargo-target` 这类场景）。
       },
       -- 临时根私有目录位置：host（默认）= 建在宿主根之下的隐藏临时子目录
       -- （如 /tmp/.cache-<tag>/<session>），命名空间映射回该根，AI 只见自己的私有子目录
@@ -1566,10 +1615,33 @@ local DEFAULT_CONFIG = {
       --   * 候选/发布只处理本轮 delta（日志 + mtime 窗口），不再整树遍历会话 upper。
       -- 关闭即回退旧版「工作区暂存副本 + overlay upper 双向拷贝」模型（兼容/回滚用）。
       single_view = true,
+      -- 未保存 buffer → 沙箱视图基线（save-all 语义）：每次工具边界把 loaded+modified 的普通
+      -- buffer 写进视图，使 read/命令/LSP 看到「假设用户刚执行 :wall」的内容。基线一致的
+      -- 文件不产生候选；已有 AI/命令改动时不覆盖（只标记分叉）。overlay 不可用时自动跳过。
+      buffer_view = {
+        enabled = true,
+        max_bytes = 2 * 1024 * 1024, -- 单 buffer 基线上限（超限跳过）
+        max_files = 64,              -- 单次同步最多处理的 buffer 数
+      },
       -- 单个候选允许内联的总字节数（所有文件内容之和；0 = 不限制）。超过即改为逐文件 blob
       -- 并在审批窗提示，避免一条 `cargo build`/`npm install` 把数 GB 产物读进编辑器内存
       -- （曾导致 nvim RSS 27.7GB 被内核 OOM 杀死）。与单文件上限 `max_file_bytes` 正交。
       capture_max_bytes = 256 * 1024 * 1024,
+      -- 候选内容**内联进 Lua 内存**的上限（字节；>0 才允许内联，默认 0 = 从不内联）。
+      -- 沙箱文件一律留在同盘（视图层/候选 blob），候选 JSON 只存 delta 元数据；发布/审批
+      -- 时才按需从 blob 读取。旧行为（小文件内容内联、随候选 JSON 进内存）在候选条目多时
+      -- 会让 nvim 每轮持有数百 MB，设为 >0 可回退以排障。
+      inline_candidate_bytes = 0,
+      -- 沙箱存储（全部在 `stdpath("cache")/NeoAI/sandbox` 下，属可重建缓存）自动清理：
+      --   on_start：回收死进程遗留的实例目录（含 candidates/blobs/view）+ 孤儿进程 + 临时目录；
+      --   on_exit ：本进程退出（VimLeavePre 而非插件热重载）时删除**本进程实例目录**。
+      -- 待审队列/候选是进程实例作用域的（进程退出即不可再应用），故清理不会造成「已审未发布」
+      -- 的静默丢失；插件热重载不清（保留本进程实例，待审队列与暂存继续可用）。
+      cleanup = {
+        on_start = true,
+        on_exit = true,
+        legacy_max_age = 3600, -- 基根下旧布局目录（candidates/reviews/blobs…）超过该秒数即清
+      },
       -- 单个候选允许的文件条目数上限（0 = 不限制）。超过则按 blob/跳过分批处理，绝不一次性
       -- 在 Lua 里持有整棵树的条目（target/ 之类构建产物通常数万文件）。
       capture_max_files = 20000,
@@ -1975,6 +2047,68 @@ local DEFAULT_CONFIG = {
         ui_throttle = true, -- UI 渲染节流与 PTY 轮询间隔按压力放大（warn ×2、critical ×4）
         pty_poll = true, -- PTY 输入检测轮询降频（不改 timer 周期，仅在回调内跳过）
       },
+    },
+
+    -- ===== 自身内存看门狗（保命层）=====
+    -- 与上面的「宿主资源压力」不同：这里只盯**本 nvim 进程**的 RSS 与 Lua 堆。
+    -- 存在意义：沙箱/工具循环在进程内做重活时，一旦无界增长，内核会直接 OOM 杀掉
+    -- nvim（实测 anon-rss 27 GB → SIGKILL），整个交互面消失。本层在到达内核红线之前
+    -- 主动回收 + 中止当前回合，把「进程消失」降级为「本回合失败」。
+    self_guard = {
+      enabled = true, -- 总开关
+      sample_ttl_ms = 1000, -- 采样缓存 TTL（ms）；热路径只读缓存，不重复读 /proc
+      -- soft：先交给已注册的回收器（释放可释放缓存）+ 强制 GC，允许继续
+      soft_mb = 2048, -- 绝对软阈值（RSS）
+      soft_ratio = 0.25, -- MemTotal 比例软阈值（与 soft_mb 取较小者；0 = 不按比例）
+      -- hard：回收 + GC 后仍超限 → 中止当前回合（会话已按轮落盘）；仅在**确实中止了在途
+      -- 工作**时进入 cooldown（期间拒绝新回合）。注意阈值语义：每一项取
+      -- min(绝对值, MemTotal × 比例)——小内存机才可能在 OOM 之前收敛；
+      -- 大内存机上行 4 GB 已属病态，需要更宽松时显式调大 hard_mb。
+      hard_mb = 4096,
+      hard_ratio = 0.40,
+      lua_heap_mb = 1024, -- Lua 堆软阈值（collectgarbage("count")，超限触发 GC/回收器）
+      cooldown_ms = 15000, -- hard 确实中止回合后的冷静期（ms）：期间新回合被拒绝
+      notify = true, -- 首次进入 soft/hard 时提示一次（会话级去重）
+    },
+
+    -- ===== 进程总管理（supervisor）=====
+    -- 统一管理本插件拉起的子进程（后台 worker、常驻沙箱命令服务器、后台服务），
+    -- 负责健康探测、退避重启、熔断降级，使子进程崩溃**只让任务失败**，不向上传导到 nvim。
+    supervisor = {
+      enabled = true,
+      heartbeat_ms = 5000, -- 健康探测间隔（ms；0 = 不主动探测，仅靠崩溃上报）
+      max_restarts = 5, -- 连续重启上限（达到即熔断）
+      backoff_ms = 200, -- 重启退避基数（ms）
+      max_backoff_ms = 30000, -- 重启退避上限（ms）
+      breaker_threshold = 5, -- 滑动窗口内崩溃达到该次数 → 熔断（停止自动重启）
+      breaker_window_ms = 120000, -- 熔断统计窗口（ms）
+      -- 子进程资源上限：超限由内核回收**子进程**，而不是宿主 OOM 杀 nvim。
+      -- 内存上限**按剩余内存动态刷新**（心跳周期重算，并更新已存在的 cgroup memory.max）：
+      --   生效值 = min( MemAvailable × 比例, memory_max_bytes（>0 时）, MemAvailable − 预留 )
+      -- 压力等级联动：warn / critical 时比例再乘 0.75 / 0.5（与 `sandbox_memory_cap` 同口径）。
+      memory_auto = true, -- true = 动态计算（推荐）；false = 只使用 memory_max_bytes 固定值
+      memory_ratio = 0.5, -- 占 MemAvailable 的比例（warn ×0.75、critical ×0.5）
+      memory_min_bytes = 256 * 1024 * 1024, -- 下限：避免可用内存很低时把子进程限制到无法工作
+      memory_reserve_bytes = 256 * 1024 * 1024, -- 为 nvim/宿主预留，不让子进程吃光可用内存
+      memory_max_bytes = 0, -- 绝对上限（>0 时与动态值取 min；0 = 不设绝对上限）
+      pids_max = 0, -- cgroup pids.max；0 = 不限制
+      notify = true, -- 熔断/恢复时提示（不静默）
+    },
+
+    -- ===== 任务分发（dispatch）=====
+    -- 交互通道（用户正在等的工具/回合）与后台通道（预热、批量冻结、会话编码）分离：
+    -- 后台任务在压力升高时暂停排队，交互任务始终优先；每个任务都有超时/重试/预算，
+    -- 失败以结构化错误返回给调用方（工具结果报错），绝不向上抛到 nvim 主循环。
+    dispatch = {
+      enabled = true,
+      queue_max = 64, -- 每通道排队上限（超出即拒绝新任务，避免无界堆积）
+      interactive_parallel = 4, -- 交互通道并发
+      background_parallel = 2, -- 后台通道并发
+      task_timeout_ms = 120000, -- 单任务默认超时（0 = 不限）
+      retries = 0, -- 默认重试次数（仅对幂等任务由调用方显式开启）
+      -- warn 级暂停后台通道；critical 级连交互通道也只允许已在途任务完成。
+      pause_background_on_warn = true,
+      pause_all_on_critical = true,
     },
   },
 

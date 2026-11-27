@@ -191,12 +191,54 @@ command). Guarantees:
   (e.g. a bug in package-candidate classification), the change is *not* in staging, so later commands
   would lose it. The wrapper records `sandbox_postprocess_failed` evidence, logs a warning and shows a
   `vim.notify`. Fixing such a failure must not be left to log-reading.
+- **Candidate content never lives in Lua memory** (`tools.sandbox.inline_candidate_bytes = 0`,
+  the default): staged files are written into candidate blobs by same-disk copy
+  (`uv.fs_copyfile`; the kernel copies, Lua never holds the bytes) and the candidate JSON keeps
+  metadata only. Hashes are computed by reading the file once inside the worker thread
+  (≤ `max_file_bytes`) and the content is released there — it is never sent back to the main
+  process. Materialization copies (`copy_file` + atomic `rename`) and only reads content for
+  entries that were secret-tokenized (the command side needs the real bytes). Publishing reads
+  from the blob on demand (bounded per file); large files go through `writer.apply_file`.
+  > Lesson (2026-11-27): the host nvim was OOM-`SIGKILL`ed at `anon-rss 27.2 GB + swap 4.4 GB`
+  > after a 65-round tool loop in which every round pulled 8k+ staged files (5 GB of them from
+  > an out-of-workspace `~/.cache/sdw-cargo-target` build dir) into Lua to assemble candidates.
+  > Since then `non_capture_paths` includes `~/.cache` by default and `generated_dirs` also
+  > matches any path component ending in `target`.
+- **Hard caps protect the host process**: resident command output blocks, the unparsed frame
+  buffer and server noise all have limits (truncate + terminate the command); the
+  `kernel/self_guard` RSS watchdog (soft reclaim → hard abort of the current turn) is the last
+  line of defence so the kernel never has to OOM-kill nvim.
+- **Sandbox storage is cache**: everything lives under `stdpath("cache")/NeoAI/sandbox`. Startup
+  reclaims instances of dead processes (candidates/blob/view die with the process); a real exit
+  (`VimLeavePre`, not a plugin hot reload) removes this process's instance directory;
+  `:NeoAI SandboxGC` still works manually.
 
 > Remaining: LSP/treesitter are host processes and cannot read the bwrap overlay directly, so they
 > still read the staging mirror; the barrier ensures the mirror already includes command changes before
 > each tool/command, so the AI's read paths (`read_file` overlay / `list_files` mirror) agree at every
 > tool boundary. The session-rotation whiteout race is handled by `candidate.rotate_session`
 > (`rotate_when_idle`).
+
+#### 2.2.1 Unsaved buffers → view baseline (save-all semantics)
+
+The AI's world is “as if the user had just run `:wall` on every buffer”. At each tool gate
+(`wrapper._gate_inner`), `sandbox/execution/buffer_view.lua` syncs loaded+modified normal buffers:
+
+- content is written into the sandbox view (single-view upper; legacy staging on fallback) and registered
+  as the `view_base_hash` **baseline**;
+- view files that still equal the baseline **never produce candidates** (`candidate.finish` skips them,
+  including never-saved new files that do not exist on disk);
+- entries that already have AI/command edits (`staged != seed_hash`) are never overwritten; they are only
+  marked `buffer_diverged`;
+- after `:w` the seed is dropped or the CAS baseline is advanced; after a successful publish, buffers
+  that have not changed since the baseline are reloaded, while newer user edits are left alone with a warning;
+- skipped when the overlay is unavailable (avoids read tools seeing buffers while commands see disk).
+  UI/background buffers, binary/non-UTF-8 files, conceal paths and oversized files are filtered;
+  `tools.sandbox.buffer_view` controls the switch and limits.
+
+The read side needs no special handling: `candidate.read_path`/`read_overrides`/`materialize_overlay`
+already include these entries, so `run_command`/git/LSP clones see the same content. On the user's opened
+buffer, `ui/components/pending_diff.lua` (`ui.pending_diff`, `:NeoAI diff`) shows the pending AI delta.
 
 ## 3. Enforcement points (loader + executor)
 
@@ -917,7 +959,12 @@ is only kept for other `approval.mode` values (`prompt`/`strict`).
     explanatory message). The AI re-reads the real file (already containing the external changes) and
     redoes the edit; the new candidate supersedes the old unit via `supersede_by_paths` and applies
     normally;
-  - External content already equals the candidate result → idempotent skip;
+  - External content already equals the candidate result → idempotent skip. The check looks at both
+    `after_hash` and **the candidate content itself** (`ours == theirs`), so an `after_hash` that is a
+    stat signature / missing (large files, package content, historical candidates) converges too:
+    a change already applied by another unit is no longer misreported as a "merge failure";
+  - An empty baseline (the real file was empty when frozen) still captures a merge base — empty content
+    is a legitimate baseline, not a read failure;
   - Only plain-text `modify` files participate (bounded by `merge_max_bytes`, default `max_file_bytes`);
     binary/large/symlink/dir create-delete/git atomic groups still use strict CAS. `merge=false` falls
     back to "reject the whole unit if the baseline changed".
@@ -930,11 +977,22 @@ is only kept for other `approval.mode` values (`prompt`/`strict`).
   vetoing the whole change set. If it hits a host-sensitive masked path (`is_masked_path`, which
   still resolves fully and follows leaf symlinks) it returns `FAILED/SANDBOX_MASKED_TARGET`. Even a
   locally-rewritten candidate cannot write to an unvalidated real location.
+  **Permanent rejections are not auto-retried**: for these hard gates (`SANDBOX_MASKED_TARGET` /
+  `SANDBOX_SELF_TARGET` / `SANDBOX_RETIRED_TARGET` / `SANDBOX_RETIRE_UNSAFE_ROOT` / `INVALID_PATH` /
+  `PATH_CHANGED` / `GIT_REFERENTIAL_INTEGRITY`) an auto-approved item is **not** restored to pending —
+  it stays `FAILED` with the reason visible so the user can reject it explicitly. Otherwise the next
+  automatic/batch apply immediately retries the same guaranteed-failing gate and the UI pops
+  `apply failed (FAILED): SANDBOX_MASKED_TARGET: …` over and over.
 - **Unpublishable files dropped at freeze**: before building the candidate, `candidate.finish`
   drops several kinds of files so a single one cannot fail the **whole** change set (e.g. a package
   install rolling back because an apt index baseline changed):
-  1. **effectively masked paths** — decided via the attempt's `effective_unmask` (tier escalation +
-     approval unmask + writable roots); paths lifted by unmask are kept;
+  1. **effectively masked paths** — decided via `is_masked_path` **without** any unmask: an
+     execution-time unmask (`effective_unmask`: tier escalation + approval + writable roots) only
+     decides whether the sandbox may write; it does **not** make the file publishable (publish
+     hard-rejects masked targets). Conflating the two lets a package install whose writable root is
+     `/etc` keep `/etc/shadow` or `/etc/ld.so.preload` in the candidate, which can never be
+     published → the whole unit fails repeatedly. Hard-mask unmask only honours an **exact same-path**
+     entry (see "masking semantics" below);
   2. **volatile package indexes/caches** — `tools.sandbox.packages.volatile_paths` (defaults include
      `/var/lib/apt/lists`, `/var/cache/apt`), applied only to package candidates. These are
      regenerated by the package manager at any time, so their baseline usually changed by apply time
@@ -2065,6 +2123,17 @@ defense-in-depth to the bwrap prefix by default (`--cap-drop ALL` plus the tier 
   > `/etc/ld.so.preload` is force-masked to `/dev/null` (creation is blocked even when absent on the
   > host). This removes the "rewrite auth config or inject a loader in-sandbox → in-session privilege
   > escalation / code injection" primitive.
+  >
+  > **Masking semantics (hard mask vs dir mask)**: `mask_paths` is a **hard mask** and only accepts an
+  > **exact same-path** `unmask` (e.g. a tier explicitly lifting `/etc/shadow`); a **parent-level**
+  > grant (a writable root such as a package install's `/etc`, or an approval for a parent directory)
+  > does **not** lift the hard masks underneath — otherwise `/etc/shadow`, `/etc/sudoers` and
+  > `/etc/ld.so.preload` would silently lose their mask and produce candidates that publish can never
+  > accept. `mask_dirs` keeps **ancestor** semantics (allowing a directory allows its subtree).
+  > **Force-masked entries** (`ALWAYS_MASK_PATHS`, e.g. `/etc/ld.so.preload`) are applied whenever their
+  > **parent is writable in this mount** (whole-root overlay or any secondary writable root such as a
+  > package install's `/etc`), not only for the whole-root overlay; a read-only parent skips it because
+  > bwrap cannot create the mount point there.
   > `/etc/passwd`, `/etc/group`, `/etc/systemd`, `/etc/profile*` and other users' homes stay
   > writable: `useradd`/`adduser` must write the account DB into the overlay (an existing sysadmin
   > capability), and systemd units / package-install artifacts are mediated by the facade/candidate
@@ -2320,6 +2389,10 @@ commands (SSRF, e.g. host admin panels, internal ports, cloud metadata):
   - Exemptions: container sessions (rootless dockerd/podman) and LSP subprocesses are not isolated
     (they need their own network stack / provider network); non-HTTP protocols (DB/SSH/raw UDP) are
     unavailable by default.
+  - **Resident instances must use the sandbox-local proxy `127.0.0.1:3128`** (session socat), not the
+    host `host_proxy` port: the host loopback is unreachable inside the private netns, so a second
+    command would fail with `curl: (7)`. `_resident_env` ensures netns readiness and builds env with
+    `net_isolated=true` before starting the resident (container/offline profiles excepted).
 - **Only with `network.isolation="off"`** (legacy shared netns) does the following application-layer
   boundary apply: raw TCP that ignores the proxy (`nc`/`ssh`/DB clients) can reach the host. The
   default mode blocks it at the kernel (netns) level; if isolation is unavailable,
@@ -3805,6 +3878,27 @@ freeze time to avoid whole-unit publish conflicts.
 - **Locating fixed overhead**: with `tools.sandbox.diagnostics.enabled = true`, logs record
   `[sandbox-profile] gate:<tool>` end-to-end time and `settle` (risk grading/enqueue/publish) time, to
   tell slow execution from slow freeze/settle.
+
+### 18.9 Plan-mode drafts (not queued, discarded on exit)
+
+When `tools.approval.mode="async"` and isolation is available, plan mode no longer relies on a read-only tool
+whitelist; writes settle as **drafts** (`sandbox/execution/plan_draft.lua`):
+
+- Drafts **never write candidate JSON, never enter the review queue, and force auto=false** (no publish even with
+  session auto-approval/package allowance); `:NeoAI SandboxCommit` cannot commit them and neither the status bar nor
+  the review UI lists them.
+- Writes go to the staging view; leaving plan mode (or scope-owner disposal / sandbox reset) runs
+  `plan_draft.discard`, comparing the view signature recorded at registration and **undoing only plan mode's own
+  changes**. A path that already had a pending review item gets its previous pending content restored (user changes
+  preserved); a previously clean path reverts to the real disk.
+- Sub-agents inherit the parent `_plan_scope_id`, so their writes are drafts too and are discarded with the parent scope.
+- **Capability ceiling**: drafts do not get SSH/host privilege/long-lived services/`nvim` editor control/MCP without `plan_safe`/unknown
+  external tools; command escalation to tier>=2 is rejected before execution (`PLAN_MODE_CAPABILITY_DENIED`).
+- Known transient: while a draft exists, the review UI still shows the previous pending content for that path while
+  the buffer diff shows the draft; they converge on exit.
+- Paths under `generated_dirs` / `non_capture_paths` are not captured and not in `attempt.mapping`; if plan mode runs a
+  build-like command, view residue may persist until the process ends / `sandbox.reset` (the plan policy asks not to fix,
+  so this is normally not triggered).
 
 ## 19. Known boundaries and residual risks (audit triage)
 

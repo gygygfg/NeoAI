@@ -2184,22 +2184,64 @@ local is_non_credential_path
 --- 扫描候选文件内容中的假密钥，返回警告信息（供待审队列展示）
 --- @param files table 候选文件数组
 --- @return table|nil { count, tokens }
+--- 候选条目的可扫描文本：内联内容优先；内容不内联（候选只存 blob）时从 blob 读取。
+---
+--- 为什么需要它：候选内容默认**不驻留内存**（`tools.sandbox.inline_candidate_bytes = 0`），
+--- `f.content` 为 nil、��文在同盘 blob 里。密钥告警与「AI 生成密钥」检测都必须仍能看到
+--- 内容——否则「AI 碰过密钥」会在审批界面静默消失（安全回归）。此处按需读一次，读完即
+--- 释放在局部变量里，**绝不**把内容写回候选/状态。
+--- @param f table 候选文件条目
+--- @param cap number 单文件上限（字节；0 = 不限）
+--- @return string|nil
+local function _entry_text(f, cap)
+  if type(f.content) == "string" then
+    return f.content ~= "" and f.content or nil
+  end
+  if type(f.blob) ~= "string" or f.blob == "" or f.large then return nil end
+  if cap and cap > 0 then
+    local ok, st = pcall(vim.uv.fs_stat, f.blob)
+    if not ok or type(st) ~= "table" or st.type ~= "file" then return nil end
+    if (tonumber(st.size) or 0) > cap then return nil end
+  end
+  local ok, fh = pcall(io.open, f.blob, "rb")
+  if not ok or not fh then return nil end
+  local raw = fh:read("*a")
+  fh:close()
+  if type(raw) ~= "string" or raw == "" then return nil end
+  return raw
+end
+
 function M.warn_for_files(files)
   local tokens = {}
   local count = 0
   local fakes = {}
   for fake in pairs(state.fake_set) do fakes[#fakes + 1] = fake end
   if #fakes == 0 then return nil end
+  -- 扫描预算：内容可能来自 blob（需读盘），逐文件全文扫描在主线程有成本；
+  -- 与「AI 生成密钥」检测共用同一预算配置。
+  local cfg = _cfg()
+  local max_bytes = tonumber(cfg.generated_scan_max_bytes) or 0
+  local max_files = tonumber(cfg.generated_scan_max_files) or 0
+  local scanned_bytes, scanned_files = 0, 0
   for _, f in ipairs(files or {}) do
+    if max_files > 0 and scanned_files >= max_files then break end
     -- 非凭据文件（哈希/校验和、编辑器状态转储 .shada、git 对象、包缓存等）不是密钥：
     -- 不参与「密钥操作」计数，避免把 nvim shada 等文件里的高熵片段误报为密钥操作。
-    if type(f.path) == "string" and f.path ~= "" and is_non_credential_path(f.path) then
-      -- skip
-    elseif type(f.content) == "string" and f.content ~= "" then
-      for _, fake in ipairs(fakes) do
-        if f.content:find(fake, 1, true) then
-          count = count + 1
-          tokens[fake] = true
+    if not (type(f.path) == "string" and f.path ~= "" and is_non_credential_path(f.path)) then
+      local content = _entry_text(f, max_bytes)
+      if content then
+        local size = #content
+        if max_bytes > 0 and scanned_bytes + size > max_bytes then
+          -- 本文件超预算：跳过（不继续消耗主线程）
+        else
+          scanned_bytes = scanned_bytes + size
+          scanned_files = scanned_files + 1
+          for _, fake in ipairs(fakes) do
+            if content:find(fake, 1, true) then
+              count = count + 1
+              tokens[fake] = true
+            end
+          end
         end
       end
     end
@@ -2230,15 +2272,18 @@ function M.detect_generated(files)
     if max_files > 0 and scanned_files >= max_files then break end
     -- 非凭据文件（哈希/校验和文件、编辑器状态转储 .shada、包缓存等）：跳过生成式密钥扫描，
     -- 避免把 sha256sum 输出、.shada 等含哈希/历史高熵片段的内容误判为「生成密钥」。
-    if not (type(f.path) == "string" and is_non_credential_path(f.path))
-        and type(f.content) == "string" and f.content ~= "" then
-      local size = #f.content
+    local content
+    if not (type(f.path) == "string" and is_non_credential_path(f.path)) then
+      content = _entry_text(f, max_bytes)
+    end
+    if content then
+      local size = #content
       if max_bytes > 0 and scanned_bytes + size > max_bytes then
         -- 本文件超预算：跳过（不再继续消耗主线程）。
       else
         scanned_bytes = scanned_bytes + size
         scanned_files = scanned_files + 1
-        for _, hit in ipairs(M.detect(f.content)) do
+        for _, hit in ipairs(M.detect(content)) do
           if not state.fake_set[hit.value] then
             out[#out + 1] = {
               path = f.path, entropy = hit.entropy, rule = hit.rule,

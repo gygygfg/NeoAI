@@ -22,6 +22,10 @@ local STATES = {
   ERROR = "error",
 }
 
+-- 进程内单调递增的用量序号：每成功累加一次 usage 即 +1。状态栏据此在主 Agent 与
+-- 全部子 Agent 之间判断「最近一次请求」（只放内存，不随会话持久化）。
+local usage_seq = 0
+
 -- ========== 构造函数 ==========
 
 --- 创建 Agent 实例
@@ -450,6 +454,8 @@ end
 --- @return table Agent
 function M.add_usage(agent, usage)
   if type(usage) ~= "table" then return agent end
+  usage_seq = usage_seq + 1
+  agent._last_usage_at = usage_seq
   local meta_usage = usage.usageMetadata or usage
   local provider_name = agent.config and agent.config.provider or nil
   local prefix = require("NeoAI.core.agent.prefix")

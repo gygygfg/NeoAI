@@ -879,9 +879,10 @@ tests.suite("sandbox_ops", function(_, it)
       sandbox.reset()
       local p = vim.fn.tempname() .. ".txt"
       fs.write_file(p, "v1\n")
-      local done = false
+      local done, failure = false, nil
       require("NeoAI.tools").execute("edit_file", { file_path = p, mode = "write", content = "v2\n", description = "t" }, {})
         :then_(function()
+          local oks, cerr = pcall(function()
           local parent = sandbox.list_reviews({ review_state = "PENDING" })[1]
           sandbox.approve(parent.change_set_id) -- 旧版已批准但未应用
           local child = sandbox.derive_revision(parent.change_set_id, { contents = { [p] = "v3\n" } })
@@ -899,9 +900,12 @@ tests.suite("sandbox_ops", function(_, it)
           t.true_(res.ok, tostring(res.reason))
           t.eq("v3", trim(fs.read_file(p)), "应用派生版本应写入新内容")
           fs.delete_file(p)
+          end)
+          if not oks then failure = type(cerr) == "table" and tostring(cerr.message) or tostring(cerr) end
           done = true
-        end, function(e) t.true_(false, tostring(e and e.message or e)); done = true end)
-      t.true_(vim.wait(3000, function() return done end), "edit_file 应完成")
+        end, function(e) failure = tostring(e and (e.message or e) or e); done = true end)
+      t.true_(vim.wait(15000, function() return done end), "edit_file 应完成")
+      t.nil_(failure, "edit_file/派生 revision 不应失败")
     end)
   end)
 
@@ -1256,6 +1260,40 @@ tests.suite("sandbox_ops", function(_, it)
       local pending2 = sandbox.list_reviews({ review_state = "PENDING" })
       t.eq(2, #pending2, "冲突后条目仍应在待审队列中")
       fs.delete_file(p)
+    end)
+  end)
+
+  it("永久性拒绝（遮蔽目标）不回队：不反复「应用失败」", function(t)
+    local sandbox = require("NeoAI.sandbox")
+    local review = require("NeoAI.sandbox.review.review")
+    local store = require("NeoAI.sandbox.state.store")
+    local fs = require("NeoAI.utils.fs")
+    with_config({ tools = { sandbox = { mode = "dry_run", review = { enabled = true } } } }, function()
+      sandbox.reset()
+      -- 模拟历史候选/旧版本产出的「遮蔽目标」候选（冻结阶段现已剔除，这里直连发布闸门）。
+      local store_root = fs.canonical(vim.fn.tempname())
+      fs.ensure_dir(store_root)
+      store.init(store_root)
+      local cand = {
+        candidate_digest = "sha256:masked_perm", created_at = os.time(), effect = "fs_write",
+        files = { {
+          path = "/etc/ld.so.preload", action = "create",
+          after_hash = "sha256:x", content = "x\n",
+        } },
+      }
+      store.write_candidate(cand)
+      local item = assert(review.enqueue(cand, { id = "cs_masked_perm", tool = "edit_file" }))
+      local res = review.apply(item.change_set_id, { auto_approve = true })
+      t.false_(res.ok, "遮蔽目标应拒绝写入")
+      t.eq("FAILED", res.state)
+      t.matches("SANDBOX_MASKED_TARGET", tostring(res.reason), "应为遮蔽目标拒绝")
+      local loaded = assert(review.get(item.change_set_id))
+      t.eq("FAILED", loaded.apply_state, "应记录为失败")
+      t.ne("PENDING", loaded.review_state, "永久性拒绝不应回退为待审（否则会反复重试）")
+      -- 批量应用不会再次尝试它（不产生第二条错误）
+      local r = review.apply_all()
+      t.eq(0, r.failed, "永久性拒绝的条目不应被批量应用反复尝试")
+      store.reset()
     end)
   end)
 

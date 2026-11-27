@@ -170,6 +170,7 @@ function M.ensure_buffer(filepath)
     if _is_binary_file(abs) then return bufnr end
     if pcall(vim.fn.bufload, bufnr) then
       bg_loaded[bufnr] = true
+      pcall(function() vim.b[bufnr].neoai_bg = true end)
       _apply_filetype(bufnr, abs)
       return bufnr, true
     end
@@ -186,6 +187,7 @@ function M.ensure_buffer(filepath)
   local buf = vim.fn.bufnr(abs)
   if buf < 0 then return nil end
   bg_loaded[buf] = true
+  pcall(function() vim.b[buf].neoai_bg = true end)
   _apply_filetype(buf, abs)
   return buf, true
 end

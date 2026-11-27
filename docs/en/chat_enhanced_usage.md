@@ -114,13 +114,19 @@ for the whole batch:
 
 `m` or `:NeoAI Plan` toggles plan mode:
 
-- The tool context keeps only **read-only/information-query tools + `run_command` (read-only research) + `ask_user`**, exposing no
-  modifying tools at all and **no mode-switching tool to the AI**.
-- The execution-time gate tightens accordingly; tools outside the visible set are rejected when called.
-- In plan mode the AI researches and asks clarifying questions, then outputs a **clear, well-formatted change
-  plan**.
+- **Async-sandbox draft mode (default)**: investigate only, do not fix. Write tools remain available, but file
+  changes only enter the sandbox staging view — **never the real workspace, never the review queue, not
+  committable via SandboxCommit** — and are discarded on leaving plan mode (a path that already had pending review
+  changes gets its previous pending content restored). A **capability ceiling** still rejects SSH/host
+  privilege/long-lived services/MCP without `plan_safe`/unknown-category external tools.
+- **Without async staging** (non-async / no isolation backend): falls back to the read-only tool set
+  (read-only/information-query + `run_command` + `ask_user`); the execution-time gate tightens accordingly and
+  tools outside the visible set are rejected.
+- Neither mode **gives the AI a mode-switching tool**.
+- In plan mode the AI researches and asks clarifying questions, then reports the conclusion/evidence concisely
+  (optionally with a short change list for a later fix).
 - After the plan is emitted the turn ends and **the user confirms** (run `:NeoAI ApprovePlan` or toggle the mode
-  manually); once confirmed, it switches to CHAT mode, parses the plan into a todo
+  manually); once confirmed, it switches to CHAT mode (drafts are discarded), parses the plan into a todo
   list, and executes it automatically.
 - Switching modes during generation (`m` / `:NeoAI Plan`) is deferred until the current turn ends,
   so it does not interrupt an in-progress generation.

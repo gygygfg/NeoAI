@@ -178,7 +178,7 @@ _run() 每轮：
 - 工具按名称字典序输出：确定性 → 相同工具集跨请求逐字节相同，前缀缓存友好。
 - 空 properties 不输出该字段（DeepSeek 拒绝 `[]` schema）。
 - 先做环境探测（`tools.environment.filter_tools`）：无法获取 workspace/git 目录时禁用相关工具。
-- 计划模式（`plan_mode.apply_tool_filter`）：只保留只读/信息查询工具 + `run_command`（只读调研）+ `ask_user`。
+- 计划模式（`plan_mode.apply_tool_filter`）：草稿模式按能力上限过滤（写类可用，拒绝宿主级/未受信工具）；无异步暂存时只保留只读/信息查询 + `run_command` + `ask_user`。
 
 ### 4.3 单工具执行（_execute_single）
 

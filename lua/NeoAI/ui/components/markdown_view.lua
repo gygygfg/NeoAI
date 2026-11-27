@@ -482,4 +482,10 @@ function M.flatten(rendered)
   return table.concat(out, "\n")
 end
 
+--- 释放渲染记忆化缓存（内存看门狗回收用；下次渲染会重新解析）。
+function M.reclaim_cache()
+  render_cache = {}
+  render_cache_n = 0
+end
+
 return M

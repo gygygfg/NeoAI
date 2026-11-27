@@ -144,8 +144,13 @@ tests.suite("observer", function(_, it)
     t.true_(#msgs <= 1, "回退通知应合并为一条（实际 " .. #msgs .. " 条）")
     local text = table.concat(msgs, "\n")
     t.matches("启发式", text, "应说明已回退命令解析")
-    t.true_(text:find("bpftrace", 1, true) ~= nil or text:find("strace", 1, true) ~= nil,
-      "应点名缺失的观测依赖（bpftrace / strace）")
+    -- 只有依赖**确实不可用**时才要求点名（本机若装了可用的 bpftrace/strace，提示里本就不该出现
+    -- 「未安装」字样；强制 backend=heuristic 只是让走回退分支，不代表依赖缺失）。
+    local p = observer.probe()
+    if (not (p.ebpf and p.ebpf.ok)) or (not (p.strace and p.strace.ok)) then
+      t.true_(text:find("bpftrace", 1, true) ~= nil or text:find("strace", 1, true) ~= nil,
+        "应点名缺失的观测依赖（bpftrace / strace）")
+    end
   end)
 
   it("密钥文件路径判定", function(t)

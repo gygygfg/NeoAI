@@ -17,8 +17,9 @@
 - **多聊天实例** — `<leader>ac` / `:NeoAI Chat` 每次在**新标签页**开一个独立聊天实例（唯一 buffer 名），可同时开多个聊天、各自独立会话与流式输出、**各自独立的思考/接收参数浮窗与推理显示开关**，旧实例保留继续运行、互不顶替
 - **丰富的内置工具** — AI 可调用文件操作、代码分析、LSP、Shell 命令等 40+ 工具
 - **工具审批系统** — 细粒度的工具执行权限控制，支持自动允许/手动审批/参数级别白名单
-- **计划模式（PLAN）与计划提取** — 按 `m` 或 `:NeoAI Plan` 切换，工具上下文只保留只读/信息查询 + `run_command`（只读调研）+ `ask_user`（不暴露任何修改类工具，也不向 AI 提供切换模式的工具）；AI 调研澄清后输出格式化修改计划并结束本轮，由用户确认（`:NeoAI ApprovePlan` 或手动切换模式）后转入 CHAT：边界处先做一轮 **XML 计划提取**（`<target>`/`<stepN>`/`<files>` 等，忽略大小写、缺失关键字段重试最多 3 次），据此组装执行上下文并按步骤自动建任务清单（`todo_write`），`<files>` 相关工具消息原样保留以保证缓存命中，再开始执行
-- **高权限模式（PRIV，opt-in）** — 按 `m` 循环或 `:NeoAI Privileged` 切换；网络不拦截仅记录（进程级：存在 PRIV 会话即整体放行+记录，焦点切换不弹窗）、不遮蔽 SSH 密钥；Docker 不再由 PRIV 直连宿主 daemon，统一走自动探测的会话内 rootless runtime + broker；生成中切换时策略立即生效、仅模型延后。默认关闭且仅异步审批可用，安全边界见 `docs/configuration.md` 与 `docs/sandbox.md`
+- **计划模式（PLAN）与计划提取** — 按 `m` 或 `:NeoAI Plan` 切换。异步沙箱下采用**草稿模式**：只调研、不修复，写类工具可用但文件改动只进沙箱暂存、不进审批、退出计划模式自动丢弃（路径原本有待审项则恢复其内容）；同时按能力上限拒绝 SSH/主机提权/长驻服务/`nvim` 编辑器控制/未标记 `plan_safe` 的 MCP 与未知类别外部工具。无异步暂存时退回只读工具集。均不向 AI 提供切换模式的工具；AI 输出结论/证据后由用户确认（`:NeoAI ApprovePlan` 或手动切换模式）后转入 CHAT：边界处先做一轮 **XML 计划提取**（`<target>`/`<stepN>`/`<files>` 等，忽略大小写、缺失关键字段重试最多 3 次），据此组装执行上下文并按步骤自动建任务清单（`todo_write`），`<files>` 相关工具消息原样保留以保证缓存命中，再开始执行
+- **高权限模式（PRIV，opt-in）** — 按 `m` 循环或 `:NeoAI Privileged` 切换；网络不拦截仅记录（进程级：存在 PRIV 会话即整体放行+记录，焦点切换不弹窗）、不遮蔽 SSH 密钥；Docker 不再由 PRIV 直连宿主 daemon，统一走自动探测的会话内 rootless runtime + broker；生成中切换时策略立即生效、仅模型延后。默认关闭且仅异步审批可用，安全边界见 `docs/configuration.md` 与 `docs/sandbox.md`- **宿主保护与崩溃恢复** — 重活（捕获/冻结/哈希/编码/大文件 IO）在后台 worker 进程执行，子进程由 `kernel/supervisor` 统一管理（心跳、退避重启、熔断、cgroup 限额）：子进程崩溃只让任务失败，不会带崩 nvim；`kernel/self_guard` 盯本进程 RSS（soft 释放可释放缓存 → hard 中止当前回合，绝不靠内核 OOM 兜底）；任务经双通道（交互/后台）分发并带超时/取消/排队上限。若仍被 SIGKILL/OOM 杀掉，下次启动检测「不干净退出」→ 自动回收死进程的沙箱存储 → 重开最近被中断的会话（`:NeoAI Recover` 可手动执行）。沙箱文件一律留在同盘（候选只存元数据 + blob），沙箱存储在 cache 下且启动/退出自动清理
+
 - **后台上下文压缩** — 接近上下文阈值时**后台异步、非阻塞**地折叠第一轮至倒数第二轮（保留最后一轮），以检查点写入**压缩覆盖层**：后续请求与再次压缩使用压缩后的替换，而聊天渲染与会话持久化仍是原始上下文（覆盖层随会话保存，重开后继续生效）；压缩不弹悬浮窗；除回合边界外，**工具循环每轮发送前也会做压力检查**（工具结果已回写、下一轮请求前），长循环逐轮收敛；**历史条数超过安全上限时先同步压缩再发送（用检查点替换，而不是裸截断改写前缀）**；溢出时自动压缩后重试；计划提取过程仍以悬浮窗实时展示推理与正文
 - **子 Agent 系统** — AI 可创建子 Agent 并行执行子任务，支持边界审核
 - **前后端分离架构** — 事件驱动的异步架构，UI 与业务逻辑解耦
@@ -204,7 +205,7 @@ require("NeoAI").setup({
 | `:NeoAI Compact`   | 手动压缩当前会话上下文（忽略压力阈值，保留最近一轮） |
 | `:NeoAI ReloadDisplay`| 热重载显示模式插件（缺省重载当前模式）            |
 | `:NeoAI ReloadAll`  | 热重载整个 NeoAI 插件（先做隔离预检，失败则取消）  |
-| `:NeoAI Plan`       | 切换计划模式（工具上下文只保留只读/信息查询 + 提问）|
+| `:NeoAI Plan`       | 切换计划模式（异步沙箱草稿：调研不改盘；无暂存时只读工具集） |
 | `:NeoAI Privileged` | 切换高权限模式（网络仅记录、SSH 不遮蔽；Docker 走自动会话 runtime；需先启用）|
 | `:NeoAI ApprovePlan`| 确认计划并转入 CHAT 模式按任务清单执行             |
 | `:NeoAI SandboxCommit`| 应用沙箱候选到真实工作区（CAS 发布，参数为候选摘要）|
@@ -232,9 +233,9 @@ require("NeoAI").setup({
 
 | 占位符 | 展开内容 |
 | --- | --- |
-| `#{buffers}` | 当前全部 buffer（编号 / 状态 / 类型 / 路径） |
-| `#{buffer:NAME}` | 指定 buffer 的内容 |
-| `#{lsp}` | 当前编辑文件的 LSP 诊断 |
+| `#{buffers}` | 当前全部 buffer（编号 / 状态 / 类型 / 路径，`[+]` = 未保存） |
+| `#{buffer}` / `#{buffer:NAME}` | **buffer 对象引用**（不含内容）；AI 用 `nvim` 工具在沙箱镜像里按需读取 |
+| `#{lsp}` / `#{lsp:NAME}` | 对应用户 LSP 信息（客户端/能力/诊断摘要，不含内容） |
 | `#{message}` / `#{notify}` | Neovim 启动至今的消息历史（上限 2000 字符，按字符计） |
 | `#{tool}` / `#{tool:NAME}` | 工具清单 / 单个工具定义 |
 | `#{skills}` / `#{skills:NAME}` | 技能清单 / 单个技能正文 |
@@ -242,7 +243,7 @@ require("NeoAI").setup({
 
 装了 nvim-cmp 时输入 `#` 自动弹候选；否则用插入模式 `<C-x><C-u>` 手动触发。
 未找到的目标（不存在的 buffer/技能）会把占位符**原样**发送，不会报错。
-配置：`ui.input_box.hash_completion = { enabled=true, max_chars=2000, max_bytes=20000 }`。
+配置：`ui.input_box.hash_completion = { enabled=true, max_chars=2000, max_bytes=20000, lsp_max_messages=30 }`。
 
 ### 3.2 AGENTS.md 自动加载
 
@@ -474,7 +475,7 @@ require("NeoAI").setup({
       distill_parallel = true,           -- 多轮并行提取：R1 3 路（target/steps/files）+ R2 4 路（可选段，回放 R1 回显）+ front 压缩并行；false 回退单请求
       distill_front = true,              -- 用压缩器同款 8 段指令把「进入 plan 前」的 front 蒸馏为一条检查点消息（失败退回原样）
       distill_max_attempts = 2,          -- 并行路径单通道最大尝试次数（仅 target/steps 缺失时重试）
-      extra_safe_tools = {},             -- 计划模式白名单扩展
+      extra_safe_tools = {},             -- 计划模式显式放行名单（能力上限之外的工具）
       -- mutating_tools = { ... },       -- 修改类工具（计划模式可见集已覆盖此语义）
     },
     privileged_mode = {
@@ -621,7 +622,7 @@ ai = {
 
 ### lualine 状态栏集成
 
-NeoAI 会把当前 Agent 的大模型用量、缓存命中率、上下文容量等信息暴露给 `nvim-lualine`。
+NeoAI 会把当前会话（主会话 + 全部直接子 Agent 会话）的用量、缓存命中率、上下文容量等信息暴露给 `nvim-lualine`。
 支持两种方式：
 
 **方式一：自动（推荐）** — 无需任何配置。只要检测到 nvim-lualine，NeoAI 会自动把
@@ -659,7 +660,12 @@ require("lualine").setup({
 的 lualine，不被污染。展示刻意简洁，干净分行、无重复、无成片截断：
 
 - **第 1 行（winbar）** 身份：`[模式] 模型 状态`
-- **第 2 行（statusline）** 指标：`↑prompt ↓completion 命中99.5%(会话94.5%) 占用y% 待发N`
+- **第 2 行（statusline）** 指标：`↑prompt ↓completion 命中99.5%(总计94.5%) 占用y% 待发N`
+
+> `↑`/`↓` 与括号内的累计命中率统计**主会话 + 全部直接子 Agent 会话**：运行中的子 Agent
+> 取实时用量，已完成或重开会话后的子 Agent 取子会话持久化用量（用户 fork 分支下的子 Agent
+> 不计入）；累计命中率按 token 加权，不是各 Agent 比率的平均。括号前的单次值取主/子 Agent
+> 中最近一次请求。
 
 > `待发N`：Agent 正忙（generating / tool_running / 生成槽被占用）时你发送的消息会先暂存，
 > 状态栏出现该徽标提醒；消息真正发送后徽标自动消失（计数归零不渲染）。
@@ -693,7 +699,7 @@ require("NeoAI").setup({
 
 相关公开 API：
 
-- `NeoAI.get_statusline_info()` — 返回当前 Agent 的用量/缓存/容量结构化数据
+- `NeoAI.get_statusline_info()` — 返回当前会话（含直接子 Agent 会话）的用量/缓存/容量结构化数据
 - `NeoAI.get_statusline()` — 返回状态栏文本
 - `require("NeoAI.services.status").segment(name)` — 单个段文本（mode/model/usage/cache/capacity/state/display/pending）
 - `require("NeoAI.services.chat_service").pending_count()` — 当前 Agent 正忙时暂存的待发消息数
@@ -918,20 +924,22 @@ NeoAI 内置了 40+ 工具，AI 可在对话中自动调用，涵盖以下类别
 | `todo_write`      | 整表替换任务清单（自动注入系统提示）           | `todos`（必填）完整清单数组，每项 `{content, status}`，`status` ∈ `pending`/`in_progress`/`completed`/`cancelled`（同一时刻至多一个 `in_progress`） |
 | `todo_read`       | 读取当前任务清单                               | 无参数 |
 | `todo_clear`      | 清空任务清单                                   | 无参数 |
-| `enter_plan_mode` | 进入计划模式（工具上下文切换为只读/信息 + 提问）| 无参数 |
+| `enter_plan_mode` | 进入计划模式（只调研不修复；异步沙箱下写入仅暂存、退出丢弃）| 无参数 |
 
 ### 💬 向用户提问
 
 | 工具名     | 描述                                     | 参数说明 |
 | ---------- | ---------------------------------------- | -------- |
-| `ask_user` | 暂停生成并向用户提问，回答回传为工具结果 | `question`（必填）要提问的问题；`options`（可选）供快速选择的选项数组（字符串，或 `{label, description}` 对象） |
+| `ask_user` | 暂停生成并向用户提问，回答回传为工具结果。子 Agent 调用时不弹窗：问题转交主 Agent，由主 Agent 用 `send_sub_agent_message` 回答或先问用户 | `question`（必填）要提问的问题；`options`（可选）供快速选择的选项数组（字符串，或 `{label, description}` 对象） |
 
-> **计划模式（PLAN MODE）**：激活时工具上下文**只包含只读/信息查询工具、`run_command`（只读调研）与 `ask_user`**，
-> 不暴露任何修改类工具（编辑/删除/创建/git 回滚等），**也不向 AI 提供切换模式的工具**；执行期门禁同步收紧，
-> 调用可见集之外的任何工具都会被驳回。AI 在此模式下调研、提问澄清，
-> 并输出**清晰、格式化的修改计划**（目标与背景 / 改动清单 / 实施步骤 / 验证与回滚）。
+> **计划模式（PLAN MODE）**：异步沙箱下为**草稿模式**——写类工具可用，但文件改动只进入沙箱暂存，
+> **不写真实工作区、不进审批队列、无法 SandboxCommit**，退出计划模式时自动丢弃（路径原本有待审项则恢复旧待审内容）；
+> 同时按能力上限拒绝 SSH/主机提权/长驻服务/`nvim` 编辑器控制/未标记 `plan_safe` 的 MCP 与未知类别外部工具。
+> 无异步暂存时退回只读工具集（只读/信息查询 + `run_command` + `ask_user`），执行期门禁同步收紧。
+> 均**不向 AI 提供切换模式的工具**。AI 在计划模式下调研、提问澄清，最后用简洁正文给出结论/证据
+> （需要后续修复时可附一份简短改动清单）。
 > 计划输出后本轮结束，**由用户确认**（执行 `:NeoAI ApprovePlan` 或手动切换模式）；
-> 确认后**直接转入 CHAT 模式**，系统把计划解析为任务清单（todo），
+> 确认后**直接转入 CHAT 模式**（草稿丢弃），系统把计划解析为任务清单（todo），
 > 并按 `tools.plan_mode.auto_execute_on_approve`（默认开启）自动开始执行。
 > 也可手动执行 `:NeoAI ApprovePlan` 完成同样的确认。
 > 生成过程中按 `m` / `:NeoAI Plan` 切换模式会**延迟到当前回合结束后生效**，

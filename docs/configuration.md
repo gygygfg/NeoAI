@@ -154,12 +154,13 @@ context_cache = {
 | `split` | `{size=80, direction="right", max_ratio=0.5, min_rest=20}` | split 窗口：`direction` 为 `right`/`left`/`top`/`bottom`；`size` 为期望尺寸（左右分割为列数、上下分割为行数），实际尺寸收敛为 `min(floor(屏幕列\|行数 × max_ratio), 屏幕列\|行数 - min_rest - 1)` 再按 `size` 截断，避免占满整屏把原有窗口挤没。默认 `max_ratio=0.5`：NeoAI 窗口最多占屏幕一半，原窗口至少保留 20 列/行 |
 | `colors` | 各段高亮 | 用户/AI/推理/标题色 |
 | `tree` | `{foldenable=false, ...auto_close_on_select=true}` | 会话树折叠/自动关闭 |
-| `input_box` | `{idle_height=1, min_height=5, max_ratio=0.8, hash_completion={enabled=true, max_chars=2000, max_bytes=20000}}` | 输入框高度（空闲/聚焦/增长上限）。`hash_completion` 为输入框 `#` 上下文占位符补全：输入 `#` 弹出候选（`#{buffers}` / `#{tool}` / `#{lsp}` 等），插入后以 `NeoAIHashPlaceholder` 高亮，**发送前**才替换为真实内容；`max_chars` 为 `#{message}`/`#{notify}` 的**字符数**上限（按字符计，中文不会被切半），`max_bytes` 为其他占位符解析结果的字节上限（UTF-8 安全截断）；`enabled=false` 完全关闭（不装 completefunc / cmp 源 / 高亮自动命令）。详见 [ui_system.md](ui_system.md)「输入框 # 占位符」 |
+| `input_box` | `{idle_height=1, min_height=5, max_ratio=0.8, hash_completion={enabled=true, max_chars=2000, max_bytes=20000, lsp_max_messages=30}}` | 输入框高度（空闲/聚焦/增长上限）。`hash_completion` 为输入框 `#` 上下文占位符补全：输入 `#` 弹出候选，插入后以 `NeoAIHashPlaceholder` 高亮，**发送前**才替换。`#{buffer}`/`#{lsp}` 只给 buffer 对象与用户 LSP 信息（不含内容/不附对象），AI 用 `nvim`/`lsp_*` 工具实时查询；`lsp_max_messages` 为 `#{lsp}` 内联诊断条数上限。`max_chars` 为 `#{message}`/`#{notify}` 的**字符数**上限，`max_bytes` 为其他占位符解析结果的字节上限（UTF-8 安全截断）；`enabled=false` 完全关闭。详见 [ui_system.md](ui_system.md)「输入框 # 占位符」 |
+| `pending_diff` | `{enabled=true, max_bytes=1048576, debounce_ms=200, virtual_added_lines=20, auto=true}` | 打开文件时在 buffer 内以**只读装饰**显示沙箱待审改动（行高亮 + sign + 纯新增 `virt_lines`）；只显示真实 AI/命令增量，用户自己的未保存输入（save-all 基线）不会误报。`auto=false` 关闭自动绘制，仍可用 `:NeoAI diff` 打开完整对比；超过 `max_bytes` 只提示不计算。详见 [ui_system.md](ui_system.md)「沙箱待审改动 → 行内 diff」 |
 | `command_hint` | `{enabled=true}` | `:NeoAI <子命令>` 的说明提示：已装 nvim-cmp + cmp-cmdline 时注册 `neoai_cmd` 补全源（提供 detail/documentation），否则用内置浮窗展示「子命令 — 说明」并随输入高亮匹配项；`enabled=false` 时零副作用（不注册任何自动命令 / 补全源）。不引入任何第三方依赖 |
 | `chat` | `{mousescroll_max_blank=3, incremental=true, fold="reasoning_tools", process_keep_steps=3}` | 鼠标滚轮滚到底时末行下方允许的最大空白行数（0=严格贴底）；`incremental` 开启增量刷新（只重渲染变化的消息块且只写差异行），设为 `false` 降级回整 buffer 全量重写；`fold` 为折叠程度：`none`（不折叠）/ `reasoning_tools`（现状：推理与工具块折叠）/ `process`（额外把每轮的 AI 中间调用收进「过程」折叠，折叠文本显示折叠轮次、工具成功/失败数、输入/输出 token、缓存命中率；Step 标记以 `· Step N` 追加在思考过程/工具调用折叠文本上，角色头只在角色切换时出现且为纯 `🤖 AI`；「过程」为 level 1 折叠，内部推理/工具块为 level 2 嵌套折叠，展开后仍各自收起；AI 运行途中插入的用户消息不开启新轮次，Step 编号连续、插入前的步骤整段收起）；用户消息与 AI 消息一律左对齐（固定行为，无配置开关）；`process_keep_steps` 为 `process` 模式下**本轮进行中**保留展开的最近中间步数（只看 agent 是否还在处理本轮，暂存队列非空不算；轮次结束后中间步骤全部收起，只留最终步骤展开） |
 | `ask_user` | `{batch_debounce_ms=25, require_confirm=true}` | 向用户提问弹窗：`batch_debounce_ms` 为同一轮多次提问的聚合去抖窗口（毫秒，覆盖兄弟调用到达时序；越大越全但首弹越慢）；`require_confirm` 为全部作答后是否展示汇总页二次确认（`false` 时直接提交）。弹窗在焦点离开时自动缩为右上角小窗、重新聚焦时展开 |
 | `trajectory` | `{log_dir=".../NeoAI/logs"}` | 轨迹显示模式的日志保存目录 |
-| `statusline` | `{enabled=true, winbar=true, parts={mode,model,usage,cache,capacity,sandbox}, separator=" ", colors=...}` | lualine 状态栏；`sandbox` 段在沙箱待审数 > 0 时显示 `待审N`（`N` 为待审**文件**总数，审批单位为单个文件），默认链接醒目高亮组 `NeoAISandboxPending`（黄底加粗，可在 `colors.sandbox` 覆盖）；待审队列含 **L3（高危）** 时该段追加 `⚠危险` 并切换为红色危险高亮组 `NeoAISandboxDanger`（可在 `colors.sandbox_danger` 覆盖）；存在**越界访问留痕**时该段追加 `越界N`（`N` 为去重文件数，两者都有时并列显示，如 `待审2 越界3`）；`usage` 段显示**会话累计**输入/输出 token（`↑` 输入合计、`↓` 输出合计，不随单次请求跳变）；`cache` 段按 `cache_mode` 展示并保留**两位小数**：`both`（缺省）为 `命中单次(会话累计)`（如 `命中99.52%(会话94.55%)`，单次值反映当前前缀缓存质量，括号内为 provider 账单口径），`latest` 只显示最近一次请求，`cumulative` 只显示会话累计（旧行为，如 `命中95.32%`；无单次数据时也回退累计）；`capacity` 段显示上下文**占用比**（已用/窗口，从 `0%` 起算、越用越大，如 `占用42%`），接近/超出上限时按级别配色（`capacity_warn` / `capacity_over`），超限时显示「上下文超限」 |
+| `statusline` | `{enabled=true, winbar=true, parts={mode,model,usage,cache,capacity,sandbox}, separator=" ", colors=...}` | lualine 状态栏；`sandbox` 段在沙箱待审数 > 0 时显示 `待审N`（`N` 为待审**文件**总数，审批单位为单个文件），默认链接醒目高亮组 `NeoAISandboxPending`（黄底加粗，可在 `colors.sandbox` 覆盖）；待审队列含 **L3（高危）** 时该段追加 `⚠危险` 并切换为红色危险高亮组 `NeoAISandboxDanger`（可在 `colors.sandbox_danger` 覆盖）；存在**越界访问留痕**时该段追加 `越界N`（`N` 为去重文件数，两者都有时并列显示，如 `待审2 越界3`）；`usage` 段显示**主会话 + 全部直接子 Agent 会话**的累计输入/输出 token（`↑` 输入合计、`↓` 输出合计，不随单次请求跳变；运行中的子 Agent 取实时用量，已完成/重开会话后取子会话持久化用量，用户 fork 分支下的子 Agent 不计入）；`cache` 段按 `cache_mode` 展示并保留**两位小数**：`both`（缺省）为 `命中单次(总计累计)`（如 `命中99.52%(总计94.55%)`，单次值取主/子 Agent 中最近一次请求、反映当前前缀缓存质量，括号内为整棵会话树的 provider 账单口径，按 token **加权**而非各 Agent 比率平均），`latest` 只显示最近一次请求，`cumulative` 只显示总计累计（旧行为，如 `命中95.32%`；无单次数据时也回退累计）；`capacity` 段显示上下文**占用比**（已用/窗口，从 `0%` 起算、越用越大，如 `占用42%`），接近/超出上限时按级别配色（`capacity_warn` / `capacity_over`），超限时显示「上下文超限」 |
 
 > **窄屏浮窗留白（无需配置）**：以「聊天主窗口宽度」为基准，宽度 `< 40` 时浮窗左右占满该窗口、
 > `40 ≤ 宽度 < 100` 时左右各留 5 格、`≥ 100` 时维持按屏幕比例居中。阈值 `40/100` 与留白 `5`
@@ -208,8 +209,19 @@ session = {
   --   file：文件名；max_bytes：注入内容上限（超限按 UTF-8 安全截断并标注）
   -- 注意：AI 更新 AGENTS.md 仍走既有沙箱审批，不会因本开关自动放行。
   agents_md = { enabled = true, file = "AGENTS.md", max_bytes = 64 * 1024, auto_allow_read = true },
+  -- 崩溃自动恢复：宿主被内核 OOM 杀 / SIGKILL 后，下一次启动检测「不干净退出」→
+  -- 回收死进程的沙箱实例（含候选/blob/视图）→ 重开最近 N 个被中断的会话。
+  -- 会话按轮落盘（工具循环轮末持久化），故最坏只丢「正在执行的那一轮」。
+  --   auto_open：启动时自动重开几个被中断会话（0 = 只提示）；不自动续跑（避免自动烧 token）。
+  --   reclaim_sandbox：等价启动时自动 :NeoAI SandboxGC。
+  recovery = { enabled = true, auto_open = 1, reclaim_sandbox = true, notify = true },
 }
 ```
+
+> 恢复判定：干净的 nvim 退出会删除 `state/alive-<pid>.json` 标记；被 SIGKILL/OOM 杀掉则
+> 标记残留。启动时若该 pid 已死（或 `boot_id` 变化）即判定崩溃，并在
+> `~/.cache/nvim/NeoAI/state` 内清理残留标记。` :NeoAI Recover ` 可随时手动执行同一流程
+> （并复位子进程熔断）。
 
 ### 2.5 `tools`
 
@@ -222,13 +234,14 @@ session = {
 | `output_guard` | `{enabled=true, max_chars=20000, head_chars=14000, tail_chars=4000, spill=true, spill_dir="neoai-out"}` | 工具输出「AI 上下文限流」：`run_command` + 只读 `git_*` + `read_file` 回传文本超过 `max_chars`（字符数）时，只回传「头 `head_chars` + 截断标记 + 尾 `tail_chars`」，并把完整输出写入沙箱私有 `/tmp/<spill_dir>/`（默认 `/tmp/neoai-out/…`，提示中给出路径，可用 `read_file` 的 `start_line/end_line` 分段回读）。`head_chars+tail_chars` 须 `< max_chars`（否则自动按比例钳制）。`spill=false` 只截断不落盘；未启用沙箱（无 `/tmp` 映射）时自动降级为仅截断。`enabled=false` 一键停止限流（仅保留 `run_command.max_output_bytes` 等硬限）。与 `max_output_bytes`（16 MiB 防冻结硬杀限，保护主线程）职责分离 |
 | `search_files` | `{max_file_bytes=8388608}` | 搜索时单文件扫描上限（字节），超过则跳过；二进制文件（含 NUL）跳过，避免大文件 OOM |
 | `run_command` | `{max_output_bytes=16777216, max_wall_ms=0, interactive={enabled=true, engine="auto", poll_ms=80, show_window="on_wait", show_window_delay_ms=2000, judge={enabled=true, model=nil, max_rounds=12, timeout_ms=120000, output_tail_lines=80}}}` | 命令 stdout/stderr 合计上限（字节）：超出则截断并终止命令，避免超大输出逐行处理冻结主线程；0 = 不限制。`max_wall_ms>0` 为墙钟安全网：命令最长运行该毫秒数（同样约束 `timeout_ms=-1` 的「不限」命令），到时经沙箱资源域真正终止进程树；0 = 不限制。`interactive`（**默认开启**）：`run_command` 以 **PTY** 运行，轮询 `/proc` 检测「进程阻塞读终端 = 等待输入」（OS 级判据，非文字匹配；用 `/proc/<pid>/io` 的 `rchar` 增长区分连续两次读取），每轮等待由**判官**（**单轮大模型请求**：模型返回 `{"action":"text"|"keys"|"kill"|"none",...}` JSON 决策，直接注入文本/按键/结束进程；非子 agent、无工具循环）或用户在悬浮终端手动输入作答；`poll_ms` 轮询间隔，`show_window` 控制悬浮终端弹出时机（always=会话启动即开 / on_wait=命令运行超过 `show_window_delay_ms`（默认 2000ms）仍未结束才开，短命令一闪而过的窗口不打扰 / never=不开；**均要求聊天光标跟随，不跟随时不弹**），`engine="off"` 等价不启用。悬浮终端以**折叠态**（屏幕右上角小窗）打开，焦点进入终端窗时自动展开为全尺寸、移出时回落到折叠态。普通前台命令走**一次性**沙箱路径（常驻命令服务器 stdin 为 /dev/null 无法交互）；但带后台意图（`&`/nohup/setsid）的命令、以及**已有常驻实例在运行时**的后续命令仍走常驻实例，保证后台进程跨调用存活且同命名空间内 `ps`/`kill`/日志可见可管。`enabled=false` 则所有命令都走常驻实例 |
+| `nvim` | `{enabled=true, timeout_ms=30000, max_buffer_bytes=1048576, max_total_bytes=8388608, allow_unisolated=false}` | 镜像 Neovim 工具（`nvim`）：AI 的 `:lua`/Ex 命令在**沙箱内独立的 headless 镜像进程**执行，读取当前 buffer 实时内容（含未保存修改）；写入落沙箱暂存（发布前不改真实盘），镜像 buffer 修改不回写主编辑器。`max_buffer_bytes`/`max_total_bytes` 为载入镜像的单 buffer/总内容上限；`allow_unisolated=false` 时沙箱不可用直接拒绝（仅测试可设为 true）。详见 [tool_system.md](tool_system.md)「镜像 Neovim」 |
 | `lsp` | `{timeout_ms=10000, start_timeout_ms=15000, auto_start=true, attach_timeout_ms=3000, check={...}}` | LSP 请求超时（服务器无响应快速失败）；`start_timeout_ms` 为等待客户端**完成 initialize** 的超时（仅当确有 server 启动在途时使用：缺失客户端时 `auto_start` 会按编辑器 LSP 配置派生并自主启动，沙箱可用优先 `@neoai-sandbox` 克隆并纳入保活/回收，无沙箱且无未发布暂存改动时回退非沙箱客户端）；`attach_timeout_ms` 为「完全无候选」时等待客户端附加/快速失败的超时（文件不在 buffer 时自动后台打开、或服务器启动/重启期间客户端尚未附加时，LSP 工具等待其就绪再发请求，超时后仍发一次以给出准确错误），而非立即报「无 LSP 客户端」。`check` 为 `lsp_check` 工具（项目级全量诊断）配置：`enabled`/`timeout_ms`/`servers`（按 server 名映射 CLI 检查命令，argv 占位符 `{path}`/`{root}`/`{level}`/`{server}`/`{out}`，`format=lua-ls|pyright|clangd|text`，可选 `extensions`（缺省 server 按目标扩展名自动选择）、`bin`（覆盖可执行文件路径）、`requires_file`（只支持单文件，如 clangd）、可选 `root_files`，可选 `auto_config`/`auto_config_file`：根缺少项目配置时用内置默认配置执行本次检查（沙箱内、不写入工作区））；内置 `lua-language-server`/`pyright`/`clangd`，未显式指定 `server` 时只选 **PATH 中已安装**的 server。在沙箱内执行、全量重算，支持目录/glob、严重级别过滤与基线比对（`{out}` 指向沙箱可写/宿主可读的结果文件，因 lua-language-server 的 JSON 写文件而非 stdout） |
 | `guard.repeat_tool` | `{enabled=true, thresholds={3,5,8}, messages=...}` | 连续重复工具调用提醒 |
 | `todo.enabled` | `true` | 待办工具 + 系统提示注入 |
 | `web` | 见下（默认 `search.enabled=false`、`fetch.enabled=false`） | DeepSeek Web Search / Fetch（仅 DeepSeek provider 暴露） |
-| `plan_mode` | `{enabled=true, auto_execute_on_approve=true, distill_on_execute=true, distill_parallel=true, distill_front=true, distill_max_attempts=2, extract_max_tokens=nil, extra_safe_tools={}, mutating_tools=...}` | 计划模式 |
+| `plan_mode` | `{enabled=true, auto_execute_on_approve=true, distill_on_execute=true, distill_parallel=true, distill_front=true, distill_max_attempts=2, extract_max_tokens=nil, extra_safe_tools={}, mutating_tools=...}` | 计划模式。**异步沙箱草稿模式**（`tools.approval.mode="async"` 且隔离可用）下不再强制只读：写类工具可用但改动只进沙箱暂存、不进审批、退出计划模式自动丢弃；同时按能力上限拒绝 SSH/主机提权/长驻服务/`nvim` 编辑器控制/未标记 `plan_safe` 的 MCP 与未知类别外部工具。`extra_safe_tools` 为显式放行名单（两种模式都生效）。无异步暂存时退回只读工具集 |
 | `privileged_mode` | `{enabled=false, require_async_approval=true, override_offline=true, unmask_ssh_keys=true, record_network=true, max_records=1000}` | 高权限模式（opt-in）：网络仅记录不拦截、不遮蔽 SSH 密钥；仅异步审批可进入。Docker 不再由 PRIV 直连，统一走自动探测的会话内 rootless runtime + broker |
-| `sub_agent` | `{final_instruction="最后请总结你的工作：…"}` | 子 Agent：创建时自动追加到其任务提示末尾的收尾指令（要求最后总结工作）；设为 `""` 可关闭。子 Agent 完成后其最终正文会自动回传主 Agent |
+| `sub_agent` | `{final_instruction="最后请总结你的工作：…"}` | 子 Agent：创建时自动追加到其任务提示末尾的收尾指令（要求最后总结工作）；设为 `""` 可关闭。子 Agent 完成后其最终正文会自动回传主 Agent。子 Agent 可用 `ask_user` 提问：问题转交主 Agent，由主 Agent 用 `send_sub_agent_message` 回答（也是 agent 对话唯一通道） |
 | `approval` | 见下 | 工具审批 |
 | `sandbox` | 见下 | 工具执行沙箱（dry-run/commit、隔离后端、策略） |
 
@@ -677,11 +690,26 @@ sandbox = {
   -- 视图基目录固定为 `<沙箱暂存基>/view`，agentEnd 不迁移暂存，轮次占用不叠加。
   -- false = 回退旧版「工作区暂存副本 + overlay upper 双向拷贝」模型（兼容/回滚用）。
   single_view = true,
+  -- 未保存 buffer → 沙箱视图基线（save-all 语义）：每次工具边界把 loaded+modified 的普通
+  -- buffer 写进视图，使 read_file/run_command/git/LSP 看到「假设用户刚执行 :wall」的内容。
+  -- 基线一致的文件不产生候选；已有 AI/命令改动时不覆盖（只标记分叉）。overlay 不可用时跳过。
+  buffer_view = { enabled = true, max_bytes = 2 * 1024 * 1024, max_files = 64 },
   -- 单个候选允许内联的总字节数 / 文件条目数（0 = 不限制）：超过即改为逐文件 blob 或跳过，
   -- 避免一条 `cargo build`/`npm install` 把数 GB 产物读进编辑器内存（曾导致 nvim RSS 27.7GB OOM）。
   capture_max_bytes = 256 * 1024 * 1024,
   capture_max_files = 20000,
-  -- 构建产物目录（相对仓库根的 basename，整棵子树不捕获为候选）：按工作区根向下 0~2 层展开。
+  -- 候选内容**内联进 Lua 内存**的上限（>0 才允许；默认 0 = 从不内联）：
+  -- 沙箱文件一律留在同盘（视图层 / 候选 blob），候选 JSON 只存 delta 元数据；
+  -- 发布/审批时才按需从 blob 读取（单文件受 max_file_bytes 约束）。
+  inline_candidate_bytes = 0,
+  -- 沙箱存储自动清理（全部在 `stdpath("cache")/NeoAI/sandbox` 下，属可重建缓存）：
+  --   on_start：回收死进程遗留的实例目录 + 孤儿进程 + 陈旧临时目录；
+  --   on_exit ：本进程退出（VimLeavePre，非插件热重载）时删除本进程实例目录；
+  --   legacy_max_age：基根下旧布局目录（candidates/reviews/blobs…）超过该秒数即清。
+  cleanup = { on_start = true, on_exit = true, legacy_max_age = 3600 },
+  -- 构建产物目录（相对仓库根的 basename，整棵子树不捕获为候选）：按工作区根向下 0~2 层展开；
+  -- 另外**任意层**的分量名以 `target` 结尾（target / cargo-target / cargo.target）同样命中，
+  -- 覆盖 `CARGO_TARGET_DIR` 之类把产物放到工作区外的场景。
   generated_dirs = {
     "target", "node_modules", "build", "out", ".venv", "venv",
     "__pycache__", ".next", ".nuxt", ".svelte-kit", ".turbo", ".pytest_cache",
@@ -1038,17 +1066,98 @@ resources = { pressure = { simulate = "critical" } }
 单点隔离排查：把 `degrade.<项>` 设为 `false`（如仅关渲染降频）；或
 `simulate = "ok"` 使所有降级判定恒为最低档。总开关 `enabled = false` 则完全退回改动前行为。
 
+#### `resources.self_guard`（本进程内存看门狗）
+
+与上面的「宿主资源压力」不同：这里只盯**本 nvim 进程**的 RSS 与 Lua 堆。到达内核红线前
+主动收敛，把「进程被 OOM 杀」降级为「本回合失败」。
+
+```lua
+resources = {
+  self_guard = {
+    enabled = true,
+    sample_ttl_ms = 1000,     -- 采样缓存 TTL；热路径只读缓存
+    soft_mb = 2048,           -- 软阈值（RSS；与 soft_ratio×MemTotal 取较小者）
+    soft_ratio = 0.25,        -- MemTotal 比例软阈值（0 = 不按比例）
+    hard_mb = 4096, hard_ratio = 0.40,
+    lua_heap_mb = 1024,       -- Lua 堆软阈值（collectgarbage("count")）
+    cooldown_ms = 15000,      -- hard 后的冷静期：期间拒绝新回合
+    notify = true,
+  },
+}
+```
+
+- `soft`：执行已注册的回收器（纯展示缓存：树摘要 / Markdown 记忆化 / 运行期结果伪消息）、
+  强制 GC，然后继续。
+- 阈值取「绝对值」与「MemTotal × 比例」中的**较小者**（小内存机才可能在 OOM 前触发）。
+- `hard`：回收后**重新采样**仍超限 → 通过注册的中止器（`chat_service.abort_all`）结束当前
+  回合（会话已按轮落盘），进入 `cooldown_ms` 冷静期；期间 `allow_start()` 为 false。
+- 探测不到 `/proc` 时一律视为 `ok`（绝不因探测失败误伤）。
+- 采样点：后台定时器（`sample_ttl_ms`）+ 工具循环每轮边界。
+
+#### `resources.supervisor`（子进程总管理）
+
+子进程（后台 worker、常驻沙箱命令服务器）的**唯一状态源与重启策略**：崩溃只让任务失败，
+不向上传导到 nvim。
+
+```lua
+resources = {
+  supervisor = {
+    enabled = true, heartbeat_ms = 5000,
+    max_restarts = 5, backoff_ms = 200, max_backoff_ms = 30000,
+    breaker_threshold = 5, breaker_window_ms = 120000,  -- 滑动窗口内崩溃达阈值 → 熔断
+    -- 内存上限**按剩余内存动态刷新**（每个心跳周期重算，并在线更新 cgroup memory.max）：
+    --   生效值 = min( MemAvailable × memory_ratio, memory_max_bytes（>0 时),
+    --                MemAvailable − memory_reserve_bytes )
+    --   再夹到 [memory_min_bytes, 可用内存]，压力 warn ×0.75 / critical ×0.5 再收紧；
+    --   收紧立即生效，放宽需超过当前值 20%（避免可用内存波动导致反复写 cgroup）。
+    memory_auto = true, memory_ratio = 0.5,
+    memory_min_bytes = 256 * 1024 * 1024, memory_reserve_bytes = 256 * 1024 * 1024,
+    memory_max_bytes = 0,          -- 绝对上限（0 = 不设上限，只用动态值）
+    pids_max = 0,                  -- 子进程 pids.max（0 = 不限）
+    notify = true,
+  },
+}
+```
+
+- 适配器在「确认异常退出」时上报 `report_crash`；本模块按窗口计数，达阈值打开熔断（状态
+  `failed` 并提示），**停止自动重启**；`:NeoAI Recover` 复位。
+- `memory_max_bytes` / `pids_max` 把子进程放进委派 cgroup：超限时由内核回收**子进程**，
+  而不是宿主 OOM 选中 nvim。默认 `memory_auto=true`：上限随**剩余内存**动态刷新（见上），
+  内存紧张时自动收紧（可用内存很低时保底 64 MB，避免子进程一启动就被回收）。
+
+#### `resources.dispatch`（任务分发）
+
+交互通道与后台通道分离，每个任务有超时/重试/取消/排队上限；失败以结构化错误返回。
+
+```lua
+resources = {
+  dispatch = {
+    enabled = true, queue_max = 64,
+    interactive_parallel = 4, background_parallel = 2,
+    task_timeout_ms = 120000, retries = 0,
+    pause_background_on_warn = true,   -- warn 级暂停后台通道
+    pause_all_on_critical = true,      -- critical 级拒绝新任务
+  },
+}
+```
+
 ## 3. 计划模式（tools/plan_mode）
 
-计划模式作为 **per-agent 状态**（`agent.plan_mode`），激活时：
+计划模式作为 **per-agent 状态**（`agent.plan_mode`）有两种形态：
 
-1. **注入 plan-policy 系统提示段**（`deployment:plan_policy`，order=100）：要求输出清晰、格式化的修改计划。
-2. **工具上下文只保留只读/信息查询工具 + `run_command`（只读调研）+ `ask_user`**（`PLAN_SAFE_TOOLS` 白名单 + `PLAN_EXTRA_TOOLS`），不暴露任何修改类工具，也**不向 AI 提供切换模式的工具**。
-3. **执行期门禁同步收紧**（`plan_mode.check_tool`）：计划模式下调用可见集之外的任何工具都会被驳回。
+1. **异步沙箱草稿模式（默认）**：`tools.approval.mode="async"` 且隔离可用时，采用**能力上限**而非只读白名单：
+   - 写类工具（edit/delete/run_command）可用，但文件改动只进沙箱暂存，**不写真实工作区、不进审批队列、
+     无法 SandboxCommit**；退出计划模式时自动丢弃（路径原本有待审项则恢复旧待审内容）。
+   - 拒绝 SSH/主机提权/长驻服务/`nvim` 编辑器控制/未标记 `plan_safe` 的 MCP 与未知类别外部工具；命令 tier≥2 在执行前拒绝。
+   - 策略文本（运行时上下文快照）要求「尽快查明原因、不要修复」，并说明改动会被丢弃。
+2. **只读工具集**（非 async / 无隔离后端）：工具上下文只保留只读/信息查询 + `run_command` + `ask_user`
+   （`PLAN_SAFE_TOOLS` + `PLAN_EXTRA_TOOLS`），执行期门禁同步收紧（`plan_mode.check_tool`）。
 
-**计划确认**：AI 输出计划后本轮结束，由用户执行 `:NeoAI ApprovePlan`（或手动切换模式）确认，
-经 `chat_service.approve_plan` 解析计划为任务清单（todo）→ 退出计划模式（转入 CHAT）
-→ 按 `auto_execute_on_approve`（默认开启）自动开始执行。
+两种形态都**不向 AI 提供切换模式的工具**。子 Agent 在草稿模式下继承父 scope，其写入同样只暂存/随父丢弃。
+
+**计划确认**：AI 输出结论后本轮结束，由用户执行 `:NeoAI ApprovePlan`（或手动切换模式）确认，
+经 `chat_service.approve_plan` 退出计划模式（草稿丢弃）并解析计划为任务清单（todo），
+按 `auto_execute_on_approve`（默认开启）自动开始执行。
 
 **XML 计划提取（`distill_on_execute`）**：计划确认、转入非计划模式发送前，会先做一轮
 「XML 结构化提取」——复用现有前缀缓存回放历史后追加提取指令，让 AI 输出

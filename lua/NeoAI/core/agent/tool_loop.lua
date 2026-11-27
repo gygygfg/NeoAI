@@ -436,6 +436,28 @@ function M.has_pending(agent)
   return ok and res == true
 end
 
+-- 在跑的后台工具数（按 agent_id）：工具批量因新消息转后台后，结果尚未回传。
+-- 上一条 run 结束（本轮已收尾）仍可能有后台工具在跑（转后台后模型已出新回答），
+-- 后续结果会以末尾 system 消息回传并续跑——UI 据此避免「等待结果时把光标拽回输入框」。
+local bg_active = {}
+
+--- 指定 Agent 仍有后台工具在跑（结果未回传）。
+--- @param agent_id string|nil
+--- @return number 在跑的后台工具数
+function M.background_pending_for(agent_id)
+  if not agent_id then return 0 end
+  return tonumber(bg_active[agent_id]) or 0
+end
+
+--- 更新某 Agent 的后台工具计数（内部使用）。
+--- @param agent_id string|nil
+--- @param n number
+local function _set_bg_active(agent_id, n)
+  if not agent_id then return end
+  n = math.max(0, tonumber(n) or 0)
+  if n == 0 then bg_active[agent_id] = nil else bg_active[agent_id] = n end
+end
+
 --- 注册轮前刷新钩子（由 chat_service/mcp 调用；nil 清除）
 --- @param fn function(agent) -> Deferred|nil
 function M.set_pre_round_refresh(fn)
@@ -540,6 +562,7 @@ function M.run(agent, tool_calls, tool_service, opts)
       bg[id] = nil
       bg_count = math.max(0, bg_count - 1)
     end
+    _set_bg_active(agent.id, bg_count)
     -- 每个后台工具完成都唤醒等待者：立即把该结果追加到末尾并发起下一轮，
     -- 不等待其余后台工具（它们完成时会再次唤醒）。
     _wake_bg("result")
@@ -633,6 +656,12 @@ function M.run(agent, tool_calls, tool_service, opts)
   local function _boundary_commit()
     require("NeoAI.core.session.runtime_context").ensure(agent)
     if round_persist then pcall(round_persist, agent) end
+    -- 自身内存看门狗：每轮边界巡检一次（秒级 TTL 缓存，开销可忽略）。hard 时看门狗经
+    -- 中止器中止本 agent 的 signal，循环在下一轮开头即退出——把「可能被内核 OOM 杀」降级为
+    -- 「本回合失败」（会话已按轮落盘）。绝不在这里直接抛错。
+    pcall(function()
+      require("NeoAI.kernel.self_guard").check({ reason = "tool_loop" })
+    end)
   end
 
   local function _settled_ids(b)
@@ -646,6 +675,7 @@ function M.run(agent, tool_calls, tool_service, opts)
   local function _cancel_background_all()
     if bg_count == 0 then
       bg_order = {}
+      _set_bg_active(agent.id, 0)
       return
     end
     for _, id in ipairs(bg_order) do
@@ -661,6 +691,7 @@ function M.run(agent, tool_calls, tool_service, opts)
     bg = {}
     bg_order = {}
     bg_count = 0
+    _set_bg_active(agent.id, 0)
   end
 
   -- 当前 batch 是否所有未完成工具都已真正开始执行（timer.running）。
@@ -700,6 +731,7 @@ function M.run(agent, tool_calls, tool_service, opts)
     if unsub_abort then pcall(unsub_abort); unsub_abort = nil end
     _wake_bg("done")
     batch = nil
+    _set_bg_active(agent.id, 0)
   end
 
   local function _round()
@@ -768,6 +800,7 @@ function M.run(agent, tool_calls, tool_service, opts)
         if b.exec_opts[i] then b.exec_opts[i].skip_live_result = true end
       end
     end
+    _set_bg_active(agent.id, bg_count)
     _mark_background(b)
     if #pending_ids > 0 then
       agent:add_message("system", _background_note(pending_ids), {

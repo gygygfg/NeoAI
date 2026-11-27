@@ -257,6 +257,53 @@ local function _server_script(boot, exec_prefix)
   }, "\n")
 end
 
+--- 单个命令输出块的上限（字节）：块内文本按 base64 承载（约 1.33×），故按上限的 2 倍封顶。
+--- 无上限时，一条持续产出（或协议失步）的命令会把整段输出堆在 nvim 内存里——这正是
+--- 「命令不返回 + RSS 暴涨」的放大点之一。
+--- @return number
+local function _block_limit()
+  local ok, n = pcall(function()
+    return tonumber(require("NeoAI.kernel.config_store").get("tools.run_command.max_output_bytes"))
+  end)
+  if not ok or not n or n <= 0 then n = 16 * 1024 * 1024 end
+  return n * 2
+end
+
+--- 未解析缓冲（协议残留）上限：超过即判定协议失步，丢弃旧数据以免无界增长。
+local BUF_LIMIT = 8 * 1024 * 1024
+--- 服务器噪声（不属于任何命令的输出）保留上限：仅诊断用，保留尾部即可。
+local NOISE_LIMIT = 64 * 1024
+
+--- 追加一段输出到当前块（超限即截断并终止该命令，避免无界内存）。
+--- @param inst table
+--- @param txt string
+local function _push_output(inst, txt)
+  if txt == nil or txt == "" then return end
+  local blk = inst.block
+  if not blk then
+    inst.noise = (inst.noise or "") .. txt
+    if #inst.noise > NOISE_LIMIT then inst.noise = inst.noise:sub(-NOISE_LIMIT) end
+    return
+  end
+  if blk.truncated then return end
+  if blk.limit == nil then blk.limit = _block_limit() end
+  blk.bytes = (blk.bytes or 0) + #txt
+  if blk.bytes > blk.limit then
+    blk.truncated = true
+    -- 让服务器在该命令进程组内终止，避免继续产出（协议帧仍会正常收尾）
+    pcall(vim.fn.chansend, inst.job, "K\t" .. tostring(blk.id) .. "\t\n")
+    pcall(function()
+      require("NeoAI.kernel.logger").warn(
+        "[sandbox] 常驻命令输出超过上限，已截断并终止（id=%s）", tostring(blk.id))
+      require("NeoAI.sandbox.review.evidence").add("resident_output_truncated", {
+        id = tostring(blk.id), bytes = blk.bytes,
+      })
+    end)
+    return
+  end
+  blk.chunks[#blk.chunks + 1] = txt
+end
+
 --- 解析常驻实例 stdout 缓冲：按 id 多路解复用标记帧与输出块（支持并发命令）。
 --- 输出块（BEGIN…END 之间）由服务器以 flock 原子写出，故整块归属同一 id；
 --- 块外文本为服务器自身噪声，不归属任何命令。
@@ -267,23 +314,12 @@ local function _drain(inst)
     local s = buf:find(RS, 1, true)
     if not s then
       -- 无标记的纯输出：归属当前活动输出块；块外为服务器噪声。
-      if #buf > 0 then
-        if inst.block then
-          inst.block.chunks[#inst.block.chunks + 1] = buf
-        else
-          inst.noise = (inst.noise or "") .. buf
-        end
-      end
+      if #buf > 0 then _push_output(inst, buf) end
       buf = ""
       break
     end
     if s > 1 then
-      local txt = buf:sub(1, s - 1)
-      if inst.block then
-        inst.block.chunks[#inst.block.chunks + 1] = txt
-      else
-        inst.noise = (inst.noise or "") .. txt
-      end
+      _push_output(inst, buf:sub(1, s - 1))
     end
     local e = buf:find(US, s + 1, true)
     if not e then
@@ -302,7 +338,10 @@ local function _drain(inst)
       local rc = tonumber(marker:match("^END%s+%S+%s+(%-?%d+)"))
       local p = inst.pendings[id]
       if inst.block and inst.block.id == id then
-        if p then p.chunks = inst.block.chunks end
+        if p then
+          p.chunks = inst.block.chunks
+          p.truncated = inst.block.truncated == true
+        end
         inst.block = nil
       end
       if p then p.finish(rc or -1, false) end
@@ -310,6 +349,14 @@ local function _drain(inst)
       local p = inst.pendings[id]
       if p then p.finish(0, true) end
     end
+  end
+  -- 未解析残留超限：判定协议失步，丢弃旧数据（否则 `inst.buf = inst.buf .. data` 会无界增长）
+  if #buf > BUF_LIMIT then
+    pcall(function()
+      require("NeoAI.kernel.logger").warn(
+        "[sandbox] 常驻实例帧缓冲超过上限（%d 字节），已丢弃旧数据（协议可能失步）", #buf)
+    end)
+    buf = buf:sub(-math.floor(BUF_LIMIT / 2))
   end
   inst.buf = buf
 end
@@ -358,6 +405,7 @@ local function _request(inst, kind, payload, opts)
       settle({
         code = rc, stdout = _decode_chunks(pending.chunks), stderr = "",
         cpid = pending.cpid, timed_out = pending.timed_out, aborted = pending.aborted,
+        truncated = pending.truncated == true,
         message = pending.abort_message,
       })
     end
@@ -647,6 +695,14 @@ function M.ensure(opts)
       for _, p in pairs(inst.pendings or {}) do ps[#ps + 1] = p end
       inst.pendings = {}
       for _, p in ipairs(ps) do p.finish(-1, false) end
+      -- 上报总管理：常驻实例退出只收敛状态（自报进程，心跳不重复计崩溃），
+      -- 使 `:NeoAI Status` 能显示真实存活态。
+      pcall(function()
+        local sup = require("NeoAI.kernel.supervisor")
+        if type(sup.report_exit) == "function" then
+          sup.report_exit("sandbox.resident", "exit:" .. tostring(code))
+        end
+      end)
     end,
   })
   if job <= 0 then
@@ -969,7 +1025,7 @@ function M.exec(command, opts)
       end
     end
     out:resolve({
-      code = res.code, stdout = stdout, stderr = "", truncated = truncated,
+      code = res.code, stdout = stdout, stderr = "", truncated = truncated or res.truncated == true,
       oom = oom, oom_level = oom_level, pids_max_hit = pids_max_hit,
       timed_out = res.timed_out, aborted = res.aborted, message = res.message,
     })
@@ -997,6 +1053,8 @@ function M.file_op(op, path, content, opts)
   end
   local payload = op .. "\t" .. vim.base64.encode(path) .. "\t" .. vim.base64.encode(content or "")
   local timeout_ms = tonumber(opts.timeout_ms) or 15000
+  -- 探针/快速路径可传更短的 `wait_ms`（默认仍预留 3s 给服务器排队）。
+  local wait_ms = tonumber(opts.wait_ms) or (timeout_ms + 3000)
   local result
   local done = false
   _request(inst, "F", payload, { timeout_ms = timeout_ms }):then_(function(res)
@@ -1006,7 +1064,7 @@ function M.file_op(op, path, content, opts)
     result = false
     done = true
   end)
-  vim.wait(timeout_ms + 3000, function() return done end, 5)
+  vim.wait(wait_ms, function() return done end, 5)
   if not done or result == nil then return nil, "TIMEOUT" end
   if result == false then return nil, "REQUEST_FAILED" end
   return { code = result.code or -1, stdout = result.stdout or "" }

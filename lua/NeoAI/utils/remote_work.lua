@@ -302,6 +302,20 @@ local function _on_disconnect(reason)
   -- 尚未发送的排队任务保留，稍后由新 worker 处理。
   _reject_pending({ kind = "worker", message = "worker 已断开: " .. tostring(reason or "eof") })
   if state.stopped then return end
+  -- 上报总管理：退避次数/熔断由 supervisor 统一裁决（未登记时保持旧行为）。
+  if was then
+    local allow = true
+    pcall(function()
+      local sup = require("NeoAI.kernel.supervisor")
+      if type(sup.report_crash) == "function" then
+        allow = sup.report_crash("worker", tostring(reason or "eof")) ~= "stop"
+      end
+    end)
+    if not allow then
+      _reject_all({ kind = "worker", message = "worker 反复崩溃，已熔断（:NeoAI Recover 可重置）" })
+      return
+    end
+  end
   if #state.queue > 0 or _has_pins() then
     _retry_restart()
   end
@@ -342,6 +356,15 @@ local function _on_connected()
   end)
   _handshake():then_(function()
     _log("worker ready pid=%s", tostring(state.spawn_pid))
+    -- 握手成功才算真正就绪：此时再把受管状态收敛为 running（spawn 回调只标记 starting，
+    -- 避免「已 spawn 未就绪」被心跳误判成失活/崩溃）。
+    pcall(function()
+      local sup = require("NeoAI.kernel.supervisor")
+      local pid = state.spawn_pid
+      if type(sup.mark_running) == "function" then sup.mark_running("worker", pid) end
+      -- 就绪即套限额（不依赖下一次心跳）：cgroup memory.max 按当前剩余内存动态计算。
+      if type(sup.apply_limits) == "function" then sup.apply_limits("worker", pid) end
+    end)
     local starting = state.starting
     state.starting = nil
     if starting then pcall(function() starting:resolve(true) end) end
@@ -448,6 +471,12 @@ local function _spawn()
   if not spid then return nil, err end
   state.spawn_pid = spid
   _log("spawned worker pid=%s socket=%s log=%s", tostring(spid), state.socket, state.spawn_log)
+  -- 上报总管理：标记运行态并立即套用**按剩余内存动态计算**的 cgroup memory.max
+  -- （超限时由内核回收 worker，而不是宿主 OOM 杀 nvim；心跳会随可用内存继续刷新）。
+  pcall(function()
+    local sup = require("NeoAI.kernel.supervisor")
+    if type(sup.on_child_spawn) == "function" then sup.on_child_spawn("worker", spid) end
+  end)
   -- 非阻塞回收 + 崩溃探测。
   if state.reaper then _close_timer(state.reaper) end
   local reaper = uv.new_timer()

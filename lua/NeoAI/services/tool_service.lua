@@ -499,6 +499,8 @@ function M.execute(agent, tool_name, args, tool_call_id, opts)
   if not pallow then
     return async.reject({ kind = "plan_mode", message = preason })
   end
+  -- 懒启动/会话恢复：确保计划草稿 scope 已建立（sandbox 可能晚于 plan_mode 启动）。
+  pcall(plan_mode.ensure_scope, agent)
 
   -- 子 Agent 的审批申请路由目标：其父（主）Agent。用于非 async 模式下把审批
   -- 归属/事件展示到主 Agent；执行仍使用子 Agent 自身 ctx（cwd/沙箱域不变）。
@@ -525,6 +527,8 @@ function M.execute(agent, tool_name, args, tool_call_id, opts)
     -- 会话绑定工作目录：工具/沙箱以该会话记录的工作区为基准（不跟随编辑器当前 cwd）。
     cwd = agent and agent.cwd or nil,
     sandbox_exec_cwd = agent and agent.cwd or nil,
+    -- 计划模式草稿作用域：沙箱据此把写入结算为「暂存但不入审批」，退出计划模式统一丢弃。
+    plan_scope = agent and agent._plan_scope_id or nil,
   }
 
   -- UI-only 通知（如沙箱降级提示）：执行完成后经 opts 回传 tool_loop，作为工具结果的

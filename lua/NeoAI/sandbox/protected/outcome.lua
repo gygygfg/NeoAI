@@ -102,6 +102,24 @@ function M.staged(opts)
   }
 end
 
+--- 计划模式草稿：改动只进沙箱暂存，不写真实盘、不进审批，退出计划模式时自动丢弃。
+--- @param opts table { files?: table, tool?: string }
+--- @return table { text = string }
+function M.plan_draft(opts)
+  opts = opts or {}
+  local lines = {
+    ("[沙箱] PLAN_DRAFT files=%d decision=%s"):format(#(opts.files or {}),
+      opts.discarded and "DISCARDED" or "AUTO_DISCARD"),
+  }
+  local brief = _files_brief(opts.files)
+  if brief ~= "" then lines[#lines + 1] = "what=" .. _one_line(brief, 512) end
+  lines[#lines + 1] = opts.discarded
+    and "state=计划模式已退出：本次改动已立即丢弃，未写入真实工作区、未进入审批队列"
+    or "state=计划模式：改动仅写入沙箱暂存，不会写入真实工作区、不会进入审批队列；退出计划模式时自动丢弃"
+  lines[#lines + 1] = "retryable=false do_not_repeat=true"
+  return { text = table.concat(lines, "\n") }
+end
+
 --- 把结果信封附加到工具返回值上（不改动原有结构）
 --- 字符串直接拼接；表按输出字段顺序写入，避免覆盖业务字段。
 --- @param result any
